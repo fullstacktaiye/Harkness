@@ -551,20 +551,50 @@ impl ProjectService {
                 git: inspect_git(&canonical_root)?,
             };
 
-            let _lock = self.lock_exclusive()?;
-            let mut candidate = self.read_catalog()?;
-            // The reopen check above ran against a catalog that is now as old
-            // as the clone. Any entry for this remote is either the stale one
-            // that entry rejected or one a concurrent import added; the
-            // checkout that provably exists on disk is this one.
-            candidate
-                .projects
-                .retain(|entry| entry.remote.as_deref() != Some(normalized.as_str()));
-            candidate.projects.push(project.clone());
-            sort_recents(&mut candidate.projects);
-            self.persist(&candidate)?;
-            self.catalog = candidate;
-            Ok(project)
+            let reconciled = {
+                let _lock = self.lock_exclusive()?;
+                let mut candidate = self.read_catalog()?;
+                // The reopen check above ran against a catalog that is now as
+                // old as the clone. If a concurrent import won the race, use
+                // its live checkout instead of replacing its entry and
+                // orphaning one of the two managed directories.
+                let reconciled = if let Some(index) = candidate
+                    .projects
+                    .iter()
+                    .position(|entry| entry.remote.as_deref() == Some(normalized.as_str()))
+                {
+                    let existing = refresh_project(candidate.projects[index].clone());
+                    if existing.available {
+                        let existing = Project {
+                            last_opened: OffsetDateTime::now_utc(),
+                            ..existing
+                        };
+                        candidate.projects[index] = existing.clone();
+                        existing
+                    } else {
+                        candidate.projects.remove(index);
+                        candidate.projects.push(project.clone());
+                        project.clone()
+                    }
+                } else {
+                    candidate.projects.push(project.clone());
+                    project.clone()
+                };
+                sort_recents(&mut candidate.projects);
+                self.persist(&candidate)?;
+                self.catalog = candidate;
+                reconciled
+            };
+
+            if reconciled.id != id {
+                fs::remove_dir_all(&managed_directory).map_err(|source| {
+                    ProjectError::Persistence {
+                        path: managed_directory.clone(),
+                        source,
+                    }
+                })?;
+            }
+            Ok(reconciled)
         })();
 
         if imported.is_err() {
@@ -1624,6 +1654,64 @@ mod tests {
                 .join(REPOSITORIES_DIRECTORY)
                 .join(imported.id.to_string())
                 .join(CHECKOUT_DIRECTORY)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_imports_of_one_remote_keep_one_managed_checkout() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{Arc, Barrier};
+
+        let fixture = Fixture::new();
+        let remote = fixture.directory("concurrent-remote");
+        initialize_repository(&remote);
+        let fake_git = fixture.root.path().join("synchronized-git");
+        fs::write(&fake_git, "#!/bin/sh\necho ready >&2\nexec git \"$@\"\n").unwrap();
+        let mut permissions = fs::metadata(&fake_git).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_git, permissions).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let data_dir = &fixture.data_dir;
+        let projects = thread::scope(|scope| {
+            let imports = (0..2)
+                .map(|_| {
+                    let barrier = Arc::clone(&barrier);
+                    let remote = &remote;
+                    let fake_git = &fake_git;
+                    scope.spawn(move || {
+                        let mut service = ProjectService::load_for_test(data_dir).unwrap();
+                        service.git_executable = fake_git.clone();
+                        service
+                            .import_repository(
+                                remote.to_str().unwrap(),
+                                &CloneCancellation::default(),
+                                |message| {
+                                    if message == "ready" {
+                                        barrier.wait();
+                                    }
+                                },
+                            )
+                            .unwrap()
+                    })
+                })
+                .collect::<Vec<_>>();
+            imports
+                .into_iter()
+                .map(|import| import.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(projects[0].id, projects[1].id);
+        let catalogued = fixture.service().list();
+        assert_eq!(catalogued.len(), 1);
+        assert_eq!(catalogued[0].id, projects[0].id);
+        assert_eq!(
+            fs::read_dir(fixture.data_dir.join(REPOSITORIES_DIRECTORY))
+                .unwrap()
+                .count(),
+            1,
         );
     }
 
