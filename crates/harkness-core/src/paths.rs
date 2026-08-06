@@ -5,11 +5,30 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Replaces the platform data directory outright when it is set.
+pub(crate) const DATA_DIRECTORY_ENV: &str = "HARKNESS_DATA_DIR";
+
 pub(crate) const CATALOG_FILE: &str = "projects.json";
 pub(crate) const CATALOG_LOCK_FILE: &str = "projects.lock";
 pub(crate) const WORKTREES_DIRECTORY: &str = "worktrees";
 pub(crate) const REPOSITORIES_DIRECTORY: &str = "repositories";
 pub(crate) const CHECKOUT_DIRECTORY: &str = "checkout";
+
+/// Resolves the Harkness data directory, honoring [`DATA_DIRECTORY_ENV`].
+///
+/// The override exists so an isolated front end or an integration test can run
+/// against its own catalog instead of the real user data directory. An empty
+/// value counts as unset, because it would otherwise resolve the catalog
+/// relative to the process working directory.
+///
+/// `None` means the platform exposed no user data directory and no override
+/// was given.
+pub(crate) fn data_directory() -> Option<PathBuf> {
+    std::env::var_os(DATA_DIRECTORY_ENV)
+        .filter(|overridden| !overridden.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::data_dir().map(|data_dir| data_dir.join("harkness")))
+}
 
 /// Why a path is not the location Harkness reserved for an entry.
 pub(crate) enum UnreservedPath {

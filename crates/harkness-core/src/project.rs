@@ -24,7 +24,7 @@ use crate::{
         lock,
     },
     paths::{
-        CATALOG_FILE, CHECKOUT_DIRECTORY, REPOSITORIES_DIRECTORY, UnreservedPath,
+        self, CATALOG_FILE, CHECKOUT_DIRECTORY, REPOSITORIES_DIRECTORY, UnreservedPath,
         WORKTREES_DIRECTORY, canonical_reserved_root,
     },
     remote::{normalize_remote_with_local, repository_name},
@@ -180,10 +180,11 @@ pub struct ProjectService {
 
 impl ProjectService {
     /// Loads the catalog from the platform user data directory.
+    ///
+    /// `HARKNESS_DATA_DIR` replaces that location entirely when it is set, so a
+    /// caller can run against an isolated catalog without an isolated build.
     pub fn load() -> Result<Self, ProjectError> {
-        let data_dir = dirs::data_dir()
-            .ok_or(ProjectError::DataDirectoryUnavailable)?
-            .join("harkness");
+        let data_dir = paths::data_directory().ok_or(ProjectError::DataDirectoryUnavailable)?;
         Self::load_from_data_dir(data_dir)
     }
 
@@ -245,6 +246,35 @@ impl ProjectService {
             .iter()
             .cloned()
             .map(refresh_project)
+            .collect::<Vec<_>>();
+        sort_recents(&mut projects);
+        projects
+    }
+
+    /// Lists projects by most-recently-opened order exactly as the catalog
+    /// stores them.
+    ///
+    /// Reads the catalog and nothing else: `available` and `git` are reported
+    /// at their defaults rather than derived, so a caller that only needs the
+    /// stored identity of every project does not pay one metadata call and one
+    /// Git inspection per entry. Use [`list`] for current derived state.
+    ///
+    /// [`list`]: ProjectService::list
+    #[must_use]
+    pub fn list_catalog_only(&self) -> Vec<Project> {
+        let catalog = self
+            .read_catalog_shared()
+            .unwrap_or_else(|| self.catalog.clone());
+        // The in-memory fallback carries the derived state of the last write,
+        // so the defaults are asserted rather than assumed.
+        let mut projects = catalog
+            .projects
+            .into_iter()
+            .map(|project| Project {
+                available: false,
+                git: None,
+                ..project
+            })
             .collect::<Vec<_>>();
         sort_recents(&mut projects);
         projects
@@ -813,8 +843,8 @@ mod tests {
     use crate::{
         catalog::{CATALOG_VERSION, entry::ProjectSource},
         paths::{
-            CATALOG_FILE, CATALOG_LOCK_FILE, CHECKOUT_DIRECTORY, REPOSITORIES_DIRECTORY,
-            WORKTREES_DIRECTORY,
+            CATALOG_FILE, CATALOG_LOCK_FILE, CHECKOUT_DIRECTORY, DATA_DIRECTORY_ENV,
+            REPOSITORIES_DIRECTORY, WORKTREES_DIRECTORY,
         },
     };
 
@@ -854,6 +884,25 @@ mod tests {
                 loop {
                     thread::park();
                 }
+            }
+            "load-env" => {
+                let root = std::env::var_os(PROCESS_PROJECT_ROOT_ENV)
+                    .expect("child project root was not set");
+                // `load`, not `load_from_data_dir`: the point is that the
+                // environment alone redirects the platform data directory.
+                // Asserted before the import, so a regression fails here
+                // instead of writing to the developer's real catalog.
+                let mut overridden = ProjectService::load().unwrap();
+                assert_eq!(overridden.data_dir, service.data_dir);
+                overridden.import_local(root).unwrap();
+            }
+            "default-data-dir" => {
+                // Spawned with the override removed, so this asserts the
+                // unset path still resolves the platform data directory.
+                assert_eq!(
+                    crate::paths::data_directory(),
+                    dirs::data_dir().map(|data_dir| data_dir.join("harkness"))
+                );
             }
             _ => panic!("unknown catalog test child role: {role}"),
         }
@@ -900,6 +949,39 @@ mod tests {
         assert_eq!(reloaded.catalog.version, CATALOG_VERSION);
         assert_eq!(reloaded.list(), service.list());
         assert_eq!(reloaded.list(), vec![imported]);
+    }
+
+    /// Set through `Command::env` on a re-executed child rather than
+    /// `std::env::set_var`, which is unsound in a multithreaded test binary
+    /// under Rust 2024.
+    #[test]
+    fn the_data_directory_environment_override_redirects_load() {
+        let fixture = Fixture::new();
+        let project_root = fixture.directory("environment-override");
+        let mut child = spawn_catalog_child(&fixture.data_dir, "load-env")
+            .env(DATA_DIRECTORY_ENV, &fixture.data_dir)
+            .env(PROCESS_PROJECT_ROOT_ENV, &project_root)
+            .spawn()
+            .unwrap();
+
+        assert!(child.wait().unwrap().success());
+
+        // The child called `load`, so finding its import here is what proves
+        // the platform data directory was never consulted.
+        let projects = fixture.service().list();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].root, fs::canonicalize(&project_root).unwrap());
+    }
+
+    #[test]
+    fn an_unset_data_directory_override_resolves_the_platform_directory() {
+        let fixture = Fixture::new();
+        let mut child = spawn_catalog_child(&fixture.data_dir, "default-data-dir")
+            .env_remove(DATA_DIRECTORY_ENV)
+            .spawn()
+            .unwrap();
+
+        assert!(child.wait().unwrap().success());
     }
 
     #[test]
@@ -1042,6 +1124,29 @@ mod tests {
         assert!(!stored.contains("available"), "{stored}");
         assert!(!stored.contains("git"), "{stored}");
         assert!(stored.contains("last_opened"), "{stored}");
+    }
+
+    #[test]
+    fn a_catalog_only_listing_derives_no_state() {
+        let fixture = Fixture::new();
+        let project_root = fixture.directory("catalog-only");
+        initialize_repository(&project_root);
+        let mut service = fixture.service();
+        let imported = service.import_local(&project_root).unwrap();
+        assert!(imported.available);
+        assert!(imported.git.is_some());
+
+        let listed = service.list_catalog_only();
+
+        // The root exists and is a repository, so defaults here can only mean
+        // the listing never looked at it.
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, imported.id);
+        assert_eq!(listed[0].root, imported.root);
+        assert_eq!(listed[0].display_name, imported.display_name);
+        assert!(!listed[0].available);
+        assert_eq!(listed[0].git, None);
+        assert_eq!(service.list(), vec![imported]);
     }
 
     #[test]
