@@ -1,8 +1,10 @@
 # Harkness
 
-Harkness is an early native AI-harness scaffold. Its Rust core supplies the same
-`Hello World` greeting to an independent command-line program and a KDE Kirigami
-desktop application.
+Harkness is an early native AI-harness scaffold. Its Rust core maintains a local
+project catalog and can safely clone GitHub repositories through the system Git
+executable, preserving the user's existing SSH and HTTPS credential setup. The
+KDE Kirigami application exposes managed import progress, cancellation, and
+confirmed removal.
 
 ## Fedora development setup
 
@@ -44,4 +46,3 @@ cmake --install build
 
 After Plasma refreshes its application database, Harkness appears in the
 Development category. Run `harkness-gui` directly to launch it without the menu.
-
