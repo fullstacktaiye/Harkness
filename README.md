@@ -3,8 +3,8 @@
 Harkness is an early native AI-harness scaffold. Its Rust core maintains a local
 project catalog and can safely clone GitHub repositories through the system Git
 executable, preserving the user's existing SSH and HTTPS credential setup. The
-KDE Kirigami application exposes managed import progress, cancellation, and
-confirmed removal.
+KDE Kirigami application lists every catalogued project with its Git state, and
+exposes managed import progress, cancellation, and confirmed removal.
 
 ## Fedora development setup
 
