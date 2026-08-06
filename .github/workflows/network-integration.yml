@@ -87,3 +87,11 @@ jobs:
           cargo test --locked -p harkness-core
           project::tests::github_remote_forms_deduplicate_through_import
           -- --ignored --exact
+      # Every other synchronizing test uses a local remote, which exercises no
+      # credential helper at all. This is the only coverage proving a real
+      # remote is still reached through the generalized runner.
+      - name: Test GitHub fetch and pull round trip
+        run: >-
+          cargo test --locked -p harkness-core
+          git::sync::tests::github_fetch_and_pull_round_trip
+          -- --ignored --exact

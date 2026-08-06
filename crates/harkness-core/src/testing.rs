@@ -168,6 +168,60 @@ pub(crate) fn initialize_repository(path: &Path) -> Repository {
     repository
 }
 
+/// Creates a bare repository whose HEAD names `main` before it exists.
+///
+/// Git refuses to update the checked-out branch of a non-bare repository, so
+/// every push fixture needs one of these rather than a second working tree.
+/// HEAD is set explicitly because libgit2's default branch is not necessarily
+/// the one [`initialize_repository`] creates, and a bare repository whose HEAD
+/// dangles is one that cannot be cloned.
+pub(crate) fn initialize_bare_repository(path: &Path) -> Repository {
+    let repository = Repository::init_bare(path).unwrap();
+    repository.set_head("refs/heads/main").unwrap();
+    repository
+}
+
+/// Creates a bare remote holding one commit on `main`, and a clone of it.
+///
+/// The clone is made by real `git clone`, which is also what writes
+/// `refs/remotes/origin/HEAD`: the ref the default-branch refusal reads, and
+/// one that adding a remote by hand would never produce.
+pub(crate) fn remote_with_clone(fixture: &Fixture, name: &str) -> (PathBuf, PathBuf) {
+    let source = fixture.directory(&format!("{name}-source"));
+    initialize_repository(&source);
+    let remote = fixture.directory(&format!("{name}-remote.git"));
+    initialize_bare_repository(&remote);
+    git(&source, ["push", "--", remote.to_str().unwrap(), "main"]);
+
+    let clone = fixture.root.path().join(format!("{name}-clone"));
+    git(
+        fixture.root.path(),
+        [
+            "clone",
+            "--",
+            remote.to_str().unwrap(),
+            clone.to_str().unwrap(),
+        ],
+    );
+    (remote, clone)
+}
+
+/// Runs system Git for a fixture, returning its standard output.
+///
+/// Bounded by the local-write timeout even for the network verbs it runs
+/// against local paths, so a fixture that goes wrong fails the test instead of
+/// hanging the suite.
+pub(crate) fn git(
+    working_directory: &Path,
+    arguments: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+) -> String {
+    let output = GitCommand::new("git", working_directory, GitAccess::LocalWrite)
+        .args(arguments)
+        .run(&Cancellation::default())
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 /// Commits every non-ignored file in the worktree onto the current head.
 pub(crate) fn commit_all(repository: &Repository, message: &str) {
     let mut index = repository.index().unwrap();

@@ -10,6 +10,7 @@ pub(crate) mod clone;
 mod lock;
 mod runner;
 pub(crate) mod status;
+mod sync;
 
 use std::{
     io,
@@ -22,6 +23,9 @@ use thiserror::Error;
 pub use lock::RepositoryLock;
 pub use runner::{Cancellation, CloneCancellation, GitAccess, GitCommand, GitOutput};
 pub use status::{DetailedStatus, FileChange, HeadState, StatusEntry};
+pub use sync::{
+    FetchOptions, FetchOutcome, PullOptions, PullOutcome, PullStrategy, PushOptions, PushOutcome,
+};
 
 use crate::catalog::entry::GitStatus;
 
@@ -63,6 +67,53 @@ pub enum GitError {
     /// The path is not the working directory of a Git repository.
     #[error("'{}' is not a Git repository", path.display())]
     NotARepository { path: PathBuf },
+
+    /// The remote rejected the update because it holds commits this repository
+    /// does not have.
+    #[error("git {command} was rejected: the remote has commits this branch does not: {stderr}")]
+    NonFastForward { command: String, stderr: String },
+
+    /// Git could not prove who it was to the remote.
+    ///
+    /// Recognized from Git's own diagnostic, once and here, so that no caller
+    /// has to match on the text of standard error to tell a credential problem
+    /// from a missing repository.
+    #[error("git {command} could not authenticate to the remote: {stderr}")]
+    AuthenticationFailed { command: String, stderr: String },
+
+    /// The branch tracks nothing, so there is no branch to reconcile with or
+    /// publish to.
+    #[error("branch '{branch}' has no upstream branch configured")]
+    NoUpstream { branch: String },
+
+    /// The named remote does not exist, or none could be chosen.
+    #[error("{}", match remote {
+        Some(remote) => format!("remote '{remote}' is not configured for this repository"),
+        None => "no remote was named, and this repository has neither an 'origin' \
+                 nor a single remote to fall back to".to_owned(),
+    })]
+    NoRemote { remote: Option<String> },
+
+    /// Pushing to the remote's default branch was refused.
+    #[error(
+        "refusing to push to '{branch}', the default branch of '{remote}'; \
+         set PushOptions::allow_default_branch to push to it anyway"
+    )]
+    DefaultBranchPush { remote: String, branch: String },
+
+    /// The remote's default branch is unrecorded, so the refusal above cannot
+    /// be evaluated. Deliberately distinct: assuming `main` would let a push
+    /// through on exactly the repositories that cannot be checked.
+    #[error(
+        "the default branch of '{remote}' is not recorded in refs/remotes/{remote}/HEAD; \
+         run 'git remote set-head {remote} --auto', or set PushOptions::allow_default_branch"
+    )]
+    DefaultBranchUnknown { remote: String },
+
+    /// A commit is checked out rather than a branch, and the operation is about
+    /// a branch.
+    #[error("'{}' has no branch checked out: {detail}", path.display())]
+    DetachedHead { path: PathBuf, detail: String },
 
     /// Git metadata could not be inspected for a readable directory.
     #[error("failed to inspect Git metadata for '{}': {source}", path.display())]
@@ -153,6 +204,73 @@ impl GitService {
     /// names rather than for a whole listing.
     pub fn detailed_status(&self, cancellation: &Cancellation) -> Result<DetailedStatus, GitError> {
         status::detailed(&self.git_executable, &self.root, cancellation)
+    }
+
+    /// Updates the remote-tracking refs of one remote.
+    ///
+    /// Blocks until Git exits, so a front end with an event loop must call it
+    /// on a worker thread; `on_progress` receives Git's transfer counters as
+    /// they arrive. The repository lock is held for the whole operation,
+    /// including the inspection either side of it that decides what moved.
+    pub fn fetch(
+        &self,
+        options: &FetchOptions,
+        cancellation: &Cancellation,
+        on_progress: impl FnMut(String),
+    ) -> Result<FetchOutcome, GitError> {
+        let lock = self.lock(cancellation)?;
+        sync::fetch(
+            &self.git_executable,
+            &self.root,
+            &lock,
+            options,
+            cancellation,
+            on_progress,
+        )
+    }
+
+    /// Fetches the checked-out branch's upstream and reconciles the branch with
+    /// it.
+    ///
+    /// Fast-forward only unless [`PullOptions::strategy`] says otherwise, so
+    /// the default can neither rewrite history nor invent a merge commit.
+    pub fn pull(
+        &self,
+        options: &PullOptions,
+        cancellation: &Cancellation,
+        on_progress: impl FnMut(String),
+    ) -> Result<PullOutcome, GitError> {
+        let lock = self.lock(cancellation)?;
+        sync::pull(
+            &self.git_executable,
+            &self.root,
+            &lock,
+            options,
+            cancellation,
+            on_progress,
+        )
+    }
+
+    /// Publishes the checked-out branch to a remote, under the same name.
+    ///
+    /// Both refusals — [`GitError::DefaultBranchPush`] and
+    /// [`GitError::NoUpstream`] — are decided before Git is spawned, so a
+    /// refused push never reaches the remote at all.
+    pub fn push(
+        &self,
+        options: &PushOptions,
+        cancellation: &Cancellation,
+        on_progress: impl FnMut(String),
+    ) -> Result<PushOutcome, GitError> {
+        let lock = self.lock(cancellation)?;
+        sync::push(
+            &self.git_executable,
+            &self.root,
+            &lock,
+            options,
+            cancellation,
+            on_progress,
+        )
     }
 
     /// Takes the exclusive lock covering this repository and its worktrees.
