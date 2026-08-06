@@ -208,7 +208,9 @@ pub enum ProjectError {
     },
 
     /// The remote cannot be normalized into a supported Git identity.
-    #[error("invalid Git repository remote '{remote}'")]
+    #[error(
+        "invalid Git repository remote '{remote}'; expected a GitHub HTTP(S) URL or SSH remote"
+    )]
     InvalidRemote { remote: String },
 
     /// The system Git executable could not be launched.
@@ -272,6 +274,7 @@ impl CloneCancellation {
 pub struct ProjectService {
     data_dir: PathBuf,
     catalog: Catalog,
+    allow_local_remotes: bool,
 }
 
 impl ProjectService {
@@ -290,7 +293,20 @@ impl ProjectService {
     pub fn load_from_data_dir(data_dir: impl Into<PathBuf>) -> Result<Self, ProjectError> {
         let data_dir = data_dir.into();
         let catalog = read_catalog(&data_dir.join(CATALOG_FILE))?;
-        Ok(Self { data_dir, catalog })
+        Ok(Self {
+            data_dir,
+            catalog,
+            allow_local_remotes: false,
+        })
+    }
+
+    /// Loads an isolated service whose managed imports may clone local test
+    /// repositories. Production constructors deliberately never enable this.
+    #[cfg(test)]
+    fn load_for_test(data_dir: impl Into<PathBuf>) -> Result<Self, ProjectError> {
+        let mut service = Self::load_from_data_dir(data_dir)?;
+        service.allow_local_remotes = true;
+        Ok(service)
     }
 
     /// Takes the exclusive catalog lock for one read-modify-write.
@@ -468,7 +484,7 @@ impl ProjectService {
         // Git reads its argument literally, so surrounding whitespace from a
         // pasted URL would reach it as part of the protocol name.
         let remote = remote.trim();
-        let normalized = normalize_remote(remote)?;
+        let normalized = normalize_remote_with_local(remote, self.allow_local_remotes)?;
 
         // An existing, available checkout for this remote is reopened rather
         // than cloned again. This critical section ends before the clone
@@ -761,12 +777,16 @@ fn read_git_output(stderr: impl Read, sender: &mpsc::Sender<String>) -> String {
 
 /// Normalizes a remote into the canonical identity used for deduplication.
 ///
-/// Accepts GitHub HTTPS/SSH/SCP-style remotes and local paths (which become
-/// `file://` URLs). This is the same validation [`ProjectService::import_repository`]
-/// applies, exposed so front ends can validate a form before starting a clone.
+/// Accepts GitHub HTTPS/SSH/SCP-style remotes. This is the same validation
+/// [`ProjectService::import_repository`] applies in production, exposed so
+/// front ends can validate a form before starting a clone.
 ///
 /// [`ProjectService::import_repository`]: crate::ProjectService::import_repository
 pub fn normalize_remote(remote: &str) -> Result<String, ProjectError> {
+    normalize_remote_with_local(remote, false)
+}
+
+fn normalize_remote_with_local(remote: &str, allow_local: bool) -> Result<String, ProjectError> {
     let remote = remote.trim();
     let invalid = || ProjectError::InvalidRemote {
         remote: remote.to_owned(),
@@ -783,7 +803,11 @@ pub fn normalize_remote(remote: &str) -> Result<String, ProjectError> {
         .or_else(|| remote.strip_prefix("ssh://git@github.com/"))
         .or_else(|| remote.strip_prefix("git@github.com:"))
     else {
-        return local(remote.strip_prefix("file://").unwrap_or(remote));
+        return if allow_local {
+            local(remote.strip_prefix("file://").unwrap_or(remote))
+        } else {
+            Err(invalid())
+        };
     };
 
     let path = path.trim_end_matches('/');
@@ -1481,6 +1505,33 @@ mod tests {
     }
 
     #[test]
+    fn production_managed_import_rejects_local_remotes() {
+        let fixture = Fixture::new();
+        let remote = fixture.directory("local-remote");
+        initialize_repository(&remote);
+        let mut service = ProjectService::load_from_data_dir(&fixture.data_dir).unwrap();
+
+        let error = service
+            .import_repository(
+                remote.to_str().unwrap(),
+                &CloneCancellation::default(),
+                |_| {},
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, ProjectError::InvalidRemote { .. }));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "invalid Git repository remote '{}'; expected a GitHub HTTP(S) URL or SSH remote",
+                remote.display()
+            )
+        );
+        assert!(service.list().is_empty());
+        assert!(!fixture.data_dir.join(REPOSITORIES_DIRECTORY).exists());
+    }
+
+    #[test]
     fn failed_and_cancelled_clones_leave_no_catalog_or_destination() {
         let fixture = Fixture::new();
         let invalid_remote = fixture.directory("not-a-repository");
@@ -1787,7 +1838,7 @@ mod tests {
         }
 
         fn service(&self) -> ProjectService {
-            ProjectService::load_from_data_dir(&self.data_dir).unwrap()
+            ProjectService::load_for_test(&self.data_dir).unwrap()
         }
     }
 }
