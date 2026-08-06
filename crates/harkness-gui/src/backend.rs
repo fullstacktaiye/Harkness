@@ -447,6 +447,13 @@ mod tests {
             Some(harkness_core::GitStatus {
                 branch: Some("main".to_owned()),
                 dirty: true,
+                upstream: Some(harkness_core::UpstreamStatus {
+                    name: "origin/main".to_owned(),
+                    ahead: 1,
+                    behind: 2,
+                }),
+                staged: 1,
+                unstaged: 0,
             }),
         ));
 
@@ -489,6 +496,9 @@ mod tests {
             Some(harkness_core::GitStatus {
                 branch: None,
                 dirty: false,
+                upstream: None,
+                staged: 0,
+                unstaged: 0,
             }),
         ));
         let plain = ProjectRow::from(project(harkness_core::ProjectSource::Local, None, None));

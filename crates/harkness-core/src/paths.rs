@@ -11,6 +11,7 @@ pub(crate) const DATA_DIRECTORY_ENV: &str = "HARKNESS_DATA_DIR";
 pub(crate) const CATALOG_FILE: &str = "projects.json";
 pub(crate) const CATALOG_LOCK_FILE: &str = "projects.lock";
 pub(crate) const WORKTREES_DIRECTORY: &str = "worktrees";
+pub(crate) const LOCKS_DIRECTORY: &str = "locks";
 pub(crate) const REPOSITORIES_DIRECTORY: &str = "repositories";
 pub(crate) const CHECKOUT_DIRECTORY: &str = "checkout";
 
