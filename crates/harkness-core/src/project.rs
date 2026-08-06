@@ -1,7 +1,15 @@
 use std::{
     fs,
-    io::{self, Write},
+    io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
+    time::Duration,
 };
 
 use git2::{ErrorCode, Repository, StatusOptions};
@@ -14,6 +22,8 @@ use uuid::Uuid;
 const CATALOG_VERSION: u32 = 1;
 const CATALOG_FILE: &str = "projects.json";
 const WORKTREES_DIRECTORY: &str = "worktrees";
+const REPOSITORIES_DIRECTORY: &str = "repositories";
+const CHECKOUT_DIRECTORY: &str = "checkout";
 
 /// A stable identifier for a project catalog entry.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -40,12 +50,22 @@ impl std::fmt::Display for ProjectId {
     }
 }
 
+impl std::str::FromStr for ProjectId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(value).map(Self)
+    }
+}
+
 /// Describes how a project entered the catalog.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectSource {
     /// A directory that already exists on the local machine.
     Local,
+    /// A clone owned by Harkness and stored below its repositories directory.
+    ManagedRepository,
 }
 
 /// Git information collected from a project directory.
@@ -68,6 +88,9 @@ pub struct Project {
     pub root: PathBuf,
     /// How this project entered the catalog.
     pub source: ProjectSource,
+    /// Canonical GitHub remote identity for managed repositories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
     /// The last time the project was imported or successfully reopened.
     pub last_opened: OffsetDateTime,
     /// Whether the root currently exists and can be read.
@@ -168,6 +191,85 @@ pub enum ProjectError {
         #[source]
         source: io::Error,
     },
+
+    /// The remote cannot be normalized into a supported Git identity.
+    #[error("invalid Git repository remote '{remote}'")]
+    InvalidRemote { remote: String },
+
+    /// The system Git executable could not be launched.
+    #[error("failed to start system Git: {source}")]
+    GitLaunch {
+        #[source]
+        source: io::Error,
+    },
+
+    /// Git could not clone the repository. Its diagnostic output is retained.
+    #[error("Git clone failed: {stderr}")]
+    CloneFailed { stderr: String },
+
+    /// The repository import was cancelled.
+    #[error("repository clone was cancelled")]
+    CloneCancelled,
+
+    /// A project is not a safely removable Harkness-managed clone.
+    #[error("refusing to delete project {id} at '{}': {reason}", path.display())]
+    UnsafeManagedRemoval {
+        id: ProjectId,
+        path: PathBuf,
+        reason: String,
+    },
+
+    /// A managed checkout could not be deleted.
+    #[error("failed to delete managed checkout '{}': {source}", path.display())]
+    ManagedRemoval {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+}
+
+/// Cooperative cancellation token for a repository clone.
+#[derive(Clone, Debug, Default)]
+pub struct CloneCancellation(Arc<AtomicBool>);
+
+impl CloneCancellation {
+    /// Requests cancellation. The Git child is killed and its partial clone is removed.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// Progress emitted from Git's standard-error stream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloneProgress {
+    pub message: String,
+}
+
+/// A repository clone running on a worker thread.
+pub struct CloneTask {
+    cancellation: CloneCancellation,
+    worker: thread::JoinHandle<Result<Project, ProjectError>>,
+}
+
+impl CloneTask {
+    /// Returns a token that can cancel this task from another thread.
+    #[must_use]
+    pub fn cancellation(&self) -> CloneCancellation {
+        self.cancellation.clone()
+    }
+
+    /// Waits for the worker and returns its result.
+    pub fn join(self) -> Result<Project, ProjectError> {
+        self.worker.join().unwrap_or_else(|_| {
+            Err(ProjectError::CloneFailed {
+                stderr: "repository clone worker panicked".to_owned(),
+            })
+        })
+    }
 }
 
 /// Loads and updates the durable local project catalog.
@@ -238,6 +340,29 @@ impl ProjectService {
         Ok(Self { data_dir, catalog })
     }
 
+    /// Starts an import without blocking the calling thread.
+    ///
+    /// The worker loads and updates the catalog at `data_dir`; callers should
+    /// reload any older [`ProjectService`] snapshot after the task completes.
+    pub fn import_repository_async(
+        data_dir: impl Into<PathBuf>,
+        remote: impl Into<String>,
+        on_progress: impl FnMut(CloneProgress) + Send + 'static,
+    ) -> CloneTask {
+        let data_dir = data_dir.into();
+        let remote = remote.into();
+        let cancellation = CloneCancellation::default();
+        let worker_cancellation = cancellation.clone();
+        let worker = thread::spawn(move || {
+            let mut service = Self::load_from_data_dir(data_dir)?;
+            service.import_repository(&remote, &worker_cancellation, on_progress)
+        });
+        CloneTask {
+            cancellation,
+            worker,
+        }
+    }
+
     /// Lists projects by most-recently-opened order with current availability
     /// and Git metadata.
     ///
@@ -277,6 +402,7 @@ impl ProjectService {
                 display_name: display_name(&canonical_root),
                 root: canonical_root.clone(),
                 source: ProjectSource::Local,
+                remote: None,
                 available: true,
                 last_opened: OffsetDateTime::now_utc(),
                 git: inspect_git(&canonical_root)?,
@@ -333,6 +459,137 @@ impl ProjectService {
         Ok(removed)
     }
 
+    /// Clones a GitHub repository with the system Git executable.
+    ///
+    /// This method waits for Git, so GUI callers should invoke it on a worker
+    /// thread. Progress is delivered as Git writes lines to standard error,
+    /// and cancellation is cooperative through `cancellation`.
+    pub fn import_repository(
+        &mut self,
+        remote: &str,
+        cancellation: &CloneCancellation,
+        mut on_progress: impl FnMut(CloneProgress),
+    ) -> Result<Project, ProjectError> {
+        let normalized = normalize_remote(remote)?;
+        let mut candidate = self.catalog.clone();
+        if let Some(project) = candidate
+            .projects
+            .iter_mut()
+            .find(|project| project.remote.as_deref() == Some(&normalized))
+        {
+            project.last_opened = OffsetDateTime::now_utc();
+            let reopened = refresh_project(project.clone());
+            *project = reopened.clone();
+            sort_recents(&mut candidate.projects);
+            self.persist(&candidate)?;
+            self.catalog = candidate;
+            return Ok(reopened);
+        }
+
+        let id = ProjectId::new();
+        let managed_directory = self
+            .data_dir
+            .join(REPOSITORIES_DIRECTORY)
+            .join(id.to_string());
+        let checkout = managed_directory.join(CHECKOUT_DIRECTORY);
+        fs::create_dir_all(&managed_directory).map_err(|source| ProjectError::Persistence {
+            path: managed_directory.clone(),
+            source,
+        })?;
+
+        let clone_result = run_git_clone(remote, &checkout, cancellation, &mut on_progress);
+        if let Err(error) = clone_result {
+            let _ = fs::remove_dir_all(&managed_directory);
+            return Err(error);
+        }
+
+        let canonical_root = match validate_local_directory(&checkout) {
+            Ok(root) => root,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&managed_directory);
+                return Err(error);
+            }
+        };
+        let project = Project {
+            id,
+            display_name: repository_name(&normalized),
+            root: canonical_root.clone(),
+            source: ProjectSource::ManagedRepository,
+            remote: Some(normalized),
+            last_opened: OffsetDateTime::now_utc(),
+            available: true,
+            git: match inspect_git(&canonical_root) {
+                Ok(git) => git,
+                Err(error) => {
+                    let _ = fs::remove_dir_all(&managed_directory);
+                    return Err(error);
+                }
+            },
+        };
+        candidate.projects.push(project.clone());
+        sort_recents(&mut candidate.projects);
+        if let Err(error) = self.persist(&candidate) {
+            let _ = fs::remove_dir_all(&managed_directory);
+            return Err(error);
+        }
+        self.catalog = candidate;
+        Ok(project)
+    }
+
+    /// Deletes a checkout only after proving it is the managed path for `id`.
+    ///
+    /// Front ends must obtain explicit confirmation naming [`Project::root`]
+    /// before calling this destructive operation.
+    pub fn remove_managed(&mut self, id: ProjectId) -> Result<Project, ProjectError> {
+        let project = self
+            .catalog
+            .projects
+            .iter()
+            .find(|project| project.id == id)
+            .cloned()
+            .ok_or(ProjectError::ProjectNotFound(id))?;
+        let managed_directory = self
+            .data_dir
+            .join(REPOSITORIES_DIRECTORY)
+            .join(id.to_string());
+        let expected_checkout = managed_directory.join(CHECKOUT_DIRECTORY);
+
+        if project.source != ProjectSource::ManagedRepository || project.remote.is_none() {
+            return Err(unsafe_removal(
+                &project,
+                "catalog entry is not a managed clone",
+            ));
+        }
+        if project.root != expected_checkout {
+            return Err(unsafe_removal(
+                &project,
+                "catalog path is not the expected managed checkout",
+            ));
+        }
+        let repositories_root = fs::canonicalize(self.data_dir.join(REPOSITORIES_DIRECTORY))
+            .map_err(|_| unsafe_removal(&project, "managed repositories root is unavailable"))?;
+        let canonical_checkout = fs::canonicalize(&project.root)
+            .map_err(|_| unsafe_removal(&project, "checkout is unavailable"))?;
+        if !canonical_checkout.starts_with(&repositories_root)
+            || canonical_checkout != expected_checkout
+        {
+            return Err(unsafe_removal(
+                &project,
+                "checkout resolves outside managed storage or through a symlink",
+            ));
+        }
+
+        fs::remove_dir_all(&managed_directory).map_err(|source| ProjectError::ManagedRemoval {
+            path: managed_directory,
+            source,
+        })?;
+        let mut candidate = self.catalog.clone();
+        candidate.projects.retain(|entry| entry.id != id);
+        self.persist(&candidate)?;
+        self.catalog = candidate;
+        Ok(project)
+    }
+
     /// Returns the reserved future worktree location without creating it.
     #[must_use]
     pub fn worktree_path(&self, id: ProjectId) -> PathBuf {
@@ -348,6 +605,130 @@ impl ProjectService {
             }
         })
     }
+}
+
+fn unsafe_removal(project: &Project, reason: impl Into<String>) -> ProjectError {
+    ProjectError::UnsafeManagedRemoval {
+        id: project.id,
+        path: project.root.clone(),
+        reason: reason.into(),
+    }
+}
+
+fn run_git_clone(
+    remote: &str,
+    checkout: &Path,
+    cancellation: &CloneCancellation,
+    on_progress: &mut impl FnMut(CloneProgress),
+) -> Result<(), ProjectError> {
+    let mut child = Command::new("git")
+        .args(["clone", "--progress", "--", remote])
+        .arg(checkout)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| ProjectError::GitLaunch { source })?;
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (sender, receiver) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut captured = String::new();
+        for line in BufReader::new(stderr).lines() {
+            match line {
+                Ok(line) => {
+                    captured.push_str(&line);
+                    captured.push('\n');
+                    let _ = sender.send(line);
+                }
+                Err(error) => {
+                    captured.push_str(&format!("failed to read Git output: {error}\n"));
+                    break;
+                }
+            }
+        }
+        captured
+    });
+
+    loop {
+        while let Ok(message) = receiver.try_recv() {
+            on_progress(CloneProgress { message });
+        }
+        if cancellation.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            return Err(ProjectError::CloneCancelled);
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|source| ProjectError::GitLaunch { source })?
+        {
+            let stderr = reader
+                .join()
+                .unwrap_or_else(|_| "Git output reader failed".to_owned());
+            while let Ok(message) = receiver.try_recv() {
+                on_progress(CloneProgress { message });
+            }
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(ProjectError::CloneFailed {
+                    stderr: stderr.trim().to_owned(),
+                })
+            };
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn normalize_remote(remote: &str) -> Result<String, ProjectError> {
+    let remote = remote.trim();
+    let path = if let Some(path) = remote.strip_prefix("https://github.com/") {
+        path
+    } else if let Some(path) = remote.strip_prefix("http://github.com/") {
+        path
+    } else if let Some(path) = remote.strip_prefix("ssh://git@github.com/") {
+        path
+    } else if let Some(path) = remote.strip_prefix("git@github.com:") {
+        path
+    } else if let Some(path) = remote.strip_prefix("file://") {
+        return fs::canonicalize(path)
+            .map(|path| format!("file://{}", path.display()))
+            .map_err(|_| ProjectError::InvalidRemote {
+                remote: remote.to_owned(),
+            });
+    } else if let Ok(path) = fs::canonicalize(remote) {
+        return Ok(format!("file://{}", path.display()));
+    } else {
+        return Err(ProjectError::InvalidRemote {
+            remote: remote.to_owned(),
+        });
+    };
+    let path = path
+        .trim_end_matches('/')
+        .strip_suffix(".git")
+        .unwrap_or(path.trim_end_matches('/'));
+    let mut parts = path.split('/');
+    let owner = parts.next().filter(|part| !part.is_empty());
+    let repository = parts.next().filter(|part| !part.is_empty());
+    if owner.is_none() || repository.is_none() || parts.next().is_some() {
+        return Err(ProjectError::InvalidRemote {
+            remote: remote.to_owned(),
+        });
+    }
+    Ok(format!(
+        "github.com/{}/{}",
+        owner.unwrap().to_ascii_lowercase(),
+        repository.unwrap().to_ascii_lowercase()
+    ))
+}
+
+fn repository_name(normalized_remote: &str) -> String {
+    normalized_remote
+        .rsplit('/')
+        .next()
+        .unwrap_or(normalized_remote)
+        .to_owned()
 }
 
 fn persist_catalog(data_dir: &Path, catalog_path: &Path, catalog: &Catalog) -> io::Result<()> {
@@ -507,8 +888,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        CATALOG_FILE, CATALOG_VERSION, ProjectError, ProjectService, ProjectSource,
-        WORKTREES_DIRECTORY,
+        CATALOG_FILE, CATALOG_VERSION, CHECKOUT_DIRECTORY, CloneCancellation, ProjectError,
+        ProjectService, ProjectSource, REPOSITORIES_DIRECTORY, WORKTREES_DIRECTORY,
     };
 
     /// Coarse enough for the ~15ms system clock granularity on Windows.
@@ -855,6 +1236,183 @@ mod tests {
             .join(imported.id.to_string());
         assert_eq!(service.worktree_path(imported.id), expected);
         assert!(!expected.exists());
+    }
+
+    #[test]
+    fn managed_repository_clone_uses_default_branch_and_deduplicates_remote() {
+        let fixture = Fixture::new();
+        let remote = fixture.directory("remote");
+        initialize_repository(&remote);
+        let mut service = fixture.service();
+
+        let imported = service
+            .import_repository(
+                remote.to_str().unwrap(),
+                &CloneCancellation::default(),
+                |_| {},
+            )
+            .unwrap();
+        let duplicate = service
+            .import_repository(
+                &format!("file://{}", remote.display()),
+                &CloneCancellation::default(),
+                |_| {},
+            )
+            .unwrap();
+
+        assert_eq!(imported.id, duplicate.id);
+        assert_eq!(service.list().len(), 1);
+        assert_eq!(imported.source, ProjectSource::ManagedRepository);
+        assert!(imported.remote.as_deref().unwrap().starts_with("file://"));
+        assert_eq!(
+            imported.git.as_ref().unwrap().branch.as_deref(),
+            Some("main")
+        );
+        assert_eq!(
+            imported.root,
+            fixture
+                .data_dir
+                .join(REPOSITORIES_DIRECTORY)
+                .join(imported.id.to_string())
+                .join(CHECKOUT_DIRECTORY)
+        );
+    }
+
+    #[test]
+    fn github_https_and_ssh_remotes_share_a_normalized_identity() {
+        let expected = "github.com/example/project";
+        assert_eq!(
+            super::normalize_remote("https://github.com/Example/Project.git").unwrap(),
+            expected
+        );
+        assert_eq!(
+            super::normalize_remote("git@github.com:example/project.git").unwrap(),
+            expected
+        );
+        assert_eq!(
+            super::normalize_remote("ssh://git@github.com/EXAMPLE/PROJECT/").unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn failed_and_cancelled_clones_leave_no_catalog_or_destination() {
+        let fixture = Fixture::new();
+        let invalid_remote = fixture.directory("not-a-repository");
+        let mut service = fixture.service();
+        let error = service
+            .import_repository(
+                invalid_remote.to_str().unwrap(),
+                &CloneCancellation::default(),
+                |_| {},
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProjectError::CloneFailed { ref stderr } if !stderr.is_empty()
+        ));
+        assert!(service.list().is_empty());
+
+        let remote = fixture.directory("cancel-remote");
+        initialize_repository(&remote);
+        let cancellation = CloneCancellation::default();
+        cancellation.cancel();
+        assert!(matches!(
+            service.import_repository(remote.to_str().unwrap(), &cancellation, |_| {}),
+            Err(ProjectError::CloneCancelled)
+        ));
+        assert!(service.list().is_empty());
+        let repositories = fixture.data_dir.join(REPOSITORIES_DIRECTORY);
+        assert!(
+            !repositories.exists() || fs::read_dir(repositories).unwrap().next().is_none(),
+            "partial managed repository directory remained"
+        );
+    }
+
+    #[test]
+    fn managed_removal_deletes_checkout_and_catalog_entry() {
+        let fixture = Fixture::new();
+        let remote = fixture.directory("remove-remote");
+        initialize_repository(&remote);
+        let mut service = fixture.service();
+        let project = service
+            .import_repository(
+                remote.to_str().unwrap(),
+                &CloneCancellation::default(),
+                |_| {},
+            )
+            .unwrap();
+
+        let removed = service.remove_managed(project.id).unwrap();
+
+        assert_eq!(removed.id, project.id);
+        assert!(!project.root.exists());
+        assert!(service.list().is_empty());
+    }
+
+    #[test]
+    fn managed_removal_rejects_local_and_unknown_paths() {
+        let fixture = Fixture::new();
+        let local = fixture.directory("local-project");
+        let mut service = fixture.service();
+        let project = service.import_local(&local).unwrap();
+        assert!(matches!(
+            service.remove_managed(project.id),
+            Err(ProjectError::UnsafeManagedRemoval { .. })
+        ));
+        assert!(local.exists());
+
+        let remote = fixture.directory("guard-remote");
+        initialize_repository(&remote);
+        let managed = service
+            .import_repository(
+                remote.to_str().unwrap(),
+                &CloneCancellation::default(),
+                |_| {},
+            )
+            .unwrap();
+        let outside = fixture.directory("outside");
+        service
+            .catalog
+            .projects
+            .iter_mut()
+            .find(|project| project.id == managed.id)
+            .unwrap()
+            .root = outside.clone();
+        assert!(matches!(
+            service.remove_managed(managed.id),
+            Err(ProjectError::UnsafeManagedRemoval { .. })
+        ));
+        assert!(outside.exists());
+        assert!(managed.root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_removal_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        let remote = fixture.directory("symlink-remote");
+        initialize_repository(&remote);
+        let mut service = fixture.service();
+        let managed = service
+            .import_repository(
+                remote.to_str().unwrap(),
+                &CloneCancellation::default(),
+                |_| {},
+            )
+            .unwrap();
+        let outside = fixture.directory("symlink-outside");
+        let managed_directory = managed.root.parent().unwrap();
+        fs::remove_dir_all(&managed.root).unwrap();
+        symlink(&outside, managed_directory.join(CHECKOUT_DIRECTORY)).unwrap();
+
+        assert!(matches!(
+            service.remove_managed(managed.id),
+            Err(ProjectError::UnsafeManagedRemoval { .. })
+        ));
+        assert!(outside.exists());
     }
 
     fn initialize_repository(path: &Path) -> Repository {
