@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Harkness
+Comment=AI harness
+Exec=harkness-gui
+Icon=applications-development
+Terminal=false
+Categories=Development;
+StartupNotify=true
+StartupWMClass=io.github.fullstacktaiye.harkness
+
