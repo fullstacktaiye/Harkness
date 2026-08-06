@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     fs::{self, File},
-    io::{self, BufReader, Read, Write},
+    io::{self, BufReader, Read},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -14,126 +14,26 @@ use std::{
 };
 
 use git2::{ErrorCode, Repository, StatusOptions};
-use serde::{Deserialize, Serialize};
-use tempfile::NamedTempFile;
 use thiserror::Error;
 use time::OffsetDateTime;
-use uuid::Uuid;
 
-const CATALOG_VERSION: u32 = 1;
-const CATALOG_FILE: &str = "projects.json";
-const CATALOG_LOCK_FILE: &str = "projects.lock";
-const WORKTREES_DIRECTORY: &str = "worktrees";
-const REPOSITORIES_DIRECTORY: &str = "repositories";
-const CHECKOUT_DIRECTORY: &str = "checkout";
+use crate::{
+    catalog::{
+        self, Catalog,
+        entry::{GitStatus, Project, ProjectId, ProjectSource},
+        lock,
+    },
+    paths::{
+        CATALOG_FILE, CHECKOUT_DIRECTORY, REPOSITORIES_DIRECTORY, UnreservedPath,
+        WORKTREES_DIRECTORY, canonical_reserved_root,
+    },
+    remote::{normalize_remote_with_local, repository_name},
+};
 
 /// Git repeats a progress phase on every update, so retaining the whole stream
 /// would put megabytes of overwritten counters into a failure message. The tail
 /// is what matters: Git prints its diagnosis last.
 const RETAINED_GIT_OUTPUT_SEGMENTS: usize = 20;
-
-/// A stable identifier for a project catalog entry.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
-pub struct ProjectId(Uuid);
-
-impl ProjectId {
-    /// Generates a new random project identifier.
-    #[must_use]
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-}
-
-impl Default for ProjectId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::fmt::Display for ProjectId {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-impl std::str::FromStr for ProjectId {
-    type Err = uuid::Error;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Uuid::parse_str(value).map(Self)
-    }
-}
-
-/// Describes how a project entered the catalog.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProjectSource {
-    /// A directory that already exists on the local machine.
-    Local,
-    /// A clone owned by Harkness and stored below its repositories directory.
-    ManagedRepository,
-}
-
-/// Git information collected from a project directory.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct GitStatus {
-    /// The checked-out branch, or `None` for a detached head.
-    pub branch: Option<String>,
-    /// Whether the worktree contains tracked or untracked changes.
-    pub dirty: bool,
-}
-
-/// A durable project catalog entry.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct Project {
-    /// Stable catalog identifier.
-    pub id: ProjectId,
-    /// Human-readable name derived from the imported directory.
-    pub display_name: String,
-    /// Canonical path to the project directory.
-    pub root: PathBuf,
-    /// How this project entered the catalog.
-    pub source: ProjectSource,
-    /// Canonical GitHub remote identity for managed repositories.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote: Option<String>,
-    /// The last time the project was imported or successfully reopened.
-    pub last_opened: OffsetDateTime,
-    /// Whether the root currently exists and can be read.
-    ///
-    /// Derived from the filesystem on every read, so it is deliberately not
-    /// persisted; a stored copy would only ever be stale.
-    #[serde(skip)]
-    pub available: bool,
-    /// Git metadata when the root is the working directory of a Git
-    /// repository.
-    ///
-    /// Derived alongside [`Project::available`], and likewise not persisted.
-    #[serde(skip)]
-    pub git: Option<GitStatus>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct Catalog {
-    version: u32,
-    projects: Vec<Project>,
-}
-
-/// The forward-compatible prefix of every catalog file.
-#[derive(Deserialize)]
-struct CatalogVersion {
-    version: u32,
-}
-
-impl Default for Catalog {
-    fn default() -> Self {
-        Self {
-            version: CATALOG_VERSION,
-            projects: Vec::new(),
-        }
-    }
-}
 
 /// Actionable failures returned by [`ProjectService`].
 #[derive(Debug, Error)]
@@ -293,7 +193,7 @@ impl ProjectService {
     /// catalog file is always named `projects.json` within `data_dir`.
     pub fn load_from_data_dir(data_dir: impl Into<PathBuf>) -> Result<Self, ProjectError> {
         let data_dir = data_dir.into();
-        let catalog = read_catalog(&data_dir.join(CATALOG_FILE))?;
+        let catalog = catalog::read_catalog(&data_dir.join(CATALOG_FILE))?;
         Ok(Self {
             data_dir,
             catalog,
@@ -312,56 +212,18 @@ impl ProjectService {
     }
 
     /// Takes the exclusive catalog lock for one read-modify-write.
-    ///
-    /// The lock file is created once and never replaced, because atomic
-    /// persistence swaps `projects.json` for a new inode and a lock held
-    /// against the old one would exclude nobody. Dropping the returned handle
-    /// releases the lock, as does the kernel if the process dies.
-    ///
-    /// Advisory locks are unreliable on NFS. That is acceptable for a local
-    /// user data directory, which is the only location Harkness supports.
     fn lock_exclusive(&self) -> Result<File, ProjectError> {
-        fs::create_dir_all(&self.data_dir).map_err(|source| ProjectError::CatalogLock {
-            path: self.data_dir.clone(),
-            source,
-        })?;
-        let lock_path = self.data_dir.join(CATALOG_LOCK_FILE);
-        let lock = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|source| ProjectError::CatalogLock {
-                path: lock_path.clone(),
-                source,
-            })?;
-        // Blocking, not `try_lock`: these critical sections are one small read
-        // plus one write, and a caller has nothing useful to do with a "busy"
-        // error except retry.
-        lock.lock().map_err(|source| ProjectError::CatalogLock {
-            path: lock_path,
-            source,
-        })?;
-        Ok(lock)
+        lock::lock_exclusive(&self.data_dir)
     }
 
     /// Reads the catalog fresh from disk. Call only while holding the lock.
     fn read_catalog(&self) -> Result<Catalog, ProjectError> {
-        read_catalog(&self.data_dir.join(CATALOG_FILE))
+        catalog::read_catalog(&self.data_dir.join(CATALOG_FILE))
     }
 
     /// Reads the catalog under a shared lock, or `None` if it cannot be read.
-    ///
-    /// Reads never create the data directory: a catalog that has never been
-    /// written has no lock file, and nothing to race with either.
     fn read_catalog_shared(&self) -> Option<Catalog> {
-        let lock = File::options()
-            .read(true)
-            .open(self.data_dir.join(CATALOG_LOCK_FILE))
-            .ok()?;
-        lock.lock_shared().ok()?;
-        read_catalog(&self.data_dir.join(CATALOG_FILE)).ok()
+        lock::read_catalog_shared(&self.data_dir)
     }
 
     /// Lists projects by most-recently-opened order with current availability
@@ -626,22 +488,26 @@ impl ProjectService {
             ));
         }
 
-        // Both sides must be canonical. `Project::root` was canonicalized at
-        // import, so a symlink anywhere above the data directory would make a
-        // literal comparison against `data_dir` fail for every managed clone.
-        // Equality also subsumes a containment check: a checkout that resolves
-        // outside managed storage, or through a symlink, cannot match.
-        let repositories_root = fs::canonicalize(self.data_dir.join(REPOSITORIES_DIRECTORY))
-            .map_err(|_| unsafe_removal(&project, "managed repositories root is unavailable"))?;
-        let managed_directory = repositories_root.join(id.to_string());
-        let canonical_checkout = fs::canonicalize(&project.root)
-            .map_err(|_| unsafe_removal(&project, "checkout is unavailable"))?;
-        if canonical_checkout != managed_directory.join(CHECKOUT_DIRECTORY) {
-            return Err(unsafe_removal(
+        let repositories_root = canonical_reserved_root(
+            &self.data_dir.join(REPOSITORIES_DIRECTORY),
+            &PathBuf::from(id.to_string()).join(CHECKOUT_DIRECTORY),
+            &project.root,
+        )
+        .map_err(|unreserved| {
+            unsafe_removal(
                 &project,
-                "checkout is not the managed path reserved for this project",
-            ));
-        }
+                match unreserved {
+                    UnreservedPath::StorageRootUnavailable => {
+                        "managed repositories root is unavailable"
+                    }
+                    UnreservedPath::CandidateUnavailable => "checkout is unavailable",
+                    UnreservedPath::Mismatch => {
+                        "checkout is not the managed path reserved for this project"
+                    }
+                },
+            )
+        })?;
+        let managed_directory = repositories_root.join(id.to_string());
 
         fs::remove_dir_all(&managed_directory).map_err(|source| ProjectError::ManagedRemoval {
             path: managed_directory,
@@ -661,49 +527,12 @@ impl ProjectService {
 
     fn persist(&self, catalog: &Catalog) -> Result<(), ProjectError> {
         let catalog_path = self.data_dir.join(CATALOG_FILE);
-        persist_catalog(&self.data_dir, &catalog_path, catalog).map_err(|source| {
+        catalog::persist_catalog(&self.data_dir, &catalog_path, catalog).map_err(|source| {
             ProjectError::Persistence {
                 path: catalog_path,
                 source,
             }
         })
-    }
-}
-
-/// Reads a catalog file, treating a missing file as an empty catalog.
-fn read_catalog(catalog_path: &Path) -> Result<Catalog, ProjectError> {
-    match catalog_path.try_exists() {
-        Ok(false) => Ok(Catalog::default()),
-        Ok(true) => {
-            let bytes = fs::read(catalog_path).map_err(|source| ProjectError::CatalogRead {
-                path: catalog_path.to_path_buf(),
-                source,
-            })?;
-            // Read the version before the body: a future schema would fail to
-            // deserialize as a v1 catalog, and reporting that as "malformed"
-            // would hide the one cause the user can act on.
-            let probe: CatalogVersion = serde_json::from_slice(&bytes).map_err(|source| {
-                ProjectError::MalformedCatalog {
-                    path: catalog_path.to_path_buf(),
-                    source,
-                }
-            })?;
-            if probe.version != CATALOG_VERSION {
-                return Err(ProjectError::UnsupportedCatalogVersion {
-                    found: probe.version,
-                    expected: CATALOG_VERSION,
-                });
-            }
-
-            serde_json::from_slice(&bytes).map_err(|source| ProjectError::MalformedCatalog {
-                path: catalog_path.to_path_buf(),
-                source,
-            })
-        }
-        Err(source) => Err(ProjectError::CatalogRead {
-            path: catalog_path.to_path_buf(),
-            source,
-        }),
     }
 }
 
@@ -839,87 +668,6 @@ fn read_git_output(stderr: impl Read, sender: &mpsc::Sender<String>) -> String {
     }
     end_segment(&mut segment, &mut retained);
     Vec::from(retained).join("\n")
-}
-
-/// Normalizes a remote into the canonical identity used for deduplication.
-///
-/// Accepts GitHub HTTPS/SSH/SCP-style remotes. This is the same validation
-/// [`ProjectService::import_repository`] applies in production, exposed so
-/// front ends can validate a form before starting a clone.
-///
-/// [`ProjectService::import_repository`]: crate::ProjectService::import_repository
-pub fn normalize_remote(remote: &str) -> Result<String, ProjectError> {
-    normalize_remote_with_local(remote, false)
-}
-
-fn normalize_remote_with_local(remote: &str, allow_local: bool) -> Result<String, ProjectError> {
-    let remote = remote.trim();
-    let invalid = || ProjectError::InvalidRemote {
-        remote: remote.to_owned(),
-    };
-    let local = |path: &str| {
-        fs::canonicalize(path)
-            .map(|path| format!("file://{}", path.display()))
-            .map_err(|_| invalid())
-    };
-
-    let Some(path) = remote
-        .strip_prefix("https://github.com/")
-        .or_else(|| remote.strip_prefix("http://github.com/"))
-        .or_else(|| remote.strip_prefix("ssh://git@github.com/"))
-        .or_else(|| remote.strip_prefix("git@github.com:"))
-    else {
-        return if allow_local {
-            local(remote.strip_prefix("file://").unwrap_or(remote))
-        } else {
-            Err(invalid())
-        };
-    };
-
-    let path = path.trim_end_matches('/');
-    let path = path.strip_suffix(".git").unwrap_or(path);
-    let mut parts = path.split('/');
-    let (Some(owner), Some(repository)) = (
-        parts.next().filter(|part| !part.is_empty()),
-        parts.next().filter(|part| !part.is_empty()),
-    ) else {
-        return Err(invalid());
-    };
-    if parts.next().is_some() {
-        return Err(invalid());
-    }
-    Ok(format!(
-        "github.com/{}/{}",
-        owner.to_ascii_lowercase(),
-        repository.to_ascii_lowercase()
-    ))
-}
-
-fn repository_name(normalized_remote: &str) -> String {
-    normalized_remote
-        .rsplit('/')
-        .next()
-        .unwrap_or(normalized_remote)
-        .to_owned()
-}
-
-fn persist_catalog(data_dir: &Path, catalog_path: &Path, catalog: &Catalog) -> io::Result<()> {
-    fs::create_dir_all(data_dir)?;
-    let mut temporary = NamedTempFile::new_in(data_dir)?;
-    serde_json::to_writer_pretty(&mut temporary, catalog).map_err(io::Error::other)?;
-    temporary.write_all(b"\n")?;
-    temporary.as_file_mut().sync_all()?;
-    temporary
-        .persist(catalog_path)
-        .map_err(|error| error.error)?;
-
-    // The file's contents are already durable; what the rename still needs is a
-    // sync of the directory holding the new entry. Windows has no equivalent
-    // handle to sync, so this is a Unix-only step.
-    #[cfg(unix)]
-    fs::File::open(data_dir)?.sync_all()?;
-
-    Ok(())
 }
 
 fn validate_local_directory(path: &Path) -> Result<PathBuf, ProjectError> {
@@ -1061,9 +809,13 @@ mod tests {
     use git2::{IndexAddOption, Repository, Signature, Time};
     use tempfile::TempDir;
 
-    use super::{
-        CATALOG_FILE, CATALOG_LOCK_FILE, CATALOG_VERSION, CHECKOUT_DIRECTORY, CloneCancellation,
-        ProjectError, ProjectService, ProjectSource, REPOSITORIES_DIRECTORY, WORKTREES_DIRECTORY,
+    use super::{CloneCancellation, ProjectError, ProjectService};
+    use crate::{
+        catalog::{CATALOG_VERSION, entry::ProjectSource},
+        paths::{
+            CATALOG_FILE, CATALOG_LOCK_FILE, CHECKOUT_DIRECTORY, REPOSITORIES_DIRECTORY,
+            WORKTREES_DIRECTORY,
+        },
     };
 
     /// Coarse enough for the ~15ms system clock granularity on Windows.
@@ -1716,23 +1468,6 @@ mod tests {
     }
 
     #[test]
-    fn github_https_and_ssh_remotes_share_a_normalized_identity() {
-        let expected = "github.com/example/project";
-        assert_eq!(
-            super::normalize_remote("https://github.com/Example/Project.git").unwrap(),
-            expected
-        );
-        assert_eq!(
-            super::normalize_remote("git@github.com:example/project.git").unwrap(),
-            expected
-        );
-        assert_eq!(
-            super::normalize_remote("ssh://git@github.com/EXAMPLE/PROJECT/").unwrap(),
-            expected
-        );
-    }
-
-    #[test]
     #[ignore = "requires network access to clone a public GitHub repository"]
     fn github_remote_forms_deduplicate_through_import() {
         let fixture = Fixture::new();
@@ -1760,26 +1495,6 @@ mod tests {
             Some("github.com/octocat/hello-world")
         );
         assert_eq!(service.list().len(), 1);
-    }
-
-    #[test]
-    fn malformed_github_remotes_are_rejected() {
-        for remote in [
-            "",
-            "https://github.com/",
-            "https://github.com/only-owner",
-            "https://github.com/owner/repository/extra",
-            "https://gitlab.com/owner/repository",
-            "not a remote at all //",
-        ] {
-            assert!(
-                matches!(
-                    super::normalize_remote(remote),
-                    Err(ProjectError::InvalidRemote { .. })
-                ),
-                "expected '{remote}' to be rejected"
-            );
-        }
     }
 
     #[test]
