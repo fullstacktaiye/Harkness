@@ -19,3 +19,7 @@ harkness-core.workspace = true
 [build-dependencies]
 cxx-qt-build = { version = "0.9", features = ["link_qt_object_files"] }
 
+[dev-dependencies]
+tempfile.workspace = true
+time.workspace = true
+

@@ -1,8 +1,12 @@
 mod backend;
+mod file_tree_model;
 
 use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QString, QUrl};
 
 fn main() {
+    // Force-links the statically compiled QML module so its types register.
+    cxx_qt::init_qml_module!("io.github.fullstacktaiye.harkness");
+
     let mut app = QGuiApplication::new();
     let mut engine = QQmlApplicationEngine::new();
 
@@ -22,5 +26,94 @@ fn main() {
 
     if let Some(app) = app.as_mut() {
         app.exec();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use cxx_qt_lib::{QByteArray, QGuiApplication, QQmlApplicationEngine, QUrl};
+
+    /// Loads Main.qml the same way `main` does and asserts the engine
+    /// produced a root object, catching broken imports and malformed QML
+    /// without a display.
+    #[test]
+    fn main_qml_loads() {
+        // SAFETY: set before any Qt object is constructed, and tests in this
+        // binary run single-threaded with respect to Qt usage.
+        unsafe {
+            std::env::set_var("QT_QPA_PLATFORM", "offscreen");
+            std::env::set_var("QT_FORCE_STDERR_LOGGING", "1");
+        }
+        cxx_qt::init_qml_module!("io.github.fullstacktaiye.harkness");
+        let app = QGuiApplication::new();
+        let mut engine = QQmlApplicationEngine::new();
+
+        static LOADED: AtomicBool = AtomicBool::new(false);
+        if let Some(mut engine) = engine.as_mut() {
+            let _connection = engine.as_mut().on_object_created(|_engine, object, _url| {
+                LOADED.store(!object.is_null(), Ordering::SeqCst);
+            });
+            engine.as_mut().load(&QUrl::from(
+                "qrc:/qt/qml/io/github/fullstacktaiye/harkness/qml/Main.qml",
+            ));
+        }
+
+        assert!(
+            LOADED.load(Ordering::SeqCst),
+            "Main.qml failed to load; see QML warnings above"
+        );
+
+        // Instantiate the shell directly with a real directory so TreeView
+        // creates delegates and validates the filesystem role bindings. The
+        // normal application cannot reach this page until an async import or
+        // open completes, which the no-event-loop smoke test cannot drive.
+        LOADED.store(false, Ordering::SeqCst);
+        if let Some(mut engine) = engine.as_mut() {
+            let _connection = engine.as_mut().on_object_created(|_engine, object, _url| {
+                LOADED.store(!object.is_null(), Ordering::SeqCst);
+            });
+            engine.as_mut().load_data(
+                &QByteArray::from(
+                    br#"
+import QtQuick
+import org.kde.kirigami as Kirigami
+import io.github.fullstacktaiye.harkness
+
+Kirigami.ApplicationWindow {
+    visible: false
+    width: 640
+    height: 480
+
+    HarknessBackend { id: backend }
+    pageStack.initialPage: ProjectShellPage {
+        backend: backend
+        project: ({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "displayName": "QML fixture",
+            "root": "/tmp",
+            "remote": "",
+            "branch": "",
+            "managed": false,
+            "available": true,
+            "isGit": false,
+            "dirty": false
+        })
+    }
+}
+"#,
+                ),
+                &QUrl::from("qrc:/ProjectShellSmoke.qml"),
+            );
+        }
+        assert!(
+            LOADED.load(Ordering::SeqCst),
+            "ProjectShellPage failed to load; see QML warnings above"
+        );
+        // The engine must be released before the application; dropping locals
+        // in declaration order would do the opposite.
+        drop(engine);
+        drop(app);
     }
 }

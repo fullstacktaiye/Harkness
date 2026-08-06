@@ -1,190 +1,119 @@
 import QtQuick
 import QtQuick.Controls as Controls
-import QtQuick.Layouts
+import QtQuick.Dialogs
 import org.kde.kirigami as Kirigami
 import io.github.fullstacktaiye.harkness
 
 Kirigami.ApplicationWindow {
-    height: 560
+    id: root
+
+    height: 640
+    minimumHeight: 420
+    minimumWidth: 520
     title: qsTr("Harkness")
     visible: true
-    width: 720
+    width: 960
+
+    // The launcher and project shell are alternative application states, not
+    // master/detail columns. Always show only the current page.
+    pageStack.columnView.columnResizeMode: Kirigami.ColumnView.SingleColumn
 
     HarknessBackend {
-        id: backend
+        id: appBackend
         Component.onCompleted: refresh()
     }
 
-    Kirigami.PromptDialog {
-        id: removeDialog
+    // Navigation is driven entirely by `opened`: any operation that sets a
+    // project pushes the shell, and clearing it (back, removal) returns to
+    // the launcher.
+    property var openedProject: appBackend.opened
 
-        property string projectId: ""
-        property string projectName: ""
-        property string projectPath: ""
-
-        standardButtons: Kirigami.Dialog.Ok | Kirigami.Dialog.Cancel
-        subtitle: qsTr("This permanently deletes the checkout at:\n%1").arg(projectPath)
-        title: qsTr("Delete “%1”?").arg(projectName)
-        onAccepted: backend.removeManaged(projectId)
+    onOpenedProjectChanged: {
+        const id = openedProject && openedProject.id !== undefined ? String(openedProject.id) : "";
+        if (id.length > 0) {
+            // A refresh re-sets `opened` for the project already on screen;
+            // update that page instead of stacking a duplicate.
+            if (pageStack.depth > 1 && pageStack.currentItem.isShell === true) {
+                pageStack.currentItem.project = openedProject;
+            } else {
+                pageStack.push(Qt.resolvedUrl("ProjectShellPage.qml"), {
+                    "backend": appBackend,
+                    "project": openedProject
+                });
+            }
+        } else if (pageStack.depth > 1) {
+            pageStack.pop();
+        }
     }
 
-    pageStack.initialPage: Kirigami.ScrollablePage {
-        id: repositoryPage
-        title: qsTr("Repositories")
+    /// Opens the native folder dialog; the chosen path is imported on accept.
+    function chooseLocalFolder() {
+        folderDialog.open();
+    }
 
-        // Describes a row's Git state. Composed here rather than in Rust so
-        // every user-visible string stays translatable.
-        function describe(project) {
-            if (!project.available)
-                return qsTr("Missing from disk");
-            if (!project.isGit)
-                return qsTr("Not a Git repository");
-            const branch = project.branch.length > 0 ? project.branch : qsTr("detached HEAD");
-            return project.dirty ? qsTr("%1 — uncommitted changes").arg(branch) : branch;
-        }
+    /// Asks before dropping a local project. The wording must make clear the
+    /// directory itself is never touched.
+    function confirmRemoveLocal(projectId, projectName) {
+        removeLocalDialog.projectId = projectId;
+        removeLocalDialog.subtitle = qsTr("“%1” is removed from Harkness only. Its files stay exactly where they are.").arg(projectName);
+        removeLocalDialog.open();
+    }
 
-        header: ColumnLayout {
-            spacing: Kirigami.Units.smallSpacing
+    /// Asks before deleting a managed clone, naming the checkout that dies.
+    function confirmRemoveManaged(projectId, projectName, projectPath) {
+        removeManagedDialog.projectId = projectId;
+        removeManagedDialog.subtitle = qsTr("This permanently deletes the checkout of “%1” at:\n%2").arg(projectName).arg(projectPath);
+        removeManagedDialog.open();
+    }
 
-            RowLayout {
-                Layout.fillWidth: true
-                Layout.margins: Kirigami.Units.largeSpacing
-                spacing: Kirigami.Units.smallSpacing
+    FolderDialog {
+        id: folderDialog
+        title: qsTr("Choose a project folder")
+        onAccepted: appBackend.importLocal(root.urlToPath(selectedFolder))
+    }
 
-                Controls.TextField {
-                    id: remoteField
-                    Layout.fillWidth: true
-                    enabled: !backend.busy
-                    placeholderText: qsTr("https://github.com/owner/repository.git")
-                    onAccepted: backend.importRepository(text)
-                }
+    Kirigami.PromptDialog {
+        id: removeLocalDialog
 
-                Controls.Button {
-                    enabled: !backend.busy && remoteField.text.length > 0
-                    text: qsTr("Clone")
-                    onClicked: backend.importRepository(remoteField.text)
-                }
+        property string projectId: ""
 
-                Controls.Button {
-                    enabled: backend.busy
-                    text: qsTr("Cancel")
-                    onClicked: backend.cancelImport()
-                }
-            }
+        standardButtons: Kirigami.Dialog.Ok | Kirigami.Dialog.Cancel
+        title: qsTr("Remove from Harkness?")
+        onAccepted: appBackend.removeProject(projectId)
+    }
 
-            RowLayout {
-                Layout.fillWidth: true
-                Layout.leftMargin: Kirigami.Units.largeSpacing
-                Layout.rightMargin: Kirigami.Units.largeSpacing
-                spacing: Kirigami.Units.smallSpacing
+    Kirigami.PromptDialog {
+        id: removeManagedDialog
 
-                Controls.BusyIndicator {
-                    Layout.preferredHeight: Kirigami.Units.gridUnit
-                    Layout.preferredWidth: Kirigami.Units.gridUnit
-                    running: backend.busy
-                    visible: running
-                }
+        property string projectId: ""
 
-                Controls.Label {
-                    Layout.fillWidth: true
-                    elide: Text.ElideRight
-                    text: backend.status
-                }
-            }
+        standardButtons: Kirigami.Dialog.Ok | Kirigami.Dialog.Cancel
+        title: qsTr("Delete managed clone?")
+        onAccepted: appBackend.removeManaged(projectId)
+    }
 
-            Kirigami.Separator {
-                Layout.fillWidth: true
-                Layout.topMargin: Kirigami.Units.smallSpacing
-            }
-        }
+    Shortcut {
+        sequences: [StandardKey.Open]
+        onActivated: root.chooseLocalFolder()
+    }
 
-        ListView {
-            id: projectList
-            model: backend.projects
-            reuseItems: true
+    Shortcut {
+        sequences: [StandardKey.Refresh]
+        onActivated: appBackend.refresh()
+    }
 
-            Kirigami.PlaceholderMessage {
-                anchors.centerIn: parent
-                icon.name: "folder-git"
-                text: qsTr("No repositories yet")
-                explanation: qsTr("Clone a GitHub repository to add it here.")
-                visible: projectList.count === 0
-                width: parent.width - Kirigami.Units.gridUnit * 4
-            }
+    // QtQuick.Dialogs reports a url; the core expects a plain filesystem path.
+    function urlToPath(url) {
+        let text = url.toString();
+        if (text.startsWith("file://"))
+            text = text.substring(7);
+        return decodeURIComponent(text);
+    }
 
-            delegate: Controls.ItemDelegate {
-                id: projectDelegate
-
-                required property var modelData
-
-                hoverEnabled: true
-                width: ListView.view.width
-
-                contentItem: RowLayout {
-                    spacing: Kirigami.Units.largeSpacing
-
-                    ColumnLayout {
-                        Layout.fillWidth: true
-                        spacing: 0
-
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: Kirigami.Units.smallSpacing
-
-                            Kirigami.Heading {
-                                elide: Text.ElideRight
-                                level: 4
-                                opacity: projectDelegate.modelData.available ? 1 : 0.6
-                                text: projectDelegate.modelData.displayName
-                            }
-
-                            Kirigami.Chip {
-                                checkable: false
-                                closable: false
-                                enabled: false
-                                text: qsTr("Managed")
-                                visible: projectDelegate.modelData.managed
-                            }
-
-                            Item {
-                                Layout.fillWidth: true
-                            }
-                        }
-
-                        Controls.Label {
-                            Layout.fillWidth: true
-                            color: Kirigami.Theme.disabledTextColor
-                            elide: Text.ElideMiddle
-                            font: Kirigami.Theme.smallFont
-                            text: projectDelegate.modelData.root
-                        }
-
-                        Controls.Label {
-                            Layout.fillWidth: true
-                            color: projectDelegate.modelData.available ? Kirigami.Theme.disabledTextColor : Kirigami.Theme.negativeTextColor
-                            elide: Text.ElideRight
-                            font: Kirigami.Theme.smallFont
-                            text: repositoryPage.describe(projectDelegate.modelData)
-                        }
-                    }
-
-                    // Only managed clones are Harkness's to delete. A local
-                    // project's directory belongs to the user, so no
-                    // destructive action is offered for it here.
-                    Controls.Button {
-                        enabled: !backend.busy
-                        icon.name: "delete"
-                        text: qsTr("Delete checkout…")
-                        visible: projectDelegate.modelData.managed
-                        onClicked: {
-                            removeDialog.projectId = projectDelegate.modelData.id;
-                            removeDialog.projectName = projectDelegate.modelData.displayName;
-                            removeDialog.projectPath = projectDelegate.modelData.root;
-                            removeDialog.open();
-                        }
-                    }
-                }
-            }
-        }
+    // Give the stack the page directly. Wrapping the initial page in a
+    // Component leaves an intermediate visual object unattached on some
+    // Kirigami versions and produces a scene-placement warning at startup.
+    pageStack.initialPage: LauncherPage {
+        backend: appBackend
     }
 }

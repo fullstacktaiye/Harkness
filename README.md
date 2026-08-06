@@ -3,8 +3,12 @@
 Harkness is an early native AI-harness scaffold. Its Rust core maintains a local
 project catalog and can safely clone GitHub repositories through the system Git
 executable, preserving the user's existing SSH and HTTPS credential setup. The
-KDE Kirigami application lists every catalogued project with its Git state, and
-exposes managed import progress, cancellation, and confirmed removal.
+KDE Kirigami application opens on a project launcher — Recents, local folder
+import, and validated GitHub cloning with progress and cancellation — and opens
+each project into a shell showing its Git identity next to a lazy, read-only
+file tree that never descends into `.git` or through directory symlinks.
+Managed clones are deleted only after a confirmation naming the checkout;
+local projects are simply forgotten, leaving their files untouched.
 
 ## Fedora development setup
 
@@ -29,8 +33,9 @@ cargo fmt --check
 cargo clippy --workspace --all-targets
 ```
 
-The CLI prints exactly `Hello World`. The GUI opens a 400 by 300 Kirigami window
-and obtains the same text from its Rust-backed `HarknessBackend` QML object.
+The CLI prints exactly `Hello World`. The GUI opens a Kirigami window on the
+project launcher backed by the Rust `HarknessBackend` and `FileTreeModel` QML
+objects.
 
 ## Install locally for Plasma
 
