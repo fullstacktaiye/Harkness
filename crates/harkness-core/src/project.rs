@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, File},
+    fs,
     io::{self, Write},
     path::{Path, PathBuf},
 };
@@ -68,11 +68,19 @@ pub struct Project {
     pub root: PathBuf,
     /// How this project entered the catalog.
     pub source: ProjectSource,
-    /// Whether the root currently exists and can be read.
-    pub available: bool,
     /// The last time the project was imported or successfully reopened.
     pub last_opened: OffsetDateTime,
-    /// Git metadata when the root belongs to a Git repository.
+    /// Whether the root currently exists and can be read.
+    ///
+    /// Derived from the filesystem on every read, so it is deliberately not
+    /// persisted; a stored copy would only ever be stale.
+    #[serde(skip)]
+    pub available: bool,
+    /// Git metadata when the root is the working directory of a Git
+    /// repository.
+    ///
+    /// Derived alongside [`Project::available`], and likewise not persisted.
+    #[serde(skip)]
     pub git: Option<GitStatus>,
 }
 
@@ -80,6 +88,12 @@ pub struct Project {
 struct Catalog {
     version: u32,
     projects: Vec<Project>,
+}
+
+/// The forward-compatible prefix of every catalog file.
+#[derive(Deserialize)]
+struct CatalogVersion {
+    version: u32,
 }
 
 impl Default for Catalog {
@@ -93,6 +107,7 @@ impl Default for Catalog {
 
 /// Actionable failures returned by [`ProjectService`].
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ProjectError {
     /// The operating system did not expose a suitable user data directory.
     #[error("the platform data directory could not be determined")]
@@ -156,6 +171,12 @@ pub enum ProjectError {
 }
 
 /// Loads and updates the durable local project catalog.
+///
+/// A service instance owns a snapshot of the catalog taken when it was loaded,
+/// and every mutation rewrites the whole file. Harkness therefore assumes a
+/// single writer at a time: two processes holding their own service would each
+/// persist their own snapshot, and the last write would win. Front ends that
+/// need to share a catalog should serialize access or reload between changes.
 pub struct ProjectService {
     data_dir: PathBuf,
     catalog: Catalog,
@@ -185,19 +206,26 @@ impl ProjectService {
                         path: catalog_path.clone(),
                         source,
                     })?;
-                let catalog: Catalog = serde_json::from_slice(&bytes).map_err(|source| {
+                // Read the version before the body: a future schema would fail
+                // to deserialize as a v1 catalog, and reporting that as
+                // "malformed" would hide the one cause the user can act on.
+                let probe: CatalogVersion = serde_json::from_slice(&bytes).map_err(|source| {
                     ProjectError::MalformedCatalog {
                         path: catalog_path.clone(),
                         source,
                     }
                 })?;
-                if catalog.version != CATALOG_VERSION {
+                if probe.version != CATALOG_VERSION {
                     return Err(ProjectError::UnsupportedCatalogVersion {
-                        found: catalog.version,
+                        found: probe.version,
                         expected: CATALOG_VERSION,
                     });
                 }
-                catalog
+
+                serde_json::from_slice(&bytes).map_err(|source| ProjectError::MalformedCatalog {
+                    path: catalog_path.clone(),
+                    source,
+                })?
             }
             Err(source) => {
                 return Err(ProjectError::CatalogRead {
@@ -212,16 +240,20 @@ impl ProjectService {
 
     /// Lists projects by most-recently-opened order with current availability
     /// and Git metadata.
-    pub fn list(&self) -> Result<Vec<Project>, ProjectError> {
+    ///
+    /// Listing never fails: a project whose Git metadata cannot be read is
+    /// reported with `git: None` rather than hiding the rest of the catalog.
+    #[must_use]
+    pub fn list(&self) -> Vec<Project> {
         let mut projects = self
             .catalog
             .projects
             .iter()
             .cloned()
             .map(refresh_project)
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Vec<_>>();
         sort_recents(&mut projects);
-        Ok(projects)
+        projects
     }
 
     /// Imports a readable local directory, or reopens its existing canonical
@@ -268,7 +300,7 @@ impl ProjectService {
             .find(|project| project.id == id)
             .ok_or(ProjectError::ProjectNotFound(id))?;
 
-        let refreshed = refresh_project(project.clone())?;
+        let refreshed = refresh_project(project.clone());
         if !refreshed.available {
             return Err(ProjectError::ProjectUnavailable {
                 id,
@@ -328,9 +360,13 @@ fn persist_catalog(data_dir: &Path, catalog_path: &Path, catalog: &Catalog) -> i
         .persist(catalog_path)
         .map_err(|error| error.error)?;
 
-    // Sync the final file as well so a successful return means its contents
-    // reached the same durability boundary on every supported platform.
-    File::open(catalog_path)?.sync_all()
+    // The file's contents are already durable; what the rename still needs is a
+    // sync of the directory holding the new entry. Windows has no equivalent
+    // handle to sync, so this is a Unix-only step.
+    #[cfg(unix)]
+    fs::File::open(data_dir)?.sync_all()?;
+
+    Ok(())
 }
 
 fn validate_local_directory(path: &Path) -> Result<PathBuf, ProjectError> {
@@ -362,15 +398,22 @@ fn validate_local_directory(path: &Path) -> Result<PathBuf, ProjectError> {
     Ok(canonical)
 }
 
-fn refresh_project(mut project: Project) -> Result<Project, ProjectError> {
+/// Recomputes the derived state of a catalog entry.
+///
+/// This runs on every ambient read, so an unreadable repository degrades to
+/// "no Git metadata" instead of failing the caller. Only [`import_local`], an
+/// explicit action against one directory, reports inspection failures.
+///
+/// [`import_local`]: ProjectService::import_local
+fn refresh_project(mut project: Project) -> Project {
     project.available = fs::metadata(&project.root).is_ok_and(|metadata| metadata.is_dir())
         && fs::read_dir(&project.root).is_ok();
     project.git = if project.available {
-        inspect_git(&project.root)?
+        inspect_git(&project.root).unwrap_or_default()
     } else {
         None
     };
-    Ok(project)
+    project
 }
 
 fn inspect_git(path: &Path) -> Result<Option<GitStatus>, ProjectError> {
@@ -384,6 +427,18 @@ fn inspect_git(path: &Path) -> Result<Option<GitStatus>, ProjectError> {
             });
         }
     };
+
+    // `discover` walks upward, so a plain directory nested inside a repository
+    // would otherwise report that ancestor's branch and dirty state as its
+    // own. Only the repository's own working directory counts as a Git
+    // project; bare repositories have no working directory at all.
+    let is_repository_root = repository
+        .workdir()
+        .and_then(|workdir| fs::canonicalize(workdir).ok())
+        .is_some_and(|workdir| workdir == path);
+    if !is_repository_root {
+        return Ok(None);
+    }
 
     let branch = match repository.head() {
         Ok(head) if head.is_branch() => Some(
@@ -404,10 +459,13 @@ fn inspect_git(path: &Path) -> Result<Option<GitStatus>, ProjectError> {
         }
     };
 
+    // `dirty` only asks whether any entry differs, so untracked directories are
+    // left unrecursed: libgit2 still reports the directory itself, at a
+    // fraction of the cost of walking a large `target/` or `node_modules/`.
     let mut options = StatusOptions::new();
     options
         .include_untracked(true)
-        .recurse_untracked_dirs(true)
+        .recurse_untracked_dirs(false)
         .include_ignored(false);
     let dirty = !repository
         .statuses(Some(&mut options))
@@ -440,18 +498,24 @@ fn sort_recents(projects: &mut [Project]) {
 mod tests {
     use std::{
         fs,
-        path::Path,
+        path::{Path, PathBuf},
         thread,
-        time::{Duration, SystemTime},
+        time::Duration,
     };
 
-    use git2::{IndexAddOption, Repository, Signature};
+    use git2::{IndexAddOption, Repository, Signature, Time};
     use tempfile::TempDir;
 
     use super::{
         CATALOG_FILE, CATALOG_VERSION, ProjectError, ProjectService, ProjectSource,
         WORKTREES_DIRECTORY,
     };
+
+    /// Coarse enough for the ~15ms system clock granularity on Windows.
+    const CLOCK_TICK: Duration = Duration::from_millis(25);
+
+    /// Fixed so repository fixtures hash identically between runs.
+    const COMMIT_EPOCH_SECONDS: i64 = 1_700_000_000;
 
     #[test]
     fn catalog_round_trip_preserves_project_data() {
@@ -463,8 +527,22 @@ mod tests {
         let reloaded = ProjectService::load_from_data_dir(&fixture.data_dir).unwrap();
 
         assert_eq!(reloaded.catalog.version, CATALOG_VERSION);
-        assert_eq!(reloaded.catalog.projects, vec![imported]);
-        assert_eq!(reloaded.list().unwrap(), service.list().unwrap());
+        assert_eq!(reloaded.list(), service.list());
+        assert_eq!(reloaded.list(), vec![imported]);
+    }
+
+    #[test]
+    fn derived_state_is_not_persisted() {
+        let fixture = Fixture::new();
+        let project_root = fixture.directory("derived-state");
+        let mut service = fixture.service();
+        service.import_local(&project_root).unwrap();
+
+        let stored = fs::read_to_string(fixture.data_dir.join(CATALOG_FILE)).unwrap();
+
+        assert!(!stored.contains("available"), "{stored}");
+        assert!(!stored.contains("git"), "{stored}");
+        assert!(stored.contains("last_opened"), "{stored}");
     }
 
     #[test]
@@ -480,7 +558,7 @@ mod tests {
         let aliased = service.import_local(&alias).unwrap();
 
         assert_eq!(direct.id, aliased.id);
-        assert_eq!(service.list().unwrap().len(), 1);
+        assert_eq!(service.list().len(), 1);
     }
 
     #[cfg(unix)]
@@ -526,14 +604,14 @@ mod tests {
         let second_root = fixture.directory("second");
         let mut service = fixture.service();
         let first = service.import_local(first_root).unwrap();
-        thread::sleep(Duration::from_millis(2));
+        thread::sleep(CLOCK_TICK);
         let second = service.import_local(second_root).unwrap();
 
-        assert_eq!(service.list().unwrap()[0].id, second.id);
+        assert_eq!(service.list()[0].id, second.id);
 
-        thread::sleep(Duration::from_millis(2));
+        thread::sleep(CLOCK_TICK);
         let reopened = service.open(first.id).unwrap();
-        let recents = service.list().unwrap();
+        let recents = service.list();
 
         assert!(reopened.last_opened > first.last_opened);
         assert_eq!(recents[0].id, first.id);
@@ -575,6 +653,36 @@ mod tests {
     }
 
     #[test]
+    fn nested_directories_do_not_inherit_ancestor_git_state() {
+        let fixture = Fixture::new();
+        let repository_root = fixture.directory("outer-repository");
+        initialize_repository(&repository_root);
+        let nested = repository_root.join("plain-subdirectory");
+        fs::create_dir(&nested).unwrap();
+        let mut service = fixture.service();
+
+        let project = service.import_local(&nested).unwrap();
+
+        assert_eq!(project.git, None);
+    }
+
+    #[test]
+    fn directories_holding_only_ignored_files_stay_clean() {
+        let fixture = Fixture::new();
+        let project_root = fixture.directory("ignored-only");
+        let repository = initialize_repository(&project_root);
+        fs::write(project_root.join(".gitignore"), "build/\n").unwrap();
+        commit_all(&repository, "ignore build output");
+        fs::create_dir(project_root.join("build")).unwrap();
+        fs::write(project_root.join("build").join("artifact.bin"), "generated").unwrap();
+        let mut service = fixture.service();
+
+        let project = service.import_local(&project_root).unwrap();
+
+        assert!(!project.git.unwrap().dirty);
+    }
+
+    #[test]
     fn missing_roots_remain_unavailable_in_the_catalog() {
         let fixture = Fixture::new();
         let project_root = fixture.directory("temporary-project");
@@ -582,7 +690,7 @@ mod tests {
         let imported = service.import_local(&project_root).unwrap();
         fs::remove_dir_all(&project_root).unwrap();
 
-        let listed = service.list().unwrap();
+        let listed = service.list();
         assert_eq!(listed.len(), 1);
         assert!(!listed[0].available);
         assert_eq!(listed[0].id, imported.id);
@@ -592,7 +700,7 @@ mod tests {
         ));
 
         let reloaded = ProjectService::load_from_data_dir(&fixture.data_dir).unwrap();
-        assert!(!reloaded.list().unwrap()[0].available);
+        assert!(!reloaded.list()[0].available);
     }
 
     #[test]
@@ -609,7 +717,7 @@ mod tests {
         let removed = service.remove(imported.id).unwrap();
 
         assert_eq!(removed.id, imported.id);
-        assert!(service.list().unwrap().is_empty());
+        assert!(service.list().is_empty());
         assert_eq!(
             fs::read_to_string(project_root.join("root.txt")).unwrap(),
             "root sentinel"
@@ -676,6 +784,18 @@ mod tests {
                 expected: CATALOG_VERSION
             })
         ));
+
+        // A newer version is reported as such even when the rest of the file no
+        // longer matches the current schema.
+        fs::write(
+            &catalog_path,
+            br#"{"version":99,"entries":{"unexpected":1}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            ProjectService::load_from_data_dir(&fixture.data_dir),
+            Err(ProjectError::UnsupportedCatalogVersion { found: 99, .. })
+        ));
     }
 
     #[test]
@@ -741,36 +861,46 @@ mod tests {
         let repository = Repository::init(path).unwrap();
         repository.set_head("refs/heads/main").unwrap();
         fs::write(path.join("tracked.txt"), "initial\n").unwrap();
+        commit_all(&repository, "initial");
+        repository
+    }
+
+    /// Commits every non-ignored file in the worktree onto the current head.
+    fn commit_all(repository: &Repository, message: &str) {
         let mut index = repository.index().unwrap();
-        index
-            .add_all(["tracked.txt"], IndexAddOption::DEFAULT, None)
-            .unwrap();
+        index.add_all(["*"], IndexAddOption::DEFAULT, None).unwrap();
         index.write().unwrap();
         let tree_id = index.write_tree().unwrap();
-        {
-            let tree = repository.find_tree(tree_id).unwrap();
-            let signature = Signature::new(
-                "Harkness Tests",
-                "tests@harkness.invalid",
-                &git2::Time::new(
-                    SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs() as i64,
-                    0,
-                ),
+        let tree = repository.find_tree(tree_id).unwrap();
+        let signature = Signature::new(
+            "Harkness Tests",
+            "tests@harkness.invalid",
+            &Time::new(COMMIT_EPOCH_SECONDS, 0),
+        )
+        .unwrap();
+        let parents = repository
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .map(|id| repository.find_commit(id).unwrap())
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                message,
+                &tree,
+                &parents.iter().collect::<Vec<_>>(),
             )
             .unwrap();
-            repository
-                .commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
-                .unwrap();
-        }
-        repository
     }
 
     struct Fixture {
         root: TempDir,
-        data_dir: std::path::PathBuf,
+        data_dir: PathBuf,
     }
 
     impl Fixture {
@@ -780,7 +910,7 @@ mod tests {
             Self { root, data_dir }
         }
 
-        fn directory(&self, name: &str) -> std::path::PathBuf {
+        fn directory(&self, name: &str) -> PathBuf {
             let path = self.root.path().join(name);
             fs::create_dir(&path).unwrap();
             path
