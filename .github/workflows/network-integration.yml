@@ -15,6 +15,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v6
+      # Clippy covers the whole workspace, and harkness-gui's build script
+      # drives qmake, moc and qmltyperegistrar, so Qt 6 has to be present even
+      # though nothing here links or runs the GUI.
+      - name: Install Qt 6 development tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qt6-base-dev qt6-declarative-dev
+      # A key distinct from the `core` job's, so two different Cargo profiles
+      # do not overwrite each other's cache on every run.
+      - name: Cache Cargo dependencies and build output
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-lint-
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
   core:
     name: Core (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -39,6 +71,8 @@ jobs:
             ${{ runner.os }}-cargo-
       - name: Test core
         run: cargo test --locked -p harkness-core
+      - name: Test CLI
+        run: cargo test --locked -p harkness-cli
 
   github-remote-import:
     name: GitHub remote import
