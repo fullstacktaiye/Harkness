@@ -6,10 +6,16 @@ mod listing;
 mod paths;
 mod project;
 mod remote;
+#[cfg(test)]
+mod testing;
 
-pub use catalog::entry::{GitStatus, Project, ProjectId, ProjectSource};
+pub use catalog::entry::{GitStatus, Project, ProjectId, ProjectSource, UpstreamStatus};
+pub use git::{
+    Cancellation, CloneCancellation, DetailedStatus, FileChange, GitAccess, GitCommand, GitError,
+    GitOutput, GitService, HeadState, RepositoryLock, StatusEntry,
+};
 pub use listing::{DirEntry, list_directory};
-pub use project::{CloneCancellation, ProjectError, ProjectService};
+pub use project::{ProjectError, ProjectService};
 pub use remote::normalize_remote;
 
 /// Returns the greeting displayed by every Harkness interface.

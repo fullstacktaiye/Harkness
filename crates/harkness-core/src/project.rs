@@ -1,19 +1,9 @@
 use std::{
-    collections::VecDeque,
     fs::{self, File},
-    io::{self, BufReader, Read},
+    io,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
-    thread,
-    time::Duration,
 };
 
-use git2::{ErrorCode, Repository, StatusOptions};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -23,17 +13,13 @@ use crate::{
         entry::{GitStatus, Project, ProjectId, ProjectSource},
         lock,
     },
+    git::{self, Cancellation, GitError, GitService, clone},
     paths::{
         self, CATALOG_FILE, CHECKOUT_DIRECTORY, REPOSITORIES_DIRECTORY, UnreservedPath,
         WORKTREES_DIRECTORY, canonical_reserved_root,
     },
     remote::{normalize_remote_with_local, repository_name},
 };
-
-/// Git repeats a progress phase on every update, so retaining the whole stream
-/// would put megabytes of overwritten counters into a failure message. The tail
-/// is what matters: Git prints its diagnosis last.
-const RETAINED_GIT_OUTPUT_SEGMENTS: usize = 20;
 
 /// Actionable failures returned by [`ProjectService`].
 #[derive(Debug, Error)]
@@ -143,20 +129,20 @@ pub enum ProjectError {
         #[source]
         source: io::Error,
     },
+
+    /// A Git operation on a catalogued project failed.
+    #[error(transparent)]
+    Git(GitError),
 }
 
-/// Cooperative cancellation token for a repository clone.
-#[derive(Clone, Debug, Default)]
-pub struct CloneCancellation(Arc<AtomicBool>);
-
-impl CloneCancellation {
-    /// Requests cancellation. The Git child is killed and its partial clone is removed.
-    pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
-    }
-
-    fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+impl From<GitError> for ProjectError {
+    fn from(error: GitError) -> Self {
+        match error {
+            // Inspection predates the Git module and is what `import_local`
+            // reports, so it keeps its own variant and its own message.
+            GitError::Inspection { path, source } => Self::GitInspection { path, source },
+            other => Self::Git(other),
+        }
     }
 }
 
@@ -206,15 +192,21 @@ impl ProjectService {
     /// Loads an isolated service whose managed imports may clone local test
     /// repositories. Production constructors deliberately never enable this.
     #[cfg(test)]
-    fn load_for_test(data_dir: impl Into<PathBuf>) -> Result<Self, ProjectError> {
+    pub(crate) fn load_for_test(data_dir: impl Into<PathBuf>) -> Result<Self, ProjectError> {
         let mut service = Self::load_from_data_dir(data_dir)?;
         service.allow_local_remotes = true;
         Ok(service)
     }
 
     /// Takes the exclusive catalog lock for one read-modify-write.
-    fn lock_exclusive(&self) -> Result<File, ProjectError> {
+    pub(crate) fn lock_exclusive(&self) -> Result<File, ProjectError> {
         lock::lock_exclusive(&self.data_dir)
+    }
+
+    /// The Harkness data directory this service is rooted at.
+    #[cfg(test)]
+    pub(crate) fn data_dir(&self) -> &Path {
+        &self.data_dir
     }
 
     /// Reads the catalog fresh from disk. Call only while holding the lock.
@@ -372,7 +364,7 @@ impl ProjectService {
     pub fn import_repository(
         &mut self,
         remote: &str,
-        cancellation: &CloneCancellation,
+        cancellation: &Cancellation,
         mut on_progress: impl FnMut(String),
     ) -> Result<Project, ProjectError> {
         // Git reads its argument literally, so surrounding whitespace from a
@@ -424,10 +416,13 @@ impl ProjectService {
         // Every failure past this point can leave a partial checkout behind, so
         // the rest of the import runs in one fallible block with one cleanup.
         let imported = (|| {
-            run_git_clone(
+            // No repository lock: the clone creates a repository that does not
+            // exist yet, inside a directory reserved for this identifier alone,
+            // so there is nothing for it to be serialized against.
+            clone::run(
                 &self.git_executable,
                 remote,
-                &checkout,
+                &managed_directory,
                 cancellation,
                 &mut on_progress,
             )?;
@@ -500,6 +495,30 @@ impl ProjectService {
     /// Front ends must obtain explicit confirmation naming [`Project::root`]
     /// before calling this destructive operation.
     pub fn remove_managed(&mut self, id: ProjectId) -> Result<Project, ProjectError> {
+        // Removing a checkout is a Git mutation, so it takes the repository
+        // lock, and the repository lock is always taken before the catalog
+        // lock. Learning the path therefore needs a shared read that is
+        // released before the lock is taken, and everything it read is
+        // re-verified under the exclusive lock below.
+        let preliminary = self
+            .read_catalog_shared()
+            .unwrap_or_else(|| self.catalog.clone())
+            .projects
+            .into_iter()
+            .find(|project| project.id == id)
+            .ok_or(ProjectError::ProjectNotFound(id))?;
+        // A checkout that is no longer a repository has no object store to
+        // serialize against. Whether it may be deleted at all is still decided
+        // by the re-verification, not here.
+        let _repository_lock = match self
+            .git_service(&preliminary.root)
+            .lock(&Cancellation::default())
+        {
+            Ok(lock) => Some(lock),
+            Err(GitError::NotARepository { .. }) => None,
+            Err(error) => return Err(error.into()),
+        };
+
         // Deleting the checkout stays inside the critical section: the path is
         // proven from the catalog entry, so releasing the lock first would let
         // a concurrent import reuse the directory this call is about to erase.
@@ -555,6 +574,30 @@ impl ProjectService {
         self.data_dir.join(WORKTREES_DIRECTORY).join(id.to_string())
     }
 
+    /// Resolves a catalog entry to the Git service for its root.
+    ///
+    /// The catalog is read under a shared lock that is released before this
+    /// returns, so the caller is free to take a repository lock afterwards
+    /// without violating the ordering documented on [`RepositoryLock`].
+    ///
+    /// [`RepositoryLock`]: crate::RepositoryLock
+    pub fn git(&self, id: ProjectId) -> Result<GitService, ProjectError> {
+        let catalog = self
+            .read_catalog_shared()
+            .unwrap_or_else(|| self.catalog.clone());
+        let project = catalog
+            .projects
+            .into_iter()
+            .find(|project| project.id == id)
+            .ok_or(ProjectError::ProjectNotFound(id))?;
+        Ok(self.git_service(&project.root))
+    }
+
+    /// Addresses one repository with this service's Git executable.
+    fn git_service(&self, root: &Path) -> GitService {
+        GitService::new(root, &self.data_dir).with_git_executable(&self.git_executable)
+    }
+
     fn persist(&self, catalog: &Catalog) -> Result<(), ProjectError> {
         let catalog_path = self.data_dir.join(CATALOG_FILE);
         catalog::persist_catalog(&self.data_dir, &catalog_path, catalog).map_err(|source| {
@@ -572,132 +615,6 @@ fn unsafe_removal(project: &Project, reason: impl Into<String>) -> ProjectError 
         path: project.root.clone(),
         reason: reason.into(),
     }
-}
-
-fn run_git_clone(
-    git_executable: &Path,
-    remote: &str,
-    checkout: &Path,
-    cancellation: &CloneCancellation,
-    on_progress: &mut impl FnMut(String),
-) -> Result<(), ProjectError> {
-    let mut command = Command::new(git_executable);
-    command
-        .args(["clone", "--progress", "--", remote])
-        .arg(checkout)
-        // Git may open /dev/tty even when stdin is closed. A GUI cannot answer
-        // that prompt, so fail with Git's diagnostic instead of hanging.
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    // A clone starts transport and credential helpers. Keeping the whole tree
-    // in a dedicated group lets cancellation stop every process before the
-    // caller removes the partial checkout.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|source| ProjectError::GitLaunch { source })?;
-    let stderr = child.stderr.take().expect("piped stderr");
-    let (sender, receiver) = mpsc::channel();
-    let reader = thread::spawn(move || read_git_output(stderr, &sender));
-
-    loop {
-        while let Ok(message) = receiver.try_recv() {
-            on_progress(message);
-        }
-        if cancellation.is_cancelled() {
-            terminate_clone(&mut child);
-            let _ = child.wait();
-            let _ = reader.join();
-            return Err(ProjectError::CloneCancelled);
-        }
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|source| ProjectError::GitLaunch { source })?
-        {
-            let stderr = reader
-                .join()
-                .unwrap_or_else(|_| "Git output reader failed".to_owned());
-            while let Ok(message) = receiver.try_recv() {
-                on_progress(message);
-            }
-            return if status.success() {
-                Ok(())
-            } else {
-                Err(ProjectError::CloneFailed { stderr })
-            };
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-
-#[cfg(unix)]
-fn terminate_clone(child: &mut std::process::Child) {
-    // `process_group(0)` makes the child's PID its process-group ID. A negative
-    // target atomically signals Git and all helpers that still belong to it.
-    unsafe {
-        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
-    }
-}
-
-#[cfg(not(unix))]
-fn terminate_clone(child: &mut std::process::Child) {
-    let _ = child.kill();
-}
-
-/// Forwards Git's standard-error segments and returns the retained tail.
-///
-/// Git separates the updates within a progress phase with carriage returns and
-/// only emits a newline when the phase ends, so reading lines would report
-/// nothing for the whole of the slowest phase and then deliver every
-/// overwritten counter at once. Both separators end a segment here.
-fn read_git_output(stderr: impl Read, sender: &mpsc::Sender<String>) -> String {
-    let mut reader = BufReader::new(stderr);
-    let mut retained: VecDeque<String> = VecDeque::new();
-    let mut segment = Vec::new();
-    let mut buffer = [0u8; 4096];
-
-    let end_segment = |segment: &mut Vec<u8>, retained: &mut VecDeque<String>| {
-        if segment.is_empty() {
-            return;
-        }
-        let message = String::from_utf8_lossy(segment).trim().to_owned();
-        segment.clear();
-        if message.is_empty() {
-            return;
-        }
-        if retained.len() == RETAINED_GIT_OUTPUT_SEGMENTS {
-            retained.pop_front();
-        }
-        retained.push_back(message.clone());
-        let _ = sender.send(message);
-    };
-
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => {
-                for &byte in &buffer[..read] {
-                    if byte == b'\n' || byte == b'\r' {
-                        end_segment(&mut segment, &mut retained);
-                    } else {
-                        segment.push(byte);
-                    }
-                }
-            }
-            Err(error) => {
-                segment.extend_from_slice(format!("failed to read Git output: {error}").as_bytes());
-                break;
-            }
-        }
-    }
-    end_segment(&mut segment, &mut retained);
-    Vec::from(retained).join("\n")
 }
 
 fn validate_local_directory(path: &Path) -> Result<PathBuf, ProjectError> {
@@ -747,66 +664,11 @@ fn refresh_project(mut project: Project) -> Project {
     project
 }
 
+/// Describes a project root as a Git repository, or reports that it is not one.
+///
+/// Spawns nothing: this runs for every catalog entry on every ambient read.
 fn inspect_git(path: &Path) -> Result<Option<GitStatus>, ProjectError> {
-    let repository = match Repository::discover(path) {
-        Ok(repository) => repository,
-        Err(error) if error.code() == ErrorCode::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(ProjectError::GitInspection {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
-    };
-
-    // `discover` walks upward, so a plain directory nested inside a repository
-    // would otherwise report that ancestor's branch and dirty state as its
-    // own. Only the repository's own working directory counts as a Git
-    // project; bare repositories have no working directory at all.
-    let is_repository_root = repository
-        .workdir()
-        .and_then(|workdir| fs::canonicalize(workdir).ok())
-        .is_some_and(|workdir| workdir == path);
-    if !is_repository_root {
-        return Ok(None);
-    }
-
-    let branch = match repository.head() {
-        Ok(head) if head.is_branch() => Some(
-            head.shorthand()
-                .map_err(|source| ProjectError::GitInspection {
-                    path: path.to_path_buf(),
-                    source,
-                })?
-                .to_owned(),
-        ),
-        Ok(_) => None,
-        Err(error) if matches!(error.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => None,
-        Err(source) => {
-            return Err(ProjectError::GitInspection {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
-    };
-
-    // `dirty` only asks whether any entry differs, so untracked directories are
-    // left unrecursed: libgit2 still reports the directory itself, at a
-    // fraction of the cost of walking a large `target/` or `node_modules/`.
-    let mut options = StatusOptions::new();
-    options
-        .include_untracked(true)
-        .recurse_untracked_dirs(false)
-        .include_ignored(false);
-    let dirty = !repository
-        .statuses(Some(&mut options))
-        .map_err(|source| ProjectError::GitInspection {
-            path: path.to_path_buf(),
-            source,
-        })?
-        .is_empty();
-
-    Ok(Some(GitStatus { branch, dirty }))
+    git::status::inspect(path).map_err(Into::into)
 }
 
 fn display_name(root: &Path) -> String {
@@ -827,115 +689,24 @@ fn sort_recents(projects: &mut [Project]) {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs, io,
-        path::{Path, PathBuf},
-        process::{Child, Command},
-        sync::mpsc,
-        thread,
-        time::{Duration, Instant},
-    };
+    use std::{fs, path::Path, thread, time::Duration};
 
-    use git2::{IndexAddOption, Repository, Signature, Time};
-    use tempfile::TempDir;
-
-    use super::{CloneCancellation, ProjectError, ProjectService};
+    use super::{ProjectError, ProjectService};
     use crate::{
         catalog::{CATALOG_VERSION, entry::ProjectSource},
+        git::{CloneCancellation, GitError},
         paths::{
             CATALOG_FILE, CATALOG_LOCK_FILE, CHECKOUT_DIRECTORY, DATA_DIRECTORY_ENV,
             REPOSITORIES_DIRECTORY, WORKTREES_DIRECTORY,
+        },
+        testing::{
+            Fixture, PROCESS_GIT_EXECUTABLE_ENV, PROCESS_PROJECT_ROOT_ENV, PROCESS_READY_FILE_ENV,
+            commit_all, initialize_repository, spawn_child, wait_for_child_signal,
         },
     };
 
     /// Coarse enough for the ~15ms system clock granularity on Windows.
     const CLOCK_TICK: Duration = Duration::from_millis(25);
-
-    /// Fixed so repository fixtures hash identically between runs.
-    const COMMIT_EPOCH_SECONDS: i64 = 1_700_000_000;
-
-    const PROCESS_CHILD_TEST: &str = "project::tests::catalog_process_child";
-    const PROCESS_ROLE_ENV: &str = "HARKNESS_CATALOG_TEST_ROLE";
-    const PROCESS_DATA_DIR_ENV: &str = "HARKNESS_CATALOG_TEST_DATA_DIR";
-    const PROCESS_PROJECT_ROOT_ENV: &str = "HARKNESS_CATALOG_TEST_PROJECT_ROOT";
-    const PROCESS_READY_FILE_ENV: &str = "HARKNESS_CATALOG_TEST_READY_FILE";
-
-    /// Re-entered by the parent tests below so catalog locking crosses an OS
-    /// process boundary. Keeping the child in this test binary avoids a
-    /// fixture crate while ensuring it uses the production service methods.
-    #[test]
-    #[ignore = "only run as a child process by the catalog locking tests"]
-    fn catalog_process_child() {
-        let role = std::env::var(PROCESS_ROLE_ENV).expect("child role was not set");
-        let data_dir = std::env::var_os(PROCESS_DATA_DIR_ENV).expect("child data dir was not set");
-        let mut service = ProjectService::load_from_data_dir(data_dir).unwrap();
-
-        match role.as_str() {
-            "import" => {
-                let root = std::env::var_os(PROCESS_PROJECT_ROOT_ENV)
-                    .expect("child project root was not set");
-                service.import_local(root).unwrap();
-            }
-            "hold-lock" => {
-                let ready_file =
-                    std::env::var_os(PROCESS_READY_FILE_ENV).expect("child ready file was not set");
-                let _lock = service.lock_exclusive().unwrap();
-                fs::write(ready_file, b"ready").unwrap();
-                loop {
-                    thread::park();
-                }
-            }
-            "load-env" => {
-                let root = std::env::var_os(PROCESS_PROJECT_ROOT_ENV)
-                    .expect("child project root was not set");
-                // `load`, not `load_from_data_dir`: the point is that the
-                // environment alone redirects the platform data directory.
-                // Asserted before the import, so a regression fails here
-                // instead of writing to the developer's real catalog.
-                let mut overridden = ProjectService::load().unwrap();
-                assert_eq!(overridden.data_dir, service.data_dir);
-                overridden.import_local(root).unwrap();
-            }
-            "default-data-dir" => {
-                // Spawned with the override removed, so this asserts the
-                // unset path still resolves the platform data directory.
-                assert_eq!(
-                    crate::paths::data_directory(),
-                    dirs::data_dir().map(|data_dir| data_dir.join("harkness"))
-                );
-            }
-            _ => panic!("unknown catalog test child role: {role}"),
-        }
-    }
-
-    fn spawn_catalog_child(data_dir: &Path, role: &str) -> Command {
-        let mut command = Command::new(std::env::current_exe().unwrap());
-        command
-            .arg("--exact")
-            .arg(PROCESS_CHILD_TEST)
-            .arg("--ignored")
-            .env(PROCESS_ROLE_ENV, role)
-            .env(PROCESS_DATA_DIR_ENV, data_dir);
-        command
-    }
-
-    fn wait_for_child_signal(child: &mut Child, signal: &Path) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if signal.exists() {
-                return;
-            }
-            if let Some(status) = child.try_wait().unwrap() {
-                panic!("catalog test child exited before signalling readiness: {status}");
-            }
-            if Instant::now() >= deadline {
-                child.kill().unwrap();
-                child.wait().unwrap();
-                panic!("catalog test child did not signal readiness within 10 seconds");
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
 
     #[test]
     fn catalog_round_trip_preserves_project_data() {
@@ -958,7 +729,7 @@ mod tests {
     fn the_data_directory_environment_override_redirects_load() {
         let fixture = Fixture::new();
         let project_root = fixture.directory("environment-override");
-        let mut child = spawn_catalog_child(&fixture.data_dir, "load-env")
+        let mut child = spawn_child(&fixture.data_dir, "load-env")
             .env(DATA_DIRECTORY_ENV, &fixture.data_dir)
             .env(PROCESS_PROJECT_ROOT_ENV, &project_root)
             .spawn()
@@ -976,7 +747,7 @@ mod tests {
     #[test]
     fn an_unset_data_directory_override_resolves_the_platform_directory() {
         let fixture = Fixture::new();
-        let mut child = spawn_catalog_child(&fixture.data_dir, "default-data-dir")
+        let mut child = spawn_child(&fixture.data_dir, "default-data-dir")
             .env_remove(DATA_DIRECTORY_ENV)
             .spawn()
             .unwrap();
@@ -1064,7 +835,7 @@ mod tests {
         let mut children = roots
             .iter()
             .map(|root| {
-                spawn_catalog_child(&fixture.data_dir, "import")
+                spawn_child(&fixture.data_dir, "import")
                     .env(PROCESS_PROJECT_ROOT_ENV, root)
                     .spawn()
                     .unwrap()
@@ -1089,7 +860,7 @@ mod tests {
         let imported_after_kill_root = fixture.directory("imported-after-kill");
         let seeded = fixture.service().import_local(&seeded_root).unwrap();
         let ready_file = fixture.root.path().join("lock-held");
-        let mut child = spawn_catalog_child(&fixture.data_dir, "hold-lock")
+        let mut child = spawn_child(&fixture.data_dir, "hold-lock")
             .env(PROCESS_READY_FILE_ENV, &ready_file)
             .spawn()
             .unwrap();
@@ -1889,109 +1660,94 @@ mod tests {
         assert!(imported.root.join(".git").exists());
     }
 
-    /// Git overwrites a progress phase with carriage returns and only emits a
-    /// newline when the phase ends, so line-oriented reads report nothing for
-    /// the whole of the slowest phase.
+    /// Availability and Git state are recomputed for every entry on every read,
+    /// so a listing that spawned Git would cost one process per project.
+    #[cfg(unix)]
     #[test]
-    fn carriage_returns_end_a_progress_segment() {
-        let (sender, receiver) = mpsc::channel();
-        let output = "Cloning into 'x'...\nReceiving objects:  50% (1/2)\rReceiving objects: 100% (2/2), done.\n";
-
-        let retained = super::read_git_output(io::Cursor::new(output), &sender);
-        drop(sender);
-
-        assert_eq!(
-            receiver.iter().collect::<Vec<_>>(),
-            [
-                "Cloning into 'x'...",
-                "Receiving objects:  50% (1/2)",
-                "Receiving objects: 100% (2/2), done.",
-            ]
+    fn listing_spawns_no_git_process() {
+        let fixture = Fixture::new();
+        let project_root = fixture.directory("listed-repository");
+        initialize_repository(&project_root);
+        let sentinel = fixture.root.path().join("git-was-spawned");
+        let recording_git = fixture.shim(
+            "recording-git",
+            &format!("#!/bin/sh\ntouch '{}'\n", sentinel.display()),
         );
-        assert!(retained.ends_with("Receiving objects: 100% (2/2), done."));
+        let mut service = fixture.service();
+        service.git_executable = recording_git;
+        service.import_local(&project_root).unwrap();
+
+        let listed = service.list();
+
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].git.is_some(), "the listing reported Git state");
+        assert!(!sentinel.exists(), "the listing spawned the Git executable");
     }
 
+    /// Set through `Command::env` on a re-executed child rather than
+    /// `std::env::set_var`, which is unsound in a multithreaded test binary
+    /// under Rust 2024.
+    #[cfg(unix)]
     #[test]
-    fn retained_git_output_keeps_only_the_diagnostic_tail() {
-        let (sender, receiver) = mpsc::channel();
-        let mut output = (0..500).fold(String::new(), |mut output, index| {
-            output.push_str(&format!("Receiving objects: {index}%\r"));
-            output
-        });
-        output.push_str("fatal: repository not found\n");
-
-        let retained = super::read_git_output(io::Cursor::new(output), &sender);
-        drop(sender);
-
-        assert_eq!(receiver.iter().count(), 501, "every update is forwarded");
-        assert_eq!(
-            retained.lines().count(),
-            super::RETAINED_GIT_OUTPUT_SEGMENTS
+    fn a_redirected_parent_environment_does_not_reach_git() {
+        let fixture = Fixture::new();
+        let working_directory = fixture.directory("scrubbed");
+        let elsewhere = fixture.directory("elsewhere");
+        let reporting_git = fixture.shim(
+            "reporting-git",
+            "#!/bin/sh\n\
+             for name in GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+                 GIT_TERMINAL_PROMPT GIT_OPTIONAL_LOCKS; do\n\
+             \x20 eval \"value=\\${$name-unset}\"\n\
+             \x20 printf '%s=%s\\n' \"$name\" \"$value\"\n\
+             done\n",
         );
-        assert!(retained.ends_with("fatal: repository not found"));
+
+        let mut child = spawn_child(&fixture.data_dir, "scrubbed-environment")
+            .env(PROCESS_PROJECT_ROOT_ENV, &working_directory)
+            .env(PROCESS_GIT_EXECUTABLE_ENV, &reporting_git)
+            .env("GIT_DIR", elsewhere.join(".git"))
+            .env("GIT_WORK_TREE", &elsewhere)
+            .env("GIT_INDEX_FILE", elsewhere.join("index"))
+            .env("GIT_OBJECT_DIRECTORY", elsewhere.join("objects"))
+            .spawn()
+            .unwrap();
+
+        assert!(child.wait().unwrap().success());
     }
 
-    fn initialize_repository(path: &Path) -> Repository {
-        let repository = Repository::init(path).unwrap();
-        repository.set_head("refs/heads/main").unwrap();
-        fs::write(path.join("tracked.txt"), "initial\n").unwrap();
-        commit_all(&repository, "initial");
-        repository
-    }
-
-    /// Commits every non-ignored file in the worktree onto the current head.
-    fn commit_all(repository: &Repository, message: &str) {
-        let mut index = repository.index().unwrap();
-        index.add_all(["*"], IndexAddOption::DEFAULT, None).unwrap();
-        index.write().unwrap();
-        let tree_id = index.write_tree().unwrap();
-        let tree = repository.find_tree(tree_id).unwrap();
-        let signature = Signature::new(
-            "Harkness Tests",
-            "tests@harkness.invalid",
-            &Time::new(COMMIT_EPOCH_SECONDS, 0),
-        )
-        .unwrap();
-        let parents = repository
-            .head()
-            .ok()
-            .and_then(|head| head.target())
-            .map(|id| repository.find_commit(id).unwrap())
-            .into_iter()
-            .collect::<Vec<_>>();
-
-        repository
-            .commit(
-                Some("HEAD"),
-                &signature,
-                &signature,
-                message,
-                &tree,
-                &parents.iter().collect::<Vec<_>>(),
+    /// The repository lock is taken before the catalog lock, so a removal
+    /// blocked by another operation refuses rather than waiting behind it.
+    #[test]
+    fn managed_removal_refuses_while_another_operation_holds_the_repository() {
+        let fixture = Fixture::new();
+        let remote = fixture.directory("busy-remote");
+        initialize_repository(&remote);
+        let mut service = fixture.service();
+        let managed = service
+            .import_repository(
+                remote.to_str().unwrap(),
+                &CloneCancellation::default(),
+                |_| {},
             )
             .unwrap();
-    }
+        let ready_file = fixture.root.path().join("managed-lock-held");
+        let mut holder = spawn_child(&fixture.data_dir, "hold-repository-lock")
+            .env(PROCESS_PROJECT_ROOT_ENV, &managed.root)
+            .env(PROCESS_READY_FILE_ENV, &ready_file)
+            .spawn()
+            .unwrap();
+        wait_for_child_signal(&mut holder, &ready_file);
 
-    struct Fixture {
-        root: TempDir,
-        data_dir: PathBuf,
-    }
+        let error = service.remove_managed(managed.id).unwrap_err();
 
-    impl Fixture {
-        fn new() -> Self {
-            let root = tempfile::tempdir().unwrap();
-            let data_dir = root.path().join("data");
-            Self { root, data_dir }
-        }
-
-        fn directory(&self, name: &str) -> PathBuf {
-            let path = self.root.path().join(name);
-            fs::create_dir(&path).unwrap();
-            path
-        }
-
-        fn service(&self) -> ProjectService {
-            ProjectService::load_for_test(&self.data_dir).unwrap()
-        }
+        holder.kill().unwrap();
+        holder.wait().unwrap();
+        assert!(
+            matches!(error, ProjectError::Git(GitError::RepositoryBusy { .. })),
+            "{error}"
+        );
+        assert!(managed.root.exists(), "the checkout was deleted anyway");
+        assert_eq!(service.list().len(), 1);
     }
 }
