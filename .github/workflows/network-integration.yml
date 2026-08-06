@@ -1,4 +1,4 @@
-name: Network integration tests
+name: Tests
 
 on:
   pull_request:
@@ -8,8 +8,36 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  core:
+    name: Core (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache Cargo dependencies and build output
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - name: Test core
+        run: cargo test --locked -p harkness-core
+
   github-remote-import:
+    name: GitHub remote import
     runs-on: [self-hosted, Linux, X64, harkness]
     timeout-minutes: 10
     steps:
