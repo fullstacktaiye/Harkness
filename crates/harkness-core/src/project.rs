@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    fs,
+    fs::{self, File},
     io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 const CATALOG_VERSION: u32 = 1;
 const CATALOG_FILE: &str = "projects.json";
+const CATALOG_LOCK_FILE: &str = "projects.lock";
 const WORKTREES_DIRECTORY: &str = "worktrees";
 const REPOSITORIES_DIRECTORY: &str = "repositories";
 const CHECKOUT_DIRECTORY: &str = "checkout";
@@ -162,6 +163,18 @@ pub enum ProjectError {
         source: io::Error,
     },
 
+    /// Another service instance currently owns the project catalog.
+    #[error("project catalog '{path}' is already in use by another Harkness process")]
+    CatalogInUse { path: PathBuf },
+
+    /// The catalog lock file could not be created or locked.
+    #[error("failed to lock project catalog '{path}': {source}")]
+    CatalogLock {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
     /// The catalog contains invalid JSON or does not match the catalog schema.
     #[error("project catalog '{}' is malformed: {source}", path.display())]
     MalformedCatalog {
@@ -252,13 +265,15 @@ impl CloneCancellation {
 /// Loads and updates the durable local project catalog.
 ///
 /// A service instance owns a snapshot of the catalog taken when it was loaded,
-/// and every mutation rewrites the whole file. Harkness therefore assumes a
-/// single writer at a time: two processes holding their own service would each
-/// persist their own snapshot, and the last write would win. Front ends that
-/// need to share a catalog should serialize access or reload between changes.
+/// and every mutation rewrites the whole file. An exclusive advisory lock is
+/// therefore held for the service's lifetime so a second process cannot load a
+/// competing snapshot and silently overwrite newer changes.
 pub struct ProjectService {
     data_dir: PathBuf,
     catalog: Catalog,
+    // The handle owns the advisory lock. It is intentionally retained even
+    // though no I/O is performed through it.
+    _catalog_lock: File,
 }
 
 impl ProjectService {
@@ -276,6 +291,33 @@ impl ProjectService {
     /// catalog file is always named `projects.json` within `data_dir`.
     pub fn load_from_data_dir(data_dir: impl Into<PathBuf>) -> Result<Self, ProjectError> {
         let data_dir = data_dir.into();
+        fs::create_dir_all(&data_dir).map_err(|source| ProjectError::CatalogLock {
+            path: data_dir.join(CATALOG_LOCK_FILE),
+            source,
+        })?;
+        let lock_path = data_dir.join(CATALOG_LOCK_FILE);
+        let catalog_lock = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|source| ProjectError::CatalogLock {
+                path: lock_path.clone(),
+                source,
+            })?;
+        match catalog_lock.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(ProjectError::CatalogInUse { path: lock_path });
+            }
+            Err(fs::TryLockError::Error(source)) => {
+                return Err(ProjectError::CatalogLock {
+                    path: lock_path,
+                    source,
+                });
+            }
+        }
         let catalog_path = data_dir.join(CATALOG_FILE);
         let catalog = match catalog_path.try_exists() {
             Ok(false) => Catalog::default(),
@@ -314,7 +356,11 @@ impl ProjectService {
             }
         };
 
-        Ok(Self { data_dir, catalog })
+        Ok(Self {
+            data_dir,
+            catalog,
+            _catalog_lock: catalog_lock,
+        })
     }
 
     /// Lists projects by most-recently-opened order with current availability
@@ -878,8 +924,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        CATALOG_FILE, CATALOG_VERSION, CHECKOUT_DIRECTORY, CloneCancellation, ProjectError,
-        ProjectService, ProjectSource, REPOSITORIES_DIRECTORY, WORKTREES_DIRECTORY,
+        CATALOG_FILE, CATALOG_LOCK_FILE, CATALOG_VERSION, CHECKOUT_DIRECTORY, CloneCancellation,
+        ProjectError, ProjectService, ProjectSource, REPOSITORIES_DIRECTORY, WORKTREES_DIRECTORY,
     };
 
     /// Coarse enough for the ~15ms system clock granularity on Windows.
@@ -895,11 +941,28 @@ mod tests {
         let mut service = fixture.service();
 
         let imported = service.import_local(&project_root).unwrap();
+        let expected = service.list();
+        drop(service);
         let reloaded = ProjectService::load_from_data_dir(&fixture.data_dir).unwrap();
 
         assert_eq!(reloaded.catalog.version, CATALOG_VERSION);
-        assert_eq!(reloaded.list(), service.list());
+        assert_eq!(reloaded.list(), expected);
         assert_eq!(reloaded.list(), vec![imported]);
+    }
+
+    #[test]
+    fn catalog_has_only_one_service_owner_at_a_time() {
+        let fixture = Fixture::new();
+        let service = fixture.service();
+
+        assert!(matches!(
+            ProjectService::load_from_data_dir(&fixture.data_dir),
+            Err(ProjectError::CatalogInUse { path })
+                if path == fixture.data_dir.join(CATALOG_LOCK_FILE)
+        ));
+
+        drop(service);
+        assert!(ProjectService::load_from_data_dir(&fixture.data_dir).is_ok());
     }
 
     #[test]
@@ -1070,6 +1133,7 @@ mod tests {
             Err(ProjectError::ProjectUnavailable { id, .. }) if id == imported.id
         ));
 
+        drop(service);
         let reloaded = ProjectService::load_from_data_dir(&fixture.data_dir).unwrap();
         assert!(!reloaded.list()[0].available);
     }
@@ -1184,10 +1248,8 @@ mod tests {
     fn failed_persistence_does_not_change_in_memory_state() {
         let fixture = Fixture::new();
         let project_root = fixture.directory("persistence-project");
-        fs::create_dir(&fixture.data_dir).unwrap();
         let mut service = fixture.service();
-        fs::remove_dir(&fixture.data_dir).unwrap();
-        fs::write(&fixture.data_dir, "blocks directory recreation").unwrap();
+        fs::create_dir(fixture.data_dir.join(CATALOG_FILE)).unwrap();
 
         assert!(matches!(
             service.import_local(project_root),
@@ -1209,7 +1271,10 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
-        assert_eq!(entries, vec![CATALOG_FILE]);
+        assert_eq!(entries.len(), 2);
+        assert!(entries.contains(&CATALOG_FILE.into()));
+        assert!(entries.contains(&CATALOG_LOCK_FILE.into()));
+        drop(service);
         assert!(ProjectService::load_from_data_dir(&fixture.data_dir).is_ok());
     }
 
