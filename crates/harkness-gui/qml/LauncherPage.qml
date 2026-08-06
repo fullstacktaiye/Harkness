@@ -58,34 +58,6 @@ Kirigami.ScrollablePage {
         spacing: Kirigami.Units.largeSpacing * 2
         width: launcher.width - Kirigami.Units.largeSpacing * 2
 
-        // Hero: wordmark and tagline.
-        RowLayout {
-            Layout.fillWidth: true
-            Layout.topMargin: Kirigami.Units.largeSpacing
-            spacing: Kirigami.Units.largeSpacing
-
-            Kirigami.Icon {
-                Layout.preferredHeight: Kirigami.Units.iconSizes.huge
-                Layout.preferredWidth: Kirigami.Units.iconSizes.huge
-                source: "applications-development"
-            }
-
-            ColumnLayout {
-                Layout.fillWidth: true
-                spacing: 0
-
-                Kirigami.Heading {
-                    level: 1
-                    text: qsTr("Harkness")
-                }
-
-                Controls.Label {
-                    color: Kirigami.Theme.disabledTextColor
-                    text: qsTr("Open a project to get started.")
-                }
-            }
-        }
-
         // The two ways in. Cards adapt: side by side when wide, stacked when narrow.
         GridLayout {
             id: actionGrid
