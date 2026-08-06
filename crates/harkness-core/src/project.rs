@@ -1,6 +1,7 @@
 use std::{
+    collections::VecDeque,
     fs,
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -24,6 +25,11 @@ const CATALOG_FILE: &str = "projects.json";
 const WORKTREES_DIRECTORY: &str = "worktrees";
 const REPOSITORIES_DIRECTORY: &str = "repositories";
 const CHECKOUT_DIRECTORY: &str = "checkout";
+
+/// Git repeats a progress phase on every update, so retaining the whole stream
+/// would put megabytes of overwritten counters into a failure message. The tail
+/// is what matters: Git prints its diagnosis last.
+const RETAINED_GIT_OUTPUT_SEGMENTS: usize = 20;
 
 /// A stable identifier for a project catalog entry.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -243,35 +249,6 @@ impl CloneCancellation {
     }
 }
 
-/// Progress emitted from Git's standard-error stream.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CloneProgress {
-    pub message: String,
-}
-
-/// A repository clone running on a worker thread.
-pub struct CloneTask {
-    cancellation: CloneCancellation,
-    worker: thread::JoinHandle<Result<Project, ProjectError>>,
-}
-
-impl CloneTask {
-    /// Returns a token that can cancel this task from another thread.
-    #[must_use]
-    pub fn cancellation(&self) -> CloneCancellation {
-        self.cancellation.clone()
-    }
-
-    /// Waits for the worker and returns its result.
-    pub fn join(self) -> Result<Project, ProjectError> {
-        self.worker.join().unwrap_or_else(|_| {
-            Err(ProjectError::CloneFailed {
-                stderr: "repository clone worker panicked".to_owned(),
-            })
-        })
-    }
-}
-
 /// Loads and updates the durable local project catalog.
 ///
 /// A service instance owns a snapshot of the catalog taken when it was loaded,
@@ -338,29 +315,6 @@ impl ProjectService {
         };
 
         Ok(Self { data_dir, catalog })
-    }
-
-    /// Starts an import without blocking the calling thread.
-    ///
-    /// The worker loads and updates the catalog at `data_dir`; callers should
-    /// reload any older [`ProjectService`] snapshot after the task completes.
-    pub fn import_repository_async(
-        data_dir: impl Into<PathBuf>,
-        remote: impl Into<String>,
-        on_progress: impl FnMut(CloneProgress) + Send + 'static,
-    ) -> CloneTask {
-        let data_dir = data_dir.into();
-        let remote = remote.into();
-        let cancellation = CloneCancellation::default();
-        let worker_cancellation = cancellation.clone();
-        let worker = thread::spawn(move || {
-            let mut service = Self::load_from_data_dir(data_dir)?;
-            service.import_repository(&remote, &worker_cancellation, on_progress)
-        });
-        CloneTask {
-            cancellation,
-            worker,
-        }
     }
 
     /// Lists projects by most-recently-opened order with current availability
@@ -462,28 +416,40 @@ impl ProjectService {
     /// Clones a GitHub repository with the system Git executable.
     ///
     /// This method waits for Git, so GUI callers should invoke it on a worker
-    /// thread. Progress is delivered as Git writes lines to standard error,
+    /// thread. Progress arrives as Git writes each update to standard error,
     /// and cancellation is cooperative through `cancellation`.
     pub fn import_repository(
         &mut self,
         remote: &str,
         cancellation: &CloneCancellation,
-        mut on_progress: impl FnMut(CloneProgress),
+        mut on_progress: impl FnMut(String),
     ) -> Result<Project, ProjectError> {
+        // Git reads its argument literally, so surrounding whitespace from a
+        // pasted URL would reach it as part of the protocol name.
+        let remote = remote.trim();
         let normalized = normalize_remote(remote)?;
         let mut candidate = self.catalog.clone();
-        if let Some(project) = candidate
+        if let Some(index) = candidate
             .projects
-            .iter_mut()
-            .find(|project| project.remote.as_deref() == Some(&normalized))
+            .iter()
+            .position(|project| project.remote.as_deref() == Some(&normalized))
         {
-            project.last_opened = OffsetDateTime::now_utc();
-            let reopened = refresh_project(project.clone());
-            *project = reopened.clone();
-            sort_recents(&mut candidate.projects);
-            self.persist(&candidate)?;
-            self.catalog = candidate;
-            return Ok(reopened);
+            let reopened = refresh_project(candidate.projects[index].clone());
+            if reopened.available {
+                let reopened = Project {
+                    last_opened: OffsetDateTime::now_utc(),
+                    ..reopened
+                };
+                candidate.projects[index] = reopened.clone();
+                sort_recents(&mut candidate.projects);
+                self.persist(&candidate)?;
+                self.catalog = candidate;
+                return Ok(reopened);
+            }
+            // The checkout was deleted outside Harkness. Reporting a
+            // successful import of a path that no longer exists would strand
+            // the user, so the stale entry is dropped and the clone repeated.
+            candidate.projects.remove(index);
         }
 
         let id = ProjectId::new();
@@ -497,43 +463,37 @@ impl ProjectService {
             source,
         })?;
 
-        let clone_result = run_git_clone(remote, &checkout, cancellation, &mut on_progress);
-        if let Err(error) = clone_result {
-            let _ = fs::remove_dir_all(&managed_directory);
-            return Err(error);
-        }
+        // Every failure past this point can leave a partial checkout behind, so
+        // the rest of the import runs in one fallible block with one cleanup.
+        let imported = (|| {
+            run_git_clone(remote, &checkout, cancellation, &mut on_progress)?;
+            let canonical_root = validate_local_directory(&checkout)?;
+            let project = Project {
+                id,
+                display_name: repository_name(&normalized),
+                root: canonical_root.clone(),
+                source: ProjectSource::ManagedRepository,
+                remote: Some(normalized),
+                last_opened: OffsetDateTime::now_utc(),
+                available: true,
+                git: inspect_git(&canonical_root)?,
+            };
+            candidate.projects.push(project.clone());
+            sort_recents(&mut candidate.projects);
+            self.persist(&candidate)?;
+            Ok(project)
+        })();
 
-        let canonical_root = match validate_local_directory(&checkout) {
-            Ok(root) => root,
+        match imported {
+            Ok(project) => {
+                self.catalog = candidate;
+                Ok(project)
+            }
             Err(error) => {
                 let _ = fs::remove_dir_all(&managed_directory);
-                return Err(error);
+                Err(error)
             }
-        };
-        let project = Project {
-            id,
-            display_name: repository_name(&normalized),
-            root: canonical_root.clone(),
-            source: ProjectSource::ManagedRepository,
-            remote: Some(normalized),
-            last_opened: OffsetDateTime::now_utc(),
-            available: true,
-            git: match inspect_git(&canonical_root) {
-                Ok(git) => git,
-                Err(error) => {
-                    let _ = fs::remove_dir_all(&managed_directory);
-                    return Err(error);
-                }
-            },
-        };
-        candidate.projects.push(project.clone());
-        sort_recents(&mut candidate.projects);
-        if let Err(error) = self.persist(&candidate) {
-            let _ = fs::remove_dir_all(&managed_directory);
-            return Err(error);
         }
-        self.catalog = candidate;
-        Ok(project)
     }
 
     /// Deletes a checkout only after proving it is the managed path for `id`.
@@ -548,34 +508,27 @@ impl ProjectService {
             .find(|project| project.id == id)
             .cloned()
             .ok_or(ProjectError::ProjectNotFound(id))?;
-        let managed_directory = self
-            .data_dir
-            .join(REPOSITORIES_DIRECTORY)
-            .join(id.to_string());
-        let expected_checkout = managed_directory.join(CHECKOUT_DIRECTORY);
-
         if project.source != ProjectSource::ManagedRepository || project.remote.is_none() {
             return Err(unsafe_removal(
                 &project,
                 "catalog entry is not a managed clone",
             ));
         }
-        if project.root != expected_checkout {
-            return Err(unsafe_removal(
-                &project,
-                "catalog path is not the expected managed checkout",
-            ));
-        }
+
+        // Both sides must be canonical. `Project::root` was canonicalized at
+        // import, so a symlink anywhere above the data directory would make a
+        // literal comparison against `data_dir` fail for every managed clone.
+        // Equality also subsumes a containment check: a checkout that resolves
+        // outside managed storage, or through a symlink, cannot match.
         let repositories_root = fs::canonicalize(self.data_dir.join(REPOSITORIES_DIRECTORY))
             .map_err(|_| unsafe_removal(&project, "managed repositories root is unavailable"))?;
+        let managed_directory = repositories_root.join(id.to_string());
         let canonical_checkout = fs::canonicalize(&project.root)
             .map_err(|_| unsafe_removal(&project, "checkout is unavailable"))?;
-        if !canonical_checkout.starts_with(&repositories_root)
-            || canonical_checkout != expected_checkout
-        {
+        if canonical_checkout != managed_directory.join(CHECKOUT_DIRECTORY) {
             return Err(unsafe_removal(
                 &project,
-                "checkout resolves outside managed storage or through a symlink",
+                "checkout is not the managed path reserved for this project",
             ));
         }
 
@@ -619,7 +572,7 @@ fn run_git_clone(
     remote: &str,
     checkout: &Path,
     cancellation: &CloneCancellation,
-    on_progress: &mut impl FnMut(CloneProgress),
+    on_progress: &mut impl FnMut(String),
 ) -> Result<(), ProjectError> {
     let mut child = Command::new("git")
         .args(["clone", "--progress", "--", remote])
@@ -631,27 +584,11 @@ fn run_git_clone(
         .map_err(|source| ProjectError::GitLaunch { source })?;
     let stderr = child.stderr.take().expect("piped stderr");
     let (sender, receiver) = mpsc::channel();
-    let reader = thread::spawn(move || {
-        let mut captured = String::new();
-        for line in BufReader::new(stderr).lines() {
-            match line {
-                Ok(line) => {
-                    captured.push_str(&line);
-                    captured.push('\n');
-                    let _ = sender.send(line);
-                }
-                Err(error) => {
-                    captured.push_str(&format!("failed to read Git output: {error}\n"));
-                    break;
-                }
-            }
-        }
-        captured
-    });
+    let reader = thread::spawn(move || read_git_output(stderr, &sender));
 
     loop {
         while let Ok(message) = receiver.try_recv() {
-            on_progress(CloneProgress { message });
+            on_progress(message);
         }
         if cancellation.is_cancelled() {
             let _ = child.kill();
@@ -667,59 +604,104 @@ fn run_git_clone(
                 .join()
                 .unwrap_or_else(|_| "Git output reader failed".to_owned());
             while let Ok(message) = receiver.try_recv() {
-                on_progress(CloneProgress { message });
+                on_progress(message);
             }
             return if status.success() {
                 Ok(())
             } else {
-                Err(ProjectError::CloneFailed {
-                    stderr: stderr.trim().to_owned(),
-                })
+                Err(ProjectError::CloneFailed { stderr })
             };
         }
         thread::sleep(Duration::from_millis(20));
     }
 }
 
+/// Forwards Git's standard-error segments and returns the retained tail.
+///
+/// Git separates the updates within a progress phase with carriage returns and
+/// only emits a newline when the phase ends, so reading lines would report
+/// nothing for the whole of the slowest phase and then deliver every
+/// overwritten counter at once. Both separators end a segment here.
+fn read_git_output(stderr: impl Read, sender: &mpsc::Sender<String>) -> String {
+    let mut reader = BufReader::new(stderr);
+    let mut retained: VecDeque<String> = VecDeque::new();
+    let mut segment = Vec::new();
+    let mut buffer = [0u8; 4096];
+
+    let end_segment = |segment: &mut Vec<u8>, retained: &mut VecDeque<String>| {
+        if segment.is_empty() {
+            return;
+        }
+        let message = String::from_utf8_lossy(segment).trim().to_owned();
+        segment.clear();
+        if message.is_empty() {
+            return;
+        }
+        if retained.len() == RETAINED_GIT_OUTPUT_SEGMENTS {
+            retained.pop_front();
+        }
+        retained.push_back(message.clone());
+        let _ = sender.send(message);
+    };
+
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                for &byte in &buffer[..read] {
+                    if byte == b'\n' || byte == b'\r' {
+                        end_segment(&mut segment, &mut retained);
+                    } else {
+                        segment.push(byte);
+                    }
+                }
+            }
+            Err(error) => {
+                segment.extend_from_slice(format!("failed to read Git output: {error}").as_bytes());
+                break;
+            }
+        }
+    }
+    end_segment(&mut segment, &mut retained);
+    Vec::from(retained).join("\n")
+}
+
 fn normalize_remote(remote: &str) -> Result<String, ProjectError> {
     let remote = remote.trim();
-    let path = if let Some(path) = remote.strip_prefix("https://github.com/") {
-        path
-    } else if let Some(path) = remote.strip_prefix("http://github.com/") {
-        path
-    } else if let Some(path) = remote.strip_prefix("ssh://git@github.com/") {
-        path
-    } else if let Some(path) = remote.strip_prefix("git@github.com:") {
-        path
-    } else if let Some(path) = remote.strip_prefix("file://") {
-        return fs::canonicalize(path)
-            .map(|path| format!("file://{}", path.display()))
-            .map_err(|_| ProjectError::InvalidRemote {
-                remote: remote.to_owned(),
-            });
-    } else if let Ok(path) = fs::canonicalize(remote) {
-        return Ok(format!("file://{}", path.display()));
-    } else {
-        return Err(ProjectError::InvalidRemote {
-            remote: remote.to_owned(),
-        });
+    let invalid = || ProjectError::InvalidRemote {
+        remote: remote.to_owned(),
     };
-    let path = path
-        .trim_end_matches('/')
-        .strip_suffix(".git")
-        .unwrap_or(path.trim_end_matches('/'));
+    let local = |path: &str| {
+        fs::canonicalize(path)
+            .map(|path| format!("file://{}", path.display()))
+            .map_err(|_| invalid())
+    };
+
+    let Some(path) = remote
+        .strip_prefix("https://github.com/")
+        .or_else(|| remote.strip_prefix("http://github.com/"))
+        .or_else(|| remote.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| remote.strip_prefix("git@github.com:"))
+    else {
+        return local(remote.strip_prefix("file://").unwrap_or(remote));
+    };
+
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
     let mut parts = path.split('/');
-    let owner = parts.next().filter(|part| !part.is_empty());
-    let repository = parts.next().filter(|part| !part.is_empty());
-    if owner.is_none() || repository.is_none() || parts.next().is_some() {
-        return Err(ProjectError::InvalidRemote {
-            remote: remote.to_owned(),
-        });
+    let (Some(owner), Some(repository)) = (
+        parts.next().filter(|part| !part.is_empty()),
+        parts.next().filter(|part| !part.is_empty()),
+    ) else {
+        return Err(invalid());
+    };
+    if parts.next().is_some() {
+        return Err(invalid());
     }
     Ok(format!(
         "github.com/{}/{}",
-        owner.unwrap().to_ascii_lowercase(),
-        repository.unwrap().to_ascii_lowercase()
+        owner.to_ascii_lowercase(),
+        repository.to_ascii_lowercase()
     ))
 }
 
@@ -878,8 +860,9 @@ fn sort_recents(projects: &mut [Project]) {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
+        fs, io,
         path::{Path, PathBuf},
+        sync::mpsc,
         thread,
         time::Duration,
     };
@@ -1413,6 +1396,129 @@ mod tests {
             Err(ProjectError::UnsafeManagedRemoval { .. })
         ));
         assert!(outside.exists());
+    }
+
+    /// A symlinked data directory is ordinary: `XDG_DATA_HOME` may point across
+    /// volumes, and macOS resolves its temporary directories through
+    /// `/private`. Comparing a canonical `Project::root` against a literal
+    /// `data_dir` made every managed clone permanently undeletable there.
+    #[cfg(unix)]
+    #[test]
+    fn managed_removal_succeeds_through_a_symlinked_data_directory() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        let real_data_dir = fixture.directory("real-data");
+        symlink(&real_data_dir, &fixture.data_dir).unwrap();
+        let remote = fixture.directory("linked-remote");
+        initialize_repository(&remote);
+        let mut service = fixture.service();
+        let managed = service
+            .import_repository(
+                remote.to_str().unwrap(),
+                &CloneCancellation::default(),
+                |_| {},
+            )
+            .unwrap();
+        assert!(
+            managed
+                .root
+                .starts_with(fs::canonicalize(&real_data_dir).unwrap())
+        );
+
+        service.remove_managed(managed.id).unwrap();
+
+        assert!(!managed.root.exists());
+        assert!(service.list().is_empty());
+    }
+
+    #[test]
+    fn reimport_reclones_a_checkout_deleted_outside_harkness() {
+        let fixture = Fixture::new();
+        let remote = fixture.directory("vanishing-remote");
+        initialize_repository(&remote);
+        let mut service = fixture.service();
+        let imported = service
+            .import_repository(
+                remote.to_str().unwrap(),
+                &CloneCancellation::default(),
+                |_| {},
+            )
+            .unwrap();
+        fs::remove_dir_all(imported.root.parent().unwrap()).unwrap();
+
+        let recloned = service
+            .import_repository(
+                remote.to_str().unwrap(),
+                &CloneCancellation::default(),
+                |_| {},
+            )
+            .unwrap();
+
+        assert_ne!(recloned.id, imported.id);
+        assert!(recloned.available);
+        assert!(recloned.root.join(".git").exists());
+        assert_eq!(service.list().len(), 1);
+    }
+
+    #[test]
+    fn remotes_are_trimmed_before_reaching_git() {
+        let fixture = Fixture::new();
+        let remote = fixture.directory("padded-remote");
+        initialize_repository(&remote);
+        let mut service = fixture.service();
+
+        let imported = service
+            .import_repository(
+                &format!("  {}\n", remote.display()),
+                &CloneCancellation::default(),
+                |_| {},
+            )
+            .unwrap();
+
+        assert!(imported.root.join(".git").exists());
+    }
+
+    /// Git overwrites a progress phase with carriage returns and only emits a
+    /// newline when the phase ends, so line-oriented reads report nothing for
+    /// the whole of the slowest phase.
+    #[test]
+    fn carriage_returns_end_a_progress_segment() {
+        let (sender, receiver) = mpsc::channel();
+        let output = "Cloning into 'x'...\nReceiving objects:  50% (1/2)\rReceiving objects: 100% (2/2), done.\n";
+
+        let retained = super::read_git_output(io::Cursor::new(output), &sender);
+        drop(sender);
+
+        assert_eq!(
+            receiver.iter().collect::<Vec<_>>(),
+            [
+                "Cloning into 'x'...",
+                "Receiving objects:  50% (1/2)",
+                "Receiving objects: 100% (2/2), done.",
+            ]
+        );
+        assert!(retained.ends_with("Receiving objects: 100% (2/2), done."));
+    }
+
+    #[test]
+    fn retained_git_output_keeps_only_the_diagnostic_tail() {
+        let (sender, receiver) = mpsc::channel();
+        let mut output = (0..500).fold(String::new(), |mut output, index| {
+            output.push_str(&format!("Receiving objects: {index}%\r"));
+            output
+        });
+        output.push_str("fatal: repository not found\n");
+
+        let retained = super::read_git_output(io::Cursor::new(output), &sender);
+        drop(sender);
+
+        assert_eq!(receiver.iter().count(), 501, "every update is forwarded");
+        assert_eq!(
+            retained.lines().count(),
+            super::RETAINED_GIT_OUTPUT_SEGMENTS
+        );
+        assert!(retained.ends_with("fatal: repository not found"));
     }
 
     fn initialize_repository(path: &Path) -> Repository {

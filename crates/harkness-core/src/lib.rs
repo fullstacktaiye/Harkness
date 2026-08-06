@@ -3,8 +3,7 @@
 mod project;
 
 pub use project::{
-    CloneCancellation, CloneProgress, CloneTask, GitStatus, Project, ProjectError, ProjectId,
-    ProjectService, ProjectSource,
+    CloneCancellation, GitStatus, Project, ProjectError, ProjectId, ProjectService, ProjectSource,
 };
 
 /// Returns the greeting displayed by every Harkness interface.

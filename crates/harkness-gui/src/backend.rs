@@ -60,8 +60,8 @@ impl ffi::HarknessBackend {
         if *self.as_ref().busy() {
             return;
         }
-        let remote = remote.to_string();
-        if remote.trim().is_empty() {
+        let remote = remote.to_string().trim().to_owned();
+        if remote.is_empty() {
             self.as_mut()
                 .set_status("Enter a GitHub repository URL".into());
             return;
@@ -75,8 +75,7 @@ impl ffi::HarknessBackend {
         std::thread::spawn(move || {
             let progress_thread = qt_thread.clone();
             let result = harkness_core::ProjectService::load().and_then(|mut service| {
-                service.import_repository(&remote, &cancellation, move |progress| {
-                    let message = progress.message;
+                service.import_repository(&remote, &cancellation, move |message| {
                     let _ = progress_thread.queue(move |mut backend| {
                         backend.as_mut().set_status(message.into());
                     });
@@ -108,23 +107,39 @@ impl ffi::HarknessBackend {
         }
     }
 
+    /// Deleting a checkout walks the whole working tree, so it runs off the
+    /// GUI thread for the same reason the clone does.
     fn remove_managed(mut self: Pin<&mut Self>, project_id: &cxx_qt_lib::QString) {
-        let project_id = project_id.to_string();
-        let result = (|| {
-            let id = project_id
-                .parse()
-                .map_err(|_| "invalid managed project identifier".to_owned())?;
-            let mut service = harkness_core::ProjectService::load().map_err(|e| e.to_string())?;
-            service.remove_managed(id).map_err(|e| e.to_string())
-        })();
-        match result {
-            Ok(_) => {
-                self.as_mut()
-                    .set_status("Managed repository removed".into());
-                self.as_mut().set_managed_path("".into());
-                self.as_mut().set_managed_project_id("".into());
-            }
-            Err(error) => self.as_mut().set_status(error.into()),
+        if *self.as_ref().busy() {
+            return;
         }
+        let project_id = project_id.to_string();
+        self.as_mut().set_busy(true);
+        self.as_mut()
+            .set_status("Removing managed repository…".into());
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let id = project_id
+                    .parse()
+                    .map_err(|_| "invalid managed project identifier".to_owned())?;
+                let mut service =
+                    harkness_core::ProjectService::load().map_err(|e| e.to_string())?;
+                service.remove_managed(id).map_err(|e| e.to_string())
+            })();
+            let _ = qt_thread.queue(move |mut backend| {
+                backend.as_mut().set_busy(false);
+                match result {
+                    Ok(_) => {
+                        backend
+                            .as_mut()
+                            .set_status("Managed repository removed".into());
+                        backend.as_mut().set_managed_path("".into());
+                        backend.as_mut().set_managed_project_id("".into());
+                    }
+                    Err(error) => backend.as_mut().set_status(error.into()),
+                }
+            });
+        });
     }
 }
