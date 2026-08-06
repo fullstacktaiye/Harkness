@@ -1022,9 +1022,10 @@ mod tests {
     use std::{
         fs, io,
         path::{Path, PathBuf},
+        process::{Child, Command},
         sync::mpsc,
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use git2::{IndexAddOption, Repository, Signature, Time};
@@ -1040,6 +1041,70 @@ mod tests {
 
     /// Fixed so repository fixtures hash identically between runs.
     const COMMIT_EPOCH_SECONDS: i64 = 1_700_000_000;
+
+    const PROCESS_CHILD_TEST: &str = "project::tests::catalog_process_child";
+    const PROCESS_ROLE_ENV: &str = "HARKNESS_CATALOG_TEST_ROLE";
+    const PROCESS_DATA_DIR_ENV: &str = "HARKNESS_CATALOG_TEST_DATA_DIR";
+    const PROCESS_PROJECT_ROOT_ENV: &str = "HARKNESS_CATALOG_TEST_PROJECT_ROOT";
+    const PROCESS_READY_FILE_ENV: &str = "HARKNESS_CATALOG_TEST_READY_FILE";
+
+    /// Re-entered by the parent tests below so catalog locking crosses an OS
+    /// process boundary. Keeping the child in this test binary avoids a
+    /// fixture crate while ensuring it uses the production service methods.
+    #[test]
+    #[ignore = "only run as a child process by the catalog locking tests"]
+    fn catalog_process_child() {
+        let role = std::env::var(PROCESS_ROLE_ENV).expect("child role was not set");
+        let data_dir = std::env::var_os(PROCESS_DATA_DIR_ENV).expect("child data dir was not set");
+        let mut service = ProjectService::load_from_data_dir(data_dir).unwrap();
+
+        match role.as_str() {
+            "import" => {
+                let root = std::env::var_os(PROCESS_PROJECT_ROOT_ENV)
+                    .expect("child project root was not set");
+                service.import_local(root).unwrap();
+            }
+            "hold-lock" => {
+                let ready_file =
+                    std::env::var_os(PROCESS_READY_FILE_ENV).expect("child ready file was not set");
+                let _lock = service.lock_exclusive().unwrap();
+                fs::write(ready_file, b"ready").unwrap();
+                loop {
+                    thread::park();
+                }
+            }
+            _ => panic!("unknown catalog test child role: {role}"),
+        }
+    }
+
+    fn spawn_catalog_child(data_dir: &Path, role: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg(PROCESS_CHILD_TEST)
+            .arg("--ignored")
+            .env(PROCESS_ROLE_ENV, role)
+            .env(PROCESS_DATA_DIR_ENV, data_dir);
+        command
+    }
+
+    fn wait_for_child_signal(child: &mut Child, signal: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if signal.exists() {
+                return;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("catalog test child exited before signalling readiness: {status}");
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("catalog test child did not signal readiness within 10 seconds");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn catalog_round_trip_preserves_project_data() {
@@ -1122,6 +1187,65 @@ mod tests {
         for root in &roots {
             assert!(reloaded.list().iter().any(|project| &project.root == root));
         }
+    }
+
+    #[test]
+    fn concurrent_process_mutations_lose_no_entry() {
+        const WRITERS: usize = 8;
+
+        let fixture = Fixture::new();
+        let roots = (0..WRITERS)
+            .map(|index| fixture.directory(&format!("process-writer-{index}")))
+            .collect::<Vec<_>>();
+        let mut children = roots
+            .iter()
+            .map(|root| {
+                spawn_catalog_child(&fixture.data_dir, "import")
+                    .env(PROCESS_PROJECT_ROOT_ENV, root)
+                    .spawn()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        for child in &mut children {
+            assert!(child.wait().unwrap().success());
+        }
+
+        let projects = fixture.service().list();
+        assert_eq!(projects.len(), WRITERS);
+        for root in roots {
+            assert!(projects.iter().any(|project| project.root == root));
+        }
+    }
+
+    #[test]
+    fn killed_lock_holder_releases_lock_and_leaves_catalog_loadable() {
+        let fixture = Fixture::new();
+        let seeded_root = fixture.directory("seeded-before-kill");
+        let imported_after_kill_root = fixture.directory("imported-after-kill");
+        let seeded = fixture.service().import_local(&seeded_root).unwrap();
+        let ready_file = fixture.root.path().join("lock-held");
+        let mut child = spawn_catalog_child(&fixture.data_dir, "hold-lock")
+            .env(PROCESS_READY_FILE_ENV, &ready_file)
+            .spawn()
+            .unwrap();
+
+        wait_for_child_signal(&mut child, &ready_file);
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let mut reloaded = ProjectService::load_from_data_dir(&fixture.data_dir).unwrap();
+        assert_eq!(reloaded.list(), vec![seeded]);
+        let imported_after_kill = reloaded.import_local(imported_after_kill_root).unwrap();
+        let projects = ProjectService::load_from_data_dir(&fixture.data_dir)
+            .unwrap()
+            .list();
+        assert_eq!(projects.len(), 2);
+        assert!(
+            projects
+                .iter()
+                .any(|project| project.id == imported_after_kill.id)
+        );
     }
 
     #[test]
