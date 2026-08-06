@@ -9,6 +9,10 @@ Kirigami.ScrollablePage {
 
     required property HarknessBackend backend
 
+    // Allows Main.qml to distinguish navigation back to this page from a
+    // project-page transition and clear the backend's open-project state.
+    readonly property bool isLauncher: true
+
     title: qsTr("Harkness")
 
     // Describes a row's Git state. Composed here rather than in Rust so every

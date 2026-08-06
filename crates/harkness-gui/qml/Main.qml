@@ -28,6 +28,23 @@ Kirigami.ApplicationWindow {
     // the launcher.
     property var openedProject: appBackend.opened
 
+    // The global toolbar's built-in Back button navigates PageRow history
+    // directly, so it bypasses ProjectShellPage's explicit Back action. Keep
+    // the backend in sync when either route returns to the launcher. Clearing
+    // `opened` also pops the hidden shell, ensuring a later card click performs
+    // a fresh push instead of depending on the Forward button.
+    Connections {
+        target: pageStack
+
+        function onCurrentItemChanged() {
+            const id = root.openedProject && root.openedProject.id !== undefined
+                ? String(root.openedProject.id)
+                : "";
+            if (pageStack.currentItem && pageStack.currentItem.isLauncher === true && id.length > 0)
+                appBackend.closeProject();
+        }
+    }
+
     onOpenedProjectChanged: {
         const id = openedProject && openedProject.id !== undefined ? String(openedProject.id) : "";
         if (id.length > 0) {
