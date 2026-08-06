@@ -1,0 +1,23 @@
+name: Network integration tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  github-remote-import:
+    runs-on: [self-hosted, Linux, X64, harkness]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          clean: true
+      - name: Test GitHub remote import deduplication
+        run: >-
+          cargo test --locked -p harkness-core
+          project::tests::github_remote_forms_deduplicate_through_import
+          -- --ignored --exact

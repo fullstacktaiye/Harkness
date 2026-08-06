@@ -1485,6 +1485,36 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires network access to clone a public GitHub repository"]
+    fn github_remote_forms_deduplicate_through_import() {
+        let fixture = Fixture::new();
+        let mut service = ProjectService::load_from_data_dir(&fixture.data_dir).unwrap();
+
+        let imported = service
+            .import_repository(
+                "https://github.com/octocat/Hello-World.git",
+                &CloneCancellation::default(),
+                |_| {},
+            )
+            .unwrap();
+        let duplicate = service
+            .import_repository(
+                "git@github.com:octocat/Hello-World.git",
+                &CloneCancellation::default(),
+                |_| {},
+            )
+            .unwrap();
+
+        assert_eq!(imported.id, duplicate.id);
+        assert_eq!(imported.remote, duplicate.remote);
+        assert_eq!(
+            imported.remote.as_deref(),
+            Some("github.com/octocat/hello-world")
+        );
+        assert_eq!(service.list().len(), 1);
+    }
+
+    #[test]
     fn malformed_github_remotes_are_rejected() {
         for remote in [
             "",
