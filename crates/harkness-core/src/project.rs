@@ -163,12 +163,8 @@ pub enum ProjectError {
         source: io::Error,
     },
 
-    /// Another service instance currently owns the project catalog.
-    #[error("project catalog '{path}' is already in use by another Harkness process")]
-    CatalogInUse { path: PathBuf },
-
     /// The catalog lock file could not be created or locked.
-    #[error("failed to lock project catalog '{path}': {source}")]
+    #[error("failed to lock project catalog '{}': {source}", path.display())]
     CatalogLock {
         path: PathBuf,
         #[source]
@@ -264,16 +260,18 @@ impl CloneCancellation {
 
 /// Loads and updates the durable local project catalog.
 ///
-/// A service instance owns a snapshot of the catalog taken when it was loaded,
-/// and every mutation rewrites the whole file. An exclusive advisory lock is
-/// therefore held for the service's lifetime so a second process cannot load a
-/// competing snapshot and silently overwrite newer changes.
+/// Concurrent front ends are safe. Every mutation takes an exclusive advisory
+/// lock on `projects.lock`, re-reads `projects.json` inside the critical
+/// section, applies its delta to that fresh state, and persists atomically, so
+/// the snapshot a service cached at load is never written back over another
+/// process's work. Reads take a shared lock for the same reason.
+///
+/// The lock covers only the read-modify-write of the catalog, never a network
+/// clone, and the kernel releases it if the process dies, so neither a slow
+/// import nor a crash can wedge the catalog.
 pub struct ProjectService {
     data_dir: PathBuf,
     catalog: Catalog,
-    // The handle owns the advisory lock. It is intentionally retained even
-    // though no I/O is performed through it.
-    _catalog_lock: File,
 }
 
 impl ProjectService {
@@ -291,12 +289,26 @@ impl ProjectService {
     /// catalog file is always named `projects.json` within `data_dir`.
     pub fn load_from_data_dir(data_dir: impl Into<PathBuf>) -> Result<Self, ProjectError> {
         let data_dir = data_dir.into();
-        fs::create_dir_all(&data_dir).map_err(|source| ProjectError::CatalogLock {
-            path: data_dir.join(CATALOG_LOCK_FILE),
+        let catalog = read_catalog(&data_dir.join(CATALOG_FILE))?;
+        Ok(Self { data_dir, catalog })
+    }
+
+    /// Takes the exclusive catalog lock for one read-modify-write.
+    ///
+    /// The lock file is created once and never replaced, because atomic
+    /// persistence swaps `projects.json` for a new inode and a lock held
+    /// against the old one would exclude nobody. Dropping the returned handle
+    /// releases the lock, as does the kernel if the process dies.
+    ///
+    /// Advisory locks are unreliable on NFS. That is acceptable for a local
+    /// user data directory, which is the only location Harkness supports.
+    fn lock_exclusive(&self) -> Result<File, ProjectError> {
+        fs::create_dir_all(&self.data_dir).map_err(|source| ProjectError::CatalogLock {
+            path: self.data_dir.clone(),
             source,
         })?;
-        let lock_path = data_dir.join(CATALOG_LOCK_FILE);
-        let catalog_lock = File::options()
+        let lock_path = self.data_dir.join(CATALOG_LOCK_FILE);
+        let lock = File::options()
             .read(true)
             .write(true)
             .create(true)
@@ -306,72 +318,49 @@ impl ProjectService {
                 path: lock_path.clone(),
                 source,
             })?;
-        match catalog_lock.try_lock() {
-            Ok(()) => {}
-            Err(fs::TryLockError::WouldBlock) => {
-                return Err(ProjectError::CatalogInUse { path: lock_path });
-            }
-            Err(fs::TryLockError::Error(source)) => {
-                return Err(ProjectError::CatalogLock {
-                    path: lock_path,
-                    source,
-                });
-            }
-        }
-        let catalog_path = data_dir.join(CATALOG_FILE);
-        let catalog = match catalog_path.try_exists() {
-            Ok(false) => Catalog::default(),
-            Ok(true) => {
-                let bytes =
-                    fs::read(&catalog_path).map_err(|source| ProjectError::CatalogRead {
-                        path: catalog_path.clone(),
-                        source,
-                    })?;
-                // Read the version before the body: a future schema would fail
-                // to deserialize as a v1 catalog, and reporting that as
-                // "malformed" would hide the one cause the user can act on.
-                let probe: CatalogVersion = serde_json::from_slice(&bytes).map_err(|source| {
-                    ProjectError::MalformedCatalog {
-                        path: catalog_path.clone(),
-                        source,
-                    }
-                })?;
-                if probe.version != CATALOG_VERSION {
-                    return Err(ProjectError::UnsupportedCatalogVersion {
-                        found: probe.version,
-                        expected: CATALOG_VERSION,
-                    });
-                }
+        // Blocking, not `try_lock`: these critical sections are one small read
+        // plus one write, and a caller has nothing useful to do with a "busy"
+        // error except retry.
+        lock.lock().map_err(|source| ProjectError::CatalogLock {
+            path: lock_path,
+            source,
+        })?;
+        Ok(lock)
+    }
 
-                serde_json::from_slice(&bytes).map_err(|source| ProjectError::MalformedCatalog {
-                    path: catalog_path.clone(),
-                    source,
-                })?
-            }
-            Err(source) => {
-                return Err(ProjectError::CatalogRead {
-                    path: catalog_path,
-                    source,
-                });
-            }
-        };
+    /// Reads the catalog fresh from disk. Call only while holding the lock.
+    fn read_catalog(&self) -> Result<Catalog, ProjectError> {
+        read_catalog(&self.data_dir.join(CATALOG_FILE))
+    }
 
-        Ok(Self {
-            data_dir,
-            catalog,
-            _catalog_lock: catalog_lock,
-        })
+    /// Reads the catalog under a shared lock, or `None` if it cannot be read.
+    ///
+    /// Reads never create the data directory: a catalog that has never been
+    /// written has no lock file, and nothing to race with either.
+    fn read_catalog_shared(&self) -> Option<Catalog> {
+        let lock = File::options()
+            .read(true)
+            .open(self.data_dir.join(CATALOG_LOCK_FILE))
+            .ok()?;
+        lock.lock_shared().ok()?;
+        read_catalog(&self.data_dir.join(CATALOG_FILE)).ok()
     }
 
     /// Lists projects by most-recently-opened order with current availability
     /// and Git metadata.
     ///
     /// Listing never fails: a project whose Git metadata cannot be read is
-    /// reported with `git: None` rather than hiding the rest of the catalog.
+    /// reported with `git: None` rather than hiding the rest of the catalog,
+    /// and a catalog that is briefly unreadable falls back to the snapshot
+    /// taken at load rather than reporting an empty Recents.
     #[must_use]
     pub fn list(&self) -> Vec<Project> {
-        let mut projects = self
-            .catalog
+        // Git and availability checks touch the filesystem once per project,
+        // so they run after the shared lock is released.
+        let catalog = self
+            .read_catalog_shared()
+            .unwrap_or_else(|| self.catalog.clone());
+        let mut projects = catalog
             .projects
             .iter()
             .cloned()
@@ -385,7 +374,11 @@ impl ProjectService {
     /// catalog entry when it was already imported.
     pub fn import_local(&mut self, path: impl AsRef<Path>) -> Result<Project, ProjectError> {
         let canonical_root = validate_local_directory(path.as_ref())?;
-        let mut candidate = self.catalog.clone();
+        // Inspecting Git walks the working tree, so it runs before the lock.
+        let git = inspect_git(&canonical_root)?;
+
+        let _lock = self.lock_exclusive()?;
+        let mut candidate = self.read_catalog()?;
 
         let project = if let Some(project) = candidate
             .projects
@@ -394,7 +387,7 @@ impl ProjectService {
         {
             project.available = true;
             project.last_opened = OffsetDateTime::now_utc();
-            project.git = inspect_git(&canonical_root)?;
+            project.git = git;
             project.clone()
         } else {
             let project = Project {
@@ -405,7 +398,7 @@ impl ProjectService {
                 remote: None,
                 available: true,
                 last_opened: OffsetDateTime::now_utc(),
-                git: inspect_git(&canonical_root)?,
+                git,
             };
             candidate.projects.push(project.clone());
             project
@@ -419,7 +412,8 @@ impl ProjectService {
 
     /// Reopens a project and moves it to the top of Recents.
     pub fn open(&mut self, id: ProjectId) -> Result<Project, ProjectError> {
-        let mut candidate = self.catalog.clone();
+        let _lock = self.lock_exclusive()?;
+        let mut candidate = self.read_catalog()?;
         let project = candidate
             .projects
             .iter_mut()
@@ -447,7 +441,8 @@ impl ProjectService {
 
     /// Removes a project record without touching its source directory.
     pub fn remove(&mut self, id: ProjectId) -> Result<Project, ProjectError> {
-        let mut candidate = self.catalog.clone();
+        let _lock = self.lock_exclusive()?;
+        let mut candidate = self.read_catalog()?;
         let index = candidate
             .projects
             .iter()
@@ -474,28 +469,35 @@ impl ProjectService {
         // pasted URL would reach it as part of the protocol name.
         let remote = remote.trim();
         let normalized = normalize_remote(remote)?;
-        let mut candidate = self.catalog.clone();
-        if let Some(index) = candidate
-            .projects
-            .iter()
-            .position(|project| project.remote.as_deref() == Some(&normalized))
+
+        // An existing, available checkout for this remote is reopened rather
+        // than cloned again. This critical section ends before the clone
+        // starts, so a slow import never holds the lock.
         {
-            let reopened = refresh_project(candidate.projects[index].clone());
-            if reopened.available {
-                let reopened = Project {
-                    last_opened: OffsetDateTime::now_utc(),
-                    ..reopened
-                };
-                candidate.projects[index] = reopened.clone();
-                sort_recents(&mut candidate.projects);
-                self.persist(&candidate)?;
-                self.catalog = candidate;
-                return Ok(reopened);
+            let _lock = self.lock_exclusive()?;
+            let mut candidate = self.read_catalog()?;
+            if let Some(index) = candidate
+                .projects
+                .iter()
+                .position(|project| project.remote.as_deref() == Some(&normalized))
+            {
+                let reopened = refresh_project(candidate.projects[index].clone());
+                if reopened.available {
+                    let reopened = Project {
+                        last_opened: OffsetDateTime::now_utc(),
+                        ..reopened
+                    };
+                    candidate.projects[index] = reopened.clone();
+                    sort_recents(&mut candidate.projects);
+                    self.persist(&candidate)?;
+                    self.catalog = candidate;
+                    return Ok(reopened);
+                }
+                // Otherwise the checkout was deleted outside Harkness.
+                // Reporting a successful import of a path that no longer
+                // exists would strand the user, so the clone is repeated and
+                // the stale entry replaced once the fresh checkout exists.
             }
-            // The checkout was deleted outside Harkness. Reporting a
-            // successful import of a path that no longer exists would strand
-            // the user, so the stale entry is dropped and the clone repeated.
-            candidate.projects.remove(index);
         }
 
         let id = ProjectId::new();
@@ -519,27 +521,32 @@ impl ProjectService {
                 display_name: repository_name(&normalized),
                 root: canonical_root.clone(),
                 source: ProjectSource::ManagedRepository,
-                remote: Some(normalized),
+                remote: Some(normalized.clone()),
                 last_opened: OffsetDateTime::now_utc(),
                 available: true,
                 git: inspect_git(&canonical_root)?,
             };
+
+            let _lock = self.lock_exclusive()?;
+            let mut candidate = self.read_catalog()?;
+            // The reopen check above ran against a catalog that is now as old
+            // as the clone. Any entry for this remote is either the stale one
+            // that entry rejected or one a concurrent import added; the
+            // checkout that provably exists on disk is this one.
+            candidate
+                .projects
+                .retain(|entry| entry.remote.as_deref() != Some(normalized.as_str()));
             candidate.projects.push(project.clone());
             sort_recents(&mut candidate.projects);
             self.persist(&candidate)?;
+            self.catalog = candidate;
             Ok(project)
         })();
 
-        match imported {
-            Ok(project) => {
-                self.catalog = candidate;
-                Ok(project)
-            }
-            Err(error) => {
-                let _ = fs::remove_dir_all(&managed_directory);
-                Err(error)
-            }
+        if imported.is_err() {
+            let _ = fs::remove_dir_all(&managed_directory);
         }
+        imported
     }
 
     /// Deletes a checkout only after proving it is the managed path for `id`.
@@ -547,8 +554,12 @@ impl ProjectService {
     /// Front ends must obtain explicit confirmation naming [`Project::root`]
     /// before calling this destructive operation.
     pub fn remove_managed(&mut self, id: ProjectId) -> Result<Project, ProjectError> {
-        let project = self
-            .catalog
+        // Deleting the checkout stays inside the critical section: the path is
+        // proven from the catalog entry, so releasing the lock first would let
+        // a concurrent import reuse the directory this call is about to erase.
+        let _lock = self.lock_exclusive()?;
+        let mut candidate = self.read_catalog()?;
+        let project = candidate
             .projects
             .iter()
             .find(|project| project.id == id)
@@ -582,7 +593,6 @@ impl ProjectService {
             path: managed_directory,
             source,
         })?;
-        let mut candidate = self.catalog.clone();
         candidate.projects.retain(|entry| entry.id != id);
         self.persist(&candidate)?;
         self.catalog = candidate;
@@ -603,6 +613,43 @@ impl ProjectService {
                 source,
             }
         })
+    }
+}
+
+/// Reads a catalog file, treating a missing file as an empty catalog.
+fn read_catalog(catalog_path: &Path) -> Result<Catalog, ProjectError> {
+    match catalog_path.try_exists() {
+        Ok(false) => Ok(Catalog::default()),
+        Ok(true) => {
+            let bytes = fs::read(catalog_path).map_err(|source| ProjectError::CatalogRead {
+                path: catalog_path.to_path_buf(),
+                source,
+            })?;
+            // Read the version before the body: a future schema would fail to
+            // deserialize as a v1 catalog, and reporting that as "malformed"
+            // would hide the one cause the user can act on.
+            let probe: CatalogVersion = serde_json::from_slice(&bytes).map_err(|source| {
+                ProjectError::MalformedCatalog {
+                    path: catalog_path.to_path_buf(),
+                    source,
+                }
+            })?;
+            if probe.version != CATALOG_VERSION {
+                return Err(ProjectError::UnsupportedCatalogVersion {
+                    found: probe.version,
+                    expected: CATALOG_VERSION,
+                });
+            }
+
+            serde_json::from_slice(&bytes).map_err(|source| ProjectError::MalformedCatalog {
+                path: catalog_path.to_path_buf(),
+                source,
+            })
+        }
+        Err(source) => Err(ProjectError::CatalogRead {
+            path: catalog_path.to_path_buf(),
+            source,
+        }),
     }
 }
 
@@ -941,28 +988,80 @@ mod tests {
         let mut service = fixture.service();
 
         let imported = service.import_local(&project_root).unwrap();
-        let expected = service.list();
-        drop(service);
         let reloaded = ProjectService::load_from_data_dir(&fixture.data_dir).unwrap();
 
         assert_eq!(reloaded.catalog.version, CATALOG_VERSION);
-        assert_eq!(reloaded.list(), expected);
+        assert_eq!(reloaded.list(), service.list());
         assert_eq!(reloaded.list(), vec![imported]);
     }
 
     #[test]
-    fn catalog_has_only_one_service_owner_at_a_time() {
+    fn concurrent_services_both_keep_their_imports() {
         let fixture = Fixture::new();
-        let service = fixture.service();
+        let first_root = fixture.directory("first");
+        let second_root = fixture.directory("second");
+        let mut first = fixture.service();
+        let mut second = fixture.service();
 
-        assert!(matches!(
-            ProjectService::load_from_data_dir(&fixture.data_dir),
-            Err(ProjectError::CatalogInUse { path })
-                if path == fixture.data_dir.join(CATALOG_LOCK_FILE)
-        ));
+        let first_project = first.import_local(&first_root).unwrap();
+        let second_project = second.import_local(&second_root).unwrap();
 
-        drop(service);
-        assert!(ProjectService::load_from_data_dir(&fixture.data_dir).is_ok());
+        let ids = fixture
+            .service()
+            .list()
+            .iter()
+            .map(|project| project.id)
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&first_project.id));
+        assert!(ids.contains(&second_project.id));
+    }
+
+    #[test]
+    fn an_unrelated_write_does_not_resurrect_a_removed_project() {
+        let fixture = Fixture::new();
+        let doomed_root = fixture.directory("doomed");
+        let other_root = fixture.directory("other");
+        let doomed = fixture.service().import_local(&doomed_root).unwrap();
+
+        // Loaded while `doomed` is still catalogued, so its snapshot is stale
+        // by the time it writes.
+        let mut stale = fixture.service();
+        fixture.service().remove(doomed.id).unwrap();
+        let other = stale.import_local(&other_root).unwrap();
+
+        let ids = fixture
+            .service()
+            .list()
+            .iter()
+            .map(|project| project.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![other.id]);
+    }
+
+    #[test]
+    fn concurrent_mutations_lose_no_entry() {
+        const WRITERS: usize = 8;
+
+        let fixture = Fixture::new();
+        let roots = (0..WRITERS)
+            .map(|index| fixture.directory(&format!("writer-{index}")))
+            .collect::<Vec<_>>();
+
+        let data_dir = &fixture.data_dir;
+        thread::scope(|scope| {
+            for root in &roots {
+                scope.spawn(move || {
+                    let mut service = ProjectService::load_from_data_dir(data_dir).unwrap();
+                    service.import_local(root).unwrap();
+                });
+            }
+        });
+
+        let reloaded = fixture.service();
+        assert_eq!(reloaded.list().len(), WRITERS);
+        for root in &roots {
+            assert!(reloaded.list().iter().any(|project| &project.root == root));
+        }
     }
 
     #[test]
@@ -1133,7 +1232,6 @@ mod tests {
             Err(ProjectError::ProjectUnavailable { id, .. }) if id == imported.id
         ));
 
-        drop(service);
         let reloaded = ProjectService::load_from_data_dir(&fixture.data_dir).unwrap();
         assert!(!reloaded.list()[0].available);
     }
@@ -1244,18 +1342,31 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn failed_persistence_does_not_change_in_memory_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn set_mode(path: &Path, mode: u32) {
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(mode);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+
         let fixture = Fixture::new();
+        let seeded_root = fixture.directory("seeded-project");
         let project_root = fixture.directory("persistence-project");
         let mut service = fixture.service();
-        fs::create_dir(fixture.data_dir.join(CATALOG_FILE)).unwrap();
+        let seeded = service.import_local(&seeded_root).unwrap();
 
-        assert!(matches!(
-            service.import_local(project_root),
-            Err(ProjectError::Persistence { .. })
-        ));
-        assert!(service.catalog.projects.is_empty());
+        // A read-only data directory still opens the catalog and the lock, and
+        // fails only where the atomic replacement creates its temporary file.
+        set_mode(&fixture.data_dir, 0o500);
+        let imported = service.import_local(project_root);
+        set_mode(&fixture.data_dir, 0o700);
+
+        assert!(matches!(imported, Err(ProjectError::Persistence { .. })));
+        assert_eq!(service.catalog.projects, vec![seeded]);
     }
 
     #[test]
@@ -1267,14 +1378,13 @@ mod tests {
         service.import_local(first).unwrap();
         service.import_local(second).unwrap();
 
-        let entries = fs::read_dir(&fixture.data_dir)
+        // The lock file is created once and survives every atomic replacement.
+        let mut entries = fs::read_dir(&fixture.data_dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
-        assert_eq!(entries.len(), 2);
-        assert!(entries.contains(&CATALOG_FILE.into()));
-        assert!(entries.contains(&CATALOG_LOCK_FILE.into()));
-        drop(service);
+        entries.sort();
+        assert_eq!(entries, vec![CATALOG_FILE, CATALOG_LOCK_FILE]);
         assert!(ProjectService::load_from_data_dir(&fixture.data_dir).is_ok());
     }
 
@@ -1447,6 +1557,8 @@ mod tests {
             )
             .unwrap();
         let outside = fixture.directory("outside");
+        // The guard reads the catalog from disk, so the tampered entry has to
+        // be persisted rather than only held in memory.
         service
             .catalog
             .projects
@@ -1454,6 +1566,8 @@ mod tests {
             .find(|project| project.id == managed.id)
             .unwrap()
             .root = outside.clone();
+        let tampered = service.catalog.clone();
+        service.persist(&tampered).unwrap();
         assert!(matches!(
             service.remove_managed(managed.id),
             Err(ProjectError::UnsafeManagedRemoval { .. })
