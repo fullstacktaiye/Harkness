@@ -9,5 +9,12 @@ license = "MIT"
 repository = "https://github.com/fullstacktaiye/harkness"
 
 [workspace.dependencies]
+dirs = "6.0"
+git2 = { version = "0.21", default-features = false }
 harkness-core = { path = "crates/harkness-core" }
-
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.27"
+thiserror = "2.0"
+time = { version = "0.3", features = ["serde-human-readable"] }
+uuid = { version = "1.24", features = ["serde", "v4"] }

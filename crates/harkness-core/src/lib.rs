@@ -1,5 +1,9 @@
 //! Shared application behavior for Harkness front ends.
 
+mod project;
+
+pub use project::{GitStatus, Project, ProjectError, ProjectId, ProjectService, ProjectSource};
+
 /// Returns the greeting displayed by every Harkness interface.
 #[must_use]
 pub const fn greeting() -> &'static str {
