@@ -19,16 +19,30 @@ pub mod ffi {
         /// camel-case call site silently resolves to `undefined`. Every
         /// multi-word member is therefore named for the Qt side explicitly,
         /// and property names are kept to a single word.
+        ///
+        /// `opened` is the project shown in the shell page as a QVariantMap
+        /// with the same keys as a `projects` row, or an empty map when the
+        /// launcher is showing.
         #[qobject]
         #[qml_element]
-        #[qproperty(QString, greeting, READ, CONSTANT)]
         #[qproperty(bool, busy)]
         #[qproperty(QString, status)]
         #[qproperty(QList_QVariant, projects)]
+        #[qproperty(QVariant, opened)]
         type HarknessBackend = super::HarknessBackendRust;
 
         #[qinvokable]
         fn refresh(self: Pin<&mut HarknessBackend>);
+
+        /// Returns an actionable error for `remote`, or an empty string when
+        /// the clone would accept it. Drives live form validation in QML.
+        #[qinvokable]
+        #[cxx_name = "validateRemote"]
+        fn validate_remote(self: &HarknessBackend, remote: &QString) -> QString;
+
+        #[qinvokable]
+        #[cxx_name = "importLocal"]
+        fn import_local(self: Pin<&mut HarknessBackend>, path: &QString);
 
         #[qinvokable]
         #[cxx_name = "importRepository"]
@@ -37,6 +51,21 @@ pub mod ffi {
         #[qinvokable]
         #[cxx_name = "cancelImport"]
         fn cancel_import(self: Pin<&mut HarknessBackend>);
+
+        #[qinvokable]
+        #[cxx_name = "openProject"]
+        fn open_project(self: Pin<&mut HarknessBackend>, project_id: &QString);
+
+        /// Leaves the project shell without touching the catalog.
+        #[qinvokable]
+        #[cxx_name = "closeProject"]
+        fn close_project(self: Pin<&mut HarknessBackend>);
+
+        /// Removes a local project from the catalog without touching its
+        /// directory.
+        #[qinvokable]
+        #[cxx_name = "removeProject"]
+        fn remove_project(self: Pin<&mut HarknessBackend>, project_id: &QString);
 
         #[qinvokable]
         #[cxx_name = "removeManaged"]
@@ -52,20 +81,20 @@ use cxx_qt::{CxxQtType, Threading};
 use cxx_qt_lib::{QList, QMap, QMapPair_QString_QVariant, QString, QVariant};
 
 pub struct HarknessBackendRust {
-    greeting: QString,
     busy: bool,
     status: QString,
     projects: QList<QVariant>,
+    opened: QVariant,
     cancellation: Option<harkness_core::CloneCancellation>,
 }
 
 impl Default for HarknessBackendRust {
     fn default() -> Self {
         Self {
-            greeting: harkness_core::greeting().into(),
             busy: false,
             status: "Ready".into(),
             projects: QList::default(),
+            opened: empty_opened(),
             cancellation: None,
         }
     }
@@ -75,6 +104,7 @@ impl Default for HarknessBackendRust {
 ///
 /// Qt value types are not `Send`, so the catalog crosses the thread boundary
 /// as these rows and only becomes a `QVariantList` on the GUI thread.
+#[derive(Debug)]
 struct ProjectRow {
     id: String,
     display_name: String,
@@ -116,39 +146,104 @@ fn load_rows() -> Result<Vec<ProjectRow>, String> {
     Ok(service.list().into_iter().map(ProjectRow::from).collect())
 }
 
+/// Flattens a row into the QVariantMap every QML binding reads.
+fn to_map(row: &ProjectRow) -> QVariant {
+    let mut entry = QMap::<QMapPair_QString_QVariant>::default();
+    let mut insert = |key: &str, value: QVariant| entry.insert(QString::from(key), value);
+    insert("id", QVariant::from(&QString::from(row.id.as_str())));
+    insert(
+        "displayName",
+        QVariant::from(&QString::from(row.display_name.as_str())),
+    );
+    insert("root", QVariant::from(&QString::from(row.root.as_str())));
+    insert(
+        "remote",
+        QVariant::from(&QString::from(row.remote.as_str())),
+    );
+    insert(
+        "branch",
+        QVariant::from(&QString::from(row.branch.as_str())),
+    );
+    insert("managed", QVariant::from(&row.managed));
+    insert("available", QVariant::from(&row.available));
+    insert("isGit", QVariant::from(&row.is_git));
+    insert("dirty", QVariant::from(&row.dirty));
+    QVariant::from(&entry)
+}
+
 fn to_projects(rows: &[ProjectRow]) -> QList<QVariant> {
     let mut projects = QList::<QVariant>::default();
     for row in rows {
-        let mut entry = QMap::<QMapPair_QString_QVariant>::default();
-        let mut insert = |key: &str, value: QVariant| entry.insert(QString::from(key), value);
-        insert("id", QVariant::from(&QString::from(row.id.as_str())));
-        insert(
-            "displayName",
-            QVariant::from(&QString::from(row.display_name.as_str())),
-        );
-        insert("root", QVariant::from(&QString::from(row.root.as_str())));
-        insert(
-            "remote",
-            QVariant::from(&QString::from(row.remote.as_str())),
-        );
-        insert(
-            "branch",
-            QVariant::from(&QString::from(row.branch.as_str())),
-        );
-        insert("managed", QVariant::from(&row.managed));
-        insert("available", QVariant::from(&row.available));
-        insert("isGit", QVariant::from(&row.is_git));
-        insert("dirty", QVariant::from(&row.dirty));
-        projects.append(QVariant::from(&entry));
+        projects.append(to_map(row));
     }
     projects
 }
 
+/// The `opened` value while no project is open: an empty map, so QML can
+/// always treat `opened` as a map and test `opened.id` for emptiness.
+fn empty_opened() -> QVariant {
+    QVariant::from(&QMap::<QMapPair_QString_QVariant>::default())
+}
+
+#[derive(Debug)]
+enum OpenedUpdate {
+    Keep,
+    Open(ProjectRow),
+    Clear,
+}
+
+#[derive(Debug)]
+struct OperationOutcome {
+    status: String,
+    opened: OpenedUpdate,
+}
+
+/// Converts a service result into the complete user-visible state transition.
+/// Keeping this independent of Qt makes success, failure, open, and removal
+/// behavior deterministic and directly testable.
+fn operation_outcome(
+    result: Result<harkness_core::Project, String>,
+    verb: &str,
+    opens: bool,
+) -> OperationOutcome {
+    match result {
+        Ok(project) => OperationOutcome {
+            status: format!("{verb} {}", project.display_name),
+            opened: if opens {
+                OpenedUpdate::Open(ProjectRow::from(project))
+            } else {
+                OpenedUpdate::Clear
+            },
+        },
+        Err(error) => OperationOutcome {
+            status: error,
+            opened: OpenedUpdate::Keep,
+        },
+    }
+}
+
+/// Applies the outcome of an operation that opens a project (import, reopen)
+/// or removes the open one. Every mutation also reloads the catalog rather
+/// than patching a row: the catalog is the single source of truth, and a
+/// clone or removal can reorder Recents.
+fn apply_result(
+    mut backend: Pin<&mut ffi::HarknessBackend>,
+    result: Result<harkness_core::Project, String>,
+    verb: &str,
+    opens: bool,
+) {
+    let outcome = operation_outcome(result, verb, opens);
+    backend.as_mut().set_status(outcome.status.into());
+    match outcome.opened {
+        OpenedUpdate::Keep => {}
+        OpenedUpdate::Open(row) => backend.as_mut().set_opened(to_map(&row)),
+        OpenedUpdate::Clear => backend.as_mut().set_opened(empty_opened()),
+    }
+    backend.as_mut().refresh();
+}
+
 impl ffi::HarknessBackend {
     /// Reloads the whole catalog into [`projects`](Self::projects).
-    ///
-    /// Every mutation reloads rather than patching a row: the catalog is the
-    /// single source of truth, and a clone or removal can reorder Recents.
     fn refresh(self: Pin<&mut Self>) {
         let qt_thread = self.qt_thread();
         std::thread::spawn(move || {
@@ -156,6 +251,37 @@ impl ffi::HarknessBackend {
             let _ = qt_thread.queue(move |mut backend| match rows {
                 Ok(rows) => backend.as_mut().set_projects(to_projects(&rows)),
                 Err(error) => backend.as_mut().set_status(error.into()),
+            });
+        });
+    }
+
+    fn validate_remote(&self, remote: &QString) -> QString {
+        match harkness_core::normalize_remote(&remote.to_string()) {
+            Ok(_) => QString::from(""),
+            Err(error) => error.to_string().into(),
+        }
+    }
+
+    fn import_local(mut self: Pin<&mut Self>, path: &QString) {
+        if *self.as_ref().busy() {
+            return;
+        }
+        let path = path.to_string().trim().to_owned();
+        if path.is_empty() {
+            self.as_mut().set_status("Choose a project folder".into());
+            return;
+        }
+
+        self.as_mut().set_busy(true);
+        self.as_mut().set_status("Opening project folder…".into());
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let result = harkness_core::ProjectService::load()
+                .and_then(|mut service| service.import_local(&path))
+                .map_err(|error| error.to_string());
+            let _ = qt_thread.queue(move |mut backend| {
+                backend.as_mut().set_busy(false);
+                apply_result(backend.as_mut(), result, "Opened", true);
             });
         });
     }
@@ -178,23 +304,19 @@ impl ffi::HarknessBackend {
         let qt_thread = self.qt_thread();
         std::thread::spawn(move || {
             let progress_thread = qt_thread.clone();
-            let result = harkness_core::ProjectService::load().and_then(|mut service| {
-                service.import_repository(&remote, &cancellation, move |message| {
-                    let _ = progress_thread.queue(move |mut backend| {
-                        backend.as_mut().set_status(message.into());
-                    });
+            let result = harkness_core::ProjectService::load()
+                .and_then(|mut service| {
+                    service.import_repository(&remote, &cancellation, move |message| {
+                        let _ = progress_thread.queue(move |mut backend| {
+                            backend.as_mut().set_status(message.into());
+                        });
+                    })
                 })
-            });
+                .map_err(|error| error.to_string());
             let _ = qt_thread.queue(move |mut backend| {
                 backend.as_mut().rust_mut().get_mut().cancellation = None;
                 backend.as_mut().set_busy(false);
-                match result {
-                    Ok(project) => backend
-                        .as_mut()
-                        .set_status(format!("Imported {}", project.display_name).into()),
-                    Err(error) => backend.as_mut().set_status(error.to_string().into()),
-                }
-                backend.as_mut().refresh();
+                apply_result(backend.as_mut(), result, "Imported", true);
             });
         });
     }
@@ -204,6 +326,58 @@ impl ffi::HarknessBackend {
             cancellation.cancel();
             self.as_mut().set_status("Cancelling Git clone…".into());
         }
+    }
+
+    fn close_project(mut self: Pin<&mut Self>) {
+        self.as_mut().set_opened(empty_opened());
+    }
+
+    fn open_project(mut self: Pin<&mut Self>, project_id: &QString) {
+        if *self.as_ref().busy() {
+            return;
+        }
+        let project_id = project_id.to_string();
+        self.as_mut().set_busy(true);
+        self.as_mut().set_status("Opening project…".into());
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let id = project_id
+                    .parse()
+                    .map_err(|_| "invalid project identifier".to_owned())?;
+                let mut service =
+                    harkness_core::ProjectService::load().map_err(|error| error.to_string())?;
+                service.open(id).map_err(|error| error.to_string())
+            })();
+            let _ = qt_thread.queue(move |mut backend| {
+                backend.as_mut().set_busy(false);
+                apply_result(backend.as_mut(), result, "Opened", true);
+            });
+        });
+    }
+
+    fn remove_project(mut self: Pin<&mut Self>, project_id: &QString) {
+        if *self.as_ref().busy() {
+            return;
+        }
+        let project_id = project_id.to_string();
+        self.as_mut().set_busy(true);
+        self.as_mut().set_status("Removing project…".into());
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let id = project_id
+                    .parse()
+                    .map_err(|_| "invalid project identifier".to_owned())?;
+                let mut service =
+                    harkness_core::ProjectService::load().map_err(|error| error.to_string())?;
+                service.remove(id).map_err(|error| error.to_string())
+            })();
+            let _ = qt_thread.queue(move |mut backend| {
+                backend.as_mut().set_busy(false);
+                apply_result(backend.as_mut(), result, "Removed", false);
+            });
+        });
     }
 
     /// Deleting a checkout walks the whole working tree, so it runs off the
@@ -230,14 +404,149 @@ impl ffi::HarknessBackend {
             })();
             let _ = qt_thread.queue(move |mut backend| {
                 backend.as_mut().set_busy(false);
-                match result {
-                    Ok(project) => backend
-                        .as_mut()
-                        .set_status(format!("Removed {}", project.display_name).into()),
-                    Err(error) => backend.as_mut().set_status(error.into()),
-                }
-                backend.as_mut().refresh();
+                apply_result(backend.as_mut(), result, "Removed", false);
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cxx_qt_lib::{QMap, QMapPair_QString_QVariant, QString, QVariant};
+
+    use super::{OpenedUpdate, ProjectRow, empty_opened, operation_outcome, to_map, to_projects};
+
+    fn project(
+        source: harkness_core::ProjectSource,
+        remote: Option<&str>,
+        git: Option<harkness_core::GitStatus>,
+    ) -> harkness_core::Project {
+        harkness_core::Project {
+            id: harkness_core::ProjectId::new(),
+            display_name: "sample".to_owned(),
+            root: "/tmp/sample".into(),
+            source,
+            remote: remote.map(str::to_owned),
+            last_opened: time::OffsetDateTime::now_utc(),
+            available: true,
+            git,
+        }
+    }
+
+    fn row_map(row: &ProjectRow) -> QMap<QMapPair_QString_QVariant> {
+        to_map(row)
+            .value::<QMap<QMapPair_QString_QVariant>>()
+            .expect("row should flatten to a QVariantMap")
+    }
+
+    #[test]
+    fn managed_repository_row_carries_git_identity() {
+        let row = ProjectRow::from(project(
+            harkness_core::ProjectSource::ManagedRepository,
+            Some("github.com/example/sample"),
+            Some(harkness_core::GitStatus {
+                branch: Some("main".to_owned()),
+                dirty: true,
+            }),
+        ));
+
+        assert!(row.managed);
+        assert_eq!(row.branch, "main");
+        assert!(row.is_git && row.dirty);
+
+        let map = row_map(&row);
+        for key in [
+            "id",
+            "displayName",
+            "root",
+            "remote",
+            "branch",
+            "managed",
+            "available",
+            "isGit",
+            "dirty",
+        ] {
+            assert!(map.contains(&QString::from(key)), "missing key '{key}'");
+        }
+        assert_eq!(
+            map.get(&QString::from("branch"))
+                .and_then(|value| value.value::<QString>())
+                .map(|value| value.to_string()),
+            Some("main".to_owned())
+        );
+        assert_eq!(
+            map.get(&QString::from("managed"))
+                .and_then(|value| value.value::<bool>()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn local_and_detached_rows_distinguish_identity_states() {
+        let detached = ProjectRow::from(project(
+            harkness_core::ProjectSource::Local,
+            None,
+            Some(harkness_core::GitStatus {
+                branch: None,
+                dirty: false,
+            }),
+        ));
+        let plain = ProjectRow::from(project(harkness_core::ProjectSource::Local, None, None));
+
+        assert!(detached.is_git && detached.branch.is_empty() && !detached.dirty);
+        assert!(!plain.is_git && !plain.managed && plain.remote.is_empty());
+    }
+
+    #[test]
+    fn projects_list_and_empty_opened_are_maps() {
+        let rows = [ProjectRow::from(project(
+            harkness_core::ProjectSource::Local,
+            None,
+            None,
+        ))];
+        let projects = to_projects(&rows);
+
+        assert_eq!(projects.len(), 1);
+        let empty = empty_opened()
+            .value::<QMap<QMapPair_QString_QVariant>>()
+            .expect("empty opened should still be a QVariantMap");
+        assert!(empty.is_empty());
+
+        let filled = to_map(&rows[0])
+            .value::<QMap<QMapPair_QString_QVariant>>()
+            .unwrap();
+        assert!(!filled.is_empty());
+        assert_eq!(QVariant::default().value::<bool>(), None);
+    }
+
+    #[test]
+    fn successful_open_and_removal_have_opposite_navigation_transitions() {
+        let opened = operation_outcome(
+            Ok(project(harkness_core::ProjectSource::Local, None, None)),
+            "Opened",
+            true,
+        );
+        assert_eq!(opened.status, "Opened sample");
+        assert!(matches!(opened.opened, OpenedUpdate::Open(_)));
+
+        let removed = operation_outcome(
+            Ok(project(harkness_core::ProjectSource::Local, None, None)),
+            "Removed",
+            false,
+        );
+        assert_eq!(removed.status, "Removed sample");
+        assert!(matches!(removed.opened, OpenedUpdate::Clear));
+    }
+
+    #[test]
+    fn errors_are_actionable_and_do_not_navigate() {
+        let outcome = operation_outcome(
+            Err("project is unavailable at /missing".to_owned()),
+            "Opened",
+            true,
+        );
+
+        assert_eq!(outcome.status, "project is unavailable at /missing");
+        assert!(matches!(outcome.opened, OpenedUpdate::Keep));
     }
 }

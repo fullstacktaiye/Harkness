@@ -666,7 +666,14 @@ fn read_git_output(stderr: impl Read, sender: &mpsc::Sender<String>) -> String {
     Vec::from(retained).join("\n")
 }
 
-fn normalize_remote(remote: &str) -> Result<String, ProjectError> {
+/// Normalizes a remote into the canonical identity used for deduplication.
+///
+/// Accepts GitHub HTTPS/SSH/SCP-style remotes and local paths (which become
+/// `file://` URLs). This is the same validation [`ProjectService::import_repository`]
+/// applies, exposed so front ends can validate a form before starting a clone.
+///
+/// [`ProjectService::import_repository`]: crate::ProjectService::import_repository
+pub fn normalize_remote(remote: &str) -> Result<String, ProjectError> {
     let remote = remote.trim();
     let invalid = || ProjectError::InvalidRemote {
         remote: remote.to_owned(),
@@ -1276,6 +1283,26 @@ mod tests {
             super::normalize_remote("ssh://git@github.com/EXAMPLE/PROJECT/").unwrap(),
             expected
         );
+    }
+
+    #[test]
+    fn malformed_github_remotes_are_rejected() {
+        for remote in [
+            "",
+            "https://github.com/",
+            "https://github.com/only-owner",
+            "https://github.com/owner/repository/extra",
+            "https://gitlab.com/owner/repository",
+            "not a remote at all //",
+        ] {
+            assert!(
+                matches!(
+                    super::normalize_remote(remote),
+                    Err(ProjectError::InvalidRemote { .. })
+                ),
+                "expected '{remote}' to be rejected"
+            );
+        }
     }
 
     #[test]
