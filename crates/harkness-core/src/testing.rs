@@ -77,6 +77,7 @@ fn process_child() {
             // them can only have inherited them through the runner.
             for name in [
                 "GIT_DIR",
+                "GIT_COMMON_DIR",
                 "GIT_WORK_TREE",
                 "GIT_INDEX_FILE",
                 "GIT_OBJECT_DIRECTORY",
@@ -97,6 +98,7 @@ fn process_child() {
             assert_eq!(
                 reported,
                 "GIT_DIR=unset\n\
+                 GIT_COMMON_DIR=unset\n\
                  GIT_WORK_TREE=unset\n\
                  GIT_INDEX_FILE=unset\n\
                  GIT_OBJECT_DIRECTORY=unset\n\

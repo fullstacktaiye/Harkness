@@ -32,8 +32,9 @@ const RETAINED_GIT_OUTPUT_SEGMENTS: usize = 20;
 /// `harkness-cli` is an agent tool, so it is invoked from Git hooks and from
 /// shells that exported these. Left in place, every command would silently
 /// operate on whichever repository the parent was pointing at.
-const REDIRECTING_ENVIRONMENT: [&str; 4] = [
+const REDIRECTING_ENVIRONMENT: [&str; 5] = [
     "GIT_DIR",
+    "GIT_COMMON_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
     "GIT_OBJECT_DIRECTORY",
@@ -130,6 +131,9 @@ pub struct GitCommand {
     arguments: Vec<OsString>,
     accepted_exit_codes: Vec<i32>,
     timeout: Option<Duration>,
+    // A mutation command obtained through `GitService` owns the repository
+    // lock for its whole lifetime, including while it runs.
+    _repository_lock: Option<crate::git::RepositoryLock>,
 }
 
 impl GitCommand {
@@ -139,7 +143,7 @@ impl GitCommand {
     /// than `git -C`, so it applies before Git reads any configuration and
     /// cannot be overridden by an argument a caller appends later.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         executable: impl Into<PathBuf>,
         working_directory: impl Into<PathBuf>,
         access: GitAccess,
@@ -151,7 +155,14 @@ impl GitCommand {
             arguments: Vec::new(),
             accepted_exit_codes: Vec::new(),
             timeout: access.default_timeout(),
+            _repository_lock: None,
         }
+    }
+
+    /// Keeps `lock` held until this command finishes or is discarded.
+    pub(crate) fn with_repository_lock(mut self, lock: crate::git::RepositoryLock) -> Self {
+        self._repository_lock = Some(lock);
+        self
     }
 
     /// Appends one argument.

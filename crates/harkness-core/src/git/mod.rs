@@ -122,9 +122,21 @@ impl GitService {
     }
 
     /// Prepares a Git invocation in this repository.
-    #[must_use]
-    pub fn command(&self, access: GitAccess) -> GitCommand {
-        GitCommand::new(&self.git_executable, &self.root, access)
+    ///
+    /// Write and network commands acquire the repository lock immediately and
+    /// retain it through execution. Local reads remain lock-free.
+    pub fn command(
+        &self,
+        access: GitAccess,
+        cancellation: &Cancellation,
+    ) -> Result<GitCommand, GitError> {
+        let command = GitCommand::new(&self.git_executable, &self.root, access);
+        match access {
+            GitAccess::LocalRead => Ok(command),
+            GitAccess::LocalWrite | GitAccess::Network => {
+                Ok(command.with_repository_lock(self.lock(cancellation)?))
+            }
+        }
     }
 
     /// Describes the repository cheaply and in process.
@@ -149,5 +161,29 @@ impl GitService {
     /// [`RepositoryLock`] for the ordering it must be acquired in.
     pub fn lock(&self, cancellation: &Cancellation) -> Result<RepositoryLock, GitError> {
         RepositoryLock::acquire(&self.data_dir, &self.root, cancellation)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cancellation, GitAccess, GitError, GitService};
+    use crate::testing::{Fixture, initialize_repository};
+
+    #[test]
+    fn mutation_commands_hold_the_repository_lock_while_they_exist() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("command-lock");
+        initialize_repository(&root);
+        let service = GitService::new(&root, &fixture.data_dir);
+
+        let command = service
+            .command(GitAccess::LocalWrite, &Cancellation::default())
+            .unwrap();
+        let cancelled = Cancellation::default();
+        cancelled.cancel();
+        assert!(matches!(service.lock(&cancelled), Err(GitError::Cancelled)));
+
+        drop(command);
+        service.lock(&Cancellation::default()).unwrap();
     }
 }

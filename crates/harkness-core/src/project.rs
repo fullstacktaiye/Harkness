@@ -1696,7 +1696,7 @@ mod tests {
         let reporting_git = fixture.shim(
             "reporting-git",
             "#!/bin/sh\n\
-             for name in GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+             for name in GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
                  GIT_TERMINAL_PROMPT GIT_OPTIONAL_LOCKS; do\n\
              \x20 eval \"value=\\${$name-unset}\"\n\
              \x20 printf '%s=%s\\n' \"$name\" \"$value\"\n\
@@ -1707,6 +1707,7 @@ mod tests {
             .env(PROCESS_PROJECT_ROOT_ENV, &working_directory)
             .env(PROCESS_GIT_EXECUTABLE_ENV, &reporting_git)
             .env("GIT_DIR", elsewhere.join(".git"))
+            .env("GIT_COMMON_DIR", elsewhere.join(".git"))
             .env("GIT_WORK_TREE", &elsewhere)
             .env("GIT_INDEX_FILE", elsewhere.join("index"))
             .env("GIT_OBJECT_DIRECTORY", elsewhere.join("objects"))
