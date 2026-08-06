@@ -14,6 +14,10 @@ Kirigami.ApplicationWindow {
     visible: true
     width: 960
 
+    // The launcher and project shell are alternative application states, not
+    // master/detail columns. Always show only the current page.
+    pageStack.columnView.columnResizeMode: Kirigami.ColumnView.SingleColumn
+
     HarknessBackend {
         id: appBackend
         Component.onCompleted: refresh()

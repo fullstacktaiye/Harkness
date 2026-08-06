@@ -246,7 +246,6 @@ Kirigami.ScrollablePage {
 
             delegate: RecentProjectCard {
                 height: GridView.view.cellHeight - Kirigami.Units.smallSpacing
-                project: modelData
                 width: GridView.view.cellWidth - Kirigami.Units.smallSpacing
                 onActivated: {
                     if (project.available)

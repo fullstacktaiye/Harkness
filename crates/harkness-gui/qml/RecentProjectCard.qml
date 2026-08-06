@@ -9,7 +9,12 @@ import org.kde.kirigami as Kirigami
 Controls.AbstractButton {
     id: card
 
-    required property var project
+    // Declaring modelData itself as required lets Qt's view populate it. A
+    // differently named required property disables the legacy delegate
+    // context, leaving `modelData` undefined at the call site.
+    required property var modelData
+
+    readonly property var project: modelData
 
     signal activated()
 

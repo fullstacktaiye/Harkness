@@ -27,19 +27,19 @@ Kirigami.Page {
             icon.name: "go-previous-symbolic"
             shortcut: "Alt+Left"
             text: qsTr("Back")
-            Controls.ToolTip.text: qsTr("Back to the launcher")
+            tooltip: qsTr("Back to the launcher")
             onTriggered: shell.backend.closeProject()
         },
         Kirigami.Action {
             icon.name: "view-refresh"
             text: qsTr("Refresh")
-            Controls.ToolTip.text: qsTr("Re-read availability and Git state")
+            tooltip: qsTr("Re-read availability and Git state")
             onTriggered: shell.backend.openProject(shell.project.id)
         },
         Kirigami.Action {
             icon.name: "delete"
             text: qsTr("Remove from Harkness…")
-            Controls.ToolTip.text: shell.project.managed ? qsTr("Delete this managed checkout") : qsTr("Forget this project; files stay untouched")
+            tooltip: shell.project.managed ? qsTr("Delete this managed checkout") : qsTr("Forget this project; files stay untouched")
             onTriggered: {
                 if (shell.project.managed)
                     applicationWindow().confirmRemoveManaged(shell.project.id, shell.project.displayName, shell.project.root);
@@ -148,7 +148,7 @@ Kirigami.Page {
         id: fileModel
     }
 
-    Controls.TreeView {
+    TreeView {
         id: tree
 
         anchors.fill: parent
@@ -160,10 +160,12 @@ Kirigami.Page {
         delegate: Controls.TreeViewDelegate {
             id: treeDelegate
 
-            required property string fileName
-            required property string filePath
-            required property bool isDirectory
-            required property bool expandable
+            // The KDE TreeViewDelegate already requires a `model` object.
+            // Consequently custom roles are exposed through that object, not
+            // injected as standalone required properties.
+            readonly property string fileName: model.fileName
+            readonly property string filePath: model.filePath
+            readonly property bool isDirectory: model.isDirectory
 
             Controls.ToolTip.text: treeDelegate.filePath
             Controls.ToolTip.visible: treeDelegate.hovered

@@ -33,7 +33,7 @@ fn main() {
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QUrl};
+    use cxx_qt_lib::{QByteArray, QGuiApplication, QQmlApplicationEngine, QUrl};
 
     /// Loads Main.qml the same way `main` does and asserts the engine
     /// produced a root object, catching broken imports and malformed QML
@@ -63,6 +63,53 @@ mod tests {
         assert!(
             LOADED.load(Ordering::SeqCst),
             "Main.qml failed to load; see QML warnings above"
+        );
+
+        // Instantiate the shell directly with a real directory so TreeView
+        // creates delegates and validates the filesystem role bindings. The
+        // normal application cannot reach this page until an async import or
+        // open completes, which the no-event-loop smoke test cannot drive.
+        LOADED.store(false, Ordering::SeqCst);
+        if let Some(mut engine) = engine.as_mut() {
+            let _connection = engine.as_mut().on_object_created(|_engine, object, _url| {
+                LOADED.store(!object.is_null(), Ordering::SeqCst);
+            });
+            engine.as_mut().load_data(
+                &QByteArray::from(
+                    br#"
+import QtQuick
+import org.kde.kirigami as Kirigami
+import io.github.fullstacktaiye.harkness
+
+Kirigami.ApplicationWindow {
+    visible: false
+    width: 640
+    height: 480
+
+    HarknessBackend { id: backend }
+    pageStack.initialPage: ProjectShellPage {
+        backend: backend
+        project: ({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "displayName": "QML fixture",
+            "root": "/tmp",
+            "remote": "",
+            "branch": "",
+            "managed": false,
+            "available": true,
+            "isGit": false,
+            "dirty": false
+        })
+    }
+}
+"#,
+                ),
+                &QUrl::from("qrc:/ProjectShellSmoke.qml"),
+            );
+        }
+        assert!(
+            LOADED.load(Ordering::SeqCst),
+            "ProjectShellPage failed to load; see QML warnings above"
         );
         // The engine must be released before the application; dropping locals
         // in declaration order would do the opposite.

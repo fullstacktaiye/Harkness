@@ -132,6 +132,9 @@ struct Node {
     entry: Option<harkness_core::DirEntry>,
     /// Child node ids, or `None` while the directory has not been listed.
     children: Option<Vec<u64>>,
+    /// Guards against a re-entrant fetch without changing row or child state
+    /// before beginInsertRows() starts the model mutation.
+    fetching: bool,
     parent: Option<u64>,
 }
 
@@ -149,6 +152,7 @@ impl Default for FileTreeModelRust {
             Node {
                 entry: None,
                 children: None,
+                fetching: false,
                 parent: None,
             },
         );
@@ -286,6 +290,7 @@ impl ffi::FileTreeModel {
         let rust = self.rust();
         rust.node(parent).is_some_and(|node| {
             node.children.is_none()
+                && !node.fetching
                 && FileTreeModelRust::is_expandable(node)
                 && !rust.root.is_empty()
         })
@@ -298,7 +303,7 @@ impl ffi::FileTreeModel {
             let Some(node) = rust.node(parent) else {
                 return;
             };
-            if node.children.is_some() || !FileTreeModelRust::is_expandable(node) {
+            if node.children.is_some() || node.fetching || !FileTreeModelRust::is_expandable(node) {
                 return;
             }
             (
@@ -313,6 +318,17 @@ impl ffi::FileTreeModel {
         let count = entries.len();
         let mut children = Vec::with_capacity(count);
         if count > 0 {
+            // beginInsertRows() may synchronously ask canFetchMore() again.
+            // Guard that re-entry separately: changing `children` here would
+            // also change rowCount()/hasChildren() before Qt's insertion
+            // protocol begins and confuse TreeView's flattening proxy.
+            self.as_mut()
+                .rust_mut()
+                .get_mut()
+                .nodes
+                .get_mut(&node_id)
+                .expect("fetched node must exist")
+                .fetching = true;
             {
                 let base: Pin<&mut ffi::FileTreeModelBase> = self.as_mut().upcast_pin();
                 base.begin_insert(parent, 0, count as i32 - 1);
@@ -326,25 +342,30 @@ impl ffi::FileTreeModel {
                     Node {
                         entry: Some(entry),
                         children: None,
+                        fetching: false,
                         parent: Some(node_id),
                     },
                 );
                 children.push(id);
             }
-            rust.nodes
+            let node = rust
+                .nodes
                 .get_mut(&node_id)
-                .expect("fetched node must exist")
-                .children = Some(children);
+                .expect("fetched node must exist");
+            node.children = Some(children);
+            node.fetching = false;
             let base: Pin<&mut ffi::FileTreeModelBase> = self.as_mut().upcast_pin();
             base.end_insert();
         } else {
-            self.as_mut()
+            let node = self
+                .as_mut()
                 .rust_mut()
                 .get_mut()
                 .nodes
                 .get_mut(&node_id)
-                .expect("fetched node must exist")
-                .children = Some(children);
+                .expect("fetched node must exist");
+            node.children = Some(children);
+            node.fetching = false;
         }
     }
 
@@ -356,6 +377,12 @@ impl ffi::FileTreeModel {
         if *self.as_ref().root() == *path {
             return;
         }
+        // Populate the first level atomically with the reset. Qt Quick's
+        // TreeView maintains an internal flattened proxy; fetching the
+        // invisible root through rowsInserted can make that proxy retain the
+        // pre- and post-fetch root rows. Descendant directories still use
+        // fetchMore(), so traversal remains one-level-at-a-time and lazy.
+        let entries = harkness_core::list_directory(path.to_string()).unwrap_or_default();
         {
             let base: Pin<&mut ffi::FileTreeModelBase> = self.as_mut().upcast_pin();
             base.begin_reset();
@@ -363,15 +390,31 @@ impl ffi::FileTreeModel {
         {
             let rust = self.as_mut().rust_mut().get_mut();
             rust.nodes.clear();
+            rust.next_id = 1;
+            let mut children = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let id = rust.next_id;
+                rust.next_id += 1;
+                rust.nodes.insert(
+                    id,
+                    Node {
+                        entry: Some(entry),
+                        children: None,
+                        fetching: false,
+                        parent: Some(ROOT_ID),
+                    },
+                );
+                children.push(id);
+            }
             rust.nodes.insert(
                 ROOT_ID,
                 Node {
                     entry: None,
-                    children: None,
+                    children: Some(children),
+                    fetching: false,
                     parent: None,
                 },
             );
-            rust.next_id = 1;
             rust.root = path.clone();
         }
         {
@@ -436,6 +479,7 @@ mod tests {
                 FileTreeModelRust::is_expandable(&Node {
                     entry: Some(entry),
                     children: None,
+                    fetching: false,
                     parent: Some(ROOT_ID),
                 })
             })
