@@ -275,6 +275,7 @@ pub struct ProjectService {
     data_dir: PathBuf,
     catalog: Catalog,
     allow_local_remotes: bool,
+    git_executable: PathBuf,
 }
 
 impl ProjectService {
@@ -297,6 +298,7 @@ impl ProjectService {
             data_dir,
             catalog,
             allow_local_remotes: false,
+            git_executable: PathBuf::from("git"),
         })
     }
 
@@ -530,7 +532,13 @@ impl ProjectService {
         // Every failure past this point can leave a partial checkout behind, so
         // the rest of the import runs in one fallible block with one cleanup.
         let imported = (|| {
-            run_git_clone(remote, &checkout, cancellation, &mut on_progress)?;
+            run_git_clone(
+                &self.git_executable,
+                remote,
+                &checkout,
+                cancellation,
+                &mut on_progress,
+            )?;
             let canonical_root = validate_local_directory(&checkout)?;
             let project = Project {
                 id,
@@ -678,17 +686,31 @@ fn unsafe_removal(project: &Project, reason: impl Into<String>) -> ProjectError 
 }
 
 fn run_git_clone(
+    git_executable: &Path,
     remote: &str,
     checkout: &Path,
     cancellation: &CloneCancellation,
     on_progress: &mut impl FnMut(String),
 ) -> Result<(), ProjectError> {
-    let mut child = Command::new("git")
+    let mut command = Command::new(git_executable);
+    command
         .args(["clone", "--progress", "--", remote])
         .arg(checkout)
+        // Git may open /dev/tty even when stdin is closed. A GUI cannot answer
+        // that prompt, so fail with Git's diagnostic instead of hanging.
+        .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // A clone starts transport and credential helpers. Keeping the whole tree
+    // in a dedicated group lets cancellation stop every process before the
+    // caller removes the partial checkout.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
         .spawn()
         .map_err(|source| ProjectError::GitLaunch { source })?;
     let stderr = child.stderr.take().expect("piped stderr");
@@ -700,7 +722,7 @@ fn run_git_clone(
             on_progress(message);
         }
         if cancellation.is_cancelled() {
-            let _ = child.kill();
+            terminate_clone(&mut child);
             let _ = child.wait();
             let _ = reader.join();
             return Err(ProjectError::CloneCancelled);
@@ -723,6 +745,20 @@ fn run_git_clone(
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[cfg(unix)]
+fn terminate_clone(child: &mut std::process::Child) {
+    // `process_group(0)` makes the child's PID its process-group ID. A negative
+    // target atomically signals Git and all helpers that still belong to it.
+    unsafe {
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_clone(child: &mut std::process::Child) {
+    let _ = child.kill();
 }
 
 /// Forwards Git's standard-error segments and returns the retained tail.
@@ -1592,6 +1628,61 @@ mod tests {
         assert!(
             !repositories.exists() || fs::read_dir(repositories).unwrap().next().is_none(),
             "partial managed repository directory remained"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_stops_clone_descendants_before_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new();
+        let remote = fixture.directory("slow-remote");
+        initialize_repository(&remote);
+        let activity = fixture.root.path().join("helper-activity");
+        let fake_git = fixture.root.path().join("fake-git");
+        fs::write(
+            &fake_git,
+            format!(
+                "#!/bin/sh\n\
+                 for argument do checkout=$argument; done\n\
+                 test \"$GIT_TERMINAL_PROMPT\" = 0 || exit 97\n\
+                 mkdir -p \"$checkout\"\n\
+                 (while true; do printf x >> '{}'; sleep 0.01; done) 2>/dev/null &\n\
+                 echo ready >&2\n\
+                 wait\n",
+                activity.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&fake_git).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_git, permissions).unwrap();
+
+        let cancellation = CloneCancellation::default();
+        let mut service = fixture.service();
+        service.git_executable = fake_git;
+        let error = service
+            .import_repository(remote.to_str().unwrap(), &cancellation, |message| {
+                if message == "ready" {
+                    cancellation.cancel();
+                }
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, ProjectError::CloneCancelled));
+        assert!(service.list().is_empty());
+        let repositories = fixture.data_dir.join(REPOSITORIES_DIRECTORY);
+        assert!(
+            !repositories.exists() || fs::read_dir(repositories).unwrap().next().is_none(),
+            "partial managed repository directory remained"
+        );
+        let activity_after_cancel = fs::read(&activity).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            fs::read(&activity).unwrap(),
+            activity_after_cancel,
+            "a clone helper survived cancellation"
         );
     }
 

@@ -389,6 +389,7 @@ version = "0.1.0"
 dependencies = [
  "dirs",
  "git2",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
