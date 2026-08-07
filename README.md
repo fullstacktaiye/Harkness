@@ -46,11 +46,21 @@ cargo fmt --check
 cargo clippy --workspace --all-targets
 ```
 
-With no arguments the CLI prints exactly `Hello World`. Its worktree commands
-provide a scriptable version of the GUI workflow:
+The CLI exposes the project catalog with stable machine-readable output and
+exit codes suitable for agents. Select a project with one global
+`--project <SELECTOR>` accepting a full ID, an ID prefix of at least eight
+characters, a canonical path, or a display name. When it is omitted, Harkness
+walks upward from the current directory and selects the deepest catalogued
+root, so commands run naturally from a repository or linked worktree.
 
 ```sh
-harkness project list
+harkness --json project list
+harkness --project <selector> project show
+harkness project import <path>
+harkness project clone <github-remote>
+harkness --project <selector> project forget
+harkness --project <selector> project delete --yes
+
 harkness worktree list <parent-id>
 harkness worktree create <parent-id> --new <branch> [--start <revision>]
 harkness worktree create <parent-id> --existing <branch>
@@ -58,6 +68,12 @@ harkness worktree create <parent-id> --detached <revision>
 harkness worktree remove <worktree-id> [--force]
 harkness worktree reconcile <parent-id>
 ```
+
+`--json` writes exactly one success or error envelope to standard output.
+Clone progress remains on standard error as one JSON object per line, keeping
+standard output parseable. `HARKNESS_DATA_DIR` and `--data-dir <path>` select an
+isolated catalog, with the explicit flag taking precedence. Run
+`harkness --help` for the exit-code contract and complete command help.
 
 Removing a worktree preserves its branch, allowing `--existing` to reuse it.
 Ordinary removal refuses uncommitted files; `--force` explicitly discards

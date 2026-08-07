@@ -19,19 +19,5 @@ pub use git::{
     StatusRefreshOutcome,
 };
 pub use listing::{DirEntry, list_directory};
-pub use project::{ProjectError, ProjectService, Worktree, WorktreeBase};
+pub use project::{ProjectError, ProjectSelector, ProjectService, Worktree, WorktreeBase};
 pub use remote::normalize_remote;
-
-/// Returns the greeting displayed by every Harkness interface.
-#[must_use]
-pub const fn greeting() -> &'static str {
-    "Hello World"
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn greeting_is_hello_world() {
-        assert_eq!(super::greeting(), "Hello World");
-    }
-}
