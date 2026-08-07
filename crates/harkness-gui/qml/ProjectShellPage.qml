@@ -20,6 +20,8 @@ Kirigami.Page {
         // changes in theory, but re-applying it is a no-op then.
         if (project.available)
             fileModel.setRoot(project.root);
+        if (project.available && project.isGit)
+            backend.refreshBranches(project.id);
     }
 
     actions: [
@@ -111,6 +113,42 @@ Kirigami.Page {
                 RowLayout {
                     spacing: Kirigami.Units.smallSpacing
 
+                    Controls.ComboBox {
+                        id: branchPicker
+
+                        Accessible.name: qsTr("Current Git branch")
+                        Layout.preferredWidth: Kirigami.Units.gridUnit * 11
+                        enabled: shell.project.isGit && shell.project.available && !shell.backend.busy
+                        model: shell.backend.branches
+                        textRole: "name"
+                        valueRole: "name"
+                        visible: shell.project.isGit
+
+                        currentIndex: {
+                            for (let index = 0; index < count; ++index) {
+                                if (valueAt(index) === shell.project.branch)
+                                    return index;
+                            }
+                            return -1;
+                        }
+
+                        delegate: Controls.ItemDelegate {
+                            required property var modelData
+
+                            Controls.ToolTip.text: modelData.detail
+                            Controls.ToolTip.visible: hovered && modelData.detail.length > 0
+                            enabled: modelData.selectable
+                            text: modelData.name
+                            width: branchPicker.width
+                        }
+
+                        onActivated: {
+                            const selected = String(currentValue);
+                            if (selected.length > 0 && selected !== shell.project.branch)
+                                shell.backend.checkoutBranch(shell.project.id, selected);
+                        }
+                    }
+
                     Kirigami.Chip {
                         checkable: false
                         closable: false
@@ -188,6 +226,11 @@ Kirigami.Page {
         }
 
         Component.onCompleted: fileModel.setRoot(shell.project.root)
+    }
+
+    Component.onCompleted: {
+        if (shell.project.available && shell.project.isGit)
+            shell.backend.refreshBranches(shell.project.id);
     }
 
     Kirigami.PlaceholderMessage {

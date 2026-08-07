@@ -41,20 +41,12 @@ use git2::{ErrorCode, Oid, Repository};
 use crate::{
     catalog::entry::GitStatus,
     git::{
-        GitError, RepositoryLock,
+        GitError, LOCAL_REMOTE, RepositoryLock, head_branch, recorded_default_branch,
+        resolve_remote,
         runner::{Cancellation, GitAccess, GitCommand, GitOutput},
         status,
     },
 };
-
-/// The remote a repository means when nothing else names one.
-const DEFAULT_REMOTE: &str = "origin";
-
-/// Git's name for the repository itself, as a value of `branch.<name>.remote`.
-///
-/// A branch built on another local branch tracks this rather than a remote, and
-/// `git pull . <branch>` is an ordinary thing to do with one.
-const LOCAL_REMOTE: &str = ".";
 
 /// What one fetch should do.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -244,7 +236,7 @@ pub(crate) fn fetch(
         &repository,
         root,
         options.remote.as_deref(),
-        upstream.as_ref(),
+        upstream.as_ref().map(|upstream| upstream.remote.as_str()),
     )?;
 
     let before = tracking_refs(&repository, root, &remote)?;
@@ -304,7 +296,7 @@ pub(crate) fn pull(
         &repository,
         root,
         options.remote.as_deref(),
-        Some(&upstream),
+        Some(&upstream.remote),
     )?;
 
     let before = head_commit(&repository);
@@ -352,7 +344,7 @@ pub(crate) fn push(
         &repository,
         root,
         options.remote.as_deref(),
-        upstream.as_ref(),
+        upstream.as_ref().map(|upstream| upstream.remote.as_str()),
     )?;
     if remote == LOCAL_REMOTE {
         return Err(GitError::LocalUpstreamUnsupported { branch });
@@ -667,62 +659,6 @@ fn configured(
     }
 }
 
-/// Chooses the remote to contact.
-///
-/// A named remote must exist; nothing else is ever silently substituted for it.
-/// With none named, a branch that tracks something decides, and a branch whose
-/// remote no longer exists is refused rather than redirected — a branch that
-/// tracks `upstream` must not be published to `origin` because `upstream` was
-/// deleted from the configuration. Only a branch that tracks nothing at all
-/// falls back, to `origin` and then to a repository's single remote.
-///
-/// [`LOCAL_REMOTE`] counts as known without appearing among the configured
-/// remotes, because it never does: Git spells "this repository" `.`, and a
-/// branch tracking another local branch is configured with exactly that. It is
-/// only ever produced when something asked for it, never chosen by a fallback.
-fn resolve_remote(
-    repository: &Repository,
-    root: &Path,
-    requested: Option<&str>,
-    upstream: Option<&Upstream>,
-) -> Result<String, GitError> {
-    let configured = repository
-        .remotes()
-        .map_err(|source| inspection(root, source))?;
-    // A remote whose name is not UTF-8 is skipped rather than guessed at; it
-    // can still be reached by naming it, since that name came from the caller.
-    let names = || configured.iter().filter_map(|name| name.ok().flatten());
-    let known =
-        |candidate: &str| candidate == LOCAL_REMOTE || names().any(|name| name == candidate);
-
-    if let Some(requested) = requested {
-        return if known(requested) {
-            Ok(requested.to_owned())
-        } else {
-            Err(GitError::NoRemote {
-                remote: Some(requested.to_owned()),
-            })
-        };
-    }
-    if let Some(upstream) = upstream {
-        return if known(&upstream.remote) {
-            Ok(upstream.remote.clone())
-        } else {
-            Err(GitError::NoRemote {
-                remote: Some(upstream.remote.clone()),
-            })
-        };
-    }
-    if known(DEFAULT_REMOTE) {
-        return Ok(DEFAULT_REMOTE.to_owned());
-    }
-    let mut only = names();
-    match (only.next(), only.next()) {
-        (Some(only), None) => Ok(only.to_owned()),
-        _ => Err(GitError::NoRemote { remote: None }),
-    }
-}
-
 /// Names the branch the remote currently calls its default.
 ///
 /// Asked of the remote, every time, immediately before the push it guards. The
@@ -750,7 +686,11 @@ fn default_branch(
 ) -> Result<String, GitError> {
     match advertised_default_branch(git_executable, root, remote, cancellation)? {
         Some(branch) => Ok(branch),
-        None => recorded_default_branch(repository, root, remote),
+        None => recorded_default_branch(repository, root, remote)?.ok_or_else(|| {
+            GitError::DefaultBranchUnknown {
+                remote: remote.to_owned(),
+            }
+        }),
     }
 }
 
@@ -788,33 +728,6 @@ fn advertised_head(line: &str) -> Option<String> {
     (!branch.is_empty()).then(|| branch.to_owned())
 }
 
-/// Reads the default branch this repository last recorded for the remote.
-///
-/// `refs/remotes/<remote>/HEAD` is what `git clone` and `git remote set-head`
-/// write, and the only local evidence there is. Correct exactly as long as the
-/// remote has not changed its mind since, which is why it is the fallback and
-/// no longer the answer.
-fn recorded_default_branch(
-    repository: &Repository,
-    root: &Path,
-    remote: &str,
-) -> Result<String, GitError> {
-    let unknown = || GitError::DefaultBranchUnknown {
-        remote: remote.to_owned(),
-    };
-    let head = match repository.find_reference(&format!("refs/remotes/{remote}/HEAD")) {
-        Ok(head) => head,
-        Err(error) if error.code() == ErrorCode::NotFound => return Err(unknown()),
-        Err(source) => return Err(inspection(root, source)),
-    };
-    head.symbolic_target()
-        .map_err(|source| inspection(root, source))?
-        .and_then(|target| target.strip_prefix(&format!("refs/remotes/{remote}/")))
-        .filter(|branch| !branch.is_empty())
-        .map(str::to_owned)
-        .ok_or_else(unknown)
-}
-
 /// Names the checked-out branch, refusing anything a push cannot be about.
 ///
 /// An unborn branch keeps its name: it has no commits to push, but it is still
@@ -832,7 +745,7 @@ fn current_branch(repository: &Repository, root: &Path) -> Result<String, GitErr
                 |commit| format!("HEAD is detached at {commit}"),
             ),
         }),
-        Err(error) if error.code() == ErrorCode::UnbornBranch => unborn_branch(repository, root),
+        Err(error) if error.code() == ErrorCode::UnbornBranch => head_branch(repository, root),
         Err(source) => Err(inspection(root, source)),
     }
 }
@@ -847,27 +760,6 @@ fn branch_if_any(repository: &Repository, root: &Path) -> Result<Option<String>,
         Err(GitError::DetachedHead { .. }) => Ok(None),
         Err(error) => Err(error),
     }
-}
-
-/// Reads the branch name HEAD points at before the first commit exists.
-fn unborn_branch(repository: &Repository, root: &Path) -> Result<String, GitError> {
-    repository
-        .find_reference("HEAD")
-        .and_then(|head| {
-            head.symbolic_target()
-                .map(|target| target.map(str::to_owned))
-        })
-        .map_err(|source| inspection(root, source))?
-        .and_then(|target| {
-            target
-                .strip_prefix("refs/heads/")
-                .filter(|branch| !branch.is_empty())
-                .map(str::to_owned)
-        })
-        .ok_or_else(|| GitError::DetachedHead {
-            path: root.to_path_buf(),
-            detail: "HEAD names no branch".to_owned(),
-        })
 }
 
 /// Snapshots the remote-tracking refs of one remote.

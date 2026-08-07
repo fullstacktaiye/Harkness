@@ -28,6 +28,7 @@ pub mod ffi {
         #[qproperty(bool, busy)]
         #[qproperty(QString, status)]
         #[qproperty(QList_QVariant, projects)]
+        #[qproperty(QList_QVariant, branches)]
         #[qproperty(QVariant, opened)]
         type HarknessBackend = super::HarknessBackendRust;
 
@@ -61,6 +62,16 @@ pub mod ffi {
         #[cxx_name = "closeProject"]
         fn close_project(self: Pin<&mut HarknessBackend>);
 
+        /// Loads branch-picker data without blocking the GUI thread.
+        #[qinvokable]
+        #[cxx_name = "refreshBranches"]
+        fn refresh_branches(self: Pin<&mut HarknessBackend>, project_id: &QString);
+
+        /// Checks out a local branch and refreshes both project and branch state.
+        #[qinvokable]
+        #[cxx_name = "checkoutBranch"]
+        fn checkout_branch(self: Pin<&mut HarknessBackend>, project_id: &QString, branch: &QString);
+
         /// Removes a local project from the catalog without touching its
         /// directory.
         #[qinvokable]
@@ -84,6 +95,7 @@ pub struct HarknessBackendRust {
     busy: bool,
     status: QString,
     projects: QList<QVariant>,
+    branches: QList<QVariant>,
     opened: QVariant,
     cancellation: Option<harkness_core::CloneCancellation>,
 }
@@ -94,8 +106,37 @@ impl Default for HarknessBackendRust {
             busy: false,
             status: "Ready".into(),
             projects: QList::default(),
+            branches: QList::default(),
             opened: empty_opened(),
             cancellation: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BranchRow {
+    name: String,
+    current: bool,
+    selectable: bool,
+    detail: String,
+}
+
+impl From<harkness_core::Branch> for BranchRow {
+    fn from(branch: harkness_core::Branch) -> Self {
+        let (current, selectable, detail) = match branch.checkout {
+            harkness_core::BranchCheckout::NotCheckedOut => (false, true, String::new()),
+            harkness_core::BranchCheckout::CurrentWorktree => {
+                (true, true, "Checked out here".to_owned())
+            }
+            harkness_core::BranchCheckout::OtherWorktree(path) => {
+                (false, false, format!("Checked out at {}", path.display()))
+            }
+        };
+        Self {
+            name: branch.name,
+            current,
+            selectable,
+            detail,
         }
     }
 }
@@ -177,6 +218,40 @@ fn to_projects(rows: &[ProjectRow]) -> QList<QVariant> {
         projects.append(to_map(row));
     }
     projects
+}
+
+fn to_branches(rows: &[BranchRow]) -> QList<QVariant> {
+    let mut branches = QList::<QVariant>::default();
+    for row in rows {
+        let mut entry = QMap::<QMapPair_QString_QVariant>::default();
+        let mut insert = |key: &str, value: QVariant| entry.insert(QString::from(key), value);
+        insert("name", QVariant::from(&QString::from(row.name.as_str())));
+        insert("current", QVariant::from(&row.current));
+        insert("selectable", QVariant::from(&row.selectable));
+        insert(
+            "detail",
+            QVariant::from(&QString::from(row.detail.as_str())),
+        );
+        branches.append(QVariant::from(&entry));
+    }
+    branches
+}
+
+fn load_branches(project_id: &str) -> Result<Vec<BranchRow>, String> {
+    let id = project_id
+        .parse()
+        .map_err(|_| "invalid project identifier".to_owned())?;
+    let service = harkness_core::ProjectService::load().map_err(|error| error.to_string())?;
+    let git = service.git(id).map_err(|error| error.to_string())?;
+    git.branches(
+        &harkness_core::BranchListOptions {
+            include_remote_tracking: false,
+            calculate_divergence: false,
+        },
+        &harkness_core::Cancellation::default(),
+    )
+    .map(|branches| branches.into_iter().map(BranchRow::from).collect())
+    .map_err(|error| error.to_string())
 }
 
 /// The `opened` value while no project is open: an empty map, so QML can
@@ -330,6 +405,74 @@ impl ffi::HarknessBackend {
 
     fn close_project(mut self: Pin<&mut Self>) {
         self.as_mut().set_opened(empty_opened());
+        self.as_mut().set_branches(QList::default());
+    }
+
+    fn refresh_branches(self: Pin<&mut Self>, project_id: &QString) {
+        let project_id = project_id.to_string();
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let result = load_branches(&project_id);
+            let _ = qt_thread.queue(move |mut backend| match result {
+                Ok(rows) => backend.as_mut().set_branches(to_branches(&rows)),
+                Err(error) => {
+                    backend.as_mut().set_branches(QList::default());
+                    backend.as_mut().set_status(error.into());
+                }
+            });
+        });
+    }
+
+    fn checkout_branch(mut self: Pin<&mut Self>, project_id: &QString, branch: &QString) {
+        if *self.as_ref().busy() {
+            return;
+        }
+        let project_id = project_id.to_string();
+        let branch = branch.to_string();
+        self.as_mut().set_busy(true);
+        self.as_mut()
+            .set_status(format!("Checking out {branch}…").into());
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let id = project_id
+                    .parse()
+                    .map_err(|_| "invalid project identifier".to_owned())?;
+                let mut projects =
+                    harkness_core::ProjectService::load().map_err(|error| error.to_string())?;
+                let git = projects.git(id).map_err(|error| error.to_string())?;
+                git.checkout_branch(&branch, &harkness_core::Cancellation::default())
+                    .map_err(|error| error.to_string())?;
+                let rows = git
+                    .branches(
+                        &harkness_core::BranchListOptions {
+                            include_remote_tracking: false,
+                            calculate_divergence: false,
+                        },
+                        &harkness_core::Cancellation::default(),
+                    )
+                    .map_err(|error| error.to_string())?
+                    .into_iter()
+                    .map(BranchRow::from)
+                    .collect::<Vec<_>>();
+                let project = projects.open(id).map_err(|error| error.to_string())?;
+                Ok::<_, String>((ProjectRow::from(project), rows))
+            })();
+            let _ = qt_thread.queue(move |mut backend| {
+                backend.as_mut().set_busy(false);
+                match result {
+                    Ok((project, rows)) => {
+                        backend.as_mut().set_opened(to_map(&project));
+                        backend.as_mut().set_branches(to_branches(&rows));
+                        backend
+                            .as_mut()
+                            .set_status(format!("Checked out {branch}").into());
+                        backend.as_mut().refresh();
+                    }
+                    Err(error) => backend.as_mut().set_status(error.into()),
+                }
+            });
+        });
     }
 
     fn open_project(mut self: Pin<&mut Self>, project_id: &QString) {
@@ -414,7 +557,10 @@ impl ffi::HarknessBackend {
 mod tests {
     use cxx_qt_lib::{QMap, QMapPair_QString_QVariant, QString, QVariant};
 
-    use super::{OpenedUpdate, ProjectRow, empty_opened, operation_outcome, to_map, to_projects};
+    use super::{
+        BranchRow, OpenedUpdate, ProjectRow, empty_opened, operation_outcome, to_branches, to_map,
+        to_projects,
+    };
 
     fn project(
         source: harkness_core::ProjectSource,
@@ -527,6 +673,31 @@ mod tests {
             .unwrap();
         assert!(!filled.is_empty());
         assert_eq!(QVariant::default().value::<bool>(), None);
+    }
+
+    #[test]
+    fn branch_rows_disable_a_branch_checked_out_elsewhere() {
+        let row = BranchRow::from(harkness_core::Branch {
+            name: "topic".to_owned(),
+            kind: harkness_core::BranchKind::Local,
+            tip: "0000000000000000000000000000000000000000".parse().unwrap(),
+            upstream: None,
+            checkout: harkness_core::BranchCheckout::OtherWorktree("/tmp/other".into()),
+        });
+        assert!(!row.current && !row.selectable);
+        assert!(row.detail.contains("/tmp/other"));
+
+        let rows = to_branches(&[row]);
+        let map = rows
+            .get(0)
+            .unwrap()
+            .value::<QMap<QMapPair_QString_QVariant>>()
+            .expect("branch row should flatten to a QVariantMap");
+        assert_eq!(
+            map.get(&QString::from("selectable"))
+                .and_then(|value| value.value::<bool>()),
+            Some(false)
+        );
     }
 
     #[test]

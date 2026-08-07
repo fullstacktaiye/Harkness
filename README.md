@@ -2,11 +2,15 @@
 
 Harkness is an early native AI-harness scaffold. Its Rust core maintains a local
 project catalog and can safely clone GitHub repositories through the system Git
-executable, preserving the user's existing SSH and HTTPS credential setup. The
+executable, preserving the user's existing SSH and HTTPS credential setup. Its
+core also provides cancellable branch listing and locked, typed create,
+checkout, rename, delete, and upstream-management operations. The
 KDE Kirigami application opens on a project launcher — Recents, local folder
 import, and validated GitHub cloning with progress and cancellation — and opens
 each project into a shell showing its Git identity next to a lazy, read-only
-file tree that never descends into `.git` or through directory symlinks.
+file tree that never descends into `.git` or through directory symlinks. A
+worker-backed branch picker switches existing local branches without blocking
+the UI and identifies branches held by another worktree before selection.
 Managed clones are deleted only after a confirmation naming the checkout;
 local projects are simply forgotten, leaving their files untouched.
 
