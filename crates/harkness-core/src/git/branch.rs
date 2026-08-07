@@ -889,7 +889,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_non_utf8_branch_name_is_rejected_deterministically() {
         use std::{ffi::OsString, os::unix::ffi::OsStringExt};
@@ -912,7 +912,7 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_non_utf8_upstream_name_is_rejected_deterministically() {
         use std::{ffi::OsString, io::Write, os::unix::ffi::OsStringExt};
