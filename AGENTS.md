@@ -55,3 +55,10 @@ selective and must not prune external worktree records.
 ## Commit & Pull Request Guidelines
 
 Write short, imperative commit subjects, matching history such as `Prevent concurrent imports from orphaning managed checkouts`. Keep each commit focused; append the PR number only when added by the merge workflow. Pull requests should explain the behavior change, testing performed, and relevant issue. Include screenshots for visible QML changes and call out platform or Qt/KDE dependency assumptions.
+
+For commit-and-push-only requests, a failed `gh auth status` is not by itself a
+blocker. Inspect the configured Git remote and retry the networked Git command
+with the required elevated sandbox permission; prefer the repository's existing
+SSH remote, and use HTTPS only when working credentials are available. Require
+GitHub CLI authentication only for operations that actually use the GitHub API,
+such as creating or editing a pull request.
