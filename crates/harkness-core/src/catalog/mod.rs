@@ -4,6 +4,7 @@ pub(crate) mod entry;
 pub(crate) mod lock;
 
 use std::{
+    collections::{HashMap, HashSet},
     fs,
     io::{self, Write},
     path::Path,
@@ -12,14 +13,18 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
-use crate::{catalog::entry::Project, project::ProjectError};
+use crate::{
+    catalog::entry::{Project, ProjectSource},
+    project::ProjectError,
+};
 
-/// The catalog schema version written by this Harkness build.
-pub const CATALOG_VERSION: u32 = 2;
+/// The newest catalog schema understood by this Harkness build.
+pub(crate) const CATALOG_VERSION: u32 = 2;
 /// The oldest catalog schema this build can load without losing data.
 pub(crate) const MINIMUM_SUPPORTED_CATALOG_VERSION: u32 = 1;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Catalog {
     pub(crate) version: u32,
     pub(crate) projects: Vec<Project>,
@@ -58,10 +63,16 @@ pub(crate) fn read_catalog(catalog_path: &Path) -> Result<Catalog, ProjectError>
                     source,
                 }
             })?;
-            if !(MINIMUM_SUPPORTED_CATALOG_VERSION..=CATALOG_VERSION).contains(&probe.version) {
-                return Err(ProjectError::UnsupportedCatalogVersion {
+            if probe.version < MINIMUM_SUPPORTED_CATALOG_VERSION {
+                return Err(ProjectError::CatalogVersionTooOld {
                     found: probe.version,
-                    expected: CATALOG_VERSION,
+                    minimum: MINIMUM_SUPPORTED_CATALOG_VERSION,
+                });
+            }
+            if probe.version > CATALOG_VERSION {
+                return Err(ProjectError::CatalogVersionTooNew {
+                    found: probe.version,
+                    maximum: CATALOG_VERSION,
                 });
             }
 
@@ -71,10 +82,12 @@ pub(crate) fn read_catalog(catalog_path: &Path) -> Result<Catalog, ProjectError>
                     source,
                 }
             })?;
-            // The v1-to-v2 migration is additive: the new optional fields
-            // deserialize to `None`. Normalize only the in-memory version so a
-            // read-only client leaves the older file untouched.
+            // Project's wire decoder accepts the v1 shapes and constructs the
+            // source-specific v2 Rust representation. Normalize only the
+            // in-memory version so a read-only client leaves the older file
+            // untouched.
             catalog.version = CATALOG_VERSION;
+            validate_catalog(catalog_path, &catalog)?;
             Ok(catalog)
         }
         Err(source) => Err(ProjectError::CatalogRead {
@@ -84,6 +97,78 @@ pub(crate) fn read_catalog(catalog_path: &Path) -> Result<Catalog, ProjectError>
     }
 }
 
+fn validate_catalog(catalog_path: &Path, catalog: &Catalog) -> Result<(), ProjectError> {
+    let mut entries = HashMap::with_capacity(catalog.projects.len());
+    for project in &catalog.projects {
+        if entries.insert(project.id, project).is_some() {
+            return Err(invalid_catalog(
+                catalog_path,
+                format!("project identifier {} appears more than once", project.id),
+            ));
+        }
+        match &project.source {
+            ProjectSource::Local => {}
+            ProjectSource::ManagedRepository { remote } if remote.trim().is_empty() => {
+                return Err(invalid_catalog(
+                    catalog_path,
+                    format!("managed project {} has an empty remote", project.id),
+                ));
+            }
+            ProjectSource::ManagedRepository { .. } => {}
+            ProjectSource::Worktree {
+                worktree_branch, ..
+            } if worktree_branch.trim().is_empty() => {
+                return Err(invalid_catalog(
+                    catalog_path,
+                    format!("worktree {} has an empty branch", project.id),
+                ));
+            }
+            ProjectSource::Worktree { .. } => {}
+        }
+    }
+
+    for project in &catalog.projects {
+        let ProjectSource::Worktree { parent, .. } = &project.source else {
+            continue;
+        };
+        if !entries.contains_key(parent) {
+            return Err(invalid_catalog(
+                catalog_path,
+                format!("worktree {} refers to missing parent {parent}", project.id),
+            ));
+        }
+
+        let mut seen = HashSet::from([project.id]);
+        let mut ancestor = *parent;
+        loop {
+            if !seen.insert(ancestor) {
+                return Err(invalid_catalog(
+                    catalog_path,
+                    format!("worktree parent cycle involving project {}", project.id),
+                ));
+            }
+            match &entries[&ancestor].source {
+                ProjectSource::Worktree { parent, .. } => ancestor = *parent,
+                ProjectSource::Local | ProjectSource::ManagedRepository { .. } => break,
+            }
+        }
+    }
+    Ok(())
+}
+
+fn invalid_catalog(catalog_path: &Path, reason: String) -> ProjectError {
+    ProjectError::InvalidCatalog {
+        path: catalog_path.to_path_buf(),
+        reason,
+    }
+}
+
+#[derive(Serialize)]
+struct PersistedCatalog<'a> {
+    version: u32,
+    projects: &'a [Project],
+}
+
 pub(crate) fn persist_catalog(
     data_dir: &Path,
     catalog_path: &Path,
@@ -91,7 +176,24 @@ pub(crate) fn persist_catalog(
 ) -> io::Result<()> {
     fs::create_dir_all(data_dir)?;
     let mut temporary = NamedTempFile::new_in(data_dir)?;
-    serde_json::to_writer_pretty(&mut temporary, catalog).map_err(io::Error::other)?;
+    // v2 is required only once v2-only data exists. Keeping v1-compatible
+    // catalogs at v1 means opening or importing a project never prevents the
+    // previous Harkness release from reading the file. Removing the final
+    // worktree naturally restores that downgrade path.
+    let version = if catalog
+        .projects
+        .iter()
+        .any(|project| matches!(project.source, ProjectSource::Worktree { .. }))
+    {
+        CATALOG_VERSION
+    } else {
+        MINIMUM_SUPPORTED_CATALOG_VERSION
+    };
+    let persisted = PersistedCatalog {
+        version,
+        projects: &catalog.projects,
+    };
+    serde_json::to_writer_pretty(&mut temporary, &persisted).map_err(io::Error::other)?;
     temporary.write_all(b"\n")?;
     temporary.as_file_mut().sync_all()?;
     temporary
