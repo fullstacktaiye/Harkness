@@ -573,6 +573,8 @@ mod tests {
             root: "/tmp/sample".into(),
             source,
             remote: remote.map(str::to_owned),
+            parent: None,
+            worktree_branch: None,
             last_opened: time::OffsetDateTime::now_utc(),
             available: true,
             git,

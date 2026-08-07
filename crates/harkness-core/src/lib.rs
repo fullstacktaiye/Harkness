@@ -9,6 +9,7 @@ mod remote;
 #[cfg(test)]
 mod testing;
 
+pub use catalog::CATALOG_VERSION;
 pub use catalog::entry::{GitStatus, Project, ProjectId, ProjectSource, UpstreamStatus};
 pub use git::{
     Branch, BranchCheckout, BranchKind, BranchListOptions, Cancellation, CloneCancellation,

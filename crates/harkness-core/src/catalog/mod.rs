@@ -14,7 +14,10 @@ use tempfile::NamedTempFile;
 
 use crate::{catalog::entry::Project, project::ProjectError};
 
-pub(crate) const CATALOG_VERSION: u32 = 1;
+/// The catalog schema version written by this Harkness build.
+pub const CATALOG_VERSION: u32 = 2;
+/// The oldest catalog schema this build can load without losing data.
+pub(crate) const MINIMUM_SUPPORTED_CATALOG_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct Catalog {
@@ -55,17 +58,24 @@ pub(crate) fn read_catalog(catalog_path: &Path) -> Result<Catalog, ProjectError>
                     source,
                 }
             })?;
-            if probe.version != CATALOG_VERSION {
+            if !(MINIMUM_SUPPORTED_CATALOG_VERSION..=CATALOG_VERSION).contains(&probe.version) {
                 return Err(ProjectError::UnsupportedCatalogVersion {
                     found: probe.version,
                     expected: CATALOG_VERSION,
                 });
             }
 
-            serde_json::from_slice(&bytes).map_err(|source| ProjectError::MalformedCatalog {
-                path: catalog_path.to_path_buf(),
-                source,
-            })
+            let mut catalog: Catalog = serde_json::from_slice(&bytes).map_err(|source| {
+                ProjectError::MalformedCatalog {
+                    path: catalog_path.to_path_buf(),
+                    source,
+                }
+            })?;
+            // The v1-to-v2 migration is additive: the new optional fields
+            // deserialize to `None`. Normalize only the in-memory version so a
+            // read-only client leaves the older file untouched.
+            catalog.version = CATALOG_VERSION;
+            Ok(catalog)
         }
         Err(source) => Err(ProjectError::CatalogRead {
             path: catalog_path.to_path_buf(),

@@ -47,6 +47,8 @@ pub enum ProjectSource {
     Local,
     /// A clone owned by Harkness and stored below its repositories directory.
     ManagedRepository,
+    /// A Git worktree owned by Harkness and linked to another catalog entry.
+    Worktree,
 }
 
 /// Where a branch stands relative to the branch it tracks.
@@ -102,6 +104,12 @@ pub struct Project {
     /// Canonical GitHub remote identity for managed repositories.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<String>,
+    /// The catalog entry whose repository owns this worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<ProjectId>,
+    /// The branch recorded when this worktree was created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_branch: Option<String>,
     /// The last time the project was imported or successfully reopened.
     pub last_opened: OffsetDateTime,
     /// Whether the root currently exists and can be read.
