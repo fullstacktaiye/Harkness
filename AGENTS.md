@@ -27,6 +27,28 @@ Use standard `rustfmt` output (four-space indentation) and keep Clippy clean. Fo
 
 Place focused unit tests in a `#[cfg(test)] mod tests` beside the implementation. Put executable-level behavior in crate-level `tests/*.rs`; use descriptive names such as `prints_exact_greeting`. Add regression coverage for catalog locking, Git process handling, filesystem safety, and navigation changes. Run the full test, format, and Clippy commands before submitting.
 
+## Catalog Schema & Worktree Invariants
+
+`projects.json` is a versioned user-data format guarded by the stable
+`projects.lock` inode. Probe `version` before deserializing the body so a newer
+schema produces an upgrade message rather than a corruption message. Persist
+the oldest version that can represent the current entries: ordinary local and
+managed projects remain v1-compatible, while the first worktree requires v2.
+Read-only operations must never rewrite the file.
+
+Additive optional fields must deserialize missing values to a safe default and
+must be omitted when absent. Any new `ProjectSource` variant or other data an
+older build cannot preserve requires a catalog version bump and a frozen JSON
+fixture. Same-version unknown fields are rejected instead of being silently
+dropped on the next write.
+
+Every worktree must name an existing parent; self-parenting, dangling parents,
+and parent cycles are invalid. Parent removal and worktree insertion both need
+the exclusive catalog lock. A future creation path must acquire the repository
+lock first, then the catalog lock, and re-check the parent under that catalog
+lock before inserting the worktree. Remove worktrees only through Git so the
+checkout and `.git/worktrees` administration disappear together.
+
 ## Commit & Pull Request Guidelines
 
 Write short, imperative commit subjects, matching history such as `Prevent concurrent imports from orphaning managed checkouts`. Keep each commit focused; append the PR number only when added by the merge workflow. Pull requests should explain the behavior change, testing performed, and relevant issue. Include screenshots for visible QML changes and call out platform or Qt/KDE dependency assumptions.

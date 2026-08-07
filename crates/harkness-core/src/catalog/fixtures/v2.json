@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "projects": [
+    {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "display_name": "version-two-parent",
+      "root": "__PARENT_ROOT__",
+      "source": "local",
+      "last_opened": "2026-08-06 18:52:03.000000000 +00:00:00"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000003",
+      "display_name": "agent/catalog-v2",
+      "root": "__WORKTREE_ROOT__",
+      "source": "worktree",
+      "parent": "00000000-0000-4000-8000-000000000001",
+      "worktree_branch": "agent/catalog-v2",
+      "last_opened": "2026-08-06 18:53:03.000000000 +00:00:00"
+    }
+  ]
+}
