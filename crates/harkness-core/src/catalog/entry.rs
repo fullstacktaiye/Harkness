@@ -42,12 +42,11 @@ impl std::str::FromStr for ProjectId {
 /// Describes how a project entered the catalog and carries the metadata that
 /// is valid for that source alone.
 ///
-/// The internally tagged representation is flattened into [`Project`], so the
-/// durable JSON remains additive: v1 managed repositories still have sibling
-/// `"source"` and `"remote"` fields, while v2 worktrees add `"parent"` and
-/// `"worktree_branch"` beside `"source": "worktree"`.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "source", rename_all = "snake_case")]
+/// [`Project`]'s hand-written serializer keeps the durable JSON flat: v1
+/// managed repositories have sibling `"source"` and `"remote"` fields, while
+/// v2 worktrees add `"parent"` and `"worktree_branch"` beside
+/// `"source": "worktree"`.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProjectSource {
     /// A directory that already exists on the local machine.
     Local,
@@ -61,7 +60,10 @@ pub enum ProjectSource {
         /// The catalog entry whose repository owns this worktree.
         parent: ProjectId,
         /// The branch recorded when this worktree was created.
-        worktree_branch: String,
+        ///
+        /// Detached worktrees have no branch, so the field is absent for
+        /// those entries rather than carrying a sentinel string.
+        worktree_branch: Option<String>,
     },
 }
 
@@ -207,12 +209,9 @@ impl<'de> Deserialize<'de> for Project {
                 let parent = wire
                     .parent
                     .ok_or_else(|| de::Error::custom("a worktree requires a parent"))?;
-                let worktree_branch = wire
-                    .worktree_branch
-                    .ok_or_else(|| de::Error::custom("a worktree requires a worktree_branch"))?;
                 ProjectSource::Worktree {
                     parent,
-                    worktree_branch,
+                    worktree_branch: wire.worktree_branch,
                 }
             }
         };
@@ -248,7 +247,7 @@ impl Serialize for Project {
                 ProjectSourceKind::Worktree,
                 None,
                 Some(*parent),
-                Some(worktree_branch.as_str()),
+                worktree_branch.as_deref(),
             ),
         };
         ProjectWireRef {

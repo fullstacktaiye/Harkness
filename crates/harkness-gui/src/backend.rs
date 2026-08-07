@@ -29,6 +29,7 @@ pub mod ffi {
         #[qproperty(QString, status)]
         #[qproperty(QList_QVariant, projects)]
         #[qproperty(QList_QVariant, branches)]
+        #[qproperty(QList_QVariant, worktrees)]
         #[qproperty(QVariant, opened)]
         type HarknessBackend = super::HarknessBackendRust;
 
@@ -67,10 +68,31 @@ pub mod ffi {
         #[cxx_name = "refreshBranches"]
         fn refresh_branches(self: Pin<&mut HarknessBackend>, project_id: &QString);
 
+        /// Loads the parent's linked worktrees without blocking the GUI thread.
+        #[qinvokable]
+        #[cxx_name = "refreshWorktrees"]
+        fn refresh_worktrees(self: Pin<&mut HarknessBackend>, project_id: &QString);
+
         /// Checks out a local branch and refreshes both project and branch state.
         #[qinvokable]
         #[cxx_name = "checkoutBranch"]
         fn checkout_branch(self: Pin<&mut HarknessBackend>, project_id: &QString, branch: &QString);
+
+        /// Creates a new-branch, existing-branch, or detached worktree.
+        #[qinvokable]
+        #[cxx_name = "createWorktree"]
+        fn create_worktree(
+            self: Pin<&mut HarknessBackend>,
+            project_id: &QString,
+            mode: &QString,
+            branch: &QString,
+            start_point: &QString,
+        );
+
+        /// Reconciles only missing worktrees owned by Harkness.
+        #[qinvokable]
+        #[cxx_name = "reconcileWorktrees"]
+        fn reconcile_worktrees(self: Pin<&mut HarknessBackend>, project_id: &QString);
 
         /// Removes a local project from the catalog without touching its
         /// directory.
@@ -84,13 +106,13 @@ pub mod ffi {
 
         #[qinvokable]
         #[cxx_name = "removeWorktree"]
-        fn remove_worktree(self: Pin<&mut HarknessBackend>, project_id: &QString);
+        fn remove_worktree(self: Pin<&mut HarknessBackend>, project_id: &QString, force: bool);
     }
 
     impl cxx_qt::Threading for HarknessBackend {}
 }
 
-use std::pin::Pin;
+use std::{collections::HashMap, pin::Pin};
 
 use cxx_qt::{CxxQtType, Threading};
 use cxx_qt_lib::{QList, QMap, QMapPair_QString_QVariant, QString, QVariant};
@@ -100,8 +122,9 @@ pub struct HarknessBackendRust {
     status: QString,
     projects: QList<QVariant>,
     branches: QList<QVariant>,
+    worktrees: QList<QVariant>,
     opened: QVariant,
-    cancellation: Option<harkness_core::CloneCancellation>,
+    cancellation: Option<harkness_core::Cancellation>,
 }
 
 impl Default for HarknessBackendRust {
@@ -111,6 +134,7 @@ impl Default for HarknessBackendRust {
             status: "Ready".into(),
             projects: QList::default(),
             branches: QList::default(),
+            worktrees: QList::default(),
             opened: empty_opened(),
             cancellation: None,
         }
@@ -158,16 +182,17 @@ struct ProjectRow {
     branch: String,
     managed: bool,
     worktree: bool,
-    parent: String,
-    worktree_branch: String,
+    parent_id: String,
+    parent_name: String,
+    created_branch: String,
     available: bool,
     is_git: bool,
     dirty: bool,
 }
 
-impl From<harkness_core::Project> for ProjectRow {
-    fn from(project: harkness_core::Project) -> Self {
-        let (remote, managed, worktree, parent, worktree_branch) = match &project.source {
+impl ProjectRow {
+    fn from_project(project: harkness_core::Project, parent_name: String) -> Self {
+        let (remote, managed, worktree, parent_id, created_branch) = match &project.source {
             harkness_core::ProjectSource::Local => {
                 (String::new(), false, false, String::new(), String::new())
             }
@@ -182,7 +207,7 @@ impl From<harkness_core::Project> for ProjectRow {
                 false,
                 true,
                 parent.to_string(),
-                worktree_branch.clone(),
+                worktree_branch.clone().unwrap_or_default(),
             ),
         };
         Self {
@@ -199,8 +224,9 @@ impl From<harkness_core::Project> for ProjectRow {
                 .unwrap_or_default(),
             managed,
             worktree,
-            parent,
-            worktree_branch,
+            parent_id,
+            parent_name,
+            created_branch,
             available: project.available,
             is_git: project.git.is_some(),
             dirty: project.git.is_some_and(|git| git.dirty),
@@ -208,11 +234,39 @@ impl From<harkness_core::Project> for ProjectRow {
     }
 }
 
+impl From<harkness_core::Project> for ProjectRow {
+    fn from(project: harkness_core::Project) -> Self {
+        Self::from_project(project, String::new())
+    }
+}
+
+fn project_rows(projects: Vec<harkness_core::Project>) -> Vec<ProjectRow> {
+    let names = projects
+        .iter()
+        .map(|project| (project.id, project.display_name.clone()))
+        .collect::<HashMap<_, _>>();
+    projects
+        .into_iter()
+        .map(|project| {
+            let parent_name = match &project.source {
+                harkness_core::ProjectSource::Worktree { parent, .. } => {
+                    names.get(parent).cloned().unwrap_or_default()
+                }
+                _ => String::new(),
+            };
+            ProjectRow::from_project(project, parent_name)
+        })
+        .collect()
+}
+
 /// Reads the catalog. Availability and Git state are recomputed per entry, so
 /// this touches the filesystem once per project and belongs off the GUI thread.
 fn load_rows() -> Result<Vec<ProjectRow>, String> {
     let service = harkness_core::ProjectService::load().map_err(|error| error.to_string())?;
-    Ok(service.list().into_iter().map(ProjectRow::from).collect())
+    service
+        .list()
+        .map(project_rows)
+        .map_err(|error| error.to_string())
 }
 
 /// Flattens a row into the QVariantMap every QML binding reads.
@@ -236,17 +290,101 @@ fn to_map(row: &ProjectRow) -> QVariant {
     insert("managed", QVariant::from(&row.managed));
     insert("worktree", QVariant::from(&row.worktree));
     insert(
-        "parent",
-        QVariant::from(&QString::from(row.parent.as_str())),
+        "parentId",
+        QVariant::from(&QString::from(row.parent_id.as_str())),
     );
     insert(
-        "worktreeBranch",
-        QVariant::from(&QString::from(row.worktree_branch.as_str())),
+        "parentName",
+        QVariant::from(&QString::from(row.parent_name.as_str())),
+    );
+    insert(
+        "createdBranch",
+        QVariant::from(&QString::from(row.created_branch.as_str())),
     );
     insert("available", QVariant::from(&row.available));
     insert("isGit", QVariant::from(&row.is_git));
     insert("dirty", QVariant::from(&row.dirty));
     QVariant::from(&entry)
+}
+
+#[derive(Debug)]
+struct WorktreeRow {
+    root: String,
+    branch: String,
+    owned: bool,
+    locked: bool,
+    prunable: bool,
+}
+
+impl From<harkness_core::Worktree> for WorktreeRow {
+    fn from(worktree: harkness_core::Worktree) -> Self {
+        Self {
+            root: worktree.root.display().to_string(),
+            branch: worktree.branch.unwrap_or_default(),
+            owned: worktree.project.is_some(),
+            locked: worktree.locked,
+            prunable: worktree.prunable,
+        }
+    }
+}
+
+fn to_worktrees(rows: &[WorktreeRow]) -> QList<QVariant> {
+    let mut worktrees = QList::<QVariant>::default();
+    for row in rows {
+        let mut entry = QMap::<QMapPair_QString_QVariant>::default();
+        let mut insert = |key: &str, value: QVariant| entry.insert(QString::from(key), value);
+        insert("root", QVariant::from(&QString::from(row.root.as_str())));
+        insert(
+            "branch",
+            QVariant::from(&QString::from(row.branch.as_str())),
+        );
+        insert("owned", QVariant::from(&row.owned));
+        insert("locked", QVariant::from(&row.locked));
+        insert("prunable", QVariant::from(&row.prunable));
+        worktrees.append(QVariant::from(&entry));
+    }
+    worktrees
+}
+
+fn worktree_base(
+    mode: &str,
+    branch: &str,
+    start_point: &str,
+) -> Result<harkness_core::WorktreeBase, String> {
+    let branch = branch.trim();
+    let start_point = start_point.trim();
+    match mode {
+        "new" if branch.is_empty() => Err("Enter a name for the new branch".to_owned()),
+        "new" => Ok(harkness_core::WorktreeBase::NewBranch {
+            name: branch.to_owned(),
+            start_point: (!start_point.is_empty()).then(|| start_point.to_owned()),
+        }),
+        "existing" if branch.is_empty() => Err("Enter an existing branch name".to_owned()),
+        "existing" => Ok(harkness_core::WorktreeBase::ExistingBranch {
+            name: branch.to_owned(),
+        }),
+        "detached" if start_point.is_empty() => {
+            Err("Enter a commit or revision for detached HEAD".to_owned())
+        }
+        "detached" => Ok(harkness_core::WorktreeBase::Detached {
+            commit: start_point.to_owned(),
+        }),
+        _ => Err("invalid worktree creation mode".to_owned()),
+    }
+}
+
+fn remove_worktree_with_service(
+    service: &mut harkness_core::ProjectService,
+    project_id: &str,
+    force: bool,
+    cancellation: &harkness_core::Cancellation,
+) -> Result<harkness_core::Project, String> {
+    let id = project_id
+        .parse()
+        .map_err(|_| "invalid worktree project identifier".to_owned())?;
+    service
+        .remove_worktree(id, force, cancellation)
+        .map_err(|error| error.to_string())
 }
 
 fn to_projects(rows: &[ProjectRow]) -> QList<QVariant> {
@@ -295,6 +433,15 @@ fn load_branches(project_id: &str) -> Result<Vec<BranchRow>, String> {
 /// always treat `opened` as a map and test `opened.id` for emptiness.
 fn empty_opened() -> QVariant {
     QVariant::from(&QMap::<QMapPair_QString_QVariant>::default())
+}
+
+fn opened_project_id(opened: &QVariant) -> Option<String> {
+    opened
+        .value::<QMap<QMapPair_QString_QVariant>>()?
+        .get(&QString::from("id"))?
+        .value::<QString>()
+        .map(|id| id.to_string())
+        .filter(|id| !id.is_empty())
 }
 
 #[derive(Debug)]
@@ -357,12 +504,25 @@ fn apply_result(
 impl ffi::HarknessBackend {
     /// Reloads the whole catalog into [`projects`](Self::projects).
     fn refresh(self: Pin<&mut Self>) {
+        let opened_id = opened_project_id(self.as_ref().opened());
         let qt_thread = self.qt_thread();
         std::thread::spawn(move || {
             let rows = load_rows();
             let _ = qt_thread.queue(move |mut backend| match rows {
-                Ok(rows) => backend.as_mut().set_projects(to_projects(&rows)),
-                Err(error) => backend.as_mut().set_status(error.into()),
+                Ok(rows) => {
+                    if opened_id == opened_project_id(backend.as_ref().opened())
+                        && let Some(row) = opened_id
+                            .as_ref()
+                            .and_then(|id| rows.iter().find(|row| &row.id == id))
+                    {
+                        backend.as_mut().set_opened(to_map(row));
+                    }
+                    backend.as_mut().set_projects(to_projects(&rows));
+                }
+                Err(error) => {
+                    backend.as_mut().set_projects(QList::default());
+                    backend.as_mut().set_status(error.into());
+                }
             });
         });
     }
@@ -436,13 +596,14 @@ impl ffi::HarknessBackend {
     fn cancel_import(mut self: Pin<&mut Self>) {
         if let Some(cancellation) = &self.as_ref().rust().cancellation {
             cancellation.cancel();
-            self.as_mut().set_status("Cancelling Git clone…".into());
+            self.as_mut().set_status("Cancelling Git operation…".into());
         }
     }
 
     fn close_project(mut self: Pin<&mut Self>) {
         self.as_mut().set_opened(empty_opened());
         self.as_mut().set_branches(QList::default());
+        self.as_mut().set_worktrees(QList::default());
     }
 
     fn refresh_branches(self: Pin<&mut Self>, project_id: &QString) {
@@ -454,6 +615,32 @@ impl ffi::HarknessBackend {
                 Ok(rows) => backend.as_mut().set_branches(to_branches(&rows)),
                 Err(error) => {
                     backend.as_mut().set_branches(QList::default());
+                    backend.as_mut().set_status(error.into());
+                }
+            });
+        });
+    }
+
+    fn refresh_worktrees(self: Pin<&mut Self>, project_id: &QString) {
+        let project_id = project_id.to_string();
+        let cancellation = harkness_core::Cancellation::default();
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let id = project_id
+                    .parse()
+                    .map_err(|_| "invalid project identifier".to_owned())?;
+                let service =
+                    harkness_core::ProjectService::load().map_err(|error| error.to_string())?;
+                service
+                    .worktrees(id, &cancellation)
+                    .map(|rows| rows.into_iter().map(WorktreeRow::from).collect::<Vec<_>>())
+                    .map_err(|error| error.to_string())
+            })();
+            let _ = qt_thread.queue(move |mut backend| match result {
+                Ok(rows) => backend.as_mut().set_worktrees(to_worktrees(&rows)),
+                Err(error) => {
+                    backend.as_mut().set_worktrees(QList::default());
                     backend.as_mut().set_status(error.into());
                 }
             });
@@ -504,6 +691,103 @@ impl ffi::HarknessBackend {
                         backend
                             .as_mut()
                             .set_status(format!("Checked out {branch}").into());
+                        backend.as_mut().refresh();
+                    }
+                    Err(error) => backend.as_mut().set_status(error.into()),
+                }
+            });
+        });
+    }
+
+    fn create_worktree(
+        mut self: Pin<&mut Self>,
+        project_id: &QString,
+        mode: &QString,
+        branch: &QString,
+        start_point: &QString,
+    ) {
+        if *self.as_ref().busy() {
+            return;
+        }
+        let project_id = project_id.to_string();
+        let base = match worktree_base(
+            &mode.to_string(),
+            &branch.to_string(),
+            &start_point.to_string(),
+        ) {
+            Ok(base) => base,
+            Err(error) => {
+                self.as_mut().set_status(error.into());
+                return;
+            }
+        };
+        let cancellation = harkness_core::Cancellation::default();
+        self.as_mut().rust_mut().get_mut().cancellation = Some(cancellation.clone());
+        self.as_mut().set_busy(true);
+        self.as_mut().set_status("Creating worktree…".into());
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let id = project_id
+                    .parse()
+                    .map_err(|_| "invalid parent project identifier".to_owned())?;
+                let mut service =
+                    harkness_core::ProjectService::load().map_err(|error| error.to_string())?;
+                service
+                    .create_worktree(id, &base, &cancellation)
+                    .map_err(|error| error.to_string())
+            })();
+            let _ = qt_thread.queue(move |mut backend| {
+                backend.as_mut().rust_mut().get_mut().cancellation = None;
+                backend.as_mut().set_busy(false);
+                apply_result(backend.as_mut(), result, "Created", true);
+            });
+        });
+    }
+
+    fn reconcile_worktrees(mut self: Pin<&mut Self>, project_id: &QString) {
+        if *self.as_ref().busy() {
+            return;
+        }
+        let project_id = project_id.to_string();
+        let cancellation = harkness_core::Cancellation::default();
+        self.as_mut().rust_mut().get_mut().cancellation = Some(cancellation.clone());
+        self.as_mut().set_busy(true);
+        self.as_mut().set_status("Reconciling worktrees…".into());
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let id = project_id
+                    .parse()
+                    .map_err(|_| "invalid parent project identifier".to_owned())?;
+                let mut service =
+                    harkness_core::ProjectService::load().map_err(|error| error.to_string())?;
+                let removed = service
+                    .reconcile_worktrees(id, &cancellation)
+                    .map_err(|error| error.to_string())?;
+                let rows = service
+                    .worktrees(id, &cancellation)
+                    .map_err(|error| error.to_string())?
+                    .into_iter()
+                    .map(WorktreeRow::from)
+                    .collect::<Vec<_>>();
+                Ok::<_, String>((removed.len(), rows))
+            })();
+            let _ = qt_thread.queue(move |mut backend| {
+                backend.as_mut().rust_mut().get_mut().cancellation = None;
+                backend.as_mut().set_busy(false);
+                match result {
+                    Ok((removed, rows)) => {
+                        backend.as_mut().set_worktrees(to_worktrees(&rows));
+                        backend.as_mut().set_status(if removed == 0 {
+                            "Worktrees are already reconciled".into()
+                        } else {
+                            format!(
+                                "Removed {removed} stale worktree entr{}",
+                                if removed == 1 { "y" } else { "ies" }
+                            )
+                            .into()
+                        });
                         backend.as_mut().refresh();
                     }
                     Err(error) => backend.as_mut().set_status(error.into()),
@@ -591,26 +875,31 @@ impl ffi::HarknessBackend {
 
     /// Git checks worktree cleanliness and removes its administrative record,
     /// so this runs off the GUI thread just like managed-repository removal.
-    fn remove_worktree(mut self: Pin<&mut Self>, project_id: &QString) {
+    fn remove_worktree(mut self: Pin<&mut Self>, project_id: &QString, force: bool) {
         if *self.as_ref().busy() {
             return;
         }
         let project_id = project_id.to_string();
+        let cancellation = harkness_core::Cancellation::default();
+        self.as_mut().rust_mut().get_mut().cancellation = Some(cancellation.clone());
         self.as_mut().set_busy(true);
-        self.as_mut().set_status("Removing worktree…".into());
+        self.as_mut().set_status(
+            if force {
+                "Removing worktree and discarding changes…"
+            } else {
+                "Removing worktree…"
+            }
+            .into(),
+        );
         let qt_thread = self.qt_thread();
         std::thread::spawn(move || {
             let result = (|| {
-                let id = project_id
-                    .parse()
-                    .map_err(|_| "invalid worktree project identifier".to_owned())?;
                 let mut service =
                     harkness_core::ProjectService::load().map_err(|error| error.to_string())?;
-                service
-                    .remove_worktree(id)
-                    .map_err(|error| error.to_string())
+                remove_worktree_with_service(&mut service, &project_id, force, &cancellation)
             })();
             let _ = qt_thread.queue(move |mut backend| {
+                backend.as_mut().rust_mut().get_mut().cancellation = None;
                 backend.as_mut().set_busy(false);
                 apply_result(backend.as_mut(), result, "Removed", false);
             });
@@ -620,11 +909,15 @@ impl ffi::HarknessBackend {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::Path};
+
     use cxx_qt_lib::{QMap, QMapPair_QString_QVariant, QString, QVariant};
+    use git2::{Repository, Signature};
+    use tempfile::TempDir;
 
     use super::{
-        BranchRow, OpenedUpdate, ProjectRow, empty_opened, operation_outcome, to_branches, to_map,
-        to_projects,
+        BranchRow, OpenedUpdate, ProjectRow, empty_opened, operation_outcome, project_rows,
+        remove_worktree_with_service, to_branches, to_map, to_projects, worktree_base,
     };
 
     fn project(
@@ -640,6 +933,20 @@ mod tests {
             available: true,
             git,
         }
+    }
+
+    fn initialize_repository(root: &Path) {
+        fs::create_dir_all(root).unwrap();
+        let repository = Repository::init(root).unwrap();
+        fs::write(root.join("README.md"), "fixture\n").unwrap();
+        let mut index = repository.index().unwrap();
+        index.add_path(Path::new("README.md")).unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repository.find_tree(tree_id).unwrap();
+        let signature = Signature::now("Harkness Tests", "tests@example.com").unwrap();
+        repository
+            .commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
+            .unwrap();
     }
 
     fn row_map(row: &ProjectRow) -> QMap<QMapPair_QString_QVariant> {
@@ -680,8 +987,9 @@ mod tests {
             "branch",
             "managed",
             "worktree",
-            "parent",
-            "worktreeBranch",
+            "parentId",
+            "parentName",
+            "createdBranch",
             "available",
             "isGit",
             "dirty",
@@ -766,20 +1074,35 @@ mod tests {
     }
 
     #[test]
-    fn worktree_row_exposes_parent_and_recorded_branch_without_looking_local() {
+    fn worktree_row_resolves_parent_name_and_keeps_creation_branch_separate() {
         let parent = harkness_core::ProjectId::new();
-        let row = ProjectRow::from(project(
+        let mut parent_project = project(harkness_core::ProjectSource::Local, None);
+        parent_project.id = parent;
+        parent_project.display_name = "parent project".to_owned();
+        let worktree = project(
             harkness_core::ProjectSource::Worktree {
                 parent,
-                worktree_branch: "agent/catalog-v2".to_owned(),
+                worktree_branch: Some("agent/catalog-v2".to_owned()),
             },
-            None,
-        ));
+            Some(harkness_core::GitStatus {
+                branch: Some("agent/live".to_owned()),
+                dirty: false,
+                upstream: None,
+                staged: 0,
+                unstaged: 0,
+            }),
+        );
+        let row = project_rows(vec![parent_project, worktree])
+            .into_iter()
+            .find(|row| row.worktree)
+            .unwrap();
 
         assert!(row.worktree);
         assert!(!row.managed);
-        assert_eq!(row.parent, parent.to_string());
-        assert_eq!(row.worktree_branch, "agent/catalog-v2");
+        assert_eq!(row.parent_id, parent.to_string());
+        assert_eq!(row.parent_name, "parent project");
+        assert_eq!(row.created_branch, "agent/catalog-v2");
+        assert_eq!(row.branch, "agent/live");
         let map = row_map(&row);
         assert_eq!(
             map.get(&QString::from("worktree"))
@@ -787,17 +1110,80 @@ mod tests {
             Some(true)
         );
         assert_eq!(
-            map.get(&QString::from("parent"))
+            map.get(&QString::from("parentName"))
                 .and_then(|value| value.value::<QString>())
                 .map(|value| value.to_string()),
-            Some(parent.to_string())
+            Some("parent project".to_owned())
         );
         assert_eq!(
-            map.get(&QString::from("worktreeBranch"))
+            map.get(&QString::from("createdBranch"))
                 .and_then(|value| value.value::<QString>())
                 .map(|value| value.to_string()),
             Some("agent/catalog-v2".to_owned())
         );
+    }
+
+    #[test]
+    fn worktree_creation_modes_are_validated_before_spawning_git() {
+        assert_eq!(
+            worktree_base("new", "agent/topic", "HEAD").unwrap(),
+            harkness_core::WorktreeBase::NewBranch {
+                name: "agent/topic".to_owned(),
+                start_point: Some("HEAD".to_owned()),
+            }
+        );
+        assert_eq!(
+            worktree_base("existing", "agent/topic", "ignored").unwrap(),
+            harkness_core::WorktreeBase::ExistingBranch {
+                name: "agent/topic".to_owned(),
+            }
+        );
+        assert_eq!(
+            worktree_base("detached", "ignored", "HEAD~1").unwrap(),
+            harkness_core::WorktreeBase::Detached {
+                commit: "HEAD~1".to_owned(),
+            }
+        );
+        assert!(worktree_base("new", "", "HEAD").is_err());
+        assert!(worktree_base("detached", "", "").is_err());
+    }
+
+    #[test]
+    fn backend_worktree_removal_passes_the_explicit_force_choice() {
+        let fixture = TempDir::new().unwrap();
+        let parent_root = fixture.path().join("parent");
+        initialize_repository(&parent_root);
+        let mut service =
+            harkness_core::ProjectService::load_from_data_dir(fixture.path().join("data")).unwrap();
+        let parent = service.import_local(&parent_root).unwrap();
+        let worktree = service
+            .create_worktree(
+                parent.id,
+                &harkness_core::WorktreeBase::NewBranch {
+                    name: "agent/gui-force".to_owned(),
+                    start_point: None,
+                },
+                &harkness_core::Cancellation::default(),
+            )
+            .unwrap();
+        fs::write(worktree.root.join("dirty.txt"), "discard me\n").unwrap();
+
+        let refused = remove_worktree_with_service(
+            &mut service,
+            &worktree.id.to_string(),
+            false,
+            &harkness_core::Cancellation::default(),
+        )
+        .unwrap_err();
+        assert!(refused.contains("uncommitted changes"));
+        remove_worktree_with_service(
+            &mut service,
+            &worktree.id.to_string(),
+            true,
+            &harkness_core::Cancellation::default(),
+        )
+        .unwrap();
+        assert!(!worktree.root.exists());
     }
 
     #[test]

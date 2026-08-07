@@ -224,8 +224,15 @@ Kirigami.ScrollablePage {
                 height: GridView.view.cellHeight - Kirigami.Units.smallSpacing
                 width: GridView.view.cellWidth - Kirigami.Units.smallSpacing
                 onActivated: {
-                    if (project.available)
+                    if (project.available) {
                         launcher.backend.openProject(project.id);
+                    } else if (project.worktree) {
+                        applicationWindow().confirmRemoveWorktree(project.id, project.displayName, project.root, project.branch, project.dirty);
+                    } else if (project.managed) {
+                        applicationWindow().confirmRemoveManaged(project.id, project.displayName, project.root);
+                    } else {
+                        applicationWindow().confirmRemoveLocal(project.id, project.displayName);
+                    }
                 }
             }
         }

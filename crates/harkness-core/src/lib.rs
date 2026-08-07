@@ -17,7 +17,7 @@ pub use git::{
     PullOutcome, PullStrategy, PushOptions, PushOutcome, RefUpdate, RepositoryLock, StatusEntry,
 };
 pub use listing::{DirEntry, list_directory};
-pub use project::{ProjectError, ProjectService};
+pub use project::{ProjectError, ProjectService, Worktree, WorktreeBase};
 pub use remote::normalize_remote;
 
 /// Returns the greeting displayed by every Harkness interface.

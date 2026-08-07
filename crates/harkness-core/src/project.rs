@@ -13,7 +13,7 @@ use crate::{
         entry::{GitStatus, Project, ProjectId, ProjectSource},
         lock,
     },
-    git::{self, Cancellation, GitAccess, GitCommand, GitError, GitService, clone},
+    git::{self, Cancellation, GitError, GitService, clone},
     paths::{
         self, CATALOG_FILE, CHECKOUT_DIRECTORY, REPOSITORIES_DIRECTORY, UnreservedPath,
         WORKTREES_DIRECTORY, canonical_reserved_root,
@@ -145,11 +145,13 @@ pub enum ProjectError {
     },
 
     /// A project cannot be removed while its worktrees remain catalogued.
-    #[error("project {id} still has catalogued worktrees; remove them first: {display}")]
+    #[error(
+        "project {id} still has catalogued worktrees; remove them first: {paths}",
+        paths = DisplayWorktrees(.worktrees)
+    )]
     ParentHasWorktrees {
         id: ProjectId,
         worktrees: Vec<PathBuf>,
-        display: String,
     },
 
     /// A managed worktree must be removed through Git before its row is dropped.
@@ -167,9 +169,60 @@ pub enum ProjectError {
         reason: String,
     },
 
+    /// Worktrees cannot be nested beneath another worktree.
+    #[error(
+        "project {id} at '{}' is itself a worktree; nested worktrees are not supported",
+        path.display()
+    )]
+    WorktreeParentUnsupported { id: ProjectId, path: PathBuf },
+
+    /// Ordinary removal preserves uncommitted work unless force is explicit.
+    #[error(
+        "worktree {id} at '{}' has uncommitted changes; explicitly force removal to discard them",
+        path.display()
+    )]
+    DirtyWorktreeRemoval { id: ProjectId, path: PathBuf },
+
     /// A Git operation on a catalogued project failed.
     #[error(transparent)]
     Git(GitError),
+}
+
+/// What a newly created worktree should check out.
+///
+/// The variants make branch creation, reuse, and detached checkout mutually
+/// exclusive, so callers cannot accidentally ask Git to invent a suffixed
+/// branch or attach a commit-only workspace to a made-up branch name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorktreeBase {
+    /// Create `name` from `start_point`, or from the parent's HEAD when absent.
+    NewBranch {
+        name: String,
+        start_point: Option<String>,
+    },
+    /// Check out an existing local branch without creating or renaming it.
+    ExistingBranch { name: String },
+    /// Check out one commit with a detached HEAD.
+    Detached { commit: String },
+}
+
+/// One worktree associated with a catalogued parent.
+///
+/// `project` is `Some` only for a Harkness-owned worktree. An external row is
+/// deliberately read-only: it has no project identifier that can be passed to
+/// [`ProjectService::remove_worktree`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Worktree {
+    /// The checkout path reported by Git.
+    pub root: PathBuf,
+    /// The currently checked-out branch, or `None` for detached HEAD.
+    pub branch: Option<String>,
+    /// Whether Git has locked this worktree against removal or pruning.
+    pub locked: bool,
+    /// Whether Git considers the administrative record safe to clean up.
+    pub prunable: bool,
+    /// The catalog entry when Harkness owns this worktree.
+    pub project: Option<Project>,
 }
 
 impl From<GitError> for ProjectError {
@@ -251,25 +304,22 @@ impl ProjectService {
         catalog::read_catalog(&self.data_dir.join(CATALOG_FILE))
     }
 
-    /// Reads the catalog under a shared lock, or `None` if it cannot be read.
-    fn read_catalog_shared(&self) -> Option<Catalog> {
+    /// Reads the catalog under a shared lock.
+    fn read_catalog_shared(&self) -> Result<Catalog, ProjectError> {
         lock::read_catalog_shared(&self.data_dir)
     }
 
     /// Lists projects by most-recently-opened order with current availability
     /// and Git metadata.
     ///
-    /// Listing never fails: a project whose Git metadata cannot be read is
-    /// reported with `git: None` rather than hiding the rest of the catalog,
-    /// and a catalog that is briefly unreadable falls back to the snapshot
-    /// taken at load rather than reporting an empty Recents.
-    #[must_use]
-    pub fn list(&self) -> Vec<Project> {
+    /// A project whose Git metadata cannot be read is reported with `git:
+    /// None` rather than hiding the rest of the catalog. Catalog read or
+    /// validation failures are returned so a front end never presents a stale
+    /// in-memory snapshot as if it were current.
+    pub fn list(&self) -> Result<Vec<Project>, ProjectError> {
         // Git and availability checks touch the filesystem once per project,
         // so they run after the shared lock is released.
-        let catalog = self
-            .read_catalog_shared()
-            .unwrap_or_else(|| self.catalog.clone());
+        let catalog = self.read_catalog_shared()?;
         let mut projects = catalog
             .projects
             .iter()
@@ -277,7 +327,7 @@ impl ProjectService {
             .map(refresh_project)
             .collect::<Vec<_>>();
         sort_recents(&mut projects);
-        projects
+        Ok(projects)
     }
 
     /// Lists projects by most-recently-opened order exactly as the catalog
@@ -289,13 +339,8 @@ impl ProjectService {
     /// Git inspection per entry. Use [`list`] for current derived state.
     ///
     /// [`list`]: ProjectService::list
-    #[must_use]
-    pub fn list_catalog_only(&self) -> Vec<Project> {
-        let catalog = self
-            .read_catalog_shared()
-            .unwrap_or_else(|| self.catalog.clone());
-        // The in-memory fallback carries the derived state of the last write,
-        // so the defaults are asserted rather than assumed.
+    pub fn list_catalog_only(&self) -> Result<Vec<Project>, ProjectError> {
+        let catalog = self.read_catalog_shared()?;
         let mut projects = catalog
             .projects
             .into_iter()
@@ -306,7 +351,7 @@ impl ProjectService {
             })
             .collect::<Vec<_>>();
         sort_recents(&mut projects);
-        projects
+        Ok(projects)
     }
 
     /// Imports a readable local directory, or reopens its existing canonical
@@ -440,7 +485,11 @@ impl ProjectService {
                     self.catalog = candidate;
                     return Ok(reopened);
                 }
-                // Otherwise the checkout was deleted outside Harkness.
+                // Otherwise the checkout was deleted outside Harkness. Refuse
+                // before cloning when replacing it would orphan worktrees.
+                refuse_parent_with_worktrees(&candidate, candidate.projects[index].id)?;
+                // With no children, clone a replacement and reconcile the
+                // stale row after the slow operation finishes.
                 // Reporting a successful import of a path that no longer
                 // exists would strand the user, so the clone is repeated and
                 // the stale entry replaced once the fresh checkout exists.
@@ -550,8 +599,7 @@ impl ProjectService {
         // released before the lock is taken, and everything it read is
         // re-verified under the exclusive lock below.
         let preliminary = self
-            .read_catalog_shared()
-            .unwrap_or_else(|| self.catalog.clone())
+            .read_catalog_shared()?
             .projects
             .into_iter()
             .find(|project| project.id == id)
@@ -580,12 +628,7 @@ impl ProjectService {
             .cloned()
             .ok_or(ProjectError::ProjectNotFound(id))?;
         match RemovalPolicy::from(&project.source) {
-            RemovalPolicy::ManagedRepository { remote } => {
-                debug_assert!(
-                    !remote.trim().is_empty(),
-                    "catalog validation rejected this"
-                )
-            }
+            RemovalPolicy::ManagedRepository => {}
             RemovalPolicy::Worktree { .. } => return Err(worktree_removal_required(&project)),
             RemovalPolicy::CatalogOnly => {
                 return Err(unsafe_removal(
@@ -627,17 +670,130 @@ impl ProjectService {
         Ok(project)
     }
 
+    /// Creates one Harkness-owned worktree below `worktrees/<new-project-id>`.
+    ///
+    /// The repository lock covers Git creation and the later catalog write.
+    /// The catalog lock is taken only after it, and the parent is re-checked
+    /// under that lock before the new entry becomes durable.
+    pub fn create_worktree(
+        &mut self,
+        parent_id: ProjectId,
+        base: &WorktreeBase,
+        cancellation: &Cancellation,
+    ) -> Result<Project, ProjectError> {
+        let preliminary_catalog = self.read_catalog_shared()?;
+        let preliminary_parent = preliminary_catalog
+            .projects
+            .iter()
+            .find(|project| project.id == parent_id)
+            .cloned()
+            .ok_or(ProjectError::ProjectNotFound(parent_id))?;
+        validate_worktree_parent(&preliminary_parent)?;
+
+        let worktrees_root = self.data_dir.join(WORKTREES_DIRECTORY);
+        fs::create_dir_all(&worktrees_root).map_err(|source| ProjectError::Persistence {
+            path: worktrees_root.clone(),
+            source,
+        })?;
+        let (id, destination) = loop {
+            let id = ProjectId::new();
+            let destination = self.worktree_path(id);
+            if !destination.exists() {
+                break (id, destination);
+            }
+        };
+
+        let repository_lock = self
+            .git_service(&preliminary_parent.root)
+            .lock(cancellation)?;
+        let added = match git::worktree::add(
+            &self.git_executable,
+            &preliminary_parent.root,
+            &repository_lock,
+            &destination,
+            base,
+            cancellation,
+        ) {
+            Ok(added) => added,
+            Err(error) => {
+                git::worktree::cleanup_failed_add(
+                    &self.git_executable,
+                    &preliminary_parent.root,
+                    &repository_lock,
+                    &destination,
+                );
+                return Err(error.into());
+            }
+        };
+
+        let created = (|| {
+            let canonical_root = validate_local_directory(&destination)?;
+            // Canonicalization and the status walk both touch the checkout and
+            // therefore finish before the global catalog lock is taken.
+            let git = inspect_git(&canonical_root)?;
+            let _catalog_lock = self.lock_exclusive()?;
+            let mut candidate = self.read_catalog()?;
+            let parent = candidate
+                .projects
+                .iter()
+                .find(|project| project.id == parent_id)
+                .ok_or(ProjectError::ProjectNotFound(parent_id))?;
+            validate_worktree_parent(parent)?;
+            if parent.root != preliminary_parent.root {
+                return Err(ProjectError::ProjectUnavailable {
+                    id: parent_id,
+                    path: preliminary_parent.root.clone(),
+                });
+            }
+
+            let display_name = added.branch.clone().unwrap_or_else(|| {
+                let oid = added.commit.to_string();
+                format!("Detached at {}", &oid[..12])
+            });
+            let project = Project {
+                id,
+                display_name,
+                root: canonical_root,
+                source: ProjectSource::Worktree {
+                    parent: parent_id,
+                    worktree_branch: added.branch.clone(),
+                },
+                last_opened: OffsetDateTime::now_utc(),
+                available: true,
+                git,
+            };
+            candidate.projects.push(project.clone());
+            sort_recents(&mut candidate.projects);
+            self.persist(&candidate)?;
+            self.catalog = candidate;
+            Ok(project)
+        })();
+
+        if created.is_err() {
+            git::worktree::cleanup_failed_add(
+                &self.git_executable,
+                &preliminary_parent.root,
+                &repository_lock,
+                &destination,
+            );
+        }
+        created
+    }
+
     /// Removes a Harkness-managed worktree through Git, then drops its catalog
-    /// entry. A dirty worktree is refused by Git; this operation never forces
-    /// deletion of uncommitted files.
+    /// entry. Dirty worktrees are refused with a typed error unless `force` is
+    /// explicit. The checked-out branch is never deleted.
     ///
     /// The repository lock is acquired through the parent before the catalog
     /// lock. The parent and worktree relationship is then re-verified under the
     /// catalog lock so a future creation path cannot race this removal.
-    pub fn remove_worktree(&mut self, id: ProjectId) -> Result<Project, ProjectError> {
-        let preliminary_catalog = self
-            .read_catalog_shared()
-            .unwrap_or_else(|| self.catalog.clone());
+    pub fn remove_worktree(
+        &mut self,
+        id: ProjectId,
+        force: bool,
+        cancellation: &Cancellation,
+    ) -> Result<Project, ProjectError> {
+        let preliminary_catalog = self.read_catalog_shared()?;
         let preliminary = preliminary_catalog
             .projects
             .iter()
@@ -646,7 +802,7 @@ impl ProjectService {
             .ok_or(ProjectError::ProjectNotFound(id))?;
         let preliminary_parent_id = match RemovalPolicy::from(&preliminary.source) {
             RemovalPolicy::Worktree { parent } => parent,
-            RemovalPolicy::CatalogOnly | RemovalPolicy::ManagedRepository { .. } => {
+            RemovalPolicy::CatalogOnly | RemovalPolicy::ManagedRepository => {
                 return Err(unsafe_worktree_removal(
                     &preliminary,
                     "catalog entry is not a managed worktree",
@@ -661,89 +817,303 @@ impl ProjectService {
             .ok_or_else(|| {
                 unsafe_worktree_removal(&preliminary, "catalogued parent no longer exists")
             })?;
-        let repository_lock = self
+        validate_worktree_parent(&preliminary_parent)?;
+        let repository_lock = match self
             .git_service(&preliminary_parent.root)
-            .lock(&Cancellation::default())?;
+            .lock(cancellation)
+        {
+            Ok(lock) => Some(lock),
+            Err(GitError::NotARepository { .. }) => None,
+            Err(error) => return Err(error.into()),
+        };
+        let checkout_state = reserved_worktree_state(&self.data_dir, &preliminary)?;
+
+        // Status can walk the entire checkout. The repository lock protects it
+        // from other Harkness mutations; the global catalog lock is not needed.
+        if repository_lock.is_some() && checkout_state == WorktreeCheckoutState::Available {
+            let status = inspect_git(&preliminary.root)?.ok_or_else(|| {
+                unsafe_worktree_removal(&preliminary, "checkout is not a Git worktree")
+            })?;
+            if status.dirty && !force {
+                return Err(ProjectError::DirtyWorktreeRemoval {
+                    id,
+                    path: preliminary.root.clone(),
+                });
+            }
+        }
+
+        // Re-verify every value learned before the repository lock. This
+        // critical section performs no Git or working-tree walk.
+        {
+            let _catalog_lock = self.lock_exclusive()?;
+            let candidate = self.read_catalog()?;
+            verify_worktree_relationship(
+                &candidate,
+                id,
+                preliminary_parent_id,
+                &preliminary.root,
+                &preliminary_parent.root,
+            )?;
+            // Worktrees cannot have children under the catalog invariant. Keep
+            // the guard as defence in depth against a future relaxed reader.
+            refuse_parent_with_worktrees(&candidate, id)?;
+        }
+
+        // Git removal can recursively delete a large checkout and therefore
+        // runs after the catalog lock is released. A missing checkout is still
+        // removed through Git when the parent survives, selectively cleaning
+        // only this Harkness-owned administrative record.
+        if let Some(repository_lock) = &repository_lock {
+            git::worktree::remove(
+                &self.git_executable,
+                &preliminary_parent.root,
+                repository_lock,
+                &preliminary.root,
+                force || checkout_state == WorktreeCheckoutState::Missing,
+                cancellation,
+            )?;
+        }
 
         let _catalog_lock = self.lock_exclusive()?;
         let mut candidate = self.read_catalog()?;
-        let project = candidate
-            .projects
-            .iter()
-            .find(|project| project.id == id)
-            .cloned()
-            .ok_or(ProjectError::ProjectNotFound(id))?;
-        let parent_id = match RemovalPolicy::from(&project.source) {
-            RemovalPolicy::Worktree { parent } => parent,
-            RemovalPolicy::CatalogOnly | RemovalPolicy::ManagedRepository { .. } => {
-                return Err(unsafe_worktree_removal(
-                    &project,
-                    "catalog entry is not a managed worktree",
-                ));
-            }
-        };
-        if parent_id != preliminary_parent_id {
-            return Err(unsafe_worktree_removal(
-                &project,
-                "worktree parent changed while the repository lock was being acquired",
-            ));
-        }
-        let parent = candidate
-            .projects
-            .iter()
-            .find(|entry| entry.id == parent_id)
-            .ok_or_else(|| {
-                unsafe_worktree_removal(&project, "catalogued parent no longer exists")
-            })?;
-        if parent.root != preliminary_parent.root {
-            return Err(unsafe_worktree_removal(
-                &project,
-                "parent path changed while the repository lock was being acquired",
-            ));
-        }
-        refuse_parent_with_worktrees(&candidate, id)?;
-
-        canonical_reserved_root(
-            &self.data_dir.join(WORKTREES_DIRECTORY),
-            &PathBuf::from(id.to_string()),
-            &project.root,
-        )
-        .map_err(|unreserved| {
-            unsafe_worktree_removal(
-                &project,
-                match unreserved {
-                    UnreservedPath::StorageRootUnavailable => {
-                        "managed worktrees root is unavailable"
-                    }
-                    UnreservedPath::CandidateUnavailable => "worktree checkout is unavailable",
-                    UnreservedPath::Mismatch => {
-                        "checkout is not the managed path reserved for this worktree"
-                    }
-                },
-            )
-        })?;
-
-        GitCommand::new(
-            &self.git_executable,
+        let project = verify_worktree_relationship(
+            &candidate,
+            id,
+            preliminary_parent_id,
+            &preliminary.root,
             &preliminary_parent.root,
-            GitAccess::LocalWrite,
-        )
-        .with_repository_lock(repository_lock)
-        .args(["worktree", "remove", "--"])
-        .arg(&project.root)
-        .run(&Cancellation::default())?;
-
+        )?;
         candidate.projects.retain(|entry| entry.id != id);
         self.persist(&candidate)?;
         self.catalog = candidate;
         Ok(project)
     }
 
-    /// Returns the reserved future worktree location without creating it.
+    /// Reconciles missing Harkness worktrees without touching external ones.
     ///
-    /// A future creation verb must acquire the repository lock before the
-    /// exclusive catalog lock and re-check that the parent still exists while
-    /// holding that catalog lock before it writes a worktree entry.
+    /// For each Harkness-owned checkout that is absent, this removes only that
+    /// path's Git administrative record and then drops its catalog row. A
+    /// locked worktree is kept because its missing path may be an intentionally
+    /// unmounted volume. No repository-wide `git worktree prune` is run.
+    pub fn reconcile_worktrees(
+        &mut self,
+        parent_id: ProjectId,
+        cancellation: &Cancellation,
+    ) -> Result<Vec<Project>, ProjectError> {
+        let preliminary_catalog = self.read_catalog_shared()?;
+        let preliminary_parent = preliminary_catalog
+            .projects
+            .iter()
+            .find(|project| project.id == parent_id)
+            .cloned()
+            .ok_or(ProjectError::ProjectNotFound(parent_id))?;
+        validate_worktree_parent(&preliminary_parent)?;
+        if !preliminary_catalog.projects.iter().any(|project| {
+            matches!(
+                project.source,
+                ProjectSource::Worktree { parent, .. } if parent == parent_id
+            )
+        }) {
+            return Ok(Vec::new());
+        }
+
+        let preliminary_worktrees = preliminary_catalog
+            .projects
+            .iter()
+            .filter(|project| {
+                matches!(
+                    project.source,
+                    ProjectSource::Worktree { parent, .. } if parent == parent_id
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let preliminary_worktrees = preliminary_worktrees
+            .into_iter()
+            .map(|project| {
+                reserved_worktree_state(&self.data_dir, &project).map(|state| (project, state))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let repository_lock = match self
+            .git_service(&preliminary_parent.root)
+            .lock(cancellation)
+        {
+            Ok(lock) => Some(lock),
+            Err(GitError::NotARepository { .. }) => None,
+            Err(error) => return Err(error.into()),
+        };
+
+        {
+            let _catalog_lock = self.lock_exclusive()?;
+            let candidate = self.read_catalog()?;
+            let parent = candidate
+                .projects
+                .iter()
+                .find(|project| project.id == parent_id)
+                .ok_or(ProjectError::ProjectNotFound(parent_id))?;
+            validate_worktree_parent(parent)?;
+            if parent.root != preliminary_parent.root {
+                return Err(ProjectError::ProjectUnavailable {
+                    id: parent_id,
+                    path: preliminary_parent.root.clone(),
+                });
+            }
+        }
+
+        let mut removable = Vec::new();
+        if let Some(repository_lock) = &repository_lock {
+            let live =
+                git::worktree::list(&self.git_executable, &preliminary_parent.root, cancellation)?;
+            for (project, state) in &preliminary_worktrees {
+                if *state == WorktreeCheckoutState::Available {
+                    continue;
+                }
+                let listed = live
+                    .iter()
+                    .find(|worktree| git::worktree::same_path(&worktree.root, &project.root));
+                if listed.is_some_and(|worktree| worktree.locked.is_some()) {
+                    continue;
+                }
+                if listed.is_some() {
+                    git::worktree::remove_known_unlocked(
+                        &self.git_executable,
+                        &preliminary_parent.root,
+                        repository_lock,
+                        &project.root,
+                        true,
+                        cancellation,
+                    )?;
+                }
+                removable.push(project.id);
+            }
+        } else {
+            removable.extend(
+                preliminary_worktrees
+                    .iter()
+                    .filter(|(_, state)| *state == WorktreeCheckoutState::Missing)
+                    .map(|(project, _)| project.id),
+            );
+        }
+
+        let _catalog_lock = self.lock_exclusive()?;
+        let mut candidate = self.read_catalog()?;
+        let parent = candidate
+            .projects
+            .iter()
+            .find(|project| project.id == parent_id)
+            .ok_or(ProjectError::ProjectNotFound(parent_id))?;
+        validate_worktree_parent(parent)?;
+        if parent.root != preliminary_parent.root {
+            return Err(ProjectError::ProjectUnavailable {
+                id: parent_id,
+                path: preliminary_parent.root,
+            });
+        }
+
+        let mut removed = Vec::new();
+        candidate.projects.retain(|project| {
+            let keep = !removable.contains(&project.id)
+                || !matches!(
+                    project.source,
+                    ProjectSource::Worktree { parent, .. } if parent == parent_id
+                )
+                || project.root.exists();
+            if !keep {
+                removed.push(project.clone());
+            }
+            keep
+        });
+        if !removed.is_empty() {
+            self.persist(&candidate)?;
+        }
+        self.catalog = candidate;
+        Ok(removed)
+    }
+
+    /// Compatibility name for callers that adopted the original API. This is
+    /// now selective reconciliation rather than repository-wide pruning.
+    pub fn prune_worktrees(
+        &mut self,
+        parent_id: ProjectId,
+        cancellation: &Cancellation,
+    ) -> Result<Vec<Project>, ProjectError> {
+        self.reconcile_worktrees(parent_id, cancellation)
+    }
+
+    /// Lists Harkness-owned and external linked worktrees for `parent_id`.
+    ///
+    /// External worktrees have `project: None` and are therefore observable
+    /// but cannot be removed through Harkness's identifier-based API.
+    pub fn worktrees(
+        &self,
+        parent_id: ProjectId,
+        cancellation: &Cancellation,
+    ) -> Result<Vec<Worktree>, ProjectError> {
+        let catalog = self.read_catalog_shared()?;
+        let parent = catalog
+            .projects
+            .iter()
+            .find(|project| project.id == parent_id)
+            .cloned()
+            .ok_or(ProjectError::ProjectNotFound(parent_id))?;
+        validate_worktree_parent(&parent)?;
+
+        let mut managed = catalog
+            .projects
+            .into_iter()
+            .filter(|project| {
+                matches!(
+                    project.source,
+                    ProjectSource::Worktree { parent, .. } if parent == parent_id
+                )
+            })
+            .map(|project| {
+                if cancellation.is_cancelled() {
+                    Err(ProjectError::Git(GitError::Cancelled))
+                } else {
+                    Ok(refresh_project(project))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let listed = git::worktree::list(&self.git_executable, &parent.root, cancellation)?;
+        let mut worktrees = Vec::new();
+        for row in listed {
+            if git::worktree::same_path(&row.root, &parent.root) {
+                continue;
+            }
+            let project = managed
+                .iter()
+                .position(|project| git::worktree::same_path(&project.root, &row.root))
+                .map(|index| managed.remove(index));
+            worktrees.push(Worktree {
+                root: row.root,
+                branch: row.branch,
+                locked: row.locked.is_some(),
+                prunable: row.prunable,
+                project,
+            });
+        }
+        worktrees.extend(managed.into_iter().filter_map(|project| {
+            let branch = match &project.source {
+                ProjectSource::Worktree {
+                    worktree_branch, ..
+                } => worktree_branch.clone(),
+                ProjectSource::Local | ProjectSource::ManagedRepository { .. } => return None,
+            };
+            Some(Worktree {
+                root: project.root.clone(),
+                branch,
+                locked: false,
+                prunable: false,
+                project: Some(project),
+            })
+        }));
+        worktrees.sort_by(|left, right| left.root.cmp(&right.root));
+        Ok(worktrees)
+    }
+
+    /// Returns the location reserved for a worktree project identifier without
+    /// creating it.
     #[must_use]
     pub fn worktree_path(&self, id: ProjectId) -> PathBuf {
         self.data_dir.join(WORKTREES_DIRECTORY).join(id.to_string())
@@ -757,9 +1127,7 @@ impl ProjectService {
     ///
     /// [`RepositoryLock`]: crate::RepositoryLock
     pub fn git(&self, id: ProjectId) -> Result<GitService, ProjectError> {
-        let catalog = self
-            .read_catalog_shared()
-            .unwrap_or_else(|| self.catalog.clone());
+        let catalog = self.read_catalog_shared()?;
         let project = catalog
             .projects
             .into_iter()
@@ -784,20 +1152,33 @@ impl ProjectService {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RemovalPolicy<'a> {
+enum RemovalPolicy {
     CatalogOnly,
-    ManagedRepository { remote: &'a str },
+    ManagedRepository,
     Worktree { parent: ProjectId },
 }
 
-impl<'a> From<&'a ProjectSource> for RemovalPolicy<'a> {
-    fn from(source: &'a ProjectSource) -> Self {
+impl From<&ProjectSource> for RemovalPolicy {
+    fn from(source: &ProjectSource) -> Self {
         match source {
             ProjectSource::Local => Self::CatalogOnly,
-            ProjectSource::ManagedRepository { remote } => Self::ManagedRepository { remote },
+            ProjectSource::ManagedRepository { .. } => Self::ManagedRepository,
             ProjectSource::Worktree { parent, .. } => Self::Worktree { parent: *parent },
         }
+    }
+}
+
+struct DisplayWorktrees<'a>(&'a [PathBuf]);
+
+impl std::fmt::Display for DisplayWorktrees<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, path) in self.0.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(", ")?;
+            }
+            write!(formatter, "'{}'", path.display())?;
+        }
+        Ok(())
     }
 }
 
@@ -816,17 +1197,89 @@ fn refuse_parent_with_worktrees(catalog: &Catalog, id: ProjectId) -> Result<(), 
     if worktrees.is_empty() {
         Ok(())
     } else {
-        let display = worktrees
-            .iter()
-            .map(|path| format!("'{}'", path.display()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        Err(ProjectError::ParentHasWorktrees {
-            id,
-            worktrees,
-            display,
-        })
+        Err(ProjectError::ParentHasWorktrees { id, worktrees })
     }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum WorktreeCheckoutState {
+    Available,
+    Missing,
+}
+
+fn reserved_worktree_state(
+    data_dir: &Path,
+    project: &Project,
+) -> Result<WorktreeCheckoutState, ProjectError> {
+    let storage_root = data_dir.join(WORKTREES_DIRECTORY);
+    let expected = match fs::canonicalize(&storage_root) {
+        Ok(root) => root.join(project.id.to_string()),
+        Err(_) => fs::canonicalize(data_dir)
+            .map(|root| root.join(WORKTREES_DIRECTORY).join(project.id.to_string()))
+            .map_err(|_| {
+                unsafe_worktree_removal(project, "managed worktrees root is unavailable")
+            })?,
+    };
+    match fs::canonicalize(&project.root) {
+        Ok(root) if root == expected => Ok(WorktreeCheckoutState::Available),
+        Ok(_) => Err(unsafe_worktree_removal(
+            project,
+            "checkout is not the managed path reserved for this worktree",
+        )),
+        Err(_) if project.root == expected => Ok(WorktreeCheckoutState::Missing),
+        Err(_) => Err(unsafe_worktree_removal(
+            project,
+            "unavailable checkout is not the managed path reserved for this worktree",
+        )),
+    }
+}
+
+fn verify_worktree_relationship(
+    catalog: &Catalog,
+    id: ProjectId,
+    expected_parent: ProjectId,
+    expected_root: &Path,
+    expected_parent_root: &Path,
+) -> Result<Project, ProjectError> {
+    let project = catalog
+        .projects
+        .iter()
+        .find(|project| project.id == id)
+        .cloned()
+        .ok_or(ProjectError::ProjectNotFound(id))?;
+    let parent_id = match RemovalPolicy::from(&project.source) {
+        RemovalPolicy::Worktree { parent } => parent,
+        RemovalPolicy::CatalogOnly | RemovalPolicy::ManagedRepository => {
+            return Err(unsafe_worktree_removal(
+                &project,
+                "catalog entry is not a managed worktree",
+            ));
+        }
+    };
+    if parent_id != expected_parent {
+        return Err(unsafe_worktree_removal(
+            &project,
+            "worktree parent changed while the repository lock was being acquired",
+        ));
+    }
+    if project.root != expected_root {
+        return Err(unsafe_worktree_removal(
+            &project,
+            "worktree path changed while the repository lock was being acquired",
+        ));
+    }
+    let parent = catalog
+        .projects
+        .iter()
+        .find(|entry| entry.id == parent_id)
+        .ok_or_else(|| unsafe_worktree_removal(&project, "catalogued parent no longer exists"))?;
+    if parent.root != expected_parent_root {
+        return Err(unsafe_worktree_removal(
+            &project,
+            "parent path changed while the repository lock was being acquired",
+        ));
+    }
+    Ok(project)
 }
 
 fn worktree_removal_required(project: &Project) -> ProjectError {
@@ -849,6 +1302,19 @@ fn unsafe_worktree_removal(project: &Project, reason: impl Into<String>) -> Proj
         id: project.id,
         path: project.root.clone(),
         reason: reason.into(),
+    }
+}
+
+fn validate_worktree_parent(project: &Project) -> Result<(), ProjectError> {
+    if matches!(project.source, ProjectSource::Worktree { .. })
+        || project.root.join(".git").is_file()
+    {
+        Err(ProjectError::WorktreeParentUnsupported {
+            id: project.id,
+            path: project.root.clone(),
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -931,21 +1397,22 @@ mod tests {
         time::Duration,
     };
 
-    use super::{ProjectError, ProjectService, sort_recents};
+    use super::{ProjectError, ProjectService, WorktreeBase, sort_recents};
     use crate::{
         catalog::{
             CATALOG_VERSION, MINIMUM_SUPPORTED_CATALOG_VERSION,
             entry::{Project, ProjectId, ProjectSource},
         },
-        git::{CloneCancellation, GitError},
+        git::{Cancellation, CloneCancellation, GitError},
+        list_directory,
         paths::{
             CATALOG_FILE, CATALOG_LOCK_FILE, CHECKOUT_DIRECTORY, DATA_DIRECTORY_ENV,
             REPOSITORIES_DIRECTORY, WORKTREES_DIRECTORY,
         },
         testing::{
-            Fixture, PROCESS_GIT_EXECUTABLE_ENV, PROCESS_PROJECT_ROOT_ENV, PROCESS_READY_FILE_ENV,
-            SCRUBBED_ENVIRONMENT, commit_all, git, initialize_repository, spawn_child,
-            wait_for_child_signal,
+            Fixture, PROCESS_BRANCH_ENV, PROCESS_GIT_EXECUTABLE_ENV, PROCESS_PROJECT_ID_ENV,
+            PROCESS_PROJECT_ROOT_ENV, PROCESS_READY_FILE_ENV, SCRUBBED_ENVIRONMENT, commit_all,
+            git, initialize_repository, spawn_child, wait_for_child_signal,
         },
     };
 
@@ -1009,6 +1476,23 @@ mod tests {
         store_worktree(service, parent.id, id, root, branch)
     }
 
+    fn create_branch_worktree(
+        service: &mut ProjectService,
+        parent: ProjectId,
+        branch: &str,
+    ) -> Project {
+        service
+            .create_worktree(
+                parent,
+                &WorktreeBase::NewBranch {
+                    name: branch.to_owned(),
+                    start_point: None,
+                },
+                &Cancellation::default(),
+            )
+            .unwrap()
+    }
+
     fn store_worktree(
         service: &mut ProjectService,
         parent: ProjectId,
@@ -1022,7 +1506,7 @@ mod tests {
             root: as_catalogued(&root),
             source: ProjectSource::Worktree {
                 parent,
-                worktree_branch: branch.to_owned(),
+                worktree_branch: Some(branch.to_owned()),
             },
             last_opened: time::OffsetDateTime::now_utc(),
             available: true,
@@ -1056,9 +1540,8 @@ mod tests {
         let imported = service.import_local(&project_root).unwrap();
         let reloaded = ProjectService::load_from_data_dir(&fixture.data_dir).unwrap();
 
-        assert_eq!(reloaded.catalog.version, CATALOG_VERSION);
-        assert_eq!(reloaded.list(), service.list());
-        assert_eq!(reloaded.list(), vec![imported]);
+        assert_eq!(reloaded.list().unwrap(), service.list().unwrap());
+        assert_eq!(reloaded.list().unwrap(), vec![imported]);
     }
 
     #[test]
@@ -1079,12 +1562,10 @@ mod tests {
         fs::File::create(fixture.data_dir.join(CATALOG_LOCK_FILE)).unwrap();
 
         let mut service = ProjectService::load_from_data_dir(&fixture.data_dir).unwrap();
-        assert_eq!(service.catalog.version, CATALOG_VERSION);
-        // If the shared read fails, both listing methods fall back to this
-        // snapshot. Clearing it makes the test prove the file was actually
-        // opened under projects.lock.
+        // Clearing the cached snapshot makes the test prove the listing was
+        // actually opened under projects.lock.
         service.catalog.projects.clear();
-        let stored = service.list_catalog_only();
+        let stored = service.list_catalog_only().unwrap();
         assert_eq!(stored.len(), 2);
         assert_eq!(stored[0].source, ProjectSource::Local);
         assert!(matches!(
@@ -1092,8 +1573,71 @@ mod tests {
             ProjectSource::ManagedRepository { remote }
                 if remote == "github.com/example/version-one"
         ));
-        assert_eq!(service.list().len(), 2);
+        assert_eq!(service.list().unwrap().len(), 2);
         assert_eq!(fs::read(&catalog_path).unwrap(), fixture_bytes);
+    }
+
+    #[test]
+    fn legacy_managed_row_without_a_remote_does_not_hide_the_catalog() {
+        let fixture = Fixture::new();
+        let legacy_root = fixture.directory("legacy-managed-without-remote");
+        let ordinary_root = fixture.directory("ordinary-beside-legacy");
+        fs::create_dir_all(&fixture.data_dir).unwrap();
+        let catalog_path = fixture.data_dir.join(CATALOG_FILE);
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "projects": [
+                {
+                    "id": "00000000-0000-4000-8000-000000000011",
+                    "display_name": "legacy managed",
+                    "root": as_catalogued(&legacy_root),
+                    "source": "managed_repository",
+                    "last_opened": "2026-08-06 18:52:03.000000000 +00:00:00"
+                },
+                {
+                    "id": "00000000-0000-4000-8000-000000000012",
+                    "display_name": "ordinary",
+                    "root": as_catalogued(&ordinary_root),
+                    "source": "local",
+                    "last_opened": "2026-08-06 18:53:03.000000000 +00:00:00"
+                }
+            ]
+        }))
+        .unwrap();
+        fs::write(&catalog_path, &bytes).unwrap();
+
+        let service = ProjectService::load_from_data_dir(&fixture.data_dir).unwrap();
+        let listed = service.list_catalog_only().unwrap();
+
+        assert_eq!(listed.len(), 2);
+        assert!(
+            listed
+                .iter()
+                .all(|project| project.source == ProjectSource::Local)
+        );
+        assert_eq!(
+            fs::read(catalog_path).unwrap(),
+            bytes,
+            "read-only load rewrote v1"
+        );
+    }
+
+    #[test]
+    fn a_catalog_read_failure_is_never_hidden_by_the_loaded_snapshot() {
+        let fixture = Fixture::new();
+        let project_root = fixture.directory("visible-catalog-failure");
+        let mut service = fixture.service();
+        service.import_local(project_root).unwrap();
+        fs::write(fixture.data_dir.join(CATALOG_FILE), b"{ broken after load").unwrap();
+
+        assert!(matches!(
+            service.list(),
+            Err(ProjectError::MalformedCatalog { .. })
+        ));
+        assert!(matches!(
+            service.list_catalog_only(),
+            Err(ProjectError::MalformedCatalog { .. })
+        ));
     }
 
     #[test]
@@ -1112,7 +1656,7 @@ mod tests {
         );
         fs::write(&catalog_path, fixture_bytes).unwrap();
         let mut service = ProjectService::load_from_data_dir(&fixture.data_dir).unwrap();
-        let originals = service.list_catalog_only();
+        let originals = service.list_catalog_only().unwrap();
 
         let new_root = fixture.directory("version-one-compatible-mutation");
         service.import_local(new_root).unwrap();
@@ -1121,7 +1665,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&persisted).unwrap();
         assert_eq!(json["version"], 1);
         assert_eq!(json["projects"].as_array().unwrap().len(), 3);
-        let after_import = service.list_catalog_only();
+        let after_import = service.list_catalog_only().unwrap();
         for original in &originals {
             assert!(
                 after_import.contains(original),
@@ -1167,6 +1711,7 @@ mod tests {
         fs::remove_dir_all(&worktree_root).unwrap();
         let stored = service
             .list()
+            .unwrap()
             .into_iter()
             .find(|project| project.id == worktree_id)
             .unwrap();
@@ -1176,7 +1721,7 @@ mod tests {
             stored.source,
             ProjectSource::Worktree { parent, ref worktree_branch }
                 if parent.to_string() == "00000000-0000-4000-8000-000000000001"
-                    && worktree_branch == "agent/catalog-v2"
+                    && worktree_branch.as_deref() == Some("agent/catalog-v2")
         ));
 
         let parent_id: ProjectId = "00000000-0000-4000-8000-000000000001".parse().unwrap();
@@ -1207,7 +1752,7 @@ mod tests {
 
         // The child called `load`, so finding its import here is what proves
         // the platform data directory was never consulted.
-        let projects = fixture.service().list();
+        let projects = fixture.service().list().unwrap();
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].root, fs::canonicalize(&project_root).unwrap());
     }
@@ -1237,6 +1782,7 @@ mod tests {
         let ids = fixture
             .service()
             .list()
+            .unwrap()
             .iter()
             .map(|project| project.id)
             .collect::<Vec<_>>();
@@ -1260,6 +1806,7 @@ mod tests {
         let ids = fixture
             .service()
             .list()
+            .unwrap()
             .iter()
             .map(|project| project.id)
             .collect::<Vec<_>>();
@@ -1286,10 +1833,16 @@ mod tests {
         });
 
         let reloaded = fixture.service();
-        assert_eq!(reloaded.list().len(), WRITERS);
+        assert_eq!(reloaded.list().unwrap().len(), WRITERS);
         for root in &roots {
             let stored = as_catalogued(root);
-            assert!(reloaded.list().iter().any(|project| project.root == stored));
+            assert!(
+                reloaded
+                    .list()
+                    .unwrap()
+                    .iter()
+                    .any(|project| project.root == stored)
+            );
         }
     }
 
@@ -1315,7 +1868,7 @@ mod tests {
             assert!(child.wait().unwrap().success());
         }
 
-        let projects = fixture.service().list();
+        let projects = fixture.service().list().unwrap();
         assert_eq!(projects.len(), WRITERS);
         for root in roots {
             let stored = as_catalogued(&root);
@@ -1340,11 +1893,12 @@ mod tests {
         child.wait().unwrap();
 
         let mut reloaded = ProjectService::load_from_data_dir(&fixture.data_dir).unwrap();
-        assert_eq!(reloaded.list(), vec![seeded]);
+        assert_eq!(reloaded.list().unwrap(), vec![seeded]);
         let imported_after_kill = reloaded.import_local(imported_after_kill_root).unwrap();
         let projects = ProjectService::load_from_data_dir(&fixture.data_dir)
             .unwrap()
-            .list();
+            .list()
+            .unwrap();
         assert_eq!(projects.len(), 2);
         assert!(
             projects
@@ -1398,7 +1952,7 @@ mod tests {
         assert!(imported.available);
         assert!(imported.git.is_some());
 
-        let listed = service.list_catalog_only();
+        let listed = service.list_catalog_only().unwrap();
 
         // The root exists and is a repository, so defaults here can only mean
         // the listing never looked at it.
@@ -1408,7 +1962,7 @@ mod tests {
         assert_eq!(listed[0].display_name, imported.display_name);
         assert!(!listed[0].available);
         assert_eq!(listed[0].git, None);
-        assert_eq!(service.list(), vec![imported]);
+        assert_eq!(service.list().unwrap(), vec![imported]);
     }
 
     #[test]
@@ -1424,7 +1978,7 @@ mod tests {
         let aliased = service.import_local(&alias).unwrap();
 
         assert_eq!(direct.id, aliased.id);
-        assert_eq!(service.list().len(), 1);
+        assert_eq!(service.list().unwrap().len(), 1);
     }
 
     #[cfg(unix)]
@@ -1473,11 +2027,11 @@ mod tests {
         thread::sleep(CLOCK_TICK);
         let second = service.import_local(second_root).unwrap();
 
-        assert_eq!(service.list()[0].id, second.id);
+        assert_eq!(service.list().unwrap()[0].id, second.id);
 
         thread::sleep(CLOCK_TICK);
         let reopened = service.open(first.id).unwrap();
-        let recents = service.list();
+        let recents = service.list().unwrap();
 
         assert!(reopened.last_opened > first.last_opened);
         assert_eq!(recents[0].id, first.id);
@@ -1556,7 +2110,7 @@ mod tests {
         let imported = service.import_local(&project_root).unwrap();
         fs::remove_dir_all(&project_root).unwrap();
 
-        let listed = service.list();
+        let listed = service.list().unwrap();
         assert_eq!(listed.len(), 1);
         assert!(!listed[0].available);
         assert_eq!(listed[0].id, imported.id);
@@ -1566,7 +2120,7 @@ mod tests {
         ));
 
         let reloaded = ProjectService::load_from_data_dir(&fixture.data_dir).unwrap();
-        assert!(!reloaded.list()[0].available);
+        assert!(!reloaded.list().unwrap()[0].available);
     }
 
     #[test]
@@ -1583,7 +2137,7 @@ mod tests {
         let removed = service.remove(imported.id).unwrap();
 
         assert_eq!(removed.id, imported.id);
-        assert!(service.list().is_empty());
+        assert!(service.list().unwrap().is_empty());
         assert_eq!(
             fs::read_to_string(project_root.join("root.txt")).unwrap(),
             "root sentinel"
@@ -1619,12 +2173,1041 @@ mod tests {
         assert!(parent_root.exists());
         assert!(first.root.exists());
         assert!(second.root.exists());
-        assert_eq!(service.list_catalog_only().len(), 3);
+        assert_eq!(service.list_catalog_only().unwrap().len(), 3);
         assert!(matches!(
             service.remove(first.id),
             Err(ProjectError::WorktreeRemovalRequired { id, .. }) if id == first.id
         ));
-        assert_eq!(service.list_catalog_only().len(), 3);
+        assert_eq!(service.list_catalog_only().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn worktrees_are_created_in_every_supported_mode_without_touching_the_parent_checkout() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("create-worktree-parent");
+        initialize_repository(&parent_root);
+        fs::write(parent_root.join("sentinel.txt"), "leave me exactly alone\n").unwrap();
+        git(&parent_root, ["branch", "existing-worktree"]);
+        let sentinel_before = fs::read(parent_root.join("sentinel.txt")).unwrap();
+        let status_before = git(&parent_root, ["status", "--porcelain=v1"]);
+        let head = git(&parent_root, ["rev-parse", "HEAD"]).trim().to_owned();
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+
+        let created = service
+            .create_worktree(
+                parent.id,
+                &WorktreeBase::NewBranch {
+                    name: "agent/new-worktree".to_owned(),
+                    start_point: Some(head.clone()),
+                },
+                &Cancellation::default(),
+            )
+            .unwrap();
+        let existing = service
+            .create_worktree(
+                parent.id,
+                &WorktreeBase::ExistingBranch {
+                    name: "existing-worktree".to_owned(),
+                },
+                &Cancellation::default(),
+            )
+            .unwrap();
+        let detached = service
+            .create_worktree(
+                parent.id,
+                &WorktreeBase::Detached {
+                    commit: head.clone(),
+                },
+                &Cancellation::default(),
+            )
+            .unwrap();
+
+        for worktree in [&created, &existing, &detached] {
+            assert_eq!(
+                worktree.root,
+                fs::canonicalize(service.worktree_path(worktree.id)).unwrap()
+            );
+            assert!(worktree.root.join(".git").is_file());
+            assert!(
+                list_directory(&worktree.root)
+                    .unwrap()
+                    .iter()
+                    .all(|entry| entry.name != ".git")
+            );
+        }
+        assert_eq!(
+            created
+                .git
+                .as_ref()
+                .and_then(|status| status.branch.as_deref()),
+            Some("agent/new-worktree")
+        );
+        assert_eq!(
+            existing
+                .git
+                .as_ref()
+                .and_then(|status| status.branch.as_deref()),
+            Some("existing-worktree")
+        );
+        assert_eq!(
+            detached
+                .git
+                .as_ref()
+                .and_then(|status| status.branch.as_deref()),
+            None
+        );
+        assert_eq!(
+            fs::read(parent_root.join("sentinel.txt")).unwrap(),
+            sentinel_before
+        );
+        assert_eq!(
+            git(&parent_root, ["status", "--porcelain=v1"]),
+            status_before
+        );
+
+        let administrative_names = fs::read_dir(parent_root.join(".git").join("worktrees"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        for worktree in [&created, &existing, &detached] {
+            assert!(administrative_names.contains(&worktree.id.to_string()));
+        }
+        assert_eq!(
+            service
+                .worktrees(parent.id, &Cancellation::default())
+                .unwrap()
+                .len(),
+            3
+        );
+
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.data_dir.join(CATALOG_FILE)).unwrap())
+                .unwrap();
+        let detached_row = persisted["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == detached.id.to_string())
+            .unwrap();
+        assert!(detached_row.get("worktree_branch").is_none());
+    }
+
+    #[test]
+    fn a_managed_repository_can_parent_a_worktree() {
+        let fixture = Fixture::new();
+        let remote = fixture.directory("managed-worktree-remote");
+        initialize_repository(&remote);
+        let mut service = fixture.service();
+        let parent = service
+            .import_repository(remote.to_str().unwrap(), &Cancellation::default(), |_| {})
+            .unwrap();
+
+        let worktree = create_branch_worktree(&mut service, parent.id, "agent/managed-parent");
+
+        assert!(
+            worktree.root.starts_with(
+                fs::canonicalize(&fixture.data_dir)
+                    .unwrap()
+                    .join(WORKTREES_DIRECTORY)
+            )
+        );
+        assert!(!worktree.root.starts_with(parent.root.parent().unwrap()));
+        assert!(worktree.root.join(".git").is_file());
+    }
+
+    #[test]
+    fn a_deleted_parent_does_not_strand_its_worktree_or_catalog_row() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("deleted-worktree-parent");
+        initialize_repository(&parent_root);
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+        let worktree = create_branch_worktree(&mut service, parent.id, "agent/orphaned-parent");
+        fs::remove_dir_all(&parent_root).unwrap();
+
+        let removed = service
+            .remove_worktree(worktree.id, true, &Cancellation::default())
+            .unwrap();
+
+        assert_eq!(removed.id, worktree.id);
+        assert!(
+            worktree.root.exists(),
+            "without the parent repository Git cannot safely delete the checkout"
+        );
+        service.remove(parent.id).unwrap();
+        assert!(service.list_catalog_only().unwrap().is_empty());
+    }
+
+    #[test]
+    fn direct_removal_reconciles_a_checkout_deleted_outside_harkness() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("direct-stale-removal-parent");
+        initialize_repository(&parent_root);
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+        let worktree = create_branch_worktree(&mut service, parent.id, "agent/direct-stale");
+        fs::remove_dir_all(&worktree.root).unwrap();
+
+        service
+            .remove_worktree(worktree.id, false, &Cancellation::default())
+            .unwrap();
+
+        assert!(
+            !git(&parent_root, ["worktree", "list", "--porcelain"])
+                .contains(&worktree.id.to_string())
+        );
+        let remaining = service.list_catalog_only().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, parent.id);
+        assert_eq!(remaining[0].root, parent.root);
+        assert_eq!(remaining[0].source, parent.source);
+    }
+
+    #[test]
+    fn direct_removal_drops_a_row_after_git_already_removed_the_worktree() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("already-removed-worktree-parent");
+        initialize_repository(&parent_root);
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+        let worktree = create_branch_worktree(&mut service, parent.id, "agent/already-removed");
+        git(
+            &parent_root,
+            [
+                "worktree",
+                "remove",
+                "--force",
+                "--",
+                worktree.root.to_str().unwrap(),
+            ],
+        );
+
+        service
+            .remove_worktree(worktree.id, false, &Cancellation::default())
+            .unwrap();
+
+        assert_eq!(service.list_catalog_only().unwrap().len(), 1);
+        assert_eq!(service.list_catalog_only().unwrap()[0].id, parent.id);
+    }
+
+    #[test]
+    fn a_worktree_opens_like_every_other_project() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("open-worktree-parent");
+        initialize_repository(&parent_root);
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+        let worktree = create_branch_worktree(&mut service, parent.id, "agent/open-me");
+
+        let opened = service.open(worktree.id).unwrap();
+
+        assert_eq!(opened.id, worktree.id);
+        assert!(opened.available && opened.git.is_some());
+        assert_eq!(service.list().unwrap()[0].id, worktree.id);
+    }
+
+    #[test]
+    fn detached_worktrees_use_the_resolved_oid_and_can_be_removed() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("detached-removal-parent");
+        initialize_repository(&parent_root);
+        let head = git(&parent_root, ["rev-parse", "HEAD"]).trim().to_owned();
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+        let detached = service
+            .create_worktree(
+                parent.id,
+                &WorktreeBase::Detached {
+                    commit: "HEAD".to_owned(),
+                },
+                &Cancellation::default(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            detached.display_name,
+            format!("Detached at {}", &head[..12])
+        );
+        service
+            .remove_worktree(detached.id, false, &Cancellation::default())
+            .unwrap();
+        assert!(!detached.root.exists());
+    }
+
+    #[test]
+    fn unborn_parent_head_is_a_typed_worktree_creation_refusal() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("unborn-worktree-parent");
+        git2::Repository::init(&parent_root).unwrap();
+        git(&parent_root, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+
+        let error = service
+            .create_worktree(
+                parent.id,
+                &WorktreeBase::NewBranch {
+                    name: "agent/unborn".to_owned(),
+                    start_point: None,
+                },
+                &Cancellation::default(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProjectError::Git(GitError::UnbornBranch { branch, .. }) if branch == "main"
+        ));
+    }
+
+    #[test]
+    fn existing_branches_checked_out_elsewhere_and_nested_parents_are_typed_refusals() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("checked-out-worktree-parent");
+        initialize_repository(&parent_root);
+        git(&parent_root, ["branch", "held-elsewhere"]);
+        let external = fixture.root.path().join("external-held-worktree");
+        git(
+            &parent_root,
+            [
+                "worktree",
+                "add",
+                "--",
+                external.to_str().unwrap(),
+                "held-elsewhere",
+            ],
+        );
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+
+        let error = service
+            .create_worktree(
+                parent.id,
+                &WorktreeBase::ExistingBranch {
+                    name: "held-elsewhere".to_owned(),
+                },
+                &Cancellation::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProjectError::Git(GitError::BranchCheckedOutInWorktree { branch, worktree })
+                if branch == "held-elsewhere"
+                    && crate::git::worktree::same_path(&worktree, &external)
+        ));
+
+        let managed = create_branch_worktree(&mut service, parent.id, "agent/not-a-parent");
+        assert!(matches!(
+            service.create_worktree(
+                managed.id,
+                &WorktreeBase::NewBranch {
+                    name: "agent/nested".to_owned(),
+                    start_point: None,
+                },
+                &Cancellation::default(),
+            ),
+            Err(ProjectError::WorktreeParentUnsupported { id, .. }) if id == managed.id
+        ));
+    }
+
+    #[test]
+    fn external_worktrees_are_reported_without_being_adopted() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("external-list-parent");
+        initialize_repository(&parent_root);
+        git(&parent_root, ["branch", "external-branch"]);
+        let external = fixture.root.path().join("external-read-only");
+        git(
+            &parent_root,
+            [
+                "worktree",
+                "add",
+                "--",
+                external.to_str().unwrap(),
+                "external-branch",
+            ],
+        );
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+
+        let worktrees = service
+            .worktrees(parent.id, &Cancellation::default())
+            .unwrap();
+
+        assert_eq!(worktrees.len(), 1);
+        assert!(crate::git::worktree::same_path(
+            &worktrees[0].root,
+            &external
+        ));
+        assert_eq!(worktrees[0].branch.as_deref(), Some("external-branch"));
+        assert!(worktrees[0].project.is_none());
+        assert_eq!(service.list_catalog_only().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn worktree_listing_refuses_an_unrelated_ancestor_repository() {
+        let fixture = Fixture::new();
+        let repository_root = fixture.directory("ancestor-worktree-repository");
+        initialize_repository(&repository_root);
+        let nested = repository_root.join("plain-subdirectory");
+        fs::create_dir(&nested).unwrap();
+        let external = fixture.root.path().join("ancestor-external-worktree");
+        git(&repository_root, ["branch", "ancestor-topic"]);
+        git(
+            &repository_root,
+            [
+                "worktree",
+                "add",
+                "--",
+                external.to_str().unwrap(),
+                "ancestor-topic",
+            ],
+        );
+        let mut service = fixture.service();
+        let project = service.import_local(&nested).unwrap();
+        assert_eq!(project.git, None);
+
+        let error = service
+            .worktrees(project.id, &Cancellation::default())
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProjectError::Git(GitError::NotARepository { path }) if path == project.root
+        ));
+    }
+
+    #[test]
+    fn live_worktree_branch_wins_without_overwriting_the_creation_record() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("live-worktree-branch-parent");
+        initialize_repository(&parent_root);
+        git(&parent_root, ["branch", "later-branch"]);
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+        let created = create_branch_worktree(&mut service, parent.id, "agent/original-branch");
+        git(&created.root, ["switch", "later-branch"]);
+
+        let listed = service
+            .worktrees(parent.id, &Cancellation::default())
+            .unwrap();
+        let row = &listed[0];
+
+        assert_eq!(row.branch.as_deref(), Some("later-branch"));
+        assert!(matches!(
+            row.project.as_ref().map(|project| &project.source),
+            Some(ProjectSource::Worktree { worktree_branch, .. })
+                if worktree_branch.as_deref() == Some("agent/original-branch")
+        ));
+    }
+
+    #[test]
+    fn locked_worktrees_have_a_typed_removal_refusal() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("locked-worktree-parent");
+        initialize_repository(&parent_root);
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+        let worktree = create_branch_worktree(&mut service, parent.id, "agent/locked-worktree");
+        git(
+            &parent_root,
+            [
+                "worktree",
+                "lock",
+                "--reason",
+                "portable checkout",
+                worktree.root.to_str().unwrap(),
+            ],
+        );
+
+        let listed = service
+            .worktrees(parent.id, &Cancellation::default())
+            .unwrap();
+        assert!(listed[0].locked);
+        let error = service
+            .remove_worktree(worktree.id, true, &Cancellation::default())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProjectError::Git(GitError::WorktreeLocked { reason, .. })
+                if reason.as_deref() == Some("portable checkout")
+        ));
+        assert!(worktree.root.exists());
+    }
+
+    #[test]
+    fn dirty_worktree_force_removal_discards_files_but_preserves_the_branch() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("force-worktree-parent");
+        initialize_repository(&parent_root);
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+        let branch = "agent/force-worktree";
+        let worktree = create_branch_worktree(&mut service, parent.id, branch);
+        fs::write(
+            worktree.root.join("uncommitted.txt"),
+            "discard only with force",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            service.remove_worktree(worktree.id, false, &Cancellation::default()),
+            Err(ProjectError::DirtyWorktreeRemoval { id, .. }) if id == worktree.id
+        ));
+        assert!(worktree.root.exists());
+
+        service
+            .remove_worktree(worktree.id, true, &Cancellation::default())
+            .unwrap();
+
+        assert!(!worktree.root.exists());
+        git(
+            &parent_root,
+            ["show-ref", "--verify", &format!("refs/heads/{branch}")],
+        );
+        assert!(
+            !git(&parent_root, ["worktree", "list", "--porcelain"])
+                .contains(&worktree.id.to_string())
+        );
+    }
+
+    #[test]
+    fn reconciliation_is_explicit_selective_and_never_deletes_a_remaining_directory() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("prune-worktree-parent");
+        initialize_repository(&parent_root);
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+        let missing = create_branch_worktree(&mut service, parent.id, "agent/prune-missing");
+        fs::remove_dir_all(&missing.root).unwrap();
+
+        let before = service
+            .worktrees(parent.id, &Cancellation::default())
+            .unwrap();
+        let stale = before
+            .iter()
+            .find_map(|worktree| worktree.project.as_ref())
+            .unwrap();
+        assert_eq!(stale.id, missing.id);
+        assert!(!stale.available);
+
+        let removed = service
+            .reconcile_worktrees(parent.id, &Cancellation::default())
+            .unwrap();
+
+        assert_eq!(
+            removed.iter().map(|project| project.id).collect::<Vec<_>>(),
+            [missing.id]
+        );
+        assert!(
+            service
+                .worktrees(parent.id, &Cancellation::default())
+                .unwrap()
+                .is_empty()
+        );
+
+        let kept = create_branch_worktree(&mut service, parent.id, "agent/prune-kept");
+        fs::remove_dir_all(
+            parent_root
+                .join(".git")
+                .join("worktrees")
+                .join(kept.id.to_string()),
+        )
+        .unwrap();
+        assert!(
+            service
+                .reconcile_worktrees(parent.id, &Cancellation::default())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(kept.root.exists(), "prune deleted a checkout directory");
+        assert!(
+            service
+                .list_catalog_only()
+                .unwrap()
+                .iter()
+                .any(|project| project.id == kept.id)
+        );
+
+        let opened_stale =
+            create_branch_worktree(&mut service, parent.id, "agent/stays-stale-while-opening");
+        fs::remove_dir_all(&opened_stale.root).unwrap();
+        service.open(parent.id).unwrap();
+        assert!(
+            service
+                .list_catalog_only()
+                .unwrap()
+                .iter()
+                .any(|project| project.id == opened_stale.id),
+            "opening a parent performed an undisclosed repository mutation"
+        );
+        let removed = service
+            .reconcile_worktrees(parent.id, &Cancellation::default())
+            .unwrap();
+        assert_eq!(removed[0].id, opened_stale.id);
+    }
+
+    #[test]
+    fn reconciliation_never_prunes_a_missing_external_worktree() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("selective-reconcile-parent");
+        initialize_repository(&parent_root);
+        git(&parent_root, ["branch", "external-portable"]);
+        let external = fixture.root.path().join("external-portable-worktree");
+        git(
+            &parent_root,
+            [
+                "worktree",
+                "add",
+                "--",
+                external.to_str().unwrap(),
+                "external-portable",
+            ],
+        );
+        git(
+            &parent_root,
+            [
+                "worktree",
+                "lock",
+                "--reason",
+                "temporarily unmounted",
+                external.to_str().unwrap(),
+            ],
+        );
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+        let managed = create_branch_worktree(&mut service, parent.id, "agent/reconcile-owned");
+        fs::remove_dir_all(&external).unwrap();
+        fs::remove_dir_all(&managed.root).unwrap();
+
+        let removed = service
+            .reconcile_worktrees(parent.id, &Cancellation::default())
+            .unwrap();
+
+        assert_eq!(removed[0].id, managed.id);
+        let listed =
+            crate::git::worktree::list(Path::new("git"), &parent_root, &Cancellation::default())
+                .unwrap();
+        let external = listed
+            .iter()
+            .find(|worktree| crate::git::worktree::same_path(&worktree.root, &external))
+            .expect("reconciliation must leave an external worktree registered");
+        assert_eq!(external.locked.as_deref(), Some("temporarily unmounted"));
+    }
+
+    #[test]
+    fn reconciliation_refuses_a_catalogued_path_outside_managed_storage() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("unsafe-reconciliation-parent");
+        initialize_repository(&parent_root);
+        let outside = fixture.root.path().join("unsafe-reconciliation-worktree");
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+        let id = ProjectId::new();
+        git(
+            &parent_root,
+            [
+                "worktree",
+                "add",
+                "-b",
+                "agent/unsafe-reconcile",
+                "--",
+                outside.to_str().unwrap(),
+            ],
+        );
+        let worktree = store_worktree(
+            &mut service,
+            parent.id,
+            id,
+            outside.clone(),
+            "agent/unsafe-reconcile",
+        );
+        fs::remove_dir_all(&outside).unwrap();
+
+        let error = service
+            .reconcile_worktrees(parent.id, &Cancellation::default())
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProjectError::UnsafeWorktreeRemoval { id: refused, .. } if refused == id
+        ));
+        let listed =
+            crate::git::worktree::list(Path::new("git"), &parent_root, &Cancellation::default())
+                .unwrap();
+        assert!(
+            listed
+                .iter()
+                .any(|worktree| crate::git::worktree::same_path(&worktree.root, &outside))
+        );
+        assert!(
+            service
+                .list_catalog_only()
+                .unwrap()
+                .iter()
+                .any(|project| project.id == worktree.id)
+        );
+    }
+
+    #[test]
+    fn worktree_reads_and_mutations_honor_pre_cancelled_tokens() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("cancelled-worktree-parent");
+        initialize_repository(&parent_root);
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+        let worktree = create_branch_worktree(&mut service, parent.id, "agent/cancelled");
+        let cancellation = Cancellation::default();
+        cancellation.cancel();
+
+        assert!(matches!(
+            service.worktrees(parent.id, &cancellation),
+            Err(ProjectError::Git(GitError::Cancelled))
+        ));
+        assert!(matches!(
+            service.create_worktree(
+                parent.id,
+                &WorktreeBase::NewBranch {
+                    name: "agent/never-created".to_owned(),
+                    start_point: None,
+                },
+                &cancellation,
+            ),
+            Err(ProjectError::Git(GitError::Cancelled))
+        ));
+        assert!(matches!(
+            service.reconcile_worktrees(parent.id, &cancellation),
+            Err(ProjectError::Git(GitError::Cancelled))
+        ));
+        assert!(matches!(
+            service.remove_worktree(worktree.id, false, &cancellation),
+            Err(ProjectError::Git(GitError::Cancelled))
+        ));
+        assert!(worktree.root.exists());
+    }
+
+    #[test]
+    fn busy_reconciliation_is_reported_and_leaves_the_catalog_intact() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("busy-reconciliation-parent");
+        initialize_repository(&parent_root);
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+        let worktree = create_branch_worktree(&mut service, parent.id, "agent/busy-reconcile");
+        fs::remove_dir_all(&worktree.root).unwrap();
+        let ready_file = fixture.root.path().join("reconciliation-lock-held");
+        let mut holder = spawn_child(&fixture.data_dir, "hold-repository-lock")
+            .env(PROCESS_PROJECT_ROOT_ENV, &parent_root)
+            .env(PROCESS_READY_FILE_ENV, &ready_file)
+            .spawn()
+            .unwrap();
+        wait_for_child_signal(&mut holder, &ready_file);
+
+        let error = service
+            .reconcile_worktrees(parent.id, &Cancellation::default())
+            .unwrap_err();
+
+        holder.kill().unwrap();
+        holder.wait().unwrap();
+        assert!(matches!(
+            error,
+            ProjectError::Git(GitError::RepositoryBusy { .. })
+        ));
+        assert!(
+            service
+                .list_catalog_only()
+                .unwrap()
+                .iter()
+                .any(|project| project.id == worktree.id)
+        );
+        assert_eq!(service.open(parent.id).unwrap().id, parent.id);
+    }
+
+    #[test]
+    fn concurrent_process_worktree_creation_never_corrupts_git_or_the_catalog() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("racing-worktree-parent");
+        initialize_repository(&parent_root);
+        let parent = fixture.service().import_local(&parent_root).unwrap();
+        let mut children = ["agent/process-first", "agent/process-second"]
+            .into_iter()
+            .map(|branch| {
+                spawn_child(&fixture.data_dir, "create-worktree")
+                    .env(PROCESS_PROJECT_ID_ENV, parent.id.to_string())
+                    .env(PROCESS_BRANCH_ENV, branch)
+                    .spawn()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        for child in &mut children {
+            assert!(child.wait().unwrap().success());
+        }
+
+        let service = fixture.service();
+        let worktrees = service
+            .worktrees(parent.id, &Cancellation::default())
+            .unwrap();
+        let managed = worktrees
+            .iter()
+            .filter(|worktree| worktree.project.is_some())
+            .collect::<Vec<_>>();
+        assert!(!managed.is_empty() && managed.len() <= 2);
+        assert_eq!(
+            service
+                .list_catalog_only()
+                .unwrap()
+                .iter()
+                .filter(|project| matches!(project.source, ProjectSource::Worktree { .. }))
+                .count(),
+            managed.len()
+        );
+        for worktree in managed {
+            assert!(worktree.root.join(".git").is_file());
+        }
+    }
+
+    #[test]
+    fn worktree_removal_refuses_a_checkout_outside_managed_storage() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("unsafe-worktree-parent");
+        initialize_repository(&parent_root);
+        let outside = fixture.root.path().join("outside-worktree");
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+        let id = ProjectId::new();
+        git(
+            &parent_root,
+            [
+                "worktree",
+                "add",
+                "-b",
+                "agent/outside-worktree",
+                "--",
+                outside.to_str().unwrap(),
+            ],
+        );
+        let worktree = store_worktree(
+            &mut service,
+            parent.id,
+            id,
+            outside.clone(),
+            "agent/outside-worktree",
+        );
+
+        assert!(matches!(
+            service.remove_worktree(worktree.id, false, &Cancellation::default()),
+            Err(ProjectError::UnsafeWorktreeRemoval { id, .. }) if id == worktree.id
+        ));
+        assert!(outside.exists());
+        git(
+            &parent_root,
+            [
+                "worktree",
+                "remove",
+                "--force",
+                "--",
+                outside.to_str().unwrap(),
+            ],
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_removal_refuses_a_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("symlink-worktree-parent");
+        initialize_repository(&parent_root);
+        let outside = fixture.root.path().join("symlink-worktree-outside");
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+        let id = ProjectId::new();
+        git(
+            &parent_root,
+            [
+                "worktree",
+                "add",
+                "-b",
+                "agent/symlink-worktree",
+                "--",
+                outside.to_str().unwrap(),
+            ],
+        );
+        fs::create_dir_all(fixture.data_dir.join(WORKTREES_DIRECTORY)).unwrap();
+        let reserved = service.worktree_path(id);
+        symlink(&outside, &reserved).unwrap();
+        let project = Project {
+            id,
+            display_name: "agent/symlink-worktree".to_owned(),
+            root: reserved.clone(),
+            source: ProjectSource::Worktree {
+                parent: parent.id,
+                worktree_branch: Some("agent/symlink-worktree".to_owned()),
+            },
+            last_opened: time::OffsetDateTime::now_utc(),
+            available: true,
+            git: None,
+        };
+        {
+            let _lock = service.lock_exclusive().unwrap();
+            let mut catalog = service.read_catalog().unwrap();
+            catalog.projects.push(project.clone());
+            service.persist(&catalog).unwrap();
+            service.catalog = catalog;
+        }
+
+        assert!(matches!(
+            service.remove_worktree(id, false, &Cancellation::default()),
+            Err(ProjectError::UnsafeWorktreeRemoval { id: refused, .. }) if refused == id
+        ));
+        assert!(outside.exists());
+        fs::remove_file(&reserved).unwrap();
+        git(
+            &parent_root,
+            [
+                "worktree",
+                "remove",
+                "--force",
+                "--",
+                outside.to_str().unwrap(),
+            ],
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_creation_cleans_git_then_the_directory_then_retries_targeted_removal() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("failed-worktree-parent");
+        initialize_repository(&parent_root);
+        let operations = fixture.root.path().join("worktree-operations.log");
+        let shim = fixture.shim(
+            "fail-after-worktree-add",
+            &format!(
+                "#!/bin/sh\n\
+                 previous=\n\
+                 operation=other\n\
+                 for argument in \"$@\"; do\n\
+                   if [ \"$previous\" = worktree ]; then operation=\"$argument\"; break; fi\n\
+                   previous=\"$argument\"\n\
+                 done\n\
+                 printf '%s\\n' \"$operation\" >> \"{}\"\n\
+                 git \"$@\"\n\
+                 status=$?\n\
+                 if [ \"$operation\" = add ] && [ \"$status\" -eq 0 ]; then exit 42; fi\n\
+                 exit \"$status\"\n",
+                operations.display()
+            ),
+        );
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+        service.git_executable = shim;
+        let branch = "agent/failed-worktree";
+
+        let error = service
+            .create_worktree(
+                parent.id,
+                &WorktreeBase::NewBranch {
+                    name: branch.to_owned(),
+                    start_point: None,
+                },
+                &Cancellation::default(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, ProjectError::Git(GitError::Failed { .. })));
+        assert_eq!(
+            fs::read_to_string(&operations)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["add", "remove", "remove"]
+        );
+        let catalog = service.list_catalog_only().unwrap();
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].id, parent.id);
+        assert!(
+            fs::read_dir(fixture.data_dir.join(WORKTREES_DIRECTORY))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        assert!(
+            !git(&parent_root, ["worktree", "list", "--porcelain"]).contains(
+                &fixture
+                    .data_dir
+                    .join(WORKTREES_DIRECTORY)
+                    .display()
+                    .to_string()
+            )
+        );
+        git(
+            &parent_root,
+            ["show-ref", "--verify", &format!("refs/heads/{branch}")],
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slow_git_worktree_removal_does_not_hold_the_catalog_lock() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("slow-removal-parent");
+        initialize_repository(&parent_root);
+        let ready = fixture.root.path().join("worktree-remove-started");
+        let release = fixture.root.path().join("release-worktree-remove");
+        let shim = fixture.shim(
+            "slow-worktree-remove",
+            &format!(
+                "#!/bin/sh\n\
+                 previous=\n\
+                 operation=other\n\
+                 for argument in \"$@\"; do\n\
+                   if [ \"$previous\" = worktree ]; then operation=\"$argument\"; break; fi\n\
+                   previous=\"$argument\"\n\
+                 done\n\
+                 if [ \"$operation\" = remove ]; then\n\
+                   touch '{}'\n\
+                   while [ ! -e '{}' ]; do sleep 0.01; done\n\
+                 fi\n\
+                 exec git \"$@\"\n",
+                ready.display(),
+                release.display()
+            ),
+        );
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+        let worktree = create_branch_worktree(&mut service, parent.id, "agent/slow-removal");
+        service.git_executable = shim;
+
+        let removal = thread::spawn(move || {
+            service.remove_worktree(worktree.id, false, &Cancellation::default())
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "the removal shim never started");
+
+        let data_dir = fixture.data_dir.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let listing = thread::spawn(move || {
+            let result = ProjectService::load_from_data_dir(data_dir)
+                .and_then(|service| service.list_catalog_only());
+            let _ = sender.send(result);
+        });
+        let listed = receiver.recv_timeout(Duration::from_secs(1));
+        fs::write(&release, b"continue").unwrap();
+        let removed = removal.join().unwrap().unwrap();
+        listing.join().unwrap();
+
+        assert!(
+            listed.unwrap().is_ok(),
+            "catalog read blocked behind Git removal"
+        );
+        assert_eq!(removed.id, worktree.id);
     }
 
     #[test]
@@ -1643,7 +3226,9 @@ mod tests {
                 .any(|line| line == branch_record)
         );
 
-        let removed = service.remove_worktree(worktree.id).unwrap();
+        let removed = service
+            .remove_worktree(worktree.id, false, &Cancellation::default())
+            .unwrap();
 
         assert_eq!(removed.id, worktree.id);
         assert!(!worktree.root.exists());
@@ -1652,7 +3237,7 @@ mod tests {
                 .lines()
                 .any(|line| line == branch_record)
         );
-        let remaining = service.list_catalog_only();
+        let remaining = service.list_catalog_only().unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, parent.id);
         let persisted: serde_json::Value =
@@ -1672,13 +3257,19 @@ mod tests {
         let worktree = catalogue_git_worktree(&mut service, &parent, "agent/dirty-worktree");
         fs::write(worktree.root.join("untracked.txt"), "keep me").unwrap();
 
-        let error = service.remove_worktree(worktree.id).unwrap_err();
+        let error = service
+            .remove_worktree(worktree.id, false, &Cancellation::default())
+            .unwrap_err();
 
-        assert!(matches!(error, ProjectError::Git(GitError::Failed { .. })));
+        assert!(matches!(
+            error,
+            ProjectError::DirtyWorktreeRemoval { id, .. } if id == worktree.id
+        ));
         assert!(worktree.root.join("untracked.txt").exists());
         assert!(
             service
                 .list_catalog_only()
+                .unwrap()
                 .iter()
                 .any(|project| project.id == worktree.id)
         );
@@ -1894,7 +3485,7 @@ mod tests {
     }
 
     #[test]
-    fn an_acyclic_worktree_parent_chain_is_valid() {
+    fn even_an_acyclic_worktree_parent_chain_is_rejected() {
         let fixture = Fixture::new();
         let parent_root = fixture.directory("chain-parent");
         let first_root = fixture.directory("chain-first");
@@ -1940,13 +3531,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            ProjectService::load_from_data_dir(&fixture.data_dir)
-                .unwrap()
-                .list_catalog_only()
-                .len(),
-            3
-        );
+        assert!(matches!(
+            ProjectService::load_from_data_dir(&fixture.data_dir),
+            Err(ProjectError::InvalidCatalog { .. })
+        ));
     }
 
     #[test]
@@ -2044,7 +3632,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(imported.id, duplicate.id);
-        assert_eq!(service.list().len(), 1);
+        assert_eq!(service.list().unwrap().len(), 1);
         assert!(managed_remote(&imported).starts_with("file://"));
         assert_eq!(
             imported.git.as_ref().unwrap().branch.as_deref(),
@@ -2109,7 +3697,7 @@ mod tests {
         });
 
         assert_eq!(projects[0].id, projects[1].id);
-        let catalogued = fixture.service().list();
+        let catalogued = fixture.service().list().unwrap();
         assert_eq!(catalogued.len(), 1);
         assert_eq!(catalogued[0].id, projects[0].id);
         assert_eq!(
@@ -2144,7 +3732,7 @@ mod tests {
         assert_eq!(imported.id, duplicate.id);
         assert_eq!(managed_remote(&imported), managed_remote(&duplicate));
         assert_eq!(managed_remote(&imported), "github.com/octocat/hello-world");
-        assert_eq!(service.list().len(), 1);
+        assert_eq!(service.list().unwrap().len(), 1);
     }
 
     #[test]
@@ -2170,7 +3758,7 @@ mod tests {
                 remote.display()
             )
         );
-        assert!(service.list().is_empty());
+        assert!(service.list().unwrap().is_empty());
         assert!(!fixture.data_dir.join(REPOSITORIES_DIRECTORY).exists());
     }
 
@@ -2190,7 +3778,7 @@ mod tests {
             error,
             ProjectError::CloneFailed { ref stderr } if !stderr.is_empty()
         ));
-        assert!(service.list().is_empty());
+        assert!(service.list().unwrap().is_empty());
 
         let remote = fixture.directory("cancel-remote");
         initialize_repository(&remote);
@@ -2200,7 +3788,7 @@ mod tests {
             service.import_repository(remote.to_str().unwrap(), &cancellation, |_| {}),
             Err(ProjectError::CloneCancelled)
         ));
-        assert!(service.list().is_empty());
+        assert!(service.list().unwrap().is_empty());
         let repositories = fixture.data_dir.join(REPOSITORIES_DIRECTORY);
         assert!(
             !repositories.exists() || fs::read_dir(repositories).unwrap().next().is_none(),
@@ -2248,7 +3836,7 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, ProjectError::CloneCancelled));
-        assert!(service.list().is_empty());
+        assert!(service.list().unwrap().is_empty());
         let repositories = fixture.data_dir.join(REPOSITORIES_DIRECTORY);
         assert!(
             !repositories.exists() || fs::read_dir(repositories).unwrap().next().is_none(),
@@ -2281,7 +3869,7 @@ mod tests {
 
         assert_eq!(removed.id, project.id);
         assert!(!project.root.exists());
-        assert!(service.list().is_empty());
+        assert!(service.list().unwrap().is_empty());
     }
 
     #[test]
@@ -2308,7 +3896,7 @@ mod tests {
         ));
         assert!(parent.root.exists(), "the managed parent was deleted");
         assert!(worktree.root.exists());
-        assert_eq!(service.list_catalog_only().len(), 2);
+        assert_eq!(service.list_catalog_only().unwrap().len(), 2);
     }
 
     #[test]
@@ -2411,7 +3999,7 @@ mod tests {
         service.remove_managed(managed.id).unwrap();
 
         assert!(!managed.root.exists());
-        assert!(service.list().is_empty());
+        assert!(service.list().unwrap().is_empty());
     }
 
     #[test]
@@ -2440,7 +4028,7 @@ mod tests {
         assert_ne!(recloned.id, imported.id);
         assert!(recloned.available);
         assert!(recloned.root.join(".git").exists());
-        assert_eq!(service.list().len(), 1);
+        assert_eq!(service.list().unwrap().len(), 1);
     }
 
     #[test]
@@ -2458,6 +4046,18 @@ mod tests {
             .unwrap();
         let worktree = catalogue_worktree(&mut service, parent.id, "agent/kept-orphan");
         fs::remove_dir_all(&parent.root).unwrap();
+        #[cfg(unix)]
+        let clone_started = {
+            let clone_started = fixture.root.path().join("replacement-clone-started");
+            service.git_executable = fixture.shim(
+                "record-replacement-clone",
+                &format!(
+                    "#!/bin/sh\ntouch '{}'\nexec git \"$@\"\n",
+                    clone_started.display()
+                ),
+            );
+            clone_started
+        };
 
         let error = service
             .import_repository(
@@ -2474,6 +4074,7 @@ mod tests {
         ));
         let ids = service
             .list_catalog_only()
+            .unwrap()
             .into_iter()
             .map(|project| project.id)
             .collect::<Vec<_>>();
@@ -2486,6 +4087,11 @@ mod tests {
                 .count(),
             1,
             "the failed replacement clone was not cleaned up"
+        );
+        #[cfg(unix)]
+        assert!(
+            !clone_started.exists(),
+            "a doomed replacement clone was started"
         );
     }
 
@@ -2524,7 +4130,7 @@ mod tests {
         service.git_executable = recording_git;
         service.import_local(&project_root).unwrap();
 
-        let listed = service.list();
+        let listed = service.list().unwrap();
 
         assert_eq!(listed.len(), 1);
         assert!(listed[0].git.is_some(), "the listing reported Git state");
@@ -2608,6 +4214,6 @@ mod tests {
             "{error}"
         );
         assert!(managed.root.exists(), "the checkout was deleted anyway");
-        assert_eq!(service.list().len(), 1);
+        assert_eq!(service.list().unwrap().len(), 1);
     }
 }

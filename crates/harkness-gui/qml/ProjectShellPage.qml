@@ -12,6 +12,7 @@ Kirigami.Page {
 
     // Lets Main.qml recognize this page when `opened` is re-set by a refresh.
     property bool isShell: true
+    property bool worktreeFormVisible: false
 
     title: shell.project.displayName
 
@@ -22,6 +23,8 @@ Kirigami.Page {
             fileModel.setRoot(project.root);
         if (project.available && project.isGit)
             backend.refreshBranches(project.id);
+        if (project.available && project.isGit && !project.worktree)
+            backend.refreshWorktrees(project.id);
     }
 
     actions: [
@@ -39,6 +42,31 @@ Kirigami.Page {
             onTriggered: shell.backend.openProject(shell.project.id)
         },
         Kirigami.Action {
+            icon.name: "vcs-branch"
+            text: qsTr("Create worktree…")
+            tooltip: qsTr("Create a linked workspace on a new branch, an existing branch, or detached HEAD")
+            visible: shell.project.available && shell.project.isGit && !shell.project.worktree
+            onTriggered: {
+                shell.worktreeFormVisible = !shell.worktreeFormVisible;
+                if (shell.worktreeFormVisible)
+                    worktreeBranch.forceActiveFocus();
+            }
+        },
+        Kirigami.Action {
+            icon.name: "view-refresh"
+            text: qsTr("Reconcile worktrees")
+            tooltip: qsTr("Remove stale Harkness entries without pruning external worktrees")
+            visible: shell.project.available && shell.project.isGit && !shell.project.worktree
+            onTriggered: shell.backend.reconcileWorktrees(shell.project.id)
+        },
+        Kirigami.Action {
+            icon.name: "process-stop"
+            text: qsTr("Cancel Git operation")
+            tooltip: qsTr("Stop the running worktree operation safely")
+            visible: shell.backend.busy
+            onTriggered: shell.backend.cancelImport()
+        },
+        Kirigami.Action {
             icon.name: "delete"
             text: qsTr("Remove from Harkness…")
             tooltip: shell.project.worktree
@@ -48,7 +76,7 @@ Kirigami.Page {
                     : qsTr("Forget this project; files stay untouched")
             onTriggered: {
                 if (shell.project.worktree)
-                    applicationWindow().confirmRemoveWorktree(shell.project.id, shell.project.displayName, shell.project.root, shell.project.worktreeBranch);
+                    applicationWindow().confirmRemoveWorktree(shell.project.id, shell.project.displayName, shell.project.root, shell.project.branch, shell.project.dirty);
                 else if (shell.project.managed)
                     applicationWindow().confirmRemoveManaged(shell.project.id, shell.project.displayName, shell.project.root);
                 else
@@ -156,13 +184,15 @@ Kirigami.Page {
                     }
 
                     Kirigami.Chip {
-                        Controls.ToolTip.text: qsTr("Parent project: %1").arg(shell.project.parent)
+                        Controls.ToolTip.text: qsTr("Parent project: %1").arg(shell.project.parentName)
                         Controls.ToolTip.visible: hovered && shell.project.worktree
                         checkable: false
                         closable: false
-                        enabled: false
+                        hoverEnabled: true
                         text: shell.project.worktree
-                            ? qsTr("Worktree: %1").arg(shell.project.worktreeBranch)
+                            ? shell.project.branch.length > 0
+                                ? qsTr("Worktree: %1").arg(shell.project.branch)
+                                : qsTr("Worktree: detached HEAD")
                             : shell.project.managed
                                 ? qsTr("Managed clone")
                                 : qsTr("Local folder")
@@ -188,6 +218,109 @@ Kirigami.Page {
                         closable: false
                         text: qsTr("Missing from disk")
                         visible: !shell.project.available
+                    }
+                }
+            }
+
+            Controls.Frame {
+                Layout.fillWidth: true
+                visible: shell.worktreeFormVisible
+
+                ColumnLayout {
+                    anchors.fill: parent
+                    spacing: Kirigami.Units.smallSpacing
+
+                    Kirigami.Heading {
+                        level: 4
+                        text: qsTr("Create linked workspace")
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+
+                        Controls.ComboBox {
+                            id: worktreeMode
+
+                            readonly property string mode: ["new", "existing", "detached"][currentIndex]
+
+                            Layout.preferredWidth: Kirigami.Units.gridUnit * 10
+                            model: [qsTr("New branch"), qsTr("Existing branch"), qsTr("Detached HEAD")]
+                        }
+
+                        Controls.TextField {
+                            id: worktreeBranch
+
+                            Layout.fillWidth: true
+                            enabled: !shell.backend.busy
+                            placeholderText: worktreeMode.mode === "existing"
+                                ? qsTr("Existing branch to reuse")
+                                : qsTr("New branch name")
+                            visible: worktreeMode.mode !== "detached"
+                        }
+
+                        Controls.TextField {
+                            id: worktreeStart
+
+                            Layout.fillWidth: true
+                            enabled: !shell.backend.busy
+                            placeholderText: worktreeMode.mode === "detached"
+                                ? qsTr("Commit or revision")
+                                : qsTr("Start point (defaults to HEAD)")
+                            text: worktreeMode.mode === "new" ? "HEAD" : ""
+                            visible: worktreeMode.mode !== "existing"
+                        }
+
+                        Controls.Button {
+                            enabled: !shell.backend.busy
+                                && (worktreeMode.mode === "detached"
+                                    ? worktreeStart.text.trim().length > 0
+                                    : worktreeBranch.text.trim().length > 0)
+                            icon.name: "list-add"
+                            text: qsTr("Create")
+                            onClicked: shell.backend.createWorktree(
+                                shell.project.id,
+                                worktreeMode.mode,
+                                worktreeBranch.text,
+                                worktreeStart.text
+                            )
+                        }
+
+                        Controls.Button {
+                            text: shell.backend.busy ? qsTr("Stop") : qsTr("Cancel")
+                            onClicked: {
+                                if (shell.backend.busy)
+                                    shell.backend.cancelImport();
+                                else
+                                    shell.worktreeFormVisible = false;
+                            }
+                        }
+                    }
+
+                    Controls.Label {
+                        Layout.fillWidth: true
+                        color: Kirigami.Theme.disabledTextColor
+                        font: Kirigami.Theme.smallFont
+                        text: shell.backend.worktrees.length === 0
+                            ? qsTr("No linked worktrees")
+                            : qsTr("%n linked worktree(s), including external checkouts", "", shell.backend.worktrees.length)
+                    }
+
+                    Repeater {
+                        model: shell.backend.worktrees
+
+                        delegate: Controls.Label {
+                            required property var modelData
+
+                            Layout.fillWidth: true
+                            elide: Text.ElideMiddle
+                            font: Kirigami.Theme.smallFont
+                            text: {
+                                const branch = modelData.branch.length > 0 ? modelData.branch : qsTr("detached HEAD");
+                                const ownership = modelData.owned ? qsTr("Harkness") : qsTr("external");
+                                const lock = modelData.locked ? qsTr(", locked") : "";
+                                return qsTr("%1 — %2 (%3%4)").arg(branch).arg(modelData.root).arg(ownership).arg(lock);
+                            }
+                        }
                     }
                 }
             }
@@ -243,6 +376,8 @@ Kirigami.Page {
     Component.onCompleted: {
         if (shell.project.available && shell.project.isGit)
             shell.backend.refreshBranches(shell.project.id);
+        if (shell.project.available && shell.project.isGit && !shell.project.worktree)
+            shell.backend.refreshWorktrees(shell.project.id);
     }
 
     Kirigami.PlaceholderMessage {

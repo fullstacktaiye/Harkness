@@ -44,10 +44,13 @@ dropped on the next write.
 
 Every worktree must name an existing parent; self-parenting, dangling parents,
 and parent cycles are invalid. Parent removal and worktree insertion both need
-the exclusive catalog lock. A future creation path must acquire the repository
-lock first, then the catalog lock, and re-check the parent under that catalog
-lock before inserting the worktree. Remove worktrees only through Git so the
-checkout and `.git/worktrees` administration disappear together.
+the exclusive catalog lock. Worktree creation acquires the repository lock
+first, then the catalog lock, and re-checks the parent under that catalog lock
+before inserting the worktree. Removal keeps the repository lock while Git
+deletes the checkout, but never holds the global catalog lock during that
+potentially long operation. Remove worktrees only through Git so the checkout
+and `.git/worktrees` administration disappear together; reconciliation must be
+selective and must not prune external worktree records.
 
 ## Commit & Pull Request Guidelines
 

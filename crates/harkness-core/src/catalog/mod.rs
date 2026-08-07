@@ -4,13 +4,14 @@ pub(crate) mod entry;
 pub(crate) mod lock;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs,
     io::{self, Write},
     path::Path,
 };
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tempfile::NamedTempFile;
 
 use crate::{
@@ -23,26 +24,22 @@ pub(crate) const CATALOG_VERSION: u32 = 2;
 /// The oldest catalog schema this build can load without losing data.
 pub(crate) const MINIMUM_SUPPORTED_CATALOG_VERSION: u32 = 1;
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Catalog {
-    pub(crate) version: u32,
     pub(crate) projects: Vec<Project>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogWire {
+    version: u32,
+    projects: Vec<Project>,
 }
 
 /// The forward-compatible prefix of every catalog file.
 #[derive(Deserialize)]
 struct CatalogVersion {
     version: u32,
-}
-
-impl Default for Catalog {
-    fn default() -> Self {
-        Self {
-            version: CATALOG_VERSION,
-            projects: Vec::new(),
-        }
-    }
 }
 
 /// Reads a catalog file, treating a missing file as an empty catalog.
@@ -76,17 +73,24 @@ pub(crate) fn read_catalog(catalog_path: &Path) -> Result<Catalog, ProjectError>
                 });
             }
 
-            let mut catalog: Catalog = serde_json::from_slice(&bytes).map_err(|source| {
+            let mut body: Value = serde_json::from_slice(&bytes).map_err(|source| {
                 ProjectError::MalformedCatalog {
                     path: catalog_path.to_path_buf(),
                     source,
                 }
             })?;
-            // Project's wire decoder accepts the v1 shapes and constructs the
-            // source-specific v2 Rust representation. Normalize only the
-            // in-memory version so a read-only client leaves the older file
-            // untouched.
-            catalog.version = CATALOG_VERSION;
+            if probe.version == 1 {
+                normalize_legacy_managed_rows(&mut body);
+            }
+            let wire: CatalogWire =
+                serde_json::from_value(body).map_err(|source| ProjectError::MalformedCatalog {
+                    path: catalog_path.to_path_buf(),
+                    source,
+                })?;
+            debug_assert_eq!(wire.version, probe.version);
+            let catalog = Catalog {
+                projects: wire.projects,
+            };
             validate_catalog(catalog_path, &catalog)?;
             Ok(catalog)
         }
@@ -94,6 +98,27 @@ pub(crate) fn read_catalog(catalog_path: &Path) -> Result<Catalog, ProjectError>
             path: catalog_path.to_path_buf(),
             source,
         }),
+    }
+}
+
+/// Before source-specific Rust types existed, a v1 managed row could omit its
+/// optional remote. Such a row was never safely deletable as managed storage.
+/// Load it as a local project so the rest of the user's catalog remains
+/// available and the same refusal is preserved. Version 2 keeps rejecting the
+/// shape: a current writer may not silently lose same-version data.
+fn normalize_legacy_managed_rows(body: &mut Value) {
+    let Some(projects) = body.get_mut("projects").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for project in projects {
+        let Some(project) = project.as_object_mut() else {
+            continue;
+        };
+        if project.get("source").and_then(Value::as_str) == Some("managed_repository")
+            && project.get("remote").is_none()
+        {
+            project.insert("source".to_owned(), Value::String("local".to_owned()));
+        }
     }
 }
 
@@ -117,7 +142,10 @@ fn validate_catalog(catalog_path: &Path, catalog: &Catalog) -> Result<(), Projec
             ProjectSource::ManagedRepository { .. } => {}
             ProjectSource::Worktree {
                 worktree_branch, ..
-            } if worktree_branch.trim().is_empty() => {
+            } if worktree_branch
+                .as_deref()
+                .is_some_and(|branch| branch.trim().is_empty()) =>
+            {
                 return Err(invalid_catalog(
                     catalog_path,
                     format!("worktree {} has an empty branch", project.id),
@@ -131,26 +159,20 @@ fn validate_catalog(catalog_path: &Path, catalog: &Catalog) -> Result<(), Projec
         let ProjectSource::Worktree { parent, .. } = &project.source else {
             continue;
         };
-        if !entries.contains_key(parent) {
+        let Some(parent_entry) = entries.get(parent) else {
             return Err(invalid_catalog(
                 catalog_path,
                 format!("worktree {} refers to missing parent {parent}", project.id),
             ));
-        }
-
-        let mut seen = HashSet::from([project.id]);
-        let mut ancestor = *parent;
-        loop {
-            if !seen.insert(ancestor) {
-                return Err(invalid_catalog(
-                    catalog_path,
-                    format!("worktree parent cycle involving project {}", project.id),
-                ));
-            }
-            match &entries[&ancestor].source {
-                ProjectSource::Worktree { parent, .. } => ancestor = *parent,
-                ProjectSource::Local | ProjectSource::ManagedRepository { .. } => break,
-            }
+        };
+        if matches!(parent_entry.source, ProjectSource::Worktree { .. }) {
+            return Err(invalid_catalog(
+                catalog_path,
+                format!(
+                    "worktree {} names worktree {parent} as its parent",
+                    project.id
+                ),
+            ));
         }
     }
     Ok(())

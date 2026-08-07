@@ -250,6 +250,14 @@ impl GitCommand {
         self
     }
 
+    /// Lets a caller whose local work scales with checkout size rely on
+    /// cooperative cancellation instead of the generic local-write timeout.
+    #[must_use]
+    pub(crate) fn without_timeout(mut self) -> Self {
+        self.timeout = None;
+        self
+    }
+
     /// Appends one argument.
     #[must_use]
     pub fn arg(mut self, argument: impl AsRef<OsStr>) -> Self {
@@ -700,5 +708,22 @@ mod tests {
             activity_at_timeout,
             "a helper survived the timeout"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkout_sized_local_work_can_explicitly_rely_on_cancellation() {
+        let fixture = Fixture::new();
+        let working_directory = fixture.directory("unbounded-local-write");
+        let sleeping_git = fixture.shim("brief-local-write", "#!/bin/sh\nsleep 0.05\nexit 0\n");
+
+        let output = GitCommand::new(sleeping_git, working_directory, GitAccess::LocalWrite)
+            .timeout(Duration::from_millis(1))
+            .without_timeout()
+            .arg("worktree")
+            .run(&Cancellation::default())
+            .unwrap();
+
+        assert_eq!(output.code, Some(0));
     }
 }
