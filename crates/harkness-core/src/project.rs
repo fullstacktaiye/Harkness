@@ -689,7 +689,12 @@ fn sort_recents(projects: &mut [Project]) {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path, thread, time::Duration};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        thread,
+        time::Duration,
+    };
 
     use super::{ProjectError, ProjectService};
     use crate::{
@@ -701,12 +706,26 @@ mod tests {
         },
         testing::{
             Fixture, PROCESS_GIT_EXECUTABLE_ENV, PROCESS_PROJECT_ROOT_ENV, PROCESS_READY_FILE_ENV,
-            commit_all, initialize_repository, spawn_child, wait_for_child_signal,
+            SCRUBBED_ENVIRONMENT, commit_all, initialize_repository, spawn_child,
+            wait_for_child_signal,
         },
     };
 
     /// Coarse enough for the ~15ms system clock granularity on Windows.
     const CLOCK_TICK: Duration = Duration::from_millis(25);
+
+    /// A path in the form the catalog records it.
+    ///
+    /// Every root is canonicalized on the way in, and on two of the three
+    /// platforms the tests run on that is not the path the fixture handed out:
+    /// macOS resolves the temporary directory's `/var` symlink to
+    /// `/private/var`, and Windows expands the 8.3 short name `TEMP` usually
+    /// carries and adds the extended-length prefix. Comparing against the
+    /// fixture's own spelling asserts that the temporary directory has a boring
+    /// name, which is not the property under test anywhere it appears.
+    fn as_catalogued(root: &Path) -> PathBuf {
+        fs::canonicalize(root).expect("a fixture root is always canonicalizable")
+    }
 
     #[test]
     fn catalog_round_trip_preserves_project_data() {
@@ -820,7 +839,8 @@ mod tests {
         let reloaded = fixture.service();
         assert_eq!(reloaded.list().len(), WRITERS);
         for root in &roots {
-            assert!(reloaded.list().iter().any(|project| &project.root == root));
+            let stored = as_catalogued(root);
+            assert!(reloaded.list().iter().any(|project| project.root == stored));
         }
     }
 
@@ -849,7 +869,8 @@ mod tests {
         let projects = fixture.service().list();
         assert_eq!(projects.len(), WRITERS);
         for root in roots {
-            assert!(projects.iter().any(|project| project.root == root));
+            let stored = as_catalogued(&root);
+            assert!(projects.iter().any(|project| project.root == stored));
         }
     }
 
@@ -1277,11 +1298,13 @@ mod tests {
         );
         assert_eq!(
             imported.root,
-            fixture
-                .data_dir
-                .join(REPOSITORIES_DIRECTORY)
-                .join(imported.id.to_string())
-                .join(CHECKOUT_DIRECTORY)
+            as_catalogued(
+                &fixture
+                    .data_dir
+                    .join(REPOSITORIES_DIRECTORY)
+                    .join(imported.id.to_string())
+                    .join(CHECKOUT_DIRECTORY)
+            )
         );
     }
 
@@ -1693,26 +1716,38 @@ mod tests {
         let fixture = Fixture::new();
         let working_directory = fixture.directory("scrubbed");
         let elsewhere = fixture.directory("elsewhere");
+        let reported = SCRUBBED_ENVIRONMENT
+            .iter()
+            .copied()
+            .chain([
+                "GIT_TERMINAL_PROMPT",
+                "GIT_OPTIONAL_LOCKS",
+                "LC_ALL",
+                "GIT_EDITOR",
+            ])
+            .collect::<Vec<_>>()
+            .join(" ");
         let reporting_git = fixture.shim(
             "reporting-git",
-            "#!/bin/sh\n\
-             for name in GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
-                 GIT_TERMINAL_PROMPT GIT_OPTIONAL_LOCKS; do\n\
-             \x20 eval \"value=\\${$name-unset}\"\n\
-             \x20 printf '%s=%s\\n' \"$name\" \"$value\"\n\
-             done\n",
+            &format!(
+                "#!/bin/sh\n\
+                 for name in {reported}; do\n\
+                 \x20 eval \"value=\\${{$name-unset}}\"\n\
+                 \x20 printf '%s=%s\\n' \"$name\" \"$value\"\n\
+                 done\n"
+            ),
         );
 
-        let mut child = spawn_child(&fixture.data_dir, "scrubbed-environment")
+        let mut child = spawn_child(&fixture.data_dir, "scrubbed-environment");
+        child
             .env(PROCESS_PROJECT_ROOT_ENV, &working_directory)
-            .env(PROCESS_GIT_EXECUTABLE_ENV, &reporting_git)
-            .env("GIT_DIR", elsewhere.join(".git"))
-            .env("GIT_COMMON_DIR", elsewhere.join(".git"))
-            .env("GIT_WORK_TREE", &elsewhere)
-            .env("GIT_INDEX_FILE", elsewhere.join("index"))
-            .env("GIT_OBJECT_DIRECTORY", elsewhere.join("objects"))
-            .spawn()
-            .unwrap();
+            .env(PROCESS_GIT_EXECUTABLE_ENV, &reporting_git);
+        // Every scrubbed name is exported with a value that would visibly
+        // change what Git did, so the child asserting `unset` asserts something.
+        for name in SCRUBBED_ENVIRONMENT {
+            child.env(name, elsewhere.join(name.to_ascii_lowercase()));
+        }
+        let mut child = child.spawn().unwrap();
 
         assert!(child.wait().unwrap().success());
     }

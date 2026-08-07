@@ -11,8 +11,10 @@ mod testing;
 
 pub use catalog::entry::{GitStatus, Project, ProjectId, ProjectSource, UpstreamStatus};
 pub use git::{
-    Cancellation, CloneCancellation, DetailedStatus, FileChange, GitAccess, GitCommand, GitError,
-    GitOutput, GitService, HeadState, RepositoryLock, StatusEntry,
+    Cancellation, CloneCancellation, DetailedStatus, FetchOptions, FetchOutcome, FileChange,
+    GitAccess, GitCommand, GitError, GitOutput, GitService, HeadState, PendingOperation,
+    PullOptions, PullOutcome, PullStrategy, PushOptions, PushOutcome, RefUpdate, RepositoryLock,
+    StatusEntry,
 };
 pub use listing::{DirEntry, list_directory};
 pub use project::{ProjectError, ProjectService};
