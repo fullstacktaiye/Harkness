@@ -1030,7 +1030,10 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    /// macOS rejects an invalid UTF-8 filename at the filesystem boundary, so
+    /// it cannot exercise the raw-byte path that Unix filesystems such as
+    /// Linux's permit. Raw-byte status parsing remains covered on every Unix.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn non_utf8_paths_reach_git_without_a_string_round_trip() {
         use std::{ffi::OsString, os::unix::ffi::OsStringExt, path::PathBuf};
