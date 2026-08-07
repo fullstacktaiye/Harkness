@@ -46,15 +46,30 @@ pub(crate) fn lock_exclusive(data_dir: &Path) -> Result<File, ProjectError> {
     Ok(lock)
 }
 
-/// Reads the catalog under a shared lock, or `None` if it cannot be read.
+/// Reads the catalog under a shared lock.
 ///
 /// Reads never create the data directory: a catalog that has never been
 /// written has no lock file, and nothing to race with either.
-pub(crate) fn read_catalog_shared(data_dir: &Path) -> Option<Catalog> {
-    let lock = File::options()
-        .read(true)
-        .open(data_dir.join(CATALOG_LOCK_FILE))
-        .ok()?;
-    lock.lock_shared().ok()?;
-    read_catalog(&data_dir.join(CATALOG_FILE)).ok()
+pub(crate) fn read_catalog_shared(data_dir: &Path) -> Result<Catalog, ProjectError> {
+    let lock_path = data_dir.join(CATALOG_LOCK_FILE);
+    let lock = match File::options().read(true).open(&lock_path) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Atomic replacement makes an unlocked read safe when no writer
+            // has created the stable lock inode yet.
+            return read_catalog(&data_dir.join(CATALOG_FILE));
+        }
+        Err(source) => {
+            return Err(ProjectError::CatalogLock {
+                path: lock_path,
+                source,
+            });
+        }
+    };
+    lock.lock_shared()
+        .map_err(|source| ProjectError::CatalogLock {
+            path: lock_path,
+            source,
+        })?;
+    read_catalog(&data_dir.join(CATALOG_FILE))
 }

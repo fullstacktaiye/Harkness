@@ -96,6 +96,10 @@ Kirigami.ApplicationWindow {
             "remote": "",
             "branch": "",
             "managed": false,
+            "worktree": false,
+            "parentId": "",
+            "parentName": "",
+            "createdBranch": "",
             "available": true,
             "isGit": false,
             "dirty": false

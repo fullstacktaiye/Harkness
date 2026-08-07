@@ -13,7 +13,7 @@ use std::{
 #[cfg(unix)]
 use std::ffi::OsString;
 
-use git2::{ErrorCode, Repository};
+use git2::{ErrorCode, Oid, Repository};
 
 use crate::{
     git::{
@@ -28,6 +28,14 @@ use crate::{
 pub(crate) struct GitWorktree {
     pub(crate) root: PathBuf,
     pub(crate) branch: Option<String>,
+    pub(crate) locked: Option<String>,
+    pub(crate) prunable: bool,
+}
+
+/// The revision and branch identity Git actually created.
+pub(crate) struct AddedWorktree {
+    pub(crate) branch: Option<String>,
+    pub(crate) commit: Oid,
 }
 
 /// Adds a worktree after resolving every caller-controlled revision to a
@@ -39,12 +47,13 @@ pub(crate) fn add(
     destination: &Path,
     base: &WorktreeBase,
     cancellation: &Cancellation,
-) -> Result<Option<String>, GitError> {
+) -> Result<AddedWorktree, GitError> {
     let repository = branch::open(root)?;
-    let mut command =
-        GitCommand::new(git_executable, root, GitAccess::LocalWrite).args(["worktree", "add"]);
+    let mut command = GitCommand::new(git_executable, root, GitAccess::LocalWrite)
+        .without_timeout()
+        .args(["worktree", "add"]);
 
-    let recorded_branch = match base {
+    let (recorded_branch, commit) = match base {
         WorktreeBase::NewBranch { name, start_point } => {
             branch::validate_name(name)?;
             branch::require_missing_branch(&repository, name)?;
@@ -53,14 +62,15 @@ pub(crate) fn add(
                 .args(["--no-track", "-b", name, "--"])
                 .arg(destination)
                 .arg(start.to_string());
-            Some(name.clone())
+            (Some(name.clone()), start)
         }
         WorktreeBase::ExistingBranch { name } => {
             branch::validate_name(name)?;
             branch::require_local_branch(&repository, name)?;
             refuse_checked_out(&repository, root, name)?;
+            let commit = resolve_start(&repository, root, Some(name))?;
             command = command.arg("--").arg(destination).arg(name);
-            Some(name.clone())
+            (Some(name.clone()), commit)
         }
         WorktreeBase::Detached { commit } => {
             let commit = resolve_start(&repository, root, Some(commit))?;
@@ -68,12 +78,15 @@ pub(crate) fn add(
                 .args(["--detach", "--"])
                 .arg(destination)
                 .arg(commit.to_string());
-            None
+            (None, commit)
         }
     };
 
     command.run(cancellation)?;
-    Ok(recorded_branch)
+    Ok(AddedWorktree {
+        branch: recorded_branch,
+        commit,
+    })
 }
 
 fn resolve_start(
@@ -127,13 +140,54 @@ fn refuse_checked_out(
 pub(crate) fn remove(
     git_executable: &Path,
     parent: &Path,
+    lock: &RepositoryLock,
+    destination: &Path,
+    force: bool,
+    cancellation: &Cancellation,
+) -> Result<(), GitError> {
+    let listed = list(git_executable, parent, cancellation)?;
+    let worktree = listed
+        .into_iter()
+        .find(|worktree| same_path(&worktree.root, destination));
+    if let Some(reason) = worktree
+        .as_ref()
+        .and_then(|worktree| worktree.locked.clone())
+    {
+        return Err(GitError::WorktreeLocked {
+            path: destination.to_path_buf(),
+            reason: (!reason.is_empty()).then_some(reason),
+        });
+    }
+    // Git and the filesystem may already agree that a checkout is gone while
+    // its Harkness row remains. There is no administrative record or directory
+    // left to mutate in that state.
+    if worktree.is_none() && !destination.exists() {
+        return Ok(());
+    }
+    remove_known_unlocked(
+        git_executable,
+        parent,
+        lock,
+        destination,
+        force,
+        cancellation,
+    )
+}
+
+/// Removes a worktree after the caller has already established that it is not
+/// locked. Used by targeted reconciliation and failed-add cleanup to avoid a
+/// second porcelain listing.
+pub(crate) fn remove_known_unlocked(
+    git_executable: &Path,
+    parent: &Path,
     _lock: &RepositoryLock,
     destination: &Path,
     force: bool,
     cancellation: &Cancellation,
 ) -> Result<(), GitError> {
-    let mut command =
-        GitCommand::new(git_executable, parent, GitAccess::LocalWrite).args(["worktree", "remove"]);
+    let mut command = GitCommand::new(git_executable, parent, GitAccess::LocalWrite)
+        .without_timeout()
+        .args(["worktree", "remove"]);
     if force {
         command = command.arg("--force");
     }
@@ -141,21 +195,9 @@ pub(crate) fn remove(
     Ok(())
 }
 
-/// Drops prunable administrative records without touching any checkout.
-pub(crate) fn prune(
-    git_executable: &Path,
-    parent: &Path,
-    _lock: &RepositoryLock,
-    cancellation: &Cancellation,
-) -> Result<(), GitError> {
-    GitCommand::new(git_executable, parent, GitAccess::LocalWrite)
-        .args(["worktree", "prune"])
-        .run(cancellation)?;
-    Ok(())
-}
-
 /// Runs the mandatory best-effort cleanup sequence after `worktree add` was
-/// attempted: Git removal, filesystem removal, then administrative pruning.
+/// attempted: Git removal, filesystem removal, then a targeted retry for any
+/// administrative record whose checkout disappeared during cleanup.
 pub(crate) fn cleanup_failed_add(
     git_executable: &Path,
     parent: &Path,
@@ -163,7 +205,7 @@ pub(crate) fn cleanup_failed_add(
     destination: &Path,
 ) {
     let cancellation = Cancellation::default();
-    let _ = remove(
+    let _ = remove_known_unlocked(
         git_executable,
         parent,
         lock,
@@ -171,12 +213,15 @@ pub(crate) fn cleanup_failed_add(
         true,
         &cancellation,
     );
-    match fs::remove_dir_all(destination) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => {}
-    }
-    let _ = prune(git_executable, parent, lock, &cancellation);
+    let _ = fs::remove_dir_all(destination);
+    let _ = remove_known_unlocked(
+        git_executable,
+        parent,
+        lock,
+        destination,
+        true,
+        &cancellation,
+    );
 }
 
 /// Lists the main and linked worktrees in Git's stable porcelain format.
@@ -185,6 +230,10 @@ pub(crate) fn list(
     parent: &Path,
     cancellation: &Cancellation,
 ) -> Result<Vec<GitWorktree>, GitError> {
+    // Validate the exact path in-process before spawning Git. Without this,
+    // Git discovers upward from a catalogued subdirectory and reports an
+    // unrelated ancestor repository's worktrees.
+    branch::open(parent)?;
     let output = GitCommand::new(git_executable, parent, GitAccess::LocalRead)
         .args(["worktree", "list", "--porcelain", "-z"])
         .run(cancellation)?;
@@ -195,6 +244,8 @@ fn parse_porcelain(output: &[u8]) -> Result<Vec<GitWorktree>, GitError> {
     let mut listed = Vec::new();
     let mut root = None;
     let mut branch = None;
+    let mut locked = None;
+    let mut prunable = false;
 
     for field in output.split(|byte| *byte == 0) {
         if field.is_empty() {
@@ -202,12 +253,26 @@ fn parse_porcelain(output: &[u8]) -> Result<Vec<GitWorktree>, GitError> {
                 listed.push(GitWorktree {
                     root,
                     branch: branch.take(),
+                    locked: locked.take(),
+                    prunable,
                 });
+                prunable = false;
             }
             continue;
         }
         if let Some(path) = field.strip_prefix(b"worktree ") {
+            if let Some(root) = root.take() {
+                listed.push(GitWorktree {
+                    root,
+                    branch: branch.take(),
+                    locked: locked.take(),
+                    prunable,
+                });
+            }
             root = Some(path_from_git(path)?);
+            branch = None;
+            locked = None;
+            prunable = false;
         } else if let Some(reference) = field.strip_prefix(b"branch refs/heads/") {
             branch = Some(String::from_utf8(reference.to_vec()).map_err(|_| {
                 GitError::MalformedStatus {
@@ -216,10 +281,21 @@ fn parse_porcelain(output: &[u8]) -> Result<Vec<GitWorktree>, GitError> {
             })?);
         } else if field == b"detached" {
             branch = None;
+        } else if field == b"locked" {
+            locked = Some(String::new());
+        } else if let Some(reason) = field.strip_prefix(b"locked ") {
+            locked = Some(String::from_utf8_lossy(reason).into_owned());
+        } else if field == b"prunable" || field.starts_with(b"prunable ") {
+            prunable = true;
         }
     }
     if let Some(root) = root {
-        listed.push(GitWorktree { root, branch });
+        listed.push(GitWorktree {
+            root,
+            branch,
+            locked,
+            prunable,
+        });
     }
     Ok(listed)
 }
@@ -259,15 +335,18 @@ mod tests {
     use super::parse_porcelain;
 
     #[test]
-    fn parses_branch_and_detached_porcelain_rows() {
+    fn parses_branch_detached_locked_and_unseparated_porcelain_rows() {
         let rows = parse_porcelain(
-            b"worktree /tmp/main\0HEAD aaaa\0branch refs/heads/main\0\0\
-              worktree /tmp/detached\0HEAD bbbb\0detached\0\0",
+            b"worktree /tmp/main\0HEAD aaaa\0branch refs/heads/main\0\
+              worktree /tmp/detached\0HEAD bbbb\0detached\0locked portable disk\0\
+              prunable stale\0\0",
         )
         .unwrap();
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].branch.as_deref(), Some("main"));
         assert_eq!(rows[1].branch, None);
+        assert_eq!(rows[1].locked.as_deref(), Some("portable disk"));
+        assert!(rows[1].prunable);
     }
 }

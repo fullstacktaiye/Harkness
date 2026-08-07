@@ -12,7 +12,13 @@ file tree that never descends into `.git` or through directory symlinks. A
 worker-backed branch picker switches existing local branches without blocking
 the UI and identifies branches held by another worktree before selection.
 Managed clones are deleted only after a confirmation naming the checkout;
-local projects are simply forgotten, leaving their files untouched.
+local projects are simply forgotten, leaving their files untouched. Git
+repositories can create, list, reconcile, and remove first-class linked
+workspaces on new branches, existing branches, or detached commits.
+
+Harkness requires Git 2.36 or newer. Worktree discovery uses the unambiguous
+NUL-delimited `git worktree list --porcelain -z` format introduced in that
+release.
 
 ## Fedora development setup
 
@@ -37,9 +43,35 @@ cargo fmt --check
 cargo clippy --workspace --all-targets
 ```
 
-The CLI prints exactly `Hello World`. The GUI opens a Kirigami window on the
-project launcher backed by the Rust `HarknessBackend` and `FileTreeModel` QML
-objects.
+With no arguments the CLI prints exactly `Hello World`. Its worktree commands
+provide a scriptable version of the GUI workflow:
+
+```sh
+harkness project list
+harkness worktree list <parent-id>
+harkness worktree create <parent-id> --new <branch> [--start <revision>]
+harkness worktree create <parent-id> --existing <branch>
+harkness worktree create <parent-id> --detached <revision>
+harkness worktree remove <worktree-id> [--force]
+harkness worktree reconcile <parent-id>
+```
+
+Removing a worktree preserves its branch, allowing `--existing` to reuse it.
+Ordinary removal refuses uncommitted files; `--force` explicitly discards
+them. Reconciliation removes only missing Harkness-owned rows and their exact
+Git administrative records. It never performs a repository-wide prune or
+adopts or removes external worktrees.
+
+The GUI opens a Kirigami window on the project launcher backed by the Rust
+`HarknessBackend` and `FileTreeModel` QML objects. Its project shell exposes the
+same creation modes, live linked-worktree inventory, selective reconciliation,
+and a second confirmation before dirty files can be discarded.
+
+### Worktree UI
+
+![Recents showing a dirty managed worktree](docs/screenshots/worktree-recents.png)
+
+![Project shell showing the linked-workspace creation form](docs/screenshots/worktree-creation.png)
 
 ## Install locally for Plasma
 

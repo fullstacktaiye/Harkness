@@ -380,7 +380,9 @@ dependencies = [
 name = "harkness-cli"
 version = "0.1.0"
 dependencies = [
+ "git2",
  "harkness-core",
+ "tempfile",
 ]
 
 [[package]]
@@ -406,6 +408,7 @@ dependencies = [
  "cxx-qt",
  "cxx-qt-build",
  "cxx-qt-lib",
+ "git2",
  "harkness-core",
  "tempfile",
  "time",

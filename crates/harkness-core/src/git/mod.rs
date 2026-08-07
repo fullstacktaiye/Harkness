@@ -107,6 +107,17 @@ pub enum GitError {
     )]
     BranchCheckedOutInWorktree { branch: String, worktree: PathBuf },
 
+    /// A worktree was explicitly locked against removal by Git.
+    #[error(
+        "worktree at '{}' is locked{}; unlock it before removal",
+        path.display(),
+        reason.as_deref().map(|reason| format!(": {reason}")).unwrap_or_default()
+    )]
+    WorktreeLocked {
+        path: PathBuf,
+        reason: Option<String>,
+    },
+
     /// The branch contains commits not merged into its upstream or HEAD.
     #[error(
         "refusing to delete unmerged branch '{branch}'; explicitly force the deletion to continue"

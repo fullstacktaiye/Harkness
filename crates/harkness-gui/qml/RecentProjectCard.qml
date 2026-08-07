@@ -4,8 +4,7 @@ import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
 
 // One Recents card: identity, path, and live Git state. An unavailable root
-// is dimmed and disabled rather than hidden, so a missing checkout is
-// explained instead of silently absent.
+// stays actionable so the launcher can offer a safe catalog recovery path.
 Controls.AbstractButton {
     id: card
 
@@ -18,7 +17,7 @@ Controls.AbstractButton {
 
     signal activated()
 
-    enabled: card.project.available
+    enabled: true
     hoverEnabled: true
     padding: Kirigami.Units.largeSpacing
     onClicked: card.activated()
@@ -33,7 +32,9 @@ Controls.AbstractButton {
         return project.dirty ? qsTr("%1 — uncommitted changes").arg(branch) : branch;
     }
 
-    Controls.ToolTip.text: project.available ? project.root : qsTr("This directory no longer exists on disk.")
+    Controls.ToolTip.text: project.available
+        ? project.root
+        : qsTr("This directory no longer exists. Click to remove its catalog entry.")
     Controls.ToolTip.visible: hovered
 
     background: Rectangle {
@@ -76,13 +77,15 @@ Controls.AbstractButton {
                 }
 
                 Kirigami.Chip {
-                    Controls.ToolTip.text: qsTr("Parent project: %1").arg(card.project.parent)
+                    Controls.ToolTip.text: qsTr("Parent project: %1").arg(card.project.parentName)
                     Controls.ToolTip.visible: hovered && card.project.worktree
                     checkable: false
                     closable: false
-                    enabled: false
+                    hoverEnabled: true
                     text: card.project.worktree
-                        ? qsTr("Worktree: %1").arg(card.project.worktreeBranch)
+                        ? card.project.branch.length > 0
+                            ? qsTr("Worktree: %1").arg(card.project.branch)
+                            : qsTr("Worktree: detached HEAD")
                         : qsTr("Managed")
                     visible: card.project.managed || card.project.worktree
                 }
