@@ -687,7 +687,7 @@ mod tests {
             GitError::BranchCheckedOutInWorktree {
                 branch,
                 worktree: held
-            } if branch == "held" && held == worktree
+            } if branch == "held" && super::same_path(&held, &worktree)
         ));
 
         // The main worktree is not returned by libgit2's linked-worktree list,
@@ -700,7 +700,7 @@ mod tests {
             GitError::BranchCheckedOutInWorktree {
                 branch,
                 worktree: held
-            } if branch == "main" && held == root
+            } if branch == "main" && super::same_path(&held, &root)
         ));
     }
 
