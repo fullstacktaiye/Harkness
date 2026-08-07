@@ -6,6 +6,7 @@
 //! project catalog — and therefore nothing here can take the catalog lock out
 //! of order.
 
+mod branch;
 pub(crate) mod clone;
 mod lock;
 mod runner;
@@ -20,6 +21,7 @@ use std::{
 
 use thiserror::Error;
 
+pub use branch::{Branch, BranchKind, CreateBranchOptions};
 pub use lock::RepositoryLock;
 pub use runner::{Cancellation, CloneCancellation, GitAccess, GitCommand, GitOutput};
 pub use status::{DetailedStatus, FileChange, HeadState, PendingOperation, StatusEntry};
@@ -68,6 +70,31 @@ pub enum GitError {
     /// The path is not the working directory of a Git repository.
     #[error("'{}' is not a Git repository", path.display())]
     NotARepository { path: PathBuf },
+
+    /// A branch name fails Git's `check-ref-format --branch` rules.
+    #[error("'{name}' is not a valid branch name")]
+    InvalidBranchName { name: String },
+
+    /// The branch is checked out in the working tree being addressed.
+    #[error("refusing to delete '{branch}', the currently checked-out branch")]
+    CurrentBranchDeletion { branch: String },
+
+    /// The branch is the locally recorded default branch of the repository.
+    #[error("refusing to delete '{branch}', the repository's default branch")]
+    DefaultBranchDeletion { branch: String },
+
+    /// Another worktree has the branch checked out.
+    #[error(
+        "refusing to delete '{branch}', which is checked out in the worktree at '{}'",
+        worktree.display()
+    )]
+    BranchCheckedOutInWorktree { branch: String, worktree: PathBuf },
+
+    /// The branch contains commits not merged into its upstream or HEAD.
+    #[error(
+        "refusing to delete unmerged branch '{branch}'; explicitly force the deletion to continue"
+    )]
+    UnmergedBranchDeletion { branch: String },
 
     /// The remote rejected the update because it holds commits this repository
     /// does not have.
@@ -305,6 +332,81 @@ impl GitService {
     /// names rather than for a whole listing.
     pub fn detailed_status(&self, cancellation: &Cancellation) -> Result<DetailedStatus, GitError> {
         status::detailed(&self.git_executable, &self.root, cancellation)
+    }
+
+    /// Lists local branches and optionally the remote-tracking refs already
+    /// present in this repository.
+    ///
+    /// Runs entirely in process and takes no repository lock.
+    pub fn branches(&self, include_remote_tracking: bool) -> Result<Vec<Branch>, GitError> {
+        branch::branches(&self.root, include_remote_tracking)
+    }
+
+    /// Creates a local branch, optionally checking it out in the same call.
+    pub fn create_branch(
+        &self,
+        name: &str,
+        options: &CreateBranchOptions,
+        cancellation: &Cancellation,
+    ) -> Result<(), GitError> {
+        branch::validate_name(name)?;
+        let lock = self.lock(cancellation)?;
+        branch::create(
+            &self.git_executable,
+            &self.root,
+            &lock,
+            name,
+            options,
+            cancellation,
+        )
+    }
+
+    /// Checks out an existing local branch without discarding local changes.
+    pub fn checkout_branch(&self, name: &str, cancellation: &Cancellation) -> Result<(), GitError> {
+        branch::validate_name(name)?;
+        let lock = self.lock(cancellation)?;
+        branch::checkout(&self.git_executable, &self.root, &lock, name, cancellation)
+    }
+
+    /// Deletes a local branch after applying the branch-safety guardrails.
+    ///
+    /// `force` overrides only the unmerged-commit refusal. It cannot delete a
+    /// current, default or other-worktree branch.
+    pub fn delete_branch(
+        &self,
+        name: &str,
+        force: bool,
+        cancellation: &Cancellation,
+    ) -> Result<(), GitError> {
+        branch::validate_name(name)?;
+        let lock = self.lock(cancellation)?;
+        branch::delete(
+            &self.git_executable,
+            &self.root,
+            &lock,
+            name,
+            force,
+            cancellation,
+        )
+    }
+
+    /// Sets a local branch's upstream, or clears it when `upstream` is `None`.
+    pub fn set_upstream(
+        &self,
+        branch: &str,
+        upstream: Option<&str>,
+        cancellation: &Cancellation,
+    ) -> Result<(), GitError> {
+        self::branch::validate_name(branch)?;
+        let lock = self.lock(cancellation)?;
+        self::branch::set_upstream(
+            &self.git_executable,
+            &self.root,
+            &lock,
+            branch,
+            upstream,
+            cancellation,
+        )
     }
 
     /// Updates the remote-tracking refs of one remote.
