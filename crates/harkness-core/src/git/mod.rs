@@ -6,6 +6,7 @@
 //! project catalog — and therefore nothing here can take the catalog lock out
 //! of order.
 
+mod branch;
 pub(crate) mod clone;
 mod lock;
 mod runner;
@@ -18,8 +19,10 @@ use std::{
     time::Duration,
 };
 
+use git2::{ErrorCode, Repository};
 use thiserror::Error;
 
+pub use branch::{Branch, BranchCheckout, BranchKind, BranchListOptions, CreateBranchOptions};
 pub use lock::RepositoryLock;
 pub use runner::{Cancellation, CloneCancellation, GitAccess, GitCommand, GitOutput};
 pub use status::{DetailedStatus, FileChange, HeadState, PendingOperation, StatusEntry};
@@ -29,6 +32,9 @@ pub use sync::{
 };
 
 use crate::catalog::entry::GitStatus;
+
+pub(crate) const DEFAULT_REMOTE: &str = "origin";
+pub(crate) const LOCAL_REMOTE: &str = ".";
 
 /// Failures raised by Git operations.
 #[derive(Debug, Error)]
@@ -69,6 +75,43 @@ pub enum GitError {
     #[error("'{}' is not a Git repository", path.display())]
     NotARepository { path: PathBuf },
 
+    /// A branch name fails Git's `check-ref-format --branch` rules.
+    #[error("'{name}' is not a valid branch name")]
+    InvalidBranchName { name: String },
+
+    /// A branch or remote-tracking ref required by the operation does not exist.
+    #[error("branch '{branch}' does not exist")]
+    NoSuchBranch { branch: String },
+
+    /// Creating or renaming a branch would overwrite an existing local branch.
+    #[error("local branch '{branch}' already exists")]
+    BranchAlreadyExists { branch: String },
+
+    /// A branch creation start point does not resolve to a commit.
+    #[error("'{start_point}' is not a valid branch start point")]
+    InvalidStartPoint { start_point: String },
+
+    /// The branch is checked out in the working tree being addressed.
+    #[error("refusing to delete '{branch}', the currently checked-out branch")]
+    CurrentBranchDeletion { branch: String },
+
+    /// The branch is the locally recorded default branch of the repository.
+    #[error("refusing to delete '{branch}', the repository's default branch")]
+    DefaultBranchDeletion { branch: String },
+
+    /// Another worktree has the branch checked out.
+    #[error(
+        "refusing to delete '{branch}', which is checked out in the worktree at '{}'",
+        worktree.display()
+    )]
+    BranchCheckedOutInWorktree { branch: String, worktree: PathBuf },
+
+    /// The branch contains commits not merged into its upstream or HEAD.
+    #[error(
+        "refusing to delete unmerged branch '{branch}'; explicitly force the deletion to continue"
+    )]
+    UnmergedBranchDeletion { branch: String },
+
     /// The remote rejected the update because it holds commits this repository
     /// does not have.
     #[error("git {command} was rejected: the remote has commits this branch does not: {stderr}")]
@@ -87,13 +130,14 @@ pub enum GitError {
     #[error("branch '{branch}' has no upstream branch configured")]
     NoUpstream { branch: String },
 
-    /// The branch exists but has no commit yet, so there is nothing to publish.
+    /// The branch exists but has no commit yet, so a commit-based operation
+    /// cannot proceed.
     ///
     /// Distinct from [`NoUpstream`]: asking for an upstream would not help, and
     /// Git's own diagnostic for it names a refspec the caller never wrote.
     ///
     /// [`NoUpstream`]: GitError::NoUpstream
-    #[error("branch '{branch}' in '{}' has no commits to push", path.display())]
+    #[error("branch '{branch}' in '{}' has no commits", path.display())]
     UnbornBranch { path: PathBuf, branch: String },
 
     /// The branch tracks `.`, which is Git's name for the repository itself
@@ -307,6 +351,111 @@ impl GitService {
         status::detailed(&self.git_executable, &self.root, cancellation)
     }
 
+    /// Lists local branches and optionally the remote-tracking refs already
+    /// present in this repository.
+    ///
+    /// Runs entirely in process and takes no repository lock. Ahead/behind
+    /// calculation can walk substantial history, so event-loop callers must
+    /// use a worker thread; [`BranchListOptions::calculate_divergence`] can
+    /// disable those walks for a branch picker.
+    pub fn branches(
+        &self,
+        options: &BranchListOptions,
+        cancellation: &Cancellation,
+    ) -> Result<Vec<Branch>, GitError> {
+        branch::branches(&self.root, options, cancellation)
+    }
+
+    /// Creates a local branch, optionally checking it out in the same call.
+    pub fn create_branch(
+        &self,
+        name: &str,
+        options: &CreateBranchOptions,
+        cancellation: &Cancellation,
+    ) -> Result<(), GitError> {
+        branch::validate_name(name)?;
+        let lock = self.lock(cancellation)?;
+        branch::create(
+            &self.git_executable,
+            &self.root,
+            lock,
+            name,
+            options,
+            cancellation,
+        )
+    }
+
+    /// Checks out an existing local branch without discarding local changes.
+    pub fn checkout_branch(&self, name: &str, cancellation: &Cancellation) -> Result<(), GitError> {
+        branch::validate_name(name)?;
+        let lock = self.lock(cancellation)?;
+        branch::checkout(&self.git_executable, &self.root, lock, name, cancellation)
+    }
+
+    /// Deletes a local branch after applying the branch-safety guardrails.
+    ///
+    /// `force` overrides only the unmerged-commit refusal. It cannot delete a
+    /// current, recorded-default or other-worktree branch. The default-branch
+    /// guard is intentionally fail-open when no `refs/remotes/<remote>/HEAD`
+    /// exists: local deletion is reflog-recoverable, and repositories assembled
+    /// without `git clone` ordinarily have no recorded remote HEAD.
+    pub fn delete_branch(
+        &self,
+        name: &str,
+        force: bool,
+        cancellation: &Cancellation,
+    ) -> Result<(), GitError> {
+        branch::validate_name(name)?;
+        let lock = self.lock(cancellation)?;
+        branch::delete(
+            &self.git_executable,
+            &self.root,
+            lock,
+            name,
+            force,
+            cancellation,
+        )
+    }
+
+    /// Sets a local branch's upstream, or clears it when `upstream` is `None`.
+    pub fn set_upstream(
+        &self,
+        branch: &str,
+        upstream: Option<&str>,
+        cancellation: &Cancellation,
+    ) -> Result<(), GitError> {
+        branch::validate_name(branch)?;
+        let lock = self.lock(cancellation)?;
+        branch::set_upstream(
+            &self.git_executable,
+            &self.root,
+            lock,
+            branch,
+            upstream,
+            cancellation,
+        )
+    }
+
+    /// Renames an existing local branch without overwriting another branch.
+    pub fn rename_branch(
+        &self,
+        old_name: &str,
+        new_name: &str,
+        cancellation: &Cancellation,
+    ) -> Result<(), GitError> {
+        branch::validate_name(old_name)?;
+        branch::validate_name(new_name)?;
+        let lock = self.lock(cancellation)?;
+        branch::rename(
+            &self.git_executable,
+            &self.root,
+            lock,
+            old_name,
+            new_name,
+            cancellation,
+        )
+    }
+
     /// Updates the remote-tracking refs of one remote.
     ///
     /// Blocks until Git exits, so a front end with an event loop must call it
@@ -391,6 +540,103 @@ impl GitService {
     /// [`RepositoryLock`] for the ordering it must be acquired in.
     pub fn lock(&self, cancellation: &Cancellation) -> Result<RepositoryLock, GitError> {
         RepositoryLock::acquire(&self.data_dir, &self.root, cancellation)
+    }
+}
+
+/// Chooses a configured remote using the same precedence for every Git verb.
+///
+/// An explicit request wins, then the branch's configured upstream remote,
+/// then `origin`, then a sole configured remote. A named remote is never
+/// silently replaced when its configuration has disappeared.
+pub(crate) fn resolve_remote(
+    repository: &Repository,
+    root: &Path,
+    requested: Option<&str>,
+    upstream_remote: Option<&str>,
+) -> Result<String, GitError> {
+    let configured = repository
+        .remotes()
+        .map_err(|source| inspection(root, source))?;
+    let names = || configured.iter().filter_map(|name| name.ok().flatten());
+    let known =
+        |candidate: &str| candidate == LOCAL_REMOTE || names().any(|name| name == candidate);
+
+    if let Some(requested) = requested {
+        return if known(requested) {
+            Ok(requested.to_owned())
+        } else {
+            Err(GitError::NoRemote {
+                remote: Some(requested.to_owned()),
+            })
+        };
+    }
+    if let Some(upstream_remote) = upstream_remote {
+        return if known(upstream_remote) {
+            Ok(upstream_remote.to_owned())
+        } else {
+            Err(GitError::NoRemote {
+                remote: Some(upstream_remote.to_owned()),
+            })
+        };
+    }
+    if known(DEFAULT_REMOTE) {
+        return Ok(DEFAULT_REMOTE.to_owned());
+    }
+    let mut only = names();
+    match (only.next(), only.next()) {
+        (Some(only), None) => Ok(only.to_owned()),
+        _ => Err(GitError::NoRemote { remote: None }),
+    }
+}
+
+/// Reads the branch named by a locally recorded remote HEAD.
+///
+/// Absence is an ordinary answer for repositories assembled with `git init`,
+/// `git remote add`, and `git fetch`; only clones normally create this ref.
+pub(crate) fn recorded_default_branch(
+    repository: &Repository,
+    root: &Path,
+    remote: &str,
+) -> Result<Option<String>, GitError> {
+    let head = match repository.find_reference(&format!("refs/remotes/{remote}/HEAD")) {
+        Ok(head) => head,
+        Err(error) if error.code() == ErrorCode::NotFound => return Ok(None),
+        Err(source) => return Err(inspection(root, source)),
+    };
+    let prefix = format!("refs/remotes/{remote}/");
+    Ok(head
+        .symbolic_target()
+        .map_err(|source| inspection(root, source))?
+        .and_then(|target| target.strip_prefix(&prefix))
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_owned))
+}
+
+/// Reads the branch name from a symbolic HEAD, including an unborn HEAD.
+pub(crate) fn head_branch(repository: &Repository, root: &Path) -> Result<String, GitError> {
+    repository
+        .find_reference("HEAD")
+        .and_then(|head| {
+            head.symbolic_target()
+                .map(|target| target.map(str::to_owned))
+        })
+        .map_err(|source| inspection(root, source))?
+        .and_then(|target| {
+            target
+                .strip_prefix("refs/heads/")
+                .filter(|branch| !branch.is_empty())
+                .map(str::to_owned)
+        })
+        .ok_or_else(|| GitError::DetachedHead {
+            path: root.to_path_buf(),
+            detail: "HEAD names no branch".to_owned(),
+        })
+}
+
+fn inspection(path: &Path, source: git2::Error) -> GitError {
+    GitError::Inspection {
+        path: path.to_path_buf(),
+        source,
     }
 }
 
