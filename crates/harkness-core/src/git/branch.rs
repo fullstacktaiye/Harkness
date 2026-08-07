@@ -430,7 +430,7 @@ pub(crate) fn rename(
     Ok(())
 }
 
-fn require_local_branch<'repo>(
+pub(super) fn require_local_branch<'repo>(
     repository: &'repo Repository,
     name: &str,
 ) -> Result<git2::Branch<'repo>, GitError> {
@@ -446,7 +446,7 @@ fn require_local_branch<'repo>(
     }
 }
 
-fn require_missing_branch(repository: &Repository, name: &str) -> Result<(), GitError> {
+pub(super) fn require_missing_branch(repository: &Repository, name: &str) -> Result<(), GitError> {
     match repository.find_branch(name, BranchType::Local) {
         Ok(_) => Err(GitError::BranchAlreadyExists {
             branch: name.to_owned(),
@@ -488,7 +488,7 @@ fn require_upstream_branch(repository: &Repository, name: &str) -> Result<(), Gi
     }
 }
 
-fn head_names(repository: &Repository, full_name: &str) -> Result<bool, GitError> {
+pub(super) fn head_names(repository: &Repository, full_name: &str) -> Result<bool, GitError> {
     match repository.head() {
         // Repository::head resolves symbolic HEAD to the branch reference, so
         // its own full name is the checked-out branch name.
@@ -541,7 +541,7 @@ fn local_default_branch(
     recorded_default_branch(repository, root, &remote)
 }
 
-fn other_worktree(
+pub(super) fn other_worktree(
     repository: &Repository,
     root: &Path,
     full_name: &str,
@@ -665,7 +665,7 @@ fn has_unmerged_commits(
         .map_err(|source| inspection(root, source))
 }
 
-fn open(root: &Path) -> Result<Repository, GitError> {
+pub(super) fn open(root: &Path) -> Result<Repository, GitError> {
     match Repository::open(root) {
         Ok(repository) if repository.workdir().is_some() => Ok(repository),
         Ok(_) => Err(GitError::NotARepository {

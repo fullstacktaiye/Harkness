@@ -76,15 +76,11 @@ Controls.AbstractButton {
                 }
 
                 Kirigami.Chip {
-                    Controls.ToolTip.text: qsTr("Parent project: %1").arg(card.project.parent)
-                    Controls.ToolTip.visible: hovered && card.project.worktree
                     checkable: false
                     closable: false
                     enabled: false
-                    text: card.project.worktree
-                        ? qsTr("Worktree: %1").arg(card.project.worktreeBranch)
-                        : qsTr("Managed")
-                    visible: card.project.managed || card.project.worktree
+                    text: qsTr("Managed")
+                    visible: card.project.managed
                 }
 
                 Kirigami.Icon {

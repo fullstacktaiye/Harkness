@@ -12,6 +12,7 @@ mod lock;
 mod runner;
 pub(crate) mod status;
 mod sync;
+pub(crate) mod worktree;
 
 use std::{
     io,

@@ -4,7 +4,7 @@ pub(crate) mod entry;
 pub(crate) mod lock;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs,
     io::{self, Write},
     path::Path,
@@ -117,7 +117,10 @@ fn validate_catalog(catalog_path: &Path, catalog: &Catalog) -> Result<(), Projec
             ProjectSource::ManagedRepository { .. } => {}
             ProjectSource::Worktree {
                 worktree_branch, ..
-            } if worktree_branch.trim().is_empty() => {
+            } if worktree_branch
+                .as_deref()
+                .is_some_and(|branch| branch.trim().is_empty()) =>
+            {
                 return Err(invalid_catalog(
                     catalog_path,
                     format!("worktree {} has an empty branch", project.id),
@@ -131,26 +134,20 @@ fn validate_catalog(catalog_path: &Path, catalog: &Catalog) -> Result<(), Projec
         let ProjectSource::Worktree { parent, .. } = &project.source else {
             continue;
         };
-        if !entries.contains_key(parent) {
+        let Some(parent_entry) = entries.get(parent) else {
             return Err(invalid_catalog(
                 catalog_path,
                 format!("worktree {} refers to missing parent {parent}", project.id),
             ));
-        }
-
-        let mut seen = HashSet::from([project.id]);
-        let mut ancestor = *parent;
-        loop {
-            if !seen.insert(ancestor) {
-                return Err(invalid_catalog(
-                    catalog_path,
-                    format!("worktree parent cycle involving project {}", project.id),
-                ));
-            }
-            match &entries[&ancestor].source {
-                ProjectSource::Worktree { parent, .. } => ancestor = *parent,
-                ProjectSource::Local | ProjectSource::ManagedRepository { .. } => break,
-            }
+        };
+        if matches!(parent_entry.source, ProjectSource::Worktree { .. }) {
+            return Err(invalid_catalog(
+                catalog_path,
+                format!(
+                    "worktree {} names worktree {parent} as its parent",
+                    project.id
+                ),
+            ));
         }
     }
     Ok(())

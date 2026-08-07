@@ -83,14 +83,6 @@ Kirigami.ApplicationWindow {
         removeManagedDialog.open();
     }
 
-    /// Asks before deleting a managed worktree. Git refuses a dirty worktree,
-    /// and successful removal also cleans the parent's administrative record.
-    function confirmRemoveWorktree(projectId, projectName, projectPath, branch) {
-        removeWorktreeDialog.projectId = projectId;
-        removeWorktreeDialog.subtitle = qsTr("This removes the worktree “%1” for branch “%2” at:\n%3\n\nUncommitted files prevent removal.").arg(projectName).arg(branch).arg(projectPath);
-        removeWorktreeDialog.open();
-    }
-
     FolderDialog {
         id: folderDialog
         title: qsTr("Choose a project folder")
@@ -115,16 +107,6 @@ Kirigami.ApplicationWindow {
         standardButtons: Kirigami.Dialog.Ok | Kirigami.Dialog.Cancel
         title: qsTr("Delete managed clone?")
         onAccepted: appBackend.removeManaged(projectId)
-    }
-
-    Kirigami.PromptDialog {
-        id: removeWorktreeDialog
-
-        property string projectId: ""
-
-        standardButtons: Kirigami.Dialog.Ok | Kirigami.Dialog.Cancel
-        title: qsTr("Remove managed worktree?")
-        onAccepted: appBackend.removeWorktree(projectId)
     }
 
     Shortcut {

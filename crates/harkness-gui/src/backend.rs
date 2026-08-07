@@ -81,10 +81,6 @@ pub mod ffi {
         #[qinvokable]
         #[cxx_name = "removeManaged"]
         fn remove_managed(self: Pin<&mut HarknessBackend>, project_id: &QString);
-
-        #[qinvokable]
-        #[cxx_name = "removeWorktree"]
-        fn remove_worktree(self: Pin<&mut HarknessBackend>, project_id: &QString);
     }
 
     impl cxx_qt::Threading for HarknessBackend {}
@@ -157,9 +153,6 @@ struct ProjectRow {
     remote: String,
     branch: String,
     managed: bool,
-    worktree: bool,
-    parent: String,
-    worktree_branch: String,
     available: bool,
     is_git: bool,
     dirty: bool,
@@ -167,23 +160,11 @@ struct ProjectRow {
 
 impl From<harkness_core::Project> for ProjectRow {
     fn from(project: harkness_core::Project) -> Self {
-        let (remote, managed, worktree, parent, worktree_branch) = match &project.source {
-            harkness_core::ProjectSource::Local => {
-                (String::new(), false, false, String::new(), String::new())
+        let (remote, managed) = match &project.source {
+            harkness_core::ProjectSource::Local | harkness_core::ProjectSource::Worktree { .. } => {
+                (String::new(), false)
             }
-            harkness_core::ProjectSource::ManagedRepository { remote } => {
-                (remote.clone(), true, false, String::new(), String::new())
-            }
-            harkness_core::ProjectSource::Worktree {
-                parent,
-                worktree_branch,
-            } => (
-                String::new(),
-                false,
-                true,
-                parent.to_string(),
-                worktree_branch.clone(),
-            ),
+            harkness_core::ProjectSource::ManagedRepository { remote } => (remote.clone(), true),
         };
         Self {
             id: project.id.to_string(),
@@ -198,9 +179,6 @@ impl From<harkness_core::Project> for ProjectRow {
                 .and_then(|git| git.branch.clone())
                 .unwrap_or_default(),
             managed,
-            worktree,
-            parent,
-            worktree_branch,
             available: project.available,
             is_git: project.git.is_some(),
             dirty: project.git.is_some_and(|git| git.dirty),
@@ -234,15 +212,6 @@ fn to_map(row: &ProjectRow) -> QVariant {
         QVariant::from(&QString::from(row.branch.as_str())),
     );
     insert("managed", QVariant::from(&row.managed));
-    insert("worktree", QVariant::from(&row.worktree));
-    insert(
-        "parent",
-        QVariant::from(&QString::from(row.parent.as_str())),
-    );
-    insert(
-        "worktreeBranch",
-        QVariant::from(&QString::from(row.worktree_branch.as_str())),
-    );
     insert("available", QVariant::from(&row.available));
     insert("isGit", QVariant::from(&row.is_git));
     insert("dirty", QVariant::from(&row.dirty));
@@ -588,34 +557,6 @@ impl ffi::HarknessBackend {
             });
         });
     }
-
-    /// Git checks worktree cleanliness and removes its administrative record,
-    /// so this runs off the GUI thread just like managed-repository removal.
-    fn remove_worktree(mut self: Pin<&mut Self>, project_id: &QString) {
-        if *self.as_ref().busy() {
-            return;
-        }
-        let project_id = project_id.to_string();
-        self.as_mut().set_busy(true);
-        self.as_mut().set_status("Removing worktree…".into());
-        let qt_thread = self.qt_thread();
-        std::thread::spawn(move || {
-            let result = (|| {
-                let id = project_id
-                    .parse()
-                    .map_err(|_| "invalid worktree project identifier".to_owned())?;
-                let mut service =
-                    harkness_core::ProjectService::load().map_err(|error| error.to_string())?;
-                service
-                    .remove_worktree(id)
-                    .map_err(|error| error.to_string())
-            })();
-            let _ = qt_thread.queue(move |mut backend| {
-                backend.as_mut().set_busy(false);
-                apply_result(backend.as_mut(), result, "Removed", false);
-            });
-        });
-    }
 }
 
 #[cfg(test)]
@@ -679,9 +620,6 @@ mod tests {
             "remote",
             "branch",
             "managed",
-            "worktree",
-            "parent",
-            "worktreeBranch",
             "available",
             "isGit",
             "dirty",
@@ -762,41 +700,6 @@ mod tests {
             map.get(&QString::from("selectable"))
                 .and_then(|value| value.value::<bool>()),
             Some(false)
-        );
-    }
-
-    #[test]
-    fn worktree_row_exposes_parent_and_recorded_branch_without_looking_local() {
-        let parent = harkness_core::ProjectId::new();
-        let row = ProjectRow::from(project(
-            harkness_core::ProjectSource::Worktree {
-                parent,
-                worktree_branch: "agent/catalog-v2".to_owned(),
-            },
-            None,
-        ));
-
-        assert!(row.worktree);
-        assert!(!row.managed);
-        assert_eq!(row.parent, parent.to_string());
-        assert_eq!(row.worktree_branch, "agent/catalog-v2");
-        let map = row_map(&row);
-        assert_eq!(
-            map.get(&QString::from("worktree"))
-                .and_then(|value| value.value::<bool>()),
-            Some(true)
-        );
-        assert_eq!(
-            map.get(&QString::from("parent"))
-                .and_then(|value| value.value::<QString>())
-                .map(|value| value.to_string()),
-            Some(parent.to_string())
-        );
-        assert_eq!(
-            map.get(&QString::from("worktreeBranch"))
-                .and_then(|value| value.value::<QString>())
-                .map(|value| value.to_string()),
-            Some("agent/catalog-v2".to_owned())
         );
     }
 

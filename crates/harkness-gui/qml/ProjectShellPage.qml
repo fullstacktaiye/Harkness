@@ -41,15 +41,9 @@ Kirigami.Page {
         Kirigami.Action {
             icon.name: "delete"
             text: qsTr("Remove from Harkness…")
-            tooltip: shell.project.worktree
-                ? qsTr("Remove this managed worktree through Git")
-                : shell.project.managed
-                    ? qsTr("Delete this managed checkout")
-                    : qsTr("Forget this project; files stay untouched")
+            tooltip: shell.project.managed ? qsTr("Delete this managed checkout") : qsTr("Forget this project; files stay untouched")
             onTriggered: {
-                if (shell.project.worktree)
-                    applicationWindow().confirmRemoveWorktree(shell.project.id, shell.project.displayName, shell.project.root, shell.project.worktreeBranch);
-                else if (shell.project.managed)
+                if (shell.project.managed)
                     applicationWindow().confirmRemoveManaged(shell.project.id, shell.project.displayName, shell.project.root);
                 else
                     applicationWindow().confirmRemoveLocal(shell.project.id, shell.project.displayName);
@@ -156,16 +150,10 @@ Kirigami.Page {
                     }
 
                     Kirigami.Chip {
-                        Controls.ToolTip.text: qsTr("Parent project: %1").arg(shell.project.parent)
-                        Controls.ToolTip.visible: hovered && shell.project.worktree
                         checkable: false
                         closable: false
                         enabled: false
-                        text: shell.project.worktree
-                            ? qsTr("Worktree: %1").arg(shell.project.worktreeBranch)
-                            : shell.project.managed
-                                ? qsTr("Managed clone")
-                                : qsTr("Local folder")
+                        text: shell.project.managed ? qsTr("Managed clone") : qsTr("Local folder")
                     }
 
                     Kirigami.Chip {

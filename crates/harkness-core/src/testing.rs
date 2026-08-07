@@ -17,8 +17,8 @@ use git2::{IndexAddOption, Repository, Signature, Time};
 use tempfile::TempDir;
 
 use crate::{
-    git::{Cancellation, GitAccess, GitCommand, GitService},
-    project::ProjectService,
+    git::{Cancellation, GitAccess, GitCommand, GitError, GitService},
+    project::{ProjectError, ProjectService, WorktreeBase},
 };
 
 /// Fixed so repository fixtures hash identically between runs.
@@ -30,6 +30,8 @@ pub(crate) const PROCESS_DATA_DIR_ENV: &str = "HARKNESS_CATALOG_TEST_DATA_DIR";
 pub(crate) const PROCESS_PROJECT_ROOT_ENV: &str = "HARKNESS_CATALOG_TEST_PROJECT_ROOT";
 pub(crate) const PROCESS_READY_FILE_ENV: &str = "HARKNESS_CATALOG_TEST_READY_FILE";
 pub(crate) const PROCESS_GIT_EXECUTABLE_ENV: &str = "HARKNESS_CATALOG_TEST_GIT_EXECUTABLE";
+pub(crate) const PROCESS_PROJECT_ID_ENV: &str = "HARKNESS_CATALOG_TEST_PROJECT_ID";
+pub(crate) const PROCESS_BRANCH_ENV: &str = "HARKNESS_CATALOG_TEST_BRANCH";
 
 /// The inherited variables the runner must remove before it spawns Git.
 ///
@@ -92,6 +94,24 @@ fn process_child() {
                 .unwrap();
             signal_ready();
             park();
+        }
+        "create-worktree" => {
+            let parent = std::env::var(PROCESS_PROJECT_ID_ENV)
+                .expect("child parent id was not set")
+                .parse()
+                .expect("child parent id was invalid");
+            let name = std::env::var(PROCESS_BRANCH_ENV).expect("child branch was not set");
+            match service.create_worktree(
+                parent,
+                &WorktreeBase::NewBranch {
+                    name,
+                    start_point: None,
+                },
+                &Cancellation::default(),
+            ) {
+                Ok(_) | Err(ProjectError::Git(GitError::RepositoryBusy { .. })) => {}
+                Err(error) => panic!("unexpected concurrent worktree result: {error}"),
+            }
         }
         "scrubbed-environment" => {
             // Set on this process by its parent, so a shim that still sees
