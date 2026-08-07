@@ -2786,9 +2786,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(removed[0].id, managed.id);
-        let porcelain = git(&parent_root, ["worktree", "list", "--porcelain"]);
-        assert!(porcelain.contains(&external.display().to_string()));
-        assert!(porcelain.contains("locked temporarily unmounted"));
+        let listed =
+            crate::git::worktree::list(Path::new("git"), &parent_root, &Cancellation::default())
+                .unwrap();
+        let external = listed
+            .iter()
+            .find(|worktree| crate::git::worktree::same_path(&worktree.root, &external))
+            .expect("reconciliation must leave an external worktree registered");
+        assert_eq!(external.locked.as_deref(), Some("temporarily unmounted"));
     }
 
     #[test]
@@ -2828,9 +2833,13 @@ mod tests {
             error,
             ProjectError::UnsafeWorktreeRemoval { id: refused, .. } if refused == id
         ));
+        let listed =
+            crate::git::worktree::list(Path::new("git"), &parent_root, &Cancellation::default())
+                .unwrap();
         assert!(
-            git(&parent_root, ["worktree", "list", "--porcelain"])
-                .contains(&outside.display().to_string())
+            listed
+                .iter()
+                .any(|worktree| crate::git::worktree::same_path(&worktree.root, &outside))
         );
         assert!(
             service
