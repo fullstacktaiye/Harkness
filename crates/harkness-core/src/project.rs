@@ -1634,10 +1634,13 @@ mod tests {
         initialize_repository(&parent_root);
         let mut service = fixture.service();
         let parent = service.import_local(&parent_root).unwrap();
-        let worktree = catalogue_git_worktree(&mut service, &parent, "agent/remove-clean-worktree");
+        let branch = "agent/remove-clean-worktree";
+        let worktree = catalogue_git_worktree(&mut service, &parent, branch);
+        let branch_record = format!("branch refs/heads/{branch}");
         assert!(
             git(&parent.root, ["worktree", "list", "--porcelain"])
-                .contains(&worktree.root.display().to_string())
+                .lines()
+                .any(|line| line == branch_record)
         );
 
         let removed = service.remove_worktree(worktree.id).unwrap();
@@ -1646,7 +1649,8 @@ mod tests {
         assert!(!worktree.root.exists());
         assert!(
             !git(&parent.root, ["worktree", "list", "--porcelain"])
-                .contains(&worktree.root.display().to_string())
+                .lines()
+                .any(|line| line == branch_record)
         );
         let remaining = service.list_catalog_only();
         assert_eq!(remaining.len(), 1);
