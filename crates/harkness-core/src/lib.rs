@@ -12,9 +12,10 @@ mod testing;
 pub use catalog::entry::{GitStatus, Project, ProjectId, ProjectSource, UpstreamStatus};
 pub use git::{
     Branch, BranchCheckout, BranchKind, BranchListOptions, Cancellation, CloneCancellation,
-    CreateBranchOptions, DetailedStatus, FetchOptions, FetchOutcome, FileChange, GitAccess,
-    GitCommand, GitError, GitOutput, GitService, HeadState, PendingOperation, PullOptions,
-    PullOutcome, PullStrategy, PushOptions, PushOutcome, RefUpdate, RepositoryLock, StatusEntry,
+    CommitOptions, CommitOutcome, CreateBranchOptions, DetailedStatus, FetchOptions, FetchOutcome,
+    FileChange, GitAccess, GitCommand, GitError, GitOutput, GitService, HeadState,
+    PendingOperation, PullOptions, PullOutcome, PullStrategy, PushOptions, PushOutcome, RefUpdate,
+    RepositoryLock, StatusEntry,
 };
 pub use listing::{DirEntry, list_directory};
 pub use project::{ProjectError, ProjectService, Worktree, WorktreeBase};

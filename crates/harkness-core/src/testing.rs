@@ -113,6 +113,20 @@ fn process_child() {
                 Err(error) => panic!("unexpected concurrent worktree result: {error}"),
             }
         }
+        "commit-with-isolated-config" => {
+            let root = child_project_root();
+            initialize_repository(&root);
+            fs::write(root.join("tracked.txt"), "committed through system Git\n").unwrap();
+            let git = GitService::new(&root, &data_dir);
+            git.stage(["tracked.txt"], &Cancellation::default())
+                .unwrap();
+            git.commit(
+                "isolated fixture commit",
+                &crate::git::CommitOptions::default(),
+                &Cancellation::default(),
+            )
+            .unwrap();
+        }
         "scrubbed-environment" => {
             // Set on this process by its parent, so a shim that still sees
             // them can only have inherited them through the runner.
@@ -219,9 +233,24 @@ pub(crate) fn wait_for_file(signal: &Path) {
 pub(crate) fn initialize_repository(path: &Path) -> Repository {
     let repository = Repository::init(path).unwrap();
     repository.set_head("refs/heads/main").unwrap();
+    configure_commit_identity(&repository);
     fs::write(path.join("tracked.txt"), "initial\n").unwrap();
     commit_all(&repository, "initial");
     repository
+}
+
+/// Gives system Git a hermetic identity for fixture commits.
+///
+/// Existing fixtures create commits through libgit2 and never consult Git
+/// configuration. The commit service shells out, so its fixtures must not
+/// depend on a developer's global identity or signing policy.
+pub(crate) fn configure_commit_identity(repository: &Repository) {
+    let mut config = repository.config().unwrap();
+    config.set_str("user.name", "Harkness Tests").unwrap();
+    config
+        .set_str("user.email", "tests@harkness.invalid")
+        .unwrap();
+    config.set_bool("commit.gpgsign", false).unwrap();
 }
 
 /// Creates a bare repository whose HEAD names `main` before it exists.

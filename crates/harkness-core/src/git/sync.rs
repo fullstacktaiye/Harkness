@@ -2242,6 +2242,7 @@ mod tests {
     fn identify(clone: &Path) {
         git(clone, ["config", "user.name", "Harkness Tests"]);
         git(clone, ["config", "user.email", "tests@harkness.invalid"]);
+        git(clone, ["config", "commit.gpgsign", "false"]);
     }
 
     /// Commits a file in the bare remote, through a throwaway clone of it.

@@ -8,6 +8,7 @@
 
 mod branch;
 pub(crate) mod clone;
+mod commit;
 mod lock;
 mod runner;
 pub(crate) mod status;
@@ -24,6 +25,7 @@ use git2::{ErrorCode, Repository};
 use thiserror::Error;
 
 pub use branch::{Branch, BranchCheckout, BranchKind, BranchListOptions, CreateBranchOptions};
+pub use commit::{CommitOptions, CommitOutcome};
 pub use lock::RepositoryLock;
 pub use runner::{Cancellation, CloneCancellation, GitAccess, GitCommand, GitOutput};
 pub use status::{DetailedStatus, FileChange, HeadState, PendingOperation, StatusEntry};
@@ -75,6 +77,26 @@ pub enum GitError {
     /// The path is not the working directory of a Git repository.
     #[error("'{}' is not a Git repository", path.display())]
     NotARepository { path: PathBuf },
+
+    /// An explicit path resolves beyond the repository working tree.
+    #[error(
+        "path '{}' resolves outside the repository at '{}'",
+        path.display(),
+        repository.display()
+    )]
+    PathOutsideRepository { path: PathBuf, repository: PathBuf },
+
+    /// A commit message must contain something other than whitespace.
+    #[error("refusing to create a commit with an empty message")]
+    EmptyCommitMessage,
+
+    /// The index has no changes to commit.
+    #[error("nothing is staged; set CommitOptions::allow_empty to create an empty commit")]
+    NothingStaged,
+
+    /// There is no existing commit for an amend operation to replace.
+    #[error("cannot amend because the checked-out branch has no commits")]
+    AmendUnbornBranch,
 
     /// A branch name fails Git's `check-ref-format --branch` rules.
     #[error("'{name}' is not a valid branch name")]
@@ -361,6 +383,91 @@ impl GitService {
     /// names rather than for a whole listing.
     pub fn detailed_status(&self, cancellation: &Cancellation) -> Result<DetailedStatus, GitError> {
         status::detailed(&self.git_executable, &self.root, cancellation)
+    }
+
+    /// Stages every change to each explicit path.
+    ///
+    /// Every path is resolved and checked against the working tree before Git
+    /// is spawned. The path arguments retain their platform-native encoding
+    /// and follow a `--` separator, so neither a non-UTF-8 name nor a name that
+    /// resembles an option is reinterpreted.
+    pub fn stage<I, P>(
+        &self,
+        paths: I,
+        cancellation: &Cancellation,
+    ) -> Result<DetailedStatus, GitError>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let paths = paths
+            .into_iter()
+            .map(|path| path.as_ref().to_path_buf())
+            .collect::<Vec<_>>();
+        let lock = self.lock(cancellation)?;
+        commit::stage(
+            &self.git_executable,
+            &self.root,
+            &lock,
+            &paths,
+            cancellation,
+        )
+    }
+
+    /// Stages every change in the working tree, including deletions.
+    pub fn stage_all(&self, cancellation: &Cancellation) -> Result<DetailedStatus, GitError> {
+        let lock = self.lock(cancellation)?;
+        commit::stage_all(&self.git_executable, &self.root, &lock, cancellation)
+    }
+
+    /// Removes each explicit path from the staged snapshot without changing
+    /// the working tree.
+    ///
+    /// On an unborn branch this uses `git rm --cached`, because there is no
+    /// `HEAD` tree for `git restore --staged` to restore.
+    pub fn unstage<I, P>(
+        &self,
+        paths: I,
+        cancellation: &Cancellation,
+    ) -> Result<DetailedStatus, GitError>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let paths = paths
+            .into_iter()
+            .map(|path| path.as_ref().to_path_buf())
+            .collect::<Vec<_>>();
+        let lock = self.lock(cancellation)?;
+        commit::unstage(
+            &self.git_executable,
+            &self.root,
+            &lock,
+            &paths,
+            cancellation,
+        )
+    }
+
+    /// Creates a commit from the staged snapshot.
+    ///
+    /// Empty messages, an unchanged index, and amending an unborn branch are
+    /// refused in process before Git is spawned. [`CommitOptions`] provides
+    /// the explicit overrides for amending and intentionally empty commits.
+    pub fn commit(
+        &self,
+        message: &str,
+        options: &CommitOptions,
+        cancellation: &Cancellation,
+    ) -> Result<CommitOutcome, GitError> {
+        let lock = self.lock(cancellation)?;
+        commit::commit(
+            &self.git_executable,
+            &self.root,
+            &lock,
+            message,
+            options,
+            cancellation,
+        )
     }
 
     /// Lists local branches and optionally the remote-tracking refs already
