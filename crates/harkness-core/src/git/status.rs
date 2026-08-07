@@ -139,6 +139,8 @@ pub struct DetailedStatus {
     pub head: HeadState,
     /// The tracked branch and the divergence from it, when one is configured.
     pub upstream: Option<UpstreamStatus>,
+    /// A multi-step Git operation waiting to be completed or aborted.
+    pub pending: Option<PendingOperation>,
     /// Every changed, untracked or conflicted path.
     pub entries: Vec<StatusEntry>,
 }
@@ -235,6 +237,7 @@ pub(crate) fn detailed(
     root: &Path,
     cancellation: &Cancellation,
 ) -> Result<DetailedStatus, GitError> {
+    let repository = Repository::open(root).map_err(|source| inspection(root, source))?;
     let output = GitCommand::new(git_executable, root, GitAccess::LocalRead)
         .args([
             "status",
@@ -247,7 +250,9 @@ pub(crate) fn detailed(
             "--ignored=no",
         ])
         .run(cancellation)?;
-    parse_porcelain_v2(&output.stdout)
+    let mut status = parse_porcelain_v2(&output.stdout)?;
+    status.pending = pending(&repository);
+    Ok(status)
 }
 
 /// Counts as a difference between the index and HEAD.
@@ -400,6 +405,7 @@ fn parse_porcelain_v2(output: &[u8]) -> Result<DetailedStatus, GitError> {
     Ok(DetailedStatus {
         head,
         upstream,
+        pending: None,
         entries,
     })
 }

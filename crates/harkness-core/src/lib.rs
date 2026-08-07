@@ -15,7 +15,8 @@ pub use git::{
     CommitOptions, CommitOutcome, CreateBranchOptions, DetailedStatus, FetchOptions, FetchOutcome,
     FileChange, GitAccess, GitCommand, GitError, GitOutput, GitService, HeadState,
     PendingOperation, PullOptions, PullOutcome, PullStrategy, PushOptions, PushOutcome, RefUpdate,
-    RepositoryLock, StatusEntry,
+    RepositoryLock, StageOptions, StageOutcome, StagePathOutcome, StagePathResult, StatusEntry,
+    StatusRefreshOutcome,
 };
 pub use listing::{DirEntry, list_directory};
 pub use project::{ProjectError, ProjectService, Worktree, WorktreeBase};

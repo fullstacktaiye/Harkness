@@ -21,23 +21,160 @@ use crate::git::{
 };
 
 /// What one commit should do.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct CommitOptions {
     /// Replace the current commit instead of creating a child commit.
     pub amend: bool,
     /// Permit a commit whose tree is identical to its parent.
     pub allow_empty: bool,
+    /// Refresh the full repository status after the commit.
+    ///
+    /// Disable this when the caller will refresh separately. The default is
+    /// `true` for callers that want one self-contained operation.
+    pub refresh_status: bool,
+}
+
+impl Default for CommitOptions {
+    fn default() -> Self {
+        Self {
+            amend: false,
+            allow_empty: false,
+            refresh_status: true,
+        }
+    }
+}
+
+impl CommitOptions {
+    /// Sets whether the current commit should be replaced.
+    #[must_use]
+    pub fn with_amend(mut self, amend: bool) -> Self {
+        self.amend = amend;
+        self
+    }
+
+    /// Sets whether an unchanged tree may be committed.
+    #[must_use]
+    pub fn with_allow_empty(mut self, allow_empty: bool) -> Self {
+        self.allow_empty = allow_empty;
+        self
+    }
+
+    /// Sets whether the commit should end with a full status refresh.
+    #[must_use]
+    pub fn with_status_refresh(mut self, refresh_status: bool) -> Self {
+        self.refresh_status = refresh_status;
+        self
+    }
+}
+
+/// What path staging and unstaging should do after updating the index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StageOptions {
+    /// Refresh the full repository status after all requested paths have run.
+    ///
+    /// Disable this when a caller is applying several user actions before one
+    /// explicit [`crate::git::GitService::detailed_status`] call.
+    pub refresh_status: bool,
+}
+
+impl Default for StageOptions {
+    fn default() -> Self {
+        Self {
+            refresh_status: true,
+        }
+    }
+}
+
+/// What happened when Git was asked to update one explicit path.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum StagePathResult {
+    /// Git accepted and completed the requested index update.
+    Succeeded,
+    /// Git rejected or could not complete this path's index update.
+    Failed(GitError),
+    /// A non-path-local failure stopped the operation before this path ran.
+    NotAttempted,
+}
+
+/// The result of staging or unstaging one requested path.
+#[derive(Debug)]
+pub struct StagePathOutcome {
+    /// The path exactly as supplied by the caller.
+    pub path: PathBuf,
+    /// Whether Git updated this path, rejected it, or never attempted it.
+    pub result: StagePathResult,
+}
+
+impl StagePathOutcome {
+    /// Whether Git completed the requested update for this path.
+    #[must_use]
+    pub fn succeeded(&self) -> bool {
+        matches!(self.result, StagePathResult::Succeeded)
+    }
+}
+
+/// The result of an optional full-repository status refresh.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum StatusRefreshOutcome {
+    /// The caller opted out of the refresh.
+    Skipped,
+    /// The refresh completed and returned the repository's current state.
+    Refreshed(DetailedStatus),
+    /// The index or commit mutation completed, but its follow-up refresh did
+    /// not. Keeping this in the outcome prevents a refresh failure from hiding
+    /// a mutation that already happened.
+    Failed(GitError),
+}
+
+impl StatusRefreshOutcome {
+    /// The refreshed status, when one was requested and completed.
+    #[must_use]
+    pub fn status(&self) -> Option<&DetailedStatus> {
+        match self {
+            Self::Refreshed(status) => Some(status),
+            Self::Skipped | Self::Failed(_) => None,
+        }
+    }
+
+    /// The refresh error, when the requested refresh failed.
+    #[must_use]
+    pub fn error(&self) -> Option<&GitError> {
+        match self {
+            Self::Failed(error) => Some(error),
+            Self::Skipped | Self::Refreshed(_) => None,
+        }
+    }
+}
+
+/// What explicit path staging or unstaging produced.
+#[derive(Debug)]
+pub struct StageOutcome {
+    /// One result for every path supplied by the caller, in input order.
+    pub paths: Vec<StagePathOutcome>,
+    /// The optional full-repository status refresh performed after all paths.
+    pub status: StatusRefreshOutcome,
+}
+
+impl StageOutcome {
+    /// Whether Git completed the requested update for every path.
+    #[must_use]
+    pub fn all_succeeded(&self) -> bool {
+        self.paths.iter().all(StagePathOutcome::succeeded)
+    }
 }
 
 /// What one successful commit produced.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct CommitOutcome {
     /// The full object ID of the new commit.
     pub commit_id: String,
     /// Whether the new commit replaced the previous `HEAD`.
     pub amended: bool,
-    /// Per-path state after the commit completed.
-    pub status: DetailedStatus,
+    /// The optional full-repository status refresh after the commit completed.
+    pub status: StatusRefreshOutcome,
 }
 
 pub(crate) fn stage(
@@ -45,31 +182,44 @@ pub(crate) fn stage(
     root: &Path,
     _lock: &RepositoryLock,
     paths: &[PathBuf],
+    options: &StageOptions,
     cancellation: &Cancellation,
-) -> Result<DetailedStatus, GitError> {
+) -> Result<StageOutcome, GitError> {
     validate_paths(root, paths)?;
-    if !paths.is_empty() {
+    open(root)?;
+    let path_outcomes = run_paths(paths, cancellation, |path| {
         GitCommand::new(git_executable, root, GitAccess::LocalWrite)
             // Explicit paths are literal filesystem names, not pathspec
             // patterns. This also prevents a name beginning with `:(` from
             // gaining pathspec-magic semantics.
             .args(["--literal-pathspecs", "add", "--all", "--"])
-            .args(paths.iter().map(|path| path.as_os_str()))
-            .run(cancellation)?;
-    }
-    status::detailed(git_executable, root, cancellation)
+            .arg(path.as_os_str())
+            .run(cancellation)
+            .map(|_| ())
+    });
+    Ok(StageOutcome {
+        paths: path_outcomes,
+        status: refresh_status(git_executable, root, options.refresh_status, cancellation),
+    })
 }
 
 pub(crate) fn stage_all(
     git_executable: &Path,
     root: &Path,
     _lock: &RepositoryLock,
+    options: &StageOptions,
     cancellation: &Cancellation,
-) -> Result<DetailedStatus, GitError> {
+) -> Result<StatusRefreshOutcome, GitError> {
+    open(root)?;
     GitCommand::new(git_executable, root, GitAccess::LocalWrite)
         .args(["add", "--all"])
         .run(cancellation)?;
-    status::detailed(git_executable, root, cancellation)
+    Ok(refresh_status(
+        git_executable,
+        root,
+        options.refresh_status,
+        cancellation,
+    ))
 }
 
 pub(crate) fn unstage(
@@ -77,29 +227,30 @@ pub(crate) fn unstage(
     root: &Path,
     _lock: &RepositoryLock,
     paths: &[PathBuf],
+    options: &StageOptions,
     cancellation: &Cancellation,
-) -> Result<DetailedStatus, GitError> {
+) -> Result<StageOutcome, GitError> {
     validate_paths(root, paths)?;
-    if paths.is_empty() {
-        return status::detailed(git_executable, root, cancellation);
-    }
-
     let repository = open(root)?;
-    let command =
-        GitCommand::new(git_executable, root, GitAccess::LocalWrite).arg("--literal-pathspecs");
-    let command = if is_unborn(&repository, root)? {
-        // `restore --staged` needs a HEAD tree. Removing an entry only from the
-        // index is its unborn-branch equivalent; force is safe here because
-        // `--cached` leaves the working tree untouched and every path is
-        // explicit and already validated.
-        command.args(["rm", "--cached", "-r", "--force", "--ignore-unmatch", "--"])
-    } else {
-        command.args(["restore", "--staged", "--"])
-    };
-    command
-        .args(paths.iter().map(|path| path.as_os_str()))
-        .run(cancellation)?;
-    status::detailed(git_executable, root, cancellation)
+    let unborn = is_unborn(&repository, root)?;
+    let path_outcomes = run_paths(paths, cancellation, |path| {
+        let command =
+            GitCommand::new(git_executable, root, GitAccess::LocalWrite).arg("--literal-pathspecs");
+        let command = if unborn {
+            // `restore --staged` needs a HEAD tree. Removing an entry only from
+            // the index is its unborn-branch equivalent; force is safe here
+            // because `--cached` leaves the working tree untouched and every
+            // path is explicit and already validated.
+            command.args(["rm", "--cached", "-r", "--force", "--ignore-unmatch", "--"])
+        } else {
+            command.args(["restore", "--staged", "--"])
+        };
+        command.arg(path.as_os_str()).run(cancellation).map(|_| ())
+    });
+    Ok(StageOutcome {
+        paths: path_outcomes,
+        status: refresh_status(git_executable, root, options.refresh_status, cancellation),
+    })
 }
 
 pub(crate) fn commit(
@@ -115,6 +266,12 @@ pub(crate) fn commit(
     }
 
     let repository = open(root)?;
+    if let Some(pending) = status::pending(&repository) {
+        return Err(GitError::OperationInProgress {
+            path: root.to_path_buf(),
+            pending,
+        });
+    }
     let unborn = is_unborn(&repository, root)?;
     if options.amend && unborn {
         return Err(GitError::AmendUnbornBranch);
@@ -141,8 +298,62 @@ pub(crate) fn commit(
     Ok(CommitOutcome {
         commit_id,
         amended: options.amend,
-        status: status::detailed(git_executable, root, cancellation)?,
+        status: refresh_status(git_executable, root, options.refresh_status, cancellation),
     })
+}
+
+/// Runs path-local commands independently so one rejected path cannot hide
+/// successful mutations to the paths before or after it.
+fn run_paths(
+    paths: &[PathBuf],
+    cancellation: &Cancellation,
+    mut run: impl FnMut(&Path) -> Result<(), GitError>,
+) -> Vec<StagePathOutcome> {
+    let mut outcomes = Vec::with_capacity(paths.len());
+    let mut stopped = false;
+    for path in paths {
+        let result = if stopped {
+            StagePathResult::NotAttempted
+        } else if cancellation.is_cancelled() {
+            stopped = true;
+            StagePathResult::Failed(GitError::Cancelled)
+        } else {
+            match run(path) {
+                Ok(()) => StagePathResult::Succeeded,
+                Err(error) => {
+                    // A normal Git rejection can be path-local, such as an
+                    // explicitly named ignored file. Runner failures are not:
+                    // retrying more paths after a launch failure, cancellation,
+                    // or timeout would only compound the original problem.
+                    stopped = !matches!(error, GitError::Failed { .. });
+                    StagePathResult::Failed(error)
+                }
+            }
+        };
+        outcomes.push(StagePathOutcome {
+            path: path.clone(),
+            result,
+        });
+    }
+    outcomes
+}
+
+fn refresh_status(
+    git_executable: &Path,
+    root: &Path,
+    enabled: bool,
+    cancellation: &Cancellation,
+) -> StatusRefreshOutcome {
+    if !enabled {
+        return StatusRefreshOutcome::Skipped;
+    }
+    if cancellation.is_cancelled() {
+        return StatusRefreshOutcome::Failed(GitError::Cancelled);
+    }
+    match status::detailed(git_executable, root, cancellation) {
+        Ok(status) => StatusRefreshOutcome::Refreshed(status),
+        Err(error) => StatusRefreshOutcome::Failed(error),
+    }
 }
 
 /// Resolves every path before any Git command is built.
@@ -249,7 +460,9 @@ mod tests {
 
     use crate::{
         git::{
-            Cancellation, CommitOptions, FileChange, GitError, GitService, HeadState, StatusEntry,
+            Cancellation, CommitOptions, DetailedStatus, FileChange, GitError, GitService,
+            HeadState, PendingOperation, StageOptions, StagePathResult, StatusEntry,
+            StatusRefreshOutcome,
         },
         testing::{
             Fixture, PROCESS_PROJECT_ROOT_ENV, commit_all, configure_commit_identity,
@@ -267,7 +480,7 @@ mod tests {
 
         fs::write(root.join("tracked.txt"), "staged version\n").unwrap();
         let staged = service.stage(["tracked.txt"], &cancellation).unwrap();
-        let tracked = entry(&staged.entries, Path::new("tracked.txt"));
+        let tracked = entry(&refreshed(&staged.status).entries, Path::new("tracked.txt"));
         assert_eq!(tracked.staged, Some(FileChange::Modified));
         assert_eq!(tracked.unstaged, None);
 
@@ -278,7 +491,10 @@ mod tests {
         assert_eq!(tracked.unstaged, Some(FileChange::Modified));
 
         let unstaged = service.unstage(["tracked.txt"], &cancellation).unwrap();
-        let tracked = entry(&unstaged.entries, Path::new("tracked.txt"));
+        let tracked = entry(
+            &refreshed(&unstaged.status).entries,
+            Path::new("tracked.txt"),
+        );
         assert_eq!(tracked.staged, None);
         assert_eq!(tracked.unstaged, Some(FileChange::Modified));
     }
@@ -313,6 +529,165 @@ mod tests {
     }
 
     #[test]
+    fn explicit_paths_report_partial_failures_without_hiding_successes() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("partial-stage");
+        initialize_repository(&root);
+        fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
+        fs::write(root.join("tracked.txt"), "staged despite sibling failure\n").unwrap();
+        fs::write(root.join("ignored.txt"), "ignored\n").unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+
+        let outcome = service
+            .stage(["tracked.txt", "ignored.txt"], &Cancellation::default())
+            .unwrap();
+
+        assert!(!outcome.all_succeeded());
+        assert!(matches!(
+            outcome.paths[0].result,
+            StagePathResult::Succeeded
+        ));
+        assert!(matches!(
+            outcome.paths[1].result,
+            StagePathResult::Failed(GitError::Failed { .. })
+        ));
+        assert_eq!(outcome.paths[0].path, Path::new("tracked.txt"));
+        assert_eq!(outcome.paths[1].path, Path::new("ignored.txt"));
+        assert_eq!(
+            entry(
+                &refreshed(&outcome.status).entries,
+                Path::new("tracked.txt")
+            )
+            .staged,
+            Some(FileChange::Modified)
+        );
+    }
+
+    #[test]
+    fn stage_unstage_stage_all_and_commit_can_skip_the_full_refresh() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("optional-refresh");
+        initialize_repository(&root);
+        let service = GitService::new(&root, &fixture.data_dir);
+        let no_refresh = StageOptions {
+            refresh_status: false,
+        };
+        let cancellation = Cancellation::default();
+
+        fs::write(root.join("tracked.txt"), "first staged version\n").unwrap();
+        let staged = service
+            .stage_with_options(["tracked.txt"], &no_refresh, &cancellation)
+            .unwrap();
+        assert!(staged.all_succeeded());
+        assert!(matches!(staged.status, StatusRefreshOutcome::Skipped));
+        assert_eq!(
+            entry(
+                &service.detailed_status(&cancellation).unwrap().entries,
+                Path::new("tracked.txt")
+            )
+            .staged,
+            Some(FileChange::Modified)
+        );
+
+        let unstaged = service
+            .unstage_with_options(["tracked.txt"], &no_refresh, &cancellation)
+            .unwrap();
+        assert!(unstaged.all_succeeded());
+        assert!(matches!(unstaged.status, StatusRefreshOutcome::Skipped));
+        assert_eq!(
+            entry(
+                &service.detailed_status(&cancellation).unwrap().entries,
+                Path::new("tracked.txt")
+            )
+            .staged,
+            None
+        );
+
+        let staged_all = service
+            .stage_all_with_options(&no_refresh, &cancellation)
+            .unwrap();
+        assert!(matches!(staged_all, StatusRefreshOutcome::Skipped));
+
+        let commit_options = CommitOptions::default().with_status_refresh(false);
+        let committed = service
+            .commit("skip status refresh", &commit_options, &cancellation)
+            .unwrap();
+        assert!(matches!(committed.status, StatusRefreshOutcome::Skipped));
+        assert_eq!(
+            Repository::open(&root)
+                .unwrap()
+                .head()
+                .unwrap()
+                .target()
+                .unwrap()
+                .to_string(),
+            committed.commit_id
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refresh_failure_does_not_hide_a_completed_mutation() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("failed-refresh");
+        initialize_repository(&root);
+        let git = fixture.shim(
+            "git-with-failed-status",
+            "#!/bin/sh\n\
+             for argument in \"$@\"; do\n\
+               if [ \"$argument\" = status ]; then\n\
+                 echo 'status intentionally failed' >&2\n\
+                 exit 1\n\
+               fi\n\
+             done\n\
+             exec git \"$@\"\n",
+        );
+        let service = GitService::new(&root, &fixture.data_dir).with_git_executable(git);
+        let cancellation = Cancellation::default();
+
+        fs::write(root.join("tracked.txt"), "staged before refresh fails\n").unwrap();
+        let staged = service.stage(["tracked.txt"], &cancellation).unwrap();
+        assert!(staged.all_succeeded());
+        assert!(matches!(
+            staged.status,
+            StatusRefreshOutcome::Failed(GitError::Failed { .. })
+        ));
+        assert_eq!(
+            entry(
+                &GitService::new(&root, &fixture.data_dir)
+                    .detailed_status(&cancellation)
+                    .unwrap()
+                    .entries,
+                Path::new("tracked.txt")
+            )
+            .staged,
+            Some(FileChange::Modified)
+        );
+
+        let committed = service
+            .commit(
+                "commit survives refresh failure",
+                &CommitOptions::default(),
+                &cancellation,
+            )
+            .unwrap();
+        assert!(matches!(
+            committed.status,
+            StatusRefreshOutcome::Failed(GitError::Failed { .. })
+        ));
+        assert_eq!(
+            Repository::open(&root)
+                .unwrap()
+                .head()
+                .unwrap()
+                .target()
+                .unwrap()
+                .to_string(),
+            committed.commit_id
+        );
+    }
+
+    #[test]
     fn renamed_paths_keep_using_detailed_status() {
         let fixture = Fixture::new();
         let root = fixture.directory("staged-rename");
@@ -324,7 +699,7 @@ mod tests {
         let staged = service
             .stage(["tracked.txt", "renamed.txt"], &cancellation)
             .unwrap();
-        let renamed = entry(&staged.entries, Path::new("renamed.txt"));
+        let renamed = entry(&refreshed(&staged.status).entries, Path::new("renamed.txt"));
         assert_eq!(renamed.staged, Some(FileChange::Renamed));
         assert_eq!(
             renamed.rename_source.as_deref(),
@@ -334,13 +709,19 @@ mod tests {
         let unstaged = service
             .unstage(["tracked.txt", "renamed.txt"], &cancellation)
             .unwrap();
-        assert!(unstaged.entries.iter().all(|entry| entry.staged.is_none()));
+        let unstaged_status = refreshed(&unstaged.status);
+        assert!(
+            unstaged_status
+                .entries
+                .iter()
+                .all(|entry| entry.staged.is_none())
+        );
         assert_eq!(
-            entry(&unstaged.entries, Path::new("tracked.txt")).unstaged,
+            entry(&unstaged_status.entries, Path::new("tracked.txt")).unstaged,
             Some(FileChange::Deleted)
         );
         assert_eq!(
-            entry(&unstaged.entries, Path::new("renamed.txt")).unstaged,
+            entry(&unstaged_status.entries, Path::new("renamed.txt")).unstaged,
             Some(FileChange::Untracked)
         );
     }
@@ -399,9 +780,10 @@ mod tests {
         let cancellation = Cancellation::default();
 
         let staged = service.stage(["first.txt"], &cancellation).unwrap();
-        assert!(matches!(staged.head, HeadState::Unborn { .. }));
+        let staged_status = refreshed(&staged.status);
+        assert!(matches!(staged_status.head, HeadState::Unborn { .. }));
         assert_eq!(
-            entry(&staged.entries, Path::new("first.txt")).staged,
+            entry(&staged_status.entries, Path::new("first.txt")).staged,
             Some(FileChange::Added)
         );
         // Prove the cached-removal path also works when the staged content no
@@ -410,7 +792,7 @@ mod tests {
 
         let unstaged = service.unstage(["first.txt"], &cancellation).unwrap();
 
-        let first = entry(&unstaged.entries, Path::new("first.txt"));
+        let first = entry(&refreshed(&unstaged.status).entries, Path::new("first.txt"));
         assert_eq!(first.staged, None);
         assert_eq!(first.unstaged, Some(FileChange::Untracked));
         assert_eq!(
@@ -455,13 +837,44 @@ mod tests {
         assert!(matches!(
             unborn.commit(
                 "cannot amend",
-                &CommitOptions {
-                    amend: true,
-                    allow_empty: false,
-                },
+                &CommitOptions::default().with_amend(true),
                 &Cancellation::default(),
             ),
             Err(GitError::AmendUnbornBranch)
+        ));
+    }
+
+    #[test]
+    fn detailed_status_exposes_a_pending_operation_and_commit_refuses_it() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("pending-commit");
+        let repository = initialize_repository(&root);
+        fs::write(root.join("tracked.txt"), "staged during merge\n").unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+        service
+            .stage(["tracked.txt"], &Cancellation::default())
+            .unwrap();
+        let head = repository.head().unwrap().target().unwrap();
+        fs::write(root.join(".git/MERGE_HEAD"), format!("{head}\n")).unwrap();
+
+        let status = service.detailed_status(&Cancellation::default()).unwrap();
+        assert_eq!(status.pending, Some(PendingOperation::Merge));
+
+        let missing_git = fixture.root.path().join("does-not-exist");
+        let error = GitService::new(&root, &fixture.data_dir)
+            .with_git_executable(missing_git)
+            .commit(
+                "must not finish an unknown merge",
+                &CommitOptions::default(),
+                &Cancellation::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            GitError::OperationInProgress {
+                pending: PendingOperation::Merge,
+                ..
+            }
         ));
     }
 
@@ -521,7 +934,7 @@ mod tests {
             )
             .unwrap();
         assert!(!committed.amended);
-        assert!(committed.status.entries.is_empty());
+        assert!(refreshed(&committed.status).entries.is_empty());
         let repository = Repository::open(&root).unwrap();
         let commit = repository
             .find_commit(committed.commit_id.parse().unwrap())
@@ -536,16 +949,13 @@ mod tests {
         let amended = service
             .commit(
                 "amended commit",
-                &CommitOptions {
-                    amend: true,
-                    allow_empty: false,
-                },
+                &CommitOptions::default().with_amend(true),
                 &cancellation,
             )
             .unwrap();
         assert!(amended.amended);
         assert_ne!(amended.commit_id, committed.commit_id);
-        assert!(amended.status.entries.is_empty());
+        assert!(refreshed(&amended.status).entries.is_empty());
         let repository = Repository::open(&root).unwrap();
         let amend = repository
             .find_commit(amended.commit_id.parse().unwrap())
@@ -581,16 +991,13 @@ mod tests {
         let outcome = service
             .commit(
                 "intentional empty commit",
-                &CommitOptions {
-                    amend: false,
-                    allow_empty: true,
-                },
+                &CommitOptions::default().with_allow_empty(true),
                 &Cancellation::default(),
             )
             .unwrap();
 
         assert!(!outcome.amended);
-        assert!(outcome.status.entries.is_empty());
+        assert!(refreshed(&outcome.status).entries.is_empty());
         assert_eq!(
             Repository::open(&root)
                 .unwrap()
@@ -617,7 +1024,7 @@ mod tests {
             .unwrap();
 
         for path in ["space name.txt", "-option.txt"] {
-            let entry = entry(&status.entries, Path::new(path));
+            let entry = entry(&refreshed(&status.status).entries, Path::new(path));
             assert_eq!(entry.staged, Some(FileChange::Added));
             assert_eq!(entry.unstaged, None);
         }
@@ -639,7 +1046,7 @@ mod tests {
 
         let status = service.stage([&path], &Cancellation::default()).unwrap();
 
-        let staged = entry(&status.entries, &path);
+        let staged = entry(&refreshed(&status.status).entries, &path);
         assert_eq!(staged.staged, Some(FileChange::Added));
         assert_eq!(staged.unstaged, None);
     }
@@ -649,5 +1056,11 @@ mod tests {
             .iter()
             .find(|entry| entry.path == path)
             .unwrap_or_else(|| panic!("status did not include '{}': {entries:?}", path.display()))
+    }
+
+    fn refreshed(outcome: &StatusRefreshOutcome) -> &DetailedStatus {
+        outcome
+            .status()
+            .unwrap_or_else(|| panic!("status was not refreshed: {outcome:?}"))
     }
 }

@@ -25,7 +25,10 @@ use git2::{ErrorCode, Repository};
 use thiserror::Error;
 
 pub use branch::{Branch, BranchCheckout, BranchKind, BranchListOptions, CreateBranchOptions};
-pub use commit::{CommitOptions, CommitOutcome};
+pub use commit::{
+    CommitOptions, CommitOutcome, StageOptions, StageOutcome, StagePathOutcome, StagePathResult,
+    StatusRefreshOutcome,
+};
 pub use lock::RepositoryLock;
 pub use runner::{Cancellation, CloneCancellation, GitAccess, GitCommand, GitOutput};
 pub use status::{DetailedStatus, FileChange, HeadState, PendingOperation, StatusEntry};
@@ -187,13 +190,13 @@ pub enum GitError {
     )]
     LocalUpstreamUnsupported { branch: String },
 
-    /// The repository is already in the middle of an operation, so there is
-    /// nothing coherent to reconcile.
+    /// The repository is already in the middle of an operation, so another
+    /// guarded operation cannot safely begin.
     ///
     /// Refused before Git is spawned. Left to Git, the failure would be
     /// indistinguishable from one this operation had caused.
     #[error(
-        "'{}' is in the middle of a {pending}; finish or abort it before pulling",
+        "'{}' is in the middle of a {pending}; finish or abort it before continuing",
         path.display()
     )]
     OperationInProgress {
@@ -385,17 +388,39 @@ impl GitService {
         status::detailed(&self.git_executable, &self.root, cancellation)
     }
 
-    /// Stages every change to each explicit path.
+    /// Stages every change to each explicit path and refreshes repository
+    /// status afterward.
     ///
     /// Every path is resolved and checked against the working tree before Git
     /// is spawned. The path arguments retain their platform-native encoding
     /// and follow a `--` separator, so neither a non-UTF-8 name nor a name that
     /// resembles an option is reinterpreted.
+    ///
+    /// Pass every path from one user action in the same call. The iterator is
+    /// intentionally a batch boundary: all paths share one repository lock and
+    /// one full-repository status refresh. Use [`Self::stage_with_options`] to
+    /// opt out of that refresh when the caller will perform one separately.
+    /// Inspect every [`StagePathOutcome`]: one path's ordinary Git rejection is
+    /// retained there while later paths continue.
     pub fn stage<I, P>(
         &self,
         paths: I,
         cancellation: &Cancellation,
-    ) -> Result<DetailedStatus, GitError>
+    ) -> Result<StageOutcome, GitError>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        self.stage_with_options(paths, &StageOptions::default(), cancellation)
+    }
+
+    /// Stages explicit paths with control over the final status refresh.
+    pub fn stage_with_options<I, P>(
+        &self,
+        paths: I,
+        options: &StageOptions,
+        cancellation: &Cancellation,
+    ) -> Result<StageOutcome, GitError>
     where
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
@@ -410,26 +435,67 @@ impl GitService {
             &self.root,
             &lock,
             &paths,
+            options,
             cancellation,
         )
     }
 
     /// Stages every change in the working tree, including deletions.
     pub fn stage_all(&self, cancellation: &Cancellation) -> Result<DetailedStatus, GitError> {
+        match self.stage_all_with_options(&StageOptions::default(), cancellation)? {
+            StatusRefreshOutcome::Refreshed(status) => Ok(status),
+            StatusRefreshOutcome::Failed(error) => Err(error),
+            StatusRefreshOutcome::Skipped => unreachable!("default stage options refresh status"),
+        }
+    }
+
+    /// Stages the whole working tree with control over the final status
+    /// refresh.
+    pub fn stage_all_with_options(
+        &self,
+        options: &StageOptions,
+        cancellation: &Cancellation,
+    ) -> Result<StatusRefreshOutcome, GitError> {
         let lock = self.lock(cancellation)?;
-        commit::stage_all(&self.git_executable, &self.root, &lock, cancellation)
+        commit::stage_all(
+            &self.git_executable,
+            &self.root,
+            &lock,
+            options,
+            cancellation,
+        )
     }
 
     /// Removes each explicit path from the staged snapshot without changing
-    /// the working tree.
+    /// the working tree, then refreshes repository status.
     ///
     /// On an unborn branch this uses `git rm --cached`, because there is no
     /// `HEAD` tree for `git restore --staged` to restore.
+    ///
+    /// Batch paths into one call to share one repository lock and one final
+    /// full-repository status refresh. Use [`Self::unstage_with_options`] when
+    /// the caller will refresh separately. Inspect every [`StagePathOutcome`]
+    /// because an ordinary Git rejection is reported per path rather than as
+    /// the outer error.
     pub fn unstage<I, P>(
         &self,
         paths: I,
         cancellation: &Cancellation,
-    ) -> Result<DetailedStatus, GitError>
+    ) -> Result<StageOutcome, GitError>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        self.unstage_with_options(paths, &StageOptions::default(), cancellation)
+    }
+
+    /// Unstages explicit paths with control over the final status refresh.
+    pub fn unstage_with_options<I, P>(
+        &self,
+        paths: I,
+        options: &StageOptions,
+        cancellation: &Cancellation,
+    ) -> Result<StageOutcome, GitError>
     where
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
@@ -444,6 +510,7 @@ impl GitService {
             &self.root,
             &lock,
             &paths,
+            options,
             cancellation,
         )
     }
@@ -452,7 +519,10 @@ impl GitService {
     ///
     /// Empty messages, an unchanged index, and amending an unborn branch are
     /// refused in process before Git is spawned. [`CommitOptions`] provides
-    /// the explicit overrides for amending and intentionally empty commits.
+    /// the explicit overrides for amending, intentionally empty commits, and
+    /// skipping the final full-repository status refresh. A successful commit
+    /// remains an `Ok` [`CommitOutcome`] if only that follow-up refresh fails;
+    /// inspect [`CommitOutcome::status`] for the refresh result.
     pub fn commit(
         &self,
         message: &str,
