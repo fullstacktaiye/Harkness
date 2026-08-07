@@ -4,6 +4,16 @@
 //! properties that make one correct are properties of all of them: a dedicated
 //! process group that cancellation can kill whole, a scrubbed environment, no
 //! terminal prompt, and both output streams drained concurrently.
+//!
+//! Those properties together are the *hermetic invocation policy*, and it is
+//! deliberately one policy rather than a habit each caller keeps. Git reads
+//! configuration from four files and two environment mechanisms before it reads
+//! an argument, and any of them can change what a command does to refs, to the
+//! working tree or to a remote. A typed option that says "publish this one
+//! branch" is only true if the invocation carrying it cannot be widened by a
+//! setting nobody in Harkness wrote, so everything capable of widening it is
+//! pinned here: see [`REDIRECTING_ENVIRONMENT`], [`INJECTING_ENVIRONMENT`],
+//! [`PINNED_CONFIGURATION`] and [`DIAGNOSTIC_LOCALE`].
 
 use std::{
     collections::VecDeque,
@@ -27,18 +37,84 @@ use crate::git::GitError;
 /// is what matters: Git prints its diagnosis last.
 const RETAINED_GIT_OUTPUT_SEGMENTS: usize = 20;
 
-/// Variables that redirect Git at another repository entirely.
+/// Variables that redirect Git at another repository, or at other refs within
+/// it.
 ///
 /// `harkness-cli` is an agent tool, so it is invoked from Git hooks and from
 /// shells that exported these. Left in place, every command would silently
 /// operate on whichever repository the parent was pointing at.
-const REDIRECTING_ENVIRONMENT: [&str; 5] = [
+///
+/// `GIT_NAMESPACE` is here for the same reason one step further in: it does not
+/// move the repository, it renames the ref namespace underneath it, so a push
+/// that named `refs/heads/main` would write somewhere else entirely while every
+/// argument still said `main`.
+const REDIRECTING_ENVIRONMENT: [&str; 8] = [
     "GIT_DIR",
     "GIT_COMMON_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
     "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_NAMESPACE",
 ];
+
+/// Variables that inject configuration into Git without touching a file.
+///
+/// A parent `git` process exports `GIT_CONFIG_PARAMETERS` to everything it
+/// spawns, which is exactly the situation a hook puts `harkness-cli` in. Left
+/// in place, a `-c push.followTags=true` two processes up would reach a push
+/// that never asked for it. Removing them cannot disturb the settings pinned
+/// below: those travel as arguments, and Git rebuilds the variable for its own
+/// children from scratch.
+const INJECTING_ENVIRONMENT: [&str; 3] =
+    ["GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"];
+
+/// The indexed halves of `GIT_CONFIG_COUNT`, which have no fixed names.
+///
+/// Removing the count alone would be enough for Git, which stops reading at it;
+/// removing the pairs as well keeps the scrubbing honest for anything that
+/// reads them directly.
+const INJECTED_CONFIGURATION_PREFIXES: [&str; 2] = ["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"];
+
+/// Configuration pinned on every invocation, whatever the repository, the user
+/// or the system config says.
+///
+/// Only settings with no command-line equivalent belong here. Where Git has a
+/// flag — `--no-prune`, `--no-follow-tags`, `--ff-only` — the caller passes the
+/// flag instead, because a flag is visible at the call site, is asserted by the
+/// tests that build the arguments, and outranks configuration anyway.
+///
+/// - Autostash is off because a pull that cannot apply cleanly must say so
+///   rather than silently stash a user's uncommitted work and, if the reapply
+///   fails, leave it in a stash nobody was told about.
+/// - `submodule.recurse` is off because it turns single-repository verbs into
+///   operations on other repositories with other remotes; the sync verbs each
+///   pin the equivalent flag as well.
+const PINNED_CONFIGURATION: [&str; 3] = [
+    "merge.autoStash=false",
+    "rebase.autoStash=false",
+    "submodule.recurse=false",
+];
+
+/// The locale every invocation runs in.
+///
+/// Git's diagnostics are translated, and Harkness recognizes some of them to
+/// tell a rejected push from an authentication failure. Left to the user's
+/// locale, that recognition would work in English and silently degrade to an
+/// untyped failure everywhere else, so the messages Harkness reads are pinned
+/// to the one language they are written in. `LC_ALL` also settles `LANGUAGE`,
+/// which gettext ignores once the message locale is `C`.
+const DIAGNOSTIC_LOCALE: &str = "C";
+
+/// What Git is told to run when it would open an editor.
+///
+/// Deliberately not an executable. A front end has no terminal to show an
+/// editor in, so a command that reaches for one must fail loudly rather than
+/// hang on a program nobody can see or accept a message nobody wrote. Every
+/// verb here also passes the flag that avoids the editor in the first place;
+/// this is what happens when a future one forgets.
+const UNAVAILABLE_EDITOR: &str = "harkness-has-no-editor";
 
 /// How long a local read may run before its process group is killed.
 const LOCAL_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -117,19 +193,27 @@ pub struct GitOutput {
 ///
 /// - the child leads its own process group, so cancellation and timeouts kill
 ///   transport and credential helpers along with Git itself;
-/// - `GIT_TERMINAL_PROMPT=0`, so a front end with no terminal fails with Git's
-///   diagnostic instead of hanging on `/dev/tty`;
-/// - the variables that redirect Git at another repository are removed from the
-///   inherited environment;
+/// - `GIT_TERMINAL_PROMPT=0` and no reachable editor, so a front end with no
+///   terminal fails with Git's diagnostic instead of hanging on `/dev/tty`;
+/// - the variables that redirect Git at another repository, at other refs, or
+///   at configuration of their own are removed from the inherited environment;
+/// - the configuration that could widen what a command does is pinned, and the
+///   locale its diagnostics are written in is fixed;
 /// - both output streams are drained on their own threads, so a command that
 ///   fills the 64 KiB pipe buffer on one stream cannot deadlock against a
 ///   parent reading the other.
+///
+/// Credentials are the deliberate exception: `GIT_ASKPASS`, `SSH_ASKPASS` and
+/// the credential helpers configured on the machine are left exactly as the
+/// user set them, because delegating to them is how Harkness reaches a real
+/// remote without ever handling a secret itself.
 pub struct GitCommand {
     executable: PathBuf,
     working_directory: PathBuf,
     access: GitAccess,
     arguments: Vec<OsString>,
     accepted_exit_codes: Vec<i32>,
+    diagnose_with_stdout: bool,
     timeout: Option<Duration>,
     // A mutation command obtained through `GitService` owns the repository
     // lock for its whole lifetime, including while it runs.
@@ -154,6 +238,7 @@ impl GitCommand {
             access,
             arguments: Vec::new(),
             accepted_exit_codes: Vec::new(),
+            diagnose_with_stdout: false,
             timeout: access.default_timeout(),
             _repository_lock: None,
         }
@@ -195,6 +280,20 @@ impl GitCommand {
         self
     }
 
+    /// Reads standard output as part of the diagnostic when the command fails.
+    ///
+    /// Git usually explains itself on standard error, and the failure carries
+    /// that alone. `git push --porcelain` is the exception this exists for: the
+    /// fate of every ref, rejections included, is reported on standard output,
+    /// and standard error keeps nothing but "failed to push some refs to". Left
+    /// out, the one machine-readable account of *why* a push was refused would
+    /// be discarded at precisely the moment it was worth having.
+    #[must_use]
+    pub fn diagnose_with_stdout(mut self) -> Self {
+        self.diagnose_with_stdout = true;
+        self
+    }
+
     /// Replaces the timeout implied by the command's [`GitAccess`].
     ///
     /// Setting one on a [`GitAccess::Network`] command opts that command out of
@@ -223,17 +322,33 @@ impl GitCommand {
         let described = self.describe();
         let mut command = Command::new(&self.executable);
         command
+            // The policy leads, because `-c` and `--no-pager` are options of
+            // `git` itself and have to precede the verb. Excluded from
+            // `describe`, so a failure names the command a caller asked for
+            // rather than the scaffolding around it.
+            .args(hermetic_arguments())
             .args(&self.arguments)
             .current_dir(&self.working_directory)
             // Git may open /dev/tty even when stdin is closed. A GUI cannot
             // answer that prompt, so fail with Git's diagnostic instead of
             // hanging.
             .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_EDITOR", UNAVAILABLE_EDITOR)
+            .env("GIT_SEQUENCE_EDITOR", UNAVAILABLE_EDITOR)
+            .env("LC_ALL", DIAGNOSTIC_LOCALE)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for name in REDIRECTING_ENVIRONMENT {
+        for name in REDIRECTING_ENVIRONMENT.iter().chain(&INJECTING_ENVIRONMENT) {
             command.env_remove(name);
+        }
+        for (name, _) in std::env::vars_os() {
+            if INJECTED_CONFIGURATION_PREFIXES
+                .iter()
+                .any(|prefix| name.to_str().is_some_and(|name| name.starts_with(prefix)))
+            {
+                command.env_remove(&name);
+            }
         }
         if self.access == GitAccess::LocalRead {
             command.env("GIT_OPTIONAL_LOCKS", "0");
@@ -298,7 +413,11 @@ impl GitCommand {
                 } else {
                     Err(GitError::Failed {
                         command: described,
-                        stderr,
+                        stderr: if self.diagnose_with_stdout {
+                            diagnostic(&stderr, &stdout)
+                        } else {
+                            stderr
+                        },
                     })
                 };
             }
@@ -306,13 +425,43 @@ impl GitCommand {
         }
     }
 
-    /// Names the invocation for a diagnostic, without its executable path.
+    /// Names the invocation for a diagnostic, without its executable path or
+    /// the hermetic policy every invocation carries.
     fn describe(&self) -> String {
         self.arguments
             .iter()
             .map(|argument| argument.to_string_lossy())
             .collect::<Vec<_>>()
             .join(" ")
+    }
+}
+
+/// The `git` options every invocation is prefixed with.
+///
+/// `--no-pager` belongs with them: Git only pages onto a terminal, so this
+/// changes nothing today, and it is what keeps that true if a future caller
+/// ever hands Git one.
+fn hermetic_arguments() -> Vec<OsString> {
+    let mut arguments = vec![OsString::from("--no-pager")];
+    for setting in PINNED_CONFIGURATION {
+        arguments.push(OsString::from("-c"));
+        arguments.push(OsString::from(setting));
+    }
+    arguments
+}
+
+/// Joins what Git wrote on both streams into one diagnostic.
+///
+/// Standard error leads because it holds Git's own summary of the failure;
+/// standard output follows because, for the commands that opt into this, it
+/// holds the detail that summary leaves out.
+fn diagnostic(stderr: &str, stdout: &[u8]) -> String {
+    let reported = String::from_utf8_lossy(stdout);
+    let reported = reported.trim();
+    match (stderr.trim().is_empty(), reported.is_empty()) {
+        (_, true) => stderr.to_owned(),
+        (true, false) => reported.to_owned(),
+        (false, false) => format!("{}\n{reported}", stderr.trim()),
     }
 }
 

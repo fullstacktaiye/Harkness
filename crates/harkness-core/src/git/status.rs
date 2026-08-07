@@ -5,9 +5,12 @@
 //! [`detailed`] is the on-demand tier: one `git status --porcelain=v2` for the
 //! single project a caller names.
 
-use std::path::{Path, PathBuf};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+};
 
-use git2::{Branch, ErrorCode, Repository, Status, StatusOptions};
+use git2::{Branch, ErrorCode, Repository, RepositoryState, Status, StatusOptions};
 
 use crate::{
     catalog::entry::{GitStatus, UpstreamStatus},
@@ -27,6 +30,69 @@ pub enum HeadState {
     Branch { name: String },
     /// A commit is checked out with no branch.
     Detached { commit: String },
+}
+
+/// A multi-step Git operation a repository is in the middle of.
+///
+/// Every one of these is a state a command can be left in rather than a state a
+/// command runs in: Git wrote `MERGE_HEAD` or a `rebase-merge` directory,
+/// stopped, and is waiting for someone to finish or abort what it started. That
+/// makes it the one thing a front end has to know after a failure, because the
+/// working tree has changed and no further operation will run until it is
+/// resolved.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum PendingOperation {
+    /// A merge stopped, usually at a conflict.
+    Merge,
+    /// A rebase stopped part-way through replaying commits.
+    Rebase,
+    /// A cherry-pick stopped.
+    CherryPick,
+    /// A revert stopped.
+    Revert,
+    /// A bisection is in progress.
+    Bisect,
+    /// A mailbox of patches is being applied.
+    ApplyMailbox,
+    /// Git reports an operation in progress that Harkness does not name.
+    Other,
+}
+
+impl fmt::Display for PendingOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Merge => "merge",
+            Self::Rebase => "rebase",
+            Self::CherryPick => "cherry-pick",
+            Self::Revert => "revert",
+            Self::Bisect => "bisection",
+            Self::ApplyMailbox => "patch application",
+            Self::Other => "Git operation",
+        })
+    }
+}
+
+/// What the repository is in the middle of, if anything.
+///
+/// Read in process from the state files Git leaves behind, so it costs nothing
+/// and stays available on the failure paths that need it most.
+pub(crate) fn pending(repository: &Repository) -> Option<PendingOperation> {
+    match repository.state() {
+        RepositoryState::Clean => None,
+        RepositoryState::Merge => Some(PendingOperation::Merge),
+        RepositoryState::Revert | RepositoryState::RevertSequence => Some(PendingOperation::Revert),
+        RepositoryState::CherryPick | RepositoryState::CherryPickSequence => {
+            Some(PendingOperation::CherryPick)
+        }
+        RepositoryState::Bisect => Some(PendingOperation::Bisect),
+        RepositoryState::Rebase
+        | RepositoryState::RebaseInteractive
+        | RepositoryState::RebaseMerge => Some(PendingOperation::Rebase),
+        RepositoryState::ApplyMailbox | RepositoryState::ApplyMailboxOrRebase => {
+            Some(PendingOperation::ApplyMailbox)
+        }
+    }
 }
 
 /// How one path changed, on one side of the index.

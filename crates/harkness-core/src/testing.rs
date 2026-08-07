@@ -31,6 +31,27 @@ pub(crate) const PROCESS_PROJECT_ROOT_ENV: &str = "HARKNESS_CATALOG_TEST_PROJECT
 pub(crate) const PROCESS_READY_FILE_ENV: &str = "HARKNESS_CATALOG_TEST_READY_FILE";
 pub(crate) const PROCESS_GIT_EXECUTABLE_ENV: &str = "HARKNESS_CATALOG_TEST_GIT_EXECUTABLE";
 
+/// The inherited variables the runner must remove before it spawns Git.
+///
+/// Every one of them redirects Git at another repository, at other refs, or at
+/// configuration nobody in Harkness wrote. Shared between the parent, which
+/// exports them all so the test proves something, and the child, which asserts
+/// none of them survived.
+pub(crate) const SCRUBBED_ENVIRONMENT: [&str; 12] = [
+    "GIT_DIR",
+    "GIT_COMMON_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_KEY_0",
+];
+
 /// Re-entered by the tests below as a child process, dispatching on a role.
 #[test]
 #[ignore = "only run as a child process by the locking and environment tests"]
@@ -75,13 +96,7 @@ fn process_child() {
         "scrubbed-environment" => {
             // Set on this process by its parent, so a shim that still sees
             // them can only have inherited them through the runner.
-            for name in [
-                "GIT_DIR",
-                "GIT_COMMON_DIR",
-                "GIT_WORK_TREE",
-                "GIT_INDEX_FILE",
-                "GIT_OBJECT_DIRECTORY",
-            ] {
+            for name in SCRUBBED_ENVIRONMENT {
                 assert!(
                     std::env::var_os(name).is_some(),
                     "the parent did not export {name}, so this proves nothing"
@@ -95,16 +110,20 @@ fn process_child() {
                     .run(&Cancellation::default())
                     .unwrap();
             let reported = String::from_utf8(output.stdout).unwrap();
-            assert_eq!(
-                reported,
-                "GIT_DIR=unset\n\
-                 GIT_COMMON_DIR=unset\n\
-                 GIT_WORK_TREE=unset\n\
-                 GIT_INDEX_FILE=unset\n\
-                 GIT_OBJECT_DIRECTORY=unset\n\
-                 GIT_TERMINAL_PROMPT=0\n\
-                 GIT_OPTIONAL_LOCKS=0\n"
+            let mut expected = SCRUBBED_ENVIRONMENT
+                .iter()
+                .map(|name| format!("{name}=unset"))
+                .collect::<Vec<_>>();
+            expected.extend(
+                [
+                    "GIT_TERMINAL_PROMPT=0",
+                    "GIT_OPTIONAL_LOCKS=0",
+                    "LC_ALL=C",
+                    "GIT_EDITOR=harkness-has-no-editor",
+                ]
+                .map(str::to_owned),
             );
+            assert_eq!(reported.lines().collect::<Vec<_>>(), expected);
         }
         _ => panic!("unknown test child role: {role}"),
     }
@@ -159,6 +178,23 @@ pub(crate) fn wait_for_child_signal(child: &mut Child, signal: &Path) {
     }
 }
 
+/// Waits for a file to appear, failing rather than hanging.
+///
+/// For the processes no test holds a handle to: a Git shim started by the code
+/// under test, which signals that it is running and therefore that there is
+/// something to cancel.
+pub(crate) fn wait_for_file(signal: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !signal.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "'{}' did not appear within 10 seconds",
+            signal.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// Creates a repository on `main` holding one committed file.
 pub(crate) fn initialize_repository(path: &Path) -> Repository {
     let repository = Repository::init(path).unwrap();
@@ -184,8 +220,8 @@ pub(crate) fn initialize_bare_repository(path: &Path) -> Repository {
 /// Creates a bare remote holding one commit on `main`, and a clone of it.
 ///
 /// The clone is made by real `git clone`, which is also what writes
-/// `refs/remotes/origin/HEAD`: the ref the default-branch refusal reads, and
-/// one that adding a remote by hand would never produce.
+/// `refs/remotes/origin/HEAD`: the ref the default-branch refusal falls back
+/// to, and one that adding a remote by hand would never produce.
 pub(crate) fn remote_with_clone(fixture: &Fixture, name: &str) -> (PathBuf, PathBuf) {
     let source = fixture.directory(&format!("{name}-source"));
     initialize_repository(&source);

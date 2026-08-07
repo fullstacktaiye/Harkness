@@ -22,9 +22,10 @@ use thiserror::Error;
 
 pub use lock::RepositoryLock;
 pub use runner::{Cancellation, CloneCancellation, GitAccess, GitCommand, GitOutput};
-pub use status::{DetailedStatus, FileChange, HeadState, StatusEntry};
+pub use status::{DetailedStatus, FileChange, HeadState, PendingOperation, StatusEntry};
 pub use sync::{
     FetchOptions, FetchOutcome, PullOptions, PullOutcome, PullStrategy, PushOptions, PushOutcome,
+    RefUpdate,
 };
 
 use crate::catalog::entry::GitStatus;
@@ -86,6 +87,71 @@ pub enum GitError {
     #[error("branch '{branch}' has no upstream branch configured")]
     NoUpstream { branch: String },
 
+    /// The branch exists but has no commit yet, so there is nothing to publish.
+    ///
+    /// Distinct from [`NoUpstream`]: asking for an upstream would not help, and
+    /// Git's own diagnostic for it names a refspec the caller never wrote.
+    ///
+    /// [`NoUpstream`]: GitError::NoUpstream
+    #[error("branch '{branch}' in '{}' has no commits to push", path.display())]
+    UnbornBranch { path: PathBuf, branch: String },
+
+    /// The branch tracks `.`, which is Git's name for the repository itself
+    /// rather than a remote.
+    ///
+    /// A perfectly ordinary upstream for a branch built on another local
+    /// branch, and one a pull honors. Reported distinctly because the
+    /// alternative was to claim the remote was not configured, which sent the
+    /// caller looking for a configuration mistake that was never made.
+    #[error(
+        "branch '{branch}' tracks '.', the repository itself, which is a valid \
+         upstream to pull from but not something to push to"
+    )]
+    LocalUpstreamUnsupported { branch: String },
+
+    /// The repository is already in the middle of an operation, so there is
+    /// nothing coherent to reconcile.
+    ///
+    /// Refused before Git is spawned. Left to Git, the failure would be
+    /// indistinguishable from one this operation had caused.
+    #[error(
+        "'{}' is in the middle of a {pending}; finish or abort it before pulling",
+        path.display()
+    )]
+    OperationInProgress {
+        path: PathBuf,
+        pending: PendingOperation,
+    },
+
+    /// An operation failed part-way and left the repository mid-operation.
+    ///
+    /// The failure that caused it is the [`source`]; the point of the variant
+    /// is everything around it. A caller that treats an error as "nothing
+    /// happened" is wrong here: the index and the working tree have changed,
+    /// [`status`] describes them as they now are, and nothing else will run
+    /// against this repository until the [`pending`] operation is finished or
+    /// aborted.
+    ///
+    /// [`source`]: std::error::Error::source
+    /// [`status`]: GitError::Interrupted::status
+    /// [`pending`]: GitError::Interrupted::pending
+    #[error(
+        "git {command} left '{}' in the middle of a {pending} that has to be \
+         resolved: {source}",
+        path.display()
+    )]
+    Interrupted {
+        command: String,
+        path: PathBuf,
+        pending: PendingOperation,
+        /// Boxed because this is the only variant carrying a whole status, and
+        /// every `Result<_, GitError>` in the crate would otherwise be as wide
+        /// as the rarest failure in it.
+        status: Option<Box<GitStatus>>,
+        #[source]
+        source: Box<GitError>,
+    },
+
     /// The named remote does not exist, or none could be chosen.
     #[error("{}", match remote {
         Some(remote) => format!("remote '{remote}' is not configured for this repository"),
@@ -95,18 +161,22 @@ pub enum GitError {
     NoRemote { remote: Option<String> },
 
     /// Pushing to the remote's default branch was refused.
+    ///
+    /// The branch is the one the remote names as its default *now*, asked of
+    /// the remote itself rather than read from what a clone recorded once.
     #[error(
         "refusing to push to '{branch}', the default branch of '{remote}'; \
          set PushOptions::allow_default_branch to push to it anyway"
     )]
     DefaultBranchPush { remote: String, branch: String },
 
-    /// The remote's default branch is unrecorded, so the refusal above cannot
-    /// be evaluated. Deliberately distinct: assuming `main` would let a push
-    /// through on exactly the repositories that cannot be checked.
+    /// The remote's default branch could not be determined, so the refusal
+    /// above cannot be evaluated. Deliberately distinct: assuming `main` would
+    /// let a push through on exactly the repositories that cannot be checked.
     #[error(
-        "the default branch of '{remote}' is not recorded in refs/remotes/{remote}/HEAD; \
-         run 'git remote set-head {remote} --auto', or set PushOptions::allow_default_branch"
+        "the default branch of '{remote}' is neither advertised by the remote nor \
+         recorded in refs/remotes/{remote}/HEAD; run 'git remote set-head {remote} --auto', \
+         or set PushOptions::allow_default_branch"
     )]
     DefaultBranchUnknown { remote: String },
 
@@ -136,8 +206,39 @@ pub enum GitError {
 /// this service is about to lock a repository. [`ProjectService::git`] does
 /// that resolution instead, releasing the catalog lock before it returns.
 ///
+/// # What a front end has to provide
+///
+/// The synchronizing verbs are blocking, and the contract they need from a
+/// caller with an event loop is the same for all three:
+///
+/// - **Worker thread.** [`fetch`], [`pull`] and [`push`] block until Git exits.
+///   Calling one on a UI thread freezes the window for the length of a network
+///   operation, which has no upper bound.
+/// - **Pending state.** The repository lock is exclusive, so a second operation
+///   on the same repository fails with [`GitError::RepositoryBusy`] rather than
+///   queueing. A front end that lets a user press *Pull* twice has to disable
+///   the control itself; the core will not serialize on its behalf.
+/// - **Cancellation.** Every verb takes a [`Cancellation`], and cancelling
+///   kills Git's whole process group. A cancelled [`pull`] is the one case that
+///   can leave work behind: see the recovery rule below.
+/// - **Refresh after failure, not just after success.** Every outcome carries
+///   the status the repository had once the operation finished, so the success
+///   path needs no second inspection. Failures carry it only where it exists —
+///   [`GitError::Interrupted`] — so any other error should be followed by a
+///   [`status`] or [`detailed_status`] call rather than by the assumption that
+///   nothing moved.
+/// - **Conflict recovery.** [`GitError::Interrupted`] means the working tree
+///   changed and Git is waiting: the front end has to offer the user a way to
+///   resolve or abort, because every later operation on that repository will
+///   refuse with [`GitError::OperationInProgress`] until it does.
+///
 /// [`ProjectId`]: crate::ProjectId
 /// [`ProjectService::git`]: crate::ProjectService::git
+/// [`fetch`]: GitService::fetch
+/// [`pull`]: GitService::pull
+/// [`push`]: GitService::push
+/// [`status`]: GitService::status
+/// [`detailed_status`]: GitService::detailed_status
 #[derive(Clone, Debug)]
 pub struct GitService {
     root: PathBuf,
@@ -234,6 +335,13 @@ impl GitService {
     ///
     /// Fast-forward only unless [`PullOptions::strategy`] says otherwise, so
     /// the default can neither rewrite history nor invent a merge commit.
+    ///
+    /// This is the one verb here that writes to the working tree, and therefore
+    /// the one whose failures are not all equivalent to "nothing happened". A
+    /// merge or rebase that stops at a conflict, and a cancellation that lands
+    /// mid-reconciliation, both report [`GitError::Interrupted`] carrying the
+    /// state the repository was left in; every other failure leaves the branch
+    /// where it was.
     pub fn pull(
         &self,
         options: &PullOptions,
@@ -253,9 +361,13 @@ impl GitService {
 
     /// Publishes the checked-out branch to a remote, under the same name.
     ///
-    /// Both refusals — [`GitError::DefaultBranchPush`] and
-    /// [`GitError::NoUpstream`] — are decided before Git is spawned, so a
-    /// refused push never reaches the remote at all.
+    /// Every refusal is decided before anything is written, so a refused push
+    /// never changes the remote. [`GitError::NoUpstream`],
+    /// [`GitError::UnbornBranch`] and [`GitError::LocalUpstreamUnsupported`]
+    /// are settled without contacting it at all;
+    /// [`GitError::DefaultBranchPush`] costs one read-only query, because the
+    /// only trustworthy answer to "which branch is the default" comes from the
+    /// remote rather than from what a clone recorded.
     pub fn push(
         &self,
         options: &PushOptions,

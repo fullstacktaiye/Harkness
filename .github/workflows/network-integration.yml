@@ -95,3 +95,11 @@ jobs:
           cargo test --locked -p harkness-core
           git::sync::tests::github_fetch_and_pull_round_trip
           -- --ignored --exact
+      # The default-branch guardrail asks the remote which branch it currently
+      # calls its default, so it needs one real hosting service to have answered
+      # at least once. It writes nothing: the push it refuses never runs.
+      - name: Test GitHub default branch refusal
+        run: >-
+          cargo test --locked -p harkness-core
+          git::sync::tests::github_default_branch_refusal_asks_the_remote
+          -- --ignored --exact
