@@ -447,9 +447,11 @@ dependencies = [
  "clap",
  "git2",
  "harkness-core",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
+ "time",
 ]
 
 [[package]]

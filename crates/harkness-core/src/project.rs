@@ -1,7 +1,9 @@
 use std::{
+    collections::HashSet,
+    ffi::OsString,
     fs::{self, File},
     io,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use thiserror::Error;
@@ -15,8 +17,8 @@ use crate::{
     },
     git::{self, Cancellation, GitError, GitService, clone},
     paths::{
-        self, CATALOG_FILE, CHECKOUT_DIRECTORY, REPOSITORIES_DIRECTORY, UnreservedPath,
-        WORKTREES_DIRECTORY, canonical_reserved_root,
+        self, CATALOG_FILE, CHECKOUT_DIRECTORY, LOCKS_DIRECTORY, REPOSITORIES_DIRECTORY,
+        UnreservedPath, WORKTREES_DIRECTORY, canonical_reserved_root,
     },
     remote::{normalize_remote_with_local, repository_name},
 };
@@ -158,6 +160,22 @@ pub enum ProjectError {
         source: io::Error,
     },
 
+    /// A managed-import lock could not be opened or acquired.
+    #[error("failed to lock managed repository storage '{}': {source}", path.display())]
+    ManagedRepositoryLock {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    /// Orphaned managed-repository storage could not be inspected or removed.
+    #[error("failed to reconcile managed repository storage '{}': {source}", path.display())]
+    ManagedRepositoryReconciliation {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
     /// A project cannot be removed while its worktrees remain catalogued.
     #[error(
         "project {id} still has catalogued worktrees; remove them first: {paths}",
@@ -203,6 +221,41 @@ pub enum ProjectError {
 }
 
 impl ProjectError {
+    /// Stable discriminants defined by the project layer itself.
+    ///
+    /// [`ProjectError::Git`] delegates to [`GitError::KINDS`], so callers that
+    /// need the complete namespace should combine both arrays.
+    pub const DIRECT_KINDS: &'static [&'static str] = &[
+        "data_directory_unavailable",
+        "invalid_directory",
+        "unreadable_directory",
+        "catalog_read",
+        "catalog_lock",
+        "malformed_catalog",
+        "catalog_version_too_old",
+        "catalog_version_too_new",
+        "invalid_catalog",
+        "project_selector_not_found",
+        "ambiguous_project_selector",
+        "project_not_found",
+        "project_unavailable",
+        "git_inspection",
+        "persistence",
+        "invalid_remote",
+        "git_launch",
+        "clone_failed",
+        "clone_cancelled",
+        "unsafe_managed_removal",
+        "managed_removal",
+        "managed_repository_lock",
+        "managed_repository_reconciliation",
+        "parent_has_worktrees",
+        "worktree_removal_required",
+        "unsafe_worktree_removal",
+        "worktree_parent_unsupported",
+        "dirty_worktree_removal",
+    ];
+
     /// Stable machine-readable discriminant for agent-facing error handling.
     #[must_use]
     pub fn kind(&self) -> &'static str {
@@ -228,6 +281,8 @@ impl ProjectError {
             Self::CloneCancelled => "clone_cancelled",
             Self::UnsafeManagedRemoval { .. } => "unsafe_managed_removal",
             Self::ManagedRemoval { .. } => "managed_removal",
+            Self::ManagedRepositoryLock { .. } => "managed_repository_lock",
+            Self::ManagedRepositoryReconciliation { .. } => "managed_repository_reconciliation",
             Self::ParentHasWorktrees { .. } => "parent_has_worktrees",
             Self::WorktreeRemovalRequired { .. } => "worktree_removal_required",
             Self::UnsafeWorktreeRemoval { .. } => "unsafe_worktree_removal",
@@ -241,9 +296,10 @@ impl ProjectError {
 /// A project lookup requested by a front end.
 ///
 /// Explicit selectors are resolved as a full identifier, an identifier prefix,
-/// a path, an exact display name, and finally a case-insensitive display name.
-/// Current-directory selectors choose the deepest catalogued root containing
-/// the supplied directory.
+/// an absolute or dot-relative path, an exact display name, and finally a
+/// case-insensitive display name. Bare words are always names. Current-directory
+/// selectors choose the deepest catalogued root containing the supplied
+/// directory.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ProjectSelector {
@@ -442,10 +498,12 @@ impl ProjectService {
     /// Resolves one catalog entry without mutating the catalog or Recents.
     ///
     /// Explicit values are considered in ergonomic precedence order: full
-    /// [`ProjectId`], UUID prefix of at least eight characters, path, exact
-    /// display name, then case-insensitive display name. A current-directory
-    /// selector returns the deepest catalogued root containing that directory,
-    /// which makes a nested worktree win over its repository parent.
+    /// [`ProjectId`], UUID prefix of at least eight characters, explicit
+    /// absolute or dot-relative path, exact display name, then case-insensitive
+    /// display name. A bare word is always a name and therefore never changes
+    /// meaning with the process working directory. A current-directory selector
+    /// returns the deepest catalogued root containing that directory, which
+    /// makes a nested worktree win over its repository parent.
     pub fn resolve(&self, selector: &ProjectSelector) -> Result<Project, ProjectError> {
         let projects = self.read_catalog_shared()?.projects;
         let project = match selector {
@@ -600,6 +658,11 @@ impl ProjectService {
         }
 
         let id = ProjectId::new();
+        // Reconciliation takes the same per-identifier lock before deleting an
+        // unreferenced directory. Keeping it for the whole clone prevents a
+        // concurrent cleanup from mistaking this not-yet-catalogued checkout
+        // for storage orphaned by a killed importer.
+        let _import_lock = ManagedImportLock::acquire(&self.data_dir, id)?;
         let managed_directory = self
             .data_dir
             .join(REPOSITORIES_DIRECTORY)
@@ -689,6 +752,82 @@ impl ProjectService {
             let _ = fs::remove_dir_all(&managed_directory);
         }
         imported
+    }
+
+    /// Removes managed-repository directories that have no catalog entry.
+    ///
+    /// Only immediate children named as project UUIDs are eligible. A live
+    /// import holds the matching per-identifier lock until its catalog row is
+    /// durable, so reconciliation skips in-progress clones and can safely reap
+    /// storage left behind when an importer was killed.
+    pub fn reconcile_managed_repositories(&self) -> Result<Vec<PathBuf>, ProjectError> {
+        let repositories_root = self.data_dir.join(REPOSITORIES_DIRECTORY);
+        let entries = match fs::read_dir(&repositories_root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(ProjectError::ManagedRepositoryReconciliation {
+                    path: repositories_root,
+                    source,
+                });
+            }
+        };
+
+        let mut candidates = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| ProjectError::ManagedRepositoryReconciliation {
+                path: repositories_root.clone(),
+                source,
+            })?;
+            let file_type = entry.file_type().map_err(|source| {
+                ProjectError::ManagedRepositoryReconciliation {
+                    path: entry.path(),
+                    source,
+                }
+            })?;
+            if !file_type.is_dir() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Ok(id) = name.parse::<ProjectId>() else {
+                continue;
+            };
+            candidates.push((id, entry.path()));
+        }
+        candidates.sort_by(|left, right| left.1.cmp(&right.1));
+
+        let mut locked = Vec::new();
+        for (id, path) in candidates {
+            if let Some(lock) = ManagedImportLock::try_acquire(&self.data_dir, id)? {
+                locked.push((id, path, lock));
+            }
+        }
+
+        // Every possible importer for one of these identifiers is excluded by
+        // its lock, so a single short shared catalog read is enough. No global
+        // catalog lock is held while directories are recursively removed.
+        let catalogued = self
+            .read_catalog_shared()?
+            .projects
+            .into_iter()
+            .map(|project| project.id)
+            .collect::<HashSet<_>>();
+        let mut removed = Vec::new();
+        for (id, path, _lock) in locked {
+            if catalogued.contains(&id) {
+                continue;
+            }
+            match fs::remove_dir_all(&path) {
+                Ok(()) => removed.push(path),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(ProjectError::ManagedRepositoryReconciliation { path, source });
+                }
+            }
+        }
+        Ok(removed)
     }
 
     /// Deletes a checkout only after proving it is the managed path for `id`.
@@ -1255,6 +1394,60 @@ impl ProjectService {
     }
 }
 
+/// Excludes reconciliation while one managed checkout is being cloned and
+/// excludes duplicate reconcilers from deleting the same orphan.
+struct ManagedImportLock {
+    file: File,
+}
+
+impl ManagedImportLock {
+    fn acquire(data_dir: &Path, id: ProjectId) -> Result<Self, ProjectError> {
+        let (file, path) = Self::open(data_dir, id)?;
+        file.lock()
+            .map_err(|source| ProjectError::ManagedRepositoryLock { path, source })?;
+        Ok(Self { file })
+    }
+
+    fn try_acquire(data_dir: &Path, id: ProjectId) -> Result<Option<Self>, ProjectError> {
+        let (file, path) = Self::open(data_dir, id)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(source)) => {
+                Err(ProjectError::ManagedRepositoryLock { path, source })
+            }
+        }
+    }
+
+    fn open(data_dir: &Path, id: ProjectId) -> Result<(File, PathBuf), ProjectError> {
+        let locks_directory = data_dir.join(LOCKS_DIRECTORY);
+        fs::create_dir_all(&locks_directory).map_err(|source| {
+            ProjectError::ManagedRepositoryLock {
+                path: locks_directory.clone(),
+                source,
+            }
+        })?;
+        let path = locks_directory.join(format!("managed-import-{id}.lock"));
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|source| ProjectError::ManagedRepositoryLock {
+                path: path.clone(),
+                source,
+            })?;
+        Ok((file, path))
+    }
+}
+
+impl Drop for ManagedImportLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
 enum RemovalPolicy {
     CatalogOnly,
     ManagedRepository,
@@ -1325,19 +1518,20 @@ fn resolve_value(projects: &[Project], value: &str) -> Result<Project, ProjectEr
     }
 
     let written_path = PathBuf::from(value);
-    let canonical_path = fs::canonicalize(&written_path).ok();
-    let path_matches = projects
-        .iter()
-        .filter(|project| {
-            project.root == written_path
-                || canonical_path
-                    .as_ref()
-                    .is_some_and(|path| project.root == *path)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if !path_matches.is_empty() {
-        return unique_match(value, path_matches);
+    if is_explicit_path_selector(&written_path)
+        && let Some(selector_path) = normalize_selector_path(&written_path)
+    {
+        let path_matches = projects
+            .iter()
+            .filter(|project| {
+                normalize_selector_path(&project.root)
+                    .is_some_and(|root| selector_paths_equal(&root, &selector_path))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !path_matches.is_empty() {
+            return unique_match(value, path_matches);
+        }
     }
 
     let exact_names = projects
@@ -1407,6 +1601,71 @@ fn is_uuid_prefix(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+}
+
+/// Bare words are names. Only an absolute path or a dot-relative path is
+/// allowed to depend on the process working directory.
+fn is_explicit_path_selector(path: &Path) -> bool {
+    path.is_absolute()
+        || matches!(
+            path.components().next(),
+            Some(Component::CurDir | Component::ParentDir)
+        )
+}
+
+/// Canonicalizes the longest existing prefix and appends any missing suffix.
+///
+/// Canonicalizing only the whole selector would make a deleted catalog root
+/// impossible to select. Resolving the existing prefix also normalizes macOS's
+/// `/var` -> `/private/var` alias and Windows's verbatim path spelling before
+/// comparing the missing final components.
+fn normalize_selector_path(path: &Path) -> Option<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let mut cursor = absolute.as_path();
+    let mut missing = Vec::<OsString>::new();
+    loop {
+        if let Ok(mut canonical) = fs::canonicalize(cursor) {
+            for component in missing.iter().rev() {
+                canonical.push(component);
+            }
+            return Some(platform_comparable_path(canonical));
+        }
+        let name = cursor.file_name()?.to_os_string();
+        missing.push(name);
+        cursor = cursor.parent()?;
+    }
+}
+
+#[cfg(windows)]
+fn platform_comparable_path(path: PathBuf) -> PathBuf {
+    let displayed = path.to_string_lossy();
+    if let Some(rest) = displayed.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = displayed.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path
+    }
+}
+
+#[cfg(not(windows))]
+fn platform_comparable_path(path: PathBuf) -> PathBuf {
+    path
+}
+
+#[cfg(windows)]
+fn selector_paths_equal(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+#[cfg(not(windows))]
+fn selector_paths_equal(left: &Path, right: &Path) -> bool {
+    left == right
 }
 
 fn refuse_parent_with_worktrees(catalog: &Catalog, id: ProjectId) -> Result<(), ProjectError> {
@@ -1624,7 +1883,10 @@ mod tests {
         time::Duration,
     };
 
-    use super::{ProjectError, ProjectSelector, ProjectService, WorktreeBase, sort_recents};
+    use super::{
+        ManagedImportLock, ProjectError, ProjectSelector, ProjectService, WorktreeBase,
+        is_explicit_path_selector, sort_recents,
+    };
     use crate::{
         catalog::{
             CATALOG_VERSION, MINIMUM_SUPPORTED_CATALOG_VERSION,
@@ -1818,6 +2080,31 @@ mod tests {
     }
 
     #[test]
+    fn bare_words_are_names_not_current_directory_relative_paths() {
+        assert!(!is_explicit_path_selector(Path::new("alpha")));
+        assert!(is_explicit_path_selector(Path::new("./alpha")));
+        assert!(is_explicit_path_selector(Path::new("../alpha")));
+    }
+
+    #[test]
+    fn path_selector_resolves_a_deleted_catalog_root() {
+        let fixture = Fixture::new();
+        let written_root = fixture.directory("deleted-selector");
+        let mut service = fixture.service();
+        let imported = service.import_local(&written_root).unwrap();
+        fs::remove_dir_all(&written_root).unwrap();
+
+        let resolved = service
+            .resolve(&ProjectSelector::from(
+                written_root.to_string_lossy().into_owned(),
+            ))
+            .unwrap();
+
+        assert_eq!(resolved.id, imported.id);
+        assert!(!resolved.available);
+    }
+
+    #[test]
     fn ambiguous_uuid_prefix_reports_every_candidate() {
         let fixture = Fixture::new();
         let first_root = fixture.directory("prefix-first");
@@ -1999,6 +2286,20 @@ mod tests {
                 "managed_removal",
             ),
             (
+                ProjectError::ManagedRepositoryLock {
+                    path: path.clone(),
+                    source: io_error(),
+                },
+                "managed_repository_lock",
+            ),
+            (
+                ProjectError::ManagedRepositoryReconciliation {
+                    path: path.clone(),
+                    source: io_error(),
+                },
+                "managed_repository_reconciliation",
+            ),
+            (
                 ProjectError::ParentHasWorktrees {
                     id,
                     worktrees: vec![path.clone()],
@@ -2037,6 +2338,11 @@ mod tests {
             (ProjectError::Git(GitError::Cancelled), "cancelled"),
         ];
 
+        let direct = cases[..cases.len() - 1]
+            .iter()
+            .map(|(_, kind)| *kind)
+            .collect::<Vec<_>>();
+        assert_eq!(direct, ProjectError::DIRECT_KINDS);
         for (error, expected) in cases {
             assert_eq!(error.kind(), expected, "unexpected kind for {error:?}");
         }
@@ -4292,6 +4598,38 @@ mod tests {
             !repositories.exists() || fs::read_dir(repositories).unwrap().next().is_none(),
             "partial managed repository directory remained"
         );
+    }
+
+    #[test]
+    fn managed_repository_reconciliation_removes_only_unlocked_uuid_orphans() {
+        let fixture = Fixture::new();
+        let service = fixture.service();
+        let repositories = fixture.data_dir.join(REPOSITORIES_DIRECTORY);
+        let orphan_id = ProjectId::new();
+        let active_id = ProjectId::new();
+        let unrelated = repositories.join("keep-me");
+        let orphan = repositories.join(orphan_id.to_string());
+        let active = repositories.join(active_id.to_string());
+        fs::create_dir_all(orphan.join(CHECKOUT_DIRECTORY)).unwrap();
+        fs::create_dir_all(active.join(CHECKOUT_DIRECTORY)).unwrap();
+        fs::create_dir_all(&unrelated).unwrap();
+        let active_lock = ManagedImportLock::acquire(&fixture.data_dir, active_id).unwrap();
+
+        assert_eq!(
+            service.reconcile_managed_repositories().unwrap(),
+            vec![orphan.clone()]
+        );
+        assert!(!orphan.exists());
+        assert!(active.exists());
+        assert!(unrelated.exists());
+
+        drop(active_lock);
+        assert_eq!(
+            service.reconcile_managed_repositories().unwrap(),
+            vec![active.clone()]
+        );
+        assert!(!active.exists());
+        assert!(unrelated.exists());
     }
 
     #[cfg(unix)]

@@ -46,40 +46,65 @@ cargo fmt --check
 cargo clippy --workspace --all-targets
 ```
 
-The CLI exposes the project catalog with stable machine-readable output and
-exit codes suitable for agents. Select a project with one global
-`--project <SELECTOR>` accepting a full ID, an ID prefix of at least eight
-characters, a canonical path, or a display name. When it is omitted, Harkness
-walks upward from the current directory and selects the deepest catalogued
-root, so commands run naturally from a repository or linked worktree.
+The CLI exposes the project catalog with a versioned machine-readable contract
+and stable exit codes suitable for agents. Commands that act on one project
+accept `--project <SELECTOR>` after the command name. A selector may be a full
+ID, an ID prefix of at least eight characters, an absolute or dot-relative
+path, or a display name. Bare words are always names, so their meaning does not
+change with the current directory. When `--project` is omitted, Harkness walks
+upward from the current directory and selects the deepest catalogued root, so
+commands run naturally from a repository or linked worktree.
 
 ```sh
 harkness --json project list
-harkness --project <selector> project show
+harkness --json project list --no-status
+harkness project show --project <selector>
+harkness project resolve <selector>
 harkness project import <path>
 harkness project clone <github-remote>
-harkness --project <selector> project forget
-harkness --project <selector> project delete --yes
+harkness project reconcile
+harkness project forget --project <selector>
+harkness project delete --project <selector> --yes
 
 harkness worktree list <parent-id>
 harkness worktree create <parent-id> --new <branch> [--start <revision>]
 harkness worktree create <parent-id> --existing <branch>
 harkness worktree create <parent-id> --detached <revision>
-harkness worktree remove <worktree-id> [--force]
+harkness worktree remove <worktree-id>
+harkness worktree remove <worktree-id> --force --yes
 harkness worktree reconcile <parent-id>
+
+harkness --json contract
 ```
 
-`--json` writes exactly one success or error envelope to standard output.
-Clone progress remains on standard error as one JSON object per line, keeping
-standard output parseable. `HARKNESS_DATA_DIR` and `--data-dir <path>` select an
-isolated catalog, with the explicit flag taking precedence. Run
+Operational `--json` commands write exactly one success or error envelope to
+standard output. Every envelope starts with `"v": 1` and has a `type` of
+`success`, `error`, or `progress`; success and error results also carry `ok`.
+Clone progress remains on standard error as one versioned JSON object per line,
+keeping standard output parseable. Help and version are deliberately plain text
+even when `--json` is present. `harkness --json contract` reports the current
+envelope version, exit codes, streams, and complete error-kind namespaces.
+
+Project JSON uses an explicit CLI projection rather than the catalog's storage
+serializer. `last_opened` is RFC 3339, source-specific optional fields are
+always present with `null` when inapplicable, and `git` has a fixed documented
+shape. A `--no-status` listing avoids filesystem and Git probes and reports
+`status_checked: false`, `available: null`, and `git: null` rather than
+pretending the project is missing. `HARKNESS_DATA_DIR` and `--data-dir <path>`
+select an isolated catalog, with the explicit flag taking precedence. Run
 `harkness --help` for the exit-code contract and complete command help.
 
 Removing a worktree preserves its branch, allowing `--existing` to reuse it.
-Ordinary removal refuses uncommitted files; `--force` explicitly discards
-them. Reconciliation removes only missing Harkness-owned rows and their exact
-Git administrative records. It never performs a repository-wide prune or
-adopts or removes external worktrees.
+Ordinary removal refuses uncommitted files; discarding them requires both
+`--force` and `--yes`. Worktree reconciliation removes only missing
+Harkness-owned rows and their exact Git administrative records. It never
+performs a repository-wide prune or adopts or removes external worktrees.
+
+Ctrl-C cooperatively cancels a running clone or Git operation, cleans partial
+storage, and exits 130. A non-cooperative kill cannot run cleanup, so `project
+reconcile` safely removes UUID-named managed directories with no catalog row.
+Per-import locks make it skip live clones, and unrelated files or directories
+under managed storage are left untouched.
 
 The GUI opens a Kirigami window on the project launcher backed by the Rust
 `HarknessBackend` and `FileTreeModel` QML objects. Its project shell exposes the

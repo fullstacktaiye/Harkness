@@ -10,10 +10,12 @@ name = "harkness"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4.6.5", features = ["derive"] }
+clap.workspace = true
 harkness-core.workspace = true
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+time.workspace = true
 
 [dev-dependencies]
 git2.workspace = true

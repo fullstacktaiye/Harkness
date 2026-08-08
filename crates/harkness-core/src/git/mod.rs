@@ -280,6 +280,43 @@ pub enum GitError {
 }
 
 impl GitError {
+    /// Every stable discriminant this error namespace can emit.
+    pub const KINDS: &'static [&'static str] = &[
+        "launch",
+        "failed",
+        "cancelled",
+        "timed_out",
+        "repository_busy",
+        "lock",
+        "not_a_repository",
+        "path_outside_repository",
+        "empty_commit_message",
+        "nothing_staged",
+        "amend_unborn_branch",
+        "invalid_branch_name",
+        "no_such_branch",
+        "branch_already_exists",
+        "invalid_start_point",
+        "current_branch_deletion",
+        "default_branch_deletion",
+        "branch_checked_out_in_worktree",
+        "worktree_locked",
+        "unmerged_branch_deletion",
+        "non_fast_forward",
+        "authentication_failed",
+        "no_upstream",
+        "unborn_branch",
+        "local_upstream_unsupported",
+        "operation_in_progress",
+        "interrupted",
+        "no_remote",
+        "default_branch_push",
+        "default_branch_unknown",
+        "detached_head",
+        "inspection",
+        "malformed_status",
+    ];
+
     /// Stable machine-readable discriminant for agent-facing error handling.
     #[must_use]
     pub fn kind(&self) -> &'static str {
@@ -1088,6 +1125,8 @@ mod tests {
             ),
         ];
 
+        let kinds = cases.iter().map(|(_, kind)| *kind).collect::<Vec<_>>();
+        assert_eq!(kinds, GitError::KINDS);
         for (error, expected) in cases {
             assert_eq!(error.kind(), expected, "unexpected kind for {error:?}");
         }
