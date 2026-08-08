@@ -6,7 +6,7 @@ fn main() {
             "qml/Main.qml",
             "qml/LauncherPage.qml",
             "qml/LauncherActionCard.qml",
-            "qml/RecentProjectCard.qml",
+            "qml/SidebarProjectRow.qml",
             "qml/ProjectShellPage.qml",
             "qml/GitPanel.qml",
         ]),
