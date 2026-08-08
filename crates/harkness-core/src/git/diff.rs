@@ -623,12 +623,16 @@ mod tests {
         fs::write(root.join("space name.txt"), b"old space\n").unwrap();
         fs::write(root.join("-leading.txt"), b"old leading\n").unwrap();
 
-        #[cfg(unix)]
+        // Linux filesystems accept arbitrary non-NUL path bytes. Darwin's
+        // filesystem APIs reject this exact invalid UTF-8 sequence with
+        // `EILSEQ`, so other platforms retain the raw-content half of this
+        // regression under an ordinary path.
+        #[cfg(target_os = "linux")]
         let byte_path = {
             use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
             std::path::PathBuf::from(OsStr::from_bytes(b"non-utf8-\xff.txt"))
         };
-        #[cfg(not(unix))]
+        #[cfg(not(target_os = "linux"))]
         let byte_path = std::path::PathBuf::from("non-utf8.txt");
         fs::write(root.join(&byte_path), b"old-\xff\n").unwrap();
         commit_all(&repository, "add unusual paths");
@@ -710,6 +714,11 @@ mod tests {
         let fixture = Fixture::new();
         let root = fixture.directory("patch-round-trip");
         let repository = initialize_repository(&root);
+        repository
+            .config()
+            .unwrap()
+            .set_bool("core.autocrlf", false)
+            .unwrap();
         let old = b"one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nfourteen\nfifteen\n";
         let new = b"one\nTWO\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nFOURTEEN\nfifteen\n";
         fs::write(root.join("tracked.txt"), old).unwrap();
