@@ -402,7 +402,9 @@ fn inspection(path: &Path, source: git2::Error) -> GitError {
 mod tests {
     use std::fs;
 
-    use super::{administrative_name_at, parse_porcelain, same_path};
+    #[cfg(unix)]
+    use super::same_path;
+    use super::{administrative_name_at, parse_porcelain};
 
     #[test]
     fn parses_branch_detached_locked_and_unseparated_porcelain_rows() {

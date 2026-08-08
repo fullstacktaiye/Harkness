@@ -4262,7 +4262,7 @@ mod tests {
                 &Cancellation::default(),
             ),
             Err(ProjectError::WorktreeDestinationInsideDataDirectory { path, .. })
-                if path == data_destination
+                if crate::git::worktree::same_path(&path, &data_destination)
         ));
 
         let missing_parent = fixture
@@ -4344,7 +4344,7 @@ mod tests {
             .move_worktree(worktree.id, &destination, &Cancellation::default())
             .unwrap();
 
-        assert_eq!(moved.root, actual_parent.join("checkout"));
+        assert_eq!(moved.root, as_catalogued(&actual_parent.join("checkout")));
         assert!(moved.root.exists());
         service
             .remove_worktree(worktree.id, false, &Cancellation::default())
@@ -4387,7 +4387,8 @@ mod tests {
                 worktree: source,
                 destination: refused,
                 ..
-            }) if source == worktree.root && refused == destination
+            }) if crate::git::worktree::same_path(&source, &worktree.root)
+                && crate::git::worktree::same_path(&refused, &destination)
         ));
         assert!(worktree.root.exists());
         assert!(!destination.exists());
