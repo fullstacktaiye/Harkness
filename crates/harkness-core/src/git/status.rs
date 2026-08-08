@@ -116,6 +116,21 @@ pub enum FileChange {
     Unmerged,
 }
 
+impl fmt::Display for FileChange {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Added => "added",
+            Self::Modified => "modified",
+            Self::Deleted => "deleted",
+            Self::Renamed => "renamed",
+            Self::Copied => "copied",
+            Self::TypeChanged => "type-changed",
+            Self::Untracked => "untracked",
+            Self::Unmerged => "unmerged",
+        })
+    }
+}
+
 /// One path reported by a detailed status.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatusEntry {

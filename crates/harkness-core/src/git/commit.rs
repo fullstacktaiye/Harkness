@@ -338,7 +338,7 @@ fn run_paths(
     outcomes
 }
 
-fn refresh_status(
+pub(crate) fn refresh_status(
     git_executable: &Path,
     root: &Path,
     enabled: bool,
@@ -898,6 +898,14 @@ mod tests {
         ));
         assert!(matches!(
             service.unstage(["tracked.txt"], &cancelled),
+            Err(GitError::Cancelled)
+        ));
+        assert!(matches!(
+            service.stage_hunks(&[], &cancelled),
+            Err(GitError::Cancelled)
+        ));
+        assert!(matches!(
+            service.unstage_hunks(&[], &cancelled),
             Err(GitError::Cancelled)
         ));
         assert!(matches!(
