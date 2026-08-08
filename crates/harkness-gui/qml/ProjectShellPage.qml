@@ -169,6 +169,21 @@ Kirigami.Page {
         anchors.fill: parent
         spacing: 0
 
+        GitPanel {
+            Layout.fillHeight: true
+            Layout.minimumWidth: Kirigami.Units.gridUnit * 20
+            Layout.preferredWidth: Kirigami.Units.gridUnit * 23
+            Layout.maximumWidth: parent.width * 0.5
+            backend: shell.backend
+            project: shell.project
+            visible: shell.project.available && shell.project.isGit
+        }
+
+        Kirigami.Separator {
+            Layout.fillHeight: true
+            visible: shell.project.available && shell.project.isGit
+        }
+
         TreeView {
             id: tree
 
@@ -211,20 +226,6 @@ Kirigami.Page {
             }
 
             Component.onCompleted: fileModel.setRoot(shell.project.root)
-        }
-
-        Kirigami.Separator {
-            Layout.fillHeight: true
-            visible: shell.project.available && shell.project.isGit
-        }
-
-        GitPanel {
-            Layout.fillHeight: true
-            Layout.preferredWidth: Kirigami.Units.gridUnit * 24
-            Layout.maximumWidth: parent.width * 0.55
-            backend: shell.backend
-            project: shell.project
-            visible: shell.project.available && shell.project.isGit
         }
     }
 

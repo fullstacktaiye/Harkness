@@ -19,6 +19,11 @@ Item {
 
     implicitWidth: Kirigami.Units.gridUnit * 22
 
+    Rectangle {
+        anchors.fill: parent
+        color: Kirigami.Theme.alternateBackgroundColor
+    }
+
     function job(kind) {
         for (let index = 0; index < backend.jobs.length; ++index) {
             const candidate = backend.jobs[index];
@@ -59,7 +64,7 @@ Item {
         contentWidth: availableWidth
 
         ColumnLayout {
-            spacing: Kirigami.Units.largeSpacing
+            spacing: 0
             width: scroll.availableWidth
 
             RowLayout {
@@ -67,6 +72,7 @@ Item {
                 Layout.leftMargin: Kirigami.Units.largeSpacing
                 Layout.rightMargin: Kirigami.Units.largeSpacing
                 Layout.topMargin: Kirigami.Units.largeSpacing
+                Layout.bottomMargin: Kirigami.Units.smallSpacing
 
                 Kirigami.Heading {
                     Layout.fillWidth: true
@@ -85,6 +91,7 @@ Item {
 
             ColumnLayout {
                 Layout.fillWidth: true
+                Layout.bottomMargin: Kirigami.Units.largeSpacing
                 Layout.leftMargin: Kirigami.Units.largeSpacing
                 Layout.rightMargin: Kirigami.Units.largeSpacing
                 spacing: Kirigami.Units.smallSpacing
@@ -140,13 +147,25 @@ Item {
 
             ColumnLayout {
                 Layout.fillWidth: true
+                Layout.bottomMargin: Kirigami.Units.largeSpacing
                 Layout.leftMargin: Kirigami.Units.largeSpacing
                 Layout.rightMargin: Kirigami.Units.largeSpacing
+                Layout.topMargin: Kirigami.Units.largeSpacing
                 spacing: Kirigami.Units.smallSpacing
 
-                Kirigami.Heading {
-                    level: 4
-                    text: qsTr("Changes")
+                RowLayout {
+                    Layout.fillWidth: true
+
+                    Kirigami.Heading {
+                        Layout.fillWidth: true
+                        level: 4
+                        text: qsTr("Changes")
+                    }
+
+                    Controls.Label {
+                        color: Kirigami.Theme.disabledTextColor
+                        text: panel.entries.length
+                    }
                 }
 
                 Controls.Label {
@@ -215,170 +234,178 @@ Item {
                 }
             }
 
-            Controls.Frame {
+            Kirigami.Separator {
                 Layout.fillWidth: true
+            }
+
+            ColumnLayout {
+                Layout.fillWidth: true
+                Layout.bottomMargin: Kirigami.Units.largeSpacing
                 Layout.leftMargin: Kirigami.Units.largeSpacing
                 Layout.rightMargin: Kirigami.Units.largeSpacing
+                Layout.topMargin: Kirigami.Units.largeSpacing
+                spacing: Kirigami.Units.smallSpacing
 
-                ColumnLayout {
-                    anchors.fill: parent
-                    spacing: Kirigami.Units.smallSpacing
+                Kirigami.Heading {
+                    level: 4
+                    text: qsTr("Commit")
+                }
 
-                    Kirigami.Heading {
-                        level: 4
+                Controls.TextField {
+                    id: commitMessage
+
+                    Layout.fillWidth: true
+                    enabled: panel.job("commit") === null
+                    placeholderText: qsTr("Commit message")
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+
+                    Controls.Button {
+                        Layout.fillWidth: true
+                        enabled: panel.job("commit") === null && commitMessage.text.trim().length > 0
+                        text: qsTr("Amend")
+                        onClicked: panel.backend.commit(panel.project.id, commitMessage.text, true)
+                    }
+
+                    Controls.Button {
+                        Layout.fillWidth: true
+                        enabled: panel.job("commit") === null && commitMessage.text.trim().length > 0
+                        highlighted: true
                         text: qsTr("Commit")
+                        onClicked: panel.backend.commit(panel.project.id, commitMessage.text, false)
+                    }
+                }
+            }
+
+            Kirigami.Separator {
+                Layout.fillWidth: true
+            }
+
+            ColumnLayout {
+                Layout.fillWidth: true
+                Layout.bottomMargin: Kirigami.Units.largeSpacing
+                Layout.leftMargin: Kirigami.Units.largeSpacing
+                Layout.rightMargin: Kirigami.Units.largeSpacing
+                Layout.topMargin: Kirigami.Units.largeSpacing
+                spacing: Kirigami.Units.smallSpacing
+
+                Kirigami.Heading {
+                    level: 4
+                    text: qsTr("Remote")
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+
+                    Controls.Button {
+                        Layout.fillWidth: true
+                        enabled: panel.job("fetch") === null
+                        icon.name: "download"
+                        text: qsTr("Fetch")
+                        onClicked: panel.backend.fetch(panel.project.id)
                     }
 
-                    Controls.TextField {
-                        id: commitMessage
-
+                    Controls.Button {
                         Layout.fillWidth: true
-                        enabled: panel.job("commit") === null
-                        placeholderText: qsTr("Commit message")
+                        enabled: panel.job("pull") === null
+                        icon.name: "go-down"
+                        text: qsTr("Pull")
+                        onClicked: panel.backend.pull(panel.project.id)
                     }
 
-                    RowLayout {
+                    Controls.Button {
+                        Layout.fillWidth: true
+                        enabled: panel.job("push") === null
+                        icon.name: "go-up"
+                        text: qsTr("Push")
+                        onClicked: panel.backend.push(panel.project.id, false)
+                    }
+                }
+
+                Repeater {
+                    model: panel.networkJobs()
+
+                    delegate: RowLayout {
+                        required property var modelData
+
                         Layout.fillWidth: true
 
-                        Item {
+                        Controls.BusyIndicator {
+                            Layout.preferredHeight: Kirigami.Units.iconSizes.small
+                            Layout.preferredWidth: Kirigami.Units.iconSizes.small
+                            running: true
+                        }
+
+                        Controls.Label {
                             Layout.fillWidth: true
+                            elide: Text.ElideRight
+                            text: qsTr("%1: %2").arg(modelData.label).arg(modelData.progress)
                         }
 
                         Controls.Button {
-                            enabled: panel.job("commit") === null && commitMessage.text.trim().length > 0
-                            text: qsTr("Amend")
-                            onClicked: panel.backend.commit(panel.project.id, commitMessage.text, true)
-                        }
-
-                        Controls.Button {
-                            enabled: panel.job("commit") === null && commitMessage.text.trim().length > 0
-                            highlighted: true
-                            text: qsTr("Commit")
-                            onClicked: panel.backend.commit(panel.project.id, commitMessage.text, false)
+                            enabled: modelData.cancellable
+                            text: qsTr("Cancel")
+                            onClicked: panel.backend.cancelJob(modelData.id)
                         }
                     }
                 }
             }
 
-            Controls.Frame {
+            Kirigami.Separator {
                 Layout.fillWidth: true
-                Layout.leftMargin: Kirigami.Units.largeSpacing
-                Layout.rightMargin: Kirigami.Units.largeSpacing
-
-                ColumnLayout {
-                    anchors.fill: parent
-                    spacing: Kirigami.Units.smallSpacing
-
-                    Kirigami.Heading {
-                        level: 4
-                        text: qsTr("Remote")
-                    }
-
-                    RowLayout {
-                        Layout.fillWidth: true
-
-                        Controls.Button {
-                            Layout.fillWidth: true
-                            enabled: panel.job("fetch") === null
-                            icon.name: "download"
-                            text: qsTr("Fetch")
-                            onClicked: panel.backend.fetch(panel.project.id)
-                        }
-
-                        Controls.Button {
-                            Layout.fillWidth: true
-                            enabled: panel.job("pull") === null
-                            icon.name: "go-down"
-                            text: qsTr("Pull")
-                            onClicked: panel.backend.pull(panel.project.id)
-                        }
-
-                        Controls.Button {
-                            Layout.fillWidth: true
-                            enabled: panel.job("push") === null
-                            icon.name: "go-up"
-                            text: qsTr("Push")
-                            onClicked: panel.backend.push(panel.project.id, false)
-                        }
-                    }
-
-                    Repeater {
-                        model: panel.networkJobs()
-
-                        delegate: RowLayout {
-                            required property var modelData
-
-                            Layout.fillWidth: true
-
-                            Controls.BusyIndicator {
-                                Layout.preferredHeight: Kirigami.Units.iconSizes.small
-                                Layout.preferredWidth: Kirigami.Units.iconSizes.small
-                                running: true
-                            }
-
-                            Controls.Label {
-                                Layout.fillWidth: true
-                                elide: Text.ElideRight
-                                text: qsTr("%1: %2").arg(modelData.label).arg(modelData.progress)
-                            }
-
-                            Controls.Button {
-                                enabled: modelData.cancellable
-                                text: qsTr("Cancel")
-                                onClicked: panel.backend.cancelJob(modelData.id)
-                            }
-                        }
-                    }
-                }
             }
 
-            Controls.Frame {
+            ColumnLayout {
                 Layout.fillWidth: true
+                Layout.bottomMargin: Kirigami.Units.largeSpacing
                 Layout.leftMargin: Kirigami.Units.largeSpacing
                 Layout.rightMargin: Kirigami.Units.largeSpacing
+                Layout.topMargin: Kirigami.Units.largeSpacing
+                spacing: Kirigami.Units.smallSpacing
 
-                ColumnLayout {
-                    anchors.fill: parent
-                    spacing: Kirigami.Units.smallSpacing
+                Kirigami.Heading {
+                    level: 4
+                    text: qsTr("Branches")
+                }
 
-                    Kirigami.Heading {
-                        level: 4
-                        text: qsTr("Branches")
+                Controls.ComboBox {
+                    id: branchPicker
+
+                    Layout.fillWidth: true
+                    enabled: panel.job("checkout") === null
+                    model: panel.backend.branches
+                    textRole: "name"
+                    valueRole: "name"
+
+                    currentIndex: {
+                        for (let index = 0; index < count; ++index) {
+                            if (valueAt(index) === panel.project.branch)
+                                return index;
+                        }
+                        return -1;
                     }
 
-                    Controls.ComboBox {
-                        id: branchPicker
+                    delegate: Controls.ItemDelegate {
+                        required property var modelData
 
-                        Layout.fillWidth: true
-                        enabled: panel.job("checkout") === null
-                        model: panel.backend.branches
-                        textRole: "name"
-                        valueRole: "name"
-
-                        currentIndex: {
-                            for (let index = 0; index < count; ++index) {
-                                if (valueAt(index) === panel.project.branch)
-                                    return index;
-                            }
-                            return -1;
-                        }
-
-                        delegate: Controls.ItemDelegate {
-                            required property var modelData
-
-                            Controls.ToolTip.text: modelData.detail
-                            Controls.ToolTip.visible: hovered && modelData.detail.length > 0
-                            enabled: modelData.selectable
-                            text: modelData.name
-                            width: branchPicker.width
-                        }
-
-                        onActivated: {
-                            const selected = String(currentValue);
-                            if (selected.length > 0 && selected !== panel.project.branch)
-                                panel.backend.checkoutBranch(panel.project.id, selected);
-                        }
+                        Controls.ToolTip.text: modelData.detail
+                        Controls.ToolTip.visible: hovered && modelData.detail.length > 0
+                        enabled: modelData.selectable
+                        text: modelData.name
+                        width: branchPicker.width
                     }
+
+                    onActivated: {
+                        const selected = String(currentValue);
+                        if (selected.length > 0 && selected !== panel.project.branch)
+                            panel.backend.checkoutBranch(panel.project.id, selected);
+                    }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
 
                     Controls.TextField {
                         id: newBranch
@@ -388,137 +415,137 @@ Item {
                         placeholderText: qsTr("New branch name")
                     }
 
-                    RowLayout {
+                    Controls.TextField {
+                        id: branchStart
+
                         Layout.fillWidth: true
-
-                        Controls.TextField {
-                            id: branchStart
-
-                            Layout.fillWidth: true
-                            enabled: panel.job("create_branch") === null
-                            placeholderText: qsTr("Start point")
-                            text: "HEAD"
-                        }
-
-                        Controls.Button {
-                            enabled: panel.job("create_branch") === null && newBranch.text.trim().length > 0
-                            icon.name: "list-add"
-                            text: qsTr("Create and switch")
-                            onClicked: panel.backend.createBranch(
-                                panel.project.id,
-                                newBranch.text,
-                                branchStart.text
-                            )
-                        }
+                        enabled: panel.job("create_branch") === null
+                        placeholderText: qsTr("Start point")
+                        text: "HEAD"
                     }
+                }
+
+                Controls.Button {
+                    Layout.fillWidth: true
+                    enabled: panel.job("create_branch") === null && newBranch.text.trim().length > 0
+                    icon.name: "list-add"
+                    text: qsTr("Create and switch")
+                    onClicked: panel.backend.createBranch(
+                        panel.project.id,
+                        newBranch.text,
+                        branchStart.text
+                    )
                 }
             }
 
-            Controls.Frame {
+            Kirigami.Separator {
                 Layout.fillWidth: true
+            }
+
+            ColumnLayout {
+                Layout.fillWidth: true
+                Layout.bottomMargin: Kirigami.Units.largeSpacing
                 Layout.leftMargin: Kirigami.Units.largeSpacing
                 Layout.rightMargin: Kirigami.Units.largeSpacing
-                Layout.bottomMargin: Kirigami.Units.largeSpacing
+                Layout.topMargin: Kirigami.Units.largeSpacing
+                spacing: Kirigami.Units.smallSpacing
+
+                Kirigami.Heading {
+                    level: 4
+                    text: qsTr("Worktrees")
+                }
+
+                Controls.Label {
+                    Layout.fillWidth: true
+                    color: Kirigami.Theme.disabledTextColor
+                    text: qsTr("This workspace comes from %1.").arg(panel.project.parentName)
+                    visible: panel.project.worktree
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    visible: !panel.project.worktree
+
+                    Controls.Button {
+                        Layout.fillWidth: true
+                        enabled: panel.job("create_worktree") === null
+                        icon.name: "vcs-branch"
+                        text: qsTr("New Worktree…")
+                        onClicked: worktreeForm.visible = !worktreeForm.visible
+                    }
+
+                    Controls.Button {
+                        Layout.fillWidth: true
+                        enabled: panel.job("reconcile_worktrees") === null
+                        icon.name: "view-refresh"
+                        text: qsTr("Reconcile")
+                        onClicked: panel.backend.reconcileWorktrees(panel.project.id)
+                    }
+                }
 
                 ColumnLayout {
-                    anchors.fill: parent
-                    spacing: Kirigami.Units.smallSpacing
+                    id: worktreeForm
 
-                    Kirigami.Heading {
-                        level: 4
-                        text: qsTr("Worktrees")
+                    Layout.fillWidth: true
+                    spacing: Kirigami.Units.smallSpacing
+                    visible: false
+
+                    Controls.ComboBox {
+                        id: worktreeMode
+
+                        readonly property string mode: ["new", "existing", "detached"][currentIndex]
+
+                        Layout.fillWidth: true
+                        model: [qsTr("New branch"), qsTr("Existing branch"), qsTr("Detached HEAD")]
                     }
 
-                    Controls.Label {
+                    Controls.TextField {
+                        id: worktreeBranch
+
+                        Layout.fillWidth: true
+                        placeholderText: worktreeMode.mode === "existing"
+                            ? qsTr("Existing branch")
+                            : qsTr("New branch name")
+                        visible: worktreeMode.mode !== "detached"
+                    }
+
+                    Controls.TextField {
+                        id: worktreeStart
+
+                        Layout.fillWidth: true
+                        placeholderText: worktreeMode.mode === "detached"
+                            ? qsTr("Commit or revision")
+                            : qsTr("Start point")
+                        text: worktreeMode.mode === "new" ? "HEAD" : ""
+                        visible: worktreeMode.mode !== "existing"
+                    }
+
+                    Controls.Button {
+                        Layout.fillWidth: true
+                        enabled: panel.job("create_worktree") === null
+                            && (worktreeMode.mode === "detached"
+                                ? worktreeStart.text.trim().length > 0
+                                : worktreeBranch.text.trim().length > 0)
+                        icon.name: "list-add"
+                        text: qsTr("Review and create…")
+                        onClicked: createWorktreeDialog.open()
+                    }
+                }
+
+                Repeater {
+                    model: panel.project.worktree ? [] : panel.backend.worktrees
+
+                    delegate: Controls.Label {
+                        required property var modelData
+
                         Layout.fillWidth: true
                         color: Kirigami.Theme.disabledTextColor
-                        text: qsTr("This workspace comes from %1.").arg(panel.project.parentName)
-                        visible: panel.project.worktree
-                    }
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        visible: !panel.project.worktree
-
-                        Controls.Button {
-                            enabled: panel.job("create_worktree") === null
-                            icon.name: "vcs-branch"
-                            text: qsTr("New Worktree…")
-                            onClicked: worktreeForm.visible = !worktreeForm.visible
-                        }
-
-                        Controls.Button {
-                            enabled: panel.job("reconcile_worktrees") === null
-                            icon.name: "view-refresh"
-                            text: qsTr("Reconcile")
-                            onClicked: panel.backend.reconcileWorktrees(panel.project.id)
-                        }
-                    }
-
-                    ColumnLayout {
-                        id: worktreeForm
-
-                        Layout.fillWidth: true
-                        spacing: Kirigami.Units.smallSpacing
-                        visible: false
-
-                        Controls.ComboBox {
-                            id: worktreeMode
-
-                            readonly property string mode: ["new", "existing", "detached"][currentIndex]
-
-                            Layout.fillWidth: true
-                            model: [qsTr("New branch"), qsTr("Existing branch"), qsTr("Detached HEAD")]
-                        }
-
-                        Controls.TextField {
-                            id: worktreeBranch
-
-                            Layout.fillWidth: true
-                            placeholderText: worktreeMode.mode === "existing"
-                                ? qsTr("Existing branch")
-                                : qsTr("New branch name")
-                            visible: worktreeMode.mode !== "detached"
-                        }
-
-                        Controls.TextField {
-                            id: worktreeStart
-
-                            Layout.fillWidth: true
-                            placeholderText: worktreeMode.mode === "detached"
-                                ? qsTr("Commit or revision")
-                                : qsTr("Start point")
-                            text: worktreeMode.mode === "new" ? "HEAD" : ""
-                            visible: worktreeMode.mode !== "existing"
-                        }
-
-                        Controls.Button {
-                            Layout.alignment: Qt.AlignRight
-                            enabled: panel.job("create_worktree") === null
-                                && (worktreeMode.mode === "detached"
-                                    ? worktreeStart.text.trim().length > 0
-                                    : worktreeBranch.text.trim().length > 0)
-                            icon.name: "list-add"
-                            text: qsTr("Review and create…")
-                            onClicked: createWorktreeDialog.open()
-                        }
-                    }
-
-                    Repeater {
-                        model: panel.project.worktree ? [] : panel.backend.worktrees
-
-                        delegate: Controls.Label {
-                            required property var modelData
-
-                            Layout.fillWidth: true
-                            color: Kirigami.Theme.disabledTextColor
-                            elide: Text.ElideMiddle
-                            font: Kirigami.Theme.smallFont
-                            text: qsTr("%1 — %2 (%3)")
-                                .arg(modelData.branch.length > 0 ? modelData.branch : qsTr("detached HEAD"))
-                                .arg(modelData.root)
-                                .arg(modelData.owned ? qsTr("Harkness") : qsTr("external"))
-                        }
+                        elide: Text.ElideMiddle
+                        font: Kirigami.Theme.smallFont
+                        text: qsTr("%1 — %2 (%3)")
+                            .arg(modelData.branch.length > 0 ? modelData.branch : qsTr("detached HEAD"))
+                            .arg(modelData.root)
+                            .arg(modelData.owned ? qsTr("Harkness") : qsTr("external"))
                     }
                 }
             }
