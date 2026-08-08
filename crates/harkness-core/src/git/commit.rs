@@ -357,7 +357,7 @@ fn refresh_status(
 }
 
 /// Resolves every path before any Git command is built.
-fn validate_paths(root: &Path, paths: &[PathBuf]) -> Result<(), GitError> {
+pub(crate) fn validate_paths(root: &Path, paths: &[PathBuf]) -> Result<(), GitError> {
     let repository = fs::canonicalize(root).map_err(|_| GitError::NotARepository {
         path: root.to_path_buf(),
     })?;
@@ -432,7 +432,7 @@ fn is_unborn(repository: &Repository, root: &Path) -> Result<bool, GitError> {
     }
 }
 
-fn open(root: &Path) -> Result<Repository, GitError> {
+pub(crate) fn open(root: &Path) -> Result<Repository, GitError> {
     match Repository::open(root) {
         Ok(repository) if repository.workdir().is_some() => Ok(repository),
         Ok(_) => Err(GitError::NotARepository {

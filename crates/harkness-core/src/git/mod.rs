@@ -9,6 +9,7 @@
 mod branch;
 pub(crate) mod clone;
 mod commit;
+mod diff;
 mod lock;
 mod runner;
 pub(crate) mod status;
@@ -29,6 +30,7 @@ pub use commit::{
     CommitOptions, CommitOutcome, StageOptions, StageOutcome, StagePathOutcome, StagePathResult,
     StatusRefreshOutcome,
 };
+pub use diff::{DiffLine, DiffLineKind, DiffOmission, DiffOptions, DiffTarget, FileDiff, Hunk};
 pub use lock::RepositoryLock;
 pub use runner::{Cancellation, CloneCancellation, GitAccess, GitCommand, GitOutput};
 pub use status::{DetailedStatus, FileChange, HeadState, PendingOperation, StatusEntry};
@@ -274,6 +276,18 @@ pub enum GitError {
         source: git2::Error,
     },
 
+    /// Working-tree content could not be read while computing its blob ID.
+    #[error("failed to read diff content for '{}': {source}", path.display())]
+    DiffContent {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    /// Libgit2 returned a diff record that violates Harkness's model contract.
+    #[error("Git produced a diff that could not be represented: {detail}")]
+    MalformedDiff { detail: String },
+
     /// Git reported a status Harkness cannot parse.
     #[error("Git reported a status that could not be parsed: {detail}")]
     MalformedStatus { detail: String },
@@ -314,6 +328,8 @@ impl GitError {
         "default_branch_unknown",
         "detached_head",
         "inspection",
+        "diff_content",
+        "malformed_diff",
         "malformed_status",
     ];
 
@@ -353,6 +369,8 @@ impl GitError {
             Self::DefaultBranchUnknown { .. } => "default_branch_unknown",
             Self::DetachedHead { .. } => "detached_head",
             Self::Inspection { .. } => "inspection",
+            Self::DiffContent { .. } => "diff_content",
+            Self::MalformedDiff { .. } => "malformed_diff",
             Self::MalformedStatus { .. } => "malformed_status",
         }
     }
@@ -465,6 +483,21 @@ impl GitService {
     /// names rather than for a whole listing.
     pub fn detailed_status(&self, cancellation: &Cancellation) -> Result<DetailedStatus, GitError> {
         status::detailed(&self.git_executable, &self.root, cancellation)
+    }
+
+    /// Computes content differences on one side of the index.
+    ///
+    /// [`DiffTarget::Staged`] compares `HEAD` (or the empty tree before the
+    /// first commit) with the index. [`DiffTarget::Unstaged`] compares the
+    /// index with the working tree, including untracked files. The operation
+    /// runs entirely in process, takes no repository lock, and never mutates
+    /// the index while inspecting it.
+    pub fn diff(
+        &self,
+        target: DiffTarget,
+        options: &DiffOptions,
+    ) -> Result<Vec<FileDiff>, GitError> {
+        diff::compute(&self.root, target, options)
     }
 
     /// Stages every change to each explicit path and refreshes repository
@@ -1116,6 +1149,19 @@ mod tests {
                     source: git_error(),
                 },
                 "inspection",
+            ),
+            (
+                GitError::DiffContent {
+                    path: path.clone(),
+                    source: io_error(),
+                },
+                "diff_content",
+            ),
+            (
+                GitError::MalformedDiff {
+                    detail: "fixture".to_owned(),
+                },
+                "malformed_diff",
             ),
             (
                 GitError::MalformedStatus {
