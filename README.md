@@ -66,13 +66,24 @@ harkness project reconcile
 harkness project forget --project <selector>
 harkness project delete --project <selector> --yes
 
-harkness worktree list <parent-id>
-harkness worktree create <parent-id> --new <branch> [--start <revision>]
-harkness worktree create <parent-id> --existing <branch>
-harkness worktree create <parent-id> --detached <revision>
-harkness worktree remove <worktree-id>
-harkness worktree remove <worktree-id> --force --yes
-harkness worktree reconcile <parent-id>
+harkness --json git status [--paths] [--project <selector>]
+harkness --json git fetch [--remote <name>] [--prune] [--project <selector>]
+harkness --json git pull [--ff-only | --rebase | --merge] [--project <selector>]
+harkness --json git push [--set-upstream] [--allow-default-branch] [--force-with-lease] [--project <selector>]
+harkness --json git branch list [--all] [--project <selector>]
+harkness --json git branch create <name> [--from <ref>] [--checkout] [--project <selector>]
+harkness --json git branch checkout <name> [--project <selector>]
+harkness --json git branch delete <name> [--force] [--project <selector>]
+harkness --json git stage (<path>... | --all) [--project <selector>]
+harkness --json git unstage <path>... [--project <selector>]
+harkness --json git commit --message <message> [--amend] [--allow-empty] [--project <selector>]
+
+harkness --json worktree list [--project <parent-selector>]
+harkness --json worktree add --branch <name> [--from <ref>] [--project <parent-selector>]
+harkness --json worktree add --branch <name> --existing [--project <parent-selector>]
+harkness --json worktree add --branch <revision> --detach [--project <parent-selector>]
+harkness --json worktree remove [--force] [--project <worktree-selector>]
+harkness --json worktree prune [--project <parent-selector>]
 
 harkness --json contract
 ```
@@ -80,23 +91,26 @@ harkness --json contract
 Operational `--json` commands write exactly one success or error envelope to
 standard output. Every envelope starts with `"v": 1` and has a `type` of
 `success`, `error`, or `progress`; success and error results also carry `ok`.
-Clone progress remains on standard error as one versioned JSON object per line,
-keeping standard output parseable. Help and version are deliberately plain text
-even when `--json` is present. `harkness --json contract` reports the current
-envelope version, exit codes, streams, and complete error-kind namespaces.
+Clone, fetch, pull, and push progress remains on standard error as one versioned
+JSON object per line, keeping standard output parseable. Help and version are
+deliberately plain text even when `--json` is present. `harkness --json contract`
+reports the current envelope version, exit codes, streams, and complete
+error-kind namespaces.
 
 Project JSON uses an explicit CLI projection rather than the catalog's storage
 serializer. `last_opened` is RFC 3339, source-specific optional fields are
 always present with `null` when inapplicable, and `git` has a fixed documented
-shape. A `--no-status` listing avoids filesystem and Git probes and reports
+shape. Paths use a lossy wire conversion when the platform path is not UTF-8
+and mark the containing record with `path_is_lossy: true`. A `--no-status`
+listing avoids filesystem and Git probes and reports
 `status_checked: false`, `available: null`, and `git: null` rather than
 pretending the project is missing. `HARKNESS_DATA_DIR` and `--data-dir <path>`
 select an isolated catalog, with the explicit flag taking precedence. Run
 `harkness --help` for the exit-code contract and complete command help.
 
 Removing a worktree preserves its branch, allowing `--existing` to reuse it.
-Ordinary removal refuses uncommitted files; discarding them requires both
-`--force` and `--yes`. Worktree reconciliation removes only missing
+Ordinary removal refuses uncommitted files; discarding them requires the
+explicit `--force` override. Worktree pruning removes only missing
 Harkness-owned rows and their exact Git administrative records. It never
 performs a repository-wide prune or adopts or removes external worktrees.
 
