@@ -151,19 +151,31 @@ pub(crate) fn refuse_if_locked(listed: &[GitWorktree], path: &Path) -> Result<()
     }
 }
 
-/// Rejects lock requests that would leave later refusals without a reason.
+/// Rejects lock requests that would leave later refusals without a reason and
+/// returns the exact text Git will store.
+///
+/// Git trims a lock reason on both ends when it reads the reason back, so the
+/// trimmed form is the only spelling that round-trips through
+/// [`parse_porcelain`]. Returning it here keeps a caller's stored reason equal
+/// to the one a later listing reports.
 ///
 /// This check is intentionally independent of the repository so callers can
 /// perform it before any Git process is spawned.
-pub(crate) fn validate_lock_reason(reason: &str) -> Result<(), GitError> {
-    if reason.trim().is_empty() {
+pub(crate) fn validate_lock_reason(reason: &str) -> Result<&str, GitError> {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
         Err(GitError::EmptyWorktreeLockReason)
     } else {
-        Ok(())
+        Ok(trimmed)
     }
 }
 
 /// Locks a worktree after its caller has proved the row is currently unlocked.
+///
+/// The reason is re-validated here rather than trusted from the caller so the
+/// primitive stays safe for any future caller outside `ProjectService`;
+/// `ProjectService` deliberately validates earlier as well so an invalid
+/// request never reaches a porcelain listing.
 pub(crate) fn lock_known_unlocked(
     git_executable: &Path,
     parent: &Path,
@@ -172,7 +184,7 @@ pub(crate) fn lock_known_unlocked(
     reason: &str,
     cancellation: &Cancellation,
 ) -> Result<(), GitError> {
-    validate_lock_reason(reason)?;
+    let reason = validate_lock_reason(reason)?;
     GitCommand::new(git_executable, parent, GitAccess::LocalWrite)
         .args(["worktree", "lock", "--reason", reason, "--"])
         .arg(destination)
@@ -464,6 +476,39 @@ mod tests {
         assert_eq!(rows[1].branch, None);
         assert_eq!(rows[1].locked.as_deref(), Some("portable disk"));
         assert!(rows[1].prunable);
+    }
+
+    /// A bare `locked` field and a `locked <reason>` field are different
+    /// states, and only the NUL-delimited format keeps a reason containing a
+    /// newline in one field. Dropping `-z` would silently split such a row.
+    #[test]
+    fn lock_rows_separate_absent_reasons_from_multi_line_ones() {
+        let rows = parse_porcelain(
+            b"worktree /tmp/bare\0HEAD aaaa\0detached\0locked\0\
+              worktree /tmp/multiline\0HEAD bbbb\0detached\0locked first\nsecond\0\0",
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].locked.as_deref(), Some(""));
+        assert_eq!(rows[1].locked.as_deref(), Some("first\nsecond"));
+    }
+
+    #[test]
+    fn lock_reasons_are_validated_against_the_text_git_stores() {
+        use super::validate_lock_reason;
+
+        for blank in ["", " ", " \t\n "] {
+            assert!(validate_lock_reason(blank).is_err(), "accepted {blank:?}");
+        }
+        // Git trims what it stores, so the trimmed spelling is the only one
+        // that round-trips back through a listing.
+        assert_eq!(
+            validate_lock_reason("  agent busy  ").unwrap(),
+            "agent busy"
+        );
+        // A reason that looks like a flag is a value, never an argument.
+        assert_eq!(validate_lock_reason("--force").unwrap(), "--force");
     }
 
     #[test]

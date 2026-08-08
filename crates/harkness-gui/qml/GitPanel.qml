@@ -554,12 +554,35 @@ Item {
                                 .arg(modelData.owned ? qsTr("Harkness") : qsTr("external"))
                         }
 
+                        // Git refuses to move or remove a locked worktree, so
+                        // the state is shown rather than left to surface as a
+                        // failed action. The reason is Git's own text and can
+                        // be absent even while the lock holds.
+                        Kirigami.Icon {
+                            Layout.preferredHeight: Kirigami.Units.iconSizes.small
+                            Layout.preferredWidth: Kirigami.Units.iconSizes.small
+                            source: "object-locked"
+                            visible: modelData.locked
+
+                            Controls.ToolTip.text: modelData.lockReason.length > 0
+                                ? qsTr("Locked by Git: %1").arg(modelData.lockReason)
+                                : qsTr("Locked by Git without a recorded reason")
+                            Controls.ToolTip.visible: lockHover.hovered
+
+                            HoverHandler {
+                                id: lockHover
+                            }
+                        }
+
                         Controls.Button {
                             display: Controls.AbstractButton.IconOnly
                             enabled: modelData.owned
+                                && !modelData.locked
                                 && panel.job("move_worktree", modelData.id) === null
                             icon.name: "folder-move"
-                            text: qsTr("Move worktree")
+                            text: modelData.locked
+                                ? qsTr("Unlock this worktree before moving it")
+                                : qsTr("Move worktree")
                             visible: modelData.owned
                             onClicked: {
                                 panel.movingWorktreeId = String(modelData.id);

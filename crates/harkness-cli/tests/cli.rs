@@ -1016,6 +1016,161 @@ fn json_detection_ignores_a_literal_after_the_argument_terminator() {
     assert!(!output.stderr.is_empty());
 }
 
+/// The lock reason has to reach the wire and come back, and the state
+/// refusals have to carry conflict exit codes rather than a generic failure.
+#[test]
+fn worktree_lock_and_unlock_round_trip_through_the_json_contract() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let parent_root = fixture.path().join("lock-parent");
+    fs::create_dir_all(&parent_root).unwrap();
+    initialize_repository(&parent_root);
+    let mut service = ProjectService::load_from_data_dir(&data_dir).unwrap();
+    let parent_id = service.import_local(&parent_root).unwrap().id.to_string();
+
+    let created = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "worktree",
+            "add",
+            "--project",
+            &parent_id,
+            "--branch",
+            "agent/cli-lock",
+        ],
+    );
+    assert_success(&created);
+    let worktree_id = json_output(&created)["data"]["project"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let blank = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "worktree",
+            "lock",
+            "--project",
+            &worktree_id,
+            "--reason",
+            "   ",
+        ],
+    );
+    assert_eq!(blank.status.code(), Some(3));
+    assert_eq!(
+        json_output(&blank)["error"]["kind"],
+        "empty_worktree_lock_reason"
+    );
+
+    // Padding is trimmed by Git, so the envelope must report what was stored.
+    let locked = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "worktree",
+            "lock",
+            "--project",
+            &worktree_id,
+            "--reason",
+            "  agent is still working  ",
+        ],
+    );
+    assert_success(&locked);
+    assert_eq!(
+        json_output(&locked)["data"]["lock_reason"],
+        "agent is still working"
+    );
+
+    let listed = harkness(
+        &data_dir,
+        &["--json", "worktree", "list", "--project", &parent_id],
+    );
+    assert_success(&listed);
+    let row = json_output(&listed)["data"]["worktrees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|worktree| worktree["id"] == worktree_id.as_str())
+        .cloned()
+        .expect("the locked worktree is listed");
+    assert_eq!(row["locked"], true);
+    assert_eq!(row["lock_reason"], "agent is still working");
+
+    let relocked = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "worktree",
+            "lock",
+            "--project",
+            &worktree_id,
+            "--reason",
+            "again",
+        ],
+    );
+    assert_eq!(relocked.status.code(), Some(5));
+    assert_eq!(
+        json_output(&relocked)["error"]["kind"],
+        "worktree_already_locked"
+    );
+
+    // A lock refuses removal even with --force, so an explicit unlock is the
+    // only way through.
+    let forced = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "worktree",
+            "remove",
+            "--project",
+            &worktree_id,
+            "--force",
+        ],
+    );
+    assert_eq!(forced.status.code(), Some(5));
+    assert_eq!(json_output(&forced)["error"]["kind"], "worktree_locked");
+
+    let replaced = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "worktree",
+            "lock",
+            "--project",
+            &worktree_id,
+            "--reason",
+            "agent is deploying",
+            "--replace",
+        ],
+    );
+    assert_success(&replaced);
+    assert_eq!(
+        json_output(&replaced)["data"]["lock_reason"],
+        "agent is deploying"
+    );
+
+    let unlocked = harkness(
+        &data_dir,
+        &["--json", "worktree", "unlock", "--project", &worktree_id],
+    );
+    assert_success(&unlocked);
+
+    let again = harkness(
+        &data_dir,
+        &["--json", "worktree", "unlock", "--project", &worktree_id],
+    );
+    assert_eq!(again.status.code(), Some(5));
+    assert_eq!(json_output(&again)["error"]["kind"], "worktree_not_locked");
+
+    let removed = harkness(
+        &data_dir,
+        &["--json", "worktree", "remove", "--project", &worktree_id],
+    );
+    assert_success(&removed);
+}
+
 #[test]
 fn contract_manifest_is_versioned_and_enumerates_exit_codes_and_kinds() {
     let fixture = TempDir::new().unwrap();

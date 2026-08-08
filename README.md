@@ -83,6 +83,9 @@ harkness --json worktree add --branch <name> [--from <ref>] [--project <parent-s
 harkness --json worktree add --branch <name> --existing [--project <parent-selector>]
 harkness --json worktree add --branch <revision> --detach [--project <parent-selector>]
 harkness --json worktree remove [--force] [--project <worktree-selector>]
+harkness --json worktree move <destination> [--project <worktree-selector>]
+harkness --json worktree lock --reason <text> [--replace] [--project <worktree-selector>]
+harkness --json worktree unlock [--project <worktree-selector>]
 harkness --json worktree prune [--project <parent-selector>]
 
 harkness --json contract
@@ -113,6 +116,16 @@ Ordinary removal refuses uncommitted files; discarding them requires the
 explicit `--force` override. Worktree pruning removes only missing
 Harkness-owned rows and their exact Git administrative records. It never
 performs a repository-wide prune or adopts or removes external worktrees.
+
+A worktree lock records a mandatory reason and protects the checkout from
+removal, relocation, and pruning; `--force` does not override it, so clearing
+protection always takes an explicit `worktree unlock`. Git trims the stored
+reason and `worktree list` reports it as `lock_reason`, which is `null` when a
+lock records no reason at all. Locking an already-locked worktree is refused
+rather than silently replaced; `--replace` supersedes an existing reason
+without leaving the checkout unprotected in between. Lock changes apply only to
+Harkness-created checkouts, so a catalog row aimed at a foreign worktree is
+refused instead of having its protection altered.
 
 Ctrl-C cooperatively cancels a running clone or Git operation, cleans partial
 storage, and exits 130. A non-cooperative kill cannot run cleanup, so `project
