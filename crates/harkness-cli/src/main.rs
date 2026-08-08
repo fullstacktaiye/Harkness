@@ -10,13 +10,16 @@ use std::{
 };
 
 use clap::{
-    Arg, ArgAction, ArgGroup, ArgMatches, Args, Command as ClapCommand, FromArgMatches, Parser,
-    Subcommand,
+    ArgGroup, Args, Parser, Subcommand,
     error::{Error as ClapError, ErrorKind},
 };
 use harkness_core::{
-    Cancellation, GitError, GitStatus, Project, ProjectError, ProjectId, ProjectSelector,
-    ProjectService, ProjectSource, UpstreamStatus, Worktree, WorktreeBase,
+    Branch, BranchCheckout, BranchKind, BranchListOptions, Cancellation, CommitOptions,
+    CommitOutcome, CreateBranchOptions, DetailedStatus, FetchOptions, FetchOutcome, FileChange,
+    GitError, GitStatus, HeadState, PendingOperation, Project, ProjectError, ProjectSelector,
+    ProjectService, ProjectSource, PullOptions, PullOutcome, PullStrategy, PushOptions,
+    PushOutcome, RefUpdate, StageOutcome, StagePathResult, StatusRefreshOutcome, UpstreamStatus,
+    Worktree, WorktreeBase,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -34,6 +37,7 @@ const CLI_ERROR_KINDS: &[&str] = &[
     "current_directory_unavailable",
     "interrupt_handler_unavailable",
     "wire_projection_failed",
+    "path_operation_failed",
     "confirmation_required",
     "managed_project_requires_delete",
     "local_project_requires_forget",
@@ -49,7 +53,7 @@ static INTERRUPTED: AtomicBool = AtomicBool::new(false);
     about = "Manage Harkness projects and workspaces",
     arg_required_else_help = true,
     disable_help_subcommand = true,
-    after_help = "When --project is omitted from project show, forget, or delete, Harkness walks upward from the current directory and uses the deepest catalogued project root. This lets an agent run inside a repository or worktree without copying its project identifier.\n\nExit codes: 0 success, 1 operation failed, 2 usage error, 3 guardrail refusal, 4 not found, 5 conflict or busy, 130 cancelled."
+    after_help = "When --project is omitted from any command that accepts it, Harkness walks upward from the current directory and uses the deepest catalogued project root. This lets an agent run inside a repository or worktree without copying its project identifier.\n\nExit codes: 0 success, 1 operation failed, 2 usage error, 3 guardrail refusal, 4 not found, 5 conflict or busy, 130 cancelled."
 )]
 struct Cli {
     /// Emit one versioned machine-readable result object on standard output.
@@ -71,6 +75,11 @@ enum Command {
     Project {
         #[command(subcommand)]
         command: ProjectCommand,
+    },
+    /// Inspect and change Git repositories through the shared core service.
+    Git {
+        #[command(subcommand)]
+        command: GitCommand,
     },
     /// Manage linked Git worktree workspaces.
     Worktree {
@@ -129,125 +138,180 @@ enum ProjectCommand {
 
 #[derive(Debug, Subcommand)]
 enum WorktreeCommand {
-    /// List linked worktrees for a parent project ID.
-    List { parent_id: ProjectId },
-    /// Create a Harkness-managed linked worktree.
-    Create(CreateWorktree),
+    /// List linked worktrees for the selected parent project.
+    List(ProjectSelection),
+    /// Create a Harkness-managed linked worktree on a new branch.
+    #[command(visible_alias = "create")]
+    Add(AddWorktree),
     /// Remove a Harkness-managed linked worktree.
     Remove {
-        worktree_id: ProjectId,
+        #[command(flatten)]
+        selection: ProjectSelection,
         /// Discard uncommitted changes in the worktree.
         #[arg(long)]
         force: bool,
-        /// Confirm that forced removal may discard uncommitted files.
-        #[arg(long, requires = "force")]
-        yes: bool,
     },
     /// Remove stale Harkness-owned worktree records selectively.
-    Reconcile { parent_id: ProjectId },
+    #[command(visible_alias = "reconcile")]
+    Prune(ProjectSelection),
 }
 
-#[derive(Debug)]
-struct CreateWorktree {
-    parent_id: ProjectId,
-    base: WorktreeBase,
+#[derive(Debug, Subcommand)]
+enum GitCommand {
+    /// Report repository state. JSON always includes path records.
+    Status {
+        #[command(flatten)]
+        selection: ProjectSelection,
+        /// Include changed paths in human-readable output.
+        #[arg(long)]
+        paths: bool,
+    },
+    /// Update local remote-tracking refs.
+    Fetch {
+        #[command(flatten)]
+        selection: ProjectSelection,
+        /// Remote to fetch instead of resolving one from the repository.
+        #[arg(long, value_name = "NAME")]
+        remote: Option<String>,
+        /// Delete remote-tracking branches removed from the remote.
+        #[arg(long)]
+        prune: bool,
+    },
+    /// Fetch and reconcile the checked-out branch with its upstream.
+    Pull(PullArguments),
+    /// Publish the checked-out branch under the same name.
+    Push {
+        #[command(flatten)]
+        selection: ProjectSelection,
+        /// Configure the published branch as the local branch's upstream.
+        #[arg(long)]
+        set_upstream: bool,
+        /// Permit pushing the remote's default branch.
+        #[arg(long)]
+        allow_default_branch: bool,
+        /// Replace the remote tip only if it still matches the last fetch.
+        #[arg(long)]
+        force_with_lease: bool,
+    },
+    /// Inspect and manage branches.
+    Branch {
+        #[command(subcommand)]
+        command: GitBranchCommand,
+    },
+    /// Add paths to the index.
+    Stage(StageArguments),
+    /// Remove paths from the index without changing the working tree.
+    Unstage {
+        #[command(flatten)]
+        selection: ProjectSelection,
+        /// Repository-relative or absolute paths to unstage.
+        #[arg(required = true, value_name = "PATH")]
+        paths: Vec<PathBuf>,
+    },
+    /// Create a commit from the index.
+    Commit {
+        #[command(flatten)]
+        selection: ProjectSelection,
+        /// Commit message.
+        #[arg(long, value_name = "MSG")]
+        message: String,
+        /// Replace the current commit.
+        #[arg(long)]
+        amend: bool,
+        /// Permit a commit with an unchanged tree.
+        #[arg(long)]
+        allow_empty: bool,
+    },
 }
 
-impl FromArgMatches for CreateWorktree {
-    fn from_arg_matches(matches: &ArgMatches) -> Result<Self, ClapError> {
-        let mut matches = matches.clone();
-        Self::from_arg_matches_mut(&mut matches)
-    }
-
-    fn from_arg_matches_mut(matches: &mut ArgMatches) -> Result<Self, ClapError> {
-        let parent_id = matches
-            .remove_one::<ProjectId>("parent_id")
-            .ok_or_else(|| {
-                ClapError::raw(ErrorKind::MissingRequiredArgument, "parent ID is required")
-            })?;
-        let new = matches.remove_one::<String>("new");
-        let existing = matches.remove_one::<String>("existing");
-        let detached = matches.remove_one::<String>("detached");
-        let start_point = matches.remove_one::<String>("start");
-        let base = match (new, existing, detached) {
-            (Some(name), None, None) => WorktreeBase::NewBranch { name, start_point },
-            (None, Some(name), None) if start_point.is_none() => {
-                WorktreeBase::ExistingBranch { name }
-            }
-            (None, None, Some(commit)) if start_point.is_none() => {
-                WorktreeBase::Detached { commit }
-            }
-            _ => {
-                return Err(ClapError::raw(
-                    ErrorKind::ArgumentConflict,
-                    "choose exactly one of --new, --existing, or --detached; --start is valid only with --new",
-                ));
-            }
-        };
-        Ok(Self { parent_id, base })
-    }
-
-    fn update_from_arg_matches(&mut self, matches: &ArgMatches) -> Result<(), ClapError> {
-        let mut matches = matches.clone();
-        self.update_from_arg_matches_mut(&mut matches)
-    }
-
-    fn update_from_arg_matches_mut(&mut self, matches: &mut ArgMatches) -> Result<(), ClapError> {
-        *self = Self::from_arg_matches_mut(matches)?;
-        Ok(())
-    }
+#[derive(Debug, Subcommand)]
+enum GitBranchCommand {
+    /// List local branches and optionally remote-tracking branches.
+    List {
+        #[command(flatten)]
+        selection: ProjectSelection,
+        /// Include remote-tracking branches.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Create a local branch.
+    Create {
+        #[command(flatten)]
+        selection: ProjectSelection,
+        /// Name of the branch to create.
+        name: String,
+        /// Revision at which to create the branch instead of HEAD.
+        #[arg(long, value_name = "REF")]
+        from: Option<String>,
+        /// Check out the branch after creating it.
+        #[arg(long)]
+        checkout: bool,
+    },
+    /// Check out an existing local branch.
+    Checkout {
+        #[command(flatten)]
+        selection: ProjectSelection,
+        name: String,
+    },
+    /// Delete a local branch.
+    Delete {
+        #[command(flatten)]
+        selection: ProjectSelection,
+        name: String,
+        /// Delete a branch with unmerged commits.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
-impl Args for CreateWorktree {
-    fn augment_args(command: ClapCommand) -> ClapCommand {
-        command
-            .arg(
-                Arg::new("parent_id")
-                    .required(true)
-                    .value_parser(clap::value_parser!(ProjectId))
-                    .help("Catalog ID of the repository that owns the worktree"),
-            )
-            .arg(
-                Arg::new("new")
-                    .long("new")
-                    .value_name("BRANCH")
-                    .action(ArgAction::Set)
-                    .help("Create and check out a new branch"),
-            )
-            .arg(
-                Arg::new("existing")
-                    .long("existing")
-                    .value_name("BRANCH")
-                    .action(ArgAction::Set)
-                    .help("Check out an existing local branch"),
-            )
-            .arg(
-                Arg::new("detached")
-                    .long("detached")
-                    .value_name("REVISION")
-                    .action(ArgAction::Set)
-                    .help("Check out a detached revision"),
-            )
-            .arg(
-                Arg::new("start")
-                    .long("start")
-                    .value_name("REVISION")
-                    .action(ArgAction::Set)
-                    .requires("new")
-                    .conflicts_with_all(["existing", "detached"])
-                    .help("Start a new branch at this revision instead of HEAD"),
-            )
-            .group(
-                ArgGroup::new("base")
-                    .required(true)
-                    .multiple(false)
-                    .args(["new", "existing", "detached"]),
-            )
-    }
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("strategy")
+        .multiple(false)
+        .args(["ff_only", "rebase", "merge"])
+))]
+struct PullArguments {
+    #[command(flatten)]
+    selection: ProjectSelection,
+    /// Refuse unless the branch can advance without a merge or rewrite.
+    #[arg(long)]
+    ff_only: bool,
+    /// Replay local commits on top of the upstream.
+    #[arg(long)]
+    rebase: bool,
+    /// Merge the upstream into the local branch.
+    #[arg(long)]
+    merge: bool,
+}
 
-    fn augment_args_for_update(command: ClapCommand) -> ClapCommand {
-        Self::augment_args(command)
-    }
+#[derive(Debug, Args)]
+struct StageArguments {
+    #[command(flatten)]
+    selection: ProjectSelection,
+    /// Repository-relative or absolute paths to stage.
+    #[arg(required_unless_present = "all", value_name = "PATH")]
+    paths: Vec<PathBuf>,
+    /// Stage every change, including deletions.
+    #[arg(long, conflicts_with = "paths")]
+    all: bool,
+}
+
+#[derive(Debug, Args)]
+struct AddWorktree {
+    #[command(flatten)]
+    selection: ProjectSelection,
+    /// New branch to create for the worktree, or revision when detached.
+    #[arg(long, value_name = "NAME")]
+    branch: String,
+    /// Start the branch, or detached checkout, at this revision.
+    #[arg(long, value_name = "REF")]
+    from: Option<String>,
+    /// Check out an existing local branch instead of creating it.
+    #[arg(long, conflicts_with_all = ["from", "detach"])]
+    existing: bool,
+    /// Create a detached checkout at --from, or at --branch when --from is absent.
+    #[arg(long)]
+    detach: bool,
 }
 
 enum CommandResult {
@@ -292,6 +356,10 @@ enum CliError {
     CurrentDirectory(io::Error),
     InterruptHandler(io::Error),
     WireProjection(String),
+    PathOperation {
+        operation: &'static str,
+        details: Value,
+    },
     Refused {
         kind: RefusalKind,
         message: String,
@@ -305,6 +373,12 @@ impl From<ProjectError> for CliError {
     }
 }
 
+impl From<GitError> for CliError {
+    fn from(error: GitError) -> Self {
+        Self::Project(ProjectError::from(error))
+    }
+}
+
 impl CliError {
     fn kind(&self) -> &'static str {
         match self {
@@ -312,6 +386,7 @@ impl CliError {
             Self::CurrentDirectory(_) => "current_directory_unavailable",
             Self::InterruptHandler(_) => "interrupt_handler_unavailable",
             Self::WireProjection(_) => "wire_projection_failed",
+            Self::PathOperation { .. } => "path_operation_failed",
             Self::Refused { kind, .. } => kind.as_str(),
         }
     }
@@ -320,6 +395,9 @@ impl CliError {
         match self {
             Self::Project(error) => error.to_string(),
             Self::WireProjection(message) => message.clone(),
+            Self::PathOperation { operation, .. } => {
+                format!("{operation} failed for one or more paths")
+            }
             Self::CurrentDirectory(error) => {
                 format!("the current working directory could not be determined: {error}")
             }
@@ -333,9 +411,10 @@ impl CliError {
     fn exit_code(&self) -> u8 {
         match self {
             Self::Project(error) => project_exit_code(error),
-            Self::CurrentDirectory(_) | Self::InterruptHandler(_) | Self::WireProjection(_) => {
-                EXIT_OPERATION_FAILED
-            }
+            Self::CurrentDirectory(_)
+            | Self::InterruptHandler(_)
+            | Self::WireProjection(_)
+            | Self::PathOperation { .. } => EXIT_OPERATION_FAILED,
             Self::Refused { .. } => EXIT_REFUSED,
         }
     }
@@ -344,6 +423,7 @@ impl CliError {
         match self {
             Self::Project(error) => project_error_details(error),
             Self::Refused { details, .. } => details.clone(),
+            Self::PathOperation { details, .. } => details.clone(),
             Self::CurrentDirectory(_) | Self::InterruptHandler(_) | Self::WireProjection(_) => {
                 json!({})
             }
@@ -480,10 +560,254 @@ fn run(cli: Cli, cancellation: &Cancellation) -> Result<CommandResult, CliError>
         Command::Project { command } => {
             run_project(command, data_dir.as_deref(), json, cancellation)
         }
+        Command::Git { command } => run_git(command, data_dir.as_deref(), json, cancellation),
         Command::Worktree { command } => {
             run_worktree(command, data_dir.as_deref(), json, cancellation)
         }
         Command::Contract => Ok(contract_result(json)),
+    }
+}
+
+fn run_git(
+    command: GitCommand,
+    data_dir: Option<&Path>,
+    json_output: bool,
+    cancellation: &Cancellation,
+) -> Result<CommandResult, CliError> {
+    let service = load_service(data_dir)?;
+    match command {
+        GitCommand::Status { selection, paths } => {
+            let git = selected_git(&service, selection)?;
+            let status = git.detailed_status(cancellation)?;
+            command_result(
+                json_output,
+                || detailed_status_line(&status, paths),
+                || Ok(json!({ "status": detailed_status_value(&status) })),
+            )
+        }
+        GitCommand::Fetch {
+            selection,
+            remote,
+            prune,
+        } => {
+            let git = selected_git(&service, selection)?;
+            let outcome = git.fetch(&FetchOptions { remote, prune }, cancellation, |message| {
+                emit_progress(json_output, &message)
+            })?;
+            command_result(
+                json_output,
+                || {
+                    format!(
+                        "fetched {} ({})",
+                        outcome.remote,
+                        change_word(outcome.updated)
+                    )
+                },
+                || Ok(fetch_outcome_value(&outcome)),
+            )
+        }
+        GitCommand::Pull(arguments) => {
+            let git = selected_git(&service, arguments.selection)?;
+            let strategy = if arguments.ff_only {
+                PullStrategy::FastForwardOnly
+            } else if arguments.rebase {
+                PullStrategy::Rebase
+            } else if arguments.merge {
+                PullStrategy::Merge
+            } else {
+                PullStrategy::FastForwardOnly
+            };
+            let outcome = git.pull(
+                &PullOptions {
+                    remote: None,
+                    strategy,
+                },
+                cancellation,
+                |message| emit_progress(json_output, &message),
+            )?;
+            command_result(
+                json_output,
+                || {
+                    format!(
+                        "pulled {}/{} ({})",
+                        outcome.remote,
+                        outcome.branch,
+                        change_word(outcome.updated)
+                    )
+                },
+                || Ok(pull_outcome_value(&outcome)),
+            )
+        }
+        GitCommand::Push {
+            selection,
+            set_upstream,
+            allow_default_branch,
+            force_with_lease,
+        } => {
+            let git = selected_git(&service, selection)?;
+            let outcome = git.push(
+                &PushOptions {
+                    remote: None,
+                    set_upstream,
+                    force_with_lease,
+                    allow_default_branch,
+                },
+                cancellation,
+                |message| emit_progress(json_output, &message),
+            )?;
+            command_result(
+                json_output,
+                || {
+                    format!(
+                        "pushed {}/{} ({})",
+                        outcome.remote,
+                        outcome.branch,
+                        ref_update_name(outcome.update)
+                    )
+                },
+                || Ok(push_outcome_value(&outcome)),
+            )
+        }
+        GitCommand::Branch { command } => {
+            run_git_branch(command, &service, json_output, cancellation)
+        }
+        GitCommand::Stage(arguments) => {
+            let git = selected_git(&service, arguments.selection)?;
+            if arguments.all {
+                let status = git.stage_all(cancellation)?;
+                command_result(
+                    json_output,
+                    || "staged all changes".to_owned(),
+                    || Ok(json!({ "status": detailed_status_value(&status) })),
+                )
+            } else {
+                let outcome = git.stage(arguments.paths, cancellation)?;
+                if !outcome.all_succeeded() {
+                    return Err(CliError::PathOperation {
+                        operation: "staging",
+                        details: stage_outcome_value(&outcome),
+                    });
+                }
+                command_result(
+                    json_output,
+                    || stage_outcome_line("staged", &outcome),
+                    || Ok(stage_outcome_value(&outcome)),
+                )
+            }
+        }
+        GitCommand::Unstage { selection, paths } => {
+            let git = selected_git(&service, selection)?;
+            let outcome = git.unstage(paths, cancellation)?;
+            if !outcome.all_succeeded() {
+                return Err(CliError::PathOperation {
+                    operation: "unstaging",
+                    details: stage_outcome_value(&outcome),
+                });
+            }
+            command_result(
+                json_output,
+                || stage_outcome_line("unstaged", &outcome),
+                || Ok(stage_outcome_value(&outcome)),
+            )
+        }
+        GitCommand::Commit {
+            selection,
+            message,
+            amend,
+            allow_empty,
+        } => {
+            let git = selected_git(&service, selection)?;
+            let outcome = git.commit(
+                &message,
+                &CommitOptions::default()
+                    .with_amend(amend)
+                    .with_allow_empty(allow_empty),
+                cancellation,
+            )?;
+            command_result(
+                json_output,
+                || format!("committed {}", outcome.commit_id),
+                || Ok(commit_outcome_value(&outcome)),
+            )
+        }
+    }
+}
+
+fn run_git_branch(
+    command: GitBranchCommand,
+    service: &ProjectService,
+    json_output: bool,
+    cancellation: &Cancellation,
+) -> Result<CommandResult, CliError> {
+    match command {
+        GitBranchCommand::List { selection, all } => {
+            let git = selected_git(service, selection)?;
+            let branches = git.branches(
+                &BranchListOptions {
+                    include_remote_tracking: all,
+                    ..BranchListOptions::default()
+                },
+                cancellation,
+            )?;
+            command_result(
+                json_output,
+                || {
+                    branches
+                        .iter()
+                        .map(branch_line)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                },
+                || {
+                    Ok(json!({
+                        "branches": branches.iter().map(branch_value).collect::<Vec<_>>()
+                    }))
+                },
+            )
+        }
+        GitBranchCommand::Create {
+            selection,
+            name,
+            from,
+            checkout,
+        } => {
+            let git = selected_git(service, selection)?;
+            git.create_branch(
+                &name,
+                &CreateBranchOptions {
+                    start_point: from,
+                    checkout,
+                },
+                cancellation,
+            )?;
+            command_result(
+                json_output,
+                || format!("created branch {name}"),
+                || Ok(json!({ "branch": name, "checked_out": checkout })),
+            )
+        }
+        GitBranchCommand::Checkout { selection, name } => {
+            let git = selected_git(service, selection)?;
+            git.checkout_branch(&name, cancellation)?;
+            command_result(
+                json_output,
+                || format!("checked out {name}"),
+                || Ok(json!({ "branch": name })),
+            )
+        }
+        GitBranchCommand::Delete {
+            selection,
+            name,
+            force,
+        } => {
+            let git = selected_git(service, selection)?;
+            git.delete_branch(&name, force, cancellation)?;
+            command_result(
+                json_output,
+                || format!("deleted branch {name}"),
+                || Ok(json!({ "branch": name })),
+            )
+        }
     }
 }
 
@@ -635,8 +959,9 @@ fn run_worktree(
 ) -> Result<CommandResult, CliError> {
     let mut service = load_service(data_dir)?;
     match command {
-        WorktreeCommand::List { parent_id } => {
-            let worktrees = service.worktrees(parent_id, cancellation)?;
+        WorktreeCommand::List(selection) => {
+            let parent = resolve_project(&service, selection.project.as_deref())?;
+            let worktrees = service.worktrees(parent.id, cancellation)?;
             command_result(
                 json_output,
                 || {
@@ -653,9 +978,23 @@ fn run_worktree(
                 },
             )
         }
-        WorktreeCommand::Create(arguments) => {
-            let project =
-                service.create_worktree(arguments.parent_id, &arguments.base, cancellation)?;
+        WorktreeCommand::Add(arguments) => {
+            let parent = resolve_project(&service, arguments.selection.project.as_deref())?;
+            let base = if arguments.existing {
+                WorktreeBase::ExistingBranch {
+                    name: arguments.branch,
+                }
+            } else if arguments.detach {
+                WorktreeBase::Detached {
+                    commit: arguments.from.unwrap_or(arguments.branch),
+                }
+            } else {
+                WorktreeBase::NewBranch {
+                    name: arguments.branch,
+                    start_point: arguments.from,
+                }
+            };
+            let project = service.create_worktree(parent.id, &base, cancellation)?;
             command_result(
                 json_output,
                 || {
@@ -669,32 +1008,21 @@ fn run_worktree(
                 || Ok(json!({ "project": project_value(&project, true)? })),
             )
         }
-        WorktreeCommand::Remove {
-            worktree_id,
-            force,
-            yes,
-        } => {
-            if force && !yes {
-                return Err(refusal(
-                    RefusalKind::ConfirmationRequired,
-                    format!(
-                        "forced removal of worktree {worktree_id} may discard uncommitted files; pass --yes to confirm"
-                    ),
-                    json!({ "override_flag": "--yes" }),
-                ));
-            }
-            let project = service.remove_worktree(worktree_id, force, cancellation)?;
+        WorktreeCommand::Remove { selection, force } => {
+            let worktree = resolve_project(&service, selection.project.as_deref())?;
+            let project = service.remove_worktree(worktree.id, force, cancellation)?;
             command_result(
                 json_output,
                 || format!("removed {}", project.display_name),
                 || Ok(json!({ "project": project_value(&project, false)? })),
             )
         }
-        WorktreeCommand::Reconcile { parent_id } => {
-            let removed = service.reconcile_worktrees(parent_id, cancellation)?;
+        WorktreeCommand::Prune(selection) => {
+            let parent = resolve_project(&service, selection.project.as_deref())?;
+            let removed = service.prune_worktrees(parent.id, cancellation)?;
             command_result(
                 json_output,
-                || format!("reconciled {} stale worktree entries", removed.len()),
+                || format!("pruned {} stale worktree entries", removed.len()),
                 || Ok(json!({ "removed": project_values(&removed, false)? })),
             )
         }
@@ -717,6 +1045,14 @@ fn resolve_project(service: &ProjectService, selector: Option<&str>) -> Result<P
         ),
     };
     service.resolve(&selector).map_err(Into::into)
+}
+
+fn selected_git(
+    service: &ProjectService,
+    selection: ProjectSelection,
+) -> Result<harkness_core::GitService, CliError> {
+    let project = resolve_project(service, selection.project.as_deref())?;
+    service.git(project.id).map_err(Into::into)
 }
 
 fn refusal(kind: RefusalKind, message: String, details: Value) -> CliError {
@@ -778,10 +1114,12 @@ fn project_value(project: &Project, status_checked: bool) -> Result<Value, CliEr
     } else {
         Value::Null
     };
+    let (root, path_is_lossy) = wire_path(&project.root);
     Ok(json!({
         "id": project.id.to_string(),
         "display_name": project.display_name,
-        "root": project.root.to_string_lossy().into_owned(),
+        "root": root,
+        "path_is_lossy": path_is_lossy,
         "source": project_source_name(&project.source),
         "remote": remote,
         "parent": parent,
@@ -794,10 +1132,12 @@ fn project_value(project: &Project, status_checked: bool) -> Result<Value, CliEr
 }
 
 fn candidate_value(project: &Project) -> Value {
+    let (root, path_is_lossy) = wire_path(&project.root);
     json!({
         "id": project.id.to_string(),
         "display_name": project.display_name,
-        "root": project.root.to_string_lossy().into_owned(),
+        "root": root,
+        "path_is_lossy": path_is_lossy,
         "source": project_source_name(&project.source),
     })
 }
@@ -810,6 +1150,271 @@ fn git_value(status: &GitStatus) -> Value {
         "staged": status.staged,
         "unstaged": status.unstaged,
     })
+}
+
+fn optional_git_value(status: Option<&GitStatus>) -> Value {
+    status.map_or(Value::Null, git_value)
+}
+
+fn detailed_status_value(status: &DetailedStatus) -> Value {
+    json!({
+        "head": head_value(&status.head),
+        "upstream": status.upstream.as_ref().map_or(Value::Null, upstream_value),
+        "pending": status.pending.map_or(Value::Null, |pending| json!(pending_name(pending))),
+        "entries": status.entries.iter().map(status_entry_value).collect::<Vec<_>>(),
+    })
+}
+
+fn head_value(head: &HeadState) -> Value {
+    match head {
+        HeadState::Unborn { branch } => json!({
+            "kind": "unborn",
+            "branch": branch,
+        }),
+        HeadState::Branch { name } => json!({
+            "kind": "branch",
+            "name": name,
+        }),
+        HeadState::Detached { commit } => json!({
+            "kind": "detached",
+            "commit": commit,
+        }),
+    }
+}
+
+fn status_entry_value(entry: &harkness_core::StatusEntry) -> Value {
+    let (path, path_is_lossy) = wire_path(&entry.path);
+    let (rename_source, rename_source_is_lossy) =
+        entry
+            .rename_source
+            .as_ref()
+            .map_or((Value::Null, Value::Null), |source| {
+                let (source, is_lossy) = wire_path(source);
+                (json!(source), json!(is_lossy))
+            });
+    json!({
+        "path": path,
+        "path_is_lossy": path_is_lossy,
+        "staged": entry.staged.map_or(Value::Null, |change| json!(file_change_name(change))),
+        "unstaged": entry.unstaged.map_or(Value::Null, |change| json!(file_change_name(change))),
+        "rename_source": rename_source,
+        "rename_source_is_lossy": rename_source_is_lossy,
+        "conflicted": entry.conflicted,
+    })
+}
+
+fn fetch_outcome_value(outcome: &FetchOutcome) -> Value {
+    json!({
+        "remote": outcome.remote,
+        "updated": outcome.updated,
+        "status": optional_git_value(outcome.status.as_ref()),
+    })
+}
+
+fn pull_outcome_value(outcome: &PullOutcome) -> Value {
+    json!({
+        "remote": outcome.remote,
+        "branch": outcome.branch,
+        "strategy": pull_strategy_name(outcome.strategy),
+        "updated": outcome.updated,
+        "status": optional_git_value(outcome.status.as_ref()),
+    })
+}
+
+fn push_outcome_value(outcome: &PushOutcome) -> Value {
+    json!({
+        "remote": outcome.remote,
+        "branch": outcome.branch,
+        "upstream_configured": outcome.upstream_configured,
+        "update": ref_update_name(outcome.update),
+        "updated": outcome.updated(),
+        "status": optional_git_value(outcome.status.as_ref()),
+    })
+}
+
+fn branch_value(branch: &Branch) -> Value {
+    json!({
+        "name": branch.name,
+        "kind": match branch.kind {
+            BranchKind::Local => "local",
+            BranchKind::RemoteTracking => "remote_tracking",
+        },
+        "tip": branch.tip.to_string(),
+        "upstream": branch.upstream.as_ref().map_or(Value::Null, upstream_value),
+        "checkout": branch_checkout_value(&branch.checkout),
+    })
+}
+
+fn branch_checkout_value(checkout: &BranchCheckout) -> Value {
+    match checkout {
+        BranchCheckout::NotCheckedOut => json!({ "kind": "not_checked_out" }),
+        BranchCheckout::CurrentWorktree => json!({ "kind": "current_worktree" }),
+        BranchCheckout::OtherWorktree(path) => {
+            let (path, path_is_lossy) = wire_path(path);
+            json!({
+                "kind": "other_worktree",
+                "path": path,
+                "path_is_lossy": path_is_lossy,
+            })
+        }
+    }
+}
+
+fn stage_outcome_value(outcome: &StageOutcome) -> Value {
+    json!({
+        "all_succeeded": outcome.all_succeeded(),
+        "paths": outcome.paths.iter().map(|path| {
+            let (written, path_is_lossy) = wire_path(&path.path);
+            let result = match &path.result {
+                StagePathResult::Succeeded => json!({ "kind": "succeeded" }),
+                StagePathResult::Failed(error) => json!({
+                    "kind": "failed",
+                    "error": {
+                        "kind": error.kind(),
+                        "message": error.to_string(),
+                        "details": git_error_details(error),
+                    }
+                }),
+                StagePathResult::NotAttempted => json!({ "kind": "not_attempted" }),
+                _ => json!({ "kind": "unknown" }),
+            };
+            json!({
+                "path": written,
+                "path_is_lossy": path_is_lossy,
+                "result": result,
+            })
+        }).collect::<Vec<_>>(),
+        "status": status_refresh_value(&outcome.status),
+    })
+}
+
+fn commit_outcome_value(outcome: &CommitOutcome) -> Value {
+    json!({
+        "commit_id": outcome.commit_id,
+        "amended": outcome.amended,
+        "status": status_refresh_value(&outcome.status),
+    })
+}
+
+fn status_refresh_value(status: &StatusRefreshOutcome) -> Value {
+    match status {
+        StatusRefreshOutcome::Skipped => json!({ "kind": "skipped" }),
+        StatusRefreshOutcome::Refreshed(status) => json!({
+            "kind": "refreshed",
+            "status": detailed_status_value(status),
+        }),
+        StatusRefreshOutcome::Failed(error) => json!({
+            "kind": "failed",
+            "error": {
+                "kind": error.kind(),
+                "message": error.to_string(),
+                "details": git_error_details(error),
+            }
+        }),
+        _ => json!({ "kind": "unknown" }),
+    }
+}
+
+fn detailed_status_line(status: &DetailedStatus, include_paths: bool) -> String {
+    let mut lines = vec![match &status.head {
+        HeadState::Unborn { branch } => {
+            format!("unborn {}", branch.as_deref().unwrap_or("unnamed branch"))
+        }
+        HeadState::Branch { name } => format!("branch {name}"),
+        HeadState::Detached { commit } => format!("detached {commit}"),
+    }];
+    if let Some(upstream) = &status.upstream {
+        lines.push(format!(
+            "upstream {} (+{} -{})",
+            upstream.name, upstream.ahead, upstream.behind
+        ));
+    }
+    if let Some(pending) = status.pending {
+        lines.push(format!("pending {}", pending_name(pending)));
+    }
+    if include_paths {
+        lines.extend(status.entries.iter().map(|entry| {
+            format!(
+                "{}\t{}\t{}",
+                entry.staged.map_or("-", file_change_name),
+                entry.unstaged.map_or("-", file_change_name),
+                entry.path.to_string_lossy()
+            )
+        }));
+    } else {
+        lines.push(format!("{} changed paths", status.entries.len()));
+    }
+    lines.join("\n")
+}
+
+fn branch_line(branch: &Branch) -> String {
+    let checkout = match &branch.checkout {
+        BranchCheckout::NotCheckedOut => "".to_owned(),
+        BranchCheckout::CurrentWorktree => "\tcurrent".to_owned(),
+        BranchCheckout::OtherWorktree(path) => format!("\t{}", path.display()),
+    };
+    format!("{}\t{}{}", branch.name, branch.tip, checkout)
+}
+
+fn stage_outcome_line(verb: &str, outcome: &StageOutcome) -> String {
+    let succeeded = outcome.paths.iter().filter(|path| path.succeeded()).count();
+    format!("{verb} {succeeded}/{} paths", outcome.paths.len())
+}
+
+fn wire_path(path: &Path) -> (String, bool) {
+    (
+        path.to_string_lossy().into_owned(),
+        path.as_os_str().to_str().is_none(),
+    )
+}
+
+const fn file_change_name(change: FileChange) -> &'static str {
+    match change {
+        FileChange::Added => "added",
+        FileChange::Modified => "modified",
+        FileChange::Deleted => "deleted",
+        FileChange::Renamed => "renamed",
+        FileChange::Copied => "copied",
+        FileChange::TypeChanged => "type_changed",
+        FileChange::Untracked => "untracked",
+        FileChange::Unmerged => "unmerged",
+    }
+}
+
+const fn pending_name(pending: PendingOperation) -> &'static str {
+    match pending {
+        PendingOperation::Merge => "merge",
+        PendingOperation::Rebase => "rebase",
+        PendingOperation::CherryPick => "cherry_pick",
+        PendingOperation::Revert => "revert",
+        PendingOperation::Bisect => "bisect",
+        PendingOperation::ApplyMailbox => "apply_mailbox",
+        PendingOperation::Other => "other",
+        _ => "other",
+    }
+}
+
+const fn pull_strategy_name(strategy: PullStrategy) -> &'static str {
+    match strategy {
+        PullStrategy::FastForwardOnly => "fast_forward_only",
+        PullStrategy::Merge => "merge",
+        PullStrategy::Rebase => "rebase",
+    }
+}
+
+const fn ref_update_name(update: RefUpdate) -> &'static str {
+    match update {
+        RefUpdate::Unchanged => "unchanged",
+        RefUpdate::Created => "created",
+        RefUpdate::FastForward => "fast_forward",
+        RefUpdate::Forced => "forced",
+        RefUpdate::Unknown => "unknown",
+        _ => "unknown",
+    }
+}
+
+const fn change_word(updated: bool) -> &'static str {
+    if updated { "updated" } else { "unchanged" }
 }
 
 fn upstream_value(upstream: &UpstreamStatus) -> Value {
@@ -861,10 +1466,12 @@ fn worktree_line(worktree: &Worktree) -> String {
 }
 
 fn worktree_value(worktree: &Worktree) -> Value {
+    let (root, path_is_lossy) = wire_path(&worktree.root);
     json!({
         "id": worktree.project.as_ref().map(|project| project.id.to_string()),
         "branch": worktree.branch,
-        "root": worktree.root.to_string_lossy(),
+        "root": root,
+        "path_is_lossy": path_is_lossy,
         "owner": if worktree.project.is_some() { "harkness" } else { "external" },
         "locked": worktree.locked,
         "prunable": worktree.prunable,
@@ -1023,6 +1630,20 @@ fn git_exit_code(error: &GitError) -> u8 {
         | GitError::BranchAlreadyExists { .. }
         | GitError::BranchCheckedOutInWorktree { .. }
         | GitError::WorktreeLocked { .. } => EXIT_CONFLICT,
+        GitError::PathOutsideRepository { .. }
+        | GitError::EmptyCommitMessage
+        | GitError::NothingStaged
+        | GitError::AmendUnbornBranch
+        | GitError::CurrentBranchDeletion { .. }
+        | GitError::DefaultBranchDeletion { .. }
+        | GitError::UnmergedBranchDeletion { .. }
+        | GitError::NoUpstream { .. }
+        | GitError::UnbornBranch { .. }
+        | GitError::LocalUpstreamUnsupported { .. }
+        | GitError::OperationInProgress { .. }
+        | GitError::DefaultBranchPush { .. }
+        | GitError::DefaultBranchUnknown { .. }
+        | GitError::DetachedHead { .. } => EXIT_REFUSED,
         _ => EXIT_OPERATION_FAILED,
     }
 }
@@ -1033,8 +1654,27 @@ fn project_error_details(error: &ProjectError) -> Value {
             "candidates": candidates.iter().map(candidate_value).collect::<Vec<_>>()
         }),
         ProjectError::DirtyWorktreeRemoval { .. } => {
-            json!({ "override_flags": ["--force", "--yes"] })
+            json!({ "override_flag": "--force" })
         }
+        ProjectError::Git(error) => git_error_details(error),
+        _ => json!({}),
+    }
+}
+
+fn git_error_details(error: &GitError) -> Value {
+    match error {
+        GitError::NothingStaged => json!({ "override_flag": "--allow-empty" }),
+        GitError::UnmergedBranchDeletion { .. } => json!({ "override_flag": "--force" }),
+        GitError::NoUpstream { .. } => json!({ "override_flag": "--set-upstream" }),
+        GitError::DefaultBranchPush { .. } | GitError::DefaultBranchUnknown { .. } => {
+            json!({ "override_flag": "--allow-default-branch" })
+        }
+        GitError::Interrupted {
+            pending, status, ..
+        } => json!({
+            "pending": pending_name(*pending),
+            "status": status.as_deref().map_or(Value::Null, git_value),
+        }),
         _ => json!({}),
     }
 }
@@ -1044,8 +1684,8 @@ mod tests {
     use std::{collections::HashSet, io};
 
     use super::{
-        CLI_ERROR_KINDS, CliError, EXIT_OPERATION_FAILED, EXIT_REFUSED, GitError, ProjectError,
-        RefusalKind, requested_json,
+        CLI_ERROR_KINDS, CliError, EXIT_OPERATION_FAILED, EXIT_REFUSED, GitError, Project,
+        ProjectError, RefusalKind, project_value, requested_json,
     };
 
     #[test]
@@ -1087,6 +1727,10 @@ mod tests {
             CliError::CurrentDirectory(io::Error::other("fixture")),
             CliError::InterruptHandler(io::Error::other("fixture")),
             CliError::WireProjection("fixture".to_owned()),
+            CliError::PathOperation {
+                operation: "staging",
+                details: serde_json::json!({}),
+            },
             refused(RefusalKind::ConfirmationRequired),
             refused(RefusalKind::ManagedProjectRequiresDelete),
             refused(RefusalKind::LocalProjectRequiresForget),
@@ -1100,5 +1744,26 @@ mod tests {
     fn json_detection_stops_at_the_argument_terminator() {
         let arguments = ["harkness", "worktree", "list", "--", "--json"].map(Into::into);
         assert!(!requested_json(&arguments));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_project_roots_use_the_cli_path_policy() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt, path::PathBuf};
+
+        let project = Project {
+            id: Default::default(),
+            display_name: "lossy".to_owned(),
+            root: PathBuf::from(OsString::from_vec(b"/tmp/lossy-\xff".to_vec())),
+            source: harkness_core::ProjectSource::Local,
+            last_opened: time::OffsetDateTime::UNIX_EPOCH,
+            available: true,
+            git: None,
+        };
+
+        let value = project_value(&project, true).unwrap();
+
+        assert_eq!(value["path_is_lossy"], true);
+        assert!(value["root"].as_str().unwrap().contains('\u{fffd}'));
     }
 }

@@ -78,7 +78,7 @@ fn project_json_wire_shape_and_rfc3339_timestamp_are_exact() {
         serde_json::to_string(&fs::canonicalize(project_root).unwrap().to_string_lossy()).unwrap();
     let branch = serde_json::to_string(&branch).unwrap();
     let expected = format!(
-        "{{\"v\":1,\"type\":\"success\",\"ok\":true,\"data\":{{\"project\":{{\"available\":true,\"display_name\":\"wire-project\",\"git\":{{\"branch\":{branch},\"dirty\":false,\"staged\":0,\"unstaged\":0,\"upstream\":null}},\"id\":\"{FIXED_ID}\",\"last_opened\":\"2026-08-06T18:52:03Z\",\"parent\":null,\"remote\":null,\"root\":{root},\"source\":\"local\",\"status_checked\":true,\"worktree_branch\":null}}}}}}\n"
+        "{{\"v\":1,\"type\":\"success\",\"ok\":true,\"data\":{{\"project\":{{\"available\":true,\"display_name\":\"wire-project\",\"git\":{{\"branch\":{branch},\"dirty\":false,\"staged\":0,\"unstaged\":0,\"upstream\":null}},\"id\":\"{FIXED_ID}\",\"last_opened\":\"2026-08-06T18:52:03Z\",\"parent\":null,\"path_is_lossy\":false,\"remote\":null,\"root\":{root},\"source\":\"local\",\"status_checked\":true,\"worktree_branch\":null}}}}}}\n"
     );
     assert_eq!(output.stdout, expected.as_bytes());
 }
@@ -179,7 +179,7 @@ fn ambiguous_project_name_lists_only_honest_identity_candidates() {
     assert_eq!(body["error"]["kind"], "ambiguous_project_selector");
     let candidates = body["error"]["details"]["candidates"].as_array().unwrap();
     assert_eq!(candidates.len(), 2);
-    let expected_keys = BTreeSet::from(["display_name", "id", "root", "source"]);
+    let expected_keys = BTreeSet::from(["display_name", "id", "path_is_lossy", "root", "source"]);
     for candidate in candidates {
         assert_eq!(
             candidate
@@ -362,190 +362,492 @@ fn no_status_listing_is_cheap_and_marks_derived_state_unchecked() {
 }
 
 #[test]
-fn worktree_create_rejects_start_with_existing_or_detached() {
-    let fixture = TempDir::new().unwrap();
-    for base in [["--existing", "feature"], ["--detached", "HEAD"]] {
-        let output = harkness(
-            fixture.path(),
-            &[
-                "--json", "worktree", "create", FIXED_ID, base[0], base[1], "--start", "HEAD",
-            ],
-        );
-        assert_eq!(output.status.code(), Some(2));
-        assert!(output.stderr.is_empty());
-        let body = json_output(&output);
-        assert_eq!(body["error"]["kind"], "usage_error");
-        assert!(
-            !body["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("Usage:")
-        );
-        assert!(
-            !body["error"]["message"]
-                .as_str()
-                .unwrap()
-                .starts_with("error: ")
-        );
-    }
-}
-
-#[test]
-fn worktree_commands_cover_modes_guardrails_reconciliation_and_exit_codes() {
+fn git_and_worktree_commands_round_trip_end_to_end_through_json() {
     let fixture = TempDir::new().unwrap();
     let data_dir = fixture.path().join("data");
-    let parent_root = fixture.path().join("parent");
-    initialize_repository(&parent_root);
+    let (remote, source, parent_root) = remote_with_clone(fixture.path());
     let mut service = ProjectService::load_from_data_dir(&data_dir).unwrap();
     let parent = service.import_local(&parent_root).unwrap();
     let parent_id = parent.id.to_string();
 
-    let missing_branch = harkness(
-        &data_dir,
-        &[
-            "--json",
-            "worktree",
-            "create",
-            &parent_id,
-            "--existing",
-            "missing",
-        ],
-    );
-    assert_eq!(missing_branch.status.code(), Some(4));
+    let status = harkness_from(&data_dir, &parent_root, &["--json", "git", "status"]);
+    assert_success(&status);
     assert_eq!(
-        json_output(&missing_branch)["error"]["kind"],
-        "no_such_branch"
+        json_output(&status)["data"]["status"]["head"]["kind"],
+        "branch"
+    );
+    assert!(
+        json_output(&status)["data"]["status"]["entries"]
+            .as_array()
+            .unwrap()
+            .is_empty()
     );
 
-    let invalid_start = harkness(
+    let fetched = harkness(
         &data_dir,
         &[
             "--json",
-            "worktree",
-            "create",
+            "git",
+            "fetch",
+            "--project",
             &parent_id,
-            "--new",
-            "invalid-start",
-            "--start",
-            "does-not-exist",
+            "--remote",
+            "origin",
+            "--prune",
         ],
     );
-    assert_eq!(invalid_start.status.code(), Some(1));
-    assert_eq!(
-        json_output(&invalid_start)["error"]["kind"],
-        "invalid_start_point"
+    assert_success(&fetched);
+    assert_eq!(json_output(&fetched)["data"]["remote"], "origin");
+
+    let created_branch = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "branch",
+            "create",
+            "temporary",
+            "--project",
+            &parent_id,
+            "--checkout",
+        ],
     );
+    assert_success(&created_branch);
+    let checked_out = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "branch",
+            "checkout",
+            "main",
+            "--project",
+            &parent_id,
+        ],
+    );
+    assert_success(&checked_out);
+    let branches = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "branch",
+            "list",
+            "--project",
+            &parent_id,
+            "--all",
+        ],
+    );
+    assert_success(&branches);
+    assert!(
+        json_output(&branches)["data"]["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|branch| branch["name"] == "temporary")
+    );
+    let deleted_branch = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "branch",
+            "delete",
+            "temporary",
+            "--project",
+            &parent_id,
+        ],
+    );
+    assert_success(&deleted_branch);
+
+    fs::write(source.join("remote-change.txt"), "from remote\n").unwrap();
+    commit_all(&Repository::open(&source).unwrap(), "remote change");
+    run_git(&source, &["push", "origin", "main"]);
+    let fetched_update = harkness(
+        &data_dir,
+        &["--json", "git", "fetch", "--project", &parent_id],
+    );
+    assert_success(&fetched_update);
+    assert_eq!(json_output(&fetched_update)["data"]["updated"], true);
+    let pulled = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "pull",
+            "--project",
+            &parent_id,
+            "--ff-only",
+        ],
+    );
+    assert_success(&pulled);
+    assert_eq!(
+        json_output(&pulled)["data"]["strategy"],
+        "fast_forward_only"
+    );
+    assert_eq!(json_output(&pulled)["data"]["updated"], true);
 
     let created = harkness(
         &data_dir,
         &[
+            "--json",
             "worktree",
-            "create",
+            "add",
+            "--project",
             &parent_id,
-            "--new",
+            "--branch",
             "agent/cli",
-            "--start",
-            "HEAD",
+            "--from",
+            "main",
         ],
     );
     assert_success(&created);
-    let worktree_id = created_id(&created);
+    let created_body = json_output(&created);
+    let worktree_id = created_body["data"]["project"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let checkout = PathBuf::from(created_body["data"]["project"]["root"].as_str().unwrap());
+    let listed = harkness(
+        &data_dir,
+        &["--json", "worktree", "list", "--project", &parent_id],
+    );
+    assert_success(&listed);
+    assert!(
+        json_output(&listed)["data"]["worktrees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|worktree| worktree["id"] == worktree_id)
+    );
 
-    let duplicate_branch = harkness(
+    fs::write(checkout.join("agent.txt"), "agent work\n").unwrap();
+    let dirty_status = harkness(
         &data_dir,
         &[
             "--json",
-            "worktree",
-            "create",
-            &parent_id,
-            "--new",
-            "agent/cli",
+            "git",
+            "status",
+            "--paths",
+            "--project",
+            &worktree_id,
         ],
     );
-    assert_eq!(duplicate_branch.status.code(), Some(5));
-    assert_eq!(
-        json_output(&duplicate_branch)["error"]["kind"],
-        "branch_already_exists"
-    );
-
-    let listed = harkness(&data_dir, &["worktree", "list", &parent_id]);
-    assert_success(&listed);
-    let listed_text = String::from_utf8(listed.stdout).unwrap();
-    assert!(listed_text.contains(&format!("{worktree_id}\tagent/cli\t")));
-    assert!(listed_text.contains("\tharkness\tactive"));
-
-    let delete_worktree = harkness(
-        &data_dir,
-        &["--json", "project", "delete", "--project", &worktree_id],
-    );
-    assert_eq!(delete_worktree.status.code(), Some(3));
-    assert_eq!(
-        json_output(&delete_worktree)["error"]["kind"],
-        "worktree_requires_remove"
-    );
-
-    let checkout = ProjectService::load_from_data_dir(&data_dir)
+    assert_success(&dirty_status);
+    let entries = json_output(&dirty_status)["data"]["status"]["entries"]
+        .as_array()
         .unwrap()
-        .resolve(&harkness_core::ProjectSelector::from(worktree_id.as_str()))
-        .unwrap();
-    fs::write(checkout.root.join("dirty.txt"), "dirty\n").unwrap();
-    let dirty = harkness(&data_dir, &["--json", "worktree", "remove", &worktree_id]);
+        .clone();
+    assert!(entries.iter().any(|entry| {
+        entry["path"] == "agent.txt"
+            && entry["path_is_lossy"] == false
+            && entry["unstaged"] == "untracked"
+    }));
+
+    let failed_stage = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "stage",
+            "missing.txt",
+            "--project",
+            &worktree_id,
+        ],
+    );
+    assert_eq!(failed_stage.status.code(), Some(1));
+    assert_eq!(
+        json_output(&failed_stage)["error"]["kind"],
+        "path_operation_failed"
+    );
+    assert_eq!(
+        json_output(&failed_stage)["error"]["details"]["all_succeeded"],
+        false
+    );
+
+    let staged = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "stage",
+            "agent.txt",
+            "--project",
+            &worktree_id,
+        ],
+    );
+    assert_success(&staged);
+    assert_eq!(json_output(&staged)["data"]["all_succeeded"], true);
+    let unstaged = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "unstage",
+            "agent.txt",
+            "--project",
+            &worktree_id,
+        ],
+    );
+    assert_success(&unstaged);
+    let staged_again = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "stage",
+            "agent.txt",
+            "--project",
+            &worktree_id,
+        ],
+    );
+    assert_success(&staged_again);
+    let committed = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "commit",
+            "--message",
+            "Commit agent work",
+            "--project",
+            &worktree_id,
+        ],
+    );
+    assert_success(&committed);
+    assert!(json_output(&committed)["data"]["commit_id"].is_string());
+    let amended = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "commit",
+            "--message",
+            "Amend agent work",
+            "--amend",
+            "--allow-empty",
+            "--project",
+            &worktree_id,
+        ],
+    );
+    assert_success(&amended);
+    assert_eq!(json_output(&amended)["data"]["amended"], true);
+    let pushed = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "push",
+            "--set-upstream",
+            "--project",
+            &worktree_id,
+        ],
+    );
+    assert_success(&pushed);
+    assert_eq!(json_output(&pushed)["data"]["branch"], "agent/cli");
+    assert!(
+        Repository::open_bare(&remote)
+            .unwrap()
+            .find_reference("refs/heads/agent/cli")
+            .is_ok()
+    );
+
+    let protected_push = harkness(
+        &data_dir,
+        &["--json", "git", "push", "--project", &parent_id],
+    );
+    assert_eq!(protected_push.status.code(), Some(3));
+    assert_eq!(
+        json_output(&protected_push)["error"]["kind"],
+        "default_branch_push"
+    );
+    assert_eq!(
+        json_output(&protected_push)["error"]["details"]["override_flag"],
+        "--allow-default-branch"
+    );
+    let allowed_push = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "push",
+            "--project",
+            &parent_id,
+            "--allow-default-branch",
+            "--force-with-lease",
+        ],
+    );
+    assert_success(&allowed_push);
+
+    fs::write(checkout.join("dirty.txt"), "dirty\n").unwrap();
+    let dirty = harkness(
+        &data_dir,
+        &["--json", "worktree", "remove", "--project", &worktree_id],
+    );
     assert_eq!(dirty.status.code(), Some(3));
     assert_eq!(
         json_output(&dirty)["error"]["kind"],
         "dirty_worktree_removal"
     );
     assert_eq!(
-        json_output(&dirty)["error"]["details"]["override_flags"],
-        json!(["--force", "--yes"])
+        json_output(&dirty)["error"]["details"]["override_flag"],
+        "--force"
     );
-
-    let unconfirmed = harkness(
-        &data_dir,
-        &["--json", "worktree", "remove", &worktree_id, "--force"],
-    );
-    assert_eq!(unconfirmed.status.code(), Some(3));
-    assert_eq!(
-        json_output(&unconfirmed)["error"]["kind"],
-        "confirmation_required"
-    );
-
     let removed = harkness(
         &data_dir,
-        &["worktree", "remove", &worktree_id, "--force", "--yes"],
+        &[
+            "--json",
+            "worktree",
+            "remove",
+            "--project",
+            &worktree_id,
+            "--force",
+        ],
     );
     assert_success(&removed);
+    assert!(!checkout.exists());
 
-    let recreated = harkness(
+    let reused = harkness(
         &data_dir,
-        &["worktree", "create", &parent_id, "--existing", "agent/cli"],
+        &[
+            "--json",
+            "worktree",
+            "add",
+            "--project",
+            &parent_id,
+            "--branch",
+            "agent/cli",
+            "--existing",
+        ],
     );
-    assert_success(&recreated);
-    let recreated_id = created_id(&recreated);
-    let reloaded = ProjectService::load_from_data_dir(&data_dir).unwrap();
-    let checkout = reloaded
-        .list()
+    assert_success(&reused);
+    let reused_id = json_output(&reused)["data"]["project"]["id"]
+        .as_str()
         .unwrap()
-        .into_iter()
-        .find(|project| project.id.to_string() == recreated_id)
-        .unwrap();
-    fs::remove_dir_all(checkout.root).unwrap();
-
-    let reconciled = harkness(&data_dir, &["worktree", "reconcile", &parent_id]);
-    assert_success(&reconciled);
-    assert_eq!(reconciled.stdout, b"reconciled 1 stale worktree entries\n");
-
-    let non_repository_root = fixture.path().join("plain");
-    fs::create_dir_all(&non_repository_root).unwrap();
-    let plain = service.import_local(non_repository_root).unwrap();
-    let not_repository = harkness(
+        .to_owned();
+    let removed_reused = harkness(
         &data_dir,
-        &["--json", "worktree", "list", &plain.id.to_string()],
+        &["--json", "worktree", "remove", "--project", &reused_id],
     );
-    assert_eq!(not_repository.status.code(), Some(4));
+    assert_success(&removed_reused);
+
+    let unmerged = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "branch",
+            "create",
+            "unmerged",
+            "--checkout",
+            "--project",
+            &parent_id,
+        ],
+    );
+    assert_success(&unmerged);
+    fs::write(parent_root.join("unmerged.txt"), "local only\n").unwrap();
+    let staged_all = harkness(
+        &data_dir,
+        &["--json", "git", "stage", "--all", "--project", &parent_id],
+    );
+    assert_success(&staged_all);
+    let local_commit = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "commit",
+            "--message",
+            "Unmerged work",
+            "--project",
+            &parent_id,
+        ],
+    );
+    assert_success(&local_commit);
+    let checkout_main = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "branch",
+            "checkout",
+            "main",
+            "--project",
+            &parent_id,
+        ],
+    );
+    assert_success(&checkout_main);
+    let refused_delete = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "branch",
+            "delete",
+            "unmerged",
+            "--project",
+            &parent_id,
+        ],
+    );
+    assert_eq!(refused_delete.status.code(), Some(3));
     assert_eq!(
-        json_output(&not_repository)["error"]["kind"],
-        "not_a_repository"
+        json_output(&refused_delete)["error"]["kind"],
+        "unmerged_branch_deletion"
+    );
+    assert_eq!(
+        json_output(&refused_delete)["error"]["details"]["override_flag"],
+        "--force"
+    );
+    let forced_delete = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "branch",
+            "delete",
+            "unmerged",
+            "--project",
+            &parent_id,
+            "--force",
+        ],
+    );
+    assert_success(&forced_delete);
+
+    let detached = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "worktree",
+            "add",
+            "--project",
+            &parent_id,
+            "--branch",
+            "main",
+            "--detach",
+        ],
+    );
+    assert_success(&detached);
+    assert!(json_output(&detached)["data"]["project"]["worktree_branch"].is_null());
+    let detached_id = json_output(&detached)["data"]["project"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let removed_detached = harkness(
+        &data_dir,
+        &["--json", "worktree", "remove", "--project", &detached_id],
+    );
+    assert_success(&removed_detached);
+
+    let pruned = harkness(
+        &data_dir,
+        &["--json", "worktree", "prune", "--project", &parent_id],
+    );
+    assert_success(&pruned);
+    assert!(
+        json_output(&pruned)["data"]["removed"]
+            .as_array()
+            .unwrap()
+            .is_empty()
     );
 }
 
@@ -841,19 +1143,193 @@ fn ctrl_c_cancels_clone_with_exit_130_and_cleans_partial_storage() {
     assert!(repositories_are_empty(&data_dir));
 }
 
+// Darwin filesystems reject this deliberately malformed UTF-8 filename with
+// EILSEQ before Harkness can inspect it. Keep the end-to-end fixture on a
+// platform where arbitrary-byte pathnames are supported; the parser's Unix
+// byte-preservation behavior remains covered by harkness-core unit tests.
+#[cfg(target_os = "linux")]
+#[test]
+fn non_utf8_status_paths_are_lossy_and_explicitly_flagged() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let project_root = fixture.path().join("non-utf8-status");
+    initialize_repository(&project_root);
+    let mut service = ProjectService::load_from_data_dir(&data_dir).unwrap();
+    let project = service.import_local(&project_root).unwrap();
+    let path = OsString::from_vec(b"invalid-\xff.txt".to_vec());
+    fs::write(project_root.join(path), "not UTF-8\n").unwrap();
+
+    let output = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "status",
+            "--project",
+            &project.id.to_string(),
+        ],
+    );
+
+    assert_success(&output);
+    let body = json_output(&output);
+    let entry = body["data"]["status"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path_is_lossy"] == true)
+        .expect("the non-UTF-8 path should be flagged");
+    assert!(entry["path"].as_str().unwrap().contains('\u{fffd}'));
+}
+
+#[cfg(unix)]
+#[test]
+fn ctrl_c_cancels_fetch_with_exit_130_and_kills_its_process_group() {
+    use std::{thread, time::Duration};
+
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let project_root = fixture.path().join("fetch-project");
+    initialize_repository(&project_root);
+    Repository::open(&project_root)
+        .unwrap()
+        .remote("origin", "file:///does-not-need-to-exist")
+        .unwrap();
+    let mut service = ProjectService::load_from_data_dir(&data_dir).unwrap();
+    let project = service.import_local(&project_root).unwrap();
+
+    let bin = fixture.path().join("bin");
+    let fake_git = bin.join("git");
+    let ready = fixture.path().join("fetch-ready");
+    let activity = fixture.path().join("fetch-helper-activity");
+    fs::create_dir_all(&bin).unwrap();
+    make_executable(
+        &fake_git,
+        "#!/bin/sh\n(while true; do printf x >> \"$HARKNESS_TEST_ACTIVITY\"; sleep 0.01; done) 2>/dev/null &\ntouch \"$HARKNESS_TEST_READY\"\necho ready >&2\nwait\n",
+    );
+    let path = path_with_prefix(&bin);
+    let child = Command::new(env!("CARGO_BIN_EXE_harkness"))
+        .env("HARKNESS_DATA_DIR", &data_dir)
+        .env("HARKNESS_TEST_READY", &ready)
+        .env("HARKNESS_TEST_ACTIVITY", &activity)
+        .env("PATH", path)
+        .args([
+            "--json",
+            "git",
+            "fetch",
+            "--project",
+            &project.id.to_string(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    for _ in 0..500 {
+        if ready.exists() && activity.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "fake Git process never started");
+    assert!(activity.exists(), "fake Git helper never started");
+    // SAFETY: the child PID is live and belongs to this test process.
+    assert_eq!(
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) },
+        0
+    );
+    let output = child.wait_with_output().unwrap();
+
+    assert_eq!(output.status.code(), Some(130));
+    assert_eq!(json_output(&output)["error"]["kind"], "cancelled");
+    let activity_after_cancel = fs::read(&activity).unwrap();
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        fs::read(&activity).unwrap(),
+        activity_after_cancel,
+        "a helper survived fetch cancellation"
+    );
+}
+
 fn initialize_repository(root: &Path) {
     fs::create_dir_all(root).unwrap();
     let repository = Repository::init(root).unwrap();
+    repository.set_head("refs/heads/main").unwrap();
+    configure_identity(&repository);
     fs::write(root.join("README.md"), "fixture\n").unwrap();
+    commit_all(&repository, "fixture");
+}
+
+fn configure_identity(repository: &Repository) {
+    let mut config = repository.config().unwrap();
+    config.set_str("user.name", "Harkness Tests").unwrap();
+    config
+        .set_str("user.email", "tests@harkness.invalid")
+        .unwrap();
+    config.set_bool("commit.gpgsign", false).unwrap();
+}
+
+fn commit_all(repository: &Repository, message: &str) {
     let mut index = repository.index().unwrap();
-    index.add_path(Path::new("README.md")).unwrap();
+    index
+        .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+        .unwrap();
     let tree_id = index.write_tree().unwrap();
     index.write().unwrap();
     let tree = repository.find_tree(tree_id).unwrap();
     let signature = Signature::now("Harkness Tests", "tests@example.com").unwrap();
+    let parents = repository
+        .head()
+        .ok()
+        .and_then(|head| head.target())
+        .map(|id| repository.find_commit(id).unwrap())
+        .into_iter()
+        .collect::<Vec<_>>();
     repository
-        .commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
+        .commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parents.iter().collect::<Vec<_>>(),
+        )
         .unwrap();
+}
+
+fn remote_with_clone(fixture: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let remote = fixture.join("remote.git");
+    let bare = Repository::init_bare(&remote).unwrap();
+    bare.set_head("refs/heads/main").unwrap();
+
+    let source = fixture.join("source");
+    initialize_repository(&source);
+    let remote_url = format!("file://{}", remote.display());
+    run_git(&source, &["remote", "add", "origin", &remote_url]);
+    run_git(&source, &["push", "--set-upstream", "origin", "main"]);
+
+    let clone = fixture.join("parent");
+    run_git(
+        fixture,
+        &["clone", "--", &remote_url, clone.to_str().unwrap()],
+    );
+    configure_identity(&Repository::open(&clone).unwrap());
+    (remote, source, clone)
+}
+
+fn run_git(current_dir: &Path, arguments: &[&str]) {
+    let output = Command::new("git")
+        .current_dir(current_dir)
+        .args(arguments)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {} failed:\nstdout: {}\nstderr: {}",
+        arguments.join(" "),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn write_catalog(data_dir: &Path, projects: Vec<Value>) {
@@ -930,17 +1406,6 @@ fn assert_success(output: &std::process::Output) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-}
-
-fn created_id(output: &std::process::Output) -> String {
-    String::from_utf8(output.stdout.clone())
-        .unwrap()
-        .strip_prefix("created ")
-        .unwrap()
-        .split('\t')
-        .next()
-        .unwrap()
-        .to_owned()
 }
 
 fn repositories_are_empty(data_dir: &Path) -> bool {
