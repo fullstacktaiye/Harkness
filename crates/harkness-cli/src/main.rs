@@ -1643,7 +1643,11 @@ fn git_exit_code(error: &GitError) -> u8 {
         | GitError::OperationInProgress { .. }
         | GitError::DefaultBranchPush { .. }
         | GitError::DefaultBranchUnknown { .. }
-        | GitError::DetachedHead { .. } => EXIT_REFUSED,
+        | GitError::DetachedHead { .. }
+        | GitError::StaleHunkSelection { .. }
+        | GitError::BinaryHunkSelection { .. }
+        | GitError::RenameOnlyHunkSelection { .. }
+        | GitError::HunkNotFound { .. } => EXIT_REFUSED,
         _ => EXIT_OPERATION_FAILED,
     }
 }

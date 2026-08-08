@@ -901,6 +901,14 @@ mod tests {
             Err(GitError::Cancelled)
         ));
         assert!(matches!(
+            service.stage_hunks(&[], &cancelled),
+            Err(GitError::Cancelled)
+        ));
+        assert!(matches!(
+            service.unstage_hunks(&[], &cancelled),
+            Err(GitError::Cancelled)
+        ));
+        assert!(matches!(
             service.commit("locked", &CommitOptions::default(), &cancelled),
             Err(GitError::Cancelled)
         ));

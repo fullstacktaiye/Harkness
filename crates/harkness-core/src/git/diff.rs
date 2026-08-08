@@ -112,6 +112,12 @@ pub struct FileDiff {
     pub old_blob_id: String,
     /// The new blob object ID, or the all-zero ID when the side is absent.
     pub new_blob_id: String,
+    /// Git file mode of the old side, or zero when that side is absent.
+    pub old_mode: u32,
+    /// Git file mode of the new side, or zero when that side is absent.
+    pub new_mode: u32,
+    /// Context-line count used to form this file's hunks.
+    pub context_lines: u32,
     /// Byte size of the old side, zero when absent.
     pub old_size: u64,
     /// Byte size of the new side, zero when absent.
@@ -270,6 +276,8 @@ pub(crate) fn compute(
             Some(patch) if !binary => collect_hunks(patch, root)?,
             Some(_) | None => Vec::new(),
         };
+        let old_mode = i32::from(old_file.mode()) as u32;
+        let new_mode = i32::from(new_file.mode()) as u32;
 
         files.push(FileDiff {
             target: target.clone(),
@@ -285,6 +293,9 @@ pub(crate) fn compute(
                 new_file,
                 new_path.as_deref(),
             )?,
+            old_mode,
+            new_mode,
+            context_lines: options.context_lines,
             old_size,
             new_size,
             binary,
