@@ -545,22 +545,27 @@ fn git_and_worktree_commands_round_trip_end_to_end_through_json() {
 
     let moved_parent = fixture.path().join("cli-moved-worktrees");
     fs::create_dir(&moved_parent).unwrap();
-    let checkout = moved_parent.join("checkout");
+    let requested_checkout = moved_parent.join("checkout");
     let moved = harkness(
         &data_dir,
         &[
             "--json",
             "worktree",
             "move",
-            checkout.to_str().unwrap(),
+            requested_checkout.to_str().unwrap(),
             "--project",
             &worktree_id,
         ],
     );
     assert_success(&moved);
+    let checkout = PathBuf::from(
+        json_output(&moved)["data"]["project"]["root"]
+            .as_str()
+            .unwrap(),
+    );
     assert_eq!(
-        json_output(&moved)["data"]["project"]["root"],
-        checkout.to_str().unwrap()
+        checkout.canonicalize().unwrap(),
+        requested_checkout.canonicalize().unwrap()
     );
     assert!(!original_checkout.exists());
     assert!(checkout.exists());
@@ -920,8 +925,14 @@ fn git_and_worktree_commands_round_trip_end_to_end_through_json() {
     let repaired_body = json_output(&repaired);
     assert_eq!(repaired_body["data"]["repaired"][0]["id"], repair_id);
     assert_eq!(
-        repaired_body["data"]["repaired"][0]["root"],
-        repair_destination.to_str().unwrap()
+        PathBuf::from(
+            repaired_body["data"]["repaired"][0]["root"]
+                .as_str()
+                .unwrap()
+        )
+        .canonicalize()
+        .unwrap(),
+        repair_destination.canonicalize().unwrap()
     );
     assert!(
         repaired_body["data"]["removed"]

@@ -4277,8 +4277,10 @@ mod tests {
         ));
         assert!(worktree.root.exists());
         assert!(
-            git(&parent_root, ["worktree", "list", "--porcelain"])
-                .contains(worktree.root.to_str().unwrap())
+            crate::git::worktree::list(Path::new("git"), &parent_root, &Cancellation::default())
+                .unwrap()
+                .iter()
+                .any(|listed| crate::git::worktree::same_path(&listed.root, &worktree.root))
         );
     }
 
