@@ -507,7 +507,8 @@ fn git_and_worktree_commands_round_trip_end_to_end_through_json() {
         .as_str()
         .unwrap()
         .to_owned();
-    let checkout = PathBuf::from(created_body["data"]["project"]["root"].as_str().unwrap());
+    let original_checkout =
+        PathBuf::from(created_body["data"]["project"]["root"].as_str().unwrap());
     let listed = harkness(
         &data_dir,
         &["--json", "worktree", "list", "--project", &parent_id],
@@ -520,6 +521,49 @@ fn git_and_worktree_commands_round_trip_end_to_end_through_json() {
             .iter()
             .any(|worktree| worktree["id"] == worktree_id)
     );
+
+    let relative_move = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "worktree",
+            "move",
+            "relative-checkout",
+            "--project",
+            &worktree_id,
+        ],
+    );
+    assert_eq!(relative_move.status.code(), Some(3));
+    assert_eq!(
+        json_output(&relative_move)["error"]["kind"],
+        "worktree_destination_not_absolute"
+    );
+    assert_eq!(
+        json_output(&relative_move)["error"]["details"]["path"],
+        "relative-checkout"
+    );
+
+    let moved_parent = fixture.path().join("cli-moved-worktrees");
+    fs::create_dir(&moved_parent).unwrap();
+    let checkout = moved_parent.join("checkout");
+    let moved = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "worktree",
+            "move",
+            checkout.to_str().unwrap(),
+            "--project",
+            &worktree_id,
+        ],
+    );
+    assert_success(&moved);
+    assert_eq!(
+        json_output(&moved)["data"]["project"]["root"],
+        checkout.to_str().unwrap()
+    );
+    assert!(!original_checkout.exists());
+    assert!(checkout.exists());
 
     fs::write(checkout.join("agent.txt"), "agent work\n").unwrap();
     let dirty_status = harkness(
@@ -838,6 +882,65 @@ fn git_and_worktree_commands_round_trip_end_to_end_through_json() {
     );
     assert_success(&removed_detached);
 
+    let repair_candidate = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "worktree",
+            "add",
+            "--project",
+            &parent_id,
+            "--branch",
+            "agent/reconciliation-report",
+        ],
+    );
+    assert_success(&repair_candidate);
+    let repair_body = json_output(&repair_candidate);
+    let repair_id = repair_body["data"]["project"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let repair_source = PathBuf::from(repair_body["data"]["project"]["root"].as_str().unwrap());
+    let repair_destination = moved_parent.join("reconciled-checkout");
+    run_git(
+        &parent_root,
+        &[
+            "worktree",
+            "move",
+            "--",
+            repair_source.to_str().unwrap(),
+            repair_destination.to_str().unwrap(),
+        ],
+    );
+    let repaired = harkness(
+        &data_dir,
+        &["--json", "worktree", "prune", "--project", &parent_id],
+    );
+    assert_success(&repaired);
+    let repaired_body = json_output(&repaired);
+    assert_eq!(repaired_body["data"]["repaired"][0]["id"], repair_id);
+    assert_eq!(
+        repaired_body["data"]["repaired"][0]["root"],
+        repair_destination.to_str().unwrap()
+    );
+    assert!(
+        repaired_body["data"]["removed"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        repaired_body["data"]["skipped"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let removed_repaired = harkness(
+        &data_dir,
+        &["--json", "worktree", "remove", "--project", &repair_id],
+    );
+    assert_success(&removed_repaired);
+
     let pruned = harkness(
         &data_dir,
         &["--json", "worktree", "prune", "--project", &parent_id],
@@ -845,6 +948,18 @@ fn git_and_worktree_commands_round_trip_end_to_end_through_json() {
     assert_success(&pruned);
     assert!(
         json_output(&pruned)["data"]["removed"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        json_output(&pruned)["data"]["repaired"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        json_output(&pruned)["data"]["skipped"]
             .as_array()
             .unwrap()
             .is_empty()

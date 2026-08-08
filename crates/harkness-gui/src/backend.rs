@@ -136,7 +136,16 @@ pub mod ffi {
             start_point: &QString,
         );
 
-        /// Reconciles only missing worktrees owned by Harkness.
+        /// Relocates a Harkness-owned worktree to an absolute destination.
+        #[qinvokable]
+        #[cxx_name = "moveWorktree"]
+        fn move_worktree(
+            self: Pin<&mut HarknessBackend>,
+            project_id: &QString,
+            destination: &QString,
+        );
+
+        /// Reconciles missing or externally moved Harkness worktrees.
         #[qinvokable]
         #[cxx_name = "reconcileWorktrees"]
         fn reconcile_worktrees(self: Pin<&mut HarknessBackend>, project_id: &QString);
@@ -786,6 +795,7 @@ fn to_map(row: &ProjectRow) -> QVariant {
 
 #[derive(Debug)]
 struct WorktreeRow {
+    id: String,
     root: String,
     branch: String,
     owned: bool,
@@ -795,7 +805,13 @@ struct WorktreeRow {
 
 impl From<harkness_core::Worktree> for WorktreeRow {
     fn from(worktree: harkness_core::Worktree) -> Self {
+        let id = worktree
+            .project
+            .as_ref()
+            .map(|project| project.id.to_string())
+            .unwrap_or_default();
         Self {
+            id,
             root: worktree.root.display().to_string(),
             branch: worktree.branch.unwrap_or_default(),
             owned: worktree.project.is_some(),
@@ -810,6 +826,7 @@ fn to_worktrees(rows: &[WorktreeRow]) -> QList<QVariant> {
     for row in rows {
         let mut entry = QMap::<QMapPair_QString_QVariant>::default();
         let mut insert = |key: &str, value: QVariant| entry.insert(QString::from(key), value);
+        insert("id", QVariant::from(&QString::from(row.id.as_str())));
         insert("root", QVariant::from(&QString::from(row.root.as_str())));
         insert(
             "branch",
@@ -861,6 +878,24 @@ fn remove_worktree_with_service(
         .map_err(|_| "invalid worktree project identifier".to_owned())?;
     service
         .remove_worktree(id, force, cancellation)
+        .map_err(|error| error.to_string())
+}
+
+fn move_worktree_with_service(
+    service: &mut harkness_core::ProjectService,
+    project_id: &str,
+    destination: &str,
+    cancellation: &harkness_core::Cancellation,
+) -> Result<harkness_core::Project, String> {
+    let id = project_id
+        .parse()
+        .map_err(|_| "invalid worktree project identifier".to_owned())?;
+    let destination = destination.trim();
+    if destination.is_empty() {
+        return Err("Enter an absolute destination path".to_owned());
+    }
+    service
+        .move_worktree(id, std::path::Path::new(destination), cancellation)
         .map_err(|error| error.to_string())
 }
 
@@ -1546,7 +1581,7 @@ impl ffi::HarknessBackend {
                     .map_err(|_| "invalid parent project identifier".to_owned())?;
                 let mut service =
                     harkness_core::ProjectService::load().map_err(|error| error.to_string())?;
-                let removed = service
+                let outcome = service
                     .reconcile_worktrees(id, &cancellation)
                     .map_err(|error| error.to_string())?;
                 let rows = service
@@ -1555,22 +1590,79 @@ impl ffi::HarknessBackend {
                     .into_iter()
                     .map(WorktreeRow::from)
                     .collect::<Vec<_>>();
-                Ok::<_, String>((removed.len(), rows))
+                Ok::<_, String>((outcome, rows))
             })();
             let _ = qt_thread.queue(move |mut backend| {
                 finish_job(backend.as_mut(), &job_id);
                 match result {
-                    Ok((removed, rows)) => {
+                    Ok((outcome, rows)) => {
                         backend.as_mut().set_worktrees(to_worktrees(&rows));
-                        backend.as_mut().set_status(if removed == 0 {
-                            "Worktrees are already reconciled".into()
-                        } else {
-                            format!(
-                                "Removed {removed} stale worktree entr{}",
-                                if removed == 1 { "y" } else { "ies" }
-                            )
-                            .into()
-                        });
+                        backend.as_mut().set_status(
+                            if outcome.removed.is_empty()
+                                && outcome.repaired.is_empty()
+                                && outcome.skipped.is_empty()
+                            {
+                                "Worktrees are already reconciled".into()
+                            } else {
+                                format!(
+                                    "Reconciled worktrees: removed {}, repaired {}, skipped {}",
+                                    outcome.removed.len(),
+                                    outcome.repaired.len(),
+                                    outcome.skipped.len()
+                                )
+                                .into()
+                            },
+                        );
+                        backend.as_mut().refresh();
+                    }
+                    Err(error) => backend.as_mut().set_status(error.into()),
+                }
+            });
+        });
+    }
+
+    fn move_worktree(mut self: Pin<&mut Self>, project_id: &QString, destination: &QString) {
+        let project_id = project_id.to_string();
+        let destination = destination.to_string();
+        let Some((job_id, cancellation)) = start_job(
+            self.as_mut(),
+            "move_worktree",
+            &project_id,
+            "Move worktree",
+            true,
+        ) else {
+            return;
+        };
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let mut service =
+                    harkness_core::ProjectService::load().map_err(|error| error.to_string())?;
+                let moved = move_worktree_with_service(
+                    &mut service,
+                    &project_id,
+                    &destination,
+                    &cancellation,
+                )?;
+                let harkness_core::ProjectSource::Worktree { parent, .. } = &moved.source else {
+                    return Err("moved project lost its worktree relationship".to_owned());
+                };
+                let rows = service
+                    .worktrees(*parent, &cancellation)
+                    .map_err(|error| error.to_string())?
+                    .into_iter()
+                    .map(WorktreeRow::from)
+                    .collect::<Vec<_>>();
+                Ok::<_, String>((moved, rows))
+            })();
+            let _ = qt_thread.queue(move |mut backend| {
+                finish_job(backend.as_mut(), &job_id);
+                match result {
+                    Ok((project, rows)) => {
+                        backend.as_mut().set_worktrees(to_worktrees(&rows));
+                        backend
+                            .as_mut()
+                            .set_status(format!("Moved {}", project.display_name).into());
                         backend.as_mut().refresh();
                     }
                     Err(error) => backend.as_mut().set_status(error.into()),
@@ -1695,8 +1787,8 @@ mod tests {
 
     use super::{
         BranchRow, GitStateRow, OpenedUpdate, ProjectRow, begin_job, empty_opened, end_job,
-        operation_outcome, project_rows, remove_worktree_with_service, to_branches, to_git,
-        to_jobs, to_map, to_projects, update_job, worktree_base,
+        move_worktree_with_service, operation_outcome, project_rows, remove_worktree_with_service,
+        to_branches, to_git, to_jobs, to_map, to_projects, update_job, worktree_base,
     };
 
     fn project(
@@ -2135,6 +2227,49 @@ mod tests {
             &harkness_core::Cancellation::default(),
         )
         .unwrap();
+        assert!(!worktree.root.exists());
+    }
+
+    #[test]
+    fn backend_worktree_move_validates_and_relocates_the_checkout() {
+        let fixture = TempDir::new().unwrap();
+        let parent_root = fixture.path().join("move-parent");
+        initialize_repository(&parent_root);
+        let destination_parent = fixture.path().join("move-destination-parent");
+        fs::create_dir(&destination_parent).unwrap();
+        let destination = destination_parent.join("checkout");
+        let mut service =
+            harkness_core::ProjectService::load_from_data_dir(fixture.path().join("move-data"))
+                .unwrap();
+        let parent = service.import_local(&parent_root).unwrap();
+        let worktree = service
+            .create_worktree(
+                parent.id,
+                &harkness_core::WorktreeBase::NewBranch {
+                    name: "agent/gui-move".to_owned(),
+                    start_point: None,
+                },
+                &harkness_core::Cancellation::default(),
+            )
+            .unwrap();
+
+        let relative = move_worktree_with_service(
+            &mut service,
+            &worktree.id.to_string(),
+            "relative-checkout",
+            &harkness_core::Cancellation::default(),
+        )
+        .unwrap_err();
+        assert!(relative.contains("must be absolute"));
+
+        let moved = move_worktree_with_service(
+            &mut service,
+            &worktree.id.to_string(),
+            destination.to_str().unwrap(),
+            &harkness_core::Cancellation::default(),
+        )
+        .unwrap();
+        assert_eq!(moved.root, destination.canonicalize().unwrap());
         assert!(!worktree.root.exists());
     }
 

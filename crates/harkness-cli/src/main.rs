@@ -151,6 +151,14 @@ enum WorktreeCommand {
         #[arg(long)]
         force: bool,
     },
+    /// Relocate a Harkness-managed linked worktree.
+    Move {
+        #[command(flatten)]
+        selection: ProjectSelection,
+        /// New absolute path. The destination itself must not exist.
+        #[arg(value_name = "DESTINATION")]
+        destination: PathBuf,
+    },
     /// Remove stale Harkness-owned worktree records selectively.
     #[command(visible_alias = "reconcile")]
     Prune(ProjectSelection),
@@ -1017,13 +1025,50 @@ fn run_worktree(
                 || Ok(json!({ "project": project_value(&project, false)? })),
             )
         }
-        WorktreeCommand::Prune(selection) => {
-            let parent = resolve_project(&service, selection.project.as_deref())?;
-            let removed = service.prune_worktrees(parent.id, cancellation)?;
+        WorktreeCommand::Move {
+            selection,
+            destination,
+        } => {
+            let worktree = resolve_project(&service, selection.project.as_deref())?;
+            let project = service.move_worktree(worktree.id, &destination, cancellation)?;
             command_result(
                 json_output,
-                || format!("pruned {} stale worktree entries", removed.len()),
-                || Ok(json!({ "removed": project_values(&removed, false)? })),
+                || {
+                    format!(
+                        "moved {}\t{}\t{}",
+                        project.id,
+                        project.display_name,
+                        project.root.display()
+                    )
+                },
+                || Ok(json!({ "project": project_value(&project, true)? })),
+            )
+        }
+        WorktreeCommand::Prune(selection) => {
+            let parent = resolve_project(&service, selection.project.as_deref())?;
+            let outcome = service.prune_worktrees(parent.id, cancellation)?;
+            command_result(
+                json_output,
+                || {
+                    format!(
+                        "reconciled worktrees: removed {}, repaired {}, skipped {}",
+                        outcome.removed.len(),
+                        outcome.repaired.len(),
+                        outcome.skipped.len()
+                    )
+                },
+                || {
+                    Ok(json!({
+                        "removed": project_values(&outcome.removed, false)?,
+                        "repaired": project_values(&outcome.repaired, false)?,
+                        "skipped": outcome.skipped.iter().map(|skip| {
+                            Ok(json!({
+                                "project": project_value(&skip.project, false)?,
+                                "reason": skip.reason,
+                            }))
+                        }).collect::<Result<Vec<Value>, CliError>>()?,
+                    }))
+                },
             )
         }
     }
@@ -1616,9 +1661,34 @@ fn project_exit_code(error: &ProjectError) -> u8 {
         | ProjectError::WorktreeRemovalRequired { .. }
         | ProjectError::UnsafeWorktreeRemoval { .. }
         | ProjectError::WorktreeParentUnsupported { .. }
-        | ProjectError::DirtyWorktreeRemoval { .. } => EXIT_REFUSED,
+        | ProjectError::DirtyWorktreeRemoval { .. }
+        | ProjectError::UnsafeWorktreeMove { .. }
+        | ProjectError::WorktreeDestinationExists { .. }
+        | ProjectError::WorktreeDestinationNotAbsolute { .. }
+        | ProjectError::WorktreeDestinationParentUnavailable { .. }
+        | ProjectError::WorktreeDestinationInsideProject { .. }
+        | ProjectError::WorktreeDestinationContainsProject { .. }
+        | ProjectError::WorktreeDestinationInsideDataDirectory { .. } => EXIT_REFUSED,
         ProjectError::Git(error) => git_exit_code(error),
-        _ => EXIT_OPERATION_FAILED,
+        ProjectError::DataDirectoryUnavailable
+        | ProjectError::InvalidDirectory { .. }
+        | ProjectError::UnreadableDirectory { .. }
+        | ProjectError::CatalogRead { .. }
+        | ProjectError::CatalogLock { .. }
+        | ProjectError::MalformedCatalog { .. }
+        | ProjectError::CatalogVersionTooOld { .. }
+        | ProjectError::CatalogVersionTooNew { .. }
+        | ProjectError::InvalidCatalog { .. }
+        | ProjectError::ProjectUnavailable { .. }
+        | ProjectError::GitInspection { .. }
+        | ProjectError::Persistence { .. }
+        | ProjectError::InvalidRemote { .. }
+        | ProjectError::GitLaunch { .. }
+        | ProjectError::CloneFailed { .. }
+        | ProjectError::ManagedRemoval { .. }
+        | ProjectError::ManagedRepositoryLock { .. }
+        | ProjectError::ManagedRepositoryReconciliation { .. }
+        | ProjectError::WorktreeMovedCatalogStale { .. } => EXIT_OPERATION_FAILED,
     }
 }
 
@@ -1644,6 +1714,7 @@ fn git_exit_code(error: &GitError) -> u8 {
         | GitError::DefaultBranchPush { .. }
         | GitError::DefaultBranchUnknown { .. }
         | GitError::DetachedHead { .. }
+        | GitError::WorktreeMoveAcrossDevices { .. }
         | GitError::StaleHunkSelection { .. }
         | GitError::BinaryHunkSelection { .. }
         | GitError::RenameOnlyHunkSelection { .. }
@@ -1664,6 +1735,72 @@ fn project_error_details(error: &ProjectError) -> Value {
         ProjectError::DirtyWorktreeRemoval { .. } => {
             json!({ "override_flag": "--force" })
         }
+        ProjectError::UnsafeWorktreeRemoval { id, path, reason }
+        | ProjectError::UnsafeWorktreeMove { id, path, reason } => {
+            let (path, path_is_lossy) = wire_path(path);
+            json!({
+                "project_id": id.to_string(),
+                "path": path,
+                "path_is_lossy": path_is_lossy,
+                "reason": reason,
+            })
+        }
+        ProjectError::WorktreeDestinationExists { path }
+        | ProjectError::WorktreeDestinationNotAbsolute { path } => {
+            let (path, path_is_lossy) = wire_path(path);
+            json!({ "path": path, "path_is_lossy": path_is_lossy })
+        }
+        ProjectError::WorktreeDestinationParentUnavailable { path, .. } => {
+            let (path, path_is_lossy) = wire_path(path);
+            json!({ "path": path, "path_is_lossy": path_is_lossy })
+        }
+        ProjectError::WorktreeDestinationInsideProject {
+            path,
+            project_id,
+            project_root,
+        }
+        | ProjectError::WorktreeDestinationContainsProject {
+            path,
+            project_id,
+            project_root,
+        } => {
+            let (path, path_is_lossy) = wire_path(path);
+            let (project_root, project_root_is_lossy) = wire_path(project_root);
+            json!({
+                "path": path,
+                "path_is_lossy": path_is_lossy,
+                "project_id": project_id.to_string(),
+                "project_root": project_root,
+                "project_root_is_lossy": project_root_is_lossy,
+            })
+        }
+        ProjectError::WorktreeDestinationInsideDataDirectory { path, data_dir } => {
+            let (path, path_is_lossy) = wire_path(path);
+            let (data_dir, data_dir_is_lossy) = wire_path(data_dir);
+            json!({
+                "path": path,
+                "path_is_lossy": path_is_lossy,
+                "data_dir": data_dir,
+                "data_dir_is_lossy": data_dir_is_lossy,
+            })
+        }
+        ProjectError::WorktreeMovedCatalogStale {
+            id,
+            stale_root,
+            destination,
+            reason,
+        } => {
+            let (stale_root, stale_root_is_lossy) = wire_path(stale_root);
+            let (destination, destination_is_lossy) = wire_path(destination);
+            json!({
+                "project_id": id.to_string(),
+                "stale_root": stale_root,
+                "stale_root_is_lossy": stale_root_is_lossy,
+                "destination": destination,
+                "destination_is_lossy": destination_is_lossy,
+                "reason": reason,
+            })
+        }
         ProjectError::Git(error) => git_error_details(error),
         _ => json!({}),
     }
@@ -1683,6 +1820,20 @@ fn git_error_details(error: &GitError) -> Value {
             "pending": pending_name(*pending),
             "status": status.as_deref().map_or(Value::Null, git_value),
         }),
+        GitError::WorktreeMoveAcrossDevices {
+            worktree,
+            destination,
+            ..
+        } => {
+            let (worktree, worktree_is_lossy) = wire_path(worktree);
+            let (destination, destination_is_lossy) = wire_path(destination);
+            json!({
+                "worktree": worktree,
+                "worktree_is_lossy": worktree_is_lossy,
+                "destination": destination,
+                "destination_is_lossy": destination_is_lossy,
+            })
+        }
         _ => json!({}),
     }
 }

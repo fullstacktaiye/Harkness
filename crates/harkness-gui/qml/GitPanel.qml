@@ -16,6 +16,8 @@ Item {
     readonly property var entries: stateReady && gitState.entries !== undefined
         ? gitState.entries
         : []
+    property string movingWorktreeId: ""
+    property string movingWorktreeName: ""
 
     implicitWidth: Kirigami.Units.gridUnit * 22
 
@@ -24,10 +26,11 @@ Item {
         color: Kirigami.Theme.alternateBackgroundColor
     }
 
-    function job(kind) {
+    function job(kind, targetProjectId) {
+        const target = targetProjectId === undefined ? project.id : targetProjectId;
         for (let index = 0; index < backend.jobs.length; ++index) {
             const candidate = backend.jobs[index];
-            if (String(candidate.projectId) === String(project.id) && candidate.kind === kind)
+            if (String(candidate.projectId) === String(target) && candidate.kind === kind)
                 return candidate;
         }
         return null;
@@ -535,17 +538,68 @@ Item {
                 Repeater {
                     model: panel.project.worktree ? [] : panel.backend.worktrees
 
-                    delegate: Controls.Label {
+                    delegate: RowLayout {
                         required property var modelData
 
                         Layout.fillWidth: true
-                        color: Kirigami.Theme.disabledTextColor
-                        elide: Text.ElideMiddle
-                        font: Kirigami.Theme.smallFont
-                        text: qsTr("%1 — %2 (%3)")
-                            .arg(modelData.branch.length > 0 ? modelData.branch : qsTr("detached HEAD"))
-                            .arg(modelData.root)
-                            .arg(modelData.owned ? qsTr("Harkness") : qsTr("external"))
+
+                        Controls.Label {
+                            Layout.fillWidth: true
+                            color: Kirigami.Theme.disabledTextColor
+                            elide: Text.ElideMiddle
+                            font: Kirigami.Theme.smallFont
+                            text: qsTr("%1 — %2 (%3)")
+                                .arg(modelData.branch.length > 0 ? modelData.branch : qsTr("detached HEAD"))
+                                .arg(modelData.root)
+                                .arg(modelData.owned ? qsTr("Harkness") : qsTr("external"))
+                        }
+
+                        Controls.Button {
+                            display: Controls.AbstractButton.IconOnly
+                            enabled: modelData.owned
+                                && panel.job("move_worktree", modelData.id) === null
+                            icon.name: "folder-move"
+                            text: qsTr("Move worktree")
+                            visible: modelData.owned
+                            onClicked: {
+                                panel.movingWorktreeId = String(modelData.id);
+                                panel.movingWorktreeName = modelData.branch.length > 0
+                                    ? String(modelData.branch)
+                                    : qsTr("detached HEAD");
+                                moveDestination.text = "";
+                                moveWorktreeForm.visible = true;
+                                moveDestination.forceActiveFocus();
+                            }
+                        }
+                    }
+                }
+
+                ColumnLayout {
+                    id: moveWorktreeForm
+
+                    Layout.fillWidth: true
+                    spacing: Kirigami.Units.smallSpacing
+                    visible: false
+
+                    Controls.Label {
+                        Layout.fillWidth: true
+                        text: qsTr("Move %1").arg(panel.movingWorktreeName)
+                    }
+
+                    Controls.TextField {
+                        id: moveDestination
+
+                        Layout.fillWidth: true
+                        placeholderText: qsTr("Absolute destination path")
+                    }
+
+                    Controls.Button {
+                        Layout.fillWidth: true
+                        enabled: moveDestination.text.trim().length > 0
+                            && panel.job("move_worktree", panel.movingWorktreeId) === null
+                        icon.name: "folder-move"
+                        text: qsTr("Review and move…")
+                        onClicked: moveWorktreeDialog.open()
                     }
                 }
             }
@@ -576,5 +630,19 @@ Item {
             worktreeBranch.text,
             worktreeStart.text
         )
+    }
+
+    Kirigami.PromptDialog {
+        id: moveWorktreeDialog
+
+        standardButtons: Kirigami.Dialog.Ok | Kirigami.Dialog.Cancel
+        subtitle: qsTr("Git will relocate %1 to:\n%2\n\nThe destination must be an absolute path that does not already exist.")
+            .arg(panel.movingWorktreeName)
+            .arg(moveDestination.text.trim())
+        title: qsTr("Move linked worktree?")
+        onAccepted: {
+            panel.backend.moveWorktree(panel.movingWorktreeId, moveDestination.text.trim());
+            moveWorktreeForm.visible = false;
+        }
     }
 }

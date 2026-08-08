@@ -20,5 +20,8 @@ pub use git::{
     StatusRefreshOutcome,
 };
 pub use listing::{DirEntry, list_directory};
-pub use project::{ProjectError, ProjectSelector, ProjectService, Worktree, WorktreeBase};
+pub use project::{
+    ProjectError, ProjectSelector, ProjectService, Worktree, WorktreeBase, WorktreeReconciliation,
+    WorktreeReconciliationSkip,
+};
 pub use remote::normalize_remote;

@@ -147,6 +147,18 @@ pub enum GitError {
         reason: Option<String>,
     },
 
+    /// Git cannot relocate a linked checkout with a filesystem rename.
+    #[error(
+        "worktree at '{}' cannot move across filesystems to '{}': {stderr}",
+        worktree.display(),
+        destination.display()
+    )]
+    WorktreeMoveAcrossDevices {
+        worktree: PathBuf,
+        destination: PathBuf,
+        stderr: String,
+    },
+
     /// The branch contains commits not merged into its upstream or HEAD.
     #[error(
         "refusing to delete unmerged branch '{branch}'; explicitly force the deletion to continue"
@@ -392,6 +404,7 @@ impl GitError {
         "default_branch_deletion",
         "branch_checked_out_in_worktree",
         "worktree_locked",
+        "worktree_move_across_devices",
         "unmerged_branch_deletion",
         "non_fast_forward",
         "authentication_failed",
@@ -442,6 +455,7 @@ impl GitError {
             Self::DefaultBranchDeletion { .. } => "default_branch_deletion",
             Self::BranchCheckedOutInWorktree { .. } => "branch_checked_out_in_worktree",
             Self::WorktreeLocked { .. } => "worktree_locked",
+            Self::WorktreeMoveAcrossDevices { .. } => "worktree_move_across_devices",
             Self::UnmergedBranchDeletion { .. } => "unmerged_branch_deletion",
             Self::NonFastForward { .. } => "non_fast_forward",
             Self::AuthenticationFailed { .. } => "authentication_failed",
@@ -1229,6 +1243,14 @@ mod tests {
                     reason: None,
                 },
                 "worktree_locked",
+            ),
+            (
+                GitError::WorktreeMoveAcrossDevices {
+                    worktree: path.clone(),
+                    destination: path.clone(),
+                    stderr: "fixture".to_owned(),
+                },
+                "worktree_move_across_devices",
             ),
             (
                 GitError::UnmergedBranchDeletion {
