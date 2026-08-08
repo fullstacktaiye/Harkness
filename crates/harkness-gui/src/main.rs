@@ -115,6 +115,120 @@ Kirigami.ApplicationWindow {
             LOADED.load(Ordering::SeqCst),
             "ProjectShellPage failed to load; see QML warnings above"
         );
+
+        // Exercise every GitPanel delegate with hand-written state. Main.qml
+        // cannot populate changed paths or running jobs without driving real
+        // asynchronous Git operations, so this fixture is what catches typos
+        // in those otherwise-lazy QML branches.
+        LOADED.store(false, Ordering::SeqCst);
+        if let Some(mut engine) = engine.as_mut() {
+            let _connection = engine.as_mut().on_object_created(|_engine, object, _url| {
+                LOADED.store(!object.is_null(), Ordering::SeqCst);
+            });
+            engine.as_mut().load_data(
+                &QByteArray::from(
+                    br#"
+import QtQuick
+import org.kde.kirigami as Kirigami
+import io.github.fullstacktaiye.harkness
+
+Kirigami.ApplicationWindow {
+    visible: false
+    width: 640
+    height: 720
+
+    property var projectFixture: ({
+        "id": "00000000-0000-0000-0000-000000000000",
+        "displayName": "Git fixture",
+        "root": "/tmp",
+        "remote": "github.com/example/repository",
+        "branch": "topic",
+        "managed": false,
+        "worktree": false,
+        "parentId": "",
+        "parentName": "",
+        "createdBranch": "",
+        "available": true,
+        "isGit": true,
+        "dirty": true
+    })
+
+    QtObject {
+        id: fixtureBackend
+
+        property var branches: [{
+            "name": "topic",
+            "current": true,
+            "selectable": true,
+            "detail": "Checked out here"
+        }]
+        property var worktrees: [{
+            "root": "/tmp/worktree",
+            "branch": "agent/topic",
+            "owned": true,
+            "locked": false,
+            "prunable": false
+        }]
+        property var jobs: [{
+            "id": "job-1",
+            "kind": "fetch",
+            "projectId": "00000000-0000-0000-0000-000000000000",
+            "label": "Fetch",
+            "progress": "Receiving objects",
+            "cancellable": true
+        }]
+        property var git: ({
+            "projectId": "00000000-0000-0000-0000-000000000000",
+            "branch": "topic",
+            "head": "topic",
+            "detached": false,
+            "unborn": false,
+            "upstream": "origin/topic",
+            "ahead": 1,
+            "behind": 2,
+            "pending": "",
+            "error": "",
+            "errorKind": "",
+            "entries": [{
+                "path": "src/main.rs",
+                "staged": "added",
+                "unstaged": "modified",
+                "renameSource": "",
+                "conflicted": false
+            }]
+        })
+
+        function refreshGit(projectId) {}
+        function refreshBranches(projectId) {}
+        function refreshWorktrees(projectId) {}
+        function stagePath(projectId, path) {}
+        function unstagePath(projectId, path) {}
+        function commit(projectId, message, amend) {}
+        function fetch(projectId) {}
+        function pull(projectId) {}
+        function push(projectId, allowDefaultBranch) {}
+        function cancelJob(jobId) {}
+        function checkoutBranch(projectId, branch) {}
+        function createBranch(projectId, branch, startPoint) {}
+        function createWorktree(projectId, mode, branch, startPoint) {}
+        function reconcileWorktrees(projectId) {}
+    }
+
+    GitPanel {
+        anchors.fill: parent
+        backend: fixtureBackend
+        project: projectFixture
+    }
+}
+"#,
+                ),
+                &QUrl::from("qrc:/GitPanelSmoke.qml"),
+            );
+        }
+        assert!(
+            LOADED.load(Ordering::SeqCst),
+            "GitPanel.qml failed to load; see QML warnings above"
+        );
         // The engine must be released before the application; dropping locals
         // in declaration order would do the opposite.
         drop(engine);
