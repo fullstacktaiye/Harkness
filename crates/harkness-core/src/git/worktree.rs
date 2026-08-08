@@ -135,43 +135,53 @@ fn refuse_checked_out(
     }
 }
 
-/// Removes a linked worktree through Git. `force` affects the checkout only;
-/// no branch is ever deleted here.
-pub(crate) fn remove(
+/// Refuses a Git-locked row using the shared typed diagnostic.
+pub(crate) fn refuse_if_locked(listed: &[GitWorktree], path: &Path) -> Result<(), GitError> {
+    let reason = listed
+        .iter()
+        .find(|worktree| same_path(&worktree.root, path))
+        .and_then(|worktree| worktree.locked.clone());
+    if let Some(reason) = reason {
+        Err(GitError::WorktreeLocked {
+            path: path.to_path_buf(),
+            reason: (!reason.is_empty()).then_some(reason),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// Relocates a worktree after the caller has identified its unlocked row while
+/// holding the repository lock.
+pub(crate) fn move_known_unlocked(
     git_executable: &Path,
     parent: &Path,
-    lock: &RepositoryLock,
+    _lock: &RepositoryLock,
+    source: &Path,
     destination: &Path,
-    force: bool,
     cancellation: &Cancellation,
 ) -> Result<(), GitError> {
-    let listed = list(git_executable, parent, cancellation)?;
-    let worktree = listed
-        .into_iter()
-        .find(|worktree| same_path(&worktree.root, destination));
-    if let Some(reason) = worktree
-        .as_ref()
-        .and_then(|worktree| worktree.locked.clone())
+    match GitCommand::new(git_executable, parent, GitAccess::LocalWrite)
+        .args(["worktree", "move", "--"])
+        .arg(source)
+        .arg(destination)
+        .run(cancellation)
     {
-        return Err(GitError::WorktreeLocked {
-            path: destination.to_path_buf(),
-            reason: (!reason.is_empty()).then_some(reason),
-        });
+        Err(GitError::Failed { stderr, .. }) if is_cross_device_move_diagnostic(&stderr) => {
+            Err(GitError::WorktreeMoveAcrossDevices {
+                worktree: source.to_path_buf(),
+                destination: destination.to_path_buf(),
+                stderr,
+            })
+        }
+        Err(error) => Err(error),
+        Ok(_) => Ok(()),
     }
-    // Git and the filesystem may already agree that a checkout is gone while
-    // its Harkness row remains. There is no administrative record or directory
-    // left to mutate in that state.
-    if worktree.is_none() && !destination.exists() {
-        return Ok(());
-    }
-    remove_known_unlocked(
-        git_executable,
-        parent,
-        lock,
-        destination,
-        force,
-        cancellation,
-    )
+}
+
+fn is_cross_device_move_diagnostic(stderr: &str) -> bool {
+    let diagnostic = stderr.to_ascii_lowercase();
+    diagnostic.contains("cross-device") || diagnostic.contains("not same device")
 }
 
 /// Removes a worktree after the caller has already established that it is not
@@ -326,6 +336,38 @@ pub(crate) fn same_path(left: &Path, right: &Path) -> bool {
     }
 }
 
+/// Finds a live worktree by the stable name of its Git administrative record.
+///
+/// Harkness initially creates each checkout at `worktrees/<project-id>`, so
+/// Git gives its administrative directory that UUID as well. `git worktree
+/// move` deliberately keeps that directory name, and the moved checkout's
+/// `.git` file continues to name it. That makes the UUID the identity needed to
+/// repair a catalog write interrupted after Git has already moved the checkout.
+pub(crate) fn registered_root<'a>(
+    listed: &'a [GitWorktree],
+    administrative_name: &str,
+) -> Option<&'a Path> {
+    listed
+        .iter()
+        .find(|worktree| {
+            administrative_name_at(&worktree.root).as_deref() == Some(administrative_name)
+        })
+        .map(|worktree| worktree.root.as_path())
+}
+
+fn administrative_name_at(root: &Path) -> Option<String> {
+    let contents = fs::read(root.join(".git")).ok()?;
+    let mut git_dir = contents.strip_prefix(b"gitdir: ")?;
+    while git_dir
+        .last()
+        .is_some_and(|byte| matches!(*byte, b'\n' | b'\r'))
+    {
+        git_dir = &git_dir[..git_dir.len() - 1];
+    }
+    let path = path_from_git(git_dir).ok()?;
+    path.file_name()?.to_str().map(str::to_owned)
+}
+
 /// Canonicalizes as much of a path as still exists, then restores its missing
 /// suffix. Git retains administrative rows after a checkout is deleted, and
 /// on Windows its path spelling can differ from Rust's canonical catalog path
@@ -358,7 +400,11 @@ fn inspection(path: &Path, source: git2::Error) -> GitError {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_porcelain, same_path};
+    use std::fs;
+
+    #[cfg(unix)]
+    use super::same_path;
+    use super::{administrative_name_at, parse_porcelain};
 
     #[test]
     fn parses_branch_detached_locked_and_unseparated_porcelain_rows() {
@@ -374,6 +420,41 @@ mod tests {
         assert_eq!(rows[1].branch, None);
         assert_eq!(rows[1].locked.as_deref(), Some("portable disk"));
         assert!(rows[1].prunable);
+    }
+
+    #[test]
+    fn administrative_names_accept_git_line_endings_and_relative_paths() {
+        let fixture = tempfile::tempdir().unwrap();
+        for (name, contents) in [
+            ("no-newline", b"gitdir: ../admin/no-newline".as_slice()),
+            ("crlf", b"gitdir: ../admin/crlf\r\n".as_slice()),
+            (
+                "repeated-endings",
+                b"gitdir: ../admin/repeated-endings\r\n\n\r".as_slice(),
+            ),
+        ] {
+            let root = fixture.path().join(name);
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join(".git"), contents).unwrap();
+            assert_eq!(administrative_name_at(&root).as_deref(), Some(name));
+        }
+    }
+
+    #[test]
+    fn administrative_names_fail_closed_for_unowned_shapes() {
+        let fixture = tempfile::tempdir().unwrap();
+        let absent = fixture.path().join("absent");
+        fs::create_dir(&absent).unwrap();
+        assert_eq!(administrative_name_at(&absent), None);
+
+        let directory = fixture.path().join("git-directory");
+        fs::create_dir_all(directory.join(".git")).unwrap();
+        assert_eq!(administrative_name_at(&directory), None);
+
+        let payload = fixture.path().join("wrong-payload");
+        fs::create_dir(&payload).unwrap();
+        fs::write(payload.join(".git"), "not-gitdir: ../admin/foreign\n").unwrap();
+        assert_eq!(administrative_name_at(&payload), None);
     }
 
     #[cfg(unix)]

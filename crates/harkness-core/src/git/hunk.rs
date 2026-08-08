@@ -1064,6 +1064,7 @@ mod tests {
     /// A bare `chmod` and a file becoming a symlink are both real changes with
     /// no content hunk. Reporting them as a missing hunk would be a lie: the
     /// diff is there, it just cannot be expressed as an index-only patch.
+    #[cfg(unix)]
     #[test]
     fn metadata_only_records_are_named_rather_than_reported_as_missing() {
         use std::os::unix::fs::{PermissionsExt, symlink};
@@ -1307,6 +1308,7 @@ mod tests {
     }
 
     /// The new mode fields exist to keep this true; nothing else pins it.
+    #[cfg(unix)]
     #[test]
     fn an_executable_file_keeps_its_mode_through_a_partial_stage() {
         use std::os::unix::fs::PermissionsExt;
