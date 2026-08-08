@@ -117,6 +117,11 @@ pub struct FileDiff {
     /// Git file mode of the new side, or zero when that side is absent.
     pub new_mode: u32,
     /// Context-line count used to form this file's hunks.
+    ///
+    /// This echoes [`DiffOptions::context_lines`] rather than describing the
+    /// file, because hunk coordinates only mean anything alongside the setting
+    /// that produced them. It is recorded per file so a selection taken from
+    /// one record stays self-describing after the surrounding list is dropped.
     pub context_lines: u32,
     /// Byte size of the old side, zero when absent.
     pub old_size: u64,
@@ -226,6 +231,14 @@ pub(crate) fn compute(
     diff.find_similar(Some(&mut find))
         .map_err(|source| inspection(root, source))?;
 
+    // Rename detection deliberately runs over the whole diff, and
+    // `path_selected` narrows the result afterwards, rather than handing
+    // `options.paths` to libgit2 as a pathspec. That ordering is load-bearing:
+    // `super::hunk` revalidates a selection by recomputing this diff restricted
+    // to the selection's own paths, and must see the same rename pairing the
+    // caller saw in a whole-tree diff. Filtering before `find_similar` would
+    // silently repair against a different pairing.
+
     let mut files = Vec::new();
     for index in 0..diff.deltas().len() {
         let Some(delta) = diff.get_delta(index) else {
@@ -276,8 +289,8 @@ pub(crate) fn compute(
             Some(patch) if !binary => collect_hunks(patch, root)?,
             Some(_) | None => Vec::new(),
         };
-        let old_mode = i32::from(old_file.mode()) as u32;
-        let new_mode = i32::from(new_file.mode()) as u32;
+        let old_mode = file_mode(old_file.mode());
+        let new_mode = file_mode(new_file.mode());
 
         files.push(FileDiff {
             target: target.clone(),
@@ -392,6 +405,15 @@ fn hash_worktree_file(repository: &Repository, path: &Path) -> Result<Oid, GitEr
     }
     Oid::hash_file_ext(ObjectType::Blob, path, repository.object_format())
         .map_err(|source| inspection(path, source))
+}
+
+/// Git's octal file mode, or zero when the side is absent.
+///
+/// Libgit2 models a mode as a signed enum; every value Git can store is
+/// positive, so a hypothetical negative discriminant is reported as the same
+/// absent-side zero rather than wrapping into a plausible-looking mode.
+fn file_mode(mode: FileMode) -> u32 {
+    u32::try_from(i32::from(mode)).unwrap_or_default()
 }
 
 fn path_buf(path: Option<&Path>, side: &str) -> Result<PathBuf, GitError> {

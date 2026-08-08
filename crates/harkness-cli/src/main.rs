@@ -1647,6 +1647,10 @@ fn git_exit_code(error: &GitError) -> u8 {
         | GitError::StaleHunkSelection { .. }
         | GitError::BinaryHunkSelection { .. }
         | GitError::RenameOnlyHunkSelection { .. }
+        | GitError::MetadataOnlyHunkSelection { .. }
+        | GitError::UnsupportedHunkChange { .. }
+        | GitError::FilteredHunkSelection { .. }
+        | GitError::OverlappingHunkSelection { .. }
         | GitError::HunkNotFound { .. } => EXIT_REFUSED,
         _ => EXIT_OPERATION_FAILED,
     }

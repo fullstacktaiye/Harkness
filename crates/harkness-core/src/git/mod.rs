@@ -32,7 +32,7 @@ pub use commit::{
     StatusRefreshOutcome,
 };
 pub use diff::{DiffLine, DiffLineKind, DiffOmission, DiffOptions, DiffTarget, FileDiff, Hunk};
-pub use hunk::HunkSelection;
+pub use hunk::{HunkSelection, HunkStageOutcome};
 pub use lock::RepositoryLock;
 pub use runner::{Cancellation, CloneCancellation, GitAccess, GitCommand, GitOutput};
 pub use status::{DetailedStatus, FileChange, HeadState, PendingOperation, StatusEntry};
@@ -309,6 +309,38 @@ pub enum GitError {
         new_path: PathBuf,
     },
 
+    /// A change to file metadata alone has no hunk that can be staged.
+    #[error(
+        "'{}' changes only its file mode ({old_mode:o} to {new_mode:o}); stage the path instead",
+        path.display()
+    )]
+    MetadataOnlyHunkSelection {
+        path: PathBuf,
+        old_mode: u32,
+        new_mode: u32,
+    },
+
+    /// The kind of change cannot be expressed as an index-only hunk apply.
+    #[error(
+        "'{}' is a {change} record, which does not support hunk staging; stage the path instead",
+        path.display()
+    )]
+    UnsupportedHunkChange { path: PathBuf, change: FileChange },
+
+    /// Content Git would rewrite through an external filter driver.
+    #[error(
+        "'{}' is filtered by the '{driver}' driver, which hunk staging cannot run; stage the path instead",
+        path.display()
+    )]
+    FilteredHunkSelection { path: PathBuf, driver: String },
+
+    /// Two selections for one path cover the same lines.
+    #[error(
+        "two selected hunks for '{}' cover the same lines; stage them one batch at a time",
+        path.display()
+    )]
+    OverlappingHunkSelection { path: PathBuf },
+
     /// The selected coordinates are not present in the current diff.
     #[error(
         "the diff for '{}' does not contain hunk -{},{} +{},{}",
@@ -323,8 +355,12 @@ pub enum GitError {
     },
 
     /// Libgit2 could not parse or atomically apply a rebuilt hunk patch.
-    #[error("failed to apply selected hunks to the index: {source}")]
+    ///
+    /// The batch is atomic, so the failure names every path it covered rather
+    /// than pretending libgit2's line-oriented message identifies one of them.
+    #[error("failed to apply the selected hunks for {}: {source}", describe_paths(.paths))]
     HunkApplication {
+        paths: Vec<PathBuf>,
         #[source]
         source: git2::Error,
     },
@@ -374,6 +410,10 @@ impl GitError {
         "stale_hunk_selection",
         "binary_hunk_selection",
         "rename_only_hunk_selection",
+        "metadata_only_hunk_selection",
+        "unsupported_hunk_change",
+        "filtered_hunk_selection",
+        "overlapping_hunk_selection",
         "hunk_not_found",
         "hunk_application",
         "malformed_status",
@@ -420,10 +460,23 @@ impl GitError {
             Self::StaleHunkSelection { .. } => "stale_hunk_selection",
             Self::BinaryHunkSelection { .. } => "binary_hunk_selection",
             Self::RenameOnlyHunkSelection { .. } => "rename_only_hunk_selection",
+            Self::MetadataOnlyHunkSelection { .. } => "metadata_only_hunk_selection",
+            Self::UnsupportedHunkChange { .. } => "unsupported_hunk_change",
+            Self::FilteredHunkSelection { .. } => "filtered_hunk_selection",
+            Self::OverlappingHunkSelection { .. } => "overlapping_hunk_selection",
             Self::HunkNotFound { .. } => "hunk_not_found",
             Self::HunkApplication { .. } => "hunk_application",
             Self::MalformedStatus { .. } => "malformed_status",
         }
+    }
+}
+
+/// Names the paths one atomic hunk batch covered, for a failure message.
+fn describe_paths(paths: &[PathBuf]) -> String {
+    match paths {
+        [] => "the requested hunks".to_owned(),
+        [path] => format!("'{}'", path.display()),
+        [path, rest @ ..] => format!("'{}' and {} more", path.display(), rest.len()),
     }
 }
 
@@ -555,14 +608,32 @@ impl GitService {
     ///
     /// Selections must come from an unstaged [`Self::diff`] result. Their blob
     /// IDs and coordinates are revalidated under the repository lock before a
-    /// byte-preserving patch is rebuilt and applied atomically to the index.
+    /// byte-preserving patch is rebuilt and applied atomically to the index:
+    /// the whole batch lands or the index is left exactly as it was.
     pub fn stage_hunks(
         &self,
         selections: &[HunkSelection],
         cancellation: &Cancellation,
-    ) -> Result<(), GitError> {
+    ) -> Result<HunkStageOutcome, GitError> {
+        self.stage_hunks_with_options(selections, &StageOptions::default(), cancellation)
+    }
+
+    /// Stages selected hunks with control over the final status refresh.
+    pub fn stage_hunks_with_options(
+        &self,
+        selections: &[HunkSelection],
+        options: &StageOptions,
+        cancellation: &Cancellation,
+    ) -> Result<HunkStageOutcome, GitError> {
         let lock = self.lock(cancellation)?;
-        hunk::stage(&self.root, &lock, selections)
+        hunk::stage(
+            &self.git_executable,
+            &self.root,
+            &lock,
+            selections,
+            options,
+            cancellation,
+        )
     }
 
     /// Unstages selected index hunks without writing the working tree.
@@ -574,9 +645,26 @@ impl GitService {
         &self,
         selections: &[HunkSelection],
         cancellation: &Cancellation,
-    ) -> Result<(), GitError> {
+    ) -> Result<HunkStageOutcome, GitError> {
+        self.unstage_hunks_with_options(selections, &StageOptions::default(), cancellation)
+    }
+
+    /// Unstages selected hunks with control over the final status refresh.
+    pub fn unstage_hunks_with_options(
+        &self,
+        selections: &[HunkSelection],
+        options: &StageOptions,
+        cancellation: &Cancellation,
+    ) -> Result<HunkStageOutcome, GitError> {
         let lock = self.lock(cancellation)?;
-        hunk::unstage(&self.root, &lock, selections)
+        hunk::unstage(
+            &self.git_executable,
+            &self.root,
+            &lock,
+            selections,
+            options,
+            cancellation,
+        )
     }
 
     /// Stages every change to each explicit path and refreshes repository
@@ -1024,7 +1112,7 @@ fn inspection(path: &Path, source: git2::Error) -> GitError {
 mod tests {
     use std::{io, path::PathBuf, time::Duration};
 
-    use super::{Cancellation, GitAccess, GitError, GitService, PendingOperation};
+    use super::{Cancellation, FileChange, GitAccess, GitError, GitService, PendingOperation};
     use crate::testing::{Fixture, initialize_repository};
 
     #[test]
@@ -1258,6 +1346,32 @@ mod tests {
                 "rename_only_hunk_selection",
             ),
             (
+                GitError::MetadataOnlyHunkSelection {
+                    path: path.clone(),
+                    old_mode: 0o100_644,
+                    new_mode: 0o100_755,
+                },
+                "metadata_only_hunk_selection",
+            ),
+            (
+                GitError::UnsupportedHunkChange {
+                    path: path.clone(),
+                    change: FileChange::TypeChanged,
+                },
+                "unsupported_hunk_change",
+            ),
+            (
+                GitError::FilteredHunkSelection {
+                    path: path.clone(),
+                    driver: "lfs".to_owned(),
+                },
+                "filtered_hunk_selection",
+            ),
+            (
+                GitError::OverlappingHunkSelection { path: path.clone() },
+                "overlapping_hunk_selection",
+            ),
+            (
                 GitError::HunkNotFound {
                     path: path.clone(),
                     old_start: 1,
@@ -1269,6 +1383,7 @@ mod tests {
             ),
             (
                 GitError::HunkApplication {
+                    paths: vec![path.clone()],
                     source: git_error(),
                 },
                 "hunk_application",

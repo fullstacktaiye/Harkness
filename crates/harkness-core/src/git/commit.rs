@@ -338,7 +338,7 @@ fn run_paths(
     outcomes
 }
 
-fn refresh_status(
+pub(crate) fn refresh_status(
     git_executable: &Path,
     root: &Path,
     enabled: bool,
