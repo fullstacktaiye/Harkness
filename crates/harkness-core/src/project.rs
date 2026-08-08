@@ -215,6 +215,41 @@ pub enum ProjectError {
     )]
     DirtyWorktreeRemoval { id: ProjectId, path: PathBuf },
 
+    /// A project is not a Harkness-managed worktree that can be relocated.
+    #[error("refusing to move worktree {id} at '{}': {reason}", path.display())]
+    UnsafeWorktreeMove {
+        id: ProjectId,
+        path: PathBuf,
+        reason: String,
+    },
+
+    /// Git requires a move destination that does not already exist.
+    #[error("worktree move destination '{}' already exists", path.display())]
+    WorktreeDestinationExists { path: PathBuf },
+
+    /// The move destination's immediate parent could not be resolved.
+    #[error(
+        "worktree move destination parent '{}' cannot be resolved: {source}",
+        path.display()
+    )]
+    WorktreeDestinationParentUnavailable {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    /// Worktree roots cannot overlap another catalogued project.
+    #[error(
+        "worktree move destination '{}' is inside project {project_id} at '{}'",
+        path.display(),
+        project_root.display()
+    )]
+    WorktreeDestinationInsideProject {
+        path: PathBuf,
+        project_id: ProjectId,
+        project_root: PathBuf,
+    },
+
     /// A Git operation on a catalogued project failed.
     #[error(transparent)]
     Git(GitError),
@@ -254,6 +289,10 @@ impl ProjectError {
         "unsafe_worktree_removal",
         "worktree_parent_unsupported",
         "dirty_worktree_removal",
+        "unsafe_worktree_move",
+        "worktree_destination_exists",
+        "worktree_destination_parent_unavailable",
+        "worktree_destination_inside_project",
     ];
 
     /// Stable machine-readable discriminant for agent-facing error handling.
@@ -288,6 +327,12 @@ impl ProjectError {
             Self::UnsafeWorktreeRemoval { .. } => "unsafe_worktree_removal",
             Self::WorktreeParentUnsupported { .. } => "worktree_parent_unsupported",
             Self::DirtyWorktreeRemoval { .. } => "dirty_worktree_removal",
+            Self::UnsafeWorktreeMove { .. } => "unsafe_worktree_move",
+            Self::WorktreeDestinationExists { .. } => "worktree_destination_exists",
+            Self::WorktreeDestinationParentUnavailable { .. } => {
+                "worktree_destination_parent_unavailable"
+            }
+            Self::WorktreeDestinationInsideProject { .. } => "worktree_destination_inside_project",
             Self::Git(error) => error.kind(),
         }
     }
@@ -1022,6 +1067,111 @@ impl ProjectService {
         created
     }
 
+    /// Relocates a Harkness-managed worktree through Git and records its
+    /// canonical destination without changing any other project metadata.
+    ///
+    /// Destination validation happens before Git is allowed to mutate the
+    /// checkout. The repository lock is acquired before the catalog lock, and
+    /// the worktree-parent relationship plus destination are re-verified under
+    /// the catalog lock immediately before the move.
+    pub fn move_worktree(
+        &mut self,
+        id: ProjectId,
+        destination: impl AsRef<Path>,
+        cancellation: &Cancellation,
+    ) -> Result<Project, ProjectError> {
+        let destination = destination.as_ref();
+        let preliminary_catalog = self.read_catalog_shared()?;
+        let preliminary = preliminary_catalog
+            .projects
+            .iter()
+            .find(|project| project.id == id)
+            .cloned()
+            .ok_or(ProjectError::ProjectNotFound(id))?;
+        let preliminary_parent_id = worktree_parent_for_move(&preliminary)?;
+        let preliminary_parent = preliminary_catalog
+            .projects
+            .iter()
+            .find(|project| project.id == preliminary_parent_id)
+            .cloned()
+            .ok_or_else(|| {
+                unsafe_worktree_move(&preliminary, "catalogued parent no longer exists")
+            })?;
+        validate_worktree_parent(&preliminary_parent)?;
+        validate_worktree_move_source(&preliminary)?;
+        let canonical_destination =
+            validate_worktree_destination(&preliminary_catalog, destination)?;
+
+        let repository_lock = self
+            .git_service(&preliminary_parent.root)
+            .lock(cancellation)?;
+        let _catalog_lock = self.lock_exclusive()?;
+        let mut candidate = self.read_catalog()?;
+        verify_worktree_move_relationship(
+            &candidate,
+            id,
+            preliminary_parent_id,
+            &preliminary.root,
+            &preliminary_parent.root,
+        )?;
+        validate_worktree_move_source(&preliminary)?;
+        let rechecked_destination = validate_worktree_destination(&candidate, destination)?;
+        if rechecked_destination != canonical_destination {
+            return Err(ProjectError::WorktreeDestinationParentUnavailable {
+                path: destination.to_path_buf(),
+                source: io::Error::other("destination parent changed while locks were acquired"),
+            });
+        }
+        let listed =
+            git::worktree::list(&self.git_executable, &preliminary_parent.root, cancellation)?;
+        match git::worktree::registered_root(&listed, &id.to_string()) {
+            Some(registered_root)
+                if git::worktree::same_path(registered_root, &preliminary.root) => {}
+            Some(registered_root) => {
+                return Err(unsafe_worktree_move(
+                    &preliminary,
+                    format!(
+                        "Git records this checkout at '{}'",
+                        registered_root.display()
+                    ),
+                ));
+            }
+            None => {
+                return Err(unsafe_worktree_move(
+                    &preliminary,
+                    "Git has no matching administrative record",
+                ));
+            }
+        }
+
+        git::worktree::move_worktree(
+            &self.git_executable,
+            &preliminary_parent.root,
+            &repository_lock,
+            &preliminary.root,
+            &canonical_destination,
+            cancellation,
+        )?;
+        let moved_root = validate_local_directory(&canonical_destination)?;
+        if moved_root != canonical_destination {
+            return Err(ProjectError::WorktreeDestinationParentUnavailable {
+                path: destination.to_path_buf(),
+                source: io::Error::other("destination resolved differently after the move"),
+            });
+        }
+
+        let project = candidate
+            .projects
+            .iter_mut()
+            .find(|project| project.id == id)
+            .expect("the relationship check found this project");
+        project.root = moved_root;
+        let moved = project.clone();
+        self.persist(&candidate)?;
+        self.catalog = candidate;
+        Ok(refresh_project(moved))
+    }
+
     /// Removes a Harkness-managed worktree through Git, then drops its catalog
     /// entry. Dirty worktrees are refused with a typed error unless `force` is
     /// explicit. The checked-out branch is never deleted.
@@ -1068,7 +1218,23 @@ impl ProjectService {
             Err(GitError::NotARepository { .. }) => None,
             Err(error) => return Err(error.into()),
         };
-        let checkout_state = reserved_worktree_state(&self.data_dir, &preliminary)?;
+        if repository_lock.is_some() {
+            let listed =
+                git::worktree::list(&self.git_executable, &preliminary_parent.root, cancellation)?;
+            if let Some(registered_root) =
+                git::worktree::registered_root(&listed, &preliminary.id.to_string())
+                && !git::worktree::same_path(registered_root, &preliminary.root)
+            {
+                return Err(unsafe_worktree_removal(
+                    &preliminary,
+                    format!(
+                        "Git records this checkout at '{}'; reconcile worktrees before removal",
+                        registered_root.display()
+                    ),
+                ));
+            }
+        }
+        let checkout_state = recorded_worktree_state(&preliminary)?;
 
         // Status can walk the entire checkout. The repository lock protects it
         // from other Harkness mutations; the global catalog lock is not needed.
@@ -1131,12 +1297,15 @@ impl ProjectService {
         Ok(project)
     }
 
-    /// Reconciles missing Harkness worktrees without touching external ones.
+    /// Reconciles missing or externally moved Harkness worktrees without
+    /// touching external ones.
     ///
-    /// For each Harkness-owned checkout that is absent, this removes only that
-    /// path's Git administrative record and then drops its catalog row. A
-    /// locked worktree is kept because its missing path may be an intentionally
-    /// unmounted volume. No repository-wide `git worktree prune` is run.
+    /// A live Git row with the stable administrative name created from the
+    /// project identifier repairs the catalogued root. Otherwise, for each
+    /// Harkness-owned checkout that is absent, this removes only that path's Git
+    /// administrative record and then drops its catalog row. A locked worktree
+    /// is kept because its missing path may be an intentionally unmounted
+    /// volume. No repository-wide `git worktree prune` is run.
     pub fn reconcile_worktrees(
         &mut self,
         parent_id: ProjectId,
@@ -1172,9 +1341,7 @@ impl ProjectService {
             .collect::<Vec<_>>();
         let preliminary_worktrees = preliminary_worktrees
             .into_iter()
-            .map(|project| {
-                reserved_worktree_state(&self.data_dir, &project).map(|state| (project, state))
-            })
+            .map(|project| recorded_worktree_state(&project).map(|state| (project, state)))
             .collect::<Result<Vec<_>, _>>()?;
         let repository_lock = match self
             .git_service(&preliminary_parent.root)
@@ -1203,6 +1370,7 @@ impl ProjectService {
         }
 
         let mut removable = Vec::new();
+        let mut repairs = Vec::new();
         if let Some(repository_lock) = &repository_lock {
             let live =
                 git::worktree::list(&self.git_executable, &preliminary_parent.root, cancellation)?;
@@ -1225,15 +1393,29 @@ impl ProjectService {
                         true,
                         cancellation,
                     )?;
+                    removable.push((project.id, project.root.clone()));
+                    continue;
                 }
-                removable.push(project.id);
+                if let Some(moved_root) =
+                    git::worktree::registered_root(&live, &project.id.to_string())
+                {
+                    let moved_root = validate_local_directory(moved_root)?;
+                    refuse_project_root_overlap(
+                        &preliminary_catalog,
+                        &moved_root,
+                        Some(project.id),
+                    )?;
+                    repairs.push((project.id, project.root.clone(), moved_root));
+                    continue;
+                }
+                removable.push((project.id, project.root.clone()));
             }
         } else {
             removable.extend(
                 preliminary_worktrees
                     .iter()
                     .filter(|(_, state)| *state == WorktreeCheckoutState::Missing)
-                    .map(|(project, _)| project.id),
+                    .map(|(project, _)| (project.id, project.root.clone())),
             );
         }
 
@@ -1252,9 +1434,38 @@ impl ProjectService {
             });
         }
 
+        for (id, old_root, moved_root) in &repairs {
+            verify_worktree_relationship(
+                &candidate,
+                *id,
+                parent_id,
+                old_root,
+                &preliminary_parent.root,
+            )?;
+            let canonical_root = validate_local_directory(moved_root)?;
+            if canonical_root != *moved_root {
+                return Err(ProjectError::ProjectUnavailable {
+                    id: *id,
+                    path: moved_root.clone(),
+                });
+            }
+            refuse_project_root_overlap(&candidate, moved_root, Some(*id))?;
+        }
+        for (id, _, moved_root) in &repairs {
+            candidate
+                .projects
+                .iter_mut()
+                .find(|project| project.id == *id)
+                .expect("the relationship check found this project")
+                .root = moved_root.clone();
+        }
+
         let mut removed = Vec::new();
         candidate.projects.retain(|project| {
-            let keep = !removable.contains(&project.id)
+            let selected = removable
+                .iter()
+                .any(|(id, root)| *id == project.id && *root == project.root);
+            let keep = !selected
                 || !matches!(
                     project.source,
                     ProjectSource::Worktree { parent, .. } if parent == parent_id
@@ -1265,7 +1476,7 @@ impl ProjectService {
             }
             keep
         });
-        if !removed.is_empty() {
+        if !repairs.is_empty() || !removed.is_empty() {
             self.persist(&candidate)?;
         }
         self.catalog = candidate;
@@ -1693,30 +1904,138 @@ enum WorktreeCheckoutState {
     Missing,
 }
 
-fn reserved_worktree_state(
-    data_dir: &Path,
-    project: &Project,
-) -> Result<WorktreeCheckoutState, ProjectError> {
-    let storage_root = data_dir.join(WORKTREES_DIRECTORY);
-    let expected = match fs::canonicalize(&storage_root) {
-        Ok(root) => root.join(project.id.to_string()),
-        Err(_) => fs::canonicalize(data_dir)
-            .map(|root| root.join(WORKTREES_DIRECTORY).join(project.id.to_string()))
-            .map_err(|_| {
-                unsafe_worktree_removal(project, "managed worktrees root is unavailable")
-            })?,
-    };
+fn recorded_worktree_state(project: &Project) -> Result<WorktreeCheckoutState, ProjectError> {
     match fs::canonicalize(&project.root) {
-        Ok(root) if root == expected => Ok(WorktreeCheckoutState::Available),
+        Ok(root) if root == project.root => Ok(WorktreeCheckoutState::Available),
         Ok(_) => Err(unsafe_worktree_removal(
             project,
-            "checkout is not the managed path reserved for this worktree",
+            "checkout does not canonically equal its catalogued path",
         )),
-        Err(_) if project.root == expected => Ok(WorktreeCheckoutState::Missing),
+        Err(_)
+            if normalize_selector_path(&project.root).is_some_and(|normalized| {
+                selector_paths_equal(&normalized, &platform_comparable_path(project.root.clone()))
+            }) =>
+        {
+            Ok(WorktreeCheckoutState::Missing)
+        }
         Err(_) => Err(unsafe_worktree_removal(
             project,
-            "unavailable checkout is not the managed path reserved for this worktree",
+            "unavailable checkout path cannot be resolved canonically",
         )),
+    }
+}
+
+fn validate_worktree_destination(
+    catalog: &Catalog,
+    destination: &Path,
+) -> Result<PathBuf, ProjectError> {
+    match fs::symlink_metadata(destination) {
+        Ok(_) => {
+            return Err(ProjectError::WorktreeDestinationExists {
+                path: destination.to_path_buf(),
+            });
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(ProjectError::WorktreeDestinationParentUnavailable {
+                path: destination.to_path_buf(),
+                source,
+            });
+        }
+    }
+
+    let absolute = if destination.is_absolute() {
+        destination.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(
+                |source| ProjectError::WorktreeDestinationParentUnavailable {
+                    path: destination.to_path_buf(),
+                    source,
+                },
+            )?
+            .join(destination)
+    };
+    let parent =
+        absolute
+            .parent()
+            .ok_or_else(|| ProjectError::WorktreeDestinationParentUnavailable {
+                path: destination.to_path_buf(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "destination has no parent directory",
+                ),
+            })?;
+    let name =
+        absolute
+            .file_name()
+            .ok_or_else(|| ProjectError::WorktreeDestinationParentUnavailable {
+                path: destination.to_path_buf(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "destination has no final path component",
+                ),
+            })?;
+    let canonical_parent = fs::canonicalize(parent).map_err(|source| {
+        ProjectError::WorktreeDestinationParentUnavailable {
+            path: destination.to_path_buf(),
+            source,
+        }
+    })?;
+    match fs::metadata(&canonical_parent) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(ProjectError::WorktreeDestinationParentUnavailable {
+                path: destination.to_path_buf(),
+                source: io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    "destination parent is not a directory",
+                ),
+            });
+        }
+        Err(source) => {
+            return Err(ProjectError::WorktreeDestinationParentUnavailable {
+                path: destination.to_path_buf(),
+                source,
+            });
+        }
+    }
+    let canonical_destination = canonical_parent.join(name);
+    match fs::symlink_metadata(&canonical_destination) {
+        Ok(_) => {
+            return Err(ProjectError::WorktreeDestinationExists {
+                path: destination.to_path_buf(),
+            });
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(ProjectError::WorktreeDestinationParentUnavailable {
+                path: destination.to_path_buf(),
+                source,
+            });
+        }
+    }
+    refuse_project_root_overlap(catalog, &canonical_destination, None)?;
+    Ok(canonical_destination)
+}
+
+fn refuse_project_root_overlap(
+    catalog: &Catalog,
+    destination: &Path,
+    ignored: Option<ProjectId>,
+) -> Result<(), ProjectError> {
+    if let Some(project) = catalog
+        .projects
+        .iter()
+        .find(|project| Some(project.id) != ignored && destination.starts_with(&project.root))
+    {
+        Err(ProjectError::WorktreeDestinationInsideProject {
+            path: destination.to_path_buf(),
+            project_id: project.id,
+            project_root: project.root.clone(),
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -1789,6 +2108,79 @@ fn unsafe_worktree_removal(project: &Project, reason: impl Into<String>) -> Proj
         path: project.root.clone(),
         reason: reason.into(),
     }
+}
+
+fn unsafe_worktree_move(project: &Project, reason: impl Into<String>) -> ProjectError {
+    ProjectError::UnsafeWorktreeMove {
+        id: project.id,
+        path: project.root.clone(),
+        reason: reason.into(),
+    }
+}
+
+fn worktree_parent_for_move(project: &Project) -> Result<ProjectId, ProjectError> {
+    match RemovalPolicy::from(&project.source) {
+        RemovalPolicy::Worktree { parent } => Ok(parent),
+        RemovalPolicy::CatalogOnly | RemovalPolicy::ManagedRepository => Err(unsafe_worktree_move(
+            project,
+            "catalog entry is not a managed worktree",
+        )),
+    }
+}
+
+fn validate_worktree_move_source(project: &Project) -> Result<(), ProjectError> {
+    match fs::canonicalize(&project.root) {
+        Ok(root) if root == project.root => Ok(()),
+        Ok(_) => Err(unsafe_worktree_move(
+            project,
+            "checkout does not canonically equal its catalogued path",
+        )),
+        Err(_) => Err(unsafe_worktree_move(
+            project,
+            "catalogued checkout is unavailable",
+        )),
+    }
+}
+
+fn verify_worktree_move_relationship(
+    catalog: &Catalog,
+    id: ProjectId,
+    expected_parent: ProjectId,
+    expected_root: &Path,
+    expected_parent_root: &Path,
+) -> Result<Project, ProjectError> {
+    let project = catalog
+        .projects
+        .iter()
+        .find(|project| project.id == id)
+        .cloned()
+        .ok_or(ProjectError::ProjectNotFound(id))?;
+    let parent_id = worktree_parent_for_move(&project)?;
+    if parent_id != expected_parent {
+        return Err(unsafe_worktree_move(
+            &project,
+            "worktree parent changed while the repository lock was being acquired",
+        ));
+    }
+    if project.root != expected_root {
+        return Err(unsafe_worktree_move(
+            &project,
+            "worktree path changed while the repository lock was being acquired",
+        ));
+    }
+    let parent = catalog
+        .projects
+        .iter()
+        .find(|entry| entry.id == parent_id)
+        .ok_or_else(|| unsafe_worktree_move(&project, "catalogued parent no longer exists"))?;
+    if parent.root != expected_parent_root {
+        return Err(unsafe_worktree_move(
+            &project,
+            "parent path changed while the repository lock was being acquired",
+        ));
+    }
+    validate_worktree_parent(parent)?;
+    Ok(project)
 }
 
 fn validate_worktree_parent(project: &Project) -> Result<(), ProjectError> {
@@ -2334,6 +2726,33 @@ mod tests {
                     path: path.clone(),
                 },
                 "dirty_worktree_removal",
+            ),
+            (
+                ProjectError::UnsafeWorktreeMove {
+                    id,
+                    path: path.clone(),
+                    reason: "fixture".to_owned(),
+                },
+                "unsafe_worktree_move",
+            ),
+            (
+                ProjectError::WorktreeDestinationExists { path: path.clone() },
+                "worktree_destination_exists",
+            ),
+            (
+                ProjectError::WorktreeDestinationParentUnavailable {
+                    path: path.clone(),
+                    source: io_error(),
+                },
+                "worktree_destination_parent_unavailable",
+            ),
+            (
+                ProjectError::WorktreeDestinationInsideProject {
+                    path: path.clone(),
+                    project_id: id,
+                    project_root: path.clone(),
+                },
+                "worktree_destination_inside_project",
             ),
             (ProjectError::Git(GitError::Cancelled), "cancelled"),
         ];
@@ -3441,6 +3860,206 @@ mod tests {
     }
 
     #[test]
+    fn moving_a_worktree_preserves_its_identity_changes_and_git_operations() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("move-worktree-parent");
+        initialize_repository(&parent_root);
+        let destination_parent = fixture.directory("relocated-worktrees");
+        let destination = destination_parent.join("moved-checkout");
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+        let worktree = create_branch_worktree(&mut service, parent.id, "agent/move-me");
+        fs::write(
+            worktree.root.join("uncommitted.txt"),
+            "survives relocation\n",
+        )
+        .unwrap();
+
+        let moved = service
+            .move_worktree(worktree.id, &destination, &Cancellation::default())
+            .unwrap();
+
+        let canonical_destination = as_catalogued(&destination);
+        assert_eq!(moved.id, worktree.id);
+        assert_eq!(moved.display_name, worktree.display_name);
+        assert_eq!(moved.source, worktree.source);
+        assert_eq!(moved.last_opened, worktree.last_opened);
+        assert_eq!(moved.root, canonical_destination);
+        assert!(moved.available);
+        assert!(moved.git.as_ref().is_some_and(|status| status.dirty));
+        assert!(!worktree.root.exists());
+        assert_eq!(
+            fs::read_to_string(canonical_destination.join("uncommitted.txt")).unwrap(),
+            "survives relocation\n"
+        );
+        assert_eq!(
+            ProjectService::load_from_data_dir(&fixture.data_dir)
+                .unwrap()
+                .list_catalog_only()
+                .unwrap()
+                .into_iter()
+                .find(|project| project.id == worktree.id)
+                .unwrap()
+                .root,
+            canonical_destination
+        );
+
+        let git = service.git(worktree.id).unwrap();
+        assert!(git.status().unwrap().unwrap().dirty);
+        assert!(
+            git.stage(["uncommitted.txt"], &Cancellation::default())
+                .unwrap()
+                .all_succeeded()
+        );
+        git.commit(
+            "Preserve work across relocation",
+            &crate::git::CommitOptions::default(),
+            &Cancellation::default(),
+        )
+        .unwrap();
+        assert!(!git.status().unwrap().unwrap().dirty);
+
+        service
+            .remove_worktree(worktree.id, false, &Cancellation::default())
+            .unwrap();
+        assert!(!canonical_destination.exists());
+    }
+
+    #[test]
+    fn worktree_move_destinations_are_validated_before_git_runs() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("move-validation-parent");
+        initialize_repository(&parent_root);
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+        let worktree = create_branch_worktree(&mut service, parent.id, "agent/validate-move");
+        let existing = fixture.directory("existing-move-destination");
+
+        assert!(matches!(
+            service.move_worktree(
+                parent.id,
+                fixture.root.path().join("not-a-worktree"),
+                &Cancellation::default(),
+            ),
+            Err(ProjectError::UnsafeWorktreeMove { id, .. }) if id == parent.id
+        ));
+
+        assert!(matches!(
+            service.move_worktree(worktree.id, &existing, &Cancellation::default()),
+            Err(ProjectError::WorktreeDestinationExists { path }) if path == existing
+        ));
+
+        let nested = parent.root.join("nested-move-destination");
+        assert!(matches!(
+            service.move_worktree(worktree.id, &nested, &Cancellation::default()),
+            Err(ProjectError::WorktreeDestinationInsideProject {
+                project_id,
+                project_root,
+                ..
+            }) if project_id == parent.id && project_root == parent.root
+        ));
+
+        let missing_parent = fixture
+            .root
+            .path()
+            .join("missing-destination-parent")
+            .join("checkout");
+        assert!(matches!(
+            service.move_worktree(worktree.id, &missing_parent, &Cancellation::default()),
+            Err(ProjectError::WorktreeDestinationParentUnavailable { path, .. })
+                if path == missing_parent
+        ));
+        assert!(worktree.root.exists());
+        assert!(
+            git(&parent_root, ["worktree", "list", "--porcelain"])
+                .contains(worktree.root.to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn locked_worktrees_refuse_moves_with_the_recorded_reason() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("locked-move-parent");
+        initialize_repository(&parent_root);
+        let destination_parent = fixture.directory("locked-move-destination-parent");
+        let destination = destination_parent.join("checkout");
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+        let worktree = create_branch_worktree(&mut service, parent.id, "agent/locked-move");
+        git(
+            &parent_root,
+            [
+                "worktree",
+                "lock",
+                "--reason",
+                "portable checkout",
+                worktree.root.to_str().unwrap(),
+            ],
+        );
+
+        let error = service
+            .move_worktree(worktree.id, &destination, &Cancellation::default())
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProjectError::Git(GitError::WorktreeLocked { reason, .. })
+                if reason.as_deref() == Some("portable checkout")
+        ));
+        assert!(worktree.root.exists());
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn reconciliation_repairs_a_git_moved_worktree_before_it_can_be_removed() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("move-repair-parent");
+        initialize_repository(&parent_root);
+        let destination_parent = fixture.directory("move-repair-destination-parent");
+        let destination = destination_parent.join("checkout");
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+        let worktree = create_branch_worktree(&mut service, parent.id, "agent/repair-move");
+        git(
+            &parent_root,
+            [
+                "worktree",
+                "move",
+                "--",
+                worktree.root.to_str().unwrap(),
+                destination.to_str().unwrap(),
+            ],
+        );
+
+        assert!(matches!(
+            service.remove_worktree(worktree.id, false, &Cancellation::default()),
+            Err(ProjectError::UnsafeWorktreeRemoval { id, .. }) if id == worktree.id
+        ));
+        assert!(destination.exists());
+
+        let removed = service
+            .reconcile_worktrees(parent.id, &Cancellation::default())
+            .unwrap();
+
+        assert!(removed.is_empty());
+        let repaired = service
+            .list_catalog_only()
+            .unwrap()
+            .into_iter()
+            .find(|project| project.id == worktree.id)
+            .unwrap();
+        assert_eq!(repaired.id, worktree.id);
+        assert_eq!(repaired.display_name, worktree.display_name);
+        assert_eq!(repaired.source, worktree.source);
+        assert_eq!(repaired.last_opened, worktree.last_opened);
+        assert_eq!(repaired.root, as_catalogued(&destination));
+        service
+            .remove_worktree(worktree.id, false, &Cancellation::default())
+            .unwrap();
+        assert!(!destination.exists());
+    }
+
+    #[test]
     fn dirty_worktree_force_removal_discards_files_but_preserves_the_branch() {
         let fixture = Fixture::new();
         let parent_root = fixture.directory("force-worktree-parent");
@@ -3601,7 +4220,7 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_refuses_a_catalogued_path_outside_managed_storage() {
+    fn reconciliation_cleans_a_missing_canonical_relocated_worktree() {
         let fixture = Fixture::new();
         let parent_root = fixture.directory("unsafe-reconciliation-parent");
         initialize_repository(&parent_root);
@@ -3629,24 +4248,22 @@ mod tests {
         );
         fs::remove_dir_all(&outside).unwrap();
 
-        let error = service
+        let removed = service
             .reconcile_worktrees(parent.id, &Cancellation::default())
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(
-            error,
-            ProjectError::UnsafeWorktreeRemoval { id: refused, .. } if refused == id
-        ));
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].id, id);
         let listed =
             crate::git::worktree::list(Path::new("git"), &parent_root, &Cancellation::default())
                 .unwrap();
         assert!(
-            listed
+            !listed
                 .iter()
                 .any(|worktree| crate::git::worktree::same_path(&worktree.root, &outside))
         );
         assert!(
-            service
+            !service
                 .list_catalog_only()
                 .unwrap()
                 .iter()
@@ -3662,6 +4279,7 @@ mod tests {
         let mut service = fixture.service();
         let parent = service.import_local(&parent_root).unwrap();
         let worktree = create_branch_worktree(&mut service, parent.id, "agent/cancelled");
+        let move_destination = fixture.directory("cancelled-move-parent").join("checkout");
         let cancellation = Cancellation::default();
         cancellation.cancel();
 
@@ -3678,6 +4296,10 @@ mod tests {
                 },
                 &cancellation,
             ),
+            Err(ProjectError::Git(GitError::Cancelled))
+        ));
+        assert!(matches!(
+            service.move_worktree(worktree.id, &move_destination, &cancellation),
             Err(ProjectError::Git(GitError::Cancelled))
         ));
         assert!(matches!(
@@ -3773,7 +4395,7 @@ mod tests {
     }
 
     #[test]
-    fn worktree_removal_refuses_a_checkout_outside_managed_storage() {
+    fn worktree_removal_accepts_a_canonical_relocated_checkout() {
         let fixture = Fixture::new();
         let parent_root = fixture.directory("unsafe-worktree-parent");
         initialize_repository(&parent_root);
@@ -3800,21 +4422,12 @@ mod tests {
             "agent/outside-worktree",
         );
 
-        assert!(matches!(
-            service.remove_worktree(worktree.id, false, &Cancellation::default()),
-            Err(ProjectError::UnsafeWorktreeRemoval { id, .. }) if id == worktree.id
-        ));
-        assert!(outside.exists());
-        git(
-            &parent_root,
-            [
-                "worktree",
-                "remove",
-                "--force",
-                "--",
-                outside.to_str().unwrap(),
-            ],
-        );
+        let removed = service
+            .remove_worktree(worktree.id, false, &Cancellation::default())
+            .unwrap();
+
+        assert_eq!(removed.id, worktree.id);
+        assert!(!outside.exists());
     }
 
     #[cfg(unix)]

@@ -174,6 +174,36 @@ pub(crate) fn remove(
     )
 }
 
+/// Relocates one linked worktree after refusing Git-locked checkouts with the
+/// same typed diagnostic used by removal.
+pub(crate) fn move_worktree(
+    git_executable: &Path,
+    parent: &Path,
+    _lock: &RepositoryLock,
+    source: &Path,
+    destination: &Path,
+    cancellation: &Cancellation,
+) -> Result<(), GitError> {
+    let listed = list(git_executable, parent, cancellation)?;
+    let worktree = listed
+        .iter()
+        .find(|worktree| same_path(&worktree.root, source));
+    if let Some(reason) = worktree.and_then(|worktree| worktree.locked.clone()) {
+        return Err(GitError::WorktreeLocked {
+            path: source.to_path_buf(),
+            reason: (!reason.is_empty()).then_some(reason),
+        });
+    }
+
+    GitCommand::new(git_executable, parent, GitAccess::LocalWrite)
+        .without_timeout()
+        .args(["worktree", "move", "--"])
+        .arg(source)
+        .arg(destination)
+        .run(cancellation)?;
+    Ok(())
+}
+
 /// Removes a worktree after the caller has already established that it is not
 /// locked. Used by targeted reconciliation and failed-add cleanup to avoid a
 /// second porcelain listing.
@@ -324,6 +354,36 @@ pub(crate) fn same_path(left: &Path, right: &Path) -> bool {
         (Some(left), Some(right)) => left == right,
         _ => left == right,
     }
+}
+
+/// Finds a live worktree by the stable name of its Git administrative record.
+///
+/// Harkness initially creates each checkout at `worktrees/<project-id>`, so
+/// Git gives its administrative directory that UUID as well. `git worktree
+/// move` deliberately keeps that directory name, and the moved checkout's
+/// `.git` file continues to name it. That makes the UUID the identity needed to
+/// repair a catalog write interrupted after Git has already moved the checkout.
+pub(crate) fn registered_root<'a>(
+    listed: &'a [GitWorktree],
+    administrative_name: &str,
+) -> Option<&'a Path> {
+    listed
+        .iter()
+        .find(|worktree| {
+            administrative_name_at(&worktree.root).as_deref() == Some(administrative_name)
+        })
+        .map(|worktree| worktree.root.as_path())
+}
+
+fn administrative_name_at(root: &Path) -> Option<String> {
+    let contents = fs::read(root.join(".git")).ok()?;
+    let git_dir = contents
+        .strip_prefix(b"gitdir: ")?
+        .strip_suffix(b"\n")
+        .unwrap_or(contents.strip_prefix(b"gitdir: ")?);
+    let git_dir = git_dir.strip_suffix(b"\r").unwrap_or(git_dir);
+    let path = path_from_git(git_dir).ok()?;
+    path.file_name()?.to_str().map(str::to_owned)
 }
 
 /// Canonicalizes as much of a path as still exists, then restores its missing
