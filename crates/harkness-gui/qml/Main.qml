@@ -7,12 +7,12 @@ import io.github.fullstacktaiye.harkness
 Kirigami.ApplicationWindow {
     id: root
 
-    height: 640
-    minimumHeight: 420
-    minimumWidth: 520
+    height: 900
+    minimumHeight: 900
+    minimumWidth: 1280
     title: qsTr("Harkness")
     visible: true
-    width: 960
+    width: 1280
 
     // The launcher and project shell are alternative application states, not
     // master/detail columns. Always show only the current page.

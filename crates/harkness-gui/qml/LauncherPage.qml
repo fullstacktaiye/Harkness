@@ -13,8 +13,6 @@ Kirigami.Page {
     // project-page transition and clear the backend's open-project state.
     readonly property bool isLauncher: true
 
-    padding: 0
-    title: qsTr("Harkness")
 
     function tinted(color, alpha) {
         return Qt.rgba(color.r, color.g, color.b, alpha);
@@ -86,22 +84,6 @@ Kirigami.Page {
                 anchors.margins: Kirigami.Units.largeSpacing
                 spacing: Kirigami.Units.largeSpacing
 
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: Kirigami.Units.smallSpacing
-
-                    Kirigami.Icon {
-                        Layout.preferredHeight: Kirigami.Units.iconSizes.medium
-                        Layout.preferredWidth: Kirigami.Units.iconSizes.medium
-                        source: "folder-git"
-                    }
-
-                    Kirigami.Heading {
-                        Layout.fillWidth: true
-                        level: 2
-                        text: qsTr("Harkness")
-                    }
-                }
 
                 ColumnLayout {
                     Layout.fillWidth: true
