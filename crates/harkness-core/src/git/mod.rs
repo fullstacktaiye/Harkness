@@ -279,6 +279,85 @@ pub enum GitError {
     MalformedStatus { detail: String },
 }
 
+impl GitError {
+    /// Every stable discriminant this error namespace can emit.
+    pub const KINDS: &'static [&'static str] = &[
+        "launch",
+        "failed",
+        "cancelled",
+        "timed_out",
+        "repository_busy",
+        "lock",
+        "not_a_repository",
+        "path_outside_repository",
+        "empty_commit_message",
+        "nothing_staged",
+        "amend_unborn_branch",
+        "invalid_branch_name",
+        "no_such_branch",
+        "branch_already_exists",
+        "invalid_start_point",
+        "current_branch_deletion",
+        "default_branch_deletion",
+        "branch_checked_out_in_worktree",
+        "worktree_locked",
+        "unmerged_branch_deletion",
+        "non_fast_forward",
+        "authentication_failed",
+        "no_upstream",
+        "unborn_branch",
+        "local_upstream_unsupported",
+        "operation_in_progress",
+        "interrupted",
+        "no_remote",
+        "default_branch_push",
+        "default_branch_unknown",
+        "detached_head",
+        "inspection",
+        "malformed_status",
+    ];
+
+    /// Stable machine-readable discriminant for agent-facing error handling.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Launch { .. } => "launch",
+            Self::Failed { .. } => "failed",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut { .. } => "timed_out",
+            Self::RepositoryBusy { .. } => "repository_busy",
+            Self::Lock { .. } => "lock",
+            Self::NotARepository { .. } => "not_a_repository",
+            Self::PathOutsideRepository { .. } => "path_outside_repository",
+            Self::EmptyCommitMessage => "empty_commit_message",
+            Self::NothingStaged => "nothing_staged",
+            Self::AmendUnbornBranch => "amend_unborn_branch",
+            Self::InvalidBranchName { .. } => "invalid_branch_name",
+            Self::NoSuchBranch { .. } => "no_such_branch",
+            Self::BranchAlreadyExists { .. } => "branch_already_exists",
+            Self::InvalidStartPoint { .. } => "invalid_start_point",
+            Self::CurrentBranchDeletion { .. } => "current_branch_deletion",
+            Self::DefaultBranchDeletion { .. } => "default_branch_deletion",
+            Self::BranchCheckedOutInWorktree { .. } => "branch_checked_out_in_worktree",
+            Self::WorktreeLocked { .. } => "worktree_locked",
+            Self::UnmergedBranchDeletion { .. } => "unmerged_branch_deletion",
+            Self::NonFastForward { .. } => "non_fast_forward",
+            Self::AuthenticationFailed { .. } => "authentication_failed",
+            Self::NoUpstream { .. } => "no_upstream",
+            Self::UnbornBranch { .. } => "unborn_branch",
+            Self::LocalUpstreamUnsupported { .. } => "local_upstream_unsupported",
+            Self::OperationInProgress { .. } => "operation_in_progress",
+            Self::Interrupted { .. } => "interrupted",
+            Self::NoRemote { .. } => "no_remote",
+            Self::DefaultBranchPush { .. } => "default_branch_push",
+            Self::DefaultBranchUnknown { .. } => "default_branch_unknown",
+            Self::DetachedHead { .. } => "detached_head",
+            Self::Inspection { .. } => "inspection",
+            Self::MalformedStatus { .. } => "malformed_status",
+        }
+    }
+}
+
 /// Git operations on one repository.
 ///
 /// Stateless and addressed by path. It deliberately cannot resolve a
@@ -831,7 +910,9 @@ fn inspection(path: &Path, source: git2::Error) -> GitError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cancellation, GitAccess, GitError, GitService};
+    use std::{io, path::PathBuf, time::Duration};
+
+    use super::{Cancellation, GitAccess, GitError, GitService, PendingOperation};
     use crate::testing::{Fixture, initialize_repository};
 
     #[test]
@@ -850,5 +931,204 @@ mod tests {
 
         drop(command);
         service.lock(&Cancellation::default()).unwrap();
+    }
+
+    #[test]
+    fn git_error_kind_contract_is_stable() {
+        let path = PathBuf::from("fixture");
+        let io_error = || io::Error::other("fixture");
+        let git_error = || git2::Error::from_str("fixture");
+        let cases = vec![
+            (GitError::Launch { source: io_error() }, "launch"),
+            (
+                GitError::Failed {
+                    command: "status".to_owned(),
+                    stderr: "fixture".to_owned(),
+                },
+                "failed",
+            ),
+            (GitError::Cancelled, "cancelled"),
+            (
+                GitError::TimedOut {
+                    command: "status".to_owned(),
+                    timeout: Duration::from_secs(1),
+                },
+                "timed_out",
+            ),
+            (
+                GitError::RepositoryBusy { path: path.clone() },
+                "repository_busy",
+            ),
+            (
+                GitError::Lock {
+                    path: path.clone(),
+                    source: io_error(),
+                },
+                "lock",
+            ),
+            (
+                GitError::NotARepository { path: path.clone() },
+                "not_a_repository",
+            ),
+            (
+                GitError::PathOutsideRepository {
+                    path: path.clone(),
+                    repository: path.clone(),
+                },
+                "path_outside_repository",
+            ),
+            (GitError::EmptyCommitMessage, "empty_commit_message"),
+            (GitError::NothingStaged, "nothing_staged"),
+            (GitError::AmendUnbornBranch, "amend_unborn_branch"),
+            (
+                GitError::InvalidBranchName {
+                    name: "fixture".to_owned(),
+                },
+                "invalid_branch_name",
+            ),
+            (
+                GitError::NoSuchBranch {
+                    branch: "fixture".to_owned(),
+                },
+                "no_such_branch",
+            ),
+            (
+                GitError::BranchAlreadyExists {
+                    branch: "fixture".to_owned(),
+                },
+                "branch_already_exists",
+            ),
+            (
+                GitError::InvalidStartPoint {
+                    start_point: "fixture".to_owned(),
+                },
+                "invalid_start_point",
+            ),
+            (
+                GitError::CurrentBranchDeletion {
+                    branch: "fixture".to_owned(),
+                },
+                "current_branch_deletion",
+            ),
+            (
+                GitError::DefaultBranchDeletion {
+                    branch: "fixture".to_owned(),
+                },
+                "default_branch_deletion",
+            ),
+            (
+                GitError::BranchCheckedOutInWorktree {
+                    branch: "fixture".to_owned(),
+                    worktree: path.clone(),
+                },
+                "branch_checked_out_in_worktree",
+            ),
+            (
+                GitError::WorktreeLocked {
+                    path: path.clone(),
+                    reason: None,
+                },
+                "worktree_locked",
+            ),
+            (
+                GitError::UnmergedBranchDeletion {
+                    branch: "fixture".to_owned(),
+                },
+                "unmerged_branch_deletion",
+            ),
+            (
+                GitError::NonFastForward {
+                    command: "push".to_owned(),
+                    stderr: "fixture".to_owned(),
+                },
+                "non_fast_forward",
+            ),
+            (
+                GitError::AuthenticationFailed {
+                    command: "push".to_owned(),
+                    stderr: "fixture".to_owned(),
+                },
+                "authentication_failed",
+            ),
+            (
+                GitError::NoUpstream {
+                    branch: "fixture".to_owned(),
+                },
+                "no_upstream",
+            ),
+            (
+                GitError::UnbornBranch {
+                    path: path.clone(),
+                    branch: "fixture".to_owned(),
+                },
+                "unborn_branch",
+            ),
+            (
+                GitError::LocalUpstreamUnsupported {
+                    branch: "fixture".to_owned(),
+                },
+                "local_upstream_unsupported",
+            ),
+            (
+                GitError::OperationInProgress {
+                    path: path.clone(),
+                    pending: PendingOperation::Merge,
+                },
+                "operation_in_progress",
+            ),
+            (
+                GitError::Interrupted {
+                    command: "pull".to_owned(),
+                    path: path.clone(),
+                    pending: PendingOperation::Merge,
+                    status: None,
+                    source: Box::new(GitError::Failed {
+                        command: "pull".to_owned(),
+                        stderr: "fixture".to_owned(),
+                    }),
+                },
+                "interrupted",
+            ),
+            (GitError::NoRemote { remote: None }, "no_remote"),
+            (
+                GitError::DefaultBranchPush {
+                    remote: "origin".to_owned(),
+                    branch: "main".to_owned(),
+                },
+                "default_branch_push",
+            ),
+            (
+                GitError::DefaultBranchUnknown {
+                    remote: "origin".to_owned(),
+                },
+                "default_branch_unknown",
+            ),
+            (
+                GitError::DetachedHead {
+                    path: path.clone(),
+                    detail: "fixture".to_owned(),
+                },
+                "detached_head",
+            ),
+            (
+                GitError::Inspection {
+                    path: path.clone(),
+                    source: git_error(),
+                },
+                "inspection",
+            ),
+            (
+                GitError::MalformedStatus {
+                    detail: "fixture".to_owned(),
+                },
+                "malformed_status",
+            ),
+        ];
+
+        let kinds = cases.iter().map(|(_, kind)| *kind).collect::<Vec<_>>();
+        assert_eq!(kinds, GitError::KINDS);
+        for (error, expected) in cases {
+            assert_eq!(error.kind(), expected, "unexpected kind for {error:?}");
+        }
     }
 }
