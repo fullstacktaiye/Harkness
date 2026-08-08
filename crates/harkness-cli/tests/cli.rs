@@ -1143,7 +1143,11 @@ fn ctrl_c_cancels_clone_with_exit_130_and_cleans_partial_storage() {
     assert!(repositories_are_empty(&data_dir));
 }
 
-#[cfg(unix)]
+// Darwin filesystems reject this deliberately malformed UTF-8 filename with
+// EILSEQ before Harkness can inspect it. Keep the end-to-end fixture on a
+// platform where arbitrary-byte pathnames are supported; the parser's Unix
+// byte-preservation behavior remains covered by harkness-core unit tests.
+#[cfg(target_os = "linux")]
 #[test]
 fn non_utf8_status_paths_are_lossy_and_explicitly_flagged() {
     use std::{ffi::OsString, os::unix::ffi::OsStringExt};
