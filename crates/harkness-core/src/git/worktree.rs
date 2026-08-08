@@ -151,6 +151,50 @@ pub(crate) fn refuse_if_locked(listed: &[GitWorktree], path: &Path) -> Result<()
     }
 }
 
+/// Rejects lock requests that would leave later refusals without a reason.
+///
+/// This check is intentionally independent of the repository so callers can
+/// perform it before any Git process is spawned.
+pub(crate) fn validate_lock_reason(reason: &str) -> Result<(), GitError> {
+    if reason.trim().is_empty() {
+        Err(GitError::EmptyWorktreeLockReason)
+    } else {
+        Ok(())
+    }
+}
+
+/// Locks a worktree after its caller has proved the row is currently unlocked.
+pub(crate) fn lock_known_unlocked(
+    git_executable: &Path,
+    parent: &Path,
+    _lock: &RepositoryLock,
+    destination: &Path,
+    reason: &str,
+    cancellation: &Cancellation,
+) -> Result<(), GitError> {
+    validate_lock_reason(reason)?;
+    GitCommand::new(git_executable, parent, GitAccess::LocalWrite)
+        .args(["worktree", "lock", "--reason", reason, "--"])
+        .arg(destination)
+        .run(cancellation)?;
+    Ok(())
+}
+
+/// Unlocks a worktree after its caller has proved the row is currently locked.
+pub(crate) fn unlock_known_locked(
+    git_executable: &Path,
+    parent: &Path,
+    _lock: &RepositoryLock,
+    destination: &Path,
+    cancellation: &Cancellation,
+) -> Result<(), GitError> {
+    GitCommand::new(git_executable, parent, GitAccess::LocalWrite)
+        .args(["worktree", "unlock", "--"])
+        .arg(destination)
+        .run(cancellation)?;
+    Ok(())
+}
+
 /// Relocates a worktree after the caller has identified its unlocked row while
 /// holding the repository lock.
 pub(crate) fn move_known_unlocked(

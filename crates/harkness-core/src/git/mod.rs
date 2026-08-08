@@ -147,6 +147,25 @@ pub enum GitError {
         reason: Option<String>,
     },
 
+    /// Harkness requires every new worktree lock to explain its purpose.
+    #[error("a worktree lock reason cannot be empty")]
+    EmptyWorktreeLockReason,
+
+    /// A caller tried to replace an existing worktree lock implicitly.
+    #[error(
+        "worktree at '{}' is already locked{}",
+        path.display(),
+        reason.as_deref().map(|reason| format!(": {reason}")).unwrap_or_default()
+    )]
+    WorktreeAlreadyLocked {
+        path: PathBuf,
+        reason: Option<String>,
+    },
+
+    /// A caller tried to unlock a worktree that has no lock.
+    #[error("worktree at '{}' is not locked", path.display())]
+    WorktreeNotLocked { path: PathBuf },
+
     /// Git cannot relocate a linked checkout with a filesystem rename.
     #[error(
         "worktree at '{}' cannot move across filesystems to '{}': {stderr}",
@@ -404,6 +423,9 @@ impl GitError {
         "default_branch_deletion",
         "branch_checked_out_in_worktree",
         "worktree_locked",
+        "empty_worktree_lock_reason",
+        "worktree_already_locked",
+        "worktree_not_locked",
         "worktree_move_across_devices",
         "unmerged_branch_deletion",
         "non_fast_forward",
@@ -455,6 +477,9 @@ impl GitError {
             Self::DefaultBranchDeletion { .. } => "default_branch_deletion",
             Self::BranchCheckedOutInWorktree { .. } => "branch_checked_out_in_worktree",
             Self::WorktreeLocked { .. } => "worktree_locked",
+            Self::EmptyWorktreeLockReason => "empty_worktree_lock_reason",
+            Self::WorktreeAlreadyLocked { .. } => "worktree_already_locked",
+            Self::WorktreeNotLocked { .. } => "worktree_not_locked",
             Self::WorktreeMoveAcrossDevices { .. } => "worktree_move_across_devices",
             Self::UnmergedBranchDeletion { .. } => "unmerged_branch_deletion",
             Self::NonFastForward { .. } => "non_fast_forward",
@@ -1243,6 +1268,21 @@ mod tests {
                     reason: None,
                 },
                 "worktree_locked",
+            ),
+            (
+                GitError::EmptyWorktreeLockReason,
+                "empty_worktree_lock_reason",
+            ),
+            (
+                GitError::WorktreeAlreadyLocked {
+                    path: path.clone(),
+                    reason: None,
+                },
+                "worktree_already_locked",
+            ),
+            (
+                GitError::WorktreeNotLocked { path: path.clone() },
+                "worktree_not_locked",
             ),
             (
                 GitError::WorktreeMoveAcrossDevices {

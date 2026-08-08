@@ -1662,6 +1662,7 @@ fn project_exit_code(error: &ProjectError) -> u8 {
         | ProjectError::UnsafeWorktreeRemoval { .. }
         | ProjectError::WorktreeParentUnsupported { .. }
         | ProjectError::DirtyWorktreeRemoval { .. }
+        | ProjectError::UnsafeWorktreeLock { .. }
         | ProjectError::UnsafeWorktreeMove { .. }
         | ProjectError::WorktreeDestinationExists { .. }
         | ProjectError::WorktreeDestinationNotAbsolute { .. }
@@ -1736,6 +1737,7 @@ fn project_error_details(error: &ProjectError) -> Value {
             json!({ "override_flag": "--force" })
         }
         ProjectError::UnsafeWorktreeRemoval { id, path, reason }
+        | ProjectError::UnsafeWorktreeLock { id, path, reason }
         | ProjectError::UnsafeWorktreeMove { id, path, reason } => {
             let (path, path_is_lossy) = wire_path(path);
             json!({

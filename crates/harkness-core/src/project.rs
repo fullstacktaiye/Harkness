@@ -214,6 +214,14 @@ pub enum ProjectError {
     )]
     DirtyWorktreeRemoval { id: ProjectId, path: PathBuf },
 
+    /// A project is not a Harkness-managed worktree whose lock can be changed.
+    #[error("refusing to change lock for worktree {id} at '{}': {reason}", path.display())]
+    UnsafeWorktreeLock {
+        id: ProjectId,
+        path: PathBuf,
+        reason: String,
+    },
+
     /// A project is not a Harkness-managed worktree that can be relocated.
     #[error("refusing to move worktree {id} at '{}': {reason}", path.display())]
     UnsafeWorktreeMove {
@@ -341,6 +349,7 @@ impl_project_error_kinds! {
     Self::UnsafeWorktreeRemoval { .. } => "unsafe_worktree_removal",
     Self::WorktreeParentUnsupported { .. } => "worktree_parent_unsupported",
     Self::DirtyWorktreeRemoval { .. } => "dirty_worktree_removal",
+    Self::UnsafeWorktreeLock { .. } => "unsafe_worktree_lock",
     Self::UnsafeWorktreeMove { .. } => "unsafe_worktree_move",
     Self::WorktreeDestinationExists { .. } => "worktree_destination_exists",
     Self::WorktreeDestinationNotAbsolute { .. } => "worktree_destination_not_absolute",
@@ -418,6 +427,8 @@ pub struct Worktree {
     pub branch: Option<String>,
     /// Whether Git has locked this worktree against removal or pruning.
     pub locked: bool,
+    /// Git's reason for the lock, when the lock records one.
+    pub lock_reason: Option<String>,
     /// Whether Git considers the administrative record safe to clean up.
     pub prunable: bool,
     /// The catalog entry when Harkness owns this worktree.
@@ -1261,6 +1272,126 @@ impl ProjectService {
         Ok(refresh_project(moved))
     }
 
+    /// Protects a Harkness-managed worktree from removal and pruning.
+    ///
+    /// A non-blank reason is mandatory so every later refusal explains why
+    /// the checkout is protected. The repository lock is acquired before the
+    /// catalog relationship is rechecked, and Git is addressed with the
+    /// canonical path recorded in that catalog entry.
+    pub fn lock_worktree(
+        &self,
+        id: ProjectId,
+        reason: &str,
+        cancellation: &Cancellation,
+    ) -> Result<(), ProjectError> {
+        // Keep input validation ahead of even the porcelain listing: invalid
+        // requests must not spawn Git at all.
+        git::worktree::validate_lock_reason(reason)?;
+        self.change_worktree_lock(id, WorktreeLockChange::Lock(reason), cancellation)
+    }
+
+    /// Clears a Harkness-managed worktree lock explicitly.
+    pub fn unlock_worktree(
+        &self,
+        id: ProjectId,
+        cancellation: &Cancellation,
+    ) -> Result<(), ProjectError> {
+        self.change_worktree_lock(id, WorktreeLockChange::Unlock, cancellation)
+    }
+
+    fn change_worktree_lock(
+        &self,
+        id: ProjectId,
+        change: WorktreeLockChange<'_>,
+        cancellation: &Cancellation,
+    ) -> Result<(), ProjectError> {
+        let preliminary_catalog = self.read_catalog_shared()?;
+        let preliminary = preliminary_catalog
+            .projects
+            .iter()
+            .find(|project| project.id == id)
+            .cloned()
+            .ok_or(ProjectError::ProjectNotFound(id))?;
+        let preliminary_parent_id = worktree_parent_for_lock(&preliminary)?;
+        let preliminary_parent = preliminary_catalog
+            .projects
+            .iter()
+            .find(|project| project.id == preliminary_parent_id)
+            .cloned()
+            .ok_or_else(|| {
+                unsafe_worktree_lock(&preliminary, "catalogued parent no longer exists")
+            })?;
+        validate_worktree_parent(&preliminary_parent)?;
+
+        let repository_lock = self
+            .git_service(&preliminary_parent.root)
+            .lock(cancellation)?;
+
+        // Re-read only after the repository lock so a concurrent move or
+        // removal cannot redirect this operation to stale catalog data.
+        let candidate = self.read_catalog_shared()?;
+        verify_worktree_lock_relationship(
+            &candidate,
+            id,
+            preliminary_parent_id,
+            &preliminary.root,
+            &preliminary_parent.root,
+        )?;
+
+        let listed =
+            git::worktree::list(&self.git_executable, &preliminary_parent.root, cancellation)?;
+        let row = listed
+            .iter()
+            .find(|row| git::worktree::same_path(&row.root, &preliminary.root))
+            .ok_or_else(|| {
+                unsafe_worktree_lock(
+                    &preliminary,
+                    "Git has no worktree at the catalogued canonical path",
+                )
+            })?;
+
+        match change {
+            WorktreeLockChange::Lock(_) if row.locked.is_some() => {
+                let reason = row
+                    .locked
+                    .as_ref()
+                    .filter(|reason| !reason.is_empty())
+                    .cloned();
+                return Err(GitError::WorktreeAlreadyLocked {
+                    path: preliminary.root,
+                    reason,
+                }
+                .into());
+            }
+            WorktreeLockChange::Unlock if row.locked.is_none() => {
+                return Err(GitError::WorktreeNotLocked {
+                    path: preliminary.root,
+                }
+                .into());
+            }
+            WorktreeLockChange::Lock(_) | WorktreeLockChange::Unlock => {}
+        }
+
+        match change {
+            WorktreeLockChange::Lock(reason) => git::worktree::lock_known_unlocked(
+                &self.git_executable,
+                &preliminary_parent.root,
+                &repository_lock,
+                &preliminary.root,
+                reason,
+                cancellation,
+            )?,
+            WorktreeLockChange::Unlock => git::worktree::unlock_known_locked(
+                &self.git_executable,
+                &preliminary_parent.root,
+                &repository_lock,
+                &preliminary.root,
+                cancellation,
+            )?,
+        }
+        Ok(())
+    }
+
     /// Removes a Harkness-managed worktree through Git, then drops its catalog
     /// entry. Dirty worktrees are refused with a typed error unless `force` is
     /// explicit. The checked-out branch is never deleted.
@@ -1743,6 +1874,7 @@ impl ProjectService {
                 root: row.root,
                 branch: row.branch,
                 locked: row.locked.is_some(),
+                lock_reason: row.locked.filter(|reason| !reason.is_empty()),
                 prunable: row.prunable,
                 project,
             });
@@ -1758,6 +1890,7 @@ impl ProjectService {
                 root: project.root.clone(),
                 branch,
                 locked: false,
+                lock_reason: None,
                 prunable: false,
                 project: Some(project),
             })
@@ -2105,6 +2238,12 @@ enum WorktreeCheckoutState {
     Missing,
 }
 
+#[derive(Clone, Copy)]
+enum WorktreeLockChange<'a> {
+    Lock(&'a str),
+    Unlock,
+}
+
 fn recorded_worktree_state(project: &Project) -> Result<WorktreeCheckoutState, ProjectError> {
     match fs::canonicalize(&project.root) {
         Ok(root)
@@ -2353,6 +2492,65 @@ fn unsafe_worktree_removal(project: &Project, reason: impl Into<String>) -> Proj
         path: project.root.clone(),
         reason: reason.into(),
     }
+}
+
+fn unsafe_worktree_lock(project: &Project, reason: impl Into<String>) -> ProjectError {
+    ProjectError::UnsafeWorktreeLock {
+        id: project.id,
+        path: project.root.clone(),
+        reason: reason.into(),
+    }
+}
+
+fn worktree_parent_for_lock(project: &Project) -> Result<ProjectId, ProjectError> {
+    match RemovalPolicy::from(&project.source) {
+        RemovalPolicy::Worktree { parent } => Ok(parent),
+        RemovalPolicy::CatalogOnly | RemovalPolicy::ManagedRepository => Err(unsafe_worktree_lock(
+            project,
+            "catalog entry is not a managed worktree",
+        )),
+    }
+}
+
+fn verify_worktree_lock_relationship(
+    catalog: &Catalog,
+    id: ProjectId,
+    expected_parent: ProjectId,
+    expected_root: &Path,
+    expected_parent_root: &Path,
+) -> Result<Project, ProjectError> {
+    let project = catalog
+        .projects
+        .iter()
+        .find(|project| project.id == id)
+        .cloned()
+        .ok_or(ProjectError::ProjectNotFound(id))?;
+    let parent_id = worktree_parent_for_lock(&project)?;
+    if parent_id != expected_parent {
+        return Err(unsafe_worktree_lock(
+            &project,
+            "worktree parent changed while the repository lock was being acquired",
+        ));
+    }
+    if project.root != expected_root {
+        return Err(unsafe_worktree_lock(
+            &project,
+            "worktree path changed while the repository lock was being acquired",
+        ));
+    }
+    let parent = catalog
+        .projects
+        .iter()
+        .find(|entry| entry.id == parent_id)
+        .ok_or_else(|| unsafe_worktree_lock(&project, "catalogued parent no longer exists"))?;
+    if parent.root != expected_parent_root {
+        return Err(unsafe_worktree_lock(
+            &project,
+            "parent path changed while the repository lock was being acquired",
+        ));
+    }
+    validate_worktree_parent(parent)?;
+    Ok(project)
 }
 
 fn unsafe_worktree_move(project: &Project, reason: impl Into<String>) -> ProjectError {
@@ -2978,6 +3176,14 @@ mod tests {
                     path: path.clone(),
                 },
                 "dirty_worktree_removal",
+            ),
+            (
+                ProjectError::UnsafeWorktreeLock {
+                    id,
+                    path: path.clone(),
+                    reason: "fixture".to_owned(),
+                },
+                "unsafe_worktree_lock",
             ),
             (
                 ProjectError::UnsafeWorktreeMove {
@@ -4106,7 +4312,95 @@ mod tests {
     }
 
     #[test]
-    fn locked_worktrees_have_a_typed_removal_refusal() {
+    fn managed_worktree_locks_round_trip_with_typed_state_refusals() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("managed-lock-parent");
+        initialize_repository(&parent_root);
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+        let worktree = create_branch_worktree(&mut service, parent.id, "agent/managed-lock");
+
+        assert!(matches!(
+            service.unlock_worktree(worktree.id, &Cancellation::default()),
+            Err(ProjectError::Git(GitError::WorktreeNotLocked { path }))
+                if path == worktree.root
+        ));
+
+        service
+            .lock_worktree(
+                worktree.id,
+                "agent is still working",
+                &Cancellation::default(),
+            )
+            .unwrap();
+
+        let listed = service
+            .worktrees(parent.id, &Cancellation::default())
+            .unwrap();
+        assert!(listed[0].locked);
+        assert_eq!(
+            listed[0].lock_reason.as_deref(),
+            Some("agent is still working")
+        );
+        assert!(matches!(
+            service.lock_worktree(
+                worktree.id,
+                "replacement reason",
+                &Cancellation::default(),
+            ),
+            Err(ProjectError::Git(GitError::WorktreeAlreadyLocked { path, reason }))
+                if path == worktree.root
+                    && reason.as_deref() == Some("agent is still working")
+        ));
+        for force in [false, true] {
+            assert!(matches!(
+                service.remove_worktree(worktree.id, force, &Cancellation::default()),
+                Err(ProjectError::Git(GitError::WorktreeLocked { path, reason }))
+                    if path == worktree.root
+                        && reason.as_deref() == Some("agent is still working")
+            ));
+        }
+
+        service
+            .unlock_worktree(worktree.id, &Cancellation::default())
+            .unwrap();
+        let listed = service
+            .worktrees(parent.id, &Cancellation::default())
+            .unwrap();
+        assert!(!listed[0].locked);
+        assert_eq!(listed[0].lock_reason, None);
+        assert!(matches!(
+            service.unlock_worktree(worktree.id, &Cancellation::default()),
+            Err(ProjectError::Git(GitError::WorktreeNotLocked { path }))
+                if path == worktree.root
+        ));
+
+        service
+            .remove_worktree(worktree.id, false, &Cancellation::default())
+            .unwrap();
+        assert!(!worktree.root.exists());
+    }
+
+    #[test]
+    fn blank_worktree_lock_reasons_are_refused_before_git_spawns() {
+        let fixture = Fixture::new();
+        let parent_root = fixture.directory("blank-lock-parent");
+        initialize_repository(&parent_root);
+        let mut service = fixture.service();
+        let parent = service.import_local(&parent_root).unwrap();
+        let worktree = create_branch_worktree(&mut service, parent.id, "agent/blank-lock");
+        service.git_executable = fixture.root.path().join("git-must-not-run");
+
+        for reason in ["", " \t\n "] {
+            assert!(matches!(
+                service.lock_worktree(worktree.id, reason, &Cancellation::default()),
+                Err(ProjectError::Git(GitError::EmptyWorktreeLockReason))
+            ));
+        }
+    }
+
+    #[test]
+    fn externally_locked_worktrees_report_the_reason_and_require_unlock() {
         let fixture = Fixture::new();
         let parent_root = fixture.directory("locked-worktree-parent");
         initialize_repository(&parent_root);
@@ -4128,15 +4422,24 @@ mod tests {
             .worktrees(parent.id, &Cancellation::default())
             .unwrap();
         assert!(listed[0].locked);
-        let error = service
-            .remove_worktree(worktree.id, true, &Cancellation::default())
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            ProjectError::Git(GitError::WorktreeLocked { reason, .. })
-                if reason.as_deref() == Some("portable checkout")
-        ));
-        assert!(worktree.root.exists());
+        assert_eq!(listed[0].lock_reason.as_deref(), Some("portable checkout"));
+        for force in [false, true] {
+            assert!(matches!(
+                service.remove_worktree(worktree.id, force, &Cancellation::default()),
+                Err(ProjectError::Git(GitError::WorktreeLocked { reason, .. }))
+                    if reason.as_deref() == Some("portable checkout")
+            ));
+            assert!(worktree.root.exists());
+        }
+
+        git(
+            &parent_root,
+            ["worktree", "unlock", worktree.root.to_str().unwrap()],
+        );
+        service
+            .remove_worktree(worktree.id, false, &Cancellation::default())
+            .unwrap();
+        assert!(!worktree.root.exists());
     }
 
     #[test]
