@@ -28,9 +28,11 @@ pub mod ffi {
         #[qproperty(bool, busy)]
         #[qproperty(QString, status)]
         #[qproperty(QList_QVariant, projects)]
+        #[qproperty(QList_QVariant, jobs)]
         #[qproperty(QList_QVariant, branches)]
         #[qproperty(QList_QVariant, worktrees)]
         #[qproperty(QVariant, opened)]
+        #[qproperty(QVariant, git)]
         type HarknessBackend = super::HarknessBackendRust;
 
         #[qinvokable]
@@ -54,6 +56,11 @@ pub mod ffi {
         #[cxx_name = "cancelImport"]
         fn cancel_import(self: Pin<&mut HarknessBackend>);
 
+        /// Cancels exactly one operation without affecting any other job.
+        #[qinvokable]
+        #[cxx_name = "cancelJob"]
+        fn cancel_job(self: Pin<&mut HarknessBackend>, job_id: &QString);
+
         #[qinvokable]
         #[cxx_name = "openProject"]
         fn open_project(self: Pin<&mut HarknessBackend>, project_id: &QString);
@@ -68,6 +75,36 @@ pub mod ffi {
         #[cxx_name = "refreshBranches"]
         fn refresh_branches(self: Pin<&mut HarknessBackend>, project_id: &QString);
 
+        /// Loads the detailed Git state for the open project.
+        #[qinvokable]
+        #[cxx_name = "refreshGit"]
+        fn refresh_git(self: Pin<&mut HarknessBackend>, project_id: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "stagePath"]
+        fn stage_path(self: Pin<&mut HarknessBackend>, project_id: &QString, path: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "unstagePath"]
+        fn unstage_path(self: Pin<&mut HarknessBackend>, project_id: &QString, path: &QString);
+
+        #[qinvokable]
+        fn commit(
+            self: Pin<&mut HarknessBackend>,
+            project_id: &QString,
+            message: &QString,
+            amend: bool,
+        );
+
+        #[qinvokable]
+        fn fetch(self: Pin<&mut HarknessBackend>, project_id: &QString);
+
+        #[qinvokable]
+        fn pull(self: Pin<&mut HarknessBackend>, project_id: &QString);
+
+        #[qinvokable]
+        fn push(self: Pin<&mut HarknessBackend>, project_id: &QString, allow_default_branch: bool);
+
         /// Loads the parent's linked worktrees without blocking the GUI thread.
         #[qinvokable]
         #[cxx_name = "refreshWorktrees"]
@@ -77,6 +114,16 @@ pub mod ffi {
         #[qinvokable]
         #[cxx_name = "checkoutBranch"]
         fn checkout_branch(self: Pin<&mut HarknessBackend>, project_id: &QString, branch: &QString);
+
+        /// Creates and checks out a local branch.
+        #[qinvokable]
+        #[cxx_name = "createBranch"]
+        fn create_branch(
+            self: Pin<&mut HarknessBackend>,
+            project_id: &QString,
+            branch: &QString,
+            start_point: &QString,
+        );
 
         /// Creates a new-branch, existing-branch, or detached worktree.
         #[qinvokable]
@@ -121,10 +168,15 @@ pub struct HarknessBackendRust {
     busy: bool,
     status: QString,
     projects: QList<QVariant>,
+    jobs: QList<QVariant>,
     branches: QList<QVariant>,
     worktrees: QList<QVariant>,
     opened: QVariant,
-    cancellation: Option<harkness_core::Cancellation>,
+    git: QVariant,
+    job_records: Vec<JobRecord>,
+    cancellations: HashMap<String, harkness_core::Cancellation>,
+    legacy_job: Option<String>,
+    next_job_id: u64,
 }
 
 impl Default for HarknessBackendRust {
@@ -133,11 +185,436 @@ impl Default for HarknessBackendRust {
             busy: false,
             status: "Ready".into(),
             projects: QList::default(),
+            jobs: QList::default(),
             branches: QList::default(),
             worktrees: QList::default(),
             opened: empty_opened(),
-            cancellation: None,
+            git: empty_git(),
+            job_records: Vec::new(),
+            cancellations: HashMap::new(),
+            legacy_job: None,
+            next_job_id: 0,
         }
+    }
+}
+
+/// One operation visible to QML. The authoritative copy lives in
+/// `HarknessBackendRust` and is only mutated on the Qt thread.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct JobRecord {
+    id: String,
+    kind: String,
+    project_id: String,
+    label: String,
+    progress: String,
+    cancellable: bool,
+}
+
+fn begin_job(
+    jobs: &mut Vec<JobRecord>,
+    next_job_id: &mut u64,
+    kind: &str,
+    project_id: &str,
+    label: &str,
+    cancellable: bool,
+) -> Option<JobRecord> {
+    if jobs
+        .iter()
+        .any(|job| job.kind == kind && job.project_id == project_id)
+    {
+        return None;
+    }
+    *next_job_id += 1;
+    let job = JobRecord {
+        id: format!("job-{}", *next_job_id),
+        kind: kind.to_owned(),
+        project_id: project_id.to_owned(),
+        label: label.to_owned(),
+        progress: "Starting…".to_owned(),
+        cancellable,
+    };
+    jobs.push(job.clone());
+    Some(job)
+}
+
+fn update_job(jobs: &mut [JobRecord], job_id: &str, progress: String) -> bool {
+    let Some(job) = jobs.iter_mut().find(|job| job.id == job_id) else {
+        return false;
+    };
+    job.progress = progress;
+    true
+}
+
+fn end_job(jobs: &mut Vec<JobRecord>, job_id: &str) -> Option<JobRecord> {
+    let index = jobs.iter().position(|job| job.id == job_id)?;
+    Some(jobs.remove(index))
+}
+
+fn to_jobs(rows: &[JobRecord]) -> QList<QVariant> {
+    let mut jobs = QList::<QVariant>::default();
+    for row in rows {
+        let mut entry = QMap::<QMapPair_QString_QVariant>::default();
+        let mut insert = |key: &str, value: QVariant| entry.insert(QString::from(key), value);
+        insert("id", QVariant::from(&QString::from(row.id.as_str())));
+        insert("kind", QVariant::from(&QString::from(row.kind.as_str())));
+        insert(
+            "projectId",
+            QVariant::from(&QString::from(row.project_id.as_str())),
+        );
+        insert("label", QVariant::from(&QString::from(row.label.as_str())));
+        insert(
+            "progress",
+            QVariant::from(&QString::from(row.progress.as_str())),
+        );
+        insert("cancellable", QVariant::from(&row.cancellable));
+        jobs.append(QVariant::from(&entry));
+    }
+    jobs
+}
+
+fn sync_jobs(mut backend: Pin<&mut ffi::HarknessBackend>) {
+    let jobs = to_jobs(&backend.as_ref().rust().job_records);
+    backend.as_mut().set_jobs(jobs);
+}
+
+fn start_job(
+    mut backend: Pin<&mut ffi::HarknessBackend>,
+    kind: &str,
+    project_id: &str,
+    label: &str,
+    cancellable: bool,
+) -> Option<(String, harkness_core::Cancellation)> {
+    let job = {
+        let rust = backend.as_mut().rust_mut().get_mut();
+        begin_job(
+            &mut rust.job_records,
+            &mut rust.next_job_id,
+            kind,
+            project_id,
+            label,
+            cancellable,
+        )
+    };
+    let Some(job) = job else {
+        backend
+            .as_mut()
+            .set_status(format!("{label} is already running for this project").into());
+        return None;
+    };
+    let cancellation = harkness_core::Cancellation::default();
+    if cancellable {
+        backend
+            .as_mut()
+            .rust_mut()
+            .get_mut()
+            .cancellations
+            .insert(job.id.clone(), cancellation.clone());
+    }
+    sync_jobs(backend.as_mut());
+    Some((job.id, cancellation))
+}
+
+fn update_backend_job(mut backend: Pin<&mut ffi::HarknessBackend>, job_id: &str, progress: String) {
+    if update_job(
+        &mut backend.as_mut().rust_mut().get_mut().job_records,
+        job_id,
+        progress,
+    ) {
+        sync_jobs(backend.as_mut());
+    }
+}
+
+fn finish_job(mut backend: Pin<&mut ffi::HarknessBackend>, job_id: &str) {
+    let changed = {
+        let rust = backend.as_mut().rust_mut().get_mut();
+        rust.cancellations.remove(job_id);
+        if rust.legacy_job.as_deref() == Some(job_id) {
+            rust.legacy_job = None;
+        }
+        end_job(&mut rust.job_records, job_id).is_some()
+    };
+    if changed {
+        sync_jobs(backend.as_mut());
+    }
+}
+
+#[derive(Debug)]
+struct StatusEntryRow {
+    path: String,
+    staged: String,
+    unstaged: String,
+    rename_source: String,
+    conflicted: bool,
+}
+
+#[derive(Debug)]
+struct GitStateRow {
+    project_id: String,
+    branch: String,
+    head: String,
+    detached: bool,
+    unborn: bool,
+    upstream: String,
+    ahead: usize,
+    behind: usize,
+    pending: String,
+    entries: Vec<StatusEntryRow>,
+    error: String,
+    error_kind: String,
+}
+
+impl GitStateRow {
+    fn from_status(project_id: String, status: harkness_core::DetailedStatus) -> Self {
+        let (branch, head, detached, unborn) = match status.head {
+            harkness_core::HeadState::Unborn { branch } => {
+                let branch = branch.unwrap_or_default();
+                let head = if branch.is_empty() {
+                    "unborn branch".to_owned()
+                } else {
+                    format!("{branch} (unborn)")
+                };
+                (branch, head, false, true)
+            }
+            harkness_core::HeadState::Branch { name } => (name.clone(), name, false, false),
+            harkness_core::HeadState::Detached { commit } => {
+                let short = commit.chars().take(12).collect::<String>();
+                (String::new(), format!("detached at {short}"), true, false)
+            }
+        };
+        let (upstream, ahead, behind) = status
+            .upstream
+            .map(|upstream| (upstream.name, upstream.ahead, upstream.behind))
+            .unwrap_or_default();
+        let pending = status
+            .pending
+            .map(|pending| pending.to_string())
+            .unwrap_or_default();
+        let entries = status
+            .entries
+            .into_iter()
+            .map(|entry| StatusEntryRow {
+                path: entry.path.display().to_string(),
+                staged: entry.staged.map(change_name).unwrap_or_default().to_owned(),
+                unstaged: entry
+                    .unstaged
+                    .map(change_name)
+                    .unwrap_or_default()
+                    .to_owned(),
+                rename_source: entry
+                    .rename_source
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+                conflicted: entry.conflicted,
+            })
+            .collect();
+        Self {
+            project_id,
+            branch,
+            head,
+            detached,
+            unborn,
+            upstream,
+            ahead,
+            behind,
+            pending,
+            entries,
+            error: String::new(),
+            error_kind: String::new(),
+        }
+    }
+
+    fn with_failure(mut self, failure: &GitFailure) -> Self {
+        self.error.clone_from(&failure.message);
+        self.error_kind.clone_from(&failure.kind);
+        self
+    }
+}
+
+fn change_name(change: harkness_core::FileChange) -> &'static str {
+    match change {
+        harkness_core::FileChange::Added => "added",
+        harkness_core::FileChange::Modified => "modified",
+        harkness_core::FileChange::Deleted => "deleted",
+        harkness_core::FileChange::Renamed => "renamed",
+        harkness_core::FileChange::Copied => "copied",
+        harkness_core::FileChange::TypeChanged => "type changed",
+        harkness_core::FileChange::Untracked => "untracked",
+        harkness_core::FileChange::Unmerged => "unmerged",
+    }
+}
+
+fn to_git(row: &GitStateRow) -> QVariant {
+    let mut state = QMap::<QMapPair_QString_QVariant>::default();
+    let mut insert = |key: &str, value: QVariant| state.insert(QString::from(key), value);
+    insert(
+        "projectId",
+        QVariant::from(&QString::from(row.project_id.as_str())),
+    );
+    insert(
+        "branch",
+        QVariant::from(&QString::from(row.branch.as_str())),
+    );
+    insert("head", QVariant::from(&QString::from(row.head.as_str())));
+    insert("detached", QVariant::from(&row.detached));
+    insert("unborn", QVariant::from(&row.unborn));
+    insert(
+        "upstream",
+        QVariant::from(&QString::from(row.upstream.as_str())),
+    );
+    insert(
+        "ahead",
+        QVariant::from(&(i32::try_from(row.ahead).unwrap_or(i32::MAX))),
+    );
+    insert(
+        "behind",
+        QVariant::from(&(i32::try_from(row.behind).unwrap_or(i32::MAX))),
+    );
+    insert(
+        "pending",
+        QVariant::from(&QString::from(row.pending.as_str())),
+    );
+    insert("error", QVariant::from(&QString::from(row.error.as_str())));
+    insert(
+        "errorKind",
+        QVariant::from(&QString::from(row.error_kind.as_str())),
+    );
+
+    let mut entries = QList::<QVariant>::default();
+    for row in &row.entries {
+        let mut entry = QMap::<QMapPair_QString_QVariant>::default();
+        let mut insert = |key: &str, value: QVariant| entry.insert(QString::from(key), value);
+        insert("path", QVariant::from(&QString::from(row.path.as_str())));
+        insert(
+            "staged",
+            QVariant::from(&QString::from(row.staged.as_str())),
+        );
+        insert(
+            "unstaged",
+            QVariant::from(&QString::from(row.unstaged.as_str())),
+        );
+        insert(
+            "renameSource",
+            QVariant::from(&QString::from(row.rename_source.as_str())),
+        );
+        insert("conflicted", QVariant::from(&row.conflicted));
+        entries.append(QVariant::from(&entry));
+    }
+    insert("entries", QVariant::from(&entries));
+    QVariant::from(&state)
+}
+
+fn empty_git() -> QVariant {
+    QVariant::from(&QMap::<QMapPair_QString_QVariant>::default())
+}
+
+#[derive(Debug)]
+struct GitFailure {
+    kind: String,
+    message: String,
+}
+
+impl From<harkness_core::GitError> for GitFailure {
+    fn from(error: harkness_core::GitError) -> Self {
+        Self {
+            kind: error.kind().to_owned(),
+            message: error.to_string(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct GitWorkerResult {
+    project_id: String,
+    message: Result<String, GitFailure>,
+    state: Option<GitStateRow>,
+}
+
+fn run_git_operation(
+    project_id: String,
+    cancellation: &harkness_core::Cancellation,
+    operation: impl FnOnce(
+        &harkness_core::GitService,
+        &harkness_core::Cancellation,
+    ) -> Result<String, GitFailure>,
+) -> GitWorkerResult {
+    let git = (|| {
+        let id = project_id.parse().map_err(|_| GitFailure {
+            kind: "invalid_project".to_owned(),
+            message: "invalid project identifier".to_owned(),
+        })?;
+        let service = harkness_core::ProjectService::load().map_err(|error| GitFailure {
+            kind: "project".to_owned(),
+            message: error.to_string(),
+        })?;
+        service.git(id).map_err(|error| GitFailure {
+            kind: "project".to_owned(),
+            message: error.to_string(),
+        })
+    })();
+    let git = match git {
+        Ok(git) => git,
+        Err(failure) => {
+            return GitWorkerResult {
+                project_id,
+                message: Err(failure),
+                state: None,
+            };
+        }
+    };
+    let mut message = operation(&git, cancellation);
+    // A cancelled or failed mutation can still have changed the repository.
+    // Use a fresh token so the mandatory post-operation refresh is not itself
+    // suppressed by the user's cancellation request.
+    let state = match git.detailed_status(&harkness_core::Cancellation::default()) {
+        Ok(status) => {
+            let state = GitStateRow::from_status(project_id.clone(), status);
+            Some(match &message {
+                Ok(_) => state,
+                Err(failure) => state.with_failure(failure),
+            })
+        }
+        Err(error) => {
+            if message.is_ok() {
+                message = Err(GitFailure::from(error));
+            }
+            None
+        }
+    };
+    GitWorkerResult {
+        project_id,
+        message,
+        state,
+    }
+}
+
+fn apply_git_result(
+    mut backend: Pin<&mut ffi::HarknessBackend>,
+    job_id: &str,
+    result: GitWorkerResult,
+    refresh_catalog: bool,
+    refresh_branches: bool,
+    quiet_success: bool,
+) {
+    finish_job(backend.as_mut(), job_id);
+    let is_open =
+        opened_project_id(backend.as_ref().opened()).as_deref() == Some(result.project_id.as_str());
+    if is_open {
+        if let Some(state) = &result.state {
+            backend.as_mut().set_git(to_git(state));
+        }
+        match result.message {
+            Ok(message) if !quiet_success => backend.as_mut().set_status(message.into()),
+            Ok(_) => {}
+            Err(failure) => backend.as_mut().set_status(failure.message.into()),
+        }
+        if refresh_branches {
+            backend
+                .as_mut()
+                .refresh_branches(&QString::from(result.project_id.as_str()));
+        }
+    }
+    if refresh_catalog {
+        backend.as_mut().refresh();
     }
 }
 
@@ -569,24 +1046,31 @@ impl ffi::HarknessBackend {
             return;
         }
 
-        let cancellation = harkness_core::CloneCancellation::default();
-        self.as_mut().rust_mut().get_mut().cancellation = Some(cancellation.clone());
+        let Some((job_id, cancellation)) =
+            start_job(self.as_mut(), "import", "", "Import repository", true)
+        else {
+            return;
+        };
+        self.as_mut().rust_mut().get_mut().legacy_job = Some(job_id.clone());
         self.as_mut().set_busy(true);
         self.as_mut().set_status("Starting Git clone…".into());
         let qt_thread = self.qt_thread();
         std::thread::spawn(move || {
             let progress_thread = qt_thread.clone();
+            let progress_job_id = job_id.clone();
             let result = harkness_core::ProjectService::load()
                 .and_then(|mut service| {
                     service.import_repository(&remote, &cancellation, move |message| {
+                        let update_job_id = progress_job_id.clone();
                         let _ = progress_thread.queue(move |mut backend| {
+                            update_backend_job(backend.as_mut(), &update_job_id, message.clone());
                             backend.as_mut().set_status(message.into());
                         });
                     })
                 })
                 .map_err(|error| error.to_string());
             let _ = qt_thread.queue(move |mut backend| {
-                backend.as_mut().rust_mut().get_mut().cancellation = None;
+                finish_job(backend.as_mut(), &job_id);
                 backend.as_mut().set_busy(false);
                 apply_result(backend.as_mut(), result, "Imported", true);
             });
@@ -594,14 +1078,27 @@ impl ffi::HarknessBackend {
     }
 
     fn cancel_import(mut self: Pin<&mut Self>) {
-        if let Some(cancellation) = &self.as_ref().rust().cancellation {
-            cancellation.cancel();
+        let job_id = self.as_ref().rust().legacy_job.clone();
+        if let Some(job_id) = job_id {
+            if let Some(cancellation) = self.as_ref().rust().cancellations.get(&job_id) {
+                cancellation.cancel();
+            }
+            update_backend_job(self.as_mut(), &job_id, "Cancelling…".to_owned());
             self.as_mut().set_status("Cancelling Git operation…".into());
+        }
+    }
+
+    fn cancel_job(mut self: Pin<&mut Self>, job_id: &QString) {
+        let job_id = job_id.to_string();
+        if let Some(cancellation) = self.as_ref().rust().cancellations.get(&job_id) {
+            cancellation.cancel();
+            update_backend_job(self.as_mut(), &job_id, "Cancelling…".to_owned());
         }
     }
 
     fn close_project(mut self: Pin<&mut Self>) {
         self.as_mut().set_opened(empty_opened());
+        self.as_mut().set_git(empty_git());
         self.as_mut().set_branches(QList::default());
         self.as_mut().set_worktrees(QList::default());
     }
@@ -611,12 +1108,274 @@ impl ffi::HarknessBackend {
         let qt_thread = self.qt_thread();
         std::thread::spawn(move || {
             let result = load_branches(&project_id);
-            let _ = qt_thread.queue(move |mut backend| match result {
-                Ok(rows) => backend.as_mut().set_branches(to_branches(&rows)),
-                Err(error) => {
-                    backend.as_mut().set_branches(QList::default());
-                    backend.as_mut().set_status(error.into());
+            let _ = qt_thread.queue(move |mut backend| {
+                if opened_project_id(backend.as_ref().opened()).as_deref()
+                    != Some(project_id.as_str())
+                {
+                    return;
                 }
+                match result {
+                    Ok(rows) => backend.as_mut().set_branches(to_branches(&rows)),
+                    Err(error) => {
+                        backend.as_mut().set_branches(QList::default());
+                        backend.as_mut().set_status(error.into());
+                    }
+                }
+            });
+        });
+    }
+
+    fn refresh_git(mut self: Pin<&mut Self>, project_id: &QString) {
+        let project_id = project_id.to_string();
+        let Some((job_id, cancellation)) = start_job(
+            self.as_mut(),
+            "status",
+            &project_id,
+            "Refresh Git status",
+            true,
+        ) else {
+            return;
+        };
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let result = run_git_operation(project_id, &cancellation, |_git, _cancellation| {
+                Ok("Git status refreshed".to_owned())
+            });
+            let _ = qt_thread.queue(move |mut backend| {
+                apply_git_result(backend.as_mut(), &job_id, result, false, false, true);
+            });
+        });
+    }
+
+    fn stage_path(mut self: Pin<&mut Self>, project_id: &QString, path: &QString) {
+        let project_id = project_id.to_string();
+        let path = path.to_string();
+        let Some((job_id, cancellation)) =
+            start_job(self.as_mut(), "stage", &project_id, "Stage path", true)
+        else {
+            return;
+        };
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let result = run_git_operation(project_id, &cancellation, |git, cancellation| {
+                let outcome = git
+                    .stage([std::path::PathBuf::from(&path)], cancellation)
+                    .map_err(GitFailure::from)?;
+                if let Some(failure) =
+                    outcome
+                        .paths
+                        .into_iter()
+                        .find_map(|outcome| match outcome.result {
+                            harkness_core::StagePathResult::Succeeded => None,
+                            harkness_core::StagePathResult::Failed(error) => {
+                                Some(GitFailure::from(error))
+                            }
+                            harkness_core::StagePathResult::NotAttempted => Some(GitFailure {
+                                kind: "not_attempted".to_owned(),
+                                message: format!("Git did not attempt to stage {path}"),
+                            }),
+                            _ => Some(GitFailure {
+                                kind: "unknown_stage_result".to_owned(),
+                                message: format!(
+                                    "Git returned an unknown staging result for {path}"
+                                ),
+                            }),
+                        })
+                {
+                    return Err(failure);
+                }
+                Ok(format!("Staged {path}"))
+            });
+            let _ = qt_thread.queue(move |mut backend| {
+                apply_git_result(backend.as_mut(), &job_id, result, true, false, false);
+            });
+        });
+    }
+
+    fn unstage_path(mut self: Pin<&mut Self>, project_id: &QString, path: &QString) {
+        let project_id = project_id.to_string();
+        let path = path.to_string();
+        let Some((job_id, cancellation)) =
+            start_job(self.as_mut(), "unstage", &project_id, "Unstage path", true)
+        else {
+            return;
+        };
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let result = run_git_operation(project_id, &cancellation, |git, cancellation| {
+                let outcome = git
+                    .unstage([std::path::PathBuf::from(&path)], cancellation)
+                    .map_err(GitFailure::from)?;
+                if let Some(failure) =
+                    outcome
+                        .paths
+                        .into_iter()
+                        .find_map(|outcome| match outcome.result {
+                            harkness_core::StagePathResult::Succeeded => None,
+                            harkness_core::StagePathResult::Failed(error) => {
+                                Some(GitFailure::from(error))
+                            }
+                            harkness_core::StagePathResult::NotAttempted => Some(GitFailure {
+                                kind: "not_attempted".to_owned(),
+                                message: format!("Git did not attempt to unstage {path}"),
+                            }),
+                            _ => Some(GitFailure {
+                                kind: "unknown_stage_result".to_owned(),
+                                message: format!(
+                                    "Git returned an unknown unstaging result for {path}"
+                                ),
+                            }),
+                        })
+                {
+                    return Err(failure);
+                }
+                Ok(format!("Unstaged {path}"))
+            });
+            let _ = qt_thread.queue(move |mut backend| {
+                apply_git_result(backend.as_mut(), &job_id, result, true, false, false);
+            });
+        });
+    }
+
+    fn commit(mut self: Pin<&mut Self>, project_id: &QString, message: &QString, amend: bool) {
+        let project_id = project_id.to_string();
+        let message = message.to_string();
+        let Some((job_id, cancellation)) =
+            start_job(self.as_mut(), "commit", &project_id, "Commit", true)
+        else {
+            return;
+        };
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let result = run_git_operation(project_id, &cancellation, |git, cancellation| {
+                let outcome = git
+                    .commit(
+                        &message,
+                        &harkness_core::CommitOptions::default().with_amend(amend),
+                        cancellation,
+                    )
+                    .map_err(GitFailure::from)?;
+                let short = outcome.commit_id.chars().take(12).collect::<String>();
+                Ok(if outcome.amended {
+                    format!("Amended commit {short}")
+                } else {
+                    format!("Created commit {short}")
+                })
+            });
+            let _ = qt_thread.queue(move |mut backend| {
+                apply_git_result(backend.as_mut(), &job_id, result, true, false, false);
+            });
+        });
+    }
+
+    fn fetch(mut self: Pin<&mut Self>, project_id: &QString) {
+        let project_id = project_id.to_string();
+        let Some((job_id, cancellation)) =
+            start_job(self.as_mut(), "fetch", &project_id, "Fetch", true)
+        else {
+            return;
+        };
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let progress_thread = qt_thread.clone();
+            let progress_job_id = job_id.clone();
+            let result = run_git_operation(project_id, &cancellation, |git, cancellation| {
+                let outcome = git
+                    .fetch(
+                        &harkness_core::FetchOptions::default(),
+                        cancellation,
+                        move |message| {
+                            let update_job_id = progress_job_id.clone();
+                            let _ = progress_thread.queue(move |mut backend| {
+                                update_backend_job(backend.as_mut(), &update_job_id, message);
+                            });
+                        },
+                    )
+                    .map_err(GitFailure::from)?;
+                Ok(if outcome.updated {
+                    format!("Fetched updates from {}", outcome.remote)
+                } else {
+                    format!("{} is already up to date", outcome.remote)
+                })
+            });
+            let _ = qt_thread.queue(move |mut backend| {
+                apply_git_result(backend.as_mut(), &job_id, result, true, false, false);
+            });
+        });
+    }
+
+    fn pull(mut self: Pin<&mut Self>, project_id: &QString) {
+        let project_id = project_id.to_string();
+        let Some((job_id, cancellation)) =
+            start_job(self.as_mut(), "pull", &project_id, "Pull", true)
+        else {
+            return;
+        };
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let progress_thread = qt_thread.clone();
+            let progress_job_id = job_id.clone();
+            let result = run_git_operation(project_id, &cancellation, |git, cancellation| {
+                let outcome = git
+                    .pull(
+                        &harkness_core::PullOptions::default(),
+                        cancellation,
+                        move |message| {
+                            let update_job_id = progress_job_id.clone();
+                            let _ = progress_thread.queue(move |mut backend| {
+                                update_backend_job(backend.as_mut(), &update_job_id, message);
+                            });
+                        },
+                    )
+                    .map_err(GitFailure::from)?;
+                Ok(if outcome.updated {
+                    format!("Pulled {} from {}", outcome.branch, outcome.remote)
+                } else {
+                    format!("{} is already up to date", outcome.branch)
+                })
+            });
+            let _ = qt_thread.queue(move |mut backend| {
+                apply_git_result(backend.as_mut(), &job_id, result, true, false, false);
+            });
+        });
+    }
+
+    fn push(mut self: Pin<&mut Self>, project_id: &QString, allow_default_branch: bool) {
+        let project_id = project_id.to_string();
+        let Some((job_id, cancellation)) =
+            start_job(self.as_mut(), "push", &project_id, "Push", true)
+        else {
+            return;
+        };
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let progress_thread = qt_thread.clone();
+            let progress_job_id = job_id.clone();
+            let result = run_git_operation(project_id, &cancellation, |git, cancellation| {
+                let outcome = git
+                    .push(
+                        &harkness_core::PushOptions {
+                            set_upstream: true,
+                            allow_default_branch,
+                            ..harkness_core::PushOptions::default()
+                        },
+                        cancellation,
+                        move |message| {
+                            let update_job_id = progress_job_id.clone();
+                            let _ = progress_thread.queue(move |mut backend| {
+                                update_backend_job(backend.as_mut(), &update_job_id, message);
+                            });
+                        },
+                    )
+                    .map_err(GitFailure::from)?;
+                Ok(if outcome.updated() {
+                    format!("Pushed {} to {}", outcome.branch, outcome.remote)
+                } else {
+                    format!("{} is already published", outcome.branch)
+                })
+            });
+            let _ = qt_thread.queue(move |mut backend| {
+                apply_git_result(backend.as_mut(), &job_id, result, true, false, false);
             });
         });
     }
@@ -637,64 +1396,86 @@ impl ffi::HarknessBackend {
                     .map(|rows| rows.into_iter().map(WorktreeRow::from).collect::<Vec<_>>())
                     .map_err(|error| error.to_string())
             })();
-            let _ = qt_thread.queue(move |mut backend| match result {
-                Ok(rows) => backend.as_mut().set_worktrees(to_worktrees(&rows)),
-                Err(error) => {
-                    backend.as_mut().set_worktrees(QList::default());
-                    backend.as_mut().set_status(error.into());
+            let _ = qt_thread.queue(move |mut backend| {
+                if opened_project_id(backend.as_ref().opened()).as_deref()
+                    != Some(project_id.as_str())
+                {
+                    return;
+                }
+                match result {
+                    Ok(rows) => backend.as_mut().set_worktrees(to_worktrees(&rows)),
+                    Err(error) => {
+                        backend.as_mut().set_worktrees(QList::default());
+                        backend.as_mut().set_status(error.into());
+                    }
                 }
             });
         });
     }
 
     fn checkout_branch(mut self: Pin<&mut Self>, project_id: &QString, branch: &QString) {
-        if *self.as_ref().busy() {
-            return;
-        }
         let project_id = project_id.to_string();
         let branch = branch.to_string();
-        self.as_mut().set_busy(true);
-        self.as_mut()
-            .set_status(format!("Checking out {branch}…").into());
+        let Some((job_id, cancellation)) = start_job(
+            self.as_mut(),
+            "checkout",
+            &project_id,
+            "Switch branch",
+            true,
+        ) else {
+            return;
+        };
         let qt_thread = self.qt_thread();
         std::thread::spawn(move || {
-            let result = (|| {
-                let id = project_id
-                    .parse()
-                    .map_err(|_| "invalid project identifier".to_owned())?;
-                let mut projects =
-                    harkness_core::ProjectService::load().map_err(|error| error.to_string())?;
-                let git = projects.git(id).map_err(|error| error.to_string())?;
-                git.checkout_branch(&branch, &harkness_core::Cancellation::default())
-                    .map_err(|error| error.to_string())?;
-                let rows = git
-                    .branches(
-                        &harkness_core::BranchListOptions {
-                            include_remote_tracking: false,
-                            calculate_divergence: false,
-                        },
-                        &harkness_core::Cancellation::default(),
-                    )
-                    .map_err(|error| error.to_string())?
-                    .into_iter()
-                    .map(BranchRow::from)
-                    .collect::<Vec<_>>();
-                let project = projects.open(id).map_err(|error| error.to_string())?;
-                Ok::<_, String>((ProjectRow::from(project), rows))
-            })();
+            let result = run_git_operation(project_id, &cancellation, |git, cancellation| {
+                git.checkout_branch(&branch, cancellation)
+                    .map_err(GitFailure::from)?;
+                Ok(format!("Checked out {branch}"))
+            });
             let _ = qt_thread.queue(move |mut backend| {
-                backend.as_mut().set_busy(false);
-                match result {
-                    Ok((project, rows)) => {
-                        backend.as_mut().set_opened(to_map(&project));
-                        backend.as_mut().set_branches(to_branches(&rows));
-                        backend
-                            .as_mut()
-                            .set_status(format!("Checked out {branch}").into());
-                        backend.as_mut().refresh();
-                    }
-                    Err(error) => backend.as_mut().set_status(error.into()),
-                }
+                apply_git_result(backend.as_mut(), &job_id, result, true, true, false);
+            });
+        });
+    }
+
+    fn create_branch(
+        mut self: Pin<&mut Self>,
+        project_id: &QString,
+        branch: &QString,
+        start_point: &QString,
+    ) {
+        let project_id = project_id.to_string();
+        let branch = branch.to_string().trim().to_owned();
+        let start_point = start_point.to_string().trim().to_owned();
+        if branch.is_empty() {
+            self.as_mut().set_status("Enter a branch name".into());
+            return;
+        }
+        let Some((job_id, cancellation)) = start_job(
+            self.as_mut(),
+            "create_branch",
+            &project_id,
+            "Create branch",
+            true,
+        ) else {
+            return;
+        };
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let result = run_git_operation(project_id, &cancellation, |git, cancellation| {
+                git.create_branch(
+                    &branch,
+                    &harkness_core::CreateBranchOptions {
+                        start_point: (!start_point.is_empty()).then_some(start_point),
+                        checkout: true,
+                    },
+                    cancellation,
+                )
+                .map_err(GitFailure::from)?;
+                Ok(format!("Created and checked out {branch}"))
+            });
+            let _ = qt_thread.queue(move |mut backend| {
+                apply_git_result(backend.as_mut(), &job_id, result, true, true, false);
             });
         });
     }
@@ -706,9 +1487,6 @@ impl ffi::HarknessBackend {
         branch: &QString,
         start_point: &QString,
     ) {
-        if *self.as_ref().busy() {
-            return;
-        }
         let project_id = project_id.to_string();
         let base = match worktree_base(
             &mode.to_string(),
@@ -721,10 +1499,15 @@ impl ffi::HarknessBackend {
                 return;
             }
         };
-        let cancellation = harkness_core::Cancellation::default();
-        self.as_mut().rust_mut().get_mut().cancellation = Some(cancellation.clone());
-        self.as_mut().set_busy(true);
-        self.as_mut().set_status("Creating worktree…".into());
+        let Some((job_id, cancellation)) = start_job(
+            self.as_mut(),
+            "create_worktree",
+            &project_id,
+            "Create worktree",
+            true,
+        ) else {
+            return;
+        };
         let qt_thread = self.qt_thread();
         std::thread::spawn(move || {
             let result = (|| {
@@ -738,22 +1521,23 @@ impl ffi::HarknessBackend {
                     .map_err(|error| error.to_string())
             })();
             let _ = qt_thread.queue(move |mut backend| {
-                backend.as_mut().rust_mut().get_mut().cancellation = None;
-                backend.as_mut().set_busy(false);
+                finish_job(backend.as_mut(), &job_id);
                 apply_result(backend.as_mut(), result, "Created", true);
             });
         });
     }
 
     fn reconcile_worktrees(mut self: Pin<&mut Self>, project_id: &QString) {
-        if *self.as_ref().busy() {
-            return;
-        }
         let project_id = project_id.to_string();
-        let cancellation = harkness_core::Cancellation::default();
-        self.as_mut().rust_mut().get_mut().cancellation = Some(cancellation.clone());
-        self.as_mut().set_busy(true);
-        self.as_mut().set_status("Reconciling worktrees…".into());
+        let Some((job_id, cancellation)) = start_job(
+            self.as_mut(),
+            "reconcile_worktrees",
+            &project_id,
+            "Reconcile worktrees",
+            true,
+        ) else {
+            return;
+        };
         let qt_thread = self.qt_thread();
         std::thread::spawn(move || {
             let result = (|| {
@@ -774,8 +1558,7 @@ impl ffi::HarknessBackend {
                 Ok::<_, String>((removed.len(), rows))
             })();
             let _ = qt_thread.queue(move |mut backend| {
-                backend.as_mut().rust_mut().get_mut().cancellation = None;
-                backend.as_mut().set_busy(false);
+                finish_job(backend.as_mut(), &job_id);
                 match result {
                     Ok((removed, rows)) => {
                         backend.as_mut().set_worktrees(to_worktrees(&rows));
@@ -876,21 +1659,17 @@ impl ffi::HarknessBackend {
     /// Git checks worktree cleanliness and removes its administrative record,
     /// so this runs off the GUI thread just like managed-repository removal.
     fn remove_worktree(mut self: Pin<&mut Self>, project_id: &QString, force: bool) {
-        if *self.as_ref().busy() {
-            return;
-        }
         let project_id = project_id.to_string();
-        let cancellation = harkness_core::Cancellation::default();
-        self.as_mut().rust_mut().get_mut().cancellation = Some(cancellation.clone());
-        self.as_mut().set_busy(true);
-        self.as_mut().set_status(
-            if force {
-                "Removing worktree and discarding changes…"
-            } else {
-                "Removing worktree…"
-            }
-            .into(),
-        );
+        let label = if force {
+            "Remove worktree and discard changes"
+        } else {
+            "Remove worktree"
+        };
+        let Some((job_id, cancellation)) =
+            start_job(self.as_mut(), "remove_worktree", &project_id, label, true)
+        else {
+            return;
+        };
         let qt_thread = self.qt_thread();
         std::thread::spawn(move || {
             let result = (|| {
@@ -899,8 +1678,7 @@ impl ffi::HarknessBackend {
                 remove_worktree_with_service(&mut service, &project_id, force, &cancellation)
             })();
             let _ = qt_thread.queue(move |mut backend| {
-                backend.as_mut().rust_mut().get_mut().cancellation = None;
-                backend.as_mut().set_busy(false);
+                finish_job(backend.as_mut(), &job_id);
                 apply_result(backend.as_mut(), result, "Removed", false);
             });
         });
@@ -909,15 +1687,16 @@ impl ffi::HarknessBackend {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{collections::HashMap, fs, path::Path};
 
     use cxx_qt_lib::{QMap, QMapPair_QString_QVariant, QString, QVariant};
     use git2::{Repository, Signature};
     use tempfile::TempDir;
 
     use super::{
-        BranchRow, OpenedUpdate, ProjectRow, empty_opened, operation_outcome, project_rows,
-        remove_worktree_with_service, to_branches, to_map, to_projects, worktree_base,
+        BranchRow, GitStateRow, OpenedUpdate, ProjectRow, begin_job, empty_opened, end_job,
+        operation_outcome, project_rows, remove_worktree_with_service, to_branches, to_git,
+        to_jobs, to_map, to_projects, update_job, worktree_base,
     };
 
     fn project(
@@ -1006,6 +1785,179 @@ mod tests {
             map.get(&QString::from("managed"))
                 .and_then(|value| value.value::<bool>()),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn job_records_flatten_with_the_qml_contract() {
+        let mut records = Vec::new();
+        let mut next_id = 0;
+        let job = begin_job(
+            &mut records,
+            &mut next_id,
+            "fetch",
+            "project-1",
+            "Fetch",
+            true,
+        )
+        .unwrap();
+        let jobs = to_jobs(&records);
+        let map = jobs
+            .get(0)
+            .unwrap()
+            .value::<QMap<QMapPair_QString_QVariant>>()
+            .expect("job should flatten to a QVariantMap");
+
+        for key in [
+            "id",
+            "kind",
+            "projectId",
+            "label",
+            "progress",
+            "cancellable",
+        ] {
+            assert!(map.contains(&QString::from(key)), "missing key '{key}'");
+        }
+        assert_eq!(
+            map.get(&QString::from("id"))
+                .and_then(|value| value.value::<QString>())
+                .map(|value| value.to_string()),
+            Some(job.id)
+        );
+    }
+
+    #[test]
+    fn jobs_begin_update_and_end_by_kind_and_project() {
+        let mut records = Vec::new();
+        let mut next_id = 0;
+        let mut fetch = begin_job(
+            &mut records,
+            &mut next_id,
+            "fetch",
+            "project-1",
+            "Fetch",
+            true,
+        )
+        .unwrap();
+        assert!(
+            begin_job(
+                &mut records,
+                &mut next_id,
+                "fetch",
+                "project-1",
+                "Fetch",
+                true,
+            )
+            .is_none()
+        );
+        assert!(
+            begin_job(
+                &mut records,
+                &mut next_id,
+                "pull",
+                "project-1",
+                "Pull",
+                true,
+            )
+            .is_some()
+        );
+        assert!(
+            begin_job(
+                &mut records,
+                &mut next_id,
+                "fetch",
+                "project-2",
+                "Fetch",
+                true,
+            )
+            .is_some()
+        );
+
+        assert!(update_job(
+            &mut records,
+            &fetch.id,
+            "Receiving objects".to_owned()
+        ));
+        assert_eq!(
+            records
+                .iter()
+                .find(|job| job.id == fetch.id)
+                .map(|job| job.progress.as_str()),
+            Some("Receiving objects")
+        );
+        fetch.progress = "Receiving objects".to_owned();
+        assert_eq!(end_job(&mut records, &fetch.id), Some(fetch));
+        assert_eq!(records.len(), 2);
+
+        let first = harkness_core::Cancellation::default();
+        let second = harkness_core::Cancellation::default();
+        let mut cancellations = HashMap::from([
+            ("job-1".to_owned(), first.clone()),
+            ("job-2".to_owned(), second.clone()),
+        ]);
+        cancellations.get("job-1").unwrap().cancel();
+        assert!(first.is_cancelled());
+        assert!(!second.is_cancelled());
+        cancellations.remove("job-1");
+        assert!(cancellations.contains_key("job-2"));
+    }
+
+    #[test]
+    fn detailed_status_entries_flatten_for_the_git_panel() {
+        let state = GitStateRow::from_status(
+            "project-1".to_owned(),
+            harkness_core::DetailedStatus {
+                head: harkness_core::HeadState::Branch {
+                    name: "topic".to_owned(),
+                },
+                upstream: Some(harkness_core::UpstreamStatus {
+                    name: "origin/topic".to_owned(),
+                    ahead: 2,
+                    behind: 1,
+                }),
+                pending: Some(harkness_core::PendingOperation::Merge),
+                entries: vec![harkness_core::StatusEntry {
+                    path: "src/new.rs".into(),
+                    staged: Some(harkness_core::FileChange::Added),
+                    unstaged: Some(harkness_core::FileChange::Modified),
+                    rename_source: Some("src/old.rs".into()),
+                    conflicted: true,
+                }],
+            },
+        );
+        let map = to_git(&state)
+            .value::<QMap<QMapPair_QString_QVariant>>()
+            .expect("Git state should flatten to a QVariantMap");
+        assert_eq!(
+            map.get(&QString::from("upstream"))
+                .and_then(|value| value.value::<QString>())
+                .map(|value| value.to_string()),
+            Some("origin/topic".to_owned())
+        );
+        assert_eq!(
+            map.get(&QString::from("pending"))
+                .and_then(|value| value.value::<QString>())
+                .map(|value| value.to_string()),
+            Some("merge".to_owned())
+        );
+        let entries = map
+            .get(&QString::from("entries"))
+            .and_then(|value| value.value::<cxx_qt_lib::QList<QVariant>>())
+            .expect("entries should be a QVariantList");
+        let entry = entries
+            .get(0)
+            .unwrap()
+            .value::<QMap<QMapPair_QString_QVariant>>()
+            .expect("status entry should be a QVariantMap");
+        for key in ["path", "staged", "unstaged", "renameSource", "conflicted"] {
+            assert!(entry.contains(&QString::from(key)), "missing key '{key}'");
+        }
+        assert_eq!(
+            entry
+                .get(&QString::from("path"))
+                .and_then(|value| value.value::<QString>())
+                .map(|value| value.to_string()),
+            Some("src/new.rs".to_owned())
         );
     }
 

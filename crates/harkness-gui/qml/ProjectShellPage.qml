@@ -12,19 +12,17 @@ Kirigami.Page {
 
     // Lets Main.qml recognize this page when `opened` is re-set by a refresh.
     property bool isShell: true
-    property bool worktreeFormVisible: false
+    readonly property string shellName: project.worktree && project.parentName.length > 0
+        ? qsTr("%1 — from %2").arg(project.displayName).arg(project.parentName)
+        : project.displayName
 
-    title: shell.project.displayName
+    title: shell.shellName
 
     onProjectChanged: {
         // A refresh can replace the project object; the root itself only
         // changes in theory, but re-applying it is a no-op then.
         if (project.available)
             fileModel.setRoot(project.root);
-        if (project.available && project.isGit)
-            backend.refreshBranches(project.id);
-        if (project.available && project.isGit && !project.worktree)
-            backend.refreshWorktrees(project.id);
     }
 
     actions: [
@@ -40,31 +38,6 @@ Kirigami.Page {
             text: qsTr("Refresh")
             tooltip: qsTr("Re-read availability and Git state")
             onTriggered: shell.backend.openProject(shell.project.id)
-        },
-        Kirigami.Action {
-            icon.name: "vcs-branch"
-            text: qsTr("Create worktree…")
-            tooltip: qsTr("Create a linked workspace on a new branch, an existing branch, or detached HEAD")
-            visible: shell.project.available && shell.project.isGit && !shell.project.worktree
-            onTriggered: {
-                shell.worktreeFormVisible = !shell.worktreeFormVisible;
-                if (shell.worktreeFormVisible)
-                    worktreeBranch.forceActiveFocus();
-            }
-        },
-        Kirigami.Action {
-            icon.name: "view-refresh"
-            text: qsTr("Reconcile worktrees")
-            tooltip: qsTr("Remove stale Harkness entries without pruning external worktrees")
-            visible: shell.project.available && shell.project.isGit && !shell.project.worktree
-            onTriggered: shell.backend.reconcileWorktrees(shell.project.id)
-        },
-        Kirigami.Action {
-            icon.name: "process-stop"
-            text: qsTr("Cancel Git operation")
-            tooltip: qsTr("Stop the running worktree operation safely")
-            visible: shell.backend.busy
-            onTriggered: shell.backend.cancelImport()
         },
         Kirigami.Action {
             icon.name: "delete"
@@ -114,7 +87,7 @@ Kirigami.Page {
                         Layout.fillWidth: true
                         elide: Text.ElideRight
                         level: 2
-                        text: shell.project.displayName
+                        text: shell.shellName
                     }
 
                     RowLayout {
@@ -146,42 +119,6 @@ Kirigami.Page {
 
                 RowLayout {
                     spacing: Kirigami.Units.smallSpacing
-
-                    Controls.ComboBox {
-                        id: branchPicker
-
-                        Accessible.name: qsTr("Current Git branch")
-                        Layout.preferredWidth: Kirigami.Units.gridUnit * 11
-                        enabled: shell.project.isGit && shell.project.available && !shell.backend.busy
-                        model: shell.backend.branches
-                        textRole: "name"
-                        valueRole: "name"
-                        visible: shell.project.isGit
-
-                        currentIndex: {
-                            for (let index = 0; index < count; ++index) {
-                                if (valueAt(index) === shell.project.branch)
-                                    return index;
-                            }
-                            return -1;
-                        }
-
-                        delegate: Controls.ItemDelegate {
-                            required property var modelData
-
-                            Controls.ToolTip.text: modelData.detail
-                            Controls.ToolTip.visible: hovered && modelData.detail.length > 0
-                            enabled: modelData.selectable
-                            text: modelData.name
-                            width: branchPicker.width
-                        }
-
-                        onActivated: {
-                            const selected = String(currentValue);
-                            if (selected.length > 0 && selected !== shell.project.branch)
-                                shell.backend.checkoutBranch(shell.project.id, selected);
-                        }
-                    }
 
                     Kirigami.Chip {
                         Controls.ToolTip.text: qsTr("Parent project: %1").arg(shell.project.parentName)
@@ -221,109 +158,6 @@ Kirigami.Page {
                     }
                 }
             }
-
-            Controls.Frame {
-                Layout.fillWidth: true
-                visible: shell.worktreeFormVisible
-
-                ColumnLayout {
-                    anchors.fill: parent
-                    spacing: Kirigami.Units.smallSpacing
-
-                    Kirigami.Heading {
-                        level: 4
-                        text: qsTr("Create linked workspace")
-                    }
-
-                    RowLayout {
-                        Layout.fillWidth: true
-
-                        Controls.ComboBox {
-                            id: worktreeMode
-
-                            readonly property string mode: ["new", "existing", "detached"][currentIndex]
-
-                            Layout.preferredWidth: Kirigami.Units.gridUnit * 10
-                            model: [qsTr("New branch"), qsTr("Existing branch"), qsTr("Detached HEAD")]
-                        }
-
-                        Controls.TextField {
-                            id: worktreeBranch
-
-                            Layout.fillWidth: true
-                            enabled: !shell.backend.busy
-                            placeholderText: worktreeMode.mode === "existing"
-                                ? qsTr("Existing branch to reuse")
-                                : qsTr("New branch name")
-                            visible: worktreeMode.mode !== "detached"
-                        }
-
-                        Controls.TextField {
-                            id: worktreeStart
-
-                            Layout.fillWidth: true
-                            enabled: !shell.backend.busy
-                            placeholderText: worktreeMode.mode === "detached"
-                                ? qsTr("Commit or revision")
-                                : qsTr("Start point (defaults to HEAD)")
-                            text: worktreeMode.mode === "new" ? "HEAD" : ""
-                            visible: worktreeMode.mode !== "existing"
-                        }
-
-                        Controls.Button {
-                            enabled: !shell.backend.busy
-                                && (worktreeMode.mode === "detached"
-                                    ? worktreeStart.text.trim().length > 0
-                                    : worktreeBranch.text.trim().length > 0)
-                            icon.name: "list-add"
-                            text: qsTr("Create")
-                            onClicked: shell.backend.createWorktree(
-                                shell.project.id,
-                                worktreeMode.mode,
-                                worktreeBranch.text,
-                                worktreeStart.text
-                            )
-                        }
-
-                        Controls.Button {
-                            text: shell.backend.busy ? qsTr("Stop") : qsTr("Cancel")
-                            onClicked: {
-                                if (shell.backend.busy)
-                                    shell.backend.cancelImport();
-                                else
-                                    shell.worktreeFormVisible = false;
-                            }
-                        }
-                    }
-
-                    Controls.Label {
-                        Layout.fillWidth: true
-                        color: Kirigami.Theme.disabledTextColor
-                        font: Kirigami.Theme.smallFont
-                        text: shell.backend.worktrees.length === 0
-                            ? qsTr("No linked worktrees")
-                            : qsTr("%n linked worktree(s), including external checkouts", "", shell.backend.worktrees.length)
-                    }
-
-                    Repeater {
-                        model: shell.backend.worktrees
-
-                        delegate: Controls.Label {
-                            required property var modelData
-
-                            Layout.fillWidth: true
-                            elide: Text.ElideMiddle
-                            font: Kirigami.Theme.smallFont
-                            text: {
-                                const branch = modelData.branch.length > 0 ? modelData.branch : qsTr("detached HEAD");
-                                const ownership = modelData.owned ? qsTr("Harkness") : qsTr("external");
-                                const lock = modelData.locked ? qsTr(", locked") : "";
-                                return qsTr("%1 — %2 (%3%4)").arg(branch).arg(modelData.root).arg(ownership).arg(lock);
-                            }
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -331,53 +165,68 @@ Kirigami.Page {
         id: fileModel
     }
 
-    TreeView {
-        id: tree
-
+    RowLayout {
         anchors.fill: parent
-        clip: true
-        model: fileModel
-        selectionModel: ItemSelectionModel {}
-        visible: shell.project.available
+        spacing: 0
 
-        delegate: Controls.TreeViewDelegate {
-            id: treeDelegate
-
-            // The KDE TreeViewDelegate already requires a `model` object.
-            // Consequently custom roles are exposed through that object, not
-            // injected as standalone required properties.
-            readonly property string fileName: model.fileName
-            readonly property string filePath: model.filePath
-            readonly property bool isDirectory: model.isDirectory
-
-            Controls.ToolTip.text: treeDelegate.filePath
-            Controls.ToolTip.visible: treeDelegate.hovered
-
-            contentItem: RowLayout {
-                spacing: Kirigami.Units.smallSpacing
-
-                Kirigami.Icon {
-                    Layout.preferredHeight: Kirigami.Units.iconSizes.small
-                    Layout.preferredWidth: Kirigami.Units.iconSizes.small
-                    source: treeDelegate.isDirectory ? "folder" : "text-plain"
-                }
-
-                Controls.Label {
-                    Layout.fillWidth: true
-                    elide: Text.ElideRight
-                    text: treeDelegate.fileName
-                }
-            }
+        GitPanel {
+            Layout.fillHeight: true
+            Layout.minimumWidth: Kirigami.Units.gridUnit * 20
+            Layout.preferredWidth: Kirigami.Units.gridUnit * 23
+            Layout.maximumWidth: parent.width * 0.5
+            backend: shell.backend
+            project: shell.project
+            visible: shell.project.available && shell.project.isGit
         }
 
-        Component.onCompleted: fileModel.setRoot(shell.project.root)
-    }
+        Kirigami.Separator {
+            Layout.fillHeight: true
+            visible: shell.project.available && shell.project.isGit
+        }
 
-    Component.onCompleted: {
-        if (shell.project.available && shell.project.isGit)
-            shell.backend.refreshBranches(shell.project.id);
-        if (shell.project.available && shell.project.isGit && !shell.project.worktree)
-            shell.backend.refreshWorktrees(shell.project.id);
+        TreeView {
+            id: tree
+
+            Layout.fillHeight: true
+            Layout.fillWidth: true
+            Layout.minimumWidth: Kirigami.Units.gridUnit * 12
+            clip: true
+            model: fileModel
+            selectionModel: ItemSelectionModel {}
+            visible: shell.project.available
+
+            delegate: Controls.TreeViewDelegate {
+                id: treeDelegate
+
+                // The KDE TreeViewDelegate already requires a `model` object.
+                // Consequently custom roles are exposed through that object,
+                // not injected as standalone required properties.
+                readonly property string fileName: model.fileName
+                readonly property string filePath: model.filePath
+                readonly property bool isDirectory: model.isDirectory
+
+                Controls.ToolTip.text: treeDelegate.filePath
+                Controls.ToolTip.visible: treeDelegate.hovered
+
+                contentItem: RowLayout {
+                    spacing: Kirigami.Units.smallSpacing
+
+                    Kirigami.Icon {
+                        Layout.preferredHeight: Kirigami.Units.iconSizes.small
+                        Layout.preferredWidth: Kirigami.Units.iconSizes.small
+                        source: treeDelegate.isDirectory ? "folder" : "text-plain"
+                    }
+
+                    Controls.Label {
+                        Layout.fillWidth: true
+                        elide: Text.ElideRight
+                        text: treeDelegate.fileName
+                    }
+                }
+            }
+
+            Component.onCompleted: fileModel.setRoot(shell.project.root)
+        }
     }
 
     Kirigami.PlaceholderMessage {

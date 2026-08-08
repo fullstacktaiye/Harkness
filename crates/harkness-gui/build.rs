@@ -8,6 +8,7 @@ fn main() {
             "qml/LauncherActionCard.qml",
             "qml/RecentProjectCard.qml",
             "qml/ProjectShellPage.qml",
+            "qml/GitPanel.qml",
         ]),
     )
     .qt_module("Network")

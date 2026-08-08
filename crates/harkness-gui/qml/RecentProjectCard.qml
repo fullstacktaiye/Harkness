@@ -83,9 +83,9 @@ Controls.AbstractButton {
                     closable: false
                     hoverEnabled: true
                     text: card.project.worktree
-                        ? card.project.branch.length > 0
-                            ? qsTr("Worktree: %1").arg(card.project.branch)
-                            : qsTr("Worktree: detached HEAD")
+                        ? card.project.parentName.length > 0
+                            ? qsTr("From %1").arg(card.project.parentName)
+                            : qsTr("Worktree")
                         : qsTr("Managed")
                     visible: card.project.managed || card.project.worktree
                 }
