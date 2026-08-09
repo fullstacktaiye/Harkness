@@ -362,8 +362,9 @@ pub enum GitError {
         source: io::Error,
     },
 
-    /// A file-context request did not contain one complete hexadecimal object ID.
-    #[error("'{blob_id}' is not a valid full blob object ID")]
+    /// A file-context request did not contain a complete object ID valid for
+    /// its selected source.
+    #[error("'{blob_id}' is not a valid full blob object ID for this context source")]
     InvalidBlobId { blob_id: String },
 
     /// No blob object exists at the requested object ID.
@@ -770,7 +771,8 @@ impl GitService {
     /// Immutable sides are addressed by the blob IDs recorded in [`FileDiff`],
     /// so later index or working-tree changes cannot move their content. A
     /// working-tree source is guarded by its recorded hash and refuses with
-    /// [`GitError::StaleHunkSelection`] when the path's bytes have changed.
+    /// [`GitError::StaleHunkSelection`] when the path no longer produces the
+    /// same raw or clean-filtered representation.
     /// The operation runs entirely in process, takes no repository lock and
     /// never spawns system Git.
     pub fn file_context(

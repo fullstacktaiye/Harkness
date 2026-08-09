@@ -3,20 +3,25 @@
 //! A diff records the object ID of each content side. Those IDs are the stable
 //! address here: index and revision content is read from the immutable object
 //! database even if a path changes later. The one exception is a working-tree
-//! side, whose recorded ID is only a hash. That source is read by path and its
-//! bytes are accepted only when they still hash to the recorded ID.
+//! side, whose recorded ID is only a hash. That source is read by path, passed
+//! through the same built-in clean filters as the diff when applicable, and
+//! accepted only when that representation still hashes to the recorded ID.
 //!
 //! Retrieval is local, read-only inspection. It uses libgit2 in process, takes
 //! no repository lock and never spawns system Git.
 
 use std::{
-    ffi::OsStr,
+    ffi::{CString, OsStr},
     fs::{self, File},
-    io::{self, Read},
+    io::{self, Read, Write},
+    os::raw::{c_char, c_int},
     path::{Path, PathBuf},
+    ptr, slice,
 };
 
-use git2::{ErrorCode, ObjectType, Oid, Repository};
+use git2::{Binding, ErrorCode, ObjectType, Oid, Repository};
+use libgit2_sys as raw;
+use tempfile::NamedTempFile;
 
 use crate::git::{
     DEFAULT_MAX_DIFF_FILE_SIZE, DEFAULT_MAX_DIFF_TOTAL_BYTES, DiffLine, DiffLineKind, DiffTarget,
@@ -56,10 +61,16 @@ pub enum FileContextRange {
 pub enum FileContextSource {
     /// An immutable blob in the repository object database.
     Blob { blob_id: String },
+    /// The empty content of a diff side that does not exist.
+    ///
+    /// `blob_id` is the all-zero object ID recorded by [`FileDiff`]. It is a
+    /// sentinel, not an object that is looked up in the repository.
+    Absent { blob_id: String },
     /// The one diff side that has a hash but no stored blob.
     ///
     /// `expected_blob_id` is the content hash recorded by the diff. The path is
-    /// used only to read the current bytes, never as their identity.
+    /// used only to reproduce the same raw or clean-filtered representation,
+    /// never as its identity.
     Worktree {
         path: PathBuf,
         expected_blob_id: String,
@@ -69,7 +80,7 @@ pub enum FileContextSource {
 impl FileContextSource {
     fn blob_id(&self) -> &str {
         match self {
-            Self::Blob { blob_id } => blob_id,
+            Self::Blob { blob_id } | Self::Absent { blob_id } => blob_id,
             Self::Worktree {
                 expected_blob_id, ..
             } => expected_blob_id,
@@ -190,7 +201,17 @@ impl FileContextRequest {
             FileSide::Old => (&file.old_blob_id, file.old_path.as_ref()),
             FileSide::New => (&file.new_blob_id, file.new_path.as_ref()),
         };
-        if side == FileSide::New
+        if path.is_none() && !blob_id.is_empty() && blob_id.bytes().all(|byte| byte == b'0') {
+            Self {
+                source: FileContextSource::Absent {
+                    blob_id: blob_id.clone(),
+                },
+                side,
+                range,
+                max_file_size: DEFAULT_MAX_DIFF_FILE_SIZE,
+                max_total_bytes: DEFAULT_MAX_DIFF_TOTAL_BYTES,
+            }
+        } else if side == FileSide::New
             && matches!(
                 file.target,
                 DiffTarget::Unstaged | DiffTarget::RevisionAgainstWorktree { .. }
@@ -223,7 +244,7 @@ pub struct FileContextResponse {
     pub side: FileSide,
     /// The range the caller requested.
     pub range: FileContextRange,
-    /// Size of the complete source in bytes.
+    /// Size of the complete addressed representation in bytes.
     pub byte_size: u64,
     /// Number of lines in the complete source, absent when the source was
     /// rejected before it could be inspected within its byte bound.
@@ -244,17 +265,81 @@ pub(crate) fn load(
     root: &Path,
     request: &FileContextRequest,
 ) -> Result<FileContextResponse, GitError> {
-    if let FileContextSource::Worktree { path, .. } = &request.source {
-        commit::validate_paths(root, std::slice::from_ref(path))?;
-    }
-    let repository = commit::open(root)?;
-    let id = parse_blob_id(&repository, request.source.blob_id())?;
-
     match &request.source {
-        FileContextSource::Blob { .. } => load_blob(&repository, root, id, request),
-        FileContextSource::Worktree { path, .. } => {
-            load_worktree(&repository, root, path, id, request)
+        FileContextSource::Blob { .. } => {
+            let repository = commit::open(root)?;
+            let id = parse_blob_id(&repository, request.source.blob_id())?;
+            load_blob(&repository, root, id, request)
         }
+        FileContextSource::Absent { blob_id } => {
+            let repository = commit::open(root)?;
+            let id = parse_blob_id(&repository, request.source.blob_id())?;
+            load_absent(blob_id, id, request)
+        }
+        FileContextSource::Worktree { path, .. } => {
+            // Reject escapes before opening or otherwise inspecting the
+            // repository so path safety is independent of repository state.
+            let resolved = validate_worktree_path(root, path)?;
+            let repository = commit::open(root)?;
+            let id = parse_blob_id(&repository, request.source.blob_id())?;
+            load_worktree(&repository, path, &resolved, id, request)
+        }
+    }
+}
+
+struct WorktreePath {
+    absolute: PathBuf,
+    repository_relative: PathBuf,
+}
+
+/// Validates the path without following its final component.
+///
+/// A tracked symlink is content in its own right, and its target may
+/// legitimately be outside the repository. Parent components still have to
+/// resolve beneath the worktree so a nested symlink cannot redirect the read.
+fn validate_worktree_path(root: &Path, path: &Path) -> Result<WorktreePath, GitError> {
+    let repository = fs::canonicalize(root).map_err(|_| GitError::NotARepository {
+        path: root.to_path_buf(),
+    })?;
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repository.join(path)
+    };
+    let Some(file_name) = candidate.file_name() else {
+        return Err(outside_repository(root, path));
+    };
+    let Some(parent) = candidate.parent() else {
+        return Err(outside_repository(root, path));
+    };
+    let parent = fs::canonicalize(parent).map_err(|source| {
+        if source.kind() == io::ErrorKind::NotFound {
+            stale(path)
+        } else {
+            GitError::DiffContent {
+                path: path.to_path_buf(),
+                source,
+            }
+        }
+    })?;
+    if !parent.starts_with(&repository) {
+        return Err(outside_repository(root, path));
+    }
+    let absolute = parent.join(file_name);
+    let repository_relative = absolute
+        .strip_prefix(&repository)
+        .map_err(|_| outside_repository(root, path))?
+        .to_path_buf();
+    Ok(WorktreePath {
+        absolute,
+        repository_relative,
+    })
+}
+
+fn outside_repository(root: &Path, path: &Path) -> GitError {
+    GitError::PathOutsideRepository {
+        path: path.to_path_buf(),
+        repository: root.to_path_buf(),
     }
 }
 
@@ -320,22 +405,32 @@ fn load_blob(
     project_lines(request, id, blob.content())
 }
 
+fn load_absent(
+    blob_id: &str,
+    id: Oid,
+    request: &FileContextRequest,
+) -> Result<FileContextResponse, GitError> {
+    if !id.is_zero() {
+        return Err(GitError::InvalidBlobId {
+            blob_id: blob_id.to_owned(),
+        });
+    }
+    project_lines(request, id, &[])
+}
+
 fn load_worktree(
     repository: &Repository,
-    root: &Path,
     path: &Path,
+    resolved: &WorktreePath,
     expected: Oid,
     request: &FileContextRequest,
 ) -> Result<FileContextResponse, GitError> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    };
-    let metadata = fs::symlink_metadata(&absolute).map_err(|source| io_or_stale(path, source))?;
+    let metadata =
+        fs::symlink_metadata(&resolved.absolute).map_err(|source| io_or_stale(path, source))?;
 
     if metadata.file_type().is_symlink() {
-        let target = fs::read_link(&absolute).map_err(|source| io_or_stale(path, source))?;
+        let target =
+            fs::read_link(&resolved.absolute).map_err(|source| io_or_stale(path, source))?;
         let content = os_str_bytes(target.as_os_str()).to_vec();
         refuse_stale_bytes(repository, path, expected, &content)?;
         let byte_size = content.len() as u64;
@@ -352,12 +447,23 @@ fn load_worktree(
         return project_lines(request, expected, &content);
     }
 
+    if !metadata.file_type().is_file() {
+        return Err(stale(path));
+    }
+
+    if let Some(filtered) = clean_filtered_file(repository, path, resolved)?
+        && let Some(response) =
+            load_filtered_worktree(repository, path, expected, request, filtered)?
+    {
+        return Ok(response);
+    }
+
     // An oversized working-tree source still has to prove it is the content
     // the diff recorded. Hashing streams through libgit2 and does not place the
     // file in the response model.
     if metadata.len() > request.max_file_size {
-        refuse_stale_file(repository, path, &absolute, expected)?;
-        let current_size = fs::symlink_metadata(&absolute)
+        refuse_stale_file(repository, path, &resolved.absolute, expected)?;
+        let current_size = fs::symlink_metadata(&resolved.absolute)
             .map_err(|source| io_or_stale(path, source))?
             .len();
         if current_size > request.max_file_size {
@@ -372,12 +478,12 @@ fn load_worktree(
         }
     }
 
-    let content = read_bounded(path, &absolute, request.max_file_size)?;
+    let content = read_bounded(path, &resolved.absolute, request.max_file_size)?;
     if content.len() as u64 > request.max_file_size {
         // The file grew after the metadata check. Revalidate the complete file
         // before returning a size summary so changed content is still stale.
-        refuse_stale_file(repository, path, &absolute, expected)?;
-        let byte_size = fs::symlink_metadata(&absolute)
+        refuse_stale_file(repository, path, &resolved.absolute, expected)?;
+        let byte_size = fs::symlink_metadata(&resolved.absolute)
             .map_err(|source| io_or_stale(path, source))?
             .len()
             .max(content.len() as u64);
@@ -392,6 +498,300 @@ fn load_worktree(
     }
     refuse_stale_bytes(repository, path, expected, &content)?;
     project_lines(request, expected, &content)
+}
+
+fn load_filtered_worktree(
+    repository: &Repository,
+    path: &Path,
+    expected: Oid,
+    request: &FileContextRequest,
+    filtered: NamedTempFile,
+) -> Result<Option<FileContextResponse>, GitError> {
+    let byte_size = filtered
+        .as_file()
+        .metadata()
+        .map_err(|source| GitError::DiffContent {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    let actual = Oid::hash_file_ext(
+        ObjectType::Blob,
+        filtered.path(),
+        repository.object_format(),
+    )
+    .map_err(|source| inspection(path, source))?;
+    if actual != expected {
+        // A diff that omitted content before asking libgit2 for a patch records
+        // the raw worktree hash because no filtered ID was materialized. Fall
+        // back to that representation; its own validation still rejects a
+        // genuinely changed file.
+        return Ok(None);
+    }
+
+    if byte_size > request.max_file_size {
+        return Ok(Some(omitted(
+            request,
+            expected,
+            byte_size,
+            FileContextOmission::FileTooLarge {
+                limit: request.max_file_size,
+            },
+        )));
+    }
+    if matches!(request.range, FileContextRange::FullFile) && byte_size > request.max_total_bytes {
+        return Ok(Some(omitted(
+            request,
+            expected,
+            byte_size,
+            FileContextOmission::ContentBudgetExhausted {
+                limit: request.max_total_bytes,
+            },
+        )));
+    }
+    let content = read_bounded(path, filtered.path(), request.max_file_size)?;
+    project_lines(request, expected, &content).map(Some)
+}
+
+/// Applies the same built-in clean filters libgit2 used to form diff lines.
+///
+/// Most paths have no filters and stay on the direct, allocation-bounded read
+/// path. Filtered output is streamed to an automatically removed temporary
+/// file so validation remains bounded in memory even when the request only
+/// needs an over-limit summary.
+fn clean_filtered_file(
+    repository: &Repository,
+    path: &Path,
+    resolved: &WorktreePath,
+) -> Result<Option<NamedTempFile>, GitError> {
+    let path_bytes = repository_path_bytes(&resolved.repository_relative).ok_or_else(|| {
+        GitError::DiffContent {
+            path: path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "repository path cannot be represented for Git filtering",
+            ),
+        }
+    })?;
+    let filter_path = CString::new(path_bytes).map_err(|source| GitError::DiffContent {
+        path: path.to_path_buf(),
+        source: io::Error::new(io::ErrorKind::InvalidInput, source),
+    })?;
+    let Some(filters) = FilterList::load(repository, path, &filter_path)? else {
+        return Ok(None);
+    };
+    let absolute_path =
+        CString::new(filesystem_path_bytes(&resolved.absolute).ok_or_else(|| {
+            GitError::DiffContent {
+                path: path.to_path_buf(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "worktree path cannot be represented for Git filtering",
+                ),
+            }
+        })?)
+        .map_err(|source| GitError::DiffContent {
+            path: path.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidInput, source),
+        })?;
+    let mut filtered = NamedTempFile::new().map_err(|source| GitError::DiffContent {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let (code, write_error) = {
+        let mut sink = FilterSink::new(filtered.as_file_mut());
+        // SAFETY: `filters` and `repository` own valid libgit2 handles, the
+        // CString and sink outlive this synchronous call, and `FilterSink`
+        // begins with the exact `git_writestream` layout libgit2 expects.
+        let code = unsafe {
+            git_filter_list_stream_file(
+                filters.0,
+                repository.raw(),
+                absolute_path.as_ptr(),
+                &mut sink.stream,
+            )
+        };
+        (code, sink.error.take())
+    };
+    if let Some(source) = write_error {
+        return Err(GitError::DiffContent {
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+    if code < 0 {
+        return Err(filter_error(path, git2::Error::last_error(code)));
+    }
+    filtered
+        .as_file_mut()
+        .flush()
+        .map_err(|source| GitError::DiffContent {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(Some(filtered))
+}
+
+#[cfg(unix)]
+fn repository_path_bytes(path: &Path) -> Option<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    Some(path.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(unix)]
+fn filesystem_path_bytes(path: &Path) -> Option<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    Some(path.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(not(unix))]
+fn repository_path_bytes(path: &Path) -> Option<Vec<u8>> {
+    Some(path.to_str()?.replace('\\', "/").into_bytes())
+}
+
+#[cfg(not(unix))]
+fn filesystem_path_bytes(path: &Path) -> Option<Vec<u8>> {
+    Some(path.to_str()?.as_bytes().to_vec())
+}
+
+#[repr(C)]
+struct RawFilterList {
+    _private: [u8; 0],
+}
+
+struct FilterList(*mut RawFilterList);
+
+impl FilterList {
+    fn load(
+        repository: &Repository,
+        path: &Path,
+        path_string: &CString,
+    ) -> Result<Option<Self>, GitError> {
+        let mut filters = ptr::null_mut();
+        // SAFETY: the repository and CString are valid for the duration of the
+        // call, and libgit2 initializes `filters` on success.
+        let code = unsafe {
+            git_filter_list_load(
+                &mut filters,
+                repository.raw(),
+                ptr::null_mut(),
+                path_string.as_ptr(),
+                GIT_FILTER_TO_ODB,
+                GIT_FILTER_ALLOW_UNSAFE,
+            )
+        };
+        if code < 0 {
+            return Err(filter_error(path, git2::Error::last_error(code)));
+        }
+        Ok((!filters.is_null()).then_some(Self(filters)))
+    }
+}
+
+impl Drop for FilterList {
+    fn drop(&mut self) {
+        // SAFETY: `FilterList::load` is the sole constructor and transfers one
+        // owned libgit2 filter-list handle into this wrapper.
+        unsafe { git_filter_list_free(self.0) };
+    }
+}
+
+#[repr(C)]
+struct FilterSink {
+    stream: raw::git_writestream,
+    file: *mut File,
+    error: Option<io::Error>,
+}
+
+impl FilterSink {
+    fn new(file: &mut File) -> Self {
+        Self {
+            stream: raw::git_writestream {
+                write: Some(filter_sink_write),
+                close: Some(filter_sink_close),
+                free: Some(filter_sink_free),
+            },
+            file,
+            error: None,
+        }
+    }
+}
+
+extern "C" fn filter_sink_write(
+    stream: *mut raw::git_writestream,
+    buffer: *const c_char,
+    length: usize,
+) -> c_int {
+    // SAFETY: libgit2 receives a pointer to the first field of a live
+    // `FilterSink`, and calls this callback only before the streaming function
+    // returns. A nonzero length always carries a valid input buffer.
+    let sink = unsafe { &mut *stream.cast::<FilterSink>() };
+    if sink.error.is_some() {
+        return -1;
+    }
+    let bytes = if length == 0 {
+        &[]
+    } else {
+        // SAFETY: guaranteed by the libgit2 writestream callback contract.
+        unsafe { slice::from_raw_parts(buffer.cast::<u8>(), length) }
+    };
+    // SAFETY: `FilterSink::new` stores a live, exclusively borrowed file for
+    // the complete synchronous filtering call.
+    match unsafe { &mut *sink.file }.write_all(bytes) {
+        Ok(()) => 0,
+        Err(error) => {
+            sink.error = Some(error);
+            -1
+        }
+    }
+}
+
+extern "C" fn filter_sink_close(stream: *mut raw::git_writestream) -> c_int {
+    // SAFETY: the same lifetime and layout guarantees as `filter_sink_write`
+    // apply to the close callback.
+    let sink = unsafe { &mut *stream.cast::<FilterSink>() };
+    if sink.error.is_some() {
+        return -1;
+    }
+    // SAFETY: the file pointer remains exclusively valid until filtering
+    // returns.
+    match unsafe { &mut *sink.file }.flush() {
+        Ok(()) => 0,
+        Err(error) => {
+            sink.error = Some(error);
+            -1
+        }
+    }
+}
+
+extern "C" fn filter_sink_free(_stream: *mut raw::git_writestream) {}
+
+fn filter_error(path: &Path, source: git2::Error) -> GitError {
+    if source.code() == ErrorCode::NotFound {
+        stale(path)
+    } else {
+        inspection(path, source)
+    }
+}
+
+const GIT_FILTER_TO_ODB: c_int = 1;
+const GIT_FILTER_ALLOW_UNSAFE: u32 = 1 << 0;
+
+unsafe extern "C" {
+    fn git_filter_list_load(
+        filters: *mut *mut RawFilterList,
+        repository: *mut raw::git_repository,
+        blob: *mut raw::git_blob,
+        path: *const c_char,
+        mode: c_int,
+        flags: u32,
+    ) -> c_int;
+    fn git_filter_list_stream_file(
+        filters: *mut RawFilterList,
+        repository: *mut raw::git_repository,
+        path: *const c_char,
+        target: *mut raw::git_writestream,
+    ) -> c_int;
+    fn git_filter_list_free(filters: *mut RawFilterList);
 }
 
 fn read_bounded(path: &Path, absolute: &Path, limit: u64) -> Result<Vec<u8>, GitError> {
@@ -784,6 +1184,240 @@ mod tests {
         assert!(matches!(
             service.file_context(&request),
             Err(GitError::StaleHunkSelection { path }) if path == Path::new("tracked.txt")
+        ));
+    }
+
+    #[test]
+    fn absent_addition_and_deletion_sides_return_empty_files() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("absent-context-sides");
+        let repository = initialize_repository(&root);
+        fs::write(root.join("added.txt"), b"added\n").unwrap();
+        stage(&repository, Path::new("added.txt"));
+        fs::remove_file(root.join("tracked.txt")).unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+        let staged = service
+            .diff(DiffTarget::Staged, &DiffOptions::default())
+            .unwrap();
+        let unstaged = service
+            .diff(DiffTarget::Unstaged, &DiffOptions::default())
+            .unwrap();
+        let addition = staged
+            .iter()
+            .find(|file| file.new_path.as_deref() == Some(Path::new("added.txt")))
+            .unwrap();
+        let deletion = unstaged
+            .iter()
+            .find(|file| file.old_path.as_deref() == Some(Path::new("tracked.txt")))
+            .unwrap();
+
+        for request in [
+            FileContextRequest::full_file(addition, FileSide::Old),
+            FileContextRequest::full_file(deletion, FileSide::New),
+        ] {
+            let response = service.file_context(&request).unwrap();
+            assert_eq!(response.byte_size, 0);
+            assert_eq!(response.total_lines, Some(0));
+            assert_eq!(response.start_line, None);
+            assert!(response.lines.is_empty());
+            assert_eq!(response.omission, None);
+            assert!(response.blob_id.chars().all(|byte| byte == '0'));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_symlink_context_reads_the_link_instead_of_following_it() {
+        use std::{os::unix::ffi::OsStrExt, os::unix::fs::symlink};
+
+        let fixture = Fixture::new();
+        let root = fixture.directory("symlink-context");
+        let outside = fixture.directory("symlink-targets");
+        let repository = initialize_repository(&root);
+        let original_target = outside.join("original");
+        let changed_target = outside.join("changed");
+        fs::write(&original_target, b"outside original\n").unwrap();
+        fs::write(&changed_target, b"outside changed\n").unwrap();
+        symlink(&original_target, root.join("link")).unwrap();
+        commit_all(&repository, "add external symlink");
+        fs::remove_file(root.join("link")).unwrap();
+        symlink(&changed_target, root.join("link")).unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+        let files = service
+            .diff(DiffTarget::Unstaged, &DiffOptions::default())
+            .unwrap();
+        let file = files
+            .iter()
+            .find(|file| file.new_path.as_deref() == Some(Path::new("link")))
+            .unwrap();
+
+        let response = service
+            .file_context(&FileContextRequest::full_file(file, FileSide::New))
+            .unwrap();
+
+        assert_eq!(
+            joined(&response.lines),
+            changed_target.as_os_str().as_bytes()
+        );
+
+        let outside_request = FileContextRequest::worktree(
+            &changed_target,
+            git2::Oid::hash_object_ext(
+                git2::ObjectType::Blob,
+                b"outside changed\n",
+                repository.object_format(),
+            )
+            .unwrap()
+            .to_string(),
+            FileSide::New,
+            super::FileContextRange::FullFile,
+        );
+        assert!(matches!(
+            service.file_context(&outside_request),
+            Err(GitError::PathOutsideRepository { path, .. }) if path == changed_target
+        ));
+    }
+
+    #[test]
+    fn worktree_context_applies_the_same_clean_filter_as_the_diff() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("autocrlf-context");
+        let repository = initialize_repository(&root);
+        repository
+            .config()
+            .unwrap()
+            .set_bool("core.autocrlf", true)
+            .unwrap();
+        fs::write(root.join(".gitignore"), b"crlf.txt\n").unwrap();
+        fs::write(root.join("crlf.txt"), b"base\r\n").unwrap();
+        stage(&repository, Path::new("crlf.txt"));
+        commit_all(&repository, "add crlf fixture");
+        repository
+            .config()
+            .unwrap()
+            .set_bool("core.safecrlf", true)
+            .unwrap();
+        let worktree = b"changed\r\nmixed\n";
+        fs::write(root.join("crlf.txt"), worktree).unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+        let files = service
+            .diff(DiffTarget::Unstaged, &DiffOptions::default())
+            .unwrap();
+        let file = files
+            .iter()
+            .find(|file| file.new_path.as_deref() == Some(Path::new("crlf.txt")))
+            .unwrap();
+        assert_eq!(file.new_size, worktree.len() as u64);
+        let diff_new = file
+            .hunks
+            .iter()
+            .flat_map(|hunk| &hunk.lines)
+            .filter(|line| line.kind != DiffLineKind::Deletion)
+            .flat_map(|line| line.content.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(diff_new, b"changed\nmixed\n");
+        assert_eq!(
+            file.new_blob_id,
+            git2::Oid::hash_object_ext(
+                git2::ObjectType::Blob,
+                &diff_new,
+                repository.object_format(),
+            )
+            .unwrap()
+            .to_string()
+        );
+
+        let request = FileContextRequest::full_file(file, FileSide::New);
+        let response = service.file_context(&request).unwrap();
+
+        assert_eq!(joined(&response.lines), diff_new);
+        assert_eq!(response.blob_id, file.new_blob_id);
+
+        let limited = service
+            .file_context(&request.clone().with_max_file_size(1))
+            .unwrap();
+        assert_eq!(
+            limited.omission,
+            Some(FileContextOmission::FileTooLarge { limit: 1 })
+        );
+        assert_eq!(limited.byte_size, diff_new.len() as u64);
+
+        fs::write(root.join("crlf.txt"), b"changed again\r\n").unwrap();
+        assert!(matches!(
+            service.file_context(&request),
+            Err(GitError::StaleHunkSelection { path }) if path == Path::new("crlf.txt")
+        ));
+    }
+
+    #[test]
+    fn omitted_filtered_diff_retains_its_recorded_raw_worktree_identity() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("omitted-autocrlf-context");
+        let repository = initialize_repository(&root);
+        repository
+            .config()
+            .unwrap()
+            .set_bool("core.autocrlf", true)
+            .unwrap();
+        fs::write(root.join("crlf.txt"), b"base\r\n").unwrap();
+        commit_all(&repository, "add omitted crlf fixture");
+        let content = b"changed\r\n";
+        fs::write(root.join("crlf.txt"), content).unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+        let files = service
+            .diff(
+                DiffTarget::Unstaged,
+                &DiffOptions::default().with_max_file_size(1),
+            )
+            .unwrap();
+        let file = files
+            .iter()
+            .find(|file| file.new_path.as_deref() == Some(Path::new("crlf.txt")))
+            .unwrap();
+        let raw_id =
+            git2::Oid::hash_object_ext(git2::ObjectType::Blob, content, repository.object_format())
+                .unwrap()
+                .to_string();
+        assert_eq!(file.new_blob_id, raw_id);
+
+        let response = service
+            .file_context(&FileContextRequest::full_file(file, FileSide::New))
+            .unwrap();
+        assert_eq!(joined(&response.lines), content);
+
+        let limited = service
+            .file_context(&FileContextRequest::full_file(file, FileSide::New).with_max_file_size(1))
+            .unwrap();
+        assert_eq!(
+            limited.omission,
+            Some(FileContextOmission::FileTooLarge { limit: 1 })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_file_worktree_sources_are_refused_without_reading_them() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        let fixture = Fixture::new();
+        let root = fixture.directory("special-file-context");
+        initialize_repository(&root);
+        let pipe = root.join("pipe");
+        let pipe_string = CString::new(pipe.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the path is a valid, NUL-terminated temporary path and the
+        // fixture owns its parent directory.
+        assert_eq!(unsafe { libc::mkfifo(pipe_string.as_ptr(), 0o600) }, 0);
+        let service = GitService::new(&root, &fixture.data_dir);
+        let request = FileContextRequest::worktree(
+            Path::new("pipe"),
+            git2::Oid::ZERO_SHA1.to_string(),
+            FileSide::New,
+            super::FileContextRange::FullFile,
+        );
+
+        assert!(matches!(
+            service.file_context(&request),
+            Err(GitError::StaleHunkSelection { path }) if path == Path::new("pipe")
         ));
     }
 

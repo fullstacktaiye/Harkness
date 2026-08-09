@@ -15,6 +15,7 @@ dirs = "6.0"
 git2 = { version = "0.21", default-features = false }
 harkness-core = { path = "crates/harkness-core" }
 libc = "0.2"
+libgit2-sys = { version = "0.18", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3.27"
