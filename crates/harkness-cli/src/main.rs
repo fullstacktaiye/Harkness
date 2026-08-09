@@ -10,20 +10,25 @@ use std::{
     time::Duration,
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD as URL_BASE64},
+};
 use clap::{
     ArgGroup, Args, Parser, Subcommand,
     error::{Error as ClapError, ErrorKind},
 };
 use harkness_core::{
-    Branch, BranchCheckout, BranchKind, BranchListOptions, Cancellation, CommitOptions,
-    CommitOutcome, CreateBranchOptions, DEFAULT_DIFF_CONTEXT_LINES, DEFAULT_MAX_DIFF_FILE_SIZE,
-    DEFAULT_MAX_DIFF_FILES, DEFAULT_MAX_DIFF_TOTAL_BYTES, DetailedStatus, DiffLine, DiffLineKind,
-    DiffOmission, DiffOptions, DiffTarget, FetchOptions, FetchOutcome, FileChange, FileDiff,
-    GitError, GitStatus, HeadState, Hunk, HunkSelection, PendingOperation, Project, ProjectError,
-    ProjectSelector, ProjectService, ProjectSource, PullOptions, PullOutcome, PullStrategy,
-    PushOptions, PushOutcome, RefUpdate, StageOutcome, StagePathResult, StatusRefreshOutcome,
-    UpstreamStatus, Worktree, WorktreeBase,
+    Branch, BranchCheckout, BranchKind, BranchListOptions, Cancellation, CommitInfo, CommitOptions,
+    CommitOutcome, CommitSignature, CreateBranchOptions, DEFAULT_DIFF_CONTEXT_LINES,
+    DEFAULT_MAX_DIFF_FILE_SIZE, DEFAULT_MAX_DIFF_FILES, DEFAULT_MAX_DIFF_TOTAL_BYTES,
+    DetailedStatus, DiffLine, DiffLineKind, DiffOmission, DiffOptions, DiffTarget, FetchOptions,
+    FetchOutcome, FileChange, FileContextOmission, FileContextRange, FileContextRequest,
+    FileContextResponse, FileDiff, FileSide, GitError, GitService, GitStatus, HeadState, Hunk,
+    HunkSelection, IntraLineDegradation, LogCursor, LogOptions, LogRange, PendingOperation,
+    Project, ProjectError, ProjectSelector, ProjectService, ProjectSource, PullOptions,
+    PullOutcome, PullStrategy, PushOptions, PushOutcome, RefUpdate, StageOutcome, StagePathResult,
+    StatusRefreshOutcome, UpstreamStatus, Worktree, WorktreeBase,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -191,6 +196,8 @@ enum GitCommand {
         #[arg(long)]
         paths: bool,
     },
+    /// Walk bounded commit history using Git-style revision ranges.
+    Log(LogArguments),
     /// Inspect structured, byte-preserving changes; raw patch text is never emitted.
     Diff(DiffArguments),
     /// Update local remote-tracking refs.
@@ -339,11 +346,63 @@ struct UnstageArguments {
 /// the file is a request to read the file, not to widen a diff.
 const MAX_DIFF_CONTEXT_LINES: u32 = 100;
 
+/// The CLI's finite upper bound for one history page.
+const DEFAULT_LOG_LIMIT: usize = 50;
+const MAX_LOG_LIMIT: usize = 1_000;
+
+#[derive(Debug, Args)]
+#[command(
+    after_help = "Range grammar:\n  REVISION        commits reachable from one revision (default: HEAD)\n  OLD..NEW        commits reachable from NEW but not OLD\n  BASE...BRANCH   commits on BRANCH after its merge-base with BASE\n\nExamples:\n  harkness --json git log HEAD --limit 25\n  harkness --json git log main..feature\n  harkness --json git log main...feature --cursor <token>"
+)]
+struct LogArguments {
+    #[command(flatten)]
+    selection: ProjectSelection,
+    /// Revision or range to walk; see RANGE GRAMMAR below.
+    #[arg(value_name = "RANGE", default_value = "HEAD")]
+    range: String,
+    /// Maximum number of commits in this page.
+    #[arg(
+        long,
+        value_name = "COUNT",
+        default_value_t = DEFAULT_LOG_LIMIT,
+        value_parser = parse_log_limit,
+    )]
+    limit: usize,
+    /// Opaque continuation token returned as `next_cursor` by an earlier page.
+    #[arg(long, value_name = "TOKEN")]
+    cursor: Option<String>,
+}
+
+impl LogArguments {
+    fn options(&self) -> Result<LogOptions, CliError> {
+        let range = parse_log_range(&self.range)?;
+        let cursor = self.cursor.as_deref().map(decode_log_cursor).transpose()?;
+        let options = match range {
+            LogRange::Revision { revision } => LogOptions::new(revision, self.limit),
+            LogRange::Excluding {
+                reachable_from,
+                not_from,
+            } => LogOptions::excluding(reachable_from, not_from, self.limit),
+            LogRange::BranchAgainstBase {
+                branch,
+                base_branch,
+            } => LogOptions::branch_against_base(branch, base_branch, self.limit),
+            _ => {
+                return Err(CliError::Usage("unsupported log range kind".to_owned()));
+            }
+        };
+        Ok(match cursor {
+            Some(cursor) => options.with_cursor(cursor),
+            None => options,
+        })
+    }
+}
+
 #[derive(Debug, Args)]
 #[command(group(
     ArgGroup::new("diff_target")
         .multiple(false)
-        .args(["staged", "unstaged"])
+        .args(["staged", "unstaged", "commit", "revisions", "worktree", "branch"])
 ))]
 struct DiffArguments {
     #[command(flatten)]
@@ -354,6 +413,21 @@ struct DiffArguments {
     /// Return only changes between the index and working tree.
     #[arg(long)]
     unstaged: bool,
+    /// Compare a commit with its first parent, or with --parent.
+    #[arg(long, value_name = "REVISION")]
+    commit: Option<String>,
+    /// Parent revision to compare with --commit; it must be a recorded parent.
+    #[arg(long, value_name = "REVISION", requires = "commit")]
+    parent: Option<String>,
+    /// Compare two revisions, written OLD..NEW.
+    #[arg(long, value_name = "OLD..NEW")]
+    revisions: Option<String>,
+    /// Compare this revision with the index and working tree combined.
+    #[arg(long, value_name = "REVISION")]
+    worktree: Option<String>,
+    /// Compare a branch with its merge-base, written BASE...BRANCH.
+    #[arg(long, value_name = "BASE...BRANCH")]
+    branch: Option<String>,
     /// Number of unchanged lines surrounding each hunk.
     #[arg(
         long,
@@ -362,6 +436,37 @@ struct DiffArguments {
         value_parser = clap::value_parser!(u32).range(0..=i64::from(MAX_DIFF_CONTEXT_LINES)),
     )]
     context_lines: u32,
+    /// Retrieve each hunk with this many additional lines before and after,
+    /// addressed by the diff's recorded blob IDs rather than by recomputing a
+    /// wider diff.
+    #[arg(long, value_name = "LINES", conflicts_with = "full_file_context")]
+    expand_context: Option<u32>,
+    /// Retrieve complete old and new file content alongside each diff record.
+    #[arg(long, visible_alias = "full-file", conflicts_with = "expand_context")]
+    full_file_context: bool,
+    /// Expand records from a prior `git diff` JSON document instead of
+    /// recomputing the diff. Accepts a file path or "-" for standard input.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = [
+            "staged",
+            "unstaged",
+            "commit",
+            "parent",
+            "revisions",
+            "worktree",
+            "branch",
+            "intra_line",
+            "context_lines",
+            "max_files",
+            "paths"
+        ]
+    )]
+    context_from: Option<PathBuf>,
+    /// Add deterministic paired-line byte ranges and named degradations.
+    #[arg(long, visible_alias = "intra-line-ranges")]
+    intra_line: bool,
     /// Largest old or new file whose content is included.
     #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_MAX_DIFF_FILE_SIZE)]
     max_file_size: u64,
@@ -383,13 +488,136 @@ impl DiffArguments {
     ///
     /// Both sides are read from one snapshot, so the absence of a narrowing
     /// flag is expressed as two targets rather than as two separate diffs.
-    fn targets(&self) -> Vec<DiffTarget> {
-        match (self.staged, self.unstaged) {
+    fn targets(&self) -> Result<Vec<DiffTarget>, CliError> {
+        if let Some(revision) = &self.commit {
+            return Ok(vec![DiffTarget::Commit {
+                revision: revision.clone(),
+                parent: self.parent.clone(),
+            }]);
+        }
+        if let Some(range) = &self.revisions {
+            let (old_revision, new_revision) = parse_revision_pair(range)?;
+            return Ok(vec![DiffTarget::Revisions {
+                old_revision,
+                new_revision,
+            }]);
+        }
+        if let Some(revision) = &self.worktree {
+            return Ok(vec![DiffTarget::RevisionAgainstWorktree {
+                revision: revision.clone(),
+            }]);
+        }
+        if let Some(range) = &self.branch {
+            let (base_branch, branch) = parse_branch_range(range)?;
+            return Ok(vec![DiffTarget::BranchAgainstBase {
+                branch,
+                base_branch,
+            }]);
+        }
+        Ok(match (self.staged, self.unstaged) {
             (true, false) => vec![DiffTarget::Staged],
             (false, true) => vec![DiffTarget::Unstaged],
             _ => vec![DiffTarget::Staged, DiffTarget::Unstaged],
+        })
+    }
+
+    const fn context_mode(&self) -> DiffContextMode {
+        match (self.expand_context, self.full_file_context) {
+            (Some(lines), false) => DiffContextMode::Expanded(lines),
+            (None, true) => DiffContextMode::FullFile,
+            _ => DiffContextMode::None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiffContextMode {
+    None,
+    Expanded(u32),
+    FullFile,
+}
+
+/// The high mode bits distinguish blob-backed entries from trees and gitlinks.
+/// Missing sides use mode zero and still have a valid empty context response.
+const GIT_MODE_TYPE_MASK: u32 = 0o170_000;
+const GIT_MODE_REGULAR_FILE: u32 = 0o100_000;
+const GIT_MODE_SYMBOLIC_LINK: u32 = 0o120_000;
+
+const fn mode_has_file_context(mode: u32) -> bool {
+    mode == 0
+        || matches!(
+            mode & GIT_MODE_TYPE_MASK,
+            GIT_MODE_REGULAR_FILE | GIT_MODE_SYMBOLIC_LINK
+        )
+}
+
+fn parse_log_range(range: &str) -> Result<LogRange, CliError> {
+    if range.contains("...") {
+        let (base_branch, branch) = parse_branch_range(range)?;
+        return Ok(LogRange::BranchAgainstBase {
+            branch,
+            base_branch,
+        });
+    }
+    if range.contains("..") {
+        let (not_from, reachable_from) = parse_revision_pair(range)?;
+        return Ok(LogRange::Excluding {
+            reachable_from,
+            not_from,
+        });
+    }
+    if range.is_empty() {
+        return Err(CliError::Usage(
+            "log range must be REVISION, OLD..NEW, or BASE...BRANCH".to_owned(),
+        ));
+    }
+    Ok(LogRange::Revision {
+        revision: range.to_owned(),
+    })
+}
+
+fn parse_log_limit(value: &str) -> Result<usize, String> {
+    let limit = value
+        .parse::<usize>()
+        .map_err(|_| format!("'{value}' is not a positive history-page size"))?;
+    if !(1..=MAX_LOG_LIMIT).contains(&limit) {
+        return Err(format!(
+            "history-page size must be between 1 and {MAX_LOG_LIMIT}"
+        ));
+    }
+    Ok(limit)
+}
+
+fn parse_revision_pair(range: &str) -> Result<(String, String), CliError> {
+    parse_range_pair(range, "..", "OLD..NEW")
+}
+
+fn parse_branch_range(range: &str) -> Result<(String, String), CliError> {
+    parse_range_pair(range, "...", "BASE...BRANCH")
+}
+
+fn parse_range_pair(
+    range: &str,
+    separator: &str,
+    expected: &'static str,
+) -> Result<(String, String), CliError> {
+    let Some((left, right)) = range.split_once(separator) else {
+        return Err(CliError::Usage(format!(
+            "range '{range}' must use the {expected} form"
+        )));
+    };
+    if left.is_empty()
+        || right.is_empty()
+        || left.ends_with('.')
+        || right.starts_with('.')
+        || left.contains("..")
+        || right.contains("..")
+    {
+        return Err(CliError::Usage(format!(
+            "range '{range}' must contain exactly two non-empty revisions in the {expected} form"
+        )));
+    }
+    Ok((left.to_owned(), right.to_owned()))
 }
 
 #[derive(Debug, Args)]
@@ -1122,13 +1350,70 @@ fn run_git(
                 || Ok(json!({ "status": detailed_status_value(&status) })),
             )
         }
+        GitCommand::Log(arguments) => {
+            let options = arguments.options()?;
+            let git = selected_git(&service, arguments.selection)?;
+            let page = git.log(&options, cancellation)?;
+            command_result(
+                json_output,
+                || log_page_line(&page.commits, page.next_cursor.is_some()),
+                || {
+                    Ok(json!({
+                        "kind": "git_log",
+                        "range": log_range_value(&options.range),
+                        "limit": options.limit,
+                        "commits": page.commits.iter().map(commit_value).collect::<Vec<_>>(),
+                        "next_cursor": page
+                            .next_cursor
+                            .as_ref()
+                            .map(encode_log_cursor)
+                            .transpose()?,
+                    }))
+                },
+            )
+        }
         GitCommand::Diff(arguments) => {
-            let targets = arguments.targets();
+            let context_mode = arguments.context_mode();
+            let max_file_size = arguments.max_file_size;
+            let max_total_bytes = arguments.max_total_bytes;
+            if let Some(source) = arguments.context_from.as_deref() {
+                if context_mode == DiffContextMode::None {
+                    return Err(CliError::Usage(
+                        "--context-from requires --expand-context or --full-file-context"
+                            .to_owned(),
+                    ));
+                }
+                let document = read_selection_document(source)?;
+                let source_files = parse_context_files(&document)?;
+                let git = selected_git(&service, arguments.selection)?;
+                let projected = context_values_from_document(
+                    &git,
+                    &source_files,
+                    context_mode,
+                    max_file_size,
+                    max_total_bytes,
+                    cancellation,
+                )?;
+                return command_result(
+                    json_output,
+                    || {
+                        format!(
+                            "expanded context for {} file{}",
+                            projected.len(),
+                            if projected.len() == 1 { "" } else { "s" }
+                        )
+                    },
+                    || Ok(json!({ "kind": "git_diff_context", "files": projected })),
+                );
+            }
+            let targets = arguments.targets()?;
+            let include_intra_line = arguments.intra_line;
             let git = selected_git(&service, arguments.selection)?;
             let options = DiffOptions::default()
                 .with_context_lines(arguments.context_lines)
-                .with_max_file_size(arguments.max_file_size)
-                .with_max_total_bytes(arguments.max_total_bytes)
+                .with_intra_line_ranges(include_intra_line)
+                .with_max_file_size(max_file_size)
+                .with_max_total_bytes(max_total_bytes)
                 .with_max_files(arguments.max_files)
                 .with_paths(arguments.paths);
             if cancellation.is_cancelled() {
@@ -1138,10 +1423,25 @@ fn run_git(
             if cancellation.is_cancelled() {
                 return Err(GitError::Cancelled.into());
             }
+            let projected = diff_values(
+                &git,
+                &files,
+                context_mode,
+                include_intra_line,
+                max_file_size,
+                max_total_bytes,
+                cancellation,
+            )?;
             command_result(
                 json_output,
-                || diff_summary_line(&files),
-                || Ok(json!({ "files": files.iter().map(file_diff_value).collect::<Vec<_>>() })),
+                || diff_summary_line(&files, &targets),
+                || {
+                    Ok(json!({
+                        "kind": "git_diff",
+                        "targets": targets.iter().map(diff_target_value).collect::<Vec<_>>(),
+                        "files": projected,
+                    }))
+                },
             )
         }
         GitCommand::Fetch {
@@ -1826,7 +2126,349 @@ fn detailed_status_value(status: &DetailedStatus) -> Value {
     })
 }
 
-fn file_diff_value(file: &FileDiff) -> Value {
+fn diff_values(
+    git: &GitService,
+    files: &[FileDiff],
+    context_mode: DiffContextMode,
+    include_intra_line: bool,
+    max_file_size: u64,
+    max_total_bytes: u64,
+    cancellation: &Cancellation,
+) -> Result<Vec<Value>, CliError> {
+    let mut context_budget = max_total_bytes;
+    files
+        .iter()
+        .map(|file| {
+            let mut value = file_diff_value(file, include_intra_line);
+            if let Some(details) = diff_target_details(&file.target) {
+                value
+                    .as_object_mut()
+                    .expect("a file diff projection is an object")
+                    .insert("target_details".to_owned(), details);
+            }
+            match context_mode {
+                DiffContextMode::None => {}
+                DiffContextMode::FullFile => {
+                    let context = if file.omission.is_some() {
+                        Value::Null
+                    } else {
+                        json!({
+                            "kind": "full_file_context",
+                            "old": load_diff_context_value(
+                                git,
+                                file,
+                                FileContextRequest::full_file(file, FileSide::Old),
+                                max_file_size,
+                                &mut context_budget,
+                                cancellation,
+                            )?,
+                            "new": load_diff_context_value(
+                                git,
+                                file,
+                                FileContextRequest::full_file(file, FileSide::New),
+                                max_file_size,
+                                &mut context_budget,
+                                cancellation,
+                            )?,
+                        })
+                    };
+                    value
+                        .as_object_mut()
+                        .expect("a file diff projection is an object")
+                        .insert("context".to_owned(), context);
+                }
+                DiffContextMode::Expanded(lines) => {
+                    let projected_hunks = value["hunks"]
+                        .as_array_mut()
+                        .expect("a file diff hunk projection is an array");
+                    for (hunk, projected) in file.hunks.iter().zip(projected_hunks) {
+                        let context = json!({
+                            "kind": "hunk_context",
+                            "lines_before": lines,
+                            "lines_after": lines,
+                            "old": load_diff_context_value(
+                                git,
+                                file,
+                                FileContextRequest::for_hunk(
+                                    file,
+                                    hunk,
+                                    FileSide::Old,
+                                    lines,
+                                    lines,
+                                ),
+                                max_file_size,
+                                &mut context_budget,
+                                cancellation,
+                            )?,
+                            "new": load_diff_context_value(
+                                git,
+                                file,
+                                FileContextRequest::for_hunk(
+                                    file,
+                                    hunk,
+                                    FileSide::New,
+                                    lines,
+                                    lines,
+                                ),
+                                max_file_size,
+                                &mut context_budget,
+                                cancellation,
+                            )?,
+                        });
+                        projected
+                            .as_object_mut()
+                            .expect("a hunk projection is an object")
+                            .insert("context".to_owned(), context);
+                    }
+                }
+            }
+            Ok(value)
+        })
+        .collect()
+}
+
+fn parse_context_files(document: &str) -> Result<Vec<Value>, CliError> {
+    let value: Value = serde_json::from_str(document)
+        .map_err(|error| CliError::Usage(format!("the context document is not JSON: {error}")))?;
+    let value = value
+        .get("data")
+        .filter(|data| data.get("files").is_some())
+        .unwrap_or(&value);
+    let files = value
+        .get("files")
+        .ok_or_else(|| CliError::Usage("the context document has no \"files\" array".to_owned()))?;
+    Ok(array(files, "files")?.clone())
+}
+
+fn context_values_from_document(
+    git: &GitService,
+    files: &[Value],
+    context_mode: DiffContextMode,
+    max_file_size: u64,
+    max_total_bytes: u64,
+    cancellation: &Cancellation,
+) -> Result<Vec<Value>, CliError> {
+    let mut context_budget = max_total_bytes;
+    files
+        .iter()
+        .enumerate()
+        .map(|(file_index, source_file)| {
+            let at = format!("files[{file_index}]");
+            let _ = context_target_uses_worktree(source_file, &at)?;
+            let mut projected = source_file.clone();
+            match context_mode {
+                DiffContextMode::None => unreachable!("context mode was validated by the caller"),
+                DiffContextMode::FullFile => {
+                    let unavailable = matches!(
+                        source_file
+                            .get("omission")
+                            .and_then(|omission| omission.get("kind"))
+                            .and_then(Value::as_str),
+                        Some("unmerged" | "unrepresentable")
+                    );
+                    let context = if unavailable {
+                        Value::Null
+                    } else {
+                        json!({
+                            "kind": "full_file_context",
+                            "old": load_record_context_value(
+                                git,
+                                source_file,
+                                FileSide::Old,
+                                FileContextRange::FullFile,
+                                &at,
+                                max_file_size,
+                                &mut context_budget,
+                                cancellation,
+                            )?,
+                            "new": load_record_context_value(
+                                git,
+                                source_file,
+                                FileSide::New,
+                                FileContextRange::FullFile,
+                                &at,
+                                max_file_size,
+                                &mut context_budget,
+                                cancellation,
+                            )?,
+                        })
+                    };
+                    projected
+                        .as_object_mut()
+                        .ok_or_else(|| CliError::Usage(format!("{at} is not an object")))?
+                        .insert("context".to_owned(), context);
+                }
+                DiffContextMode::Expanded(lines) => {
+                    let source_hunks = array(
+                        source_file
+                            .get("hunks")
+                            .ok_or_else(|| CliError::Usage(format!("{at} has no \"hunks\"")))?,
+                        &format!("{at}.hunks"),
+                    )?;
+                    let projected_hunks = projected
+                        .get_mut("hunks")
+                        .and_then(Value::as_array_mut)
+                        .ok_or_else(|| CliError::Usage(format!("{at}.hunks is not an array")))?;
+                    for (hunk_index, (source_hunk, projected_hunk)) in
+                        source_hunks.iter().zip(projected_hunks).enumerate()
+                    {
+                        let hunk_at = format!("{at}.hunks[{hunk_index}]");
+                        let old_range =
+                            context_range_from_hunk(source_hunk, FileSide::Old, lines, &hunk_at)?;
+                        let new_range =
+                            context_range_from_hunk(source_hunk, FileSide::New, lines, &hunk_at)?;
+                        let context = json!({
+                            "kind": "hunk_context",
+                            "lines_before": lines,
+                            "lines_after": lines,
+                            "old": load_record_context_value(
+                                git,
+                                source_file,
+                                FileSide::Old,
+                                old_range,
+                                &hunk_at,
+                                max_file_size,
+                                &mut context_budget,
+                                cancellation,
+                            )?,
+                            "new": load_record_context_value(
+                                git,
+                                source_file,
+                                FileSide::New,
+                                new_range,
+                                &hunk_at,
+                                max_file_size,
+                                &mut context_budget,
+                                cancellation,
+                            )?,
+                        });
+                        projected_hunk
+                            .as_object_mut()
+                            .ok_or_else(|| CliError::Usage(format!("{hunk_at} is not an object")))?
+                            .insert("context".to_owned(), context);
+                    }
+                }
+            }
+            Ok(projected)
+        })
+        .collect()
+}
+
+fn context_range_from_hunk(
+    hunk: &Value,
+    side: FileSide,
+    lines: u32,
+    at: &str,
+) -> Result<FileContextRange, CliError> {
+    let (start, count) = match side {
+        FileSide::Old => ("old_start", "old_lines"),
+        FileSide::New => ("new_start", "new_lines"),
+        _ => return Err(CliError::Usage("unsupported context side".to_owned())),
+    };
+    Ok(FileContextRange::Hunk {
+        start_line: record_u32(hunk, start, at)?,
+        line_count: record_u32(hunk, count, at)?,
+        lines_before: lines,
+        lines_after: lines,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_record_context_value(
+    git: &GitService,
+    file: &Value,
+    side: FileSide,
+    range: FileContextRange,
+    at: &str,
+    max_file_size: u64,
+    remaining_bytes: &mut u64,
+    cancellation: &Cancellation,
+) -> Result<Value, CliError> {
+    let target_uses_worktree = context_target_uses_worktree(file, at)?;
+    let (path_field, blob_field, mode_field) = match side {
+        FileSide::Old => ("old_path", "old_blob_id", "old_mode"),
+        FileSide::New => ("new_path", "new_blob_id", "new_mode"),
+        _ => return Err(CliError::Usage("unsupported context side".to_owned())),
+    };
+    let blob_id = record_string(file, blob_field, at)?;
+    if !mode_has_file_context(record_u32(file, mode_field, at)?) {
+        return Ok(Value::Null);
+    }
+    let encoded_path_field = format!("{path_field}_base64");
+    let path_is_absent = file.get(path_field).is_none_or(Value::is_null)
+        && file.get(&encoded_path_field).is_none_or(Value::is_null);
+    let request =
+        if path_is_absent && !blob_id.is_empty() && blob_id.bytes().all(|byte| byte == b'0') {
+            FileContextRequest::absent(blob_id, side, range)
+        } else if side == FileSide::New && target_uses_worktree {
+            let path = record_path(file, path_field, at)?.ok_or_else(|| {
+                CliError::Usage(format!(
+                    "{at}.{path_field} is required for a working-tree context"
+                ))
+            })?;
+            FileContextRequest::worktree(path, blob_id, side, range)
+        } else {
+            FileContextRequest::blob(blob_id, side, range)
+        };
+    load_context_value(git, request, max_file_size, remaining_bytes, cancellation)
+}
+
+fn context_target_uses_worktree(file: &Value, at: &str) -> Result<bool, CliError> {
+    let target = record_string(file, "target", at)?;
+    match target.as_str() {
+        "unstaged" | "revision_against_worktree" => Ok(true),
+        "staged" | "commit" | "revisions" | "branch_against_base" => Ok(false),
+        _ => Err(CliError::Usage(format!(
+            "{at}.target is an unsupported diff target \"{target}\""
+        ))),
+    }
+}
+
+fn load_diff_context_value(
+    git: &GitService,
+    file: &FileDiff,
+    request: FileContextRequest,
+    max_file_size: u64,
+    remaining_bytes: &mut u64,
+    cancellation: &Cancellation,
+) -> Result<Value, CliError> {
+    let mode = match request.side {
+        FileSide::Old => file.old_mode,
+        FileSide::New => file.new_mode,
+        _ => return Err(CliError::Usage("unsupported context side".to_owned())),
+    };
+    if !mode_has_file_context(mode) {
+        return Ok(Value::Null);
+    }
+    load_context_value(git, request, max_file_size, remaining_bytes, cancellation)
+}
+
+fn load_context_value(
+    git: &GitService,
+    mut request: FileContextRequest,
+    max_file_size: u64,
+    remaining_bytes: &mut u64,
+    cancellation: &Cancellation,
+) -> Result<Value, CliError> {
+    if cancellation.is_cancelled() {
+        return Err(GitError::Cancelled.into());
+    }
+    request.max_file_size = max_file_size;
+    request.max_total_bytes = *remaining_bytes;
+    let response = git.file_context(&request)?;
+    if cancellation.is_cancelled() {
+        return Err(GitError::Cancelled.into());
+    }
+    let returned_bytes = response
+        .lines
+        .iter()
+        .map(|line| line.content.len() as u64)
+        .sum::<u64>();
+    *remaining_bytes = remaining_bytes.saturating_sub(returned_bytes);
+    Ok(file_context_value(&response))
+}
+
+fn file_diff_value(file: &FileDiff, include_intra_line: bool) -> Value {
     let (old_path, old_path_is_lossy) = optional_wire_path(file.old_path.as_deref());
     let (new_path, new_path_is_lossy) = optional_wire_path(file.new_path.as_deref());
     json!({
@@ -1847,7 +2489,11 @@ fn file_diff_value(file: &FileDiff) -> Value {
         "new_size": file.new_size,
         "binary": file.binary,
         "omission": file.omission.as_ref().map_or(Value::Null, diff_omission_value),
-        "hunks": file.hunks.iter().map(hunk_value).collect::<Vec<_>>(),
+        "hunks": file
+            .hunks
+            .iter()
+            .map(|hunk| hunk_value(hunk, include_intra_line))
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -1896,28 +2542,133 @@ fn diff_omission_value(omission: &DiffOmission) -> Value {
     }
 }
 
-fn hunk_value(hunk: &Hunk) -> Value {
+fn hunk_value(hunk: &Hunk, include_intra_line: bool) -> Value {
     let (header, header_encoding) = encoded_bytes(&hunk.header);
-    json!({
+    let mut value = json!({
         "old_start": hunk.old_start,
         "old_lines": hunk.old_lines,
         "new_start": hunk.new_start,
         "new_lines": hunk.new_lines,
         "header": header,
         "header_encoding": header_encoding,
-        "lines": hunk.lines.iter().map(diff_line_value).collect::<Vec<_>>(),
-    })
+        "lines": hunk
+            .lines
+            .iter()
+            .map(|line| diff_line_value(line, include_intra_line))
+            .collect::<Vec<_>>(),
+    });
+    if include_intra_line {
+        value
+            .as_object_mut()
+            .expect("a hunk projection is an object")
+            .insert(
+                "intra_line_degradation".to_owned(),
+                hunk.intra_line_degradation
+                    .as_ref()
+                    .map_or(Value::Null, intra_line_degradation_value),
+            );
+    }
+    value
 }
 
-fn diff_line_value(line: &DiffLine) -> Value {
+fn diff_line_value(line: &DiffLine, include_intra_line: bool) -> Value {
     let (content, content_encoding) = encoded_bytes(&line.content);
-    json!({
+    let mut value = json!({
         "kind": diff_line_kind_name(line.kind),
         "old_line_number": line.old_line_number,
         "new_line_number": line.new_line_number,
         "content": content,
         "content_encoding": content_encoding,
+    });
+    if include_intra_line {
+        let ranges = line.intra_line_ranges.as_ref().map(|ranges| {
+            ranges
+                .iter()
+                .map(|range| json!({ "start": range.start, "end": range.end }))
+                .collect::<Vec<_>>()
+        });
+        let object = value
+            .as_object_mut()
+            .expect("a diff line projection is an object");
+        object.insert(
+            "paired_line_index".to_owned(),
+            json!(line.paired_line_index),
+        );
+        object.insert("intra_line_ranges".to_owned(), json!(ranges));
+    }
+    value
+}
+
+fn intra_line_degradation_value(degradation: &IntraLineDegradation) -> Value {
+    match degradation {
+        IntraLineDegradation::LineTooLong { limit } => {
+            json!({ "kind": "line_too_long", "limit": limit })
+        }
+        IntraLineDegradation::PairingTooLarge { limit } => {
+            json!({ "kind": "pairing_too_large", "limit": limit })
+        }
+        _ => json!({ "kind": "unknown" }),
+    }
+}
+
+fn file_context_value(response: &FileContextResponse) -> Value {
+    json!({
+        "kind": "file_context",
+        "blob_id": response.blob_id,
+        "side": file_side_name(response.side),
+        "range": file_context_range_value(&response.range),
+        "byte_size": response.byte_size,
+        "total_lines": response.total_lines,
+        "start_line": response.start_line,
+        "lines": response
+            .lines
+            .iter()
+            .map(|line| diff_line_value(line, false))
+            .collect::<Vec<_>>(),
+        "omission": response
+            .omission
+            .as_ref()
+            .map_or(Value::Null, file_context_omission_value),
     })
+}
+
+const fn file_side_name(side: FileSide) -> &'static str {
+    match side {
+        FileSide::Old => "old",
+        FileSide::New => "new",
+        _ => "unknown",
+    }
+}
+
+fn file_context_range_value(range: &FileContextRange) -> Value {
+    match range {
+        FileContextRange::FullFile => json!({ "kind": "full_file" }),
+        FileContextRange::Hunk {
+            start_line,
+            line_count,
+            lines_before,
+            lines_after,
+        } => json!({
+            "kind": "hunk",
+            "start_line": start_line,
+            "line_count": line_count,
+            "lines_before": lines_before,
+            "lines_after": lines_after,
+        }),
+        _ => json!({ "kind": "unknown" }),
+    }
+}
+
+fn file_context_omission_value(omission: &FileContextOmission) -> Value {
+    match omission {
+        FileContextOmission::FileTooLarge { limit } => {
+            json!({ "kind": "file_too_large", "limit": limit })
+        }
+        FileContextOmission::ContentBudgetExhausted { limit } => {
+            json!({ "kind": "content_budget_exhausted", "limit": limit })
+        }
+        _ => json!({ "kind": "unknown" }),
+    }
 }
 
 fn encoded_bytes(bytes: &[u8]) -> (String, &'static str) {
@@ -1925,6 +2676,83 @@ fn encoded_bytes(bytes: &[u8]) -> (String, &'static str) {
         Ok(text) => (text.to_owned(), "utf8"),
         Err(_) => (BASE64.encode(bytes), "base64"),
     }
+}
+
+fn encode_log_cursor(cursor: &LogCursor) -> Result<String, CliError> {
+    serde_json::to_vec(cursor)
+        .map(|bytes| URL_BASE64.encode(bytes))
+        .map_err(|error| CliError::WireProjection(error.to_string()))
+}
+
+fn decode_log_cursor(token: &str) -> Result<LogCursor, CliError> {
+    let bytes = URL_BASE64.decode(token).map_err(|_| {
+        CliError::Usage("--cursor is not a valid Harkness log cursor token".to_owned())
+    })?;
+    serde_json::from_slice(&bytes).map_err(|_| {
+        CliError::Usage("--cursor is not a valid Harkness log cursor token".to_owned())
+    })
+}
+
+fn commit_value(commit: &CommitInfo) -> Value {
+    let (summary, summary_encoding) = encoded_bytes(&commit.summary);
+    let (message, message_encoding) = encoded_bytes(&commit.message);
+    json!({
+        "kind": "commit",
+        "id": commit.id.to_string(),
+        "parent_ids": commit
+            .parent_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        "author": commit_signature_value(&commit.author),
+        "committer": commit_signature_value(&commit.committer),
+        "summary": summary,
+        "summary_encoding": summary_encoding,
+        "message": message,
+        "message_encoding": message_encoding,
+    })
+}
+
+fn log_range_value(range: &LogRange) -> Value {
+    match range {
+        LogRange::Revision { revision } => json!({
+            "kind": "revision",
+            "revision": revision,
+        }),
+        LogRange::Excluding {
+            reachable_from,
+            not_from,
+        } => json!({
+            "kind": "excluding",
+            "reachable_from": reachable_from,
+            "not_from": not_from,
+        }),
+        LogRange::BranchAgainstBase {
+            branch,
+            base_branch,
+        } => json!({
+            "kind": "branch_against_base",
+            "branch": branch,
+            "base_branch": base_branch,
+        }),
+        _ => json!({ "kind": "unknown" }),
+    }
+}
+
+fn commit_signature_value(signature: &CommitSignature) -> Value {
+    let (name, name_encoding) = encoded_bytes(&signature.name);
+    let (email, email_encoding) = encoded_bytes(&signature.email);
+    json!({
+        "name": name,
+        "name_encoding": name_encoding,
+        "email": email,
+        "email_encoding": email_encoding,
+        "time": {
+            "seconds": signature.time.seconds(),
+            "offset_minutes": signature.time.offset_minutes(),
+            "sign": signature.time.sign().to_string(),
+        },
+    })
 }
 
 fn head_value(head: &HeadState) -> Value {
@@ -2108,15 +2936,26 @@ fn detailed_status_line(status: &DetailedStatus, include_paths: bool) -> String 
 /// The JSON projection is the contract, but a human running this still needs to
 /// see which paths changed and which of them came back without content; a pair
 /// of totals alone answers no question worth asking.
-fn diff_summary_line(files: &[FileDiff]) -> String {
-    let staged = files
+fn diff_summary_line(files: &[FileDiff], targets: &[DiffTarget]) -> String {
+    let index_targets = targets
         .iter()
-        .filter(|file| matches!(file.target, DiffTarget::Staged))
-        .count();
-    let mut lines = vec![format!(
-        "{staged} staged, {} unstaged",
-        files.len() - staged
-    )];
+        .all(|target| matches!(target, DiffTarget::Staged | DiffTarget::Unstaged));
+    let mut lines = if index_targets {
+        let staged = files
+            .iter()
+            .filter(|file| matches!(file.target, DiffTarget::Staged))
+            .count();
+        vec![format!(
+            "{staged} staged, {} unstaged",
+            files.len() - staged
+        )]
+    } else {
+        vec![format!(
+            "{} changed file{}",
+            files.len(),
+            if files.len() == 1 { "" } else { "s" }
+        )]
+    };
     lines.extend(files.iter().map(|file| {
         let path = display_diff_path(file);
         let content = match (&file.omission, file.binary) {
@@ -2130,6 +2969,24 @@ fn diff_summary_line(files: &[FileDiff]) -> String {
             file_change_name(file.change),
         )
     }));
+    lines.join("\n")
+}
+
+fn log_page_line(commits: &[CommitInfo], has_more: bool) -> String {
+    let mut lines = commits
+        .iter()
+        .map(|commit| {
+            let id = commit.id.to_string();
+            format!(
+                "{}\t{}",
+                &id[..12],
+                single_line(&String::from_utf8_lossy(&commit.summary))
+            )
+        })
+        .collect::<Vec<_>>();
+    if has_more {
+        lines.push("more commits available; use --json to obtain next_cursor".to_owned());
+    }
     lines.join("\n")
 }
 
@@ -2196,8 +3053,48 @@ const fn diff_target_name(target: &DiffTarget) -> &'static str {
     match target {
         DiffTarget::Staged => "staged",
         DiffTarget::Unstaged => "unstaged",
+        DiffTarget::Commit { .. } => "commit",
+        DiffTarget::Revisions { .. } => "revisions",
+        DiffTarget::RevisionAgainstWorktree { .. } => "revision_against_worktree",
+        DiffTarget::BranchAgainstBase { .. } => "branch_against_base",
         _ => "unknown",
     }
+}
+
+fn diff_target_details(target: &DiffTarget) -> Option<Value> {
+    match target {
+        DiffTarget::Staged | DiffTarget::Unstaged => None,
+        DiffTarget::Commit { revision, parent } => Some(json!({
+            "kind": "commit",
+            "revision": revision,
+            "parent": parent,
+        })),
+        DiffTarget::Revisions {
+            old_revision,
+            new_revision,
+        } => Some(json!({
+            "kind": "revisions",
+            "old_revision": old_revision,
+            "new_revision": new_revision,
+        })),
+        DiffTarget::RevisionAgainstWorktree { revision } => Some(json!({
+            "kind": "revision_against_worktree",
+            "revision": revision,
+        })),
+        DiffTarget::BranchAgainstBase {
+            branch,
+            base_branch,
+        } => Some(json!({
+            "kind": "branch_against_base",
+            "branch": branch,
+            "base_branch": base_branch,
+        })),
+        _ => Some(json!({ "kind": "unknown" })),
+    }
+}
+
+fn diff_target_value(target: &DiffTarget) -> Value {
+    diff_target_details(target).unwrap_or_else(|| json!({ "kind": diff_target_name(target) }))
 }
 
 const fn diff_line_kind_name(kind: DiffLineKind) -> &'static str {
@@ -2518,9 +3415,9 @@ fn git_exit_code(error: &GitError) -> u8 {
         GitError::NoSuchBranch { .. }
         | GitError::NotARepository { .. }
         | GitError::RevisionNotFound { .. }
+        | GitError::AmbiguousRevision { .. }
         | GitError::BlobNotFound { .. } => EXIT_NOT_FOUND,
         GitError::RepositoryBusy { .. }
-        | GitError::AmbiguousRevision { .. }
         | GitError::NoMergeBase { .. }
         | GitError::BranchAlreadyExists { .. }
         | GitError::BranchCheckedOutInWorktree { .. }
@@ -2602,7 +3499,7 @@ const GIT_KIND_EXIT_CODES: &[(&str, u8)] = &[
     ("lock", EXIT_OPERATION_FAILED),
     ("not_a_repository", EXIT_NOT_FOUND),
     ("revision_not_found", EXIT_NOT_FOUND),
-    ("ambiguous_revision", EXIT_CONFLICT),
+    ("ambiguous_revision", EXIT_NOT_FOUND),
     ("revision_not_commit", EXIT_REFUSED),
     ("revision_not_parent", EXIT_REFUSED),
     ("no_merge_base", EXIT_CONFLICT),
@@ -3047,7 +3944,7 @@ mod tests {
                 GitError::AmbiguousRevision {
                     revision: "abcd".to_owned(),
                 },
-                EXIT_CONFLICT,
+                EXIT_NOT_FOUND,
                 serde_json::json!({ "revision": "abcd" }),
             ),
             (

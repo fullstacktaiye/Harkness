@@ -116,6 +116,24 @@ impl FileContextRequest {
         }
     }
 
+    /// Builds a request for the absent side of an addition or deletion.
+    ///
+    /// Front ends reconstructing a request from a serialized diff record use
+    /// this constructor when the selected side has no path and carries the
+    /// all-zero object ID sentinel.
+    #[must_use]
+    pub fn absent(blob_id: impl Into<String>, side: FileSide, range: FileContextRange) -> Self {
+        Self {
+            source: FileContextSource::Absent {
+                blob_id: blob_id.into(),
+            },
+            side,
+            range,
+            max_file_size: DEFAULT_MAX_DIFF_FILE_SIZE,
+            max_total_bytes: DEFAULT_MAX_DIFF_TOTAL_BYTES,
+        }
+    }
+
     /// Builds a full-file request for an immutable blob.
     #[must_use]
     pub fn full_blob(blob_id: impl Into<String>, side: FileSide) -> Self {
@@ -202,15 +220,7 @@ impl FileContextRequest {
             FileSide::New => (&file.new_blob_id, file.new_path.as_ref()),
         };
         if path.is_none() && !blob_id.is_empty() && blob_id.bytes().all(|byte| byte == b'0') {
-            Self {
-                source: FileContextSource::Absent {
-                    blob_id: blob_id.clone(),
-                },
-                side,
-                range,
-                max_file_size: DEFAULT_MAX_DIFF_FILE_SIZE,
-                max_total_bytes: DEFAULT_MAX_DIFF_TOTAL_BYTES,
-            }
+            Self::absent(blob_id, side, range)
         } else if side == FileSide::New
             && matches!(
                 file.target,

@@ -67,7 +67,8 @@ harkness project forget --project <selector>
 harkness project delete --project <selector> --yes
 
 harkness --json git status [--paths] [--project <selector>]
-harkness --json git diff [--staged | --unstaged] [--context-lines <lines>] [--max-file-size <bytes>] [--max-total-bytes <bytes>] [--max-files <count>] [--] [<path>...] [--project <selector>]
+harkness --json git log [HEAD | <old>..<new> | <base>...<branch>] [--limit <count>] [--cursor <token>] [--project <selector>]
+harkness --json git diff [--staged | --unstaged | --commit <revision> [--parent <revision>] | --revisions <old>..<new> | --worktree <revision> | --branch <base>...<branch>] [--context-lines <lines>] [--expand-context <lines> | --full-file-context] [--context-from <path|->] [--intra-line] [--max-file-size <bytes>] [--max-total-bytes <bytes>] [--max-files <count>] [--] [<path>...] [--project <selector>]
 harkness --json git fetch [--remote <name>] [--prune] [--project <selector>]
 harkness --json git pull [--ff-only | --rebase | --merge] [--project <selector>]
 harkness --json git push [--set-upstream] [--allow-default-branch] [--force-with-lease] [--project <selector>]
@@ -103,15 +104,35 @@ error-kind namespaces. It also reports `exit_code_by_kind`, which maps every
 CLI, project, and Git error kind to the exit code it returns, so a caller reads
 the classification instead of hardcoding it.
 
-`git diff` returns one structured `files` array, staged records first and
-unstaged records second; `--staged` or `--unstaged` narrows it to one side of
-the index. Both sides are read from a single index snapshot, so a combined
-response always describes one moment. Each file carries its blob IDs, paths,
-modes, sizes, and hunks. Every hunk line names its `content_encoding`: valid
-UTF-8 is emitted directly, while arbitrary bytes use Base64, so consumers can
-reconstruct the exact content. Paths additionally carry `old_path_base64` and
-`new_path_base64` holding their exact bytes, because a name that is not UTF-8
-cannot be spelled in the lossy `old_path` and `new_path` strings.
+`git log` accepts one Git-style range: `REVISION` walks everything reachable
+from it, `OLD..NEW` walks commits reachable from `NEW` but not `OLD`, and
+`BASE...BRANCH` walks only the branch commits after the merge-base. A page is
+bounded by `--limit` (50 by default and at most 1,000) and returns an opaque
+`next_cursor`; pass that token back with the same range to continue without an
+offset, even if a new commit lands at the tip. The `git_log` payload carries
+newest-first `commit` records with every parent ID, author and committer time,
+and byte-exact names, emails, summaries, and messages. Each byte field names
+its `utf8` or `base64` encoding. Missing and ambiguous revisions are distinct
+error kinds and both exit 4.
+
+`git diff` returns a `git_diff` payload with one structured `files` array.
+Without a revision target it returns staged records first and unstaged records
+second; `--staged` or `--unstaged` narrows it to one side of the index. Both
+sides are read from a single index snapshot, so a combined response always
+describes one moment. `--commit` compares a commit with its first or explicitly
+named parent, `--revisions OLD..NEW` compares two trees, `--worktree` compares a
+revision with the current index and working tree, and
+`--branch BASE...BRANCH` compares the branch with its merge-base so base-only
+changes do not leak into review. The payload names every requested comparison
+in `targets`; revision file records repeat their stable `target` kind and echo
+the comparison in `target_details` so a narrowed record stays self-describing.
+
+Each file carries its blob IDs, paths, modes, sizes, and hunks. Every hunk line
+names its `content_encoding`: valid UTF-8 is emitted directly, while arbitrary
+bytes use Base64, so consumers can reconstruct the exact content. Paths
+additionally carry `old_path_base64` and `new_path_base64` holding their exact
+bytes, because a name that is not UTF-8 cannot be spelled in the lossy
+`old_path` and `new_path` strings.
 
 Inspection is total: a file always appears in the listing, and when it carries
 no hunks the `omission` object says why. The reasons are `file_too_large`,
@@ -122,6 +143,34 @@ shape the model cannot carry. One such file never fails the whole command.
 `--max-files` bound the whole response; `--context-lines` is capped at 100
 because context multiplies every hunk in every file. Binary files remain
 summary records with `binary: true`.
+
+Context retrieval does not widen and recompute the diff. `--expand-context N`
+adds a `hunk_context` to every returned hunk, loading `N` additional lines on
+both sides from the recorded immutable blob IDs (or from a hash-guarded
+working-tree side). `--full-file-context` adds complete old and new
+`file_context` responses to each eligible file. The same per-file and total-byte
+bounds apply across these responses, and a bound produces a named omission in
+the success payload rather than partial content. To expand an earlier response
+without recomputing even the base diff, narrow that response's `files` and
+`hunks` arrays and pass it through `--context-from <path|->`; immutable sides
+still resolve by their recorded blob IDs, while a changed working-tree side is
+refused as stale. A submodule entry names a commit rather than a file blob, so
+its context side is `null` while any blob-backed side remains available. The
+replayed input already fixes the original diff width and file set, so
+`--context-lines` and `--max-files` are rejected in that mode. For example:
+
+```sh
+harkness --json git diff --staged --project <selector> \
+  | jq '{files: [.data.files[] | select(.new_path == "src/main.rs")
+                               | .hunks |= [.[0]]]}' \
+  | harkness --json git diff --expand-context 20 --context-from - \
+      --project <selector>
+```
+
+`--intra-line` opts into
+paired deletion/addition indexes and half-open byte ranges. Those keys are
+absent without the flag; pathological lines or pairings retain ordinary line
+marks and name `line_too_long` or `pairing_too_large` on the hunk.
 
 There are two ways to stage or unstage below path granularity, and both are
 refused before any mutation if an identity or coordinate has gone stale: the

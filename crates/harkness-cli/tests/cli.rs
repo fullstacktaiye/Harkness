@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -7,8 +7,8 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use git2::{Repository, Signature};
-use harkness_core::{Project, ProjectService};
+use git2::{ObjectType, Repository, Signature};
+use harkness_core::{DiffOptions, DiffTarget, GitService, Project, ProjectService};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -1195,12 +1195,27 @@ fn selector_help_is_exposed_only_where_it_is_accepted() {
 #[test]
 fn new_command_help_offers_every_diff_and_hunk_flag() {
     let fixture = TempDir::new().unwrap();
+    let log_help =
+        String::from_utf8(harkness(fixture.path(), &["git", "log", "--help"]).stdout).unwrap();
+    for text in ["--limit", "--cursor", "OLD..NEW", "BASE...BRANCH"] {
+        assert!(log_help.contains(text), "git log --help lacks {text}");
+    }
+
     let diff_help =
         String::from_utf8(harkness(fixture.path(), &["git", "diff", "--help"]).stdout).unwrap();
     for flag in [
         "--staged",
         "--unstaged",
+        "--commit",
+        "--parent",
+        "--revisions",
+        "--worktree",
+        "--branch",
         "--context-lines",
+        "--expand-context",
+        "--full-file-context",
+        "--context-from",
+        "--intra-line",
         "--max-file-size",
         "--max-total-bytes",
         "--max-files",
@@ -1230,9 +1245,52 @@ fn new_command_help_offers_every_diff_and_hunk_flag() {
 #[test]
 fn rejected_flag_combinations_are_usage_errors() {
     let fixture = TempDir::new().unwrap();
-    let cases: [&[&str]; 6] = [
+    let cases: [&[&str]; 15] = [
         &["--json", "git", "diff", "--staged", "--unstaged"],
+        &["--json", "git", "diff", "--staged", "--commit", "HEAD"],
+        &["--json", "git", "diff", "--parent", "HEAD"],
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--expand-context",
+            "2",
+            "--full-file-context",
+        ],
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--staged",
+            "--expand-context",
+            "2",
+            "--context-from",
+            "-",
+        ],
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--context-lines",
+            "4",
+            "--full-file-context",
+            "--context-from",
+            "-",
+        ],
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--max-files",
+            "1",
+            "--full-file-context",
+            "--context-from",
+            "-",
+        ],
         &["--json", "git", "diff", "--context-lines", "100001"],
+        &["--json", "git", "diff", "--revisions", "main...feature"],
+        &["--json", "git", "log", "--limit", "0"],
+        &["--json", "git", "log", "main....feature"],
         &["--json", "git", "stage", "--hunk"],
         &["--json", "git", "stage", "--hunk", "--all"],
         &["--json", "git", "stage", "--hunk", "some-path.txt"],
@@ -1261,6 +1319,592 @@ fn rejected_flag_combinations_are_usage_errors() {
         listed.iter().any(|line| line.contains("--old-blob-id")),
         "missing list is unhelpful: {listed:?}"
     );
+}
+
+#[test]
+fn git_log_pages_statelessly_and_preserves_commit_bytes() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("history-project");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    fs::write(root.join("tracked.txt"), b"second\n").unwrap();
+    commit_all(&repository, "second");
+    fs::write(root.join("tracked.txt"), b"third\n").unwrap();
+    commit_all(&repository, "third");
+    let raw_message = b"raw summary \xff\nraw body \xfe\n";
+    let raw_id = raw_commit(&repository, raw_message);
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+
+    let full = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "log",
+            "HEAD",
+            "--limit",
+            "10",
+            "--project",
+            &project_id,
+        ],
+    );
+    assert_success(&full);
+    let full_body = json_output(&full);
+    assert_envelope(&full_body, "success", true);
+    assert_eq!(full_body["data"]["kind"], "git_log");
+    assert_eq!(full_body["data"]["range"]["kind"], "revision");
+    assert_eq!(full_body["data"]["range"]["revision"], "HEAD");
+    assert_eq!(full_body["data"]["limit"], 10);
+    assert!(full_body["data"]["next_cursor"].is_null());
+    let full_ids = full_body["data"]["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|commit| commit["id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    let git_order = Command::new("git")
+        .args(["rev-list", "HEAD"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(git_order.status.success());
+    assert_eq!(
+        full_ids,
+        String::from_utf8(git_order.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    );
+
+    let first = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "log",
+            "HEAD",
+            "--limit",
+            "2",
+            "--project",
+            &project_id,
+        ],
+    );
+    assert_success(&first);
+    let first_body = json_output(&first);
+    let cursor = first_body["data"]["next_cursor"]
+        .as_str()
+        .expect("the first page has a continuation")
+        .to_owned();
+    let raw = first_body["data"]["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|commit| commit["id"] == raw_id.to_string())
+        .expect("the raw commit is the history tip");
+    assert_eq!(raw["kind"], "commit");
+    assert_eq!(raw["summary_encoding"], "base64");
+    assert_eq!(raw["message_encoding"], "base64");
+    assert_eq!(
+        BASE64.decode(raw["message"].as_str().unwrap()).unwrap(),
+        raw_message
+    );
+    assert_eq!(raw["author"]["name_encoding"], "base64");
+    assert_eq!(
+        BASE64
+            .decode(raw["author"]["name"].as_str().unwrap())
+            .unwrap(),
+        b"Auth\xffor"
+    );
+    assert_eq!(raw["author"]["time"]["offset_minutes"], -90);
+    assert_eq!(raw["author"]["time"]["sign"], "-");
+
+    // A new tip must not move a page addressed by the cursor.
+    commit_all(&repository, "new tip after first page");
+    let second = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "log",
+            "HEAD",
+            "--limit",
+            "2",
+            "--cursor",
+            &cursor,
+            "--project",
+            &project_id,
+        ],
+    );
+    assert_success(&second);
+    let second_body = json_output(&second);
+    let joined = first_body["data"]["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(second_body["data"]["commits"].as_array().unwrap())
+        .map(|commit| commit["id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(joined, full_ids);
+    assert!(second_body["data"]["next_cursor"].is_null());
+}
+
+#[test]
+fn log_ranges_and_every_revision_diff_target_use_the_shared_core_model() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("revision-project");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    let common = repository.head().unwrap().target().unwrap().to_string();
+    run_git(&root, &["branch", "feature"]);
+
+    fs::write(root.join("main-only.txt"), b"main\n").unwrap();
+    commit_all(&repository, "main advanced");
+    run_git(&root, &["checkout", "feature"]);
+    fs::write(root.join("feature-only.txt"), b"feature\n").unwrap();
+    commit_all(&repository, "feature advanced");
+    let feature = repository.head().unwrap().target().unwrap().to_string();
+
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+
+    for range in ["main..feature", "main...feature"] {
+        let output = harkness(
+            &data_dir,
+            &["--json", "git", "log", range, "--project", &project_id],
+        );
+        assert_success(&output);
+        let commits = json_output(&output)["data"]["commits"]
+            .as_array()
+            .cloned()
+            .unwrap();
+        assert_eq!(commits.len(), 1, "wrong log range for {range}");
+        assert_eq!(commits[0]["id"], feature);
+    }
+
+    let diff = |target: &[&str]| {
+        let mut arguments = vec!["--json", "git", "diff"];
+        arguments.extend_from_slice(target);
+        arguments.extend(["--project", &project_id]);
+        let output = harkness(&data_dir, &arguments);
+        assert_success(&output);
+        let body = json_output(&output);
+        assert_envelope(&body, "success", true);
+        assert_eq!(body["data"]["kind"], "git_diff");
+        assert_eq!(body["data"]["targets"].as_array().unwrap().len(), 1);
+        body["data"]["files"].as_array().cloned().unwrap()
+    };
+
+    let commit = diff(&["--commit", "feature"]);
+    assert_eq!(commit.len(), 1);
+    assert_eq!(commit[0]["target"], "commit");
+    assert_eq!(commit[0]["target_details"]["revision"], "feature");
+    assert_eq!(commit[0]["new_path"], "feature-only.txt");
+    let core_commit = GitService::new(&root, &data_dir)
+        .diff(
+            DiffTarget::Commit {
+                revision: "feature".to_owned(),
+                parent: None,
+            },
+            &DiffOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(core_commit.len(), commit.len());
+    assert_eq!(commit[0]["old_blob_id"], core_commit[0].old_blob_id);
+    assert_eq!(commit[0]["new_blob_id"], core_commit[0].new_blob_id);
+    assert_eq!(
+        commit[0]["hunks"].as_array().unwrap().len(),
+        core_commit[0].hunks.len()
+    );
+    assert_eq!(
+        commit[0]["hunks"][0]["new_start"],
+        core_commit[0].hunks[0].new_start
+    );
+
+    let pair = diff(&["--revisions", &format!("{common}..main")]);
+    assert_eq!(pair.len(), 1);
+    assert_eq!(pair[0]["target"], "revisions");
+    assert_eq!(pair[0]["new_path"], "main-only.txt");
+
+    let branch = diff(&["--branch", "main...feature"]);
+    assert_eq!(branch.len(), 1);
+    assert_eq!(branch[0]["target"], "branch_against_base");
+    assert_eq!(branch[0]["new_path"], "feature-only.txt");
+    assert!(
+        branch
+            .iter()
+            .all(|file| file["new_path"] != "main-only.txt"),
+        "base-only changes leaked into the branch review"
+    );
+
+    fs::write(root.join("worktree-only.txt"), b"working\n").unwrap();
+    let worktree = diff(&["--worktree", "feature"]);
+    assert_eq!(worktree.len(), 1);
+    assert_eq!(worktree[0]["target"], "revision_against_worktree");
+    assert_eq!(worktree[0]["new_path"], "worktree-only.txt");
+
+    let bounded = diff(&["--commit", "feature", "--max-file-size", "1"]);
+    assert_eq!(bounded[0]["omission"]["kind"], "file_too_large");
+}
+
+#[test]
+fn diff_context_and_intra_line_metadata_are_opt_in_and_bounded() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("review-project");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    let original = (1..=25)
+        .map(|line| format!("line {line} alpha\n"))
+        .collect::<String>();
+    fs::write(root.join("review.txt"), &original).unwrap();
+    let long_old = format!("{} old\n", "a".repeat(5_000));
+    fs::write(root.join("long.txt"), &long_old).unwrap();
+    fs::write(root.join("bytes.txt"), b"old \xff\n").unwrap();
+    commit_all(&repository, "add review fixtures");
+    fs::write(
+        root.join("review.txt"),
+        original.replace("line 13 alpha", "line 13 beta"),
+    )
+    .unwrap();
+    fs::write(
+        root.join("long.txt"),
+        format!("{} new\n", "a".repeat(5_000)),
+    )
+    .unwrap();
+    fs::write(root.join("bytes.txt"), b"new \xfe\n").unwrap();
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+
+    let review = |extra: &[&str], path: &str| {
+        let mut arguments = vec!["--json", "git", "diff", "--unstaged"];
+        arguments.extend_from_slice(extra);
+        arguments.extend(["--project", &project_id, "--", path]);
+        let output = harkness(&data_dir, &arguments);
+        assert_success(&output);
+        json_output(&output)["data"]["files"][0].clone()
+    };
+
+    let plain = review(&[], "review.txt");
+    let plain_hunk = &plain["hunks"][0];
+    assert!(plain_hunk.get("intra_line_degradation").is_none());
+    assert!(
+        plain_hunk["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|line| line.get("paired_line_index").is_none())
+    );
+
+    let ranged = review(&["--intra-line", "--expand-context", "2"], "review.txt");
+    let hunk = &ranged["hunks"][0];
+    assert!(hunk["intra_line_degradation"].is_null());
+    assert_eq!(hunk["context"]["kind"], "hunk_context");
+    assert_eq!(hunk["context"]["old"]["range"]["kind"], "hunk");
+    assert_eq!(hunk["context"]["old"]["range"]["lines_before"], 2);
+    let changed = hunk["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|line| matches!(line["kind"].as_str(), Some("deletion" | "addition")))
+        .collect::<Vec<_>>();
+    assert_eq!(changed.len(), 2);
+    for line in changed {
+        assert!(line["paired_line_index"].is_number());
+        assert!(
+            !line["intra_line_ranges"].as_array().unwrap().is_empty(),
+            "the word-level byte range is missing: {line:#?}"
+        );
+    }
+
+    let full = review(&["--full-file-context"], "review.txt");
+    assert_eq!(full["context"]["kind"], "full_file_context");
+    assert_eq!(full["context"]["new"]["range"]["kind"], "full_file");
+    assert_eq!(full["context"]["new"]["total_lines"], 25);
+    assert_eq!(
+        full["context"]["new"]["lines"].as_array().unwrap().len(),
+        25
+    );
+
+    let bytes = review(&["--full-file-context"], "bytes.txt");
+    let encoded = &bytes["context"]["new"]["lines"][0];
+    assert_eq!(encoded["content_encoding"], "base64");
+    assert_eq!(
+        BASE64.decode(encoded["content"].as_str().unwrap()).unwrap(),
+        b"new \xfe\n"
+    );
+
+    let degraded = review(&["--intra-line"], "long.txt");
+    assert_eq!(
+        degraded["hunks"][0]["intra_line_degradation"]["kind"],
+        "line_too_long"
+    );
+}
+
+#[test]
+fn context_expansion_handles_gitlinks_and_rejects_unknown_replay_targets() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("gitlink-context-project");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    let gitlink = repository.head().unwrap().target().unwrap().to_string();
+    let cache_entry = format!("160000,{gitlink},README.md");
+    run_git(
+        &root,
+        &["update-index", "--cacheinfo", cache_entry.as_str()],
+    );
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+
+    let full = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--staged",
+            "--full-file-context",
+            "--project",
+            &project_id,
+        ],
+    );
+    assert_success(&full);
+    let full_file = &json_output(&full)["data"]["files"][0];
+    assert_eq!(full_file["change"], "type_changed");
+    assert_eq!(
+        full_file["context"]["old"]["lines"][0]["content"],
+        "fixture\n"
+    );
+    assert!(full_file["context"]["new"].is_null());
+
+    commit_index(&repository, "record gitlink");
+    let next_gitlink = repository.head().unwrap().target().unwrap().to_string();
+    let next_cache_entry = format!("160000,{next_gitlink},README.md");
+    run_git(
+        &root,
+        &["update-index", "--cacheinfo", next_cache_entry.as_str()],
+    );
+
+    let plain = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--staged",
+            "--project",
+            &project_id,
+        ],
+    );
+    assert_success(&plain);
+
+    let expanded = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--staged",
+            "--expand-context",
+            "2",
+            "--project",
+            &project_id,
+        ],
+    );
+    assert_success(&expanded);
+    let expanded_hunk = &json_output(&expanded)["data"]["files"][0]["hunks"][0];
+    assert!(expanded_hunk["context"]["old"].is_null());
+    assert!(expanded_hunk["context"]["new"].is_null());
+
+    let replayed = harkness_with_stdin(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--expand-context",
+            "2",
+            "--context-from",
+            "-",
+            "--project",
+            &project_id,
+        ],
+        &String::from_utf8(plain.stdout.clone()).unwrap(),
+    );
+    assert_success(&replayed);
+    let replayed_hunk = &json_output(&replayed)["data"]["files"][0]["hunks"][0];
+    assert!(replayed_hunk["context"]["old"].is_null());
+    assert!(replayed_hunk["context"]["new"].is_null());
+
+    let mut unsupported = json_output(&plain);
+    unsupported["data"]["files"][0]["target"] = json!("future_target");
+    let refused = harkness_with_stdin(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--expand-context",
+            "2",
+            "--context-from",
+            "-",
+            "--project",
+            &project_id,
+        ],
+        &unsupported.to_string(),
+    );
+    assert_eq!(refused.status.code(), Some(2));
+    assert_eq!(json_output(&refused)["error"]["kind"], "usage_error");
+}
+
+#[test]
+fn context_from_a_prior_diff_keeps_blob_content_stable_and_refuses_stale_worktree_bytes() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("stable-context-project");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    fs::write(root.join("tracked.txt"), b"one\ntwo\nbase\nfour\nfive\n").unwrap();
+    commit_all(&repository, "add tracked context fixture");
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+
+    fs::write(root.join("tracked.txt"), b"one\ntwo\nstaged\nfour\nfive\n").unwrap();
+    run_git(&root, &["add", "tracked.txt"]);
+    let staged = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--staged",
+            "--project",
+            &project_id,
+        ],
+    );
+    assert_success(&staged);
+    fs::write(
+        root.join("tracked.txt"),
+        b"one\ntwo\nlater worktree\nfour\nfive\n",
+    )
+    .unwrap();
+
+    let expanded_staged = harkness_with_stdin(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--expand-context",
+            "2",
+            "--context-from",
+            "-",
+            "--project",
+            &project_id,
+        ],
+        &String::from_utf8(staged.stdout).unwrap(),
+    );
+    assert_success(&expanded_staged);
+    let staged_body = json_output(&expanded_staged);
+    assert_envelope(&staged_body, "success", true);
+    assert_eq!(staged_body["data"]["kind"], "git_diff_context");
+    let staged_lines = staged_body["data"]["files"][0]["hunks"][0]["context"]["new"]["lines"]
+        .as_array()
+        .unwrap();
+    assert!(
+        staged_lines
+            .iter()
+            .any(|line| line["content"] == "staged\n")
+    );
+    assert!(
+        staged_lines
+            .iter()
+            .all(|line| line["content"] != "later worktree\n")
+    );
+
+    let unstaged = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--unstaged",
+            "--project",
+            &project_id,
+        ],
+    );
+    assert_success(&unstaged);
+    fs::write(
+        root.join("tracked.txt"),
+        b"one\ntwo\nchanged again\nfour\nfive\n",
+    )
+    .unwrap();
+    let stale = harkness_with_stdin(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--expand-context",
+            "2",
+            "--context-from",
+            "-",
+            "--project",
+            &project_id,
+        ],
+        &String::from_utf8(unstaged.stdout).unwrap(),
+    );
+    assert_eq!(stale.status.code(), Some(3));
+    assert_eq!(json_output(&stale)["error"]["kind"], "stale_hunk_selection");
+}
+
+#[test]
+fn missing_and_ambiguous_revisions_are_distinct_not_found_errors() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("revision-errors");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    let ambiguous = ambiguous_object_prefix(&repository);
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+
+    for (revision, kind) in [
+        ("definitely-missing".to_owned(), "revision_not_found"),
+        (ambiguous, "ambiguous_revision"),
+    ] {
+        let output = harkness(
+            &data_dir,
+            &["--json", "git", "log", &revision, "--project", &project_id],
+        );
+        assert_eq!(output.status.code(), Some(4), "for {revision}");
+        let body = json_output(&output);
+        assert_envelope(&body, "error", false);
+        assert_eq!(body["error"]["kind"], kind);
+        assert_eq!(body["error"]["details"]["revision"], revision);
+    }
 }
 
 /// An unresolved merge is where an agent most needs a diff, and the index has
@@ -2590,6 +3234,15 @@ fn commit_all(repository: &Repository, message: &str) {
     index
         .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
         .unwrap();
+    commit_from_index(repository, message, &mut index);
+}
+
+fn commit_index(repository: &Repository, message: &str) {
+    let mut index = repository.index().unwrap();
+    commit_from_index(repository, message, &mut index);
+}
+
+fn commit_from_index(repository: &Repository, message: &str, index: &mut git2::Index) {
     let tree_id = index.write_tree().unwrap();
     index.write().unwrap();
     let tree = repository.find_tree(tree_id).unwrap();
@@ -2611,6 +3264,40 @@ fn commit_all(repository: &Repository, message: &str) {
             &parents.iter().collect::<Vec<_>>(),
         )
         .unwrap();
+}
+
+fn raw_commit(repository: &Repository, message: &[u8]) -> git2::Oid {
+    let parent = repository.head().unwrap().target().unwrap();
+    let tree = repository.find_commit(parent).unwrap().tree_id();
+    let mut raw = Vec::new();
+    raw.extend_from_slice(format!("tree {tree}\nparent {parent}\nauthor ").as_bytes());
+    raw.extend_from_slice(b"Auth\xffor <a\xfe@example.invalid> 1700000010 -0130\n");
+    raw.extend_from_slice(b"committer Comm\xfdtter <c\xfc@example.invalid> 1700000020 +0200\n\n");
+    raw.extend_from_slice(message);
+    let id = repository
+        .odb()
+        .unwrap()
+        .write(ObjectType::Commit, &raw)
+        .unwrap();
+    let reference = repository.head().unwrap().name().unwrap().to_owned();
+    repository
+        .reference(&reference, id, true, "raw byte CLI fixture")
+        .unwrap();
+    id
+}
+
+fn ambiguous_object_prefix(repository: &Repository) -> String {
+    let database = repository.odb().unwrap();
+    let mut seen = HashMap::new();
+    for index in 0..20_000 {
+        let bytes = format!("ambiguous object {index}");
+        let id = database.write(ObjectType::Blob, bytes.as_bytes()).unwrap();
+        let prefix = id.to_string()[..4].to_owned();
+        if seen.insert(prefix.clone(), id).is_some() {
+            return prefix;
+        }
+    }
+    panic!("failed to construct an ambiguous four-hex object prefix")
 }
 
 fn remote_with_clone(fixture: &Path) -> (PathBuf, PathBuf, PathBuf) {
