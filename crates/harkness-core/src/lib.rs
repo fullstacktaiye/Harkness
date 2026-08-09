@@ -18,9 +18,10 @@ pub use git::{
     DiffOptions, DiffTarget, FetchOptions, FetchOutcome, FileChange, FileContextOmission,
     FileContextRange, FileContextRequest, FileContextResponse, FileContextSource, FileDiff,
     FileSide, GitAccess, GitCommand, GitError, GitOutput, GitService, HeadState, Hunk,
-    HunkSelection, LogCursor, LogOptions, LogPage, LogRange, PendingOperation, PullOptions,
-    PullOutcome, PullStrategy, PushOptions, PushOutcome, RefUpdate, RepositoryLock, StageOptions,
-    StageOutcome, StagePathOutcome, StagePathResult, StatusEntry, StatusRefreshOutcome,
+    HunkSelection, IntraLineDegradation, IntraLineRange, LogCursor, LogOptions, LogPage, LogRange,
+    MAX_INTRA_LINE_BYTES, MAX_INTRA_LINE_COMPARISONS, PendingOperation, PullOptions, PullOutcome,
+    PullStrategy, PushOptions, PushOutcome, RefUpdate, RepositoryLock, StageOptions, StageOutcome,
+    StagePathOutcome, StagePathResult, StatusEntry, StatusRefreshOutcome,
 };
 pub use listing::{DirEntry, list_directory};
 pub use project::{

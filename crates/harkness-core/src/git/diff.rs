@@ -18,7 +18,7 @@ use git2::{
     ErrorCode, FileMode, ObjectType, Oid, Patch, Repository,
 };
 
-use crate::git::{FileChange, GitError, commit, history};
+use crate::git::{FileChange, GitError, commit, history, intra_line};
 
 /// The default largest file whose content Harkness will put in a diff model.
 pub const DEFAULT_MAX_DIFF_FILE_SIZE: u64 = 1024 * 1024;
@@ -42,6 +42,20 @@ pub const DEFAULT_MAX_DIFF_FILES: usize = 5_000;
 
 /// The default number of unchanged lines surrounding each hunk.
 pub const DEFAULT_DIFF_CONTEXT_LINES: u32 = 3;
+
+/// The longest raw line eligible for intra-line pairing.
+///
+/// This is a hard safety boundary rather than a display default. A line beyond
+/// it remains byte-exact in the ordinary hunk model, while the hunk reports
+/// [`IntraLineDegradation::LineTooLong`] when ranges were requested.
+pub const MAX_INTRA_LINE_BYTES: usize = 4 * 1024;
+
+/// The most elementary comparisons one hunk may spend on line pairing and
+/// token-range computation.
+///
+/// The estimate is checked before either dynamic-programming matrix is built,
+/// keeping adversarial replacement runs bounded independently of file size.
+pub const MAX_INTRA_LINE_COMPARISONS: usize = 1_000_000;
 
 /// The two content states to compare.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,6 +99,10 @@ pub struct DiffOptions {
     pub max_files: usize,
     /// The number of unchanged lines surrounding each hunk.
     pub context_lines: u32,
+    /// Whether paired deletion/addition lines carry intra-line byte ranges.
+    /// Disabled by default so existing consumers receive the original hunk
+    /// projection unchanged.
+    pub include_intra_line_ranges: bool,
     /// Literal paths to inspect. An empty list selects the whole tree.
     pub paths: Vec<PathBuf>,
 }
@@ -96,6 +114,7 @@ impl Default for DiffOptions {
             max_total_bytes: DEFAULT_MAX_DIFF_TOTAL_BYTES,
             max_files: DEFAULT_MAX_DIFF_FILES,
             context_lines: DEFAULT_DIFF_CONTEXT_LINES,
+            include_intra_line_ranges: false,
             paths: Vec::new(),
         }
     }
@@ -140,6 +159,13 @@ impl DiffOptions {
     #[must_use]
     pub fn with_context_lines(mut self, context_lines: u32) -> Self {
         self.context_lines = context_lines;
+        self
+    }
+
+    /// Enables or disables deterministic intra-line pairing and byte ranges.
+    #[must_use]
+    pub fn with_intra_line_ranges(mut self, include: bool) -> Self {
+        self.include_intra_line_ranges = include;
         self
     }
 
@@ -236,8 +262,33 @@ pub struct Hunk {
     pub new_lines: u32,
     /// The raw `@@ ... @@` header, including any function context.
     pub header: Vec<u8>,
+    /// Why requested intra-line metadata was withheld for this hunk.
+    ///
+    /// `None` means either the option was disabled, no replacement run could
+    /// be paired, or every eligible pair was computed successfully.
+    pub intra_line_degradation: Option<IntraLineDegradation>,
     /// Lines in patch order, retained byte-for-byte.
     pub lines: Vec<DiffLine>,
+}
+
+/// Why an opted-in hunk carries only its ordinary whole-line marks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum IntraLineDegradation {
+    /// A line in a replacement run exceeded [`MAX_INTRA_LINE_BYTES`].
+    LineTooLong { limit: usize },
+    /// Pairing or range computation exceeded
+    /// [`MAX_INTRA_LINE_COMPARISONS`].
+    PairingTooLarge { limit: usize },
+}
+
+/// One half-open changed range into [`DiffLine::content`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IntraLineRange {
+    /// Inclusive byte offset into the raw line.
+    pub start: usize,
+    /// Exclusive byte offset into the raw line.
+    pub end: usize,
 }
 
 /// The role of one raw line in a hunk.
@@ -266,6 +317,15 @@ pub struct DiffLine {
     pub new_line_number: Option<u32>,
     /// Raw line bytes. A trailing newline is retained when one exists.
     pub content: Vec<u8>,
+    /// Index of this line's counterpart in its hunk's line array.
+    ///
+    /// Only paired deletions and additions populate this field.
+    pub paired_line_index: Option<usize>,
+    /// Changed byte ranges computed against the paired line.
+    ///
+    /// `Some([])` is meaningful: the pair was computed but this side only has
+    /// a zero-width insertion. Unpaired and non-opted-in lines use `None`.
+    pub intra_line_ranges: Option<Vec<IntraLineRange>>,
 }
 
 pub(crate) fn compute(
@@ -546,7 +606,13 @@ fn collect_target(
         let mut content_bytes = 0;
         let hunks = match patch.as_ref() {
             Some(patch) if !binary => {
-                match collect_hunks(patch, root, budget.remaining_bytes, &mut content_bytes) {
+                match collect_hunks(
+                    patch,
+                    root,
+                    budget.remaining_bytes,
+                    options.include_intra_line_ranges,
+                    &mut content_bytes,
+                ) {
                     Ok(Some(hunks)) => hunks,
                     Ok(None) => {
                         omission = Some(DiffOmission::ContentBudgetExhausted {
@@ -776,6 +842,7 @@ fn collect_hunks(
     patch: &Patch<'_>,
     root: &Path,
     limit: u64,
+    include_intra_line_ranges: bool,
     spent: &mut u64,
 ) -> Result<Option<Vec<Hunk>>, GitError> {
     let mut hunks = Vec::with_capacity(patch.num_hunks());
@@ -808,6 +875,8 @@ fn collect_hunks(
                 old_line_number: line.old_lineno(),
                 new_line_number: line.new_lineno(),
                 content: line.content().to_vec(),
+                paired_line_index: None,
+                intra_line_ranges: None,
             });
         }
         hunks.push(Hunk {
@@ -816,8 +885,14 @@ fn collect_hunks(
             new_start: hunk.new_start(),
             new_lines: hunk.new_lines(),
             header: hunk.header().to_vec(),
+            intra_line_degradation: None,
             lines,
         });
+    }
+    if include_intra_line_ranges {
+        for hunk in &mut hunks {
+            intra_line::annotate(hunk);
+        }
     }
     *spent = used;
     Ok(Some(hunks))
@@ -995,7 +1070,10 @@ mod tests {
 
     use git2::{ObjectType, Oid, Repository};
 
-    use super::{DiffLineKind, DiffOmission, DiffOptions, DiffTarget, FileDiff, Hunk};
+    use super::{
+        DiffLineKind, DiffOmission, DiffOptions, DiffTarget, FileDiff, Hunk, IntraLineDegradation,
+        IntraLineRange, MAX_INTRA_LINE_BYTES,
+    };
     use crate::{
         git::{FileChange, GitError, GitService},
         testing::{Fixture, commit_all, configure_commit_identity, git, initialize_repository},
@@ -1028,6 +1106,161 @@ mod tests {
         assert_ne!(staged[0].new_blob_id, unstaged[0].new_blob_id);
         assert_eq!(staged[0].new_blob_id, unstaged[0].old_blob_id);
         assert!(!fixture.data_dir.exists(), "a read-only diff took a lock");
+    }
+
+    #[test]
+    fn intra_line_ranges_are_opt_in_and_leave_the_hunk_projection_unchanged() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("intra-line-opt-in");
+        let repository = initialize_repository(&root);
+        fs::write(root.join("tracked.txt"), b"let color = red;\n").unwrap();
+        commit_all(&repository, "prepare word diff");
+        fs::write(root.join("tracked.txt"), b"let color = blue;\n").unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+
+        let plain = service
+            .diff(DiffTarget::Unstaged, &DiffOptions::default())
+            .unwrap();
+        let ranged = service
+            .diff(
+                DiffTarget::Unstaged,
+                &DiffOptions::default().with_intra_line_ranges(true),
+            )
+            .unwrap();
+
+        let file = named(&ranged, Path::new("tracked.txt"));
+        let (_, deletion, _, addition) = paired_lines(file);
+        assert_eq!(
+            deletion.intra_line_ranges,
+            Some(vec![IntraLineRange { start: 12, end: 15 }])
+        );
+        assert_eq!(
+            addition.intra_line_ranges,
+            Some(vec![IntraLineRange { start: 12, end: 16 }])
+        );
+
+        assert!(plain.iter().flat_map(|file| &file.hunks).all(|hunk| {
+            hunk.intra_line_degradation.is_none()
+                && hunk.lines.iter().all(|line| {
+                    line.paired_line_index.is_none() && line.intra_line_ranges.is_none()
+                })
+        }));
+        let mut stripped = ranged;
+        strip_intra_line_metadata(&mut stripped);
+        assert_eq!(
+            stripped, plain,
+            "range annotation altered the underlying hunk model"
+        );
+    }
+
+    #[test]
+    fn intra_line_ranges_apply_to_every_worktree_and_revision_target() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("all-intra-line-targets");
+        let repository = initialize_repository(&root);
+        fs::write(root.join("tracked.txt"), b"the old word\n").unwrap();
+        commit_all(&repository, "range baseline");
+        let base = repository.head().unwrap().target().unwrap();
+
+        git(&root, ["checkout", "-b", "feature"]);
+        fs::write(root.join("tracked.txt"), b"the feature word\n").unwrap();
+        commit_all(&repository, "range feature");
+        let feature = repository.head().unwrap().target().unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+        let options = DiffOptions::default().with_intra_line_ranges(true);
+
+        let revision_targets = [
+            DiffTarget::Commit {
+                revision: feature.to_string(),
+                parent: None,
+            },
+            DiffTarget::Revisions {
+                old_revision: base.to_string(),
+                new_revision: feature.to_string(),
+            },
+            DiffTarget::BranchAgainstBase {
+                branch: "feature".to_owned(),
+                base_branch: "main".to_owned(),
+            },
+        ];
+        for target in revision_targets {
+            let files = service.diff(target.clone(), &options).unwrap();
+            paired_lines(named(&files, Path::new("tracked.txt")));
+        }
+
+        fs::write(root.join("tracked.txt"), b"the staged word\n").unwrap();
+        stage(&repository, Path::new("tracked.txt"));
+        fs::write(root.join("tracked.txt"), b"the working word\n").unwrap();
+        let worktree_targets = [
+            DiffTarget::Staged,
+            DiffTarget::Unstaged,
+            DiffTarget::RevisionAgainstWorktree {
+                revision: base.to_string(),
+            },
+        ];
+        for target in worktree_targets {
+            let files = service.diff(target.clone(), &options).unwrap();
+            paired_lines(named(&files, Path::new("tracked.txt")));
+        }
+        assert!(!fixture.data_dir.exists(), "an intra-line diff took a lock");
+    }
+
+    #[test]
+    fn non_utf8_intra_line_ranges_are_raw_byte_offsets() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("non-utf8-intra-line");
+        let repository = initialize_repository(&root);
+        fs::write(root.join("tracked.txt"), b"word \xff\n").unwrap();
+        commit_all(&repository, "prepare non-utf8 word");
+        fs::write(root.join("tracked.txt"), b"word \xfe\n").unwrap();
+
+        let files = GitService::new(&root, &fixture.data_dir)
+            .diff(
+                DiffTarget::Unstaged,
+                &DiffOptions::default().with_intra_line_ranges(true),
+            )
+            .unwrap();
+        let (_, deletion, _, addition) = paired_lines(named(&files, Path::new("tracked.txt")));
+
+        let expected = Some(vec![IntraLineRange { start: 5, end: 6 }]);
+        assert_eq!(deletion.intra_line_ranges, expected);
+        assert_eq!(addition.intra_line_ranges, expected);
+        assert_eq!(&deletion.content[5..6], b"\xff");
+        assert_eq!(&addition.content[5..6], b"\xfe");
+    }
+
+    #[test]
+    fn an_overlong_intra_line_pair_names_the_hunk_degradation() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("overlong-intra-line");
+        let repository = initialize_repository(&root);
+        let mut old = vec![b'a'; MAX_INTRA_LINE_BYTES + 1];
+        old.push(b'\n');
+        fs::write(root.join("tracked.txt"), &old).unwrap();
+        commit_all(&repository, "prepare overlong line");
+        let mut new = old;
+        new[0] = b'b';
+        fs::write(root.join("tracked.txt"), new).unwrap();
+
+        let files = GitService::new(&root, &fixture.data_dir)
+            .diff(
+                DiffTarget::Unstaged,
+                &DiffOptions::default().with_intra_line_ranges(true),
+            )
+            .unwrap();
+        let hunk = &named(&files, Path::new("tracked.txt")).hunks[0];
+
+        assert_eq!(
+            hunk.intra_line_degradation,
+            Some(IntraLineDegradation::LineTooLong {
+                limit: MAX_INTRA_LINE_BYTES
+            })
+        );
+        assert!(
+            hunk.lines.iter().all(|line| {
+                line.paired_line_index.is_none() && line.intra_line_ranges.is_none()
+            })
+        );
     }
 
     #[test]
@@ -1820,6 +2053,49 @@ mod tests {
             .filter(|line| line.kind == DiffLineKind::Deletion)
             .map(|line| line.content.clone())
             .collect()
+    }
+
+    fn paired_lines(file: &FileDiff) -> (usize, &super::DiffLine, usize, &super::DiffLine) {
+        let hunk = file
+            .hunks
+            .iter()
+            .find(|hunk| {
+                hunk.lines
+                    .iter()
+                    .any(|line| line.kind == DiffLineKind::Deletion)
+                    && hunk
+                        .lines
+                        .iter()
+                        .any(|line| line.kind == DiffLineKind::Addition)
+            })
+            .unwrap_or_else(|| panic!("no replacement hunk in {file:#?}"));
+        let (deletion_index, deletion) = hunk
+            .lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.kind == DiffLineKind::Deletion)
+            .unwrap();
+        let (addition_index, addition) = hunk
+            .lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.kind == DiffLineKind::Addition)
+            .unwrap();
+        assert_eq!(deletion.paired_line_index, Some(addition_index));
+        assert_eq!(addition.paired_line_index, Some(deletion_index));
+        assert!(deletion.intra_line_ranges.is_some());
+        assert!(addition.intra_line_ranges.is_some());
+        (deletion_index, deletion, addition_index, addition)
+    }
+
+    fn strip_intra_line_metadata(files: &mut [FileDiff]) {
+        for hunk in files.iter_mut().flat_map(|file| &mut file.hunks) {
+            hunk.intra_line_degradation = None;
+            for line in &mut hunk.lines {
+                line.paired_line_index = None;
+                line.intra_line_ranges = None;
+            }
+        }
     }
 
     fn model_name_status(files: &[FileDiff]) -> Vec<(char, String, Option<String>)> {

@@ -13,6 +13,7 @@ mod context;
 mod diff;
 mod history;
 mod hunk;
+mod intra_line;
 mod lock;
 mod runner;
 pub(crate) mod status;
@@ -40,7 +41,8 @@ pub use context::{
 pub use diff::{
     DEFAULT_DIFF_CONTEXT_LINES, DEFAULT_MAX_DIFF_FILE_SIZE, DEFAULT_MAX_DIFF_FILES,
     DEFAULT_MAX_DIFF_TOTAL_BYTES, DiffLine, DiffLineKind, DiffOmission, DiffOptions, DiffTarget,
-    FileDiff, Hunk,
+    FileDiff, Hunk, IntraLineDegradation, IntraLineRange, MAX_INTRA_LINE_BYTES,
+    MAX_INTRA_LINE_COMPARISONS,
 };
 pub use history::{CommitInfo, CommitSignature, LogCursor, LogOptions, LogPage, LogRange};
 pub use hunk::{HunkSelection, HunkStageOutcome};

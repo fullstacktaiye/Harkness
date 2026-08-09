@@ -1722,6 +1722,7 @@ mod tests {
             new_start: 1,
             new_lines: 1,
             header: b"@@ -1 +1 @@\n".to_vec(),
+            intra_line_degradation: None,
             lines: Vec::new(),
         }
     }
