@@ -1410,6 +1410,30 @@ fn load_review_with_git(
     })
 }
 
+/// Selects the first changed path as part of opening a review target. The
+/// metadata pass remains bounded and only this one default selection receives
+/// a path-restricted content request.
+fn load_review_with_initial_file_with_git(
+    git: &harkness_core::GitService,
+    project_id: String,
+    selection: ReviewSelection,
+    review_generation: u64,
+    file_generation: u64,
+) -> Result<ReviewStateRow, GitFailure> {
+    let mut review = load_review_with_git(git, project_id, selection, review_generation)?;
+    let Some(entry) = review.files.first().cloned() else {
+        return Ok(review);
+    };
+    let target = review.target.as_ref().ok_or_else(|| GitFailure {
+        kind: "review_target_missing".to_owned(),
+        message: "The selected review target is no longer available".to_owned(),
+    })?;
+    let loaded = load_review_file_with_git(git, target, &entry, file_generation)?;
+    review.selected_file_id.clone_from(&entry.id);
+    review.loaded_file = Some(loaded);
+    Ok(review)
+}
+
 fn file_context_side(file: &harkness_core::FileDiff) -> harkness_core::FileSide {
     if file.new_path.is_some() {
         harkness_core::FileSide::New
@@ -2075,11 +2099,11 @@ fn launch_review_request(
     ) else {
         return;
     };
-    let request_id = {
+    let (request_id, file_request) = {
         let rust = backend.as_mut().rust_mut().get_mut();
         rust.next_review_request += 1;
         rust.next_review_file_request += 1;
-        rust.next_review_request
+        (rust.next_review_request, rust.next_review_file_request)
     };
     set_review_state(
         backend.as_mut(),
@@ -2087,11 +2111,19 @@ fn launch_review_request(
     );
     let qt_thread = backend.qt_thread();
     std::thread::spawn(move || {
-        let result = load_project_git(&project_id)
-            .and_then(|git| load_review_with_git(&git, project_id.clone(), selection, request_id));
+        let result = load_project_git(&project_id).and_then(|git| {
+            load_review_with_initial_file_with_git(
+                &git,
+                project_id.clone(),
+                selection,
+                request_id,
+                file_request,
+            )
+        });
         let _ = qt_thread.queue(move |mut backend| {
             finish_job(backend.as_mut(), &job_id);
             if backend.as_ref().rust().next_review_request != request_id
+                || backend.as_ref().rust().next_review_file_request != file_request
                 || opened_project_id(backend.as_ref().opened()).as_deref()
                     != Some(project_id.as_str())
             {
@@ -4088,10 +4120,10 @@ mod tests {
         ReviewContextOutcome, ReviewSelection, WorktreeLockAction, begin_job,
         change_worktree_lock_with_service, empty_opened, end_job, expand_review_context_with_git,
         file_content_summary, hidden_before, load_diff_with_git, load_history_page_with_git,
-        load_review_file_with_git, load_review_with_git, move_worktree_with_service,
-        mutate_hunk_with_git, operation_outcome, project_rows, register_path_selection,
-        remove_worktree_with_service, resolve_path_selection, review_rows, to_branches, to_diff,
-        to_git, to_jobs, to_map, to_projects, update_job, worktree_base,
+        load_review_file_with_git, load_review_with_git, load_review_with_initial_file_with_git,
+        move_worktree_with_service, mutate_hunk_with_git, operation_outcome, project_rows,
+        register_path_selection, remove_worktree_with_service, resolve_path_selection, review_rows,
+        to_branches, to_diff, to_git, to_jobs, to_map, to_projects, update_job, worktree_base,
     };
 
     fn project(
@@ -4880,6 +4912,54 @@ mod tests {
         };
         assert_eq!(changed(deletion), "old");
         assert_eq!(changed(addition), "new");
+    }
+
+    #[test]
+    fn opening_a_review_selects_and_loads_only_the_first_changed_file() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("default-review-file-repository");
+        initialize_repository(&root);
+        let first_path = Path::new("first.txt");
+        let second_path = Path::new("second.txt");
+        fs::write(root.join(first_path), "first old\n").unwrap();
+        fs::write(root.join(second_path), "second old\n").unwrap();
+        let repository = Repository::open(&root).unwrap();
+        let mut index = repository.index().unwrap();
+        index.add_path(first_path).unwrap();
+        index.add_path(second_path).unwrap();
+        index.write().unwrap();
+        drop(index);
+        drop(repository);
+        commit_index(&root, "add review files");
+
+        fs::write(root.join(first_path), "first new\n").unwrap();
+        fs::write(root.join(second_path), "second new\n").unwrap();
+        let repository = Repository::open(&root).unwrap();
+        let mut index = repository.index().unwrap();
+        index.add_path(first_path).unwrap();
+        index.add_path(second_path).unwrap();
+        index.write().unwrap();
+        drop(index);
+        drop(repository);
+        let revision = commit_index(&root, "change both review files").to_string();
+
+        let git = harkness_core::GitService::new(&root, fixture.path().join("default-locks"));
+        let review = load_review_with_initial_file_with_git(
+            &git,
+            "project-1".to_owned(),
+            ReviewSelection::Commit { revision },
+            7,
+            8,
+        )
+        .unwrap();
+
+        assert_eq!(review.files.len(), 2);
+        assert_eq!(review.selected_file_id, review.files[0].id);
+        let loaded = review.loaded_file.as_ref().unwrap();
+        assert_eq!(loaded.id, review.files[0].id);
+        assert_eq!(loaded.file.new_path, review.files[0].file.new_path);
+        assert!(!loaded.file.hunks.is_empty());
+        assert!(review.files.iter().all(|entry| entry.file.hunks.is_empty()));
     }
 
     #[test]
