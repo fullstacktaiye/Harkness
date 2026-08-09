@@ -21,12 +21,13 @@ Item {
         && backend.diff
         && backend.diff.projectId !== undefined
         && String(backend.diff.projectId) === String(project.id)
-        && String(backend.diff.path) === selectedPath
+        && String(backend.diff.pathId) === selectedPathId
     readonly property var diffState: diffReady ? backend.diff : ({})
     readonly property var diffFiles: diffReady && diffState.files !== undefined
         ? diffState.files
         : []
     property string diffProjectId: ""
+    property string selectedPathId: ""
     property string selectedPath: ""
     property string movingWorktreeId: ""
     property string movingWorktreeName: ""
@@ -75,19 +76,30 @@ Item {
         const nextId = project && project.id !== undefined ? String(project.id) : "";
         if (diffProjectId !== nextId) {
             diffProjectId = nextId;
+            selectedPathId = "";
             selectedPath = "";
             backend.clearDiff();
         }
         refresh();
     }
 
-    function selectPath(path) {
+    function selectPath(pathId, path) {
+        selectedPathId = String(pathId);
         selectedPath = String(path);
-        backend.refreshDiff(project.id, selectedPath);
+        backend.refreshDiff(project.id, selectedPathId);
     }
 
     function diffTint(color) {
         return Qt.rgba(color.r, color.g, color.b, 0.14);
+    }
+
+    // InlineMessage does not expose its internal label's textFormat. Wrap an
+    // escaped value so repository-controlled text is displayed literally.
+    function escapedRichText(value) {
+        return "<span>" + String(value)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;") + "</span>";
     }
 
     function pathBaseName(path) {
@@ -156,6 +168,7 @@ Item {
                     elide: Text.ElideRight
                     font.bold: true
                     text: panel.stateReady ? panel.gitState.head : qsTr("Loading repository status…")
+                    textFormat: Text.PlainText
                 }
 
                 Controls.Label {
@@ -169,18 +182,22 @@ Item {
                             .arg(panel.gitState.ahead)
                             .arg(panel.gitState.behind);
                     }
+                    textFormat: Text.PlainText
                 }
 
                 Kirigami.InlineMessage {
                     Layout.fillWidth: true
-                    text: qsTr("A %1 is waiting to be resolved or aborted.").arg(panel.gitState.pending || "")
+                    text: panel.escapedRichText(
+                        qsTr("A %1 is waiting to be resolved or aborted.")
+                            .arg(panel.gitState.pending || "")
+                    )
                     type: Kirigami.MessageType.Warning
                     visible: panel.stateReady && panel.gitState.pending && panel.gitState.pending.length > 0
                 }
 
                 Kirigami.InlineMessage {
                     Layout.fillWidth: true
-                    text: panel.gitState.error || ""
+                    text: panel.escapedRichText(panel.gitState.error || "")
                     type: Kirigami.MessageType.Error
                     visible: panel.stateReady && panel.gitState.error && panel.gitState.error.length > 0
                 }
@@ -250,6 +267,7 @@ Item {
                                     elide: Text.ElideMiddle
                                     font.family: "monospace"
                                     text: modelData.path
+                                    textFormat: Text.PlainText
                                 }
 
                                 Controls.ToolButton {
@@ -258,10 +276,10 @@ Item {
                                         : qsTr("View staged and unstaged diff")
                                     Controls.ToolTip.visible: hovered
                                     checkable: true
-                                    checked: panel.selectedPath === String(modelData.path)
+                                    checked: panel.selectedPathId === String(modelData.pathId)
                                     display: Controls.AbstractButton.TextOnly
                                     text: checked ? qsTr("Refresh diff") : qsTr("View diff")
-                                    onClicked: panel.selectPath(modelData.path)
+                                    onClicked: panel.selectPath(modelData.pathId, modelData.path)
                                 }
                             }
 
@@ -284,20 +302,21 @@ Item {
                                             states.push(qsTr("conflict"));
                                         return states.join(" · ");
                                     }
+                                    textFormat: Text.PlainText
                                 }
 
                                 Controls.Button {
                                     enabled: panel.job("unstage") === null
                                     text: qsTr("Unstage")
                                     visible: modelData.staged.length > 0
-                                    onClicked: panel.backend.unstagePath(panel.project.id, modelData.path)
+                                    onClicked: panel.backend.unstagePath(panel.project.id, modelData.pathId)
                                 }
 
                                 Controls.Button {
                                     enabled: panel.job("stage") === null
                                     text: qsTr("Stage")
                                     visible: modelData.unstaged.length > 0
-                                    onClicked: panel.backend.stagePath(panel.project.id, modelData.path)
+                                    onClicked: panel.backend.stagePath(panel.project.id, modelData.pathId)
                                 }
                             }
                         }
@@ -318,6 +337,7 @@ Item {
                             elide: Text.ElideMiddle
                             level: 5
                             text: qsTr("Diff · %1").arg(panel.selectedPath)
+                            textFormat: Text.PlainText
                         }
 
                         Controls.BusyIndicator {
@@ -334,13 +354,15 @@ Item {
                             enabled: !(panel.diffReady && panel.diffState.loading === true)
                             icon.name: "view-refresh"
                             text: qsTr("Refresh diff")
-                            onClicked: panel.selectPath(panel.selectedPath)
+                            onClicked: panel.backend.refreshDiff(panel.project.id, panel.selectedPathId)
                         }
                     }
 
                     Kirigami.InlineMessage {
                         Layout.fillWidth: true
-                        text: panel.diffReady ? panel.diffState.error || "" : ""
+                        text: panel.escapedRichText(
+                            panel.diffReady ? panel.diffState.error || "" : ""
+                        )
                         type: Kirigami.MessageType.Error
                         visible: panel.diffReady
                             && panel.diffState.error
@@ -382,6 +404,7 @@ Item {
                                     text: fileDiffFrame.file.target === "staged"
                                         ? qsTr("Staged · %1").arg(fileDiffFrame.file.change)
                                         : qsTr("Working tree · %1").arg(fileDiffFrame.file.change)
+                                    textFormat: Text.PlainText
                                 }
 
                                 Controls.Label {
@@ -390,11 +413,12 @@ Item {
                                     elide: Text.ElideMiddle
                                     font.family: "monospace"
                                     text: fileDiffFrame.file.path
+                                    textFormat: Text.PlainText
                                 }
 
                                 Kirigami.InlineMessage {
                                     Layout.fillWidth: true
-                                    text: fileDiffFrame.file.summary
+                                    text: panel.escapedRichText(fileDiffFrame.file.summary)
                                     type: Kirigami.MessageType.Information
                                     visible: fileDiffFrame.file.summary.length > 0
                                 }
@@ -423,6 +447,7 @@ Item {
                                                     color: Kirigami.Theme.highlightColor
                                                     font.family: "monospace"
                                                     text: hunkFrame.hunk.header
+                                                    textFormat: Text.PlainText
                                                     wrapMode: Text.WrapAnywhere
                                                 }
 
@@ -509,6 +534,7 @@ Item {
                                                             Layout.fillWidth: true
                                                             font.family: "monospace"
                                                             text: diffLine.line.content
+                                                            textFormat: Text.PlainText
                                                             wrapMode: Text.WrapAnywhere
                                                         }
                                                     }
@@ -631,6 +657,7 @@ Item {
                             Layout.fillWidth: true
                             elide: Text.ElideRight
                             text: qsTr("%1: %2").arg(modelData.label).arg(modelData.progress)
+                            textFormat: Text.PlainText
                         }
 
                         Controls.Button {
@@ -679,7 +706,7 @@ Item {
                     delegate: Controls.ItemDelegate {
                         required property var modelData
 
-                        Controls.ToolTip.text: modelData.detail
+                        Controls.ToolTip.text: panel.escapedRichText(modelData.detail)
                         Controls.ToolTip.visible: hovered && modelData.detail.length > 0
                         enabled: modelData.selectable
                         text: modelData.name
@@ -748,6 +775,7 @@ Item {
                     Layout.fillWidth: true
                     color: Kirigami.Theme.disabledTextColor
                     text: qsTr("This workspace comes from %1.").arg(panel.project.parentName)
+                    textFormat: Text.PlainText
                     visible: panel.project.worktree
                 }
 
@@ -850,6 +878,7 @@ Item {
                                             : qsTr("detached HEAD"))
                                         .arg(worktreeRow.row.root)
                                         .arg(worktreeRow.row.owned ? qsTr("Harkness") : qsTr("external"))
+                                    textFormat: Text.PlainText
                                 }
 
                                 Kirigami.Icon {
@@ -869,6 +898,7 @@ Item {
                                 text: worktreeRow.row.lockReason.length > 0
                                     ? qsTr("Locked: %1").arg(worktreeRow.row.lockReason)
                                     : qsTr("Locked without a recorded reason")
+                                textFormat: Text.PlainText
                                 visible: worktreeRow.row.locked
                                 wrapMode: Text.Wrap
                             }
@@ -940,6 +970,7 @@ Item {
                     Controls.Label {
                         Layout.fillWidth: true
                         text: qsTr("Lock %1").arg(panel.lockingWorktreeName)
+                        textFormat: Text.PlainText
                     }
 
                     Controls.TextField {
@@ -972,6 +1003,7 @@ Item {
                     Controls.Label {
                         Layout.fillWidth: true
                         text: qsTr("Move %1").arg(panel.movingWorktreeName)
+                        textFormat: Text.PlainText
                     }
 
                     RowLayout {

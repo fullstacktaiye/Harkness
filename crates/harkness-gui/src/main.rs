@@ -200,6 +200,7 @@ Kirigami.ApplicationWindow {
             "error": "",
             "errorKind": "",
             "entries": [{
+                "pathId": "fixture-path",
                 "path": "src/main.rs",
                 "staged": "added",
                 "unstaged": "modified",
@@ -209,6 +210,7 @@ Kirigami.ApplicationWindow {
         })
         property var diff: ({
             "projectId": "00000000-0000-0000-0000-000000000000",
+            "pathId": "fixture-path",
             "path": "src/main.rs",
             "loading": false,
             "error": "",
@@ -237,7 +239,7 @@ Kirigami.ApplicationWindow {
                         "marker": "+",
                         "oldLine": 0,
                         "newLine": 1,
-                        "content": "new line"
+                        "content": "<b>new line must stay literal</b>"
                     }, {
                         "kind": "context",
                         "marker": " ",
@@ -257,12 +259,12 @@ Kirigami.ApplicationWindow {
         })
 
         function refreshGit(projectId) {}
-        function refreshDiff(projectId, path) {}
+        function refreshDiff(projectId, pathId) {}
         function clearDiff() {}
         function refreshBranches(projectId) {}
         function refreshWorktrees(projectId) {}
-        function stagePath(projectId, path) {}
-        function unstagePath(projectId, path) {}
+        function stagePath(projectId, pathId) {}
+        function unstagePath(projectId, pathId) {}
         function stageHunk(projectId, selectionId) {}
         function unstageHunk(projectId, selectionId) {}
         function commit(projectId, message, amend) {}
@@ -284,6 +286,7 @@ Kirigami.ApplicationWindow {
         backend: fixtureBackend
         diffProjectId: String(projectFixture.id)
         project: projectFixture
+        selectedPathId: "fixture-path"
         selectedPath: "src/main.rs"
     }
 }

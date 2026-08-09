@@ -200,10 +200,10 @@ The GUI opens a Kirigami window on the project launcher backed by the Rust
 same creation modes, live linked-worktree inventory, selective reconciliation,
 and a second confirmation before dirty files can be discarded. Selecting a
 changed path loads only that path's staged and unstaged content, marks added
-and removed lines, and stages or unstages one stale-safe hunk at a time. Binary
-and bounded-out content stays visible as a named summary instead of an empty
-pane. Managed worktree rows expose move, lock, and unlock while showing the
-stored lock reason inline.
+and removed lines, and stages or unstages one stale-safe hunk at a time. Binary,
+byte-bounded, and line-bounded content stays visible as a named summary instead
+of eagerly creating an unbounded number of QML delegates. Managed worktree rows
+expose move, lock, and unlock while showing the stored lock reason inline.
 
 ### Git review UI
 
