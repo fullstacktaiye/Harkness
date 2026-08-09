@@ -2515,13 +2515,19 @@ fn project_exit_code(error: &ProjectError) -> u8 {
 fn git_exit_code(error: &GitError) -> u8 {
     match error {
         GitError::Cancelled => EXIT_CANCELLED,
-        GitError::NoSuchBranch { .. } | GitError::NotARepository { .. } => EXIT_NOT_FOUND,
+        GitError::NoSuchBranch { .. }
+        | GitError::NotARepository { .. }
+        | GitError::RevisionNotFound { .. } => EXIT_NOT_FOUND,
         GitError::RepositoryBusy { .. }
+        | GitError::AmbiguousRevision { .. }
+        | GitError::NoMergeBase { .. }
         | GitError::BranchAlreadyExists { .. }
         | GitError::BranchCheckedOutInWorktree { .. }
         | GitError::WorktreeAlreadyLocked { .. }
         | GitError::WorktreeNotLocked { .. } => EXIT_CONFLICT,
         GitError::PathOutsideRepository { .. }
+        | GitError::RevisionNotCommit { .. }
+        | GitError::InvalidLogLimit
         | GitError::EmptyCommitMessage
         | GitError::EmptyWorktreeLockReason
         | GitError::NothingStaged
@@ -2591,6 +2597,11 @@ const GIT_KIND_EXIT_CODES: &[(&str, u8)] = &[
     ("repository_busy", EXIT_CONFLICT),
     ("lock", EXIT_OPERATION_FAILED),
     ("not_a_repository", EXIT_NOT_FOUND),
+    ("revision_not_found", EXIT_NOT_FOUND),
+    ("ambiguous_revision", EXIT_CONFLICT),
+    ("revision_not_commit", EXIT_REFUSED),
+    ("no_merge_base", EXIT_CONFLICT),
+    ("invalid_log_limit", EXIT_REFUSED),
     ("path_outside_repository", EXIT_REFUSED),
     ("empty_commit_message", EXIT_REFUSED),
     ("nothing_staged", EXIT_REFUSED),
@@ -2788,6 +2799,17 @@ fn project_error_details(error: &ProjectError) -> Value {
 
 fn git_error_details(error: &GitError) -> Value {
     match error {
+        GitError::RevisionNotFound { revision } | GitError::AmbiguousRevision { revision } => {
+            json!({ "revision": revision })
+        }
+        GitError::RevisionNotCommit { revision, id } => {
+            json!({ "revision": revision, "object_id": id.to_string() })
+        }
+        GitError::NoMergeBase { one, two } => json!({
+            "one": one,
+            "two": two,
+        }),
+        GitError::InvalidLogLimit => json!({ "minimum": 1 }),
         GitError::NothingStaged => json!({ "override_flag": "--allow-empty" }),
         GitError::UnmergedBranchDeletion { .. } => json!({ "override_flag": "--force" }),
         GitError::NoUpstream { .. } => json!({ "override_flag": "--set-upstream" }),
@@ -2956,9 +2978,10 @@ mod tests {
 
     use super::{
         CLI_ERROR_KINDS, CLI_KIND_EXIT_CODES, CliError, EXIT_CANCELLED, EXIT_CONFLICT,
-        EXIT_OPERATION_FAILED, EXIT_REFUSED, EXIT_USAGE, GIT_KIND_EXIT_CODES, GitError,
-        PROJECT_KIND_EXIT_CODES, Project, ProjectError, RefusalKind, git_exit_code,
-        parse_selection_document, project_exit_code, project_value, requested_json, single_line,
+        EXIT_NOT_FOUND, EXIT_OPERATION_FAILED, EXIT_REFUSED, EXIT_USAGE, GIT_KIND_EXIT_CODES,
+        GitError, PROJECT_KIND_EXIT_CODES, Project, ProjectError, RefusalKind, git_error_details,
+        git_exit_code, parse_selection_document, project_exit_code, project_value, requested_json,
+        single_line,
     };
 
     #[test]
@@ -2992,6 +3015,64 @@ mod tests {
             GitError::KINDS,
             "GIT_KIND_EXIT_CODES must classify every Git error kind, in order"
         );
+    }
+
+    #[test]
+    fn history_errors_keep_agent_facing_classification_and_details() {
+        let object_id = git2::Oid::ZERO_SHA1;
+        let cases = vec![
+            (
+                GitError::RevisionNotFound {
+                    revision: "missing".to_owned(),
+                },
+                EXIT_NOT_FOUND,
+                serde_json::json!({ "revision": "missing" }),
+            ),
+            (
+                GitError::AmbiguousRevision {
+                    revision: "abcd".to_owned(),
+                },
+                EXIT_CONFLICT,
+                serde_json::json!({ "revision": "abcd" }),
+            ),
+            (
+                GitError::RevisionNotCommit {
+                    revision: "blob".to_owned(),
+                    id: object_id,
+                },
+                EXIT_REFUSED,
+                serde_json::json!({
+                    "revision": "blob",
+                    "object_id": object_id.to_string(),
+                }),
+            ),
+            (
+                GitError::NoMergeBase {
+                    one: "main".to_owned(),
+                    two: "orphan".to_owned(),
+                },
+                EXIT_CONFLICT,
+                serde_json::json!({ "one": "main", "two": "orphan" }),
+            ),
+            (
+                GitError::InvalidLogLimit,
+                EXIT_REFUSED,
+                serde_json::json!({ "minimum": 1 }),
+            ),
+        ];
+
+        for (error, exit_code, details) in cases {
+            assert_eq!(git_exit_code(&error), exit_code, "for {error:?}");
+            assert_eq!(git_error_details(&error), details, "for {error:?}");
+            assert_eq!(
+                GIT_KIND_EXIT_CODES
+                    .iter()
+                    .find(|(kind, _)| *kind == error.kind())
+                    .map(|(_, declared)| *declared),
+                Some(exit_code),
+                "published table disagrees for {error:?}"
+            );
+        }
     }
 
     /// The project table has no wildcard to defend against, but it does have to
