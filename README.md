@@ -251,10 +251,17 @@ and a second confirmation before dirty files can be discarded. Selecting a
 changed path loads only that path's staged and unstaged content, marks added
 and removed lines, and stages or unstages one stale-safe hunk at a time. Binary,
 byte-bounded, and line-bounded content stays visible as a named summary instead
-of eagerly creating an unbounded number of QML delegates. Managed worktree rows
-expose move, lock, and unlock while showing the stored lock reason inline.
+of eagerly creating an unbounded number of QML delegates. The review surface
+pages commit history through core cursors, compares commits or a branch against
+its pinned merge-base, and loads one selected file at a time. Its virtualized
+unified and side-by-side layouts render core's intra-line ranges, apply
+presentation-only syntax color, expand stable blob-addressed context, and expose
+keyboard navigation between files and hunks. Managed worktree rows expose move,
+lock, and unlock while showing the stored lock reason inline.
 
 ### Git review UI
+
+![Commit history and a lazily loaded unified review diff](docs/screenshots/review-surface.png)
 
 ![Git panel showing a selected hunk diff](docs/screenshots/git-panel.png)
 

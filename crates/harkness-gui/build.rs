@@ -9,6 +9,7 @@ fn main() {
             "qml/SidebarProjectRow.qml",
             "qml/ProjectShellPage.qml",
             "qml/GitPanel.qml",
+            "qml/ReviewSurface.qml",
         ]),
     )
     .qt_module("Network")

@@ -257,10 +257,103 @@ Kirigami.ApplicationWindow {
                 "hunks": []
             }]
         })
+        property var history: ({
+            "projectId": "00000000-0000-0000-0000-000000000000",
+            "loading": false,
+            "hasMore": true,
+            "error": "",
+            "errorKind": "",
+            "commits": [{
+                "id": "0123456789abcdef0123456789abcdef01234567",
+                "shortId": "0123456789ab",
+                "summary": "Exercise the review surface",
+                "message": "Exercise the review surface\n\nFixture body.",
+                "author": "QML Fixture",
+                "authorEmail": "fixture@example.com",
+                "authorTime": "1700000000",
+                "parentCount": 1
+            }]
+        })
+        property var review: ({
+            "projectId": "00000000-0000-0000-0000-000000000000",
+            "title": "Commit 0123456789ab",
+            "detail": "Pinned review fixture",
+            "loading": false,
+            "fileLoading": false,
+            "error": "",
+            "errorKind": "",
+            "selectedFileId": "review-file-fixture",
+            "files": [{
+                "fileId": "review-file-fixture",
+                "path": "src/main.rs",
+                "change": "modified",
+                "oldSize": "24",
+                "newSize": "24"
+            }],
+            "file": {
+                "fileId": "review-file-fixture",
+                "path": "src/main.rs",
+                "summary": "",
+                "binary": false,
+                "hunkCount": 1,
+                "rows": [{
+                    "type": "collapsed",
+                    "hunkId": "review-hunk-fixture",
+                    "direction": "before",
+                    "count": 12
+                }, {
+                    "type": "hunk",
+                    "hunkId": "review-hunk-fixture",
+                    "header": "@@ -1,2 +1,2 @@",
+                    "degradation": ""
+                }, {
+                    "type": "line",
+                    "splitHidden": false,
+                    "unified": {
+                        "oldLine": 1,
+                        "newLine": 0,
+                        "kind": "deletion",
+                        "marker": "-",
+                        "segments": [{
+                            "text": "let old_word = true;",
+                            "changed": true
+                        }]
+                    },
+                    "old": {
+                        "present": true,
+                        "line": 1,
+                        "kind": "deletion",
+                        "marker": "-",
+                        "segments": [{
+                            "text": "let old_word = true;",
+                            "changed": true
+                        }]
+                    },
+                    "new": {
+                        "present": true,
+                        "line": 1,
+                        "kind": "addition",
+                        "marker": "+",
+                        "segments": [{
+                            "text": "let new_word = true;",
+                            "changed": true
+                        }]
+                    }
+                }]
+            }
+        })
 
         function refreshGit(projectId) {}
         function refreshDiff(projectId, pathId) {}
         function clearDiff() {}
+        function refreshHistory(projectId) {}
+        function loadMoreHistory(projectId) {}
+        function reviewCommit(projectId, revision) {}
+        function reviewBranch(projectId, branch, baseBranch) {}
+        function reviewWorkingChanges(projectId, staged) {}
+        function loadReviewFile(projectId, fileId) {}
+        function expandReviewContext(projectId, hunkId, direction) {}
+        function clearReview() {}
         function refreshBranches(projectId) {}
         function refreshWorktrees(projectId) {}
         function stagePath(projectId, pathId) {}

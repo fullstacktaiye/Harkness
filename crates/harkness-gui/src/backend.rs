@@ -34,6 +34,8 @@ pub mod ffi {
         #[qproperty(QVariant, opened)]
         #[qproperty(QVariant, git)]
         #[qproperty(QVariant, diff)]
+        #[qproperty(QVariant, history)]
+        #[qproperty(QVariant, review)]
         type HarknessBackend = super::HarknessBackendRust;
 
         #[qinvokable]
@@ -90,6 +92,64 @@ pub mod ffi {
         #[qinvokable]
         #[cxx_name = "clearDiff"]
         fn clear_diff(self: Pin<&mut HarknessBackend>);
+
+        /// Starts a fresh bounded history walk at HEAD.
+        #[qinvokable]
+        #[cxx_name = "refreshHistory"]
+        fn refresh_history(self: Pin<&mut HarknessBackend>, project_id: &QString);
+
+        /// Requests exactly the continuation returned by the current history page.
+        #[qinvokable]
+        #[cxx_name = "loadMoreHistory"]
+        fn load_more_history(self: Pin<&mut HarknessBackend>, project_id: &QString);
+
+        /// Opens a commit against its first parent in the read-only review surface.
+        #[qinvokable]
+        #[cxx_name = "reviewCommit"]
+        fn review_commit(self: Pin<&mut HarknessBackend>, project_id: &QString, revision: &QString);
+
+        /// Pins a branch and its merge-base, then opens their read-only diff.
+        #[qinvokable]
+        #[cxx_name = "reviewBranch"]
+        fn review_branch(
+            self: Pin<&mut HarknessBackend>,
+            project_id: &QString,
+            branch: &QString,
+            base_branch: &QString,
+        );
+
+        /// Opens either side of the index in the shared read-only renderer.
+        #[qinvokable]
+        #[cxx_name = "reviewWorkingChanges"]
+        fn review_working_changes(
+            self: Pin<&mut HarknessBackend>,
+            project_id: &QString,
+            staged: bool,
+        );
+
+        /// Fetches hunk content for one backend-owned review path.
+        #[qinvokable]
+        #[cxx_name = "loadReviewFile"]
+        fn load_review_file(
+            self: Pin<&mut HarknessBackend>,
+            project_id: &QString,
+            file_id: &QString,
+        );
+
+        /// Expands one collapsed region through core's stable context API.
+        #[qinvokable]
+        #[cxx_name = "expandReviewContext"]
+        fn expand_review_context(
+            self: Pin<&mut HarknessBackend>,
+            project_id: &QString,
+            hunk_id: &QString,
+            direction: &QString,
+        );
+
+        /// Invalidates in-flight history and review requests for the open shell.
+        #[qinvokable]
+        #[cxx_name = "clearReview"]
+        fn clear_review(self: Pin<&mut HarknessBackend>);
 
         #[qinvokable]
         #[cxx_name = "stagePath"]
@@ -226,6 +286,8 @@ pub struct HarknessBackendRust {
     opened: QVariant,
     git: QVariant,
     diff: QVariant,
+    history: QVariant,
+    review: QVariant,
     job_records: Vec<JobRecord>,
     cancellations: HashMap<String, harkness_core::Cancellation>,
     path_selections: HashMap<String, PathSelectionKey>,
@@ -236,6 +298,11 @@ pub struct HarknessBackendRust {
     next_path_selection: u64,
     next_diff_request: u64,
     next_diff_generation: u64,
+    history_state: Option<HistoryStateRow>,
+    review_state: Option<ReviewStateRow>,
+    next_history_request: u64,
+    next_review_request: u64,
+    next_review_file_request: u64,
 }
 
 impl Default for HarknessBackendRust {
@@ -250,6 +317,8 @@ impl Default for HarknessBackendRust {
             opened: empty_opened(),
             git: empty_git(),
             diff: empty_diff(),
+            history: empty_history(),
+            review: empty_review(),
             job_records: Vec::new(),
             cancellations: HashMap::new(),
             path_selections: HashMap::new(),
@@ -260,6 +329,11 @@ impl Default for HarknessBackendRust {
             next_path_selection: 0,
             next_diff_request: 0,
             next_diff_generation: 0,
+            history_state: None,
+            review_state: None,
+            next_history_request: 0,
+            next_review_request: 0,
+            next_review_file_request: 0,
         }
     }
 }
@@ -999,6 +1073,1080 @@ fn load_project_git(project_id: &str) -> Result<harkness_core::GitService, GitFa
         kind: "project".to_owned(),
         message: error.to_string(),
     })
+}
+
+const HISTORY_PAGE_SIZE: usize = 50;
+const REVIEW_CONTEXT_STEP: u32 = 20;
+
+#[derive(Clone, Debug)]
+struct HistoryCommitRow {
+    id: String,
+    short_id: String,
+    summary: String,
+    message: String,
+    author: String,
+    author_email: String,
+    author_time: i64,
+    parent_count: usize,
+}
+
+impl From<harkness_core::CommitInfo> for HistoryCommitRow {
+    fn from(commit: harkness_core::CommitInfo) -> Self {
+        let id = commit.id.to_string();
+        Self {
+            short_id: id.chars().take(12).collect(),
+            id,
+            summary: display_patch_bytes(&commit.summary),
+            message: String::from_utf8_lossy(&commit.message).into_owned(),
+            author: String::from_utf8_lossy(&commit.author.name).into_owned(),
+            author_email: String::from_utf8_lossy(&commit.author.email).into_owned(),
+            author_time: commit.author.time.seconds(),
+            parent_count: commit.parent_ids.len(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct HistoryStateRow {
+    project_id: String,
+    commits: Vec<HistoryCommitRow>,
+    next_cursor: Option<harkness_core::LogCursor>,
+    loading: bool,
+    error: String,
+    error_kind: String,
+}
+
+impl HistoryStateRow {
+    fn loading(project_id: String) -> Self {
+        Self {
+            project_id,
+            commits: Vec::new(),
+            next_cursor: None,
+            loading: true,
+            error: String::new(),
+            error_kind: String::new(),
+        }
+    }
+
+    fn with_failure(mut self, failure: &GitFailure) -> Self {
+        self.loading = false;
+        self.error.clone_from(&failure.message);
+        self.error_kind.clone_from(&failure.kind);
+        self
+    }
+}
+
+fn load_history_page_with_git(
+    git: &harkness_core::GitService,
+    cursor: Option<harkness_core::LogCursor>,
+    cancellation: &harkness_core::Cancellation,
+) -> Result<(Vec<HistoryCommitRow>, Option<harkness_core::LogCursor>), GitFailure> {
+    let mut options = harkness_core::LogOptions::new("HEAD", HISTORY_PAGE_SIZE);
+    if let Some(cursor) = cursor {
+        options = options.with_cursor(cursor);
+    }
+    let page = git.log(&options, cancellation).map_err(GitFailure::from)?;
+    Ok((
+        page.commits
+            .into_iter()
+            .map(HistoryCommitRow::from)
+            .collect(),
+        page.next_cursor,
+    ))
+}
+
+fn empty_history() -> QVariant {
+    QVariant::from(&QMap::<QMapPair_QString_QVariant>::default())
+}
+
+fn to_history(row: &HistoryStateRow) -> QVariant {
+    let mut state = QMap::<QMapPair_QString_QVariant>::default();
+    let mut insert = |key: &str, value: QVariant| state.insert(QString::from(key), value);
+    insert(
+        "projectId",
+        QVariant::from(&QString::from(row.project_id.as_str())),
+    );
+    insert("loading", QVariant::from(&row.loading));
+    insert("hasMore", QVariant::from(&row.next_cursor.is_some()));
+    insert("error", QVariant::from(&QString::from(row.error.as_str())));
+    insert(
+        "errorKind",
+        QVariant::from(&QString::from(row.error_kind.as_str())),
+    );
+
+    let mut commits = QList::<QVariant>::default();
+    for commit in &row.commits {
+        let mut value = QMap::<QMapPair_QString_QVariant>::default();
+        let mut insert = |key: &str, field: QVariant| value.insert(QString::from(key), field);
+        insert("id", QVariant::from(&QString::from(commit.id.as_str())));
+        insert(
+            "shortId",
+            QVariant::from(&QString::from(commit.short_id.as_str())),
+        );
+        insert(
+            "summary",
+            QVariant::from(&QString::from(commit.summary.as_str())),
+        );
+        insert(
+            "message",
+            QVariant::from(&QString::from(commit.message.as_str())),
+        );
+        insert(
+            "author",
+            QVariant::from(&QString::from(commit.author.as_str())),
+        );
+        insert(
+            "authorEmail",
+            QVariant::from(&QString::from(commit.author_email.as_str())),
+        );
+        insert(
+            "authorTime",
+            QVariant::from(&QString::from(commit.author_time.to_string().as_str())),
+        );
+        insert(
+            "parentCount",
+            QVariant::from(&i32::try_from(commit.parent_count).unwrap_or(i32::MAX)),
+        );
+        commits.append(QVariant::from(&value));
+    }
+    insert("commits", QVariant::from(&commits));
+    QVariant::from(&state)
+}
+
+fn set_history_state(mut backend: Pin<&mut ffi::HarknessBackend>, row: HistoryStateRow) {
+    let value = to_history(&row);
+    backend.as_mut().rust_mut().get_mut().history_state = Some(row);
+    backend.as_mut().set_history(value);
+}
+
+fn clear_history_state(mut backend: Pin<&mut ffi::HarknessBackend>) {
+    let rust = backend.as_mut().rust_mut().get_mut();
+    rust.next_history_request += 1;
+    rust.history_state = None;
+    backend.as_mut().set_history(empty_history());
+}
+
+#[derive(Clone, Debug)]
+enum ReviewSelection {
+    Staged,
+    Unstaged,
+    Commit { revision: String },
+    Branch { branch: String, base_branch: String },
+}
+
+#[derive(Clone, Debug)]
+struct ReviewTargetRecord {
+    target: harkness_core::DiffTarget,
+    title: String,
+    detail: String,
+}
+
+#[derive(Clone, Debug)]
+struct ReviewFileEntry {
+    id: String,
+    path: PathBuf,
+    file: harkness_core::FileDiff,
+}
+
+#[derive(Clone, Debug)]
+struct ReviewContextLine {
+    old_line: u32,
+    new_line: u32,
+    content: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct ReviewHunkState {
+    id: String,
+    before: Vec<ReviewContextLine>,
+    after: Vec<ReviewContextLine>,
+}
+
+#[derive(Clone, Debug)]
+struct ReviewLoadedFile {
+    id: String,
+    file: harkness_core::FileDiff,
+    hunks: Vec<ReviewHunkState>,
+    total_lines: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+struct ReviewStateRow {
+    project_id: String,
+    target: Option<ReviewTargetRecord>,
+    title: String,
+    detail: String,
+    files: Vec<ReviewFileEntry>,
+    selected_file_id: String,
+    loaded_file: Option<ReviewLoadedFile>,
+    loading: bool,
+    file_loading: bool,
+    error: String,
+    error_kind: String,
+}
+
+impl ReviewStateRow {
+    fn loading(project_id: String, title: String, detail: String) -> Self {
+        Self {
+            project_id,
+            target: None,
+            title,
+            detail,
+            files: Vec::new(),
+            selected_file_id: String::new(),
+            loaded_file: None,
+            loading: true,
+            file_loading: false,
+            error: String::new(),
+            error_kind: String::new(),
+        }
+    }
+
+    fn with_failure(mut self, failure: &GitFailure) -> Self {
+        self.loading = false;
+        self.file_loading = false;
+        self.error.clone_from(&failure.message);
+        self.error_kind.clone_from(&failure.kind);
+        self
+    }
+}
+
+fn review_path(file: &harkness_core::FileDiff) -> PathBuf {
+    file.new_path
+        .as_ref()
+        .or(file.old_path.as_ref())
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn prepare_review_target(
+    git: &harkness_core::GitService,
+    selection: ReviewSelection,
+) -> Result<ReviewTargetRecord, GitFailure> {
+    match selection {
+        ReviewSelection::Staged => Ok(ReviewTargetRecord {
+            target: harkness_core::DiffTarget::Staged,
+            title: "Staged changes".to_owned(),
+            detail: "HEAD against the index; context is pinned to recorded blobs".to_owned(),
+        }),
+        ReviewSelection::Unstaged => Ok(ReviewTargetRecord {
+            target: harkness_core::DiffTarget::Unstaged,
+            title: "Working-tree changes".to_owned(),
+            detail: "Index against the working tree; changed content refreshes if it becomes stale"
+                .to_owned(),
+        }),
+        ReviewSelection::Commit { revision } => {
+            let commit = git.resolve_revision(&revision).map_err(GitFailure::from)?;
+            let id = commit.to_string();
+            let short = id.chars().take(12).collect::<String>();
+            Ok(ReviewTargetRecord {
+                target: harkness_core::DiffTarget::Commit {
+                    revision: id.clone(),
+                    parent: None,
+                },
+                title: format!("Commit {short}"),
+                detail: format!("{id} against its first parent"),
+            })
+        }
+        ReviewSelection::Branch {
+            branch,
+            base_branch,
+        } => {
+            let branch_id = git.resolve_revision(&branch).map_err(GitFailure::from)?;
+            let base_id = git
+                .merge_base(&branch, &base_branch)
+                .map_err(GitFailure::from)?;
+            let branch_short = branch_id.to_string().chars().take(12).collect::<String>();
+            let base_short = base_id.to_string().chars().take(12).collect::<String>();
+            Ok(ReviewTargetRecord {
+                target: harkness_core::DiffTarget::Revisions {
+                    old_revision: base_id.to_string(),
+                    new_revision: branch_id.to_string(),
+                },
+                title: format!("{branch} against {base_branch}"),
+                detail: format!(
+                    "Pinned {branch_short} against merge-base {base_short}; only branch changes are shown"
+                ),
+            })
+        }
+    }
+}
+
+fn load_review_with_git(
+    git: &harkness_core::GitService,
+    project_id: String,
+    selection: ReviewSelection,
+    generation: u64,
+) -> Result<ReviewStateRow, GitFailure> {
+    let target = prepare_review_target(git, selection)?;
+    // A zero content budget asks core for the complete identity list while
+    // intentionally omitting every hunk. Opening a path makes the second,
+    // path-restricted request below, so a thousand-file review never eagerly
+    // builds a thousand line models.
+    let options = harkness_core::DiffOptions::default().with_max_total_bytes(0);
+    let files = git
+        .diff(target.target.clone(), &options)
+        .map_err(GitFailure::from)?
+        .into_iter()
+        .enumerate()
+        .map(|(index, file)| ReviewFileEntry {
+            id: format!("review-file-{generation}-{index}"),
+            path: review_path(&file),
+            file,
+        })
+        .collect();
+    Ok(ReviewStateRow {
+        project_id,
+        title: target.title.clone(),
+        detail: target.detail.clone(),
+        target: Some(target),
+        files,
+        selected_file_id: String::new(),
+        loaded_file: None,
+        loading: false,
+        file_loading: false,
+        error: String::new(),
+        error_kind: String::new(),
+    })
+}
+
+/// Selects the first changed path as part of opening a review target. The
+/// metadata pass remains bounded and only this one default selection receives
+/// a path-restricted content request.
+fn load_review_with_initial_file_with_git(
+    git: &harkness_core::GitService,
+    project_id: String,
+    selection: ReviewSelection,
+    review_generation: u64,
+    file_generation: u64,
+) -> Result<ReviewStateRow, GitFailure> {
+    let mut review = load_review_with_git(git, project_id, selection, review_generation)?;
+    let Some(entry) = review.files.first().cloned() else {
+        return Ok(review);
+    };
+    let target = review.target.as_ref().ok_or_else(|| GitFailure {
+        kind: "review_target_missing".to_owned(),
+        message: "The selected review target is no longer available".to_owned(),
+    })?;
+    let loaded = load_review_file_with_git(git, target, &entry, file_generation)?;
+    review.selected_file_id.clone_from(&entry.id);
+    review.loaded_file = Some(loaded);
+    Ok(review)
+}
+
+fn file_context_side(file: &harkness_core::FileDiff) -> harkness_core::FileSide {
+    if file.new_path.is_some() {
+        harkness_core::FileSide::New
+    } else {
+        harkness_core::FileSide::Old
+    }
+}
+
+fn hunk_side_coordinates(file: &harkness_core::FileDiff, hunk: &harkness_core::Hunk) -> (u32, u32) {
+    match file_context_side(file) {
+        harkness_core::FileSide::Old => (hunk.old_start, hunk.old_lines),
+        harkness_core::FileSide::New => (hunk.new_start, hunk.new_lines),
+        _ => (hunk.new_start, hunk.new_lines),
+    }
+}
+
+fn load_review_file_with_git(
+    git: &harkness_core::GitService,
+    target: &ReviewTargetRecord,
+    entry: &ReviewFileEntry,
+    generation: u64,
+) -> Result<ReviewLoadedFile, GitFailure> {
+    let options = harkness_core::DiffOptions::default()
+        .with_paths([entry.path.as_path()])
+        .with_intra_line_ranges(true);
+    let mut files = git
+        .diff(target.target.clone(), &options)
+        .map_err(GitFailure::from)?;
+    let file = files
+        .drain(..)
+        .find(|file| {
+            file.old_path.as_deref() == Some(entry.path.as_path())
+                || file.new_path.as_deref() == Some(entry.path.as_path())
+        })
+        .ok_or_else(|| GitFailure {
+            kind: "review_path_not_found".to_owned(),
+            message: format!(
+                "{} is no longer present in this review target",
+                entry.path.display()
+            ),
+        })?;
+
+    let total_lines = file.hunks.last().and_then(|hunk| {
+        git.file_context(&harkness_core::FileContextRequest::for_hunk(
+            &file,
+            hunk,
+            file_context_side(&file),
+            0,
+            0,
+        ))
+        .ok()
+        .and_then(|response| response.total_lines)
+    });
+    let hunks = file
+        .hunks
+        .iter()
+        .enumerate()
+        .map(|(index, _)| ReviewHunkState {
+            id: format!("review-hunk-{generation}-{index}"),
+            before: Vec::new(),
+            after: Vec::new(),
+        })
+        .collect();
+    Ok(ReviewLoadedFile {
+        id: entry.id.clone(),
+        file,
+        hunks,
+        total_lines,
+    })
+}
+
+fn empty_review() -> QVariant {
+    QVariant::from(&QMap::<QMapPair_QString_QVariant>::default())
+}
+
+fn review_content_summary(file: &harkness_core::FileDiff) -> String {
+    if let Some(omission) = &file.omission {
+        omission_summary(omission)
+    } else if file.binary {
+        "Binary file — textual review is unavailable.".to_owned()
+    } else if file.hunks.is_empty() {
+        "No textual hunks are available for this file.".to_owned()
+    } else {
+        String::new()
+    }
+}
+
+fn hunk_degradation_summary(hunk: &harkness_core::Hunk) -> String {
+    match hunk.intra_line_degradation.as_ref() {
+        Some(harkness_core::IntraLineDegradation::LineTooLong { limit }) => {
+            format!("Word emphasis unavailable — a line exceeds the {limit}-byte pairing limit.")
+        }
+        Some(harkness_core::IntraLineDegradation::PairingTooLarge { limit }) => {
+            format!("Word emphasis unavailable — pairing exceeds the {limit}-comparison limit.")
+        }
+        Some(_) => "Word emphasis unavailable for a named core limit.".to_owned(),
+        None => String::new(),
+    }
+}
+
+fn display_line_end(bytes: &[u8]) -> usize {
+    let without_newline = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    without_newline
+        .strip_suffix(b"\r")
+        .unwrap_or(without_newline)
+        .len()
+}
+
+fn to_text_segments(
+    bytes: &[u8],
+    ranges: Option<&[harkness_core::IntraLineRange]>,
+) -> QList<QVariant> {
+    let end = display_line_end(bytes);
+    let mut segments = QList::<QVariant>::default();
+    let mut push = |slice: &[u8], changed: bool| {
+        if slice.is_empty() {
+            return;
+        }
+        let mut value = QMap::<QMapPair_QString_QVariant>::default();
+        value.insert(
+            QString::from("text"),
+            QVariant::from(&QString::from(String::from_utf8_lossy(slice).as_ref())),
+        );
+        value.insert(QString::from("changed"), QVariant::from(&changed));
+        segments.append(QVariant::from(&value));
+    };
+
+    let Some(ranges) = ranges else {
+        push(&bytes[..end], false);
+        return segments;
+    };
+    let mut cursor = 0;
+    for range in ranges {
+        let start = range.start.min(end).max(cursor);
+        let range_end = range.end.min(end).max(start);
+        push(&bytes[cursor..start], false);
+        push(&bytes[start..range_end], true);
+        cursor = range_end;
+    }
+    push(&bytes[cursor..end], false);
+    segments
+}
+
+fn empty_review_side() -> QVariant {
+    let mut side = QMap::<QMapPair_QString_QVariant>::default();
+    side.insert(QString::from("present"), QVariant::from(&false));
+    QVariant::from(&side)
+}
+
+fn to_review_side(line: &harkness_core::DiffLine, number: Option<u32>) -> QVariant {
+    let (kind, marker) = diff_line_name(line.kind);
+    let mut side = QMap::<QMapPair_QString_QVariant>::default();
+    side.insert(QString::from("present"), QVariant::from(&true));
+    side.insert(
+        QString::from("line"),
+        QVariant::from(&number.map_or(0, bounded_i32)),
+    );
+    side.insert(QString::from("kind"), QVariant::from(&QString::from(kind)));
+    side.insert(
+        QString::from("marker"),
+        QVariant::from(&QString::from(marker)),
+    );
+    side.insert(
+        QString::from("segments"),
+        QVariant::from(&to_text_segments(
+            &line.content,
+            line.intra_line_ranges.as_deref(),
+        )),
+    );
+    QVariant::from(&side)
+}
+
+fn to_unified_review_line(line: &harkness_core::DiffLine) -> QVariant {
+    let (kind, marker) = diff_line_name(line.kind);
+    let mut value = QMap::<QMapPair_QString_QVariant>::default();
+    value.insert(
+        QString::from("oldLine"),
+        QVariant::from(&line.old_line_number.map_or(0, bounded_i32)),
+    );
+    value.insert(
+        QString::from("newLine"),
+        QVariant::from(&line.new_line_number.map_or(0, bounded_i32)),
+    );
+    value.insert(QString::from("kind"), QVariant::from(&QString::from(kind)));
+    value.insert(
+        QString::from("marker"),
+        QVariant::from(&QString::from(marker)),
+    );
+    value.insert(
+        QString::from("segments"),
+        QVariant::from(&to_text_segments(
+            &line.content,
+            line.intra_line_ranges.as_deref(),
+        )),
+    );
+    QVariant::from(&value)
+}
+
+fn to_review_line_row(hunk: &harkness_core::Hunk, index: usize) -> QVariant {
+    let line = &hunk.lines[index];
+    let partner = line
+        .paired_line_index
+        .and_then(|partner| hunk.lines.get(partner));
+    let split_hidden = matches!(line.kind, harkness_core::DiffLineKind::Addition)
+        && partner
+            .is_some_and(|partner| matches!(partner.kind, harkness_core::DiffLineKind::Deletion));
+    let (old, new) = match line.kind {
+        harkness_core::DiffLineKind::Context => (
+            to_review_side(line, line.old_line_number),
+            to_review_side(line, line.new_line_number),
+        ),
+        harkness_core::DiffLineKind::Deletion => (
+            to_review_side(line, line.old_line_number),
+            partner.map_or_else(empty_review_side, |partner| {
+                to_review_side(partner, partner.new_line_number)
+            }),
+        ),
+        harkness_core::DiffLineKind::Addition => {
+            if split_hidden {
+                (empty_review_side(), empty_review_side())
+            } else {
+                (
+                    empty_review_side(),
+                    to_review_side(line, line.new_line_number),
+                )
+            }
+        }
+        _ => (
+            to_review_side(line, line.old_line_number),
+            to_review_side(line, line.new_line_number),
+        ),
+    };
+    let mut row = QMap::<QMapPair_QString_QVariant>::default();
+    row.insert(
+        QString::from("type"),
+        QVariant::from(&QString::from("line")),
+    );
+    row.insert(QString::from("unified"), to_unified_review_line(line));
+    row.insert(QString::from("old"), old);
+    row.insert(QString::from("new"), new);
+    row.insert(QString::from("splitHidden"), QVariant::from(&split_hidden));
+    QVariant::from(&row)
+}
+
+fn to_context_side(content: &[u8], number: u32, present: bool) -> QVariant {
+    if !present {
+        return empty_review_side();
+    }
+    let mut side = QMap::<QMapPair_QString_QVariant>::default();
+    side.insert(QString::from("present"), QVariant::from(&true));
+    side.insert(QString::from("line"), QVariant::from(&bounded_i32(number)));
+    side.insert(
+        QString::from("kind"),
+        QVariant::from(&QString::from("context")),
+    );
+    side.insert(QString::from("marker"), QVariant::from(&QString::from(" ")));
+    side.insert(
+        QString::from("segments"),
+        QVariant::from(&to_text_segments(content, None)),
+    );
+    QVariant::from(&side)
+}
+
+fn to_context_row(line: &ReviewContextLine) -> QVariant {
+    let mut unified = QMap::<QMapPair_QString_QVariant>::default();
+    unified.insert(
+        QString::from("oldLine"),
+        QVariant::from(&bounded_i32(line.old_line)),
+    );
+    unified.insert(
+        QString::from("newLine"),
+        QVariant::from(&bounded_i32(line.new_line)),
+    );
+    unified.insert(
+        QString::from("kind"),
+        QVariant::from(&QString::from("context")),
+    );
+    unified.insert(QString::from("marker"), QVariant::from(&QString::from(" ")));
+    unified.insert(
+        QString::from("segments"),
+        QVariant::from(&to_text_segments(&line.content, None)),
+    );
+
+    let mut row = QMap::<QMapPair_QString_QVariant>::default();
+    row.insert(
+        QString::from("type"),
+        QVariant::from(&QString::from("line")),
+    );
+    row.insert(QString::from("unified"), QVariant::from(&unified));
+    row.insert(
+        QString::from("old"),
+        to_context_side(&line.content, line.old_line, line.old_line > 0),
+    );
+    row.insert(
+        QString::from("new"),
+        to_context_side(&line.content, line.new_line, line.new_line > 0),
+    );
+    row.insert(QString::from("splitHidden"), QVariant::from(&false));
+    QVariant::from(&row)
+}
+
+fn collapsed_review_row(hunk_id: &str, direction: &str, count: u32) -> QVariant {
+    let mut row = QMap::<QMapPair_QString_QVariant>::default();
+    row.insert(
+        QString::from("type"),
+        QVariant::from(&QString::from("collapsed")),
+    );
+    row.insert(
+        QString::from("hunkId"),
+        QVariant::from(&QString::from(hunk_id)),
+    );
+    row.insert(
+        QString::from("direction"),
+        QVariant::from(&QString::from(direction)),
+    );
+    row.insert(QString::from("count"), QVariant::from(&bounded_i32(count)));
+    QVariant::from(&row)
+}
+
+fn review_hunk_row(hunk_id: &str, hunk: &harkness_core::Hunk) -> QVariant {
+    let mut row = QMap::<QMapPair_QString_QVariant>::default();
+    row.insert(
+        QString::from("type"),
+        QVariant::from(&QString::from("hunk")),
+    );
+    row.insert(
+        QString::from("hunkId"),
+        QVariant::from(&QString::from(hunk_id)),
+    );
+    row.insert(
+        QString::from("header"),
+        QVariant::from(&QString::from(display_patch_bytes(&hunk.header).as_str())),
+    );
+    row.insert(
+        QString::from("degradation"),
+        QVariant::from(&QString::from(hunk_degradation_summary(hunk).as_str())),
+    );
+    QVariant::from(&row)
+}
+
+fn hidden_before(loaded: &ReviewLoadedFile, index: usize) -> u32 {
+    let (start, _) = hunk_side_coordinates(&loaded.file, &loaded.file.hunks[index]);
+    let prior_end = index.checked_sub(1).map_or(1, |prior| {
+        let (prior_start, prior_count) =
+            hunk_side_coordinates(&loaded.file, &loaded.file.hunks[prior]);
+        prior_start.saturating_add(prior_count)
+    });
+    start.saturating_sub(prior_end)
+}
+
+fn hidden_after(loaded: &ReviewLoadedFile, index: usize) -> u32 {
+    if index + 1 < loaded.file.hunks.len() {
+        return 0;
+    }
+    let Some(total_lines) = loaded.total_lines else {
+        return 0;
+    };
+    let (start, count) = hunk_side_coordinates(&loaded.file, &loaded.file.hunks[index]);
+    total_lines.saturating_sub(start.saturating_add(count).saturating_sub(1))
+}
+
+fn review_rows(loaded: &ReviewLoadedFile) -> QList<QVariant> {
+    let mut rows = QList::<QVariant>::default();
+    for (index, (hunk, state)) in loaded.file.hunks.iter().zip(&loaded.hunks).enumerate() {
+        let remaining_before = hidden_before(loaded, index)
+            .saturating_sub(u32::try_from(state.before.len()).unwrap_or(u32::MAX));
+        if remaining_before > 0 {
+            rows.append(collapsed_review_row(&state.id, "before", remaining_before));
+        }
+        for line in &state.before {
+            rows.append(to_context_row(line));
+        }
+        rows.append(review_hunk_row(&state.id, hunk));
+        for line_index in 0..hunk.lines.len() {
+            rows.append(to_review_line_row(hunk, line_index));
+        }
+        if index + 1 == loaded.file.hunks.len() {
+            for line in &state.after {
+                rows.append(to_context_row(line));
+            }
+            let remaining_after = hidden_after(loaded, index)
+                .saturating_sub(u32::try_from(state.after.len()).unwrap_or(u32::MAX));
+            if remaining_after > 0 {
+                rows.append(collapsed_review_row(&state.id, "after", remaining_after));
+            }
+        }
+    }
+    rows
+}
+
+fn to_review(row: &ReviewStateRow) -> QVariant {
+    let mut state = QMap::<QMapPair_QString_QVariant>::default();
+    let mut insert = |key: &str, value: QVariant| state.insert(QString::from(key), value);
+    insert(
+        "projectId",
+        QVariant::from(&QString::from(row.project_id.as_str())),
+    );
+    insert("title", QVariant::from(&QString::from(row.title.as_str())));
+    insert(
+        "detail",
+        QVariant::from(&QString::from(row.detail.as_str())),
+    );
+    insert("loading", QVariant::from(&row.loading));
+    insert("fileLoading", QVariant::from(&row.file_loading));
+    insert("error", QVariant::from(&QString::from(row.error.as_str())));
+    insert(
+        "errorKind",
+        QVariant::from(&QString::from(row.error_kind.as_str())),
+    );
+    insert(
+        "selectedFileId",
+        QVariant::from(&QString::from(row.selected_file_id.as_str())),
+    );
+
+    let mut files = QList::<QVariant>::default();
+    for entry in &row.files {
+        let mut value = QMap::<QMapPair_QString_QVariant>::default();
+        value.insert(
+            QString::from("fileId"),
+            QVariant::from(&QString::from(entry.id.as_str())),
+        );
+        value.insert(
+            QString::from("path"),
+            QVariant::from(&QString::from(display_diff_path(&entry.file).as_str())),
+        );
+        value.insert(
+            QString::from("change"),
+            QVariant::from(&QString::from(change_name(entry.file.change))),
+        );
+        value.insert(
+            QString::from("oldSize"),
+            QVariant::from(&QString::from(entry.file.old_size.to_string().as_str())),
+        );
+        value.insert(
+            QString::from("newSize"),
+            QVariant::from(&QString::from(entry.file.new_size.to_string().as_str())),
+        );
+        files.append(QVariant::from(&value));
+    }
+    insert("files", QVariant::from(&files));
+
+    let file = row.loaded_file.as_ref().map_or_else(
+        || QVariant::from(&QMap::<QMapPair_QString_QVariant>::default()),
+        |loaded| {
+            let mut value = QMap::<QMapPair_QString_QVariant>::default();
+            value.insert(
+                QString::from("fileId"),
+                QVariant::from(&QString::from(loaded.id.as_str())),
+            );
+            value.insert(
+                QString::from("path"),
+                QVariant::from(&QString::from(display_diff_path(&loaded.file).as_str())),
+            );
+            value.insert(
+                QString::from("summary"),
+                QVariant::from(&QString::from(
+                    review_content_summary(&loaded.file).as_str(),
+                )),
+            );
+            value.insert(QString::from("binary"), QVariant::from(&loaded.file.binary));
+            value.insert(
+                QString::from("hunkCount"),
+                QVariant::from(&i32::try_from(loaded.file.hunks.len()).unwrap_or(i32::MAX)),
+            );
+            value.insert(QString::from("rows"), QVariant::from(&review_rows(loaded)));
+            QVariant::from(&value)
+        },
+    );
+    insert("file", file);
+    QVariant::from(&state)
+}
+
+fn set_review_state(mut backend: Pin<&mut ffi::HarknessBackend>, row: ReviewStateRow) {
+    let value = to_review(&row);
+    backend.as_mut().rust_mut().get_mut().review_state = Some(row);
+    backend.as_mut().set_review(value);
+}
+
+fn clear_review_state(mut backend: Pin<&mut ffi::HarknessBackend>) {
+    let rust = backend.as_mut().rust_mut().get_mut();
+    rust.next_review_request += 1;
+    rust.next_review_file_request += 1;
+    rust.review_state = None;
+    backend.as_mut().set_review(empty_review());
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReviewContextDirection {
+    Before,
+    After,
+}
+
+impl ReviewContextDirection {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "before" => Some(Self::Before),
+            "after" => Some(Self::After),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ReviewContextOutcome {
+    Loaded(Box<ReviewLoadedFile>),
+    Stale,
+}
+
+fn context_omission_summary(omission: &harkness_core::FileContextOmission) -> String {
+    match omission {
+        harkness_core::FileContextOmission::FileTooLarge { limit } => {
+            format!("File too large — context exceeds the {limit}-byte display limit.")
+        }
+        harkness_core::FileContextOmission::ContentBudgetExhausted { limit } => {
+            format!("Context budget exhausted — the range exceeds {limit} bytes.")
+        }
+        _ => "Context omitted for a named core limit.".to_owned(),
+    }
+}
+
+fn translated_line(number: u32, from_start: u32, to_start: u32) -> u32 {
+    let translated = i64::from(number) + i64::from(to_start) - i64::from(from_start);
+    u32::try_from(translated).unwrap_or(0)
+}
+
+fn project_review_context(
+    response: &harkness_core::FileContextResponse,
+    hunk: &harkness_core::Hunk,
+    direction: ReviewContextDirection,
+) -> Vec<ReviewContextLine> {
+    let (side_start, side_count) = match response.side {
+        harkness_core::FileSide::Old => (hunk.old_start, hunk.old_lines),
+        harkness_core::FileSide::New => (hunk.new_start, hunk.new_lines),
+        _ => (hunk.new_start, hunk.new_lines),
+    };
+    let side_end = side_start.saturating_add(side_count);
+    response
+        .lines
+        .iter()
+        .filter_map(|line| {
+            let number = match response.side {
+                harkness_core::FileSide::Old => line.old_line_number,
+                harkness_core::FileSide::New => line.new_line_number,
+                _ => line.new_line_number,
+            }?;
+            let belongs = match direction {
+                ReviewContextDirection::Before => number < side_start,
+                ReviewContextDirection::After => number >= side_end,
+            };
+            if !belongs {
+                return None;
+            }
+            let (old_line, new_line) = match (response.side, direction) {
+                (harkness_core::FileSide::New, ReviewContextDirection::Before) => (
+                    translated_line(number, hunk.new_start, hunk.old_start),
+                    number,
+                ),
+                (harkness_core::FileSide::New, ReviewContextDirection::After) => (
+                    translated_line(
+                        number,
+                        hunk.new_start.saturating_add(hunk.new_lines),
+                        hunk.old_start.saturating_add(hunk.old_lines),
+                    ),
+                    number,
+                ),
+                (harkness_core::FileSide::Old, ReviewContextDirection::Before) => (
+                    number,
+                    translated_line(number, hunk.old_start, hunk.new_start),
+                ),
+                (harkness_core::FileSide::Old, ReviewContextDirection::After) => (
+                    number,
+                    translated_line(
+                        number,
+                        hunk.old_start.saturating_add(hunk.old_lines),
+                        hunk.new_start.saturating_add(hunk.new_lines),
+                    ),
+                ),
+                _ => (number, number),
+            };
+            Some(ReviewContextLine {
+                old_line,
+                new_line,
+                content: line.content.clone(),
+            })
+        })
+        .collect()
+}
+
+fn expand_review_context_with_git(
+    git: &harkness_core::GitService,
+    mut loaded: ReviewLoadedFile,
+    hunk_id: &str,
+    direction: ReviewContextDirection,
+) -> Result<ReviewContextOutcome, GitFailure> {
+    let Some(index) = loaded.hunks.iter().position(|hunk| hunk.id == hunk_id) else {
+        return Err(GitFailure {
+            kind: "review_hunk_not_found".to_owned(),
+            message: "The selected hunk is no longer available; reopen the file".to_owned(),
+        });
+    };
+    let available = match direction {
+        ReviewContextDirection::Before => hidden_before(&loaded, index),
+        ReviewContextDirection::After => hidden_after(&loaded, index),
+    };
+    let current = match direction {
+        ReviewContextDirection::Before => loaded.hunks[index].before.len(),
+        ReviewContextDirection::After => loaded.hunks[index].after.len(),
+    };
+    let requested = u32::try_from(current)
+        .unwrap_or(u32::MAX)
+        .saturating_add(REVIEW_CONTEXT_STEP)
+        .min(available);
+    if requested <= u32::try_from(current).unwrap_or(u32::MAX) {
+        return Ok(ReviewContextOutcome::Loaded(Box::new(loaded)));
+    }
+    let hunk = &loaded.file.hunks[index];
+    let (before, after) = match direction {
+        ReviewContextDirection::Before => (requested, 0),
+        ReviewContextDirection::After => (0, requested),
+    };
+    let request = harkness_core::FileContextRequest::for_hunk(
+        &loaded.file,
+        hunk,
+        file_context_side(&loaded.file),
+        before,
+        after,
+    );
+    let response = match git.file_context(&request) {
+        Ok(response) => response,
+        Err(harkness_core::GitError::StaleHunkSelection { .. }) => {
+            return Ok(ReviewContextOutcome::Stale);
+        }
+        Err(error) => return Err(GitFailure::from(error)),
+    };
+    if let Some(omission) = response.omission.as_ref() {
+        return Err(GitFailure {
+            kind: "review_context_omitted".to_owned(),
+            message: context_omission_summary(omission),
+        });
+    }
+    let lines = project_review_context(&response, hunk, direction);
+    loaded.total_lines = response.total_lines.or(loaded.total_lines);
+    match direction {
+        ReviewContextDirection::Before => loaded.hunks[index].before = lines,
+        ReviewContextDirection::After => loaded.hunks[index].after = lines,
+    }
+    Ok(ReviewContextOutcome::Loaded(Box::new(loaded)))
+}
+
+fn launch_review_request(
+    mut backend: Pin<&mut ffi::HarknessBackend>,
+    project_id: String,
+    selection: ReviewSelection,
+    loading_title: String,
+    loading_detail: String,
+) {
+    let Some((job_id, _cancellation)) = start_job(
+        backend.as_mut(),
+        "review",
+        &project_id,
+        "Load review",
+        false,
+    ) else {
+        return;
+    };
+    let (request_id, file_request) = {
+        let rust = backend.as_mut().rust_mut().get_mut();
+        rust.next_review_request += 1;
+        rust.next_review_file_request += 1;
+        (rust.next_review_request, rust.next_review_file_request)
+    };
+    set_review_state(
+        backend.as_mut(),
+        ReviewStateRow::loading(project_id.clone(), loading_title, loading_detail),
+    );
+    let qt_thread = backend.qt_thread();
+    std::thread::spawn(move || {
+        let result = load_project_git(&project_id).and_then(|git| {
+            load_review_with_initial_file_with_git(
+                &git,
+                project_id.clone(),
+                selection,
+                request_id,
+                file_request,
+            )
+        });
+        let _ = qt_thread.queue(move |mut backend| {
+            finish_job(backend.as_mut(), &job_id);
+            if backend.as_ref().rust().next_review_request != request_id
+                || backend.as_ref().rust().next_review_file_request != file_request
+                || opened_project_id(backend.as_ref().opened()).as_deref()
+                    != Some(project_id.as_str())
+            {
+                return;
+            }
+            match result {
+                Ok(row) => set_review_state(backend.as_mut(), row),
+                Err(failure) => {
+                    backend.as_mut().set_status(failure.message.as_str().into());
+                    let row = backend
+                        .as_ref()
+                        .rust()
+                        .review_state
+                        .clone()
+                        .unwrap_or_else(|| {
+                            ReviewStateRow::loading(project_id, "Review".to_owned(), String::new())
+                        })
+                        .with_failure(&failure);
+                    set_review_state(backend.as_mut(), row);
+                }
+            }
+        });
+    });
 }
 
 #[derive(Debug)]
@@ -1860,6 +3008,8 @@ impl ffi::HarknessBackend {
         self.as_mut().set_branches(QList::default());
         self.as_mut().set_worktrees(QList::default());
         clear_diff_state(self.as_mut());
+        clear_history_state(self.as_mut());
+        clear_review_state(self.as_mut());
     }
 
     fn refresh_branches(self: Pin<&mut Self>, project_id: &QString) {
@@ -1967,6 +3117,362 @@ impl ffi::HarknessBackend {
 
     fn clear_diff(self: Pin<&mut Self>) {
         clear_diff_state(self);
+    }
+
+    fn refresh_history(mut self: Pin<&mut Self>, project_id: &QString) {
+        let project_id = project_id.to_string();
+        let Some((job_id, cancellation)) = start_job(
+            self.as_mut(),
+            "history",
+            &project_id,
+            "Load commit history",
+            true,
+        ) else {
+            return;
+        };
+        let request_id = {
+            let rust = self.as_mut().rust_mut().get_mut();
+            rust.next_history_request += 1;
+            rust.next_history_request
+        };
+        let loading = HistoryStateRow::loading(project_id.clone());
+        set_history_state(self.as_mut(), loading.clone());
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let result = load_project_git(&project_id)
+                .and_then(|git| load_history_page_with_git(&git, None, &cancellation));
+            let _ = qt_thread.queue(move |mut backend| {
+                finish_job(backend.as_mut(), &job_id);
+                if backend.as_ref().rust().next_history_request != request_id
+                    || opened_project_id(backend.as_ref().opened()).as_deref()
+                        != Some(project_id.as_str())
+                {
+                    return;
+                }
+                match result {
+                    Ok((commits, next_cursor)) => {
+                        set_history_state(
+                            backend.as_mut(),
+                            HistoryStateRow {
+                                project_id,
+                                commits,
+                                next_cursor,
+                                loading: false,
+                                error: String::new(),
+                                error_kind: String::new(),
+                            },
+                        );
+                    }
+                    Err(failure) => {
+                        backend.as_mut().set_status(failure.message.as_str().into());
+                        set_history_state(backend.as_mut(), loading.with_failure(&failure));
+                    }
+                }
+            });
+        });
+    }
+
+    fn load_more_history(mut self: Pin<&mut Self>, project_id: &QString) {
+        let project_id = project_id.to_string();
+        let Some(mut current) = self.as_ref().rust().history_state.clone() else {
+            self.as_mut()
+                .set_status("Load commit history before requesting another page".into());
+            return;
+        };
+        if current.project_id != project_id {
+            self.as_mut()
+                .set_status("The visible history belongs to a different project".into());
+            return;
+        }
+        let Some(cursor) = current.next_cursor.clone() else {
+            return;
+        };
+        let Some((job_id, cancellation)) = start_job(
+            self.as_mut(),
+            "history",
+            &project_id,
+            "Load more history",
+            true,
+        ) else {
+            return;
+        };
+        let request_id = {
+            let rust = self.as_mut().rust_mut().get_mut();
+            rust.next_history_request += 1;
+            rust.next_history_request
+        };
+        current.loading = true;
+        current.error.clear();
+        current.error_kind.clear();
+        set_history_state(self.as_mut(), current.clone());
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let result = load_project_git(&project_id)
+                .and_then(|git| load_history_page_with_git(&git, Some(cursor), &cancellation));
+            let _ = qt_thread.queue(move |mut backend| {
+                finish_job(backend.as_mut(), &job_id);
+                if backend.as_ref().rust().next_history_request != request_id
+                    || opened_project_id(backend.as_ref().opened()).as_deref()
+                        != Some(project_id.as_str())
+                {
+                    return;
+                }
+                match result {
+                    Ok((commits, next_cursor)) => {
+                        let known = current
+                            .commits
+                            .iter()
+                            .map(|commit| commit.id.clone())
+                            .collect::<std::collections::HashSet<_>>();
+                        current.commits.extend(
+                            commits
+                                .into_iter()
+                                .filter(|commit| !known.contains(&commit.id)),
+                        );
+                        current.next_cursor = next_cursor;
+                        current.loading = false;
+                        set_history_state(backend.as_mut(), current);
+                    }
+                    Err(failure) => {
+                        backend.as_mut().set_status(failure.message.as_str().into());
+                        set_history_state(backend.as_mut(), current.with_failure(&failure));
+                    }
+                }
+            });
+        });
+    }
+
+    fn review_commit(mut self: Pin<&mut Self>, project_id: &QString, revision: &QString) {
+        let project_id = project_id.to_string();
+        let revision = revision.to_string().trim().to_owned();
+        if revision.is_empty() {
+            self.as_mut().set_status("Choose a commit to review".into());
+            return;
+        }
+        let short = revision.chars().take(12).collect::<String>();
+        launch_review_request(
+            self,
+            project_id,
+            ReviewSelection::Commit {
+                revision: revision.clone(),
+            },
+            format!("Commit {short}"),
+            revision,
+        );
+    }
+
+    fn review_branch(
+        mut self: Pin<&mut Self>,
+        project_id: &QString,
+        branch: &QString,
+        base_branch: &QString,
+    ) {
+        let project_id = project_id.to_string();
+        let branch = branch.to_string().trim().to_owned();
+        let base_branch = base_branch.to_string().trim().to_owned();
+        if branch.is_empty() || base_branch.is_empty() {
+            self.as_mut()
+                .set_status("Choose both a branch and a base branch to review".into());
+            return;
+        }
+        launch_review_request(
+            self,
+            project_id,
+            ReviewSelection::Branch {
+                branch: branch.clone(),
+                base_branch: base_branch.clone(),
+            },
+            format!("{branch} against {base_branch}"),
+            "Resolving the merge-base…".to_owned(),
+        );
+    }
+
+    fn review_working_changes(self: Pin<&mut Self>, project_id: &QString, staged: bool) {
+        launch_review_request(
+            self,
+            project_id.to_string(),
+            if staged {
+                ReviewSelection::Staged
+            } else {
+                ReviewSelection::Unstaged
+            },
+            if staged {
+                "Staged changes".to_owned()
+            } else {
+                "Working-tree changes".to_owned()
+            },
+            "Loading changed paths…".to_owned(),
+        );
+    }
+
+    fn load_review_file(mut self: Pin<&mut Self>, project_id: &QString, file_id: &QString) {
+        let project_id = project_id.to_string();
+        let file_id = file_id.to_string();
+        let Some(mut state) = self.as_ref().rust().review_state.clone() else {
+            self.as_mut()
+                .set_status("Open a review before choosing a file".into());
+            return;
+        };
+        if state.project_id != project_id {
+            self.as_mut()
+                .set_status("The visible review belongs to a different project".into());
+            return;
+        }
+        let Some(target) = state.target.clone() else {
+            self.as_mut()
+                .set_status("Wait for the review to finish loading".into());
+            return;
+        };
+        let Some(entry) = state
+            .files
+            .iter()
+            .find(|entry| entry.id == file_id)
+            .cloned()
+        else {
+            self.as_mut()
+                .set_status("The selected review file is no longer available".into());
+            return;
+        };
+        let Some((job_id, _cancellation)) = start_job(
+            self.as_mut(),
+            "review_file",
+            &project_id,
+            "Load review file",
+            false,
+        ) else {
+            return;
+        };
+        let (review_request, file_request) = {
+            let rust = self.as_mut().rust_mut().get_mut();
+            rust.next_review_file_request += 1;
+            (rust.next_review_request, rust.next_review_file_request)
+        };
+        state.selected_file_id.clone_from(&file_id);
+        state.loaded_file = None;
+        state.file_loading = true;
+        state.error.clear();
+        state.error_kind.clear();
+        set_review_state(self.as_mut(), state);
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let result = load_project_git(&project_id)
+                .and_then(|git| load_review_file_with_git(&git, &target, &entry, file_request));
+            let _ = qt_thread.queue(move |mut backend| {
+                finish_job(backend.as_mut(), &job_id);
+                if backend.as_ref().rust().next_review_request != review_request
+                    || backend.as_ref().rust().next_review_file_request != file_request
+                    || opened_project_id(backend.as_ref().opened()).as_deref()
+                        != Some(project_id.as_str())
+                {
+                    return;
+                }
+                let Some(mut state) = backend.as_ref().rust().review_state.clone() else {
+                    return;
+                };
+                match result {
+                    Ok(file) => {
+                        state.loaded_file = Some(file);
+                        state.file_loading = false;
+                        set_review_state(backend.as_mut(), state);
+                    }
+                    Err(failure) => {
+                        backend.as_mut().set_status(failure.message.as_str().into());
+                        set_review_state(backend.as_mut(), state.with_failure(&failure));
+                    }
+                }
+            });
+        });
+    }
+
+    fn expand_review_context(
+        mut self: Pin<&mut Self>,
+        project_id: &QString,
+        hunk_id: &QString,
+        direction: &QString,
+    ) {
+        let project_id = project_id.to_string();
+        let hunk_id = hunk_id.to_string();
+        let Some(direction) = ReviewContextDirection::parse(direction.to_string().as_str()) else {
+            self.as_mut()
+                .set_status("Choose context before or after the hunk".into());
+            return;
+        };
+        let Some(state) = self.as_ref().rust().review_state.clone() else {
+            self.as_mut().set_status("Open a review file first".into());
+            return;
+        };
+        if state.project_id != project_id {
+            self.as_mut()
+                .set_status("The visible review belongs to a different project".into());
+            return;
+        }
+        let Some(loaded) = state.loaded_file.clone() else {
+            self.as_mut().set_status("Open a review file first".into());
+            return;
+        };
+        if !loaded.hunks.iter().any(|hunk| hunk.id == hunk_id) {
+            self.as_mut()
+                .set_status("The selected hunk is no longer available".into());
+            return;
+        }
+        let Some((job_id, _cancellation)) = start_job(
+            self.as_mut(),
+            "review_context",
+            &project_id,
+            "Expand review context",
+            false,
+        ) else {
+            return;
+        };
+        let review_request = self.as_ref().rust().next_review_request;
+        let file_request = self.as_ref().rust().next_review_file_request;
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let result = load_project_git(&project_id)
+                .and_then(|git| expand_review_context_with_git(&git, loaded, &hunk_id, direction));
+            let _ = qt_thread.queue(move |mut backend| {
+                finish_job(backend.as_mut(), &job_id);
+                if backend.as_ref().rust().next_review_request != review_request
+                    || backend.as_ref().rust().next_review_file_request != file_request
+                    || opened_project_id(backend.as_ref().opened()).as_deref()
+                        != Some(project_id.as_str())
+                {
+                    return;
+                }
+                let Some(mut state) = backend.as_ref().rust().review_state.clone() else {
+                    return;
+                };
+                match result {
+                    Ok(ReviewContextOutcome::Loaded(file)) => {
+                        state.loaded_file = Some(*file);
+                        state.error.clear();
+                        state.error_kind.clear();
+                        set_review_state(backend.as_mut(), state);
+                    }
+                    Ok(ReviewContextOutcome::Stale) => {
+                        let file_id = state.selected_file_id.clone();
+                        backend.as_mut().set_status(
+                            "The file changed; refreshed the review before expanding context"
+                                .into(),
+                        );
+                        let project = QString::from(project_id.as_str());
+                        let file = QString::from(file_id.as_str());
+                        backend.as_mut().load_review_file(&project, &file);
+                    }
+                    Err(failure) => {
+                        state.error.clone_from(&failure.message);
+                        state.error_kind.clone_from(&failure.kind);
+                        backend.as_mut().set_status(failure.message.as_str().into());
+                        set_review_state(backend.as_mut(), state);
+                    }
+                }
+            });
+        });
+    }
+
+    fn clear_review(mut self: Pin<&mut Self>) {
+        clear_history_state(self.as_mut());
+        clear_review_state(self);
     }
 
     fn stage_path(mut self: Pin<&mut Self>, project_id: &QString, path_id: &QString) {
@@ -2610,12 +4116,14 @@ mod tests {
 
     use super::{
         BranchRow, GitStateRow, HarknessBackendRust, HunkAction, HunkMutationOutcome,
-        MAX_GUI_DIFF_LINES_PER_FILE, OpenedUpdate, ProjectRow, WorktreeLockAction, begin_job,
-        change_worktree_lock_with_service, empty_opened, end_job, file_content_summary,
-        load_diff_with_git, move_worktree_with_service, mutate_hunk_with_git, operation_outcome,
-        project_rows, register_path_selection, remove_worktree_with_service,
-        resolve_path_selection, to_branches, to_diff, to_git, to_jobs, to_map, to_projects,
-        update_job, worktree_base,
+        MAX_GUI_DIFF_LINES_PER_FILE, OpenedUpdate, ProjectRow, ReviewContextDirection,
+        ReviewContextOutcome, ReviewSelection, WorktreeLockAction, begin_job,
+        change_worktree_lock_with_service, empty_opened, end_job, expand_review_context_with_git,
+        file_content_summary, hidden_before, load_diff_with_git, load_history_page_with_git,
+        load_review_file_with_git, load_review_with_git, load_review_with_initial_file_with_git,
+        move_worktree_with_service, mutate_hunk_with_git, operation_outcome, project_rows,
+        register_path_selection, remove_worktree_with_service, resolve_path_selection, review_rows,
+        to_branches, to_diff, to_git, to_jobs, to_map, to_projects, update_job, worktree_base,
     };
 
     fn project(
@@ -2639,6 +4147,7 @@ mod tests {
         fs::write(root.join("README.md"), "fixture\n").unwrap();
         let mut index = repository.index().unwrap();
         index.add_path(Path::new("README.md")).unwrap();
+        index.write().unwrap();
         let tree_id = index.write_tree().unwrap();
         let tree = repository.find_tree(tree_id).unwrap();
         let signature = Signature::now("Harkness Tests", "tests@example.com").unwrap();
@@ -3248,6 +4757,368 @@ mod tests {
             .and_then(|value| value.value::<cxx_qt_lib::QList<QVariant>>())
             .expect("diff hunks should flatten to a QVariantList");
         assert!(hunks.is_empty());
+    }
+
+    #[test]
+    fn review_history_uses_exactly_one_core_cursor_page_at_a_time() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("history-repository");
+        initialize_repository(&root);
+        for revision in 1..=52 {
+            commit_file(
+                &root,
+                Path::new("history.txt"),
+                format!("revision {revision}\n").as_str(),
+                format!("revision {revision}").as_str(),
+            );
+        }
+        let git = harkness_core::GitService::new(&root, fixture.path().join("history-locks"));
+        let cancellation = harkness_core::Cancellation::default();
+
+        let (first, cursor) = load_history_page_with_git(&git, None, &cancellation).unwrap();
+        assert_eq!(first.len(), 50);
+        assert_eq!(first[0].summary, "revision 52");
+        let cursor = cursor.expect("53 commits require a continuation");
+
+        // Advancing HEAD cannot move the cursor-anchored continuation.
+        commit_file(
+            &root,
+            Path::new("history.txt"),
+            "revision after cursor\n",
+            "revision after cursor",
+        );
+        let (second, cursor) =
+            load_history_page_with_git(&git, Some(cursor), &cancellation).unwrap();
+        assert_eq!(second.len(), 3);
+        assert!(cursor.is_none());
+        assert!(
+            second
+                .iter()
+                .all(|commit| commit.summary != "revision after cursor")
+        );
+        let mut ids = first
+            .iter()
+            .map(|commit| commit.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(second.iter().all(|commit| ids.insert(&commit.id)));
+    }
+
+    #[test]
+    fn branch_review_pins_the_merge_base_and_excludes_base_only_changes() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("branch-review-repository");
+        initialize_repository(&root);
+        let repository = Repository::open(&root).unwrap();
+        let common = repository.head().unwrap().peel_to_commit().unwrap();
+        let base_branch = repository.head().unwrap().shorthand().unwrap().to_owned();
+        repository.branch("topic", &common, false).unwrap();
+        drop(common);
+        drop(repository);
+
+        commit_file(
+            &root,
+            Path::new("base-only.txt"),
+            "base moved\n",
+            "advance base",
+        );
+        let repository = Repository::open(&root).unwrap();
+        repository.set_head("refs/heads/topic").unwrap();
+        repository
+            .checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        drop(repository);
+        commit_file(
+            &root,
+            Path::new("topic-only.txt"),
+            "topic change\n",
+            "change topic",
+        );
+
+        let git = harkness_core::GitService::new(&root, fixture.path().join("branch-locks"));
+        let review = load_review_with_git(
+            &git,
+            "project-1".to_owned(),
+            ReviewSelection::Branch {
+                branch: "topic".to_owned(),
+                base_branch,
+            },
+            4,
+        )
+        .unwrap();
+
+        assert!(review.detail.contains("merge-base"));
+        assert_eq!(review.files.len(), 1);
+        assert_eq!(review.files[0].path, Path::new("topic-only.txt"));
+        assert!(review.files[0].file.hunks.is_empty());
+        assert!(matches!(
+            review.files[0].file.omission.as_ref(),
+            Some(harkness_core::DiffOmission::ContentBudgetExhausted { limit: 0 })
+        ));
+    }
+
+    #[test]
+    fn review_file_loads_core_intra_line_ranges_only_on_demand() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("word-review-repository");
+        initialize_repository(&root);
+        let path = Path::new("src/word.rs");
+        commit_file(
+            &root,
+            path,
+            "fn example() { let value = old; }\n",
+            "add old word",
+        );
+        commit_file(
+            &root,
+            path,
+            "fn example() { let value = new; }\n",
+            "replace one word",
+        );
+        let repository = Repository::open(&root).unwrap();
+        let revision = repository.head().unwrap().target().unwrap().to_string();
+        let git = harkness_core::GitService::new(&root, fixture.path().join("word-locks"));
+        let review = load_review_with_git(
+            &git,
+            "project-1".to_owned(),
+            ReviewSelection::Commit { revision },
+            5,
+        )
+        .unwrap();
+        assert_eq!(review.files.len(), 1);
+        assert!(review.loaded_file.is_none());
+        assert!(review.files[0].file.hunks.is_empty());
+
+        let target = review.target.as_ref().unwrap();
+        let loaded = load_review_file_with_git(&git, target, &review.files[0], 6).unwrap();
+        let deletion = loaded.file.hunks[0]
+            .lines
+            .iter()
+            .find(|line| matches!(line.kind, harkness_core::DiffLineKind::Deletion))
+            .unwrap();
+        let addition = loaded.file.hunks[0]
+            .lines
+            .iter()
+            .find(|line| matches!(line.kind, harkness_core::DiffLineKind::Addition))
+            .unwrap();
+        let changed = |line: &harkness_core::DiffLine| {
+            line.intra_line_ranges
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|range| {
+                    String::from_utf8_lossy(&line.content[range.start..range.end]).into_owned()
+                })
+                .collect::<String>()
+        };
+        assert_eq!(changed(deletion), "old");
+        assert_eq!(changed(addition), "new");
+    }
+
+    #[test]
+    fn opening_a_review_selects_and_loads_only_the_first_changed_file() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("default-review-file-repository");
+        initialize_repository(&root);
+        let first_path = Path::new("first.txt");
+        let second_path = Path::new("second.txt");
+        fs::write(root.join(first_path), "first old\n").unwrap();
+        fs::write(root.join(second_path), "second old\n").unwrap();
+        let repository = Repository::open(&root).unwrap();
+        let mut index = repository.index().unwrap();
+        index.add_path(first_path).unwrap();
+        index.add_path(second_path).unwrap();
+        index.write().unwrap();
+        drop(index);
+        drop(repository);
+        commit_index(&root, "add review files");
+
+        fs::write(root.join(first_path), "first new\n").unwrap();
+        fs::write(root.join(second_path), "second new\n").unwrap();
+        let repository = Repository::open(&root).unwrap();
+        let mut index = repository.index().unwrap();
+        index.add_path(first_path).unwrap();
+        index.add_path(second_path).unwrap();
+        index.write().unwrap();
+        drop(index);
+        drop(repository);
+        let revision = commit_index(&root, "change both review files").to_string();
+
+        let git = harkness_core::GitService::new(&root, fixture.path().join("default-locks"));
+        let review = load_review_with_initial_file_with_git(
+            &git,
+            "project-1".to_owned(),
+            ReviewSelection::Commit { revision },
+            7,
+            8,
+        )
+        .unwrap();
+
+        assert_eq!(review.files.len(), 2);
+        assert_eq!(review.selected_file_id, review.files[0].id);
+        let loaded = review.loaded_file.as_ref().unwrap();
+        assert_eq!(loaded.id, review.files[0].id);
+        assert_eq!(loaded.file.new_path, review.files[0].file.new_path);
+        assert!(!loaded.file.hunks.is_empty());
+        assert!(review.files.iter().all(|entry| entry.file.hunks.is_empty()));
+    }
+
+    #[test]
+    fn thousand_file_review_keeps_only_identity_rows_until_a_file_opens() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("large-review-repository");
+        initialize_repository(&root);
+        let repository = Repository::open(&root).unwrap();
+        let mut index = repository.index().unwrap();
+        for number in 0..1_000 {
+            let path = PathBuf::from(format!("files/file-{number:04}.txt"));
+            let full_path = root.join(&path);
+            fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+            fs::write(&full_path, format!("file {number}\n")).unwrap();
+            index.add_path(&path).unwrap();
+        }
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repository.find_tree(tree_id).unwrap();
+        let parent = repository.head().unwrap().peel_to_commit().unwrap();
+        let signature = Signature::now("Harkness Tests", "tests@example.com").unwrap();
+        let revision = repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "add one thousand files",
+                &tree,
+                &[&parent],
+            )
+            .unwrap()
+            .to_string();
+        drop(tree);
+        drop(parent);
+        drop(repository);
+
+        let git = harkness_core::GitService::new(&root, fixture.path().join("large-locks"));
+        let review = load_review_with_git(
+            &git,
+            "project-1".to_owned(),
+            ReviewSelection::Commit { revision },
+            7,
+        )
+        .unwrap();
+        assert_eq!(review.files.len(), 1_000);
+        assert!(review.loaded_file.is_none());
+        assert!(review.files.iter().all(|entry| entry.file.hunks.is_empty()));
+    }
+
+    #[test]
+    fn context_expansion_keeps_the_original_review_hunk_identity() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("context-review-repository");
+        initialize_repository(&root);
+        let path = Path::new("context.txt");
+        let original = (1..=100)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        commit_file(&root, path, &original, "add context fixture");
+        let changed = original.replace("line 50\n", "line fifty\n");
+        commit_file(&root, path, &changed, "change middle line");
+        let repository = Repository::open(&root).unwrap();
+        let revision = repository.head().unwrap().target().unwrap().to_string();
+        let git = harkness_core::GitService::new(&root, fixture.path().join("context-locks"));
+        let review = load_review_with_git(
+            &git,
+            "project-1".to_owned(),
+            ReviewSelection::Commit { revision },
+            8,
+        )
+        .unwrap();
+        let loaded =
+            load_review_file_with_git(&git, review.target.as_ref().unwrap(), &review.files[0], 9)
+                .unwrap();
+        assert_eq!(loaded.hunks.len(), 1);
+        assert!(hidden_before(&loaded, 0) > 20);
+        let hunk_id = loaded.hunks[0].id.clone();
+
+        let ReviewContextOutcome::Loaded(expanded) =
+            expand_review_context_with_git(&git, loaded, &hunk_id, ReviewContextDirection::Before)
+                .unwrap()
+        else {
+            panic!("immutable commit context cannot become stale");
+        };
+        assert_eq!(expanded.hunks[0].id, hunk_id);
+        assert_eq!(expanded.hunks[0].before.len(), 20);
+        assert!(
+            review_rows(&expanded).len()
+                > isize::try_from(expanded.file.hunks[0].lines.len()).unwrap()
+        );
+    }
+
+    #[test]
+    fn working_change_context_is_blob_stable_or_refreshably_stale() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("working-context-repository");
+        initialize_repository(&root);
+        let path = Path::new("working.txt");
+        let original = (1..=80)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        commit_file(&root, path, &original, "add working fixture");
+        let staged_content = original.replace("line 40\n", "line forty staged\n");
+        fs::write(root.join(path), &staged_content).unwrap();
+        let repository = Repository::open(&root).unwrap();
+        let mut index = repository.index().unwrap();
+        index.add_path(path).unwrap();
+        index.write().unwrap();
+        drop(index);
+        drop(repository);
+
+        let git = harkness_core::GitService::new(&root, fixture.path().join("working-locks"));
+        let staged =
+            load_review_with_git(&git, "project-1".to_owned(), ReviewSelection::Staged, 10)
+                .unwrap();
+        let staged_file =
+            load_review_file_with_git(&git, staged.target.as_ref().unwrap(), &staged.files[0], 11)
+                .unwrap();
+        let staged_hunk = staged_file.hunks[0].id.clone();
+
+        let unstaged_content = staged_content.replace("line 60\n", "line sixty unstaged\n");
+        fs::write(root.join(path), &unstaged_content).unwrap();
+        assert!(matches!(
+            expand_review_context_with_git(
+                &git,
+                staged_file,
+                &staged_hunk,
+                ReviewContextDirection::Before,
+            )
+            .unwrap(),
+            ReviewContextOutcome::Loaded(_)
+        ));
+
+        let unstaged =
+            load_review_with_git(&git, "project-1".to_owned(), ReviewSelection::Unstaged, 12)
+                .unwrap();
+        let unstaged_file = load_review_file_with_git(
+            &git,
+            unstaged.target.as_ref().unwrap(),
+            &unstaged.files[0],
+            13,
+        )
+        .unwrap();
+        let unstaged_hunk = unstaged_file.hunks[0].id.clone();
+        fs::write(
+            root.join(path),
+            unstaged_content.replace("line 70\n", "line seventy newer\n"),
+        )
+        .unwrap();
+        assert!(matches!(
+            expand_review_context_with_git(
+                &git,
+                unstaged_file,
+                &unstaged_hunk,
+                ReviewContextDirection::Before,
+            )
+            .unwrap(),
+            ReviewContextOutcome::Stale
+        ));
     }
 
     #[test]
