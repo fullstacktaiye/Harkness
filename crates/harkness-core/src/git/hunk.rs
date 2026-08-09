@@ -79,6 +79,34 @@ impl HunkSelection {
         }
     }
 
+    /// Reconstructs a selection carried across a serialization boundary.
+    ///
+    /// The values are intentionally the same identity fields emitted by a
+    /// [`FileDiff`] and its [`Hunk`]. They remain untrusted until staging
+    /// recomputes the diff and validates every value under the repository lock.
+    #[must_use]
+    pub fn from_parts(
+        old_path: Option<PathBuf>,
+        new_path: Option<PathBuf>,
+        old_blob_id: impl Into<String>,
+        new_blob_id: impl Into<String>,
+        context_lines: u32,
+        old_range: (u32, u32),
+        new_range: (u32, u32),
+    ) -> Self {
+        Self {
+            old_path,
+            new_path,
+            old_blob_id: old_blob_id.into(),
+            new_blob_id: new_blob_id.into(),
+            context_lines,
+            old_start: old_range.0,
+            old_lines: old_range.1,
+            new_start: new_range.0,
+            new_lines: new_range.1,
+        }
+    }
+
     /// The path callers should normally show in an error or selection list.
     #[must_use]
     pub fn path(&self) -> Option<&Path> {

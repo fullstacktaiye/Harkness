@@ -6,6 +6,7 @@ use std::{
     process::{Command, Stdio},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use git2::{Repository, Signature};
 use harkness_core::{Project, ProjectService};
 use serde_json::{Value, json};
@@ -545,6 +546,24 @@ fn git_and_worktree_commands_round_trip_end_to_end_through_json() {
 
     let moved_parent = fixture.path().join("cli-moved-worktrees");
     fs::create_dir(&moved_parent).unwrap();
+    let occupied_checkout = moved_parent.join("occupied");
+    fs::create_dir(&occupied_checkout).unwrap();
+    let occupied_move = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "worktree",
+            "move",
+            occupied_checkout.to_str().unwrap(),
+            "--project",
+            &worktree_id,
+        ],
+    );
+    assert_eq!(occupied_move.status.code(), Some(5));
+    assert_eq!(
+        json_output(&occupied_move)["error"]["kind"],
+        "worktree_destination_exists"
+    );
     let requested_checkout = moved_parent.join("checkout");
     let moved = harkness(
         &data_dir,
@@ -978,6 +997,157 @@ fn git_and_worktree_commands_round_trip_end_to_end_through_json() {
 }
 
 #[test]
+fn structured_diff_reports_both_sides_binary_renames_and_lossless_lines() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("diff-project");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    fs::write(root.join("staged.txt"), b"staged before\n").unwrap();
+    fs::write(root.join("unstaged.txt"), b"unstaged before\n").unwrap();
+    fs::write(root.join("binary.bin"), b"before\0bytes").unwrap();
+    fs::write(root.join("old-name.txt"), b"rename me\n").unwrap();
+    fs::write(root.join("encoded.txt"), b"before\xff\n").unwrap();
+    commit_all(&repository, "prepare diff fixture");
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+
+    fs::write(root.join("staged.txt"), b"staged after\n").unwrap();
+    run_git(&root, &["add", "--", "staged.txt"]);
+    fs::write(root.join("unstaged.txt"), b"unstaged after\n").unwrap();
+    fs::write(root.join("binary.bin"), b"after\0bytes").unwrap();
+    fs::rename(root.join("old-name.txt"), root.join("new-name.txt")).unwrap();
+    run_git(&root, &["add", "--", "old-name.txt", "new-name.txt"]);
+    fs::write(root.join("encoded.txt"), b"after\xfe\n").unwrap();
+
+    let output = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--project",
+            &project.id.to_string(),
+        ],
+    );
+
+    assert_success(&output);
+    assert!(output.stderr.is_empty());
+    let body = json_output(&output);
+    assert_envelope(&body, "success", true);
+    let files = body["data"]["files"].as_array().unwrap();
+    assert!(files.iter().any(|file| {
+        file["target"] == "staged" && file["new_path"] == "staged.txt" && file["binary"] == false
+    }));
+    assert!(files.iter().any(|file| {
+        file["target"] == "unstaged"
+            && file["new_path"] == "unstaged.txt"
+            && file["binary"] == false
+    }));
+    let binary = files
+        .iter()
+        .find(|file| file["new_path"] == "binary.bin")
+        .expect("binary diff is present");
+    assert_eq!(binary["binary"], true);
+    assert!(binary["hunks"].as_array().unwrap().is_empty());
+    assert!(files.iter().any(|file| {
+        file["change"] == "renamed"
+            && file["old_path"] == "old-name.txt"
+            && file["new_path"] == "new-name.txt"
+    }));
+
+    let encoded = files
+        .iter()
+        .find(|file| file["new_path"] == "encoded.txt")
+        .expect("non-UTF-8 diff is present");
+    let encoded_lines = encoded["hunks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|hunk| hunk["lines"].as_array().unwrap())
+        .filter(|line| line["content_encoding"] == "base64")
+        .map(|line| BASE64.decode(line["content"].as_str().unwrap()).unwrap())
+        .collect::<Vec<_>>();
+    assert!(encoded_lines.contains(&b"before\xff\n".to_vec()));
+    assert!(encoded_lines.contains(&b"after\xfe\n".to_vec()));
+}
+
+#[test]
+fn diff_hunk_flags_stage_unstage_and_refuse_a_stale_selection() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("hunk-project");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    let original = b"one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nfourteen\nfifteen\n";
+    let changed = b"one\nTWO\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nFOURTEEN\nfifteen\n";
+    fs::write(root.join("tracked.txt"), original).unwrap();
+    commit_all(&repository, "prepare hunk fixture");
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+    fs::write(root.join("tracked.txt"), changed).unwrap();
+
+    let unstaged = diff_file(&data_dir, &project_id, "--unstaged", "tracked.txt");
+    assert_eq!(unstaged["hunks"].as_array().unwrap().len(), 2);
+    let stage_arguments = hunk_arguments("stage", &project_id, &unstaged, 0);
+    let staged = harkness_owned(&data_dir, &stage_arguments);
+    assert_success(&staged);
+
+    let status = harkness(
+        &data_dir,
+        &["--json", "git", "status", "--project", &project_id],
+    );
+    let tracked = json_output(&status)["data"]["status"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == "tracked.txt")
+        .cloned()
+        .unwrap();
+    assert_eq!(tracked["staged"], "modified");
+    assert_eq!(tracked["unstaged"], "modified");
+
+    let staged_file = diff_file(&data_dir, &project_id, "--staged", "tracked.txt");
+    let unstage_arguments = hunk_arguments("unstage", &project_id, &staged_file, 0);
+    let unstaged_again = harkness_owned(&data_dir, &unstage_arguments);
+    assert_success(&unstaged_again);
+    let staged_after_unstage = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--staged",
+            "--project",
+            &project_id,
+        ],
+    );
+    assert!(
+        json_output(&staged_after_unstage)["data"]["files"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    assert_success(&harkness_owned(&data_dir, &stage_arguments));
+    fs::write(
+        root.join("tracked.txt"),
+        b"one\nTWO AGAIN\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nFOURTEEN\nfifteen\n",
+    )
+    .unwrap();
+    let stale = harkness_owned(&data_dir, &stage_arguments);
+    assert_eq!(stale.status.code(), Some(3));
+    let stale_body = json_output(&stale);
+    assert_eq!(stale_body["error"]["kind"], "stale_hunk_selection");
+    assert_eq!(stale_body["error"]["details"]["path"], "tracked.txt");
+}
+
+#[test]
 fn selector_help_is_exposed_only_where_it_is_accepted() {
     let fixture = TempDir::new().unwrap();
     let list_help = harkness(fixture.path(), &["project", "list", "--help"]);
@@ -1005,6 +1175,31 @@ fn selector_help_is_exposed_only_where_it_is_accepted() {
 }
 
 #[test]
+fn new_command_help_documents_diff_hunks_and_lock_guardrails() {
+    let fixture = TempDir::new().unwrap();
+    let diff_help =
+        String::from_utf8(harkness(fixture.path(), &["git", "diff", "--help"]).stdout).unwrap();
+    assert!(diff_help.contains("byte-preserving"));
+    assert!(diff_help.contains("--max-file-size"));
+    assert!(diff_help.contains("--context-lines"));
+
+    let stage_help =
+        String::from_utf8(harkness(fixture.path(), &["git", "stage", "--help"]).stdout).unwrap();
+    assert!(stage_help.contains("stale diff identities are refused"));
+    assert!(stage_help.contains("--old-blob-id"));
+    assert!(stage_help.contains("--new-lines"));
+
+    let remove_help =
+        String::from_utf8(harkness(fixture.path(), &["worktree", "remove", "--help"]).stdout)
+            .unwrap();
+    assert!(remove_help.contains("never bypasses a worktree lock"));
+    let lock_help =
+        String::from_utf8(harkness(fixture.path(), &["worktree", "lock", "--help"]).stdout)
+            .unwrap();
+    assert!(lock_help.contains("there is no force bypass"));
+}
+
+#[test]
 fn json_detection_ignores_a_literal_after_the_argument_terminator() {
     let fixture = TempDir::new().unwrap();
     let output = harkness(
@@ -1017,7 +1212,7 @@ fn json_detection_ignores_a_literal_after_the_argument_terminator() {
 }
 
 /// The lock reason has to reach the wire and come back, and the state
-/// refusals have to carry conflict exit codes rather than a generic failure.
+/// refusals have to carry their deliberate refusal or conflict exit codes.
 #[test]
 fn worktree_lock_and_unlock_round_trip_through_the_json_contract() {
     let fixture = TempDir::new().unwrap();
@@ -1045,6 +1240,13 @@ fn worktree_lock_and_unlock_round_trip_through_the_json_contract() {
         .as_str()
         .unwrap()
         .to_owned();
+
+    let missing_reason = harkness(
+        &data_dir,
+        &["--json", "worktree", "lock", "--project", &worktree_id],
+    );
+    assert_eq!(missing_reason.status.code(), Some(2));
+    assert_eq!(json_output(&missing_reason)["error"]["kind"], "usage_error");
 
     let blank = harkness(
         &data_dir,
@@ -1129,8 +1331,12 @@ fn worktree_lock_and_unlock_round_trip_through_the_json_contract() {
             "--force",
         ],
     );
-    assert_eq!(forced.status.code(), Some(5));
+    assert_eq!(forced.status.code(), Some(3));
     assert_eq!(json_output(&forced)["error"]["kind"], "worktree_locked");
+    assert_eq!(
+        json_output(&forced)["error"]["details"]["reason"],
+        "agent is still working"
+    );
 
     let replaced = harkness(
         &data_dir,
@@ -1532,6 +1738,64 @@ fn ctrl_c_cancels_fetch_with_exit_130_and_kills_its_process_group() {
     );
 }
 
+fn diff_file(data_dir: &Path, project_id: &str, target: &str, path: &str) -> Value {
+    let output = harkness(
+        data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            target,
+            path,
+            "--project",
+            project_id,
+        ],
+    );
+    assert_success(&output);
+    json_output(&output)["data"]["files"]
+        .as_array()
+        .unwrap()
+        .first()
+        .cloned()
+        .expect("the requested path has a diff")
+}
+
+fn hunk_arguments(command: &str, project_id: &str, file: &Value, hunk_index: usize) -> Vec<String> {
+    let hunk = &file["hunks"][hunk_index];
+    let mut arguments = vec![
+        "--json".to_owned(),
+        "git".to_owned(),
+        command.to_owned(),
+        "--hunk".to_owned(),
+        "--project".to_owned(),
+        project_id.to_owned(),
+    ];
+    for (flag, value) in [
+        ("--old-path", &file["old_path"]),
+        ("--new-path", &file["new_path"]),
+    ] {
+        if let Some(value) = value.as_str() {
+            arguments.extend([flag.to_owned(), value.to_owned()]);
+        }
+    }
+    for (flag, value) in [
+        ("--old-blob-id", &file["old_blob_id"]),
+        ("--new-blob-id", &file["new_blob_id"]),
+        ("--context-lines", &file["context_lines"]),
+        ("--old-start", &hunk["old_start"]),
+        ("--old-lines", &hunk["old_lines"]),
+        ("--new-start", &hunk["new_start"]),
+        ("--new-lines", &hunk["new_lines"]),
+    ] {
+        let value = value
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| value.as_u64().unwrap().to_string());
+        arguments.extend([flag.to_owned(), value]);
+    }
+    arguments
+}
+
 fn initialize_repository(root: &Path) {
     fs::create_dir_all(root).unwrap();
     let repository = Repository::init(root).unwrap();
@@ -1623,6 +1887,14 @@ fn write_catalog(data_dir: &Path, projects: Vec<Value>) {
 }
 
 fn harkness(data_dir: &Path, arguments: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_harkness"))
+        .env("HARKNESS_DATA_DIR", data_dir)
+        .args(arguments)
+        .output()
+        .expect("harkness command should start")
+}
+
+fn harkness_owned(data_dir: &Path, arguments: &[String]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_harkness"))
         .env("HARKNESS_DATA_DIR", data_dir)
         .args(arguments)

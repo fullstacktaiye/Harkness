@@ -9,14 +9,16 @@ use std::{
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use clap::{
     ArgGroup, Args, Parser, Subcommand,
     error::{Error as ClapError, ErrorKind},
 };
 use harkness_core::{
     Branch, BranchCheckout, BranchKind, BranchListOptions, Cancellation, CommitOptions,
-    CommitOutcome, CreateBranchOptions, DetailedStatus, FetchOptions, FetchOutcome, FileChange,
-    GitError, GitStatus, HeadState, PendingOperation, Project, ProjectError, ProjectSelector,
+    CommitOutcome, CreateBranchOptions, DetailedStatus, DiffLine, DiffLineKind, DiffOmission,
+    DiffOptions, DiffTarget, FetchOptions, FetchOutcome, FileChange, FileDiff, GitError, GitStatus,
+    HeadState, Hunk, HunkSelection, PendingOperation, Project, ProjectError, ProjectSelector,
     ProjectService, ProjectSource, PullOptions, PullOutcome, PullStrategy, PushOptions,
     PushOutcome, RefUpdate, StageOutcome, StagePathResult, StatusRefreshOutcome, UpstreamStatus,
     Worktree, WorktreeBase,
@@ -147,7 +149,7 @@ enum WorktreeCommand {
     Remove {
         #[command(flatten)]
         selection: ProjectSelection,
-        /// Discard uncommitted changes in the worktree.
+        /// Discard uncommitted changes. This never bypasses a worktree lock.
         #[arg(long)]
         force: bool,
     },
@@ -159,7 +161,7 @@ enum WorktreeCommand {
         #[arg(value_name = "DESTINATION")]
         destination: PathBuf,
     },
-    /// Protect a Harkness-managed linked worktree from removal and pruning.
+    /// Protect a worktree from move, removal, and pruning; there is no force bypass.
     Lock {
         #[command(flatten)]
         selection: ProjectSelection,
@@ -187,6 +189,8 @@ enum GitCommand {
         #[arg(long)]
         paths: bool,
     },
+    /// Inspect structured, byte-preserving changes; raw patch text is never emitted.
+    Diff(DiffArguments),
     /// Update local remote-tracking refs.
     Fetch {
         #[command(flatten)]
@@ -222,13 +226,7 @@ enum GitCommand {
     /// Add paths to the index.
     Stage(StageArguments),
     /// Remove paths from the index without changing the working tree.
-    Unstage {
-        #[command(flatten)]
-        selection: ProjectSelection,
-        /// Repository-relative or absolute paths to unstage.
-        #[arg(required = true, value_name = "PATH")]
-        paths: Vec<PathBuf>,
-    },
+    Unstage(UnstageArguments),
     /// Create a commit from the index.
     Commit {
         #[command(flatten)]
@@ -310,11 +308,140 @@ struct StageArguments {
     #[command(flatten)]
     selection: ProjectSelection,
     /// Repository-relative or absolute paths to stage.
-    #[arg(required_unless_present = "all", value_name = "PATH")]
+    #[arg(required_unless_present_any = ["all", "hunk"], value_name = "PATH")]
     paths: Vec<PathBuf>,
     /// Stage every change, including deletions.
-    #[arg(long, conflicts_with = "paths")]
+    #[arg(long, conflicts_with_all = ["paths", "hunk"])]
     all: bool,
+    #[command(flatten)]
+    hunk: HunkArguments,
+}
+
+#[derive(Debug, Args)]
+struct UnstageArguments {
+    #[command(flatten)]
+    selection: ProjectSelection,
+    /// Repository-relative or absolute paths to unstage.
+    #[arg(required_unless_present = "hunk", value_name = "PATH")]
+    paths: Vec<PathBuf>,
+    #[command(flatten)]
+    hunk: HunkArguments,
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("diff_target")
+        .multiple(false)
+        .args(["staged", "unstaged"])
+))]
+struct DiffArguments {
+    #[command(flatten)]
+    selection: ProjectSelection,
+    /// Return only changes between HEAD and the index.
+    #[arg(long)]
+    staged: bool,
+    /// Return only changes between the index and working tree.
+    #[arg(long)]
+    unstaged: bool,
+    /// Number of unchanged lines surrounding each hunk.
+    #[arg(long, value_name = "LINES", default_value_t = 3)]
+    context_lines: u32,
+    /// Largest old or new file whose content is included.
+    #[arg(long, value_name = "BYTES", default_value_t = 1024 * 1024)]
+    max_file_size: u64,
+    /// Restrict the diff to these literal repository paths.
+    #[arg(value_name = "PATH")]
+    paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("hunk_path")
+        .multiple(true)
+        .args(["old_path", "new_path"])
+        .requires("hunk")
+))]
+struct HunkArguments {
+    /// Stage or unstage one hunk; stale diff identities are refused before mutation.
+    #[arg(
+        long,
+        conflicts_with = "paths",
+        requires_all = [
+            "hunk_path",
+            "old_blob_id",
+            "new_blob_id",
+            "context_lines",
+            "old_start",
+            "old_lines",
+            "new_start",
+            "new_lines"
+        ]
+    )]
+    hunk: bool,
+    /// Old-side path from the diff file record; omit for an addition.
+    #[arg(long, value_name = "PATH", requires = "hunk")]
+    old_path: Option<PathBuf>,
+    /// New-side path from the diff file record; omit for a deletion.
+    #[arg(long, value_name = "PATH", requires = "hunk")]
+    new_path: Option<PathBuf>,
+    /// Old-side blob ID from the diff file record.
+    #[arg(long, value_name = "OID", requires = "hunk")]
+    old_blob_id: Option<String>,
+    /// New-side blob ID from the diff file record.
+    #[arg(long, value_name = "OID", requires = "hunk")]
+    new_blob_id: Option<String>,
+    /// Context-line count from the diff file record.
+    #[arg(long, value_name = "LINES", requires = "hunk")]
+    context_lines: Option<u32>,
+    /// Old-side start line from the selected hunk.
+    #[arg(long, value_name = "LINE", requires = "hunk")]
+    old_start: Option<u32>,
+    /// Old-side line count from the selected hunk.
+    #[arg(long, value_name = "COUNT", requires = "hunk")]
+    old_lines: Option<u32>,
+    /// New-side start line from the selected hunk.
+    #[arg(long, value_name = "LINE", requires = "hunk")]
+    new_start: Option<u32>,
+    /// New-side line count from the selected hunk.
+    #[arg(long, value_name = "COUNT", requires = "hunk")]
+    new_lines: Option<u32>,
+}
+
+impl HunkArguments {
+    fn into_selection(self) -> Result<Option<HunkSelection>, CliError> {
+        if !self.hunk {
+            return Ok(None);
+        }
+        let missing = || {
+            CliError::Usage(
+                "--hunk requires both blob IDs, context, all four coordinates, and at least one path"
+                    .to_owned(),
+            )
+        };
+        if self.old_path.is_none() && self.new_path.is_none() {
+            return Err(missing());
+        }
+        let old_blob_id = self.old_blob_id.ok_or_else(missing)?;
+        let new_blob_id = self.new_blob_id.ok_or_else(missing)?;
+        let context_lines = self.context_lines.ok_or_else(missing)?;
+        let old_range = (
+            self.old_start.ok_or_else(missing)?,
+            self.old_lines.ok_or_else(missing)?,
+        );
+        let new_range = (
+            self.new_start.ok_or_else(missing)?,
+            self.new_lines.ok_or_else(missing)?,
+        );
+        Ok(Some(HunkSelection::from_parts(
+            self.old_path,
+            self.new_path,
+            old_blob_id,
+            new_blob_id,
+            context_lines,
+            old_range,
+            new_range,
+        )))
+    }
 }
 
 #[derive(Debug, Args)]
@@ -374,6 +501,7 @@ impl RefusalKind {
 #[derive(Debug)]
 enum CliError {
     Project(ProjectError),
+    Usage(String),
     CurrentDirectory(io::Error),
     InterruptHandler(io::Error),
     WireProjection(String),
@@ -404,6 +532,7 @@ impl CliError {
     fn kind(&self) -> &'static str {
         match self {
             Self::Project(error) => error.kind(),
+            Self::Usage(_) => "usage_error",
             Self::CurrentDirectory(_) => "current_directory_unavailable",
             Self::InterruptHandler(_) => "interrupt_handler_unavailable",
             Self::WireProjection(_) => "wire_projection_failed",
@@ -415,6 +544,7 @@ impl CliError {
     fn message(&self) -> String {
         match self {
             Self::Project(error) => error.to_string(),
+            Self::Usage(message) => message.clone(),
             Self::WireProjection(message) => message.clone(),
             Self::PathOperation { operation, .. } => {
                 format!("{operation} failed for one or more paths")
@@ -432,6 +562,7 @@ impl CliError {
     fn exit_code(&self) -> u8 {
         match self {
             Self::Project(error) => project_exit_code(error),
+            Self::Usage(_) => EXIT_USAGE,
             Self::CurrentDirectory(_)
             | Self::InterruptHandler(_)
             | Self::WireProjection(_)
@@ -445,7 +576,10 @@ impl CliError {
             Self::Project(error) => project_error_details(error),
             Self::Refused { details, .. } => details.clone(),
             Self::PathOperation { details, .. } => details.clone(),
-            Self::CurrentDirectory(_) | Self::InterruptHandler(_) | Self::WireProjection(_) => {
+            Self::Usage(_)
+            | Self::CurrentDirectory(_)
+            | Self::InterruptHandler(_)
+            | Self::WireProjection(_) => {
                 json!({})
             }
         }
@@ -606,6 +740,37 @@ fn run_git(
                 || Ok(json!({ "status": detailed_status_value(&status) })),
             )
         }
+        GitCommand::Diff(arguments) => {
+            let git = selected_git(&service, arguments.selection)?;
+            let options = DiffOptions::default()
+                .with_context_lines(arguments.context_lines)
+                .with_max_file_size(arguments.max_file_size)
+                .with_paths(arguments.paths);
+            let mut files = Vec::new();
+            if !arguments.unstaged {
+                if cancellation.is_cancelled() {
+                    return Err(GitError::Cancelled.into());
+                }
+                files.extend(git.diff(DiffTarget::Staged, &options)?);
+                if cancellation.is_cancelled() {
+                    return Err(GitError::Cancelled.into());
+                }
+            }
+            if !arguments.staged {
+                if cancellation.is_cancelled() {
+                    return Err(GitError::Cancelled.into());
+                }
+                files.extend(git.diff(DiffTarget::Unstaged, &options)?);
+                if cancellation.is_cancelled() {
+                    return Err(GitError::Cancelled.into());
+                }
+            }
+            command_result(
+                json_output,
+                || diff_summary_line(&files),
+                || Ok(json!({ "files": files.iter().map(file_diff_value).collect::<Vec<_>>() })),
+            )
+        }
         GitCommand::Fetch {
             selection,
             remote,
@@ -694,7 +859,19 @@ fn run_git(
         }
         GitCommand::Stage(arguments) => {
             let git = selected_git(&service, arguments.selection)?;
-            if arguments.all {
+            if let Some(selection) = arguments.hunk.into_selection()? {
+                let outcome = git.stage_hunks(&[selection], cancellation)?;
+                command_result(
+                    json_output,
+                    || "staged 1 hunk".to_owned(),
+                    || {
+                        Ok(json!({
+                            "hunks": 1,
+                            "status": status_refresh_value(&outcome.status),
+                        }))
+                    },
+                )
+            } else if arguments.all {
                 let status = git.stage_all(cancellation)?;
                 command_result(
                     json_output,
@@ -716,20 +893,34 @@ fn run_git(
                 )
             }
         }
-        GitCommand::Unstage { selection, paths } => {
-            let git = selected_git(&service, selection)?;
-            let outcome = git.unstage(paths, cancellation)?;
-            if !outcome.all_succeeded() {
-                return Err(CliError::PathOperation {
-                    operation: "unstaging",
-                    details: stage_outcome_value(&outcome),
-                });
+        GitCommand::Unstage(arguments) => {
+            let git = selected_git(&service, arguments.selection)?;
+            if let Some(selection) = arguments.hunk.into_selection()? {
+                let outcome = git.unstage_hunks(&[selection], cancellation)?;
+                command_result(
+                    json_output,
+                    || "unstaged 1 hunk".to_owned(),
+                    || {
+                        Ok(json!({
+                            "hunks": 1,
+                            "status": status_refresh_value(&outcome.status),
+                        }))
+                    },
+                )
+            } else {
+                let outcome = git.unstage(arguments.paths, cancellation)?;
+                if !outcome.all_succeeded() {
+                    return Err(CliError::PathOperation {
+                        operation: "unstaging",
+                        details: stage_outcome_value(&outcome),
+                    });
+                }
+                command_result(
+                    json_output,
+                    || stage_outcome_line("unstaged", &outcome),
+                    || Ok(stage_outcome_value(&outcome)),
+                )
             }
-            command_result(
-                json_output,
-                || stage_outcome_line("unstaged", &outcome),
-                || Ok(stage_outcome_value(&outcome)),
-            )
         }
         GitCommand::Commit {
             selection,
@@ -1256,6 +1447,77 @@ fn detailed_status_value(status: &DetailedStatus) -> Value {
     })
 }
 
+fn file_diff_value(file: &FileDiff) -> Value {
+    let (old_path, old_path_is_lossy) = optional_wire_path(file.old_path.as_deref());
+    let (new_path, new_path_is_lossy) = optional_wire_path(file.new_path.as_deref());
+    json!({
+        "target": diff_target_name(&file.target),
+        "change": file_change_name(file.change),
+        "old_path": old_path,
+        "old_path_is_lossy": old_path_is_lossy,
+        "new_path": new_path,
+        "new_path_is_lossy": new_path_is_lossy,
+        "old_blob_id": file.old_blob_id,
+        "new_blob_id": file.new_blob_id,
+        "old_mode": file.old_mode,
+        "new_mode": file.new_mode,
+        "context_lines": file.context_lines,
+        "old_size": file.old_size,
+        "new_size": file.new_size,
+        "binary": file.binary,
+        "omission": file.omission.as_ref().map_or(Value::Null, diff_omission_value),
+        "hunks": file.hunks.iter().map(hunk_value).collect::<Vec<_>>(),
+    })
+}
+
+fn optional_wire_path(path: Option<&Path>) -> (Value, Value) {
+    path.map_or((Value::Null, Value::Null), |path| {
+        let (path, is_lossy) = wire_path(path);
+        (json!(path), json!(is_lossy))
+    })
+}
+
+fn diff_omission_value(omission: &DiffOmission) -> Value {
+    match omission {
+        DiffOmission::FileTooLarge { limit } => json!({
+            "kind": "file_too_large",
+            "limit": limit,
+        }),
+        _ => json!({ "kind": "unknown" }),
+    }
+}
+
+fn hunk_value(hunk: &Hunk) -> Value {
+    let (header, header_encoding) = encoded_bytes(&hunk.header);
+    json!({
+        "old_start": hunk.old_start,
+        "old_lines": hunk.old_lines,
+        "new_start": hunk.new_start,
+        "new_lines": hunk.new_lines,
+        "header": header,
+        "header_encoding": header_encoding,
+        "lines": hunk.lines.iter().map(diff_line_value).collect::<Vec<_>>(),
+    })
+}
+
+fn diff_line_value(line: &DiffLine) -> Value {
+    let (content, content_encoding) = encoded_bytes(&line.content);
+    json!({
+        "kind": diff_line_kind_name(line.kind),
+        "old_line_number": line.old_line_number,
+        "new_line_number": line.new_line_number,
+        "content": content,
+        "content_encoding": content_encoding,
+    })
+}
+
+fn encoded_bytes(bytes: &[u8]) -> (String, &'static str) {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => (text.to_owned(), "utf8"),
+        Err(_) => (BASE64.encode(bytes), "base64"),
+    }
+}
+
 fn head_value(head: &HeadState) -> Value {
     match head {
         HeadState::Unborn { branch } => json!({
@@ -1438,6 +1700,15 @@ fn detailed_status_line(status: &DetailedStatus, include_paths: bool) -> String 
     lines.join("\n")
 }
 
+fn diff_summary_line(files: &[FileDiff]) -> String {
+    let staged = files
+        .iter()
+        .filter(|file| matches!(file.target, DiffTarget::Staged))
+        .count();
+    let unstaged = files.len() - staged;
+    format!("{staged} staged files, {unstaged} unstaged files")
+}
+
 fn branch_line(branch: &Branch) -> String {
     let checkout = match &branch.checkout {
         BranchCheckout::NotCheckedOut => "".to_owned(),
@@ -1469,6 +1740,26 @@ const fn file_change_name(change: FileChange) -> &'static str {
         FileChange::TypeChanged => "type_changed",
         FileChange::Untracked => "untracked",
         FileChange::Unmerged => "unmerged",
+    }
+}
+
+const fn diff_target_name(target: &DiffTarget) -> &'static str {
+    match target {
+        DiffTarget::Staged => "staged",
+        DiffTarget::Unstaged => "unstaged",
+        _ => "unknown",
+    }
+}
+
+const fn diff_line_kind_name(kind: DiffLineKind) -> &'static str {
+    match kind {
+        DiffLineKind::Context => "context",
+        DiffLineKind::Addition => "addition",
+        DiffLineKind::Deletion => "deletion",
+        DiffLineKind::BothEofNoNewline => "both_eof_no_newline",
+        DiffLineKind::OldEofNoNewline => "old_eof_no_newline",
+        DiffLineKind::NewEofNoNewline => "new_eof_no_newline",
+        _ => "unknown",
     }
 }
 
@@ -1715,9 +2006,9 @@ fn project_exit_code(error: &ProjectError) -> u8 {
         ProjectError::ProjectSelectorNotFound { .. } | ProjectError::ProjectNotFound(_) => {
             EXIT_NOT_FOUND
         }
-        ProjectError::AmbiguousProjectSelector { .. } | ProjectError::ParentHasWorktrees { .. } => {
-            EXIT_CONFLICT
-        }
+        ProjectError::AmbiguousProjectSelector { .. }
+        | ProjectError::ParentHasWorktrees { .. }
+        | ProjectError::WorktreeDestinationExists { .. } => EXIT_CONFLICT,
         ProjectError::UnsafeManagedRemoval { .. }
         | ProjectError::WorktreeRemovalRequired { .. }
         | ProjectError::UnsafeWorktreeRemoval { .. }
@@ -1725,7 +2016,6 @@ fn project_exit_code(error: &ProjectError) -> u8 {
         | ProjectError::DirtyWorktreeRemoval { .. }
         | ProjectError::UnsafeWorktreeLock { .. }
         | ProjectError::UnsafeWorktreeMove { .. }
-        | ProjectError::WorktreeDestinationExists { .. }
         | ProjectError::WorktreeDestinationNotAbsolute { .. }
         | ProjectError::WorktreeDestinationParentUnavailable { .. }
         | ProjectError::WorktreeDestinationInsideProject { .. }
@@ -1761,7 +2051,6 @@ fn git_exit_code(error: &GitError) -> u8 {
         GitError::RepositoryBusy { .. }
         | GitError::BranchAlreadyExists { .. }
         | GitError::BranchCheckedOutInWorktree { .. }
-        | GitError::WorktreeLocked { .. }
         | GitError::WorktreeAlreadyLocked { .. }
         | GitError::WorktreeNotLocked { .. } => EXIT_CONFLICT,
         GitError::PathOutsideRepository { .. }
@@ -1779,6 +2068,7 @@ fn git_exit_code(error: &GitError) -> u8 {
         | GitError::DefaultBranchPush { .. }
         | GitError::DefaultBranchUnknown { .. }
         | GitError::DetachedHead { .. }
+        | GitError::WorktreeLocked { .. }
         | GitError::WorktreeMoveAcrossDevices { .. }
         | GitError::StaleHunkSelection { .. }
         | GitError::BinaryHunkSelection { .. }
@@ -1841,7 +2131,7 @@ const GIT_KIND_EXIT_CODES: &[(&str, u8)] = &[
     ("current_branch_deletion", EXIT_REFUSED),
     ("default_branch_deletion", EXIT_REFUSED),
     ("branch_checked_out_in_worktree", EXIT_CONFLICT),
-    ("worktree_locked", EXIT_CONFLICT),
+    ("worktree_locked", EXIT_REFUSED),
     ("empty_worktree_lock_reason", EXIT_REFUSED),
     ("worktree_already_locked", EXIT_CONFLICT),
     ("worktree_not_locked", EXIT_CONFLICT),
@@ -1981,6 +2271,39 @@ fn git_error_details(error: &GitError) -> Value {
                 "destination_is_lossy": destination_is_lossy,
             })
         }
+        GitError::WorktreeLocked { path, reason }
+        | GitError::WorktreeAlreadyLocked { path, reason } => {
+            let (path, path_is_lossy) = wire_path(path);
+            json!({
+                "path": path,
+                "path_is_lossy": path_is_lossy,
+                "reason": reason,
+            })
+        }
+        GitError::WorktreeNotLocked { path }
+        | GitError::StaleHunkSelection { path }
+        | GitError::BinaryHunkSelection { path }
+        | GitError::OverlappingHunkSelection { path } => {
+            let (path, path_is_lossy) = wire_path(path);
+            json!({ "path": path, "path_is_lossy": path_is_lossy })
+        }
+        GitError::HunkNotFound {
+            path,
+            old_start,
+            old_lines,
+            new_start,
+            new_lines,
+        } => {
+            let (path, path_is_lossy) = wire_path(path);
+            json!({
+                "path": path,
+                "path_is_lossy": path_is_lossy,
+                "old_start": old_start,
+                "old_lines": old_lines,
+                "new_start": new_start,
+                "new_lines": new_lines,
+            })
+        }
         _ => json!({}),
     }
 }
@@ -2036,8 +2359,15 @@ mod tests {
     #[test]
     fn worktree_lock_errors_report_conflict_and_refusal_exit_codes() {
         let path = PathBuf::from("/tmp/worktree");
-        let cases: [(GitError, u8); 3] = [
+        let cases: [(GitError, u8); 4] = [
             (GitError::EmptyWorktreeLockReason, EXIT_REFUSED),
+            (
+                GitError::WorktreeLocked {
+                    path: path.clone(),
+                    reason: Some("agent is still working".to_owned()),
+                },
+                EXIT_REFUSED,
+            ),
             (
                 GitError::WorktreeAlreadyLocked {
                     path: path.clone(),

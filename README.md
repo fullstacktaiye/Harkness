@@ -67,6 +67,7 @@ harkness project forget --project <selector>
 harkness project delete --project <selector> --yes
 
 harkness --json git status [--paths] [--project <selector>]
+harkness --json git diff [--staged | --unstaged] [--context-lines <lines>] [--max-file-size <bytes>] [<path>...] [--project <selector>]
 harkness --json git fetch [--remote <name>] [--prune] [--project <selector>]
 harkness --json git pull [--ff-only | --rebase | --merge] [--project <selector>]
 harkness --json git push [--set-upstream] [--allow-default-branch] [--force-with-lease] [--project <selector>]
@@ -74,8 +75,8 @@ harkness --json git branch list [--all] [--project <selector>]
 harkness --json git branch create <name> [--from <ref>] [--checkout] [--project <selector>]
 harkness --json git branch checkout <name> [--project <selector>]
 harkness --json git branch delete <name> [--force] [--project <selector>]
-harkness --json git stage (<path>... | --all) [--project <selector>]
-harkness --json git unstage <path>... [--project <selector>]
+harkness --json git stage (<path>... | --all | --hunk <selection-flags>) [--project <selector>]
+harkness --json git unstage (<path>... | --hunk <selection-flags>) [--project <selector>]
 harkness --json git commit --message <message> [--amend] [--allow-empty] [--project <selector>]
 
 harkness --json worktree list [--project <parent-selector>]
@@ -99,6 +100,21 @@ JSON object per line, keeping standard output parseable. Help and version are
 deliberately plain text even when `--json` is present. `harkness --json contract`
 reports the current envelope version, exit codes, streams, and complete
 error-kind namespaces.
+
+`git diff` returns one structured `files` array, staged records first and
+unstaged records second; `--staged` or `--unstaged` narrows it to one side of
+the index. Each file carries its blob IDs, paths, modes, sizes, and hunks.
+Every hunk line names its `content_encoding`: valid UTF-8 is emitted directly,
+while arbitrary bytes use Base64, so consumers can reconstruct the exact
+content. Binary and oversized files remain summary records rather than raw or
+truncated patches.
+
+To stage or unstage one hunk, pass `--hunk` with the selected file's
+`--old-path` and/or `--new-path`, `--old-blob-id`, `--new-blob-id`, and
+`--context-lines`, plus the hunk's `--old-start`, `--old-lines`, `--new-start`,
+and `--new-lines`. Harkness recomputes the diff under the repository lock; if
+any identity or coordinate is stale it exits 3 without changing the index.
+Whole-path staging and unstaging keep their existing syntax.
 
 Project JSON uses an explicit CLI projection rather than the catalog's storage
 serializer. `last_opened` is RFC 3339, source-specific optional fields are

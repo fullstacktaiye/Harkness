@@ -10,6 +10,7 @@ name = "harkness"
 path = "src/main.rs"
 
 [dependencies]
+base64.workspace = true
 clap.workspace = true
 harkness-core.workspace = true
 libc.workspace = true
