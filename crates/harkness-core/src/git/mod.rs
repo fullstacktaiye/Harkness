@@ -10,6 +10,7 @@ mod branch;
 pub(crate) mod clone;
 mod commit;
 mod diff;
+mod history;
 mod hunk;
 mod lock;
 mod runner;
@@ -36,6 +37,7 @@ pub use diff::{
     DEFAULT_MAX_DIFF_TOTAL_BYTES, DiffLine, DiffLineKind, DiffOmission, DiffOptions, DiffTarget,
     FileDiff, Hunk,
 };
+pub use history::{CommitInfo, CommitSignature, LogCursor, LogOptions, LogPage, LogRange};
 pub use hunk::{HunkSelection, HunkStageOutcome};
 pub use lock::RepositoryLock;
 pub use runner::{Cancellation, CloneCancellation, GitAccess, GitCommand, GitOutput};
@@ -88,6 +90,32 @@ pub enum GitError {
     /// The path is not the working directory of a Git repository.
     #[error("'{}' is not a Git repository", path.display())]
     NotARepository { path: PathBuf },
+
+    /// A revision expression names no object in this repository.
+    #[error("revision '{revision}' does not exist")]
+    RevisionNotFound { revision: String },
+
+    /// An abbreviated object ID names more than one object.
+    #[error("revision '{revision}' is ambiguous")]
+    AmbiguousRevision { revision: String },
+
+    /// A history operation requires a commit, but the revision names another
+    /// kind of Git object.
+    #[error("revision '{revision}' resolves to {id}, which is not a commit")]
+    RevisionNotCommit { revision: String, id: git2::Oid },
+
+    /// Two revisions have no common ancestor.
+    #[error("revisions '{one}' and '{two}' have no merge base")]
+    NoMergeBase { one: String, two: String },
+
+    /// A zero-sized page cannot make progress or produce a continuation.
+    #[error("a commit log page limit must be greater than zero")]
+    InvalidLogLimit,
+
+    /// A continuation was copied to another range or no longer names its
+    /// recorded ancestry frontier.
+    #[error("commit log cursor {cursor} is not valid for the requested range")]
+    InvalidLogCursor { cursor: git2::Oid },
 
     /// An explicit path resolves beyond the repository working tree.
     #[error(
@@ -418,6 +446,12 @@ impl GitError {
         "repository_busy",
         "lock",
         "not_a_repository",
+        "revision_not_found",
+        "ambiguous_revision",
+        "revision_not_commit",
+        "no_merge_base",
+        "invalid_log_limit",
+        "invalid_log_cursor",
         "path_outside_repository",
         "empty_commit_message",
         "nothing_staged",
@@ -472,6 +506,12 @@ impl GitError {
             Self::RepositoryBusy { .. } => "repository_busy",
             Self::Lock { .. } => "lock",
             Self::NotARepository { .. } => "not_a_repository",
+            Self::RevisionNotFound { .. } => "revision_not_found",
+            Self::AmbiguousRevision { .. } => "ambiguous_revision",
+            Self::RevisionNotCommit { .. } => "revision_not_commit",
+            Self::NoMergeBase { .. } => "no_merge_base",
+            Self::InvalidLogLimit => "invalid_log_limit",
+            Self::InvalidLogCursor { .. } => "invalid_log_cursor",
             Self::PathOutsideRepository { .. } => "path_outside_repository",
             Self::EmptyCommitMessage => "empty_commit_message",
             Self::NothingStaged => "nothing_staged",
@@ -633,6 +673,38 @@ impl GitService {
     /// names rather than for a whole listing.
     pub fn detailed_status(&self, cancellation: &Cancellation) -> Result<DetailedStatus, GitError> {
         status::detailed(&self.git_executable, &self.root, cancellation)
+    }
+
+    /// Lists one bounded page of commits, newest first.
+    ///
+    /// History inspection runs entirely through libgit2: it takes no
+    /// repository lock, spawns no process and never contacts a remote. A
+    /// continuation cursor is anchored at the first commit of the next page
+    /// and retains every pending ancestry path, so later commits added above it
+    /// cannot move that page and merges cannot strand an unvisited parent.
+    pub fn log(
+        &self,
+        options: &LogOptions,
+        cancellation: &Cancellation,
+    ) -> Result<LogPage, GitError> {
+        history::log(&self.root, options, cancellation)
+    }
+
+    /// Resolves a Git revision expression to the object it names.
+    ///
+    /// Branches, tags, full and abbreviated object IDs are accepted using
+    /// libgit2's revision syntax. Missing and ambiguous expressions remain
+    /// distinct typed errors for front ends.
+    pub fn resolve_revision(&self, revision: &str) -> Result<git2::Oid, GitError> {
+        history::resolve_revision(&self.root, revision)
+    }
+
+    /// Finds the best common ancestor of two commit-ish revisions.
+    ///
+    /// This is local, read-only inspection and therefore takes no repository
+    /// lock and spawns no process.
+    pub fn merge_base(&self, one: &str, two: &str) -> Result<git2::Oid, GitError> {
+        history::merge_base(&self.root, one, two)
     }
 
     /// Computes content differences on one side of the index.
@@ -1231,6 +1303,39 @@ mod tests {
             (
                 GitError::NotARepository { path: path.clone() },
                 "not_a_repository",
+            ),
+            (
+                GitError::RevisionNotFound {
+                    revision: "fixture".to_owned(),
+                },
+                "revision_not_found",
+            ),
+            (
+                GitError::AmbiguousRevision {
+                    revision: "fixture".to_owned(),
+                },
+                "ambiguous_revision",
+            ),
+            (
+                GitError::RevisionNotCommit {
+                    revision: "fixture".to_owned(),
+                    id: git2::Oid::ZERO_SHA1,
+                },
+                "revision_not_commit",
+            ),
+            (
+                GitError::NoMergeBase {
+                    one: "one".to_owned(),
+                    two: "two".to_owned(),
+                },
+                "no_merge_base",
+            ),
+            (GitError::InvalidLogLimit, "invalid_log_limit"),
+            (
+                GitError::InvalidLogCursor {
+                    cursor: git2::Oid::ZERO_SHA1,
+                },
+                "invalid_log_cursor",
             ),
             (
                 GitError::PathOutsideRepository {
