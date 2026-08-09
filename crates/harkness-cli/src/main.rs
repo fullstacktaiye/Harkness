@@ -2527,6 +2527,7 @@ fn git_exit_code(error: &GitError) -> u8 {
         | GitError::WorktreeNotLocked { .. } => EXIT_CONFLICT,
         GitError::PathOutsideRepository { .. }
         | GitError::RevisionNotCommit { .. }
+        | GitError::RevisionNotParent { .. }
         | GitError::InvalidLogLimit
         | GitError::InvalidLogCursor { .. }
         | GitError::EmptyCommitMessage
@@ -2601,6 +2602,7 @@ const GIT_KIND_EXIT_CODES: &[(&str, u8)] = &[
     ("revision_not_found", EXIT_NOT_FOUND),
     ("ambiguous_revision", EXIT_CONFLICT),
     ("revision_not_commit", EXIT_REFUSED),
+    ("revision_not_parent", EXIT_REFUSED),
     ("no_merge_base", EXIT_CONFLICT),
     ("invalid_log_limit", EXIT_REFUSED),
     ("invalid_log_cursor", EXIT_REFUSED),
@@ -2806,6 +2808,9 @@ fn git_error_details(error: &GitError) -> Value {
         }
         GitError::RevisionNotCommit { revision, id } => {
             json!({ "revision": revision, "object_id": id.to_string() })
+        }
+        GitError::RevisionNotParent { revision, parent } => {
+            json!({ "revision": revision, "parent": parent })
         }
         GitError::NoMergeBase { one, two } => json!({
             "one": one,
@@ -3047,6 +3052,17 @@ mod tests {
                 serde_json::json!({
                     "revision": "blob",
                     "object_id": object_id.to_string(),
+                }),
+            ),
+            (
+                GitError::RevisionNotParent {
+                    revision: "commit".to_owned(),
+                    parent: "unrelated".to_owned(),
+                },
+                EXIT_REFUSED,
+                serde_json::json!({
+                    "revision": "commit",
+                    "parent": "unrelated",
                 }),
             ),
             (

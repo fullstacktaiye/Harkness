@@ -359,7 +359,7 @@ fn merge_base_in(
     merge_base_ids(repository, root, one_id, two_id, one, two)
 }
 
-fn merge_base_ids(
+pub(super) fn merge_base_ids(
     repository: &Repository,
     root: &Path,
     one_id: Oid,
@@ -378,7 +378,11 @@ fn merge_base_ids(
         })
 }
 
-fn require_commit(repository: &Repository, root: &Path, revision: &str) -> Result<Oid, GitError> {
+pub(super) fn require_commit(
+    repository: &Repository,
+    root: &Path,
+    revision: &str,
+) -> Result<Oid, GitError> {
     let object = resolve(repository, root, revision)?;
     let id = object.id();
     object
