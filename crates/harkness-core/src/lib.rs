@@ -12,12 +12,13 @@ mod testing;
 pub use catalog::entry::{GitStatus, Project, ProjectId, ProjectSource, UpstreamStatus};
 pub use git::{
     Branch, BranchCheckout, BranchKind, BranchListOptions, Cancellation, CloneCancellation,
-    CommitOptions, CommitOutcome, CreateBranchOptions, DetailedStatus, DiffLine, DiffLineKind,
-    DiffOmission, DiffOptions, DiffTarget, FetchOptions, FetchOutcome, FileChange, FileDiff,
-    GitAccess, GitCommand, GitError, GitOutput, GitService, HeadState, Hunk, HunkSelection,
-    PendingOperation, PullOptions, PullOutcome, PullStrategy, PushOptions, PushOutcome, RefUpdate,
-    RepositoryLock, StageOptions, StageOutcome, StagePathOutcome, StagePathResult, StatusEntry,
-    StatusRefreshOutcome,
+    CommitOptions, CommitOutcome, CreateBranchOptions, DEFAULT_DIFF_CONTEXT_LINES,
+    DEFAULT_MAX_DIFF_FILE_SIZE, DEFAULT_MAX_DIFF_FILES, DEFAULT_MAX_DIFF_TOTAL_BYTES,
+    DetailedStatus, DiffLine, DiffLineKind, DiffOmission, DiffOptions, DiffTarget, FetchOptions,
+    FetchOutcome, FileChange, FileDiff, GitAccess, GitCommand, GitError, GitOutput, GitService,
+    HeadState, Hunk, HunkSelection, PendingOperation, PullOptions, PullOutcome, PullStrategy,
+    PushOptions, PushOutcome, RefUpdate, RepositoryLock, StageOptions, StageOutcome,
+    StagePathOutcome, StagePathResult, StatusEntry, StatusRefreshOutcome,
 };
 pub use listing::{DirEntry, list_directory};
 pub use project::{

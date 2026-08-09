@@ -31,7 +31,11 @@ pub use commit::{
     CommitOptions, CommitOutcome, StageOptions, StageOutcome, StagePathOutcome, StagePathResult,
     StatusRefreshOutcome,
 };
-pub use diff::{DiffLine, DiffLineKind, DiffOmission, DiffOptions, DiffTarget, FileDiff, Hunk};
+pub use diff::{
+    DEFAULT_DIFF_CONTEXT_LINES, DEFAULT_MAX_DIFF_FILE_SIZE, DEFAULT_MAX_DIFF_FILES,
+    DEFAULT_MAX_DIFF_TOTAL_BYTES, DiffLine, DiffLineKind, DiffOmission, DiffOptions, DiffTarget,
+    FileDiff, Hunk,
+};
 pub use hunk::{HunkSelection, HunkStageOutcome};
 pub use lock::RepositoryLock;
 pub use runner::{Cancellation, CloneCancellation, GitAccess, GitCommand, GitOutput};
@@ -136,9 +140,12 @@ pub enum GitError {
     )]
     BranchCheckedOutInWorktree { branch: String, worktree: PathBuf },
 
-    /// A worktree was explicitly locked against removal by Git.
+    /// A worktree was explicitly locked by Git against every lifecycle change.
+    ///
+    /// The message names no single operation because one lock refuses removal,
+    /// relocation and pruning alike, and `--force` overrides none of them.
     #[error(
-        "worktree at '{}' is locked{}; unlock it before removal",
+        "worktree at '{}' is locked{}; run 'worktree unlock' before changing it",
         path.display(),
         reason.as_deref().map(|reason| format!(": {reason}")).unwrap_or_default()
     )]
@@ -641,6 +648,22 @@ impl GitService {
         options: &DiffOptions,
     ) -> Result<Vec<FileDiff>, GitError> {
         diff::compute(&self.root, target, options)
+    }
+
+    /// Computes several targets against one repository and index snapshot.
+    ///
+    /// Records are returned in the order the targets are given. Prefer this to
+    /// two [`Self::diff`] calls whenever both sides of the index are wanted at
+    /// once: separate calls each re-read the index, so a concurrent write can
+    /// land between them and yield a pair of results that never coexisted.
+    /// [`DiffOptions`] budgets apply to the combined model rather than to each
+    /// target, so the whole response stays bounded.
+    pub fn diff_snapshot(
+        &self,
+        targets: &[DiffTarget],
+        options: &DiffOptions,
+    ) -> Result<Vec<FileDiff>, GitError> {
+        diff::compute_targets(&self.root, targets, options)
     }
 
     /// Stages selected working-tree hunks without writing the working tree.

@@ -273,11 +273,10 @@ fn prepare(
         if cancellation.is_cancelled() {
             return Err(GitError::Cancelled);
         }
-        // An unbounded size keeps this model a superset of whatever the caller
-        // diffed: a file the caller could legitimately select from is never
-        // omitted here merely for exceeding that caller's own display limit.
-        let options = DiffOptions::default()
-            .with_max_file_size(u64::MAX)
+        // Unbounded keeps this model a superset of whatever the caller diffed:
+        // a file the caller could legitimately select from is never omitted
+        // here merely for exceeding that caller's own display budget.
+        let options = DiffOptions::unbounded()
             .with_context_lines(context_lines)
             .with_paths(paths);
         current.push((
