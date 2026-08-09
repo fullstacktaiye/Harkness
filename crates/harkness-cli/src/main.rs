@@ -556,6 +556,11 @@ fn path_from_bytes(bytes: Vec<u8>, _field: &str) -> Result<PathBuf, CliError> {
     Ok(PathBuf::from(OsString::from_vec(bytes)))
 }
 
+/// Where a path is UTF-16 rather than bytes, arbitrary bytes name no file.
+///
+/// Refusing is the only honest answer: Git cannot create such a path here
+/// either, so decoding it lossily would hand back a name pointing somewhere
+/// else, and a mutation would then be revalidated against the wrong file.
 #[cfg(not(unix))]
 fn path_from_bytes(bytes: Vec<u8>, field: &str) -> Result<PathBuf, CliError> {
     String::from_utf8(bytes).map(PathBuf::from).map_err(|_| {
@@ -565,17 +570,23 @@ fn path_from_bytes(bytes: Vec<u8>, field: &str) -> Result<PathBuf, CliError> {
     })
 }
 
-/// The exact bytes of a path, for a wire field that must survive a round trip.
+/// The exact bytes of a path, or `None` when this platform cannot supply them.
+///
+/// A Unix path is already bytes. A Windows path is UTF-16, and one holding an
+/// unpaired surrogate has no faithful byte spelling, so the field is withheld
+/// rather than filled with a lossy conversion. A caller then sees a lossy path
+/// with no exact alternative and is refused, which is the truth, instead of
+/// receiving an encoding that silently decodes to a different name.
 #[cfg(unix)]
-fn path_bytes(path: &Path) -> Vec<u8> {
+fn path_bytes(path: &Path) -> Option<Vec<u8>> {
     use std::os::unix::ffi::OsStrExt;
 
-    path.as_os_str().as_bytes().to_vec()
+    Some(path.as_os_str().as_bytes().to_vec())
 }
 
 #[cfg(not(unix))]
-fn path_bytes(path: &Path) -> Vec<u8> {
-    path.to_string_lossy().into_owned().into_bytes()
+fn path_bytes(path: &Path) -> Option<Vec<u8>> {
+    path.to_str().map(|path| path.as_bytes().to_vec())
 }
 
 fn read_selection_document(source: &Path) -> Result<String, CliError> {
@@ -1858,7 +1869,8 @@ fn optional_wire_path(path: Option<&Path>) -> (Value, Value) {
 /// the same treatment: without this a file whose name is not UTF-8 could be
 /// listed by `git diff` and then never named back to `git stage --hunk`.
 fn encoded_path(path: Option<&Path>) -> Value {
-    path.map_or(Value::Null, |path| json!(BASE64.encode(path_bytes(path))))
+    path.and_then(path_bytes)
+        .map_or(Value::Null, |bytes| json!(BASE64.encode(bytes)))
 }
 
 fn diff_omission_value(omission: &DiffOmission) -> Value {
@@ -3125,14 +3137,34 @@ mod tests {
         })
         .to_string();
 
-        let selections = parse_selection_document(&exact, "unstaged").unwrap();
+        let parsed = parse_selection_document(&exact, "unstaged");
 
-        assert_eq!(selections.len(), 1);
-        assert_ne!(
-            selections[0].new_path.as_deref(),
-            Some(Path::new("bad-\u{fffd}.txt")),
-            "the Base64 spelling must win over the lossy one"
-        );
+        // Whether those bytes name a file at all is a platform question. A
+        // Unix path is bytes, so the exact spelling wins; a Windows path is
+        // UTF-16 and cannot hold them, so the only honest answer is to say so
+        // rather than to substitute a name that points somewhere else.
+        #[cfg(unix)]
+        {
+            let selections = parsed.unwrap();
+            assert_eq!(selections.len(), 1);
+            assert_ne!(
+                selections[0].new_path.as_deref(),
+                Some(Path::new("bad-\u{fffd}.txt")),
+                "the Base64 spelling must win over the lossy one"
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            let error = parsed.unwrap_err();
+            assert_eq!(error.kind(), "usage_error");
+            assert!(
+                error
+                    .message()
+                    .contains("not a valid path on this platform"),
+                "the refusal must explain why: {}",
+                error.message()
+            );
+        }
     }
 
     /// Piping a combined diff into one side's command is the obvious mistake,

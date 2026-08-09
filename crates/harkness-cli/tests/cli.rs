@@ -1877,21 +1877,24 @@ fn hunk_refusals_carry_structured_details() {
         assert_eq!(body["error"]["details"]["new_mode"], 0o100_755);
     }
 
+    // A parent-relative escape is refused on every platform, unlike an
+    // absolute Unix path, which on Windows is merely a rooted relative one.
     let outside = harkness(
         &data_dir,
         &[
             "--json",
             "git",
             "diff",
-            "/etc/passwd",
             "--project",
             &project_id,
+            "--",
+            "../outside.txt",
         ],
     );
     assert_eq!(outside.status.code(), Some(3));
     let body = json_output(&outside);
     assert_eq!(body["error"]["kind"], "path_outside_repository");
-    assert_eq!(body["error"]["details"]["path"], "/etc/passwd");
+    assert_eq!(body["error"]["details"]["path"], "../outside.txt");
     assert!(body["error"]["details"]["repository"].is_string());
 }
 
