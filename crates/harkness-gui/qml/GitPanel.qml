@@ -68,6 +68,7 @@ Item {
             return;
         backend.refreshGit(project.id);
         backend.refreshBranches(project.id);
+        backend.refreshHistory(project.id);
         if (!project.worktree)
             backend.refreshWorktrees(project.id);
     }
@@ -79,6 +80,7 @@ Item {
             selectedPathId = "";
             selectedPath = "";
             backend.clearDiff();
+            backend.clearReview();
         }
         refresh();
     }
@@ -211,6 +213,22 @@ Item {
                         && ["default_branch_push", "default_branch_unknown"].indexOf(panel.gitState.errorKind) !== -1
                     onClicked: pushOverrideDialog.open()
                 }
+            }
+
+            Kirigami.Separator {
+                Layout.fillWidth: true
+            }
+
+            ReviewSurface {
+                Layout.fillWidth: true
+                Layout.bottomMargin: Kirigami.Units.largeSpacing
+                Layout.leftMargin: Kirigami.Units.largeSpacing
+                Layout.rightMargin: Kirigami.Units.largeSpacing
+                Layout.topMargin: Kirigami.Units.largeSpacing
+                backend: panel.backend
+                gitState: panel.gitState
+                project: panel.project
+                stateReady: panel.stateReady
             }
 
             Kirigami.Separator {
