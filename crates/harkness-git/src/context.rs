@@ -23,7 +23,7 @@ use git2::{Binding, ErrorCode, ObjectType, Oid, Repository};
 use libgit2_sys as raw;
 use tempfile::NamedTempFile;
 
-use crate::git::{
+use crate::{
     DEFAULT_MAX_DIFF_FILE_SIZE, DEFAULT_MAX_DIFF_TOTAL_BYTES, DiffLine, DiffLineKind, DiffTarget,
     FileDiff, GitError, Hunk, commit,
 };
@@ -1020,7 +1020,7 @@ fn stale(path: &Path) -> GitError {
 fn inspection(path: &Path, source: git2::Error) -> GitError {
     GitError::Inspection {
         path: path.to_path_buf(),
-        source,
+        source: source.into(),
     }
 }
 
@@ -1043,7 +1043,7 @@ mod tests {
 
     use super::{FileContextOmission, FileContextRequest, FileSide};
     use crate::{
-        git::{DiffLineKind, DiffOptions, DiffTarget, GitError, GitService},
+        DiffLineKind, DiffOptions, DiffTarget, GitError, GitService,
         testing::{Fixture, commit_all, initialize_repository},
     };
 
@@ -1538,7 +1538,7 @@ mod tests {
             .into_bytes()
     }
 
-    fn joined(lines: &[crate::git::DiffLine]) -> Vec<u8> {
+    fn joined(lines: &[crate::DiffLine]) -> Vec<u8> {
         lines
             .iter()
             .flat_map(|line| line.content.iter().copied())

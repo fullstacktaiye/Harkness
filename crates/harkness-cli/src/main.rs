@@ -19,6 +19,9 @@ use clap::{
     error::{Error as ClapError, ErrorKind},
 };
 use harkness_core::{
+    Project, ProjectError, ProjectSelector, ProjectService, ProjectSource, Worktree,
+};
+use harkness_git::{
     Branch, BranchCheckout, BranchKind, BranchListOptions, Cancellation, CommitInfo, CommitOptions,
     CommitOutcome, CommitSignature, CreateBranchOptions, DEFAULT_DIFF_CONTEXT_LINES,
     DEFAULT_MAX_DIFF_FILE_SIZE, DEFAULT_MAX_DIFF_FILES, DEFAULT_MAX_DIFF_TOTAL_BYTES,
@@ -26,9 +29,8 @@ use harkness_core::{
     FetchOutcome, FileChange, FileContextOmission, FileContextRange, FileContextRequest,
     FileContextResponse, FileDiff, FileSide, GitError, GitService, GitStatus, HeadState, Hunk,
     HunkSelection, IntraLineDegradation, LogCursor, LogOptions, LogRange, PendingOperation,
-    Project, ProjectError, ProjectSelector, ProjectService, ProjectSource, PullOptions,
-    PullOutcome, PullStrategy, PushOptions, PushOutcome, RefUpdate, StageOutcome, StagePathResult,
-    StatusRefreshOutcome, UpstreamStatus, Worktree, WorktreeBase,
+    PullOptions, PullOutcome, PullStrategy, PushOptions, PushOutcome, RefUpdate, StageOutcome,
+    StagePathResult, StatusEntry, StatusRefreshOutcome, UpstreamStatus, WorktreeBase,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -85,7 +87,7 @@ enum Command {
         #[command(subcommand)]
         command: ProjectCommand,
     },
-    /// Inspect and change Git repositories through the shared core service.
+    /// Inspect and change Git repositories through the dedicated Git service.
     Git {
         #[command(subcommand)]
         command: GitCommand,
@@ -2011,7 +2013,7 @@ fn resolve_project(service: &ProjectService, selector: Option<&str>) -> Result<P
 fn selected_git(
     service: &ProjectService,
     selection: ProjectSelection,
-) -> Result<harkness_core::GitService, CliError> {
+) -> Result<GitService, CliError> {
     let project = resolve_project(service, selection.project.as_deref())?;
     service.git(project.id).map_err(Into::into)
 }
@@ -2772,7 +2774,7 @@ fn head_value(head: &HeadState) -> Value {
     }
 }
 
-fn status_entry_value(entry: &harkness_core::StatusEntry) -> Value {
+fn status_entry_value(entry: &StatusEntry) -> Value {
     let (path, path_is_lossy) = wire_path(&entry.path);
     let (rename_source, rename_source_is_lossy) =
         optional_wire_path(entry.rename_source.as_deref());

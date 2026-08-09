@@ -1,9 +1,10 @@
 # Harkness
 
-Harkness is an early native AI-harness scaffold. Its Rust core maintains a local
-project catalog and can safely clone GitHub repositories through the system Git
-executable, preserving the user's existing SSH and HTTPS credential setup. Its
-core also provides cancellable branch listing and locked, typed create,
+Harkness is an early native AI-harness scaffold. Its Rust catalog core and
+dedicated Git integration crate maintain a local project catalog and safely
+clone GitHub repositories through the system Git executable, preserving the
+user's existing SSH and HTTPS credential setup. The Git layer also provides
+cancellable branch listing and locked, typed create,
 checkout, rename, delete, and upstream-management operations. The same locked
 service stages explicit paths, stages a whole working tree, unstages safely
 before or after the first commit, and creates guarded commits and amendments.

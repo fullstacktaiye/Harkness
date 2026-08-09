@@ -30,7 +30,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::git::GitError;
+use crate::GitError;
 
 /// Git repeats a progress phase on every update, so retaining the whole stream
 /// would put megabytes of overwritten counters into a failure message. The tail
@@ -151,7 +151,7 @@ pub type CloneCancellation = Cancellation;
 
 /// What a Git invocation touches, which fixes its locking and its timeout.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GitAccess {
+pub(crate) enum GitAccess {
     /// Reads local state. Runs with `GIT_OPTIONAL_LOCKS=0`, so a status refresh
     /// never takes `index.lock` to write back a refreshed index, and is bounded
     /// by a 30 second timeout.
@@ -176,14 +176,16 @@ impl GitAccess {
 
 /// What one finished Git invocation produced.
 #[derive(Clone, Debug)]
-pub struct GitOutput {
+pub(crate) struct GitOutput {
     /// The exit code Git reported, or `None` when a signal ended it.
-    pub code: Option<i32>,
+    #[allow(dead_code)]
+    pub(crate) code: Option<i32>,
     /// Everything Git wrote to standard output, as raw bytes: paths in Git's
     /// output are byte strings and need not be UTF-8.
-    pub stdout: Vec<u8>,
+    pub(crate) stdout: Vec<u8>,
     /// The retained tail of Git's diagnostic output.
-    pub stderr: String,
+    #[allow(dead_code)]
+    pub(crate) stderr: String,
 }
 
 /// One invocation of the system Git executable.
@@ -207,7 +209,7 @@ pub struct GitOutput {
 /// the credential helpers configured on the machine are left exactly as the
 /// user set them, because delegating to them is how Harkness reaches a real
 /// remote without ever handling a secret itself.
-pub struct GitCommand {
+pub(crate) struct GitCommand {
     executable: PathBuf,
     working_directory: PathBuf,
     access: GitAccess,
@@ -217,7 +219,7 @@ pub struct GitCommand {
     timeout: Option<Duration>,
     // A mutation command obtained through `GitService` owns the repository
     // lock for its whole lifetime, including while it runs.
-    _repository_lock: Option<crate::git::RepositoryLock>,
+    _repository_lock: Option<crate::RepositoryLock>,
 }
 
 impl GitCommand {
@@ -245,7 +247,7 @@ impl GitCommand {
     }
 
     /// Keeps `lock` held until this command finishes or is discarded.
-    pub(crate) fn with_repository_lock(mut self, lock: crate::git::RepositoryLock) -> Self {
+    pub(crate) fn with_repository_lock(mut self, lock: crate::RepositoryLock) -> Self {
         self._repository_lock = Some(lock);
         self
     }
@@ -283,7 +285,8 @@ impl GitCommand {
     /// `git merge-base --is-ancestor` exits 1 for false. Without this they
     /// would be unusable, because every non-zero status is otherwise a failure.
     #[must_use]
-    pub fn accept_exit_code(mut self, code: i32) -> Self {
+    #[cfg(test)]
+    pub(crate) fn accept_exit_code(mut self, code: i32) -> Self {
         self.accepted_exit_codes.push(code);
         self
     }
@@ -307,7 +310,8 @@ impl GitCommand {
     /// Setting one on a [`GitAccess::Network`] command opts that command out of
     /// the deliberate no-timeout rule; nothing in Harkness does.
     #[must_use]
-    pub fn timeout(mut self, timeout: Duration) -> Self {
+    #[cfg(test)]
+    pub(crate) fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
     }
@@ -573,7 +577,7 @@ mod tests {
     #[cfg(unix)]
     use super::{Cancellation, GitAccess, GitCommand};
     #[cfg(unix)]
-    use crate::{git::GitError, testing::Fixture};
+    use crate::{GitError, testing::Fixture};
 
     /// Git overwrites a progress phase with carriage returns and only emits a
     /// newline when the phase ends, so line-oriented reads report nothing for

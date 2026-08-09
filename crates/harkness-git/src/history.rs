@@ -9,7 +9,7 @@ use std::path::Path;
 use git2::{ErrorCode, Oid, Repository, Sort, Time};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
-use crate::git::{Cancellation, GitError};
+use crate::{Cancellation, GitError};
 
 /// The revision set a commit log page walks.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -538,7 +538,7 @@ fn open(root: &Path) -> Result<Repository, GitError> {
 fn inspection(path: &Path, source: git2::Error) -> GitError {
     GitError::Inspection {
         path: path.to_path_buf(),
-        source,
+        source: source.into(),
     }
 }
 
@@ -561,7 +561,7 @@ mod tests {
 
     use super::LogOptions;
     use crate::{
-        git::{Cancellation, GitError, GitService},
+        Cancellation, GitError, GitService,
         testing::{COMMIT_EPOCH_SECONDS, Fixture, initialize_repository},
     };
 

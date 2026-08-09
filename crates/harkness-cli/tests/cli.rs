@@ -8,7 +8,8 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use git2::{ObjectType, Repository, Signature};
-use harkness_core::{DiffOptions, DiffTarget, GitService, Project, ProjectService};
+use harkness_core::{Project, ProjectService};
+use harkness_git::{DiffOptions, DiffTarget, GitService};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 

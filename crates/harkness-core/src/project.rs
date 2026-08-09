@@ -6,16 +6,19 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+use harkness_git::{
+    Cancellation, GitError, GitService, GitStatus, GitWorktree, InspectionSource, WorktreeBase,
+    inspect_repository, validate_worktree_lock_reason,
+};
 use thiserror::Error;
 use time::OffsetDateTime;
 
 use crate::{
     catalog::{
         self, Catalog,
-        entry::{GitStatus, Project, ProjectId, ProjectSource},
+        entry::{Project, ProjectId, ProjectSource},
         lock,
     },
-    git::{self, Cancellation, GitError, GitService, clone},
     paths::{
         self, CATALOG_FILE, CHECKOUT_DIRECTORY, LOCKS_DIRECTORY, REPOSITORIES_DIRECTORY,
         UnreservedPath, WORKTREES_DIRECTORY, canonical_reserved_root,
@@ -111,7 +114,7 @@ pub enum ProjectError {
     GitInspection {
         path: PathBuf,
         #[source]
-        source: git2::Error,
+        source: InspectionSource,
     },
 
     /// An updated catalog could not be written atomically.
@@ -396,24 +399,6 @@ impl From<&str> for ProjectSelector {
     }
 }
 
-/// What a newly created worktree should check out.
-///
-/// The variants make branch creation, reuse, and detached checkout mutually
-/// exclusive, so callers cannot accidentally ask Git to invent a suffixed
-/// branch or attach a commit-only workspace to a made-up branch name.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum WorktreeBase {
-    /// Create `name` from `start_point`, or from the parent's HEAD when absent.
-    NewBranch {
-        name: String,
-        start_point: Option<String>,
-    },
-    /// Check out an existing local branch without creating or renaming it.
-    ExistingBranch { name: String },
-    /// Check out one commit with a detached HEAD.
-    Detached { commit: String },
-}
-
 /// One worktree associated with a catalogued parent.
 ///
 /// `project` is `Some` only for a Harkness-owned worktree. An external row is
@@ -462,8 +447,8 @@ pub struct WorktreeReconciliationSkip {
 impl From<GitError> for ProjectError {
     fn from(error: GitError) -> Self {
         match error {
-            // Inspection predates the Git module and is what `import_local`
-            // reports, so it keeps its own variant and its own message.
+            // Inspection is an established project-level contract reported by
+            // `import_local`, so it keeps its own variant and message.
             GitError::Inspection { path, source } => Self::GitInspection { path, source },
             other => Self::Git(other),
         }
@@ -772,13 +757,9 @@ impl ProjectService {
             // No repository lock: the clone creates a repository that does not
             // exist yet, inside a directory reserved for this identifier alone,
             // so there is nothing for it to be serialized against.
-            clone::run(
-                &self.git_executable,
-                remote,
-                &managed_directory,
-                cancellation,
-                &mut on_progress,
-            )?;
+            self.git_service(&managed_directory)
+                .clone_to(remote, CHECKOUT_DIRECTORY, cancellation, &mut on_progress)
+                .map_err(clone_failure)?;
             let canonical_root = validate_local_directory(&checkout)?;
             let project = Project {
                 id,
@@ -1038,25 +1019,13 @@ impl ProjectService {
             }
         };
 
-        let repository_lock = self
+        let repository = self
             .git_service(&preliminary_parent.root)
             .lock(cancellation)?;
-        let added = match git::worktree::add(
-            &self.git_executable,
-            &preliminary_parent.root,
-            &repository_lock,
-            &destination,
-            base,
-            cancellation,
-        ) {
+        let added = match repository.add_worktree(&destination, base, cancellation) {
             Ok(added) => added,
             Err(error) => {
-                git::worktree::cleanup_failed_add(
-                    &self.git_executable,
-                    &preliminary_parent.root,
-                    &repository_lock,
-                    &destination,
-                );
+                repository.cleanup_failed_worktree_add(&destination);
                 return Err(error.into());
             }
         };
@@ -1081,8 +1050,9 @@ impl ProjectService {
                 });
             }
 
-            let display_name = added.branch.clone().unwrap_or_else(|| {
-                let oid = added.commit.to_string();
+            let worktree_branch = added.branch().map(str::to_owned);
+            let display_name = worktree_branch.clone().unwrap_or_else(|| {
+                let oid = added.commit_id();
                 format!("Detached at {}", &oid[..12])
             });
             let project = Project {
@@ -1091,7 +1061,7 @@ impl ProjectService {
                 root: canonical_root,
                 source: ProjectSource::Worktree {
                     parent: parent_id,
-                    worktree_branch: added.branch.clone(),
+                    worktree_branch,
                 },
                 last_opened: OffsetDateTime::now_utc(),
                 available: true,
@@ -1105,12 +1075,7 @@ impl ProjectService {
         })();
 
         if created.is_err() {
-            git::worktree::cleanup_failed_add(
-                &self.git_executable,
-                &preliminary_parent.root,
-                &repository_lock,
-                &destination,
-            );
+            repository.cleanup_failed_worktree_add(&destination);
         }
         created
     }
@@ -1157,20 +1122,18 @@ impl ProjectService {
         let canonical_destination =
             validate_worktree_destination(&preliminary_catalog, &self.data_dir, destination)?;
 
-        let repository_lock = self
+        let repository = self
             .git_service(&preliminary_parent.root)
             .lock(cancellation)?;
-        let listed =
-            git::worktree::list(&self.git_executable, &preliminary_parent.root, cancellation)?;
-        match git::worktree::registered_root(&listed, &id.to_string()) {
-            Some(registered_root)
-                if git::worktree::same_path(registered_root, &preliminary.root) => {}
-            Some(registered_root) => {
+        let listed = repository.worktrees(cancellation)?;
+        match registered_worktree(&listed, &id.to_string()) {
+            Some(registered) if registered.matches_path(&preliminary.root) => {}
+            Some(registered) => {
                 return Err(unsafe_worktree_move(
                     &preliminary,
                     &format!(
                         "Git records this checkout at '{}'",
-                        registered_root.display()
+                        registered.root().display()
                     ),
                 ));
             }
@@ -1181,7 +1144,7 @@ impl ProjectService {
                 ));
             }
         }
-        git::worktree::refuse_if_locked(&listed, &preliminary.root)?;
+        refuse_locked_worktree(&listed, &preliminary.root)?;
 
         // No Git command runs under the global catalog lock. This phase only
         // re-verifies the values learned before the repository lock and proves
@@ -1209,14 +1172,7 @@ impl ProjectService {
             }
         }
 
-        git::worktree::move_known_unlocked(
-            &self.git_executable,
-            &preliminary_parent.root,
-            &repository_lock,
-            &preliminary.root,
-            &canonical_destination,
-            cancellation,
-        )?;
+        repository.move_worktree(&preliminary.root, &canonical_destination, cancellation)?;
 
         // Every failure after Git succeeds is terminally distinct: callers can
         // tell that retrying the move is wrong and reconciliation is required.
@@ -1224,21 +1180,20 @@ impl ProjectService {
         // administrative rewrite; reconciliation deliberately preserves any
         // row it cannot identify instead of guessing or deleting files.
         let post_move = (|| -> Result<(Catalog, Project), String> {
-            let listed =
-                git::worktree::list(&self.git_executable, &preliminary_parent.root, cancellation)
-                    .map_err(|error| error.to_string())?;
-            let registered_root = git::worktree::registered_root(&listed, &id.to_string())
-                .ok_or_else(|| {
-                    "Git has no matching administrative record after the move".to_owned()
-                })?;
-            if !git::worktree::same_path(registered_root, &canonical_destination) {
+            let listed = repository
+                .worktrees(cancellation)
+                .map_err(|error| error.to_string())?;
+            let registered = registered_worktree(&listed, &id.to_string()).ok_or_else(|| {
+                "Git has no matching administrative record after the move".to_owned()
+            })?;
+            if !registered.matches_path(&canonical_destination) {
                 return Err(format!(
                     "Git records the moved checkout at '{}', not the requested destination",
-                    registered_root.display()
+                    registered.root().display()
                 ));
             }
             let moved_root =
-                validate_local_directory(registered_root).map_err(|error| error.to_string())?;
+                validate_local_directory(registered.root()).map_err(|error| error.to_string())?;
             if moved_root != canonical_destination {
                 return Err(format!(
                     "destination resolved to '{}' after the move",
@@ -1309,7 +1264,7 @@ impl ProjectService {
     ) -> Result<(), ProjectError> {
         // Keep input validation ahead of even the porcelain listing: invalid
         // requests must not spawn Git at all.
-        let reason = git::worktree::validate_lock_reason(reason)?;
+        let reason = validate_worktree_lock_reason(reason)?;
         self.change_worktree_lock(
             id,
             WorktreeLockChange::Lock {
@@ -1335,7 +1290,7 @@ impl ProjectService {
         reason: &str,
         cancellation: &Cancellation,
     ) -> Result<(), ProjectError> {
-        let reason = git::worktree::validate_lock_reason(reason)?;
+        let reason = validate_worktree_lock_reason(reason)?;
         self.change_worktree_lock(
             id,
             WorktreeLockChange::Lock {
@@ -1383,7 +1338,7 @@ impl ProjectService {
             })?;
         validate_worktree_parent(&preliminary_parent)?;
 
-        let repository_lock = self
+        let repository = self
             .git_service(&preliminary_parent.root)
             .lock(cancellation)?;
 
@@ -1404,8 +1359,7 @@ impl ProjectService {
             )?;
         }
 
-        let listed =
-            git::worktree::list(&self.git_executable, &preliminary_parent.root, cancellation)?;
+        let listed = repository.worktrees(cancellation)?;
 
         // Matching the catalogued path alone would let a stranger that has
         // taken over that path inherit this operation. Prove the checkout is
@@ -1414,15 +1368,14 @@ impl ProjectService {
         // its identity is unprovable; there is also no foreign checkout at a
         // path that does not exist, and protecting a vanished worktree from
         // pruning is precisely what a lock is for.
-        match git::worktree::registered_root(&listed, &id.to_string()) {
-            Some(registered_root)
-                if git::worktree::same_path(registered_root, &preliminary.root) => {}
-            Some(registered_root) => {
+        match registered_worktree(&listed, &id.to_string()) {
+            Some(registered) if registered.matches_path(&preliminary.root) => {}
+            Some(registered) => {
                 return Err(unsafe_worktree_lock(
                     &preliminary,
                     &format!(
                         "Git records this checkout at '{}'; reconcile worktrees before changing its lock",
-                        registered_root.display()
+                        registered.root().display()
                     ),
                 ));
             }
@@ -1437,7 +1390,7 @@ impl ProjectService {
 
         let row = listed
             .iter()
-            .find(|row| git::worktree::same_path(&row.root, &preliminary.root))
+            .find(|row| row.matches_path(&preliminary.root))
             .ok_or_else(|| {
                 unsafe_worktree_lock(
                     &preliminary,
@@ -1447,49 +1400,29 @@ impl ProjectService {
 
         match change {
             WorktreeLockChange::Lock { reason, replace } => {
-                match &row.locked {
-                    Some(existing) if !replace => {
+                if row.is_locked() {
+                    if !replace {
                         return Err(GitError::WorktreeAlreadyLocked {
                             path: preliminary.root.clone(),
-                            reason: (!existing.is_empty()).then(|| existing.clone()),
+                            reason: row.lock_reason().map(str::to_owned),
                         }
                         .into());
                     }
                     // Git cannot replace a reason in place. Unlocking here
                     // still holds the repository lock, so the unprotected
                     // window is closed to every other Harkness operation.
-                    Some(_) => git::worktree::unlock_known_locked(
-                        &self.git_executable,
-                        &preliminary_parent.root,
-                        &repository_lock,
-                        &preliminary.root,
-                        cancellation,
-                    )?,
-                    None => {}
+                    repository.unlock_worktree(&preliminary.root, cancellation)?;
                 }
-                git::worktree::lock_known_unlocked(
-                    &self.git_executable,
-                    &preliminary_parent.root,
-                    &repository_lock,
-                    &preliminary.root,
-                    reason,
-                    cancellation,
-                )?;
+                repository.lock_worktree(&preliminary.root, reason, cancellation)?;
             }
             WorktreeLockChange::Unlock => {
-                if row.locked.is_none() {
+                if !row.is_locked() {
                     return Err(GitError::WorktreeNotLocked {
                         path: preliminary.root.clone(),
                     }
                     .into());
                 }
-                git::worktree::unlock_known_locked(
-                    &self.git_executable,
-                    &preliminary_parent.root,
-                    &repository_lock,
-                    &preliminary.root,
-                    cancellation,
-                )?;
+                repository.unlock_worktree(&preliminary.root, cancellation)?;
             }
         }
         Ok(())
@@ -1537,7 +1470,7 @@ impl ProjectService {
                 unsafe_worktree_removal(&preliminary, "catalogued parent no longer exists")
             })?;
         validate_worktree_parent(&preliminary_parent)?;
-        let repository_lock = match self
+        let repository = match self
             .git_service(&preliminary_parent.root)
             .lock(cancellation)
         {
@@ -1546,18 +1479,16 @@ impl ProjectService {
             Err(error) => return Err(error.into()),
         };
         let checkout_state = recorded_worktree_state(&preliminary, unsafe_worktree_removal)?;
-        let listed = if repository_lock.is_some() {
-            let listed =
-                git::worktree::list(&self.git_executable, &preliminary_parent.root, cancellation)?;
-            match git::worktree::registered_root(&listed, &preliminary.id.to_string()) {
-                Some(registered_root)
-                    if git::worktree::same_path(registered_root, &preliminary.root) => {}
-                Some(registered_root) => {
+        let listed = if let Some(repository) = &repository {
+            let listed = repository.worktrees(cancellation)?;
+            match registered_worktree(&listed, &preliminary.id.to_string()) {
+                Some(registered) if registered.matches_path(&preliminary.root) => {}
+                Some(registered) => {
                     return Err(unsafe_worktree_removal(
                         &preliminary,
                         &format!(
                             "Git records this checkout at '{}'; reconcile worktrees before removal",
-                            registered_root.display()
+                            registered.root().display()
                         ),
                     ));
                 }
@@ -1569,7 +1500,7 @@ impl ProjectService {
                 }
                 None => {}
             }
-            git::worktree::refuse_if_locked(&listed, &preliminary.root)?;
+            refuse_locked_worktree(&listed, &preliminary.root)?;
             Some(listed)
         } else {
             None
@@ -1577,7 +1508,7 @@ impl ProjectService {
 
         // Status can walk the entire checkout. The repository lock protects it
         // from other Harkness mutations; the global catalog lock is not needed.
-        if repository_lock.is_some() && checkout_state == WorktreeCheckoutState::Available {
+        if repository.is_some() && checkout_state == WorktreeCheckoutState::Available {
             let status = inspect_git(&preliminary.root)?.ok_or_else(|| {
                 unsafe_worktree_removal(&preliminary, "checkout is not a Git worktree")
             })?;
@@ -1610,17 +1541,14 @@ impl ProjectService {
         // runs after the catalog lock is released. A missing checkout is still
         // removed through Git when the parent survives, selectively cleaning
         // only this Harkness-owned administrative record.
-        if let Some(repository_lock) = &repository_lock {
+        if let Some(repository) = &repository {
             let has_administrative_row = listed.as_ref().is_some_and(|listed| {
                 listed
                     .iter()
-                    .any(|worktree| git::worktree::same_path(&worktree.root, &preliminary.root))
+                    .any(|worktree| worktree.matches_path(&preliminary.root))
             });
             if has_administrative_row || preliminary.root.exists() {
-                git::worktree::remove_known_unlocked(
-                    &self.git_executable,
-                    &preliminary_parent.root,
-                    repository_lock,
+                repository.remove_worktree(
                     &preliminary.root,
                     force || checkout_state == WorktreeCheckoutState::Missing,
                     cancellation,
@@ -1696,7 +1624,7 @@ impl ProjectService {
                 }),
             }
         }
-        let repository_lock = match self
+        let repository = match self
             .git_service(&preliminary_parent.root)
             .lock(cancellation)
         {
@@ -1726,19 +1654,18 @@ impl ProjectService {
         let mut git_removals = Vec::new();
         let mut repairs = Vec::new();
         let mut terminal_error = None;
-        if let Some(repository_lock) = &repository_lock {
-            let live =
-                git::worktree::list(&self.git_executable, &preliminary_parent.root, cancellation)?;
+        if let Some(repository) = &repository {
+            let live = repository.worktrees(cancellation)?;
             for (project, state) in &worktree_states {
-                let registered = git::worktree::registered_root(&live, &project.id.to_string());
+                let registered = registered_worktree(&live, &project.id.to_string());
                 if *state == WorktreeCheckoutState::Available {
                     match registered {
-                        Some(root) if git::worktree::same_path(root, &project.root) => {}
-                        Some(root) => outcome.skipped.push(WorktreeReconciliationSkip {
+                        Some(worktree) if worktree.matches_path(&project.root) => {}
+                        Some(worktree) => outcome.skipped.push(WorktreeReconciliationSkip {
                             project: project.clone(),
                             reason: format!(
                                 "Git records this checkout at '{}' instead of its available catalogued root",
-                                root.display()
+                                worktree.root().display()
                             ),
                         }),
                         None => outcome.skipped.push(WorktreeReconciliationSkip {
@@ -1751,16 +1678,17 @@ impl ProjectService {
                 }
                 let listed = live
                     .iter()
-                    .find(|worktree| git::worktree::same_path(&worktree.root, &project.root));
+                    .find(|worktree| worktree.matches_path(&project.root));
                 if let Some(worktree) = listed
-                    && let Some(reason) = &worktree.locked
+                    && worktree.is_locked()
                 {
                     outcome.skipped.push(WorktreeReconciliationSkip {
                         project: project.clone(),
-                        reason: if reason.is_empty() {
-                            "Git has locked the missing worktree".to_owned()
-                        } else {
-                            format!("Git has locked the missing worktree: {reason}")
+                        reason: match worktree.lock_reason() {
+                            Some(reason) => {
+                                format!("Git has locked the missing worktree: {reason}")
+                            }
+                            None => "Git has locked the missing worktree".to_owned(),
                         },
                     });
                     continue;
@@ -1769,8 +1697,8 @@ impl ProjectService {
                     git_removals.push(project.clone());
                     continue;
                 }
-                if let Some(moved_root) = registered {
-                    let repair = validate_local_directory(moved_root).and_then(|moved_root| {
+                if let Some(moved) = registered {
+                    let repair = validate_local_directory(moved.root()).and_then(|moved_root| {
                         refuse_worktree_root_location(
                             &preliminary_catalog,
                             &self.data_dir,
@@ -1794,14 +1722,7 @@ impl ProjectService {
             }
 
             for project in git_removals {
-                match git::worktree::remove_known_unlocked(
-                    &self.git_executable,
-                    &preliminary_parent.root,
-                    repository_lock,
-                    &project.root,
-                    true,
-                    cancellation,
-                ) {
+                match repository.remove_worktree(&project.root, true, cancellation) {
                     Ok(()) => removable.push((project.id, project.root.clone())),
                     Err(GitError::Cancelled) => {
                         terminal_error = Some(ProjectError::Git(GitError::Cancelled));
@@ -1967,22 +1888,22 @@ impl ProjectService {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let listed = git::worktree::list(&self.git_executable, &parent.root, cancellation)?;
+        let listed = self.git_service(&parent.root).worktrees(cancellation)?;
         let mut worktrees = Vec::new();
         for row in listed {
-            if git::worktree::same_path(&row.root, &parent.root) {
+            if row.matches_path(&parent.root) {
                 continue;
             }
             let project = managed
                 .iter()
-                .position(|project| git::worktree::same_path(&project.root, &row.root))
+                .position(|project| row.matches_path(&project.root))
                 .map(|index| managed.remove(index));
             worktrees.push(Worktree {
-                root: row.root,
-                branch: row.branch,
-                locked: row.locked.is_some(),
-                lock_reason: row.locked.filter(|reason| !reason.is_empty()),
-                prunable: row.prunable,
+                root: row.root().to_path_buf(),
+                branch: row.branch().map(str::to_owned),
+                locked: row.is_locked(),
+                lock_reason: row.lock_reason().map(str::to_owned),
+                prunable: row.is_prunable(),
                 project,
             });
         }
@@ -2017,9 +1938,7 @@ impl ProjectService {
     ///
     /// The catalog is read under a shared lock that is released before this
     /// returns, so the caller is free to take a repository lock afterwards
-    /// without violating the ordering documented on [`RepositoryLock`].
-    ///
-    /// [`RepositoryLock`]: crate::RepositoryLock
+    /// without violating the repository-before-catalog lock order.
     pub fn git(&self, id: ProjectId) -> Result<GitService, ProjectError> {
         let catalog = self.read_catalog_shared()?;
         let project = catalog
@@ -2032,7 +1951,8 @@ impl ProjectService {
 
     /// Addresses one repository with this service's Git executable.
     fn git_service(&self, root: &Path) -> GitService {
-        GitService::new(root, &self.data_dir).with_git_executable(&self.git_executable)
+        GitService::new(root, self.data_dir.join(LOCKS_DIRECTORY))
+            .with_git_executable(&self.git_executable)
     }
 
     fn persist(&self, catalog: &Catalog) -> Result<(), ProjectError> {
@@ -2799,7 +2719,40 @@ fn refresh_project(mut project: Project) -> Project {
 ///
 /// Spawns nothing: this runs for every catalog entry on every ambient read.
 fn inspect_git(path: &Path) -> Result<Option<GitStatus>, ProjectError> {
-    git::status::inspect(path).map_err(Into::into)
+    inspect_repository(path).map_err(Into::into)
+}
+
+fn registered_worktree<'a>(
+    worktrees: &'a [GitWorktree],
+    administrative_name: &str,
+) -> Option<&'a GitWorktree> {
+    worktrees
+        .iter()
+        .find(|worktree| worktree.matches_administrative_name(administrative_name))
+}
+
+fn refuse_locked_worktree(worktrees: &[GitWorktree], path: &Path) -> Result<(), GitError> {
+    let locked = worktrees
+        .iter()
+        .find(|worktree| worktree.matches_path(path) && worktree.is_locked());
+    match locked {
+        Some(worktree) => Err(GitError::WorktreeLocked {
+            path: path.to_path_buf(),
+            reason: worktree.lock_reason().map(str::to_owned),
+        }),
+        None => Ok(()),
+    }
+}
+
+fn clone_failure(error: GitError) -> ProjectError {
+    match error {
+        GitError::Launch { source } => ProjectError::GitLaunch { source },
+        GitError::Cancelled => ProjectError::CloneCancelled,
+        GitError::Failed { stderr, .. } => ProjectError::CloneFailed { stderr },
+        other => ProjectError::CloneFailed {
+            stderr: other.to_string(),
+        },
+    }
 }
 
 fn display_name(root: &Path) -> String {
@@ -2828,7 +2781,7 @@ mod tests {
     };
 
     use super::{
-        ManagedImportLock, ProjectError, ProjectSelector, ProjectService, WorktreeBase,
+        ManagedImportLock, ProjectError, ProjectSelector, ProjectService,
         is_explicit_path_selector, sort_recents,
     };
     use crate::{
@@ -2836,7 +2789,6 @@ mod tests {
             CATALOG_VERSION, MINIMUM_SUPPORTED_CATALOG_VERSION,
             entry::{Project, ProjectId, ProjectSource},
         },
-        git::{Cancellation, CloneCancellation, GitError},
         list_directory,
         paths::{
             CATALOG_FILE, CATALOG_LOCK_FILE, CHECKOUT_DIRECTORY, DATA_DIRECTORY_ENV,
@@ -2847,6 +2799,10 @@ mod tests {
             PROCESS_PROJECT_ROOT_ENV, PROCESS_READY_FILE_ENV, SCRUBBED_ENVIRONMENT, commit_all,
             git, initialize_repository, spawn_child, wait_for_child_signal,
         },
+    };
+    use harkness_git::{
+        Cancellation, CloneCancellation, CommitOptions, GitError, GitWorktree, InspectionSource,
+        WorktreeBase,
     };
 
     /// Coarse enough for the ~15ms system clock granularity on Windows.
@@ -3189,7 +3145,7 @@ mod tests {
             (
                 ProjectError::GitInspection {
                     path: path.clone(),
-                    source: git_error(),
+                    source: git_error().into(),
                 },
                 "git_inspection",
             ),
@@ -3353,6 +3309,45 @@ mod tests {
         for (error, expected) in cases {
             assert_eq!(error.kind(), expected, "unexpected kind for {error:?}");
         }
+    }
+
+    #[test]
+    fn git_inspection_errors_keep_the_project_namespace_and_diagnostic() {
+        let path = PathBuf::from("inspection-fixture");
+        let error = ProjectError::from(GitError::Inspection {
+            path: path.clone(),
+            source: InspectionSource::from_message("fixture inspection failure"),
+        });
+
+        assert_eq!(error.kind(), "git_inspection");
+        assert!(matches!(
+            &error,
+            ProjectError::GitInspection { path: actual, .. } if actual == &path
+        ));
+        assert!(error.to_string().contains("fixture inspection failure"));
+    }
+
+    #[test]
+    fn clone_git_errors_keep_the_project_error_contract() {
+        let launch = super::clone_failure(GitError::Launch {
+            source: io::Error::other("fixture launch failure"),
+        });
+        assert_eq!(launch.kind(), "git_launch");
+        assert!(matches!(launch, ProjectError::GitLaunch { .. }));
+
+        let cancelled = super::clone_failure(GitError::Cancelled);
+        assert_eq!(cancelled.kind(), "clone_cancelled");
+        assert!(matches!(cancelled, ProjectError::CloneCancelled));
+
+        let failed = super::clone_failure(GitError::Failed {
+            command: "clone".to_owned(),
+            stderr: "fixture process failure".to_owned(),
+        });
+        assert_eq!(failed.kind(), "clone_failed");
+        assert!(matches!(
+            failed,
+            ProjectError::CloneFailed { stderr } if stderr == "fixture process failure"
+        ));
     }
 
     #[test]
@@ -4305,7 +4300,7 @@ mod tests {
             error,
             ProjectError::Git(GitError::BranchCheckedOutInWorktree { branch, worktree })
                 if branch == "held-elsewhere"
-                    && crate::git::worktree::same_path(&worktree, &external)
+                    && GitWorktree::paths_match(&worktree, &external)
         ));
 
         let managed = create_branch_worktree(&mut service, parent.id, "agent/not-a-parent");
@@ -4347,10 +4342,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(worktrees.len(), 1);
-        assert!(crate::git::worktree::same_path(
-            &worktrees[0].root,
-            &external
-        ));
+        assert!(GitWorktree::paths_match(&worktrees[0].root, &external));
         assert_eq!(worktrees[0].branch.as_deref(), Some("external-branch"));
         assert!(worktrees[0].project.is_none());
         assert_eq!(service.list_catalog_only().unwrap().len(), 1);
@@ -4625,7 +4617,7 @@ mod tests {
             .unwrap();
         let foreign = listed
             .iter()
-            .find(|row| crate::git::worktree::same_path(&row.root, &outside))
+            .find(|row| GitWorktree::paths_match(&row.root, &outside))
             .expect("the foreign worktree is listed");
         assert!(foreign.locked);
         assert_eq!(
@@ -4807,7 +4799,7 @@ mod tests {
         );
         git.commit(
             "Preserve work across relocation",
-            &crate::git::CommitOptions::default(),
+            &CommitOptions::default(),
             &Cancellation::default(),
         )
         .unwrap();
@@ -4876,7 +4868,7 @@ mod tests {
                 &Cancellation::default(),
             ),
             Err(ProjectError::WorktreeDestinationInsideDataDirectory { path, .. })
-                if crate::git::worktree::same_path(&path, &data_destination)
+                if GitWorktree::paths_match(&path, &data_destination)
         ));
 
         let missing_parent = fixture
@@ -4891,10 +4883,13 @@ mod tests {
         ));
         assert!(worktree.root.exists());
         assert!(
-            crate::git::worktree::list(Path::new("git"), &parent_root, &Cancellation::default())
+            service
+                .git(parent.id)
+                .unwrap()
+                .worktrees(&Cancellation::default())
                 .unwrap()
                 .iter()
-                .any(|listed| crate::git::worktree::same_path(&listed.root, &worktree.root))
+                .any(|listed| listed.matches_path(&worktree.root))
         );
     }
 
@@ -5003,8 +4998,8 @@ mod tests {
                 worktree: source,
                 destination: refused,
                 ..
-            }) if crate::git::worktree::same_path(&source, &worktree.root)
-                && crate::git::worktree::same_path(&refused, &destination)
+            }) if GitWorktree::paths_match(&source, &worktree.root)
+                && GitWorktree::paths_match(&refused, &destination)
         ));
         assert!(worktree.root.exists());
         assert!(!destination.exists());
@@ -5448,14 +5443,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(outcome.removed[0].id, managed.id);
-        let listed =
-            crate::git::worktree::list(Path::new("git"), &parent_root, &Cancellation::default())
-                .unwrap();
+        let listed = service
+            .git(parent.id)
+            .unwrap()
+            .worktrees(&Cancellation::default())
+            .unwrap();
         let external = listed
             .iter()
-            .find(|worktree| crate::git::worktree::same_path(&worktree.root, &external))
+            .find(|worktree| worktree.matches_path(&external))
             .expect("reconciliation must leave an external worktree registered");
-        assert_eq!(external.locked.as_deref(), Some("temporarily unmounted"));
+        assert!(external.is_locked());
+        assert_eq!(external.lock_reason(), Some("temporarily unmounted"));
     }
 
     #[test]
@@ -5493,13 +5491,15 @@ mod tests {
 
         assert_eq!(outcome.removed.len(), 1);
         assert_eq!(outcome.removed[0].id, id);
-        let listed =
-            crate::git::worktree::list(Path::new("git"), &parent_root, &Cancellation::default())
-                .unwrap();
+        let listed = service
+            .git(parent.id)
+            .unwrap()
+            .worktrees(&Cancellation::default())
+            .unwrap();
         assert!(
             !listed
                 .iter()
-                .any(|worktree| crate::git::worktree::same_path(&worktree.root, &outside))
+                .any(|worktree| worktree.matches_path(&outside))
         );
         assert!(
             !service
@@ -6939,25 +6939,19 @@ mod tests {
         let fixture = Fixture::new();
         let working_directory = fixture.directory("scrubbed");
         let elsewhere = fixture.directory("elsewhere");
-        let reported = SCRUBBED_ENVIRONMENT
-            .iter()
-            .copied()
-            .chain([
-                "GIT_TERMINAL_PROMPT",
-                "GIT_OPTIONAL_LOCKS",
-                "LC_ALL",
-                "GIT_EDITOR",
-            ])
-            .collect::<Vec<_>>()
-            .join(" ");
+        let scrubbed = SCRUBBED_ENVIRONMENT.join(" ");
         let reporting_git = fixture.shim(
             "reporting-git",
             &format!(
                 "#!/bin/sh\n\
-                 for name in {reported}; do\n\
+                 for name in {scrubbed}; do\n\
                  \x20 eval \"value=\\${{$name-unset}}\"\n\
-                 \x20 printf '%s=%s\\n' \"$name\" \"$value\"\n\
-                 done\n"
+                 \x20 test \"$value\" = unset || exit 41\n\
+                 done\n\
+                 test \"$GIT_TERMINAL_PROMPT\" = 0 || exit 42\n\
+                 test \"$GIT_OPTIONAL_LOCKS\" = 0 || exit 43\n\
+                 test \"$LC_ALL\" = C || exit 44\n\
+                 test \"$GIT_EDITOR\" = harkness-has-no-editor || exit 45\n"
             ),
         );
 

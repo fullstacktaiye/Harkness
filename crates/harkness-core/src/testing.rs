@@ -14,12 +14,10 @@ use std::{
 };
 
 use git2::{IndexAddOption, Repository, Signature, Time};
+use harkness_git::{Cancellation, CommitOptions, GitError, GitService, WorktreeBase};
 use tempfile::TempDir;
 
-use crate::{
-    git::{Cancellation, GitAccess, GitCommand, GitError, GitService},
-    project::{ProjectError, ProjectService, WorktreeBase},
-};
+use crate::project::{ProjectError, ProjectService};
 
 /// Fixed so repository fixtures hash identically between runs.
 pub(crate) const COMMIT_EPOCH_SECONDS: i64 = 1_700_000_000;
@@ -89,9 +87,10 @@ fn process_child() {
             );
         }
         "hold-repository-lock" => {
-            let _lock = GitService::new(child_project_root(), &data_dir)
-                .lock(&Cancellation::default())
-                .unwrap();
+            let _lock =
+                GitService::new(child_project_root(), PathBuf::from(&data_dir).join("locks"))
+                    .lock(&Cancellation::default())
+                    .unwrap();
             signal_ready();
             park();
         }
@@ -117,12 +116,12 @@ fn process_child() {
             let root = child_project_root();
             initialize_repository(&root);
             fs::write(root.join("tracked.txt"), "committed through system Git\n").unwrap();
-            let git = GitService::new(&root, &data_dir);
+            let git = GitService::new(&root, PathBuf::from(&data_dir).join("locks"));
             git.stage(["tracked.txt"], &Cancellation::default())
                 .unwrap();
             git.commit(
                 "isolated fixture commit",
-                &crate::git::CommitOptions::default(),
+                &CommitOptions::default(),
                 &Cancellation::default(),
             )
             .unwrap();
@@ -138,26 +137,12 @@ fn process_child() {
             }
             let git_executable = std::env::var_os(PROCESS_GIT_EXECUTABLE_ENV)
                 .expect("child Git executable was not set");
-            let output =
-                GitCommand::new(git_executable, child_project_root(), GitAccess::LocalRead)
-                    .arg("status")
-                    .run(&Cancellation::default())
-                    .unwrap();
-            let reported = String::from_utf8(output.stdout).unwrap();
-            let mut expected = SCRUBBED_ENVIRONMENT
-                .iter()
-                .map(|name| format!("{name}=unset"))
-                .collect::<Vec<_>>();
-            expected.extend(
-                [
-                    "GIT_TERMINAL_PROMPT=0",
-                    "GIT_OPTIONAL_LOCKS=0",
-                    "LC_ALL=C",
-                    "GIT_EDITOR=harkness-has-no-editor",
-                ]
-                .map(str::to_owned),
-            );
-            assert_eq!(reported.lines().collect::<Vec<_>>(), expected);
+            let root = child_project_root();
+            initialize_repository(&root);
+            GitService::new(&root, PathBuf::from(&data_dir).join("locks"))
+                .with_git_executable(git_executable)
+                .worktrees(&Cancellation::default())
+                .unwrap();
         }
         _ => panic!("unknown test child role: {role}"),
     }
@@ -212,23 +197,6 @@ pub(crate) fn wait_for_child_signal(child: &mut Child, signal: &Path) {
     }
 }
 
-/// Waits for a file to appear, failing rather than hanging.
-///
-/// For the processes no test holds a handle to: a Git shim started by the code
-/// under test, which signals that it is running and therefore that there is
-/// something to cancel.
-pub(crate) fn wait_for_file(signal: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !signal.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "'{}' did not appear within 10 seconds",
-            signal.display()
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
 /// Creates a repository on `main` holding one committed file.
 pub(crate) fn initialize_repository(path: &Path) -> Repository {
     let repository = Repository::init(path).unwrap();
@@ -253,57 +221,24 @@ pub(crate) fn configure_commit_identity(repository: &Repository) {
     config.set_bool("commit.gpgsign", false).unwrap();
 }
 
-/// Creates a bare repository whose HEAD names `main` before it exists.
-///
-/// Git refuses to update the checked-out branch of a non-bare repository, so
-/// every push fixture needs one of these rather than a second working tree.
-/// HEAD is set explicitly because libgit2's default branch is not necessarily
-/// the one [`initialize_repository`] creates, and a bare repository whose HEAD
-/// dangles is one that cannot be cloned.
-pub(crate) fn initialize_bare_repository(path: &Path) -> Repository {
-    let repository = Repository::init_bare(path).unwrap();
-    repository.set_head("refs/heads/main").unwrap();
-    repository
-}
-
-/// Creates a bare remote holding one commit on `main`, and a clone of it.
-///
-/// The clone is made by real `git clone`, which is also what writes
-/// `refs/remotes/origin/HEAD`: the ref the default-branch refusal falls back
-/// to, and one that adding a remote by hand would never produce.
-pub(crate) fn remote_with_clone(fixture: &Fixture, name: &str) -> (PathBuf, PathBuf) {
-    let source = fixture.directory(&format!("{name}-source"));
-    initialize_repository(&source);
-    let remote = fixture.directory(&format!("{name}-remote.git"));
-    initialize_bare_repository(&remote);
-    git(&source, ["push", "--", remote.to_str().unwrap(), "main"]);
-
-    let clone = fixture.root.path().join(format!("{name}-clone"));
-    git(
-        fixture.root.path(),
-        [
-            "clone",
-            "--",
-            remote.to_str().unwrap(),
-            clone.to_str().unwrap(),
-        ],
-    );
-    (remote, clone)
-}
-
 /// Runs system Git for a fixture, returning its standard output.
 ///
-/// Bounded by the local-write timeout even for the network verbs it runs
-/// against local paths, so a fixture that goes wrong fails the test instead of
-/// hanging the suite.
+/// This test-only setup deliberately stays outside production code; every
+/// caller operates only on local fixture repositories and remotes.
 pub(crate) fn git(
     working_directory: &Path,
     arguments: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
 ) -> String {
-    let output = GitCommand::new("git", working_directory, GitAccess::LocalWrite)
+    let output = Command::new("git")
+        .current_dir(working_directory)
         .args(arguments)
-        .run(&Cancellation::default())
+        .output()
         .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 

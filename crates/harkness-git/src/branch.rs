@@ -13,11 +13,8 @@ use std::{
 use git2::{BranchType, ErrorCode, Oid, Reference, Repository};
 
 use crate::{
-    catalog::entry::UpstreamStatus,
-    git::{
-        GitError, RepositoryLock, head_branch, recorded_default_branch, resolve_remote,
-        runner::{Cancellation, GitAccess, GitCommand},
-    },
+    GitError, RepositoryLock, UpstreamStatus, head_branch, recorded_default_branch, resolve_remote,
+    runner::{Cancellation, GitAccess, GitCommand},
 };
 
 /// Which ref namespace a [`Branch`] came from.
@@ -681,7 +678,7 @@ pub(super) fn open(root: &Path) -> Result<Repository, GitError> {
 fn inspection(path: &Path, source: git2::Error) -> GitError {
     GitError::Inspection {
         path: path.to_path_buf(),
-        source,
+        source: source.into(),
     }
 }
 
@@ -693,7 +690,7 @@ mod tests {
 
     use super::{BranchCheckout, BranchKind, BranchListOptions, CreateBranchOptions};
     use crate::{
-        git::{Cancellation, GitError, GitService},
+        Cancellation, GitError, GitService,
         testing::{
             COMMIT_EPOCH_SECONDS, Fixture, PROCESS_PROJECT_ROOT_ENV, PROCESS_READY_FILE_ENV,
             commit_all, git, initialize_repository, remote_with_clone, spawn_child,

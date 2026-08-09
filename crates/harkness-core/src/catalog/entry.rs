@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use harkness_git::GitStatus;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -65,45 +66,6 @@ pub enum ProjectSource {
         /// those entries rather than carrying a sentinel string.
         worktree_branch: Option<String>,
     },
-}
-
-/// Where a branch stands relative to the branch it tracks.
-///
-/// Resolved from local refs only. The counts answer "how far apart are the two
-/// refs this machine already has", never "what does the remote have now", so
-/// producing one never touches the network.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct UpstreamStatus {
-    /// The tracked branch, as `origin/main` rather than as a full ref name.
-    pub name: String,
-    /// Commits on the local branch that the upstream does not have.
-    pub ahead: usize,
-    /// Commits on the upstream that the local branch does not have.
-    pub behind: usize,
-}
-
-/// Git information collected from a project directory.
-///
-/// The cheap status tier: everything here comes from one in-process walk, so it
-/// can be recomputed for every catalog entry on every read. A caller that needs
-/// per-path detail asks [`GitService::detailed_status`] for one project.
-///
-/// [`GitService::detailed_status`]: crate::GitService::detailed_status
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct GitStatus {
-    /// The checked-out branch, or `None` for a detached head.
-    pub branch: Option<String>,
-    /// Whether the worktree contains tracked or untracked changes.
-    pub dirty: bool,
-    /// The tracked branch and the divergence from it, when one is configured.
-    pub upstream: Option<UpstreamStatus>,
-    /// How many paths differ between the index and HEAD.
-    pub staged: usize,
-    /// How many tracked paths differ between the working tree and the index.
-    ///
-    /// Untracked paths are excluded: they are not recursed into during the
-    /// walk, so counting them would count directories rather than files.
-    pub unstaged: usize,
 }
 
 /// A durable project catalog entry.

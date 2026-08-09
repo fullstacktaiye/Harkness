@@ -1,4 +1,4 @@
-//! System Git integration.
+//! System Git integration for Harkness front ends.
 //!
 //! Everything Harkness does with Git goes through this module: one command
 //! runner, one per-repository lock, and the two status tiers. [`GitService`] is
@@ -7,7 +7,7 @@
 //! of order.
 
 mod branch;
-pub(crate) mod clone;
+mod clone;
 mod commit;
 mod context;
 mod diff;
@@ -16,12 +16,14 @@ mod hunk;
 mod intra_line;
 mod lock;
 mod runner;
-pub(crate) mod status;
+mod status;
 mod sync;
-pub(crate) mod worktree;
+#[cfg(test)]
+mod testing;
+mod worktree;
 
 use std::{
-    io,
+    fmt, io,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -46,18 +48,46 @@ pub use diff::{
 };
 pub use history::{CommitInfo, CommitSignature, LogCursor, LogOptions, LogPage, LogRange};
 pub use hunk::{HunkSelection, HunkStageOutcome};
-pub use lock::RepositoryLock;
-pub use runner::{Cancellation, CloneCancellation, GitAccess, GitCommand, GitOutput};
-pub use status::{DetailedStatus, FileChange, HeadState, PendingOperation, StatusEntry};
+use lock::RepositoryLock;
+pub use runner::{Cancellation, CloneCancellation};
+pub use status::{
+    DetailedStatus, FileChange, GitStatus, HeadState, PendingOperation, StatusEntry, UpstreamStatus,
+};
 pub use sync::{
     FetchOptions, FetchOutcome, PullOptions, PullOutcome, PullStrategy, PushOptions, PushOutcome,
     RefUpdate,
 };
-
-use crate::catalog::entry::GitStatus;
+pub use worktree::{AddedWorktree, GitWorktree, WorktreeBase};
 
 pub(crate) const DEFAULT_REMOTE: &str = "origin";
 pub(crate) const LOCAL_REMOTE: &str = ".";
+
+/// A Git inspection diagnostic without exposing the underlying libgit2 type
+/// across crate boundaries.
+#[derive(Debug)]
+pub struct InspectionSource(git2::Error);
+
+impl InspectionSource {
+    /// Creates an inspection diagnostic with the supplied human-readable text.
+    #[must_use]
+    pub fn from_message(message: &str) -> Self {
+        Self(git2::Error::from_str(message))
+    }
+}
+
+impl fmt::Display for InspectionSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for InspectionSource {}
+
+impl From<git2::Error> for InspectionSource {
+    fn from(source: git2::Error) -> Self {
+        Self(source)
+    }
+}
 
 /// Failures raised by Git operations.
 #[derive(Debug, Error)]
@@ -353,7 +383,7 @@ pub enum GitError {
     Inspection {
         path: PathBuf,
         #[source]
-        source: git2::Error,
+        source: InspectionSource,
     },
 
     /// Working-tree content could not be read while computing its blob ID.
@@ -595,11 +625,10 @@ fn describe_paths(paths: &[PathBuf]) -> String {
 
 /// Git operations on one repository.
 ///
-/// Stateless and addressed by path. It deliberately cannot resolve a
-/// [`ProjectId`]: reading the catalog would mean taking the catalog lock, and
-/// the lock ordering documented on [`RepositoryLock`] forbids taking it while
-/// this service is about to lock a repository. [`ProjectService::git`] does
-/// that resolution instead, releasing the catalog lock before it returns.
+/// Stateless and addressed by path. It deliberately has no project-catalog
+/// dependency: the embedding layer resolves project identities and releases
+/// its catalog lock before constructing this service. That keeps repository
+/// locking independent of, and ordered before, any later catalog lock.
 ///
 /// # What a front end has to provide
 ///
@@ -612,7 +641,7 @@ fn describe_paths(paths: &[PathBuf]) -> String {
 /// - **Pending state.** The repository lock is exclusive, so a second operation
 ///   on the same repository fails with [`GitError::RepositoryBusy`] rather than
 ///   queueing. A front end that lets a user press *Pull* twice has to disable
-///   the control itself; the core will not serialize on its behalf.
+///   the control itself; this service will not serialize on its behalf.
 /// - **Cancellation.** Every verb takes a [`Cancellation`], and cancelling
 ///   kills Git's whole process group. A cancelled [`pull`] is the one case that
 ///   can leave work behind: see the recovery rule below.
@@ -627,8 +656,6 @@ fn describe_paths(paths: &[PathBuf]) -> String {
 ///   resolve or abort, because every later operation on that repository will
 ///   refuse with [`GitError::OperationInProgress`] until it does.
 ///
-/// [`ProjectId`]: crate::ProjectId
-/// [`ProjectService::git`]: crate::ProjectService::git
 /// [`fetch`]: GitService::fetch
 /// [`pull`]: GitService::pull
 /// [`push`]: GitService::push
@@ -637,20 +664,20 @@ fn describe_paths(paths: &[PathBuf]) -> String {
 #[derive(Clone, Debug)]
 pub struct GitService {
     root: PathBuf,
-    data_dir: PathBuf,
+    lock_dir: PathBuf,
     git_executable: PathBuf,
 }
 
 impl GitService {
     /// Addresses the repository whose working directory is `root`.
     ///
-    /// `data_dir` is the Harkness data directory, which is where repository
-    /// locks live; nothing is created there until a lock is taken.
+    /// `lock_dir` is supplied explicitly by the embedding application; nothing
+    /// is created there until a lock is taken.
     #[must_use]
-    pub fn new(root: impl Into<PathBuf>, data_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(root: impl Into<PathBuf>, lock_dir: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            data_dir: data_dir.into(),
+            lock_dir: lock_dir.into(),
             git_executable: PathBuf::from("git"),
         }
     }
@@ -668,24 +695,6 @@ impl GitService {
         &self.root
     }
 
-    /// Prepares a Git invocation in this repository.
-    ///
-    /// Write and network commands acquire the repository lock immediately and
-    /// retain it through execution. Local reads remain lock-free.
-    pub fn command(
-        &self,
-        access: GitAccess,
-        cancellation: &Cancellation,
-    ) -> Result<GitCommand, GitError> {
-        let command = GitCommand::new(&self.git_executable, &self.root, access);
-        match access {
-            GitAccess::LocalRead => Ok(command),
-            GitAccess::LocalWrite | GitAccess::Network => {
-                Ok(command.with_repository_lock(self.lock(cancellation)?))
-            }
-        }
-    }
-
     /// Describes the repository cheaply and in process.
     ///
     /// `None` means the root is not the working tree of a repository. Spawns
@@ -700,6 +709,33 @@ impl GitService {
     /// names rather than for a whole listing.
     pub fn detailed_status(&self, cancellation: &Cancellation) -> Result<DetailedStatus, GitError> {
         status::detailed(&self.git_executable, &self.root, cancellation)
+    }
+
+    /// Clones `remote` to an explicit destination using this service's working
+    /// directory and Git executable.
+    ///
+    /// Clone creates a repository, so there is no repository lock to take yet.
+    pub fn clone_to(
+        &self,
+        remote: &str,
+        destination: impl AsRef<Path>,
+        cancellation: &Cancellation,
+        mut on_progress: impl FnMut(String),
+    ) -> Result<(), GitError> {
+        clone::run(
+            &self.git_executable,
+            &self.root,
+            remote,
+            destination.as_ref(),
+            cancellation,
+            &mut on_progress,
+        )
+    }
+
+    /// Lists the repository's main and linked worktrees without taking its
+    /// mutation lock.
+    pub fn worktrees(&self, cancellation: &Cancellation) -> Result<Vec<GitWorktree>, GitError> {
+        worktree::list(&self.git_executable, &self.root, cancellation)
     }
 
     /// Lists one bounded page of commits, newest first.
@@ -805,7 +841,7 @@ impl GitService {
         options: &StageOptions,
         cancellation: &Cancellation,
     ) -> Result<HunkStageOutcome, GitError> {
-        let lock = self.lock(cancellation)?;
+        let lock = self.acquire_lock(cancellation)?;
         hunk::stage(
             &self.git_executable,
             &self.root,
@@ -836,7 +872,7 @@ impl GitService {
         options: &StageOptions,
         cancellation: &Cancellation,
     ) -> Result<HunkStageOutcome, GitError> {
-        let lock = self.lock(cancellation)?;
+        let lock = self.acquire_lock(cancellation)?;
         hunk::unstage(
             &self.git_executable,
             &self.root,
@@ -888,7 +924,7 @@ impl GitService {
             .into_iter()
             .map(|path| path.as_ref().to_path_buf())
             .collect::<Vec<_>>();
-        let lock = self.lock(cancellation)?;
+        let lock = self.acquire_lock(cancellation)?;
         commit::stage(
             &self.git_executable,
             &self.root,
@@ -915,7 +951,7 @@ impl GitService {
         options: &StageOptions,
         cancellation: &Cancellation,
     ) -> Result<StatusRefreshOutcome, GitError> {
-        let lock = self.lock(cancellation)?;
+        let lock = self.acquire_lock(cancellation)?;
         commit::stage_all(
             &self.git_executable,
             &self.root,
@@ -963,7 +999,7 @@ impl GitService {
             .into_iter()
             .map(|path| path.as_ref().to_path_buf())
             .collect::<Vec<_>>();
-        let lock = self.lock(cancellation)?;
+        let lock = self.acquire_lock(cancellation)?;
         commit::unstage(
             &self.git_executable,
             &self.root,
@@ -988,7 +1024,7 @@ impl GitService {
         options: &CommitOptions,
         cancellation: &Cancellation,
     ) -> Result<CommitOutcome, GitError> {
-        let lock = self.lock(cancellation)?;
+        let lock = self.acquire_lock(cancellation)?;
         commit::commit(
             &self.git_executable,
             &self.root,
@@ -1022,7 +1058,7 @@ impl GitService {
         cancellation: &Cancellation,
     ) -> Result<(), GitError> {
         branch::validate_name(name)?;
-        let lock = self.lock(cancellation)?;
+        let lock = self.acquire_lock(cancellation)?;
         branch::create(
             &self.git_executable,
             &self.root,
@@ -1036,7 +1072,7 @@ impl GitService {
     /// Checks out an existing local branch without discarding local changes.
     pub fn checkout_branch(&self, name: &str, cancellation: &Cancellation) -> Result<(), GitError> {
         branch::validate_name(name)?;
-        let lock = self.lock(cancellation)?;
+        let lock = self.acquire_lock(cancellation)?;
         branch::checkout(&self.git_executable, &self.root, lock, name, cancellation)
     }
 
@@ -1054,7 +1090,7 @@ impl GitService {
         cancellation: &Cancellation,
     ) -> Result<(), GitError> {
         branch::validate_name(name)?;
-        let lock = self.lock(cancellation)?;
+        let lock = self.acquire_lock(cancellation)?;
         branch::delete(
             &self.git_executable,
             &self.root,
@@ -1073,7 +1109,7 @@ impl GitService {
         cancellation: &Cancellation,
     ) -> Result<(), GitError> {
         branch::validate_name(branch)?;
-        let lock = self.lock(cancellation)?;
+        let lock = self.acquire_lock(cancellation)?;
         branch::set_upstream(
             &self.git_executable,
             &self.root,
@@ -1093,7 +1129,7 @@ impl GitService {
     ) -> Result<(), GitError> {
         branch::validate_name(old_name)?;
         branch::validate_name(new_name)?;
-        let lock = self.lock(cancellation)?;
+        let lock = self.acquire_lock(cancellation)?;
         branch::rename(
             &self.git_executable,
             &self.root,
@@ -1116,7 +1152,7 @@ impl GitService {
         cancellation: &Cancellation,
         on_progress: impl FnMut(String),
     ) -> Result<FetchOutcome, GitError> {
-        let lock = self.lock(cancellation)?;
+        let lock = self.acquire_lock(cancellation)?;
         sync::fetch(
             &self.git_executable,
             &self.root,
@@ -1145,7 +1181,7 @@ impl GitService {
         cancellation: &Cancellation,
         on_progress: impl FnMut(String),
     ) -> Result<PullOutcome, GitError> {
-        let lock = self.lock(cancellation)?;
+        let lock = self.acquire_lock(cancellation)?;
         sync::pull(
             &self.git_executable,
             &self.root,
@@ -1171,7 +1207,7 @@ impl GitService {
         cancellation: &Cancellation,
         on_progress: impl FnMut(String),
     ) -> Result<PushOutcome, GitError> {
-        let lock = self.lock(cancellation)?;
+        let lock = self.acquire_lock(cancellation)?;
         sync::push(
             &self.git_executable,
             &self.root,
@@ -1184,11 +1220,142 @@ impl GitService {
 
     /// Takes the exclusive lock covering this repository and its worktrees.
     ///
-    /// Every Git mutation holds it; no read takes it at all. See
-    /// [`RepositoryLock`] for the ordering it must be acquired in.
-    pub fn lock(&self, cancellation: &Cancellation) -> Result<RepositoryLock, GitError> {
-        RepositoryLock::acquire(&self.data_dir, &self.root, cancellation)
+    /// Every Git mutation holds it; no read takes it at all. The caller must
+    /// acquire it before any catalog lock.
+    pub fn lock(&self, cancellation: &Cancellation) -> Result<LockedRepository, GitError> {
+        Ok(LockedRepository {
+            root: self.root.clone(),
+            git_executable: self.git_executable.clone(),
+            lock: self.acquire_lock(cancellation)?,
+        })
     }
+
+    fn acquire_lock(&self, cancellation: &Cancellation) -> Result<RepositoryLock, GitError> {
+        RepositoryLock::acquire(&self.lock_dir, &self.root, cancellation)
+    }
+}
+
+/// A repository session that proves the repository mutation lock is held.
+///
+/// Its public surface is intentionally limited to the worktree lifecycle used
+/// by the catalog layer. Dropping the session releases the lock.
+#[derive(Debug)]
+pub struct LockedRepository {
+    root: PathBuf,
+    git_executable: PathBuf,
+    lock: RepositoryLock,
+}
+
+impl LockedRepository {
+    /// Lists worktrees while retaining the repository mutation capability.
+    pub fn worktrees(&self, cancellation: &Cancellation) -> Result<Vec<GitWorktree>, GitError> {
+        worktree::list(&self.git_executable, &self.root, cancellation)
+    }
+
+    /// Adds a linked worktree while retaining the repository lock.
+    pub fn add_worktree(
+        &self,
+        destination: impl AsRef<Path>,
+        base: &WorktreeBase,
+        cancellation: &Cancellation,
+    ) -> Result<AddedWorktree, GitError> {
+        worktree::add(
+            &self.git_executable,
+            &self.root,
+            &self.lock,
+            destination.as_ref(),
+            base,
+            cancellation,
+        )
+    }
+
+    /// Performs the mandatory best-effort cleanup after a failed add.
+    pub fn cleanup_failed_worktree_add(&self, destination: impl AsRef<Path>) {
+        worktree::cleanup_failed_add(
+            &self.git_executable,
+            &self.root,
+            &self.lock,
+            destination.as_ref(),
+        );
+    }
+
+    /// Moves a known unlocked worktree.
+    pub fn move_worktree(
+        &self,
+        source: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+        cancellation: &Cancellation,
+    ) -> Result<(), GitError> {
+        worktree::move_known_unlocked(
+            &self.git_executable,
+            &self.root,
+            &self.lock,
+            source.as_ref(),
+            destination.as_ref(),
+            cancellation,
+        )
+    }
+
+    /// Removes a known unlocked worktree through Git.
+    pub fn remove_worktree(
+        &self,
+        destination: impl AsRef<Path>,
+        force: bool,
+        cancellation: &Cancellation,
+    ) -> Result<(), GitError> {
+        worktree::remove_known_unlocked(
+            &self.git_executable,
+            &self.root,
+            &self.lock,
+            destination.as_ref(),
+            force,
+            cancellation,
+        )
+    }
+
+    /// Locks a worktree whose current state the caller already verified.
+    pub fn lock_worktree(
+        &self,
+        destination: impl AsRef<Path>,
+        reason: &str,
+        cancellation: &Cancellation,
+    ) -> Result<(), GitError> {
+        worktree::lock_known_unlocked(
+            &self.git_executable,
+            &self.root,
+            &self.lock,
+            destination.as_ref(),
+            reason,
+            cancellation,
+        )
+    }
+
+    /// Unlocks a worktree whose current state the caller already verified.
+    pub fn unlock_worktree(
+        &self,
+        destination: impl AsRef<Path>,
+        cancellation: &Cancellation,
+    ) -> Result<(), GitError> {
+        worktree::unlock_known_locked(
+            &self.git_executable,
+            &self.root,
+            &self.lock,
+            destination.as_ref(),
+            cancellation,
+        )
+    }
+}
+
+/// Validates and normalizes a reason before any worktree command is spawned.
+pub fn validate_worktree_lock_reason(reason: &str) -> Result<&str, GitError> {
+    worktree::validate_lock_reason(reason)
+}
+
+/// Describes a directory as a repository working tree without spawning Git.
+///
+/// `None` means the directory is not itself a repository working tree.
+pub fn inspect_repository(path: impl AsRef<Path>) -> Result<Option<GitStatus>, GitError> {
+    status::inspect(path.as_ref())
 }
 
 /// Chooses a configured remote using the same precedence for every Git verb.
@@ -1284,7 +1451,7 @@ pub(crate) fn head_branch(repository: &Repository, root: &Path) -> Result<String
 fn inspection(path: &Path, source: git2::Error) -> GitError {
     GitError::Inspection {
         path: path.to_path_buf(),
-        source,
+        source: source.into(),
     }
 }
 
@@ -1292,24 +1459,22 @@ fn inspection(path: &Path, source: git2::Error) -> GitError {
 mod tests {
     use std::{io, path::PathBuf, time::Duration};
 
-    use super::{Cancellation, FileChange, GitAccess, GitError, GitService, PendingOperation};
+    use super::{Cancellation, FileChange, GitError, GitService, PendingOperation};
     use crate::testing::{Fixture, initialize_repository};
 
     #[test]
-    fn mutation_commands_hold_the_repository_lock_while_they_exist() {
+    fn locked_sessions_hold_the_repository_lock_while_they_exist() {
         let fixture = Fixture::new();
         let root = fixture.directory("command-lock");
         initialize_repository(&root);
         let service = GitService::new(&root, &fixture.data_dir);
 
-        let command = service
-            .command(GitAccess::LocalWrite, &Cancellation::default())
-            .unwrap();
+        let session = service.lock(&Cancellation::default()).unwrap();
         let cancelled = Cancellation::default();
         cancelled.cancel();
         assert!(matches!(service.lock(&cancelled), Err(GitError::Cancelled)));
 
-        drop(command);
+        drop(session);
         service.lock(&Cancellation::default()).unwrap();
     }
 
@@ -1556,7 +1721,7 @@ mod tests {
             (
                 GitError::Inspection {
                     path: path.clone(),
-                    source: git_error(),
+                    source: git_error().into(),
                 },
                 "inspection",
             ),

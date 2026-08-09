@@ -289,7 +289,7 @@ pub struct HarknessBackendRust {
     history: QVariant,
     review: QVariant,
     job_records: Vec<JobRecord>,
-    cancellations: HashMap<String, harkness_core::Cancellation>,
+    cancellations: HashMap<String, harkness_git::Cancellation>,
     path_selections: HashMap<String, PathSelectionKey>,
     path_selection_ids: HashMap<PathSelectionKey, String>,
     diff_selections: HashMap<String, DiffSelectionRecord>,
@@ -423,7 +423,7 @@ fn start_job(
     project_id: &str,
     label: &str,
     cancellable: bool,
-) -> Option<(String, harkness_core::Cancellation)> {
+) -> Option<(String, harkness_git::Cancellation)> {
     let job = {
         let rust = backend.as_mut().rust_mut().get_mut();
         begin_job(
@@ -441,7 +441,7 @@ fn start_job(
             .set_status(format!("{label} is already running for this project").into());
         return None;
     };
-    let cancellation = harkness_core::Cancellation::default();
+    let cancellation = harkness_git::Cancellation::default();
     if cancellable {
         backend
             .as_mut()
@@ -511,9 +511,9 @@ struct GitStateRow {
 }
 
 impl GitStateRow {
-    fn from_status(project_id: String, status: harkness_core::DetailedStatus) -> Self {
+    fn from_status(project_id: String, status: harkness_git::DetailedStatus) -> Self {
         let (branch, head, detached, unborn) = match status.head {
-            harkness_core::HeadState::Unborn { branch } => {
+            harkness_git::HeadState::Unborn { branch } => {
                 let branch = branch.unwrap_or_default();
                 let head = if branch.is_empty() {
                     "unborn branch".to_owned()
@@ -522,8 +522,8 @@ impl GitStateRow {
                 };
                 (branch, head, false, true)
             }
-            harkness_core::HeadState::Branch { name } => (name.clone(), name, false, false),
-            harkness_core::HeadState::Detached { commit } => {
+            harkness_git::HeadState::Branch { name } => (name.clone(), name, false, false),
+            harkness_git::HeadState::Detached { commit } => {
                 let short = commit.chars().take(12).collect::<String>();
                 (String::new(), format!("detached at {short}"), true, false)
             }
@@ -581,16 +581,16 @@ impl GitStateRow {
     }
 }
 
-fn change_name(change: harkness_core::FileChange) -> &'static str {
+fn change_name(change: harkness_git::FileChange) -> &'static str {
     match change {
-        harkness_core::FileChange::Added => "added",
-        harkness_core::FileChange::Modified => "modified",
-        harkness_core::FileChange::Deleted => "deleted",
-        harkness_core::FileChange::Renamed => "renamed",
-        harkness_core::FileChange::Copied => "copied",
-        harkness_core::FileChange::TypeChanged => "type changed",
-        harkness_core::FileChange::Untracked => "untracked",
-        harkness_core::FileChange::Unmerged => "unmerged",
+        harkness_git::FileChange::Added => "added",
+        harkness_git::FileChange::Modified => "modified",
+        harkness_git::FileChange::Deleted => "deleted",
+        harkness_git::FileChange::Renamed => "renamed",
+        harkness_git::FileChange::Copied => "copied",
+        harkness_git::FileChange::TypeChanged => "type changed",
+        harkness_git::FileChange::Untracked => "untracked",
+        harkness_git::FileChange::Unmerged => "unmerged",
     }
 }
 
@@ -724,8 +724,8 @@ fn clear_git_state(mut backend: Pin<&mut ffi::HarknessBackend>) {
 #[derive(Clone, Debug)]
 struct DiffSelectionRecord {
     project_id: String,
-    target: harkness_core::DiffTarget,
-    selection: harkness_core::HunkSelection,
+    target: harkness_git::DiffTarget,
+    selection: harkness_git::HunkSelection,
 }
 
 #[derive(Debug)]
@@ -733,7 +733,7 @@ struct DiffStateRow {
     project_id: String,
     path_id: String,
     path: String,
-    files: Vec<harkness_core::FileDiff>,
+    files: Vec<harkness_git::FileDiff>,
     loading: bool,
     error: String,
     error_kind: String,
@@ -774,22 +774,22 @@ fn empty_diff() -> QVariant {
     QVariant::from(&QMap::<QMapPair_QString_QVariant>::default())
 }
 
-fn diff_target_name(target: &harkness_core::DiffTarget) -> &'static str {
+fn diff_target_name(target: &harkness_git::DiffTarget) -> &'static str {
     match target {
-        harkness_core::DiffTarget::Staged => "staged",
-        harkness_core::DiffTarget::Unstaged => "unstaged",
+        harkness_git::DiffTarget::Staged => "staged",
+        harkness_git::DiffTarget::Unstaged => "unstaged",
         _ => "unknown",
     }
 }
 
-fn diff_line_name(line: harkness_core::DiffLineKind) -> (&'static str, &'static str) {
+fn diff_line_name(line: harkness_git::DiffLineKind) -> (&'static str, &'static str) {
     match line {
-        harkness_core::DiffLineKind::Context => ("context", " "),
-        harkness_core::DiffLineKind::Addition => ("addition", "+"),
-        harkness_core::DiffLineKind::Deletion => ("deletion", "-"),
-        harkness_core::DiffLineKind::BothEofNoNewline
-        | harkness_core::DiffLineKind::OldEofNoNewline
-        | harkness_core::DiffLineKind::NewEofNoNewline => ("eof", "\\"),
+        harkness_git::DiffLineKind::Context => ("context", " "),
+        harkness_git::DiffLineKind::Addition => ("addition", "+"),
+        harkness_git::DiffLineKind::Deletion => ("deletion", "-"),
+        harkness_git::DiffLineKind::BothEofNoNewline
+        | harkness_git::DiffLineKind::OldEofNoNewline
+        | harkness_git::DiffLineKind::NewEofNoNewline => ("eof", "\\"),
         _ => ("unknown", "?"),
     }
 }
@@ -800,7 +800,7 @@ fn display_patch_bytes(bytes: &[u8]) -> String {
     text.strip_suffix('\r').unwrap_or(text).to_owned()
 }
 
-fn display_diff_path(file: &harkness_core::FileDiff) -> String {
+fn display_diff_path(file: &harkness_git::FileDiff) -> String {
     match (file.old_path.as_deref(), file.new_path.as_deref()) {
         (Some(old), Some(new)) if old != new => {
             format!("{} → {}", old.to_string_lossy(), new.to_string_lossy())
@@ -810,21 +810,21 @@ fn display_diff_path(file: &harkness_core::FileDiff) -> String {
     }
 }
 
-fn omission_summary(omission: &harkness_core::DiffOmission) -> String {
+fn omission_summary(omission: &harkness_git::DiffOmission) -> String {
     match omission {
-        harkness_core::DiffOmission::FileTooLarge { limit } => {
+        harkness_git::DiffOmission::FileTooLarge { limit } => {
             format!("File too large — content exceeds the {limit}-byte display limit.")
         }
-        harkness_core::DiffOmission::Unmerged => {
+        harkness_git::DiffOmission::Unmerged => {
             "Unmerged file — resolve the conflict before viewing a two-sided diff.".to_owned()
         }
-        harkness_core::DiffOmission::ContentBudgetExhausted { limit } => {
+        harkness_git::DiffOmission::ContentBudgetExhausted { limit } => {
             format!("Content budget exhausted — the diff reached its {limit}-byte limit.")
         }
-        harkness_core::DiffOmission::FileBudgetExhausted { limit } => {
+        harkness_git::DiffOmission::FileBudgetExhausted { limit } => {
             format!("File budget exhausted — the diff reached its {limit}-file limit.")
         }
-        harkness_core::DiffOmission::Unrepresentable { detail } => {
+        harkness_git::DiffOmission::Unrepresentable { detail } => {
             format!("Unrepresentable diff — {detail}")
         }
         _ => "Content omitted for an unknown reason.".to_owned(),
@@ -835,15 +835,15 @@ fn omission_summary(omission: &harkness_core::DiffOmission) -> String {
 /// predictable object count even when a byte-small file contains many lines.
 const MAX_GUI_DIFF_LINES_PER_FILE: usize = 1_000;
 
-fn diff_line_count(file: &harkness_core::FileDiff) -> usize {
+fn diff_line_count(file: &harkness_git::FileDiff) -> usize {
     file.hunks.iter().map(|hunk| hunk.lines.len()).sum()
 }
 
-fn displays_diff_hunks(file: &harkness_core::FileDiff) -> bool {
+fn displays_diff_hunks(file: &harkness_git::FileDiff) -> bool {
     file.omission.is_none() && !file.binary && diff_line_count(file) <= MAX_GUI_DIFF_LINES_PER_FILE
 }
 
-fn file_content_summary(file: &harkness_core::FileDiff) -> String {
+fn file_content_summary(file: &harkness_git::FileDiff) -> String {
     if let Some(omission) = &file.omission {
         omission_summary(omission)
     } else if file.binary {
@@ -925,7 +925,7 @@ fn to_diff(
                 DiffSelectionRecord {
                     project_id: row.project_id.clone(),
                     target: file.target.clone(),
-                    selection: harkness_core::HunkSelection::new(file, hunk),
+                    selection: harkness_git::HunkSelection::new(file, hunk),
                 },
             );
 
@@ -1013,7 +1013,7 @@ fn diff_identity(diff: &QVariant) -> Option<(String, String)> {
 }
 
 fn load_diff_with_git(
-    git: &harkness_core::GitService,
+    git: &harkness_git::GitService,
     project_id: String,
     path_id: String,
     path: PathBuf,
@@ -1024,12 +1024,12 @@ fn load_diff_with_git(
             message: "select a changed path before loading its diff".to_owned(),
         });
     }
-    let options = harkness_core::DiffOptions::default().with_paths([path.as_path()]);
+    let options = harkness_git::DiffOptions::default().with_paths([path.as_path()]);
     let files = git
         .diff_snapshot(
             &[
-                harkness_core::DiffTarget::Staged,
-                harkness_core::DiffTarget::Unstaged,
+                harkness_git::DiffTarget::Staged,
+                harkness_git::DiffTarget::Unstaged,
             ],
             &options,
         )
@@ -1051,8 +1051,8 @@ struct GitFailure {
     message: String,
 }
 
-impl From<harkness_core::GitError> for GitFailure {
-    fn from(error: harkness_core::GitError) -> Self {
+impl From<harkness_git::GitError> for GitFailure {
+    fn from(error: harkness_git::GitError) -> Self {
         Self {
             kind: error.kind().to_owned(),
             message: error.to_string(),
@@ -1060,7 +1060,7 @@ impl From<harkness_core::GitError> for GitFailure {
     }
 }
 
-fn load_project_git(project_id: &str) -> Result<harkness_core::GitService, GitFailure> {
+fn load_project_git(project_id: &str) -> Result<harkness_git::GitService, GitFailure> {
     let id = project_id.parse().map_err(|_| GitFailure {
         kind: "invalid_project".to_owned(),
         message: "invalid project identifier".to_owned(),
@@ -1090,8 +1090,8 @@ struct HistoryCommitRow {
     parent_count: usize,
 }
 
-impl From<harkness_core::CommitInfo> for HistoryCommitRow {
-    fn from(commit: harkness_core::CommitInfo) -> Self {
+impl From<harkness_git::CommitInfo> for HistoryCommitRow {
+    fn from(commit: harkness_git::CommitInfo) -> Self {
         let id = commit.id.to_string();
         Self {
             short_id: id.chars().take(12).collect(),
@@ -1110,7 +1110,7 @@ impl From<harkness_core::CommitInfo> for HistoryCommitRow {
 struct HistoryStateRow {
     project_id: String,
     commits: Vec<HistoryCommitRow>,
-    next_cursor: Option<harkness_core::LogCursor>,
+    next_cursor: Option<harkness_git::LogCursor>,
     loading: bool,
     error: String,
     error_kind: String,
@@ -1137,11 +1137,11 @@ impl HistoryStateRow {
 }
 
 fn load_history_page_with_git(
-    git: &harkness_core::GitService,
-    cursor: Option<harkness_core::LogCursor>,
-    cancellation: &harkness_core::Cancellation,
-) -> Result<(Vec<HistoryCommitRow>, Option<harkness_core::LogCursor>), GitFailure> {
-    let mut options = harkness_core::LogOptions::new("HEAD", HISTORY_PAGE_SIZE);
+    git: &harkness_git::GitService,
+    cursor: Option<harkness_git::LogCursor>,
+    cancellation: &harkness_git::Cancellation,
+) -> Result<(Vec<HistoryCommitRow>, Option<harkness_git::LogCursor>), GitFailure> {
+    let mut options = harkness_git::LogOptions::new("HEAD", HISTORY_PAGE_SIZE);
     if let Some(cursor) = cursor {
         options = options.with_cursor(cursor);
     }
@@ -1236,7 +1236,7 @@ enum ReviewSelection {
 
 #[derive(Clone, Debug)]
 struct ReviewTargetRecord {
-    target: harkness_core::DiffTarget,
+    target: harkness_git::DiffTarget,
     title: String,
     detail: String,
 }
@@ -1245,7 +1245,7 @@ struct ReviewTargetRecord {
 struct ReviewFileEntry {
     id: String,
     path: PathBuf,
-    file: harkness_core::FileDiff,
+    file: harkness_git::FileDiff,
 }
 
 #[derive(Clone, Debug)]
@@ -1265,7 +1265,7 @@ struct ReviewHunkState {
 #[derive(Clone, Debug)]
 struct ReviewLoadedFile {
     id: String,
-    file: harkness_core::FileDiff,
+    file: harkness_git::FileDiff,
     hunks: Vec<ReviewHunkState>,
     total_lines: Option<u32>,
 }
@@ -1311,7 +1311,7 @@ impl ReviewStateRow {
     }
 }
 
-fn review_path(file: &harkness_core::FileDiff) -> PathBuf {
+fn review_path(file: &harkness_git::FileDiff) -> PathBuf {
     file.new_path
         .as_ref()
         .or(file.old_path.as_ref())
@@ -1320,17 +1320,17 @@ fn review_path(file: &harkness_core::FileDiff) -> PathBuf {
 }
 
 fn prepare_review_target(
-    git: &harkness_core::GitService,
+    git: &harkness_git::GitService,
     selection: ReviewSelection,
 ) -> Result<ReviewTargetRecord, GitFailure> {
     match selection {
         ReviewSelection::Staged => Ok(ReviewTargetRecord {
-            target: harkness_core::DiffTarget::Staged,
+            target: harkness_git::DiffTarget::Staged,
             title: "Staged changes".to_owned(),
             detail: "HEAD against the index; context is pinned to recorded blobs".to_owned(),
         }),
         ReviewSelection::Unstaged => Ok(ReviewTargetRecord {
-            target: harkness_core::DiffTarget::Unstaged,
+            target: harkness_git::DiffTarget::Unstaged,
             title: "Working-tree changes".to_owned(),
             detail: "Index against the working tree; changed content refreshes if it becomes stale"
                 .to_owned(),
@@ -1340,7 +1340,7 @@ fn prepare_review_target(
             let id = commit.to_string();
             let short = id.chars().take(12).collect::<String>();
             Ok(ReviewTargetRecord {
-                target: harkness_core::DiffTarget::Commit {
+                target: harkness_git::DiffTarget::Commit {
                     revision: id.clone(),
                     parent: None,
                 },
@@ -1359,7 +1359,7 @@ fn prepare_review_target(
             let branch_short = branch_id.to_string().chars().take(12).collect::<String>();
             let base_short = base_id.to_string().chars().take(12).collect::<String>();
             Ok(ReviewTargetRecord {
-                target: harkness_core::DiffTarget::Revisions {
+                target: harkness_git::DiffTarget::Revisions {
                     old_revision: base_id.to_string(),
                     new_revision: branch_id.to_string(),
                 },
@@ -1373,7 +1373,7 @@ fn prepare_review_target(
 }
 
 fn load_review_with_git(
-    git: &harkness_core::GitService,
+    git: &harkness_git::GitService,
     project_id: String,
     selection: ReviewSelection,
     generation: u64,
@@ -1383,7 +1383,7 @@ fn load_review_with_git(
     // intentionally omitting every hunk. Opening a path makes the second,
     // path-restricted request below, so a thousand-file review never eagerly
     // builds a thousand line models.
-    let options = harkness_core::DiffOptions::default().with_max_total_bytes(0);
+    let options = harkness_git::DiffOptions::default().with_max_total_bytes(0);
     let files = git
         .diff(target.target.clone(), &options)
         .map_err(GitFailure::from)?
@@ -1414,7 +1414,7 @@ fn load_review_with_git(
 /// metadata pass remains bounded and only this one default selection receives
 /// a path-restricted content request.
 fn load_review_with_initial_file_with_git(
-    git: &harkness_core::GitService,
+    git: &harkness_git::GitService,
     project_id: String,
     selection: ReviewSelection,
     review_generation: u64,
@@ -1434,29 +1434,29 @@ fn load_review_with_initial_file_with_git(
     Ok(review)
 }
 
-fn file_context_side(file: &harkness_core::FileDiff) -> harkness_core::FileSide {
+fn file_context_side(file: &harkness_git::FileDiff) -> harkness_git::FileSide {
     if file.new_path.is_some() {
-        harkness_core::FileSide::New
+        harkness_git::FileSide::New
     } else {
-        harkness_core::FileSide::Old
+        harkness_git::FileSide::Old
     }
 }
 
-fn hunk_side_coordinates(file: &harkness_core::FileDiff, hunk: &harkness_core::Hunk) -> (u32, u32) {
+fn hunk_side_coordinates(file: &harkness_git::FileDiff, hunk: &harkness_git::Hunk) -> (u32, u32) {
     match file_context_side(file) {
-        harkness_core::FileSide::Old => (hunk.old_start, hunk.old_lines),
-        harkness_core::FileSide::New => (hunk.new_start, hunk.new_lines),
+        harkness_git::FileSide::Old => (hunk.old_start, hunk.old_lines),
+        harkness_git::FileSide::New => (hunk.new_start, hunk.new_lines),
         _ => (hunk.new_start, hunk.new_lines),
     }
 }
 
 fn load_review_file_with_git(
-    git: &harkness_core::GitService,
+    git: &harkness_git::GitService,
     target: &ReviewTargetRecord,
     entry: &ReviewFileEntry,
     generation: u64,
 ) -> Result<ReviewLoadedFile, GitFailure> {
-    let options = harkness_core::DiffOptions::default()
+    let options = harkness_git::DiffOptions::default()
         .with_paths([entry.path.as_path()])
         .with_intra_line_ranges(true);
     let mut files = git
@@ -1477,7 +1477,7 @@ fn load_review_file_with_git(
         })?;
 
     let total_lines = file.hunks.last().and_then(|hunk| {
-        git.file_context(&harkness_core::FileContextRequest::for_hunk(
+        git.file_context(&harkness_git::FileContextRequest::for_hunk(
             &file,
             hunk,
             file_context_side(&file),
@@ -1509,7 +1509,7 @@ fn empty_review() -> QVariant {
     QVariant::from(&QMap::<QMapPair_QString_QVariant>::default())
 }
 
-fn review_content_summary(file: &harkness_core::FileDiff) -> String {
+fn review_content_summary(file: &harkness_git::FileDiff) -> String {
     if let Some(omission) = &file.omission {
         omission_summary(omission)
     } else if file.binary {
@@ -1521,12 +1521,12 @@ fn review_content_summary(file: &harkness_core::FileDiff) -> String {
     }
 }
 
-fn hunk_degradation_summary(hunk: &harkness_core::Hunk) -> String {
+fn hunk_degradation_summary(hunk: &harkness_git::Hunk) -> String {
     match hunk.intra_line_degradation.as_ref() {
-        Some(harkness_core::IntraLineDegradation::LineTooLong { limit }) => {
+        Some(harkness_git::IntraLineDegradation::LineTooLong { limit }) => {
             format!("Word emphasis unavailable — a line exceeds the {limit}-byte pairing limit.")
         }
-        Some(harkness_core::IntraLineDegradation::PairingTooLarge { limit }) => {
+        Some(harkness_git::IntraLineDegradation::PairingTooLarge { limit }) => {
             format!("Word emphasis unavailable — pairing exceeds the {limit}-comparison limit.")
         }
         Some(_) => "Word emphasis unavailable for a named core limit.".to_owned(),
@@ -1544,7 +1544,7 @@ fn display_line_end(bytes: &[u8]) -> usize {
 
 fn to_text_segments(
     bytes: &[u8],
-    ranges: Option<&[harkness_core::IntraLineRange]>,
+    ranges: Option<&[harkness_git::IntraLineRange]>,
 ) -> QList<QVariant> {
     let end = display_line_end(bytes);
     let mut segments = QList::<QVariant>::default();
@@ -1583,7 +1583,7 @@ fn empty_review_side() -> QVariant {
     QVariant::from(&side)
 }
 
-fn to_review_side(line: &harkness_core::DiffLine, number: Option<u32>) -> QVariant {
+fn to_review_side(line: &harkness_git::DiffLine, number: Option<u32>) -> QVariant {
     let (kind, marker) = diff_line_name(line.kind);
     let mut side = QMap::<QMapPair_QString_QVariant>::default();
     side.insert(QString::from("present"), QVariant::from(&true));
@@ -1606,7 +1606,7 @@ fn to_review_side(line: &harkness_core::DiffLine, number: Option<u32>) -> QVaria
     QVariant::from(&side)
 }
 
-fn to_unified_review_line(line: &harkness_core::DiffLine) -> QVariant {
+fn to_unified_review_line(line: &harkness_git::DiffLine) -> QVariant {
     let (kind, marker) = diff_line_name(line.kind);
     let mut value = QMap::<QMapPair_QString_QVariant>::default();
     value.insert(
@@ -1632,26 +1632,26 @@ fn to_unified_review_line(line: &harkness_core::DiffLine) -> QVariant {
     QVariant::from(&value)
 }
 
-fn to_review_line_row(hunk: &harkness_core::Hunk, index: usize) -> QVariant {
+fn to_review_line_row(hunk: &harkness_git::Hunk, index: usize) -> QVariant {
     let line = &hunk.lines[index];
     let partner = line
         .paired_line_index
         .and_then(|partner| hunk.lines.get(partner));
-    let split_hidden = matches!(line.kind, harkness_core::DiffLineKind::Addition)
+    let split_hidden = matches!(line.kind, harkness_git::DiffLineKind::Addition)
         && partner
-            .is_some_and(|partner| matches!(partner.kind, harkness_core::DiffLineKind::Deletion));
+            .is_some_and(|partner| matches!(partner.kind, harkness_git::DiffLineKind::Deletion));
     let (old, new) = match line.kind {
-        harkness_core::DiffLineKind::Context => (
+        harkness_git::DiffLineKind::Context => (
             to_review_side(line, line.old_line_number),
             to_review_side(line, line.new_line_number),
         ),
-        harkness_core::DiffLineKind::Deletion => (
+        harkness_git::DiffLineKind::Deletion => (
             to_review_side(line, line.old_line_number),
             partner.map_or_else(empty_review_side, |partner| {
                 to_review_side(partner, partner.new_line_number)
             }),
         ),
-        harkness_core::DiffLineKind::Addition => {
+        harkness_git::DiffLineKind::Addition => {
             if split_hidden {
                 (empty_review_side(), empty_review_side())
             } else {
@@ -1753,7 +1753,7 @@ fn collapsed_review_row(hunk_id: &str, direction: &str, count: u32) -> QVariant 
     QVariant::from(&row)
 }
 
-fn review_hunk_row(hunk_id: &str, hunk: &harkness_core::Hunk) -> QVariant {
+fn review_hunk_row(hunk_id: &str, hunk: &harkness_git::Hunk) -> QVariant {
     let mut row = QMap::<QMapPair_QString_QVariant>::default();
     row.insert(
         QString::from("type"),
@@ -1942,12 +1942,12 @@ enum ReviewContextOutcome {
     Stale,
 }
 
-fn context_omission_summary(omission: &harkness_core::FileContextOmission) -> String {
+fn context_omission_summary(omission: &harkness_git::FileContextOmission) -> String {
     match omission {
-        harkness_core::FileContextOmission::FileTooLarge { limit } => {
+        harkness_git::FileContextOmission::FileTooLarge { limit } => {
             format!("File too large — context exceeds the {limit}-byte display limit.")
         }
-        harkness_core::FileContextOmission::ContentBudgetExhausted { limit } => {
+        harkness_git::FileContextOmission::ContentBudgetExhausted { limit } => {
             format!("Context budget exhausted — the range exceeds {limit} bytes.")
         }
         _ => "Context omitted for a named core limit.".to_owned(),
@@ -1960,13 +1960,13 @@ fn translated_line(number: u32, from_start: u32, to_start: u32) -> u32 {
 }
 
 fn project_review_context(
-    response: &harkness_core::FileContextResponse,
-    hunk: &harkness_core::Hunk,
+    response: &harkness_git::FileContextResponse,
+    hunk: &harkness_git::Hunk,
     direction: ReviewContextDirection,
 ) -> Vec<ReviewContextLine> {
     let (side_start, side_count) = match response.side {
-        harkness_core::FileSide::Old => (hunk.old_start, hunk.old_lines),
-        harkness_core::FileSide::New => (hunk.new_start, hunk.new_lines),
+        harkness_git::FileSide::Old => (hunk.old_start, hunk.old_lines),
+        harkness_git::FileSide::New => (hunk.new_start, hunk.new_lines),
         _ => (hunk.new_start, hunk.new_lines),
     };
     let side_end = side_start.saturating_add(side_count);
@@ -1975,8 +1975,8 @@ fn project_review_context(
         .iter()
         .filter_map(|line| {
             let number = match response.side {
-                harkness_core::FileSide::Old => line.old_line_number,
-                harkness_core::FileSide::New => line.new_line_number,
+                harkness_git::FileSide::Old => line.old_line_number,
+                harkness_git::FileSide::New => line.new_line_number,
                 _ => line.new_line_number,
             }?;
             let belongs = match direction {
@@ -1987,11 +1987,11 @@ fn project_review_context(
                 return None;
             }
             let (old_line, new_line) = match (response.side, direction) {
-                (harkness_core::FileSide::New, ReviewContextDirection::Before) => (
+                (harkness_git::FileSide::New, ReviewContextDirection::Before) => (
                     translated_line(number, hunk.new_start, hunk.old_start),
                     number,
                 ),
-                (harkness_core::FileSide::New, ReviewContextDirection::After) => (
+                (harkness_git::FileSide::New, ReviewContextDirection::After) => (
                     translated_line(
                         number,
                         hunk.new_start.saturating_add(hunk.new_lines),
@@ -1999,11 +1999,11 @@ fn project_review_context(
                     ),
                     number,
                 ),
-                (harkness_core::FileSide::Old, ReviewContextDirection::Before) => (
+                (harkness_git::FileSide::Old, ReviewContextDirection::Before) => (
                     number,
                     translated_line(number, hunk.old_start, hunk.new_start),
                 ),
-                (harkness_core::FileSide::Old, ReviewContextDirection::After) => (
+                (harkness_git::FileSide::Old, ReviewContextDirection::After) => (
                     number,
                     translated_line(
                         number,
@@ -2023,7 +2023,7 @@ fn project_review_context(
 }
 
 fn expand_review_context_with_git(
-    git: &harkness_core::GitService,
+    git: &harkness_git::GitService,
     mut loaded: ReviewLoadedFile,
     hunk_id: &str,
     direction: ReviewContextDirection,
@@ -2054,7 +2054,7 @@ fn expand_review_context_with_git(
         ReviewContextDirection::Before => (requested, 0),
         ReviewContextDirection::After => (0, requested),
     };
-    let request = harkness_core::FileContextRequest::for_hunk(
+    let request = harkness_git::FileContextRequest::for_hunk(
         &loaded.file,
         hunk,
         file_context_side(&loaded.file),
@@ -2063,7 +2063,7 @@ fn expand_review_context_with_git(
     );
     let response = match git.file_context(&request) {
         Ok(response) => response,
-        Err(harkness_core::GitError::StaleHunkSelection { .. }) => {
+        Err(harkness_git::GitError::StaleHunkSelection { .. }) => {
             return Ok(ReviewContextOutcome::Stale);
         }
         Err(error) => return Err(GitFailure::from(error)),
@@ -2158,10 +2158,10 @@ struct GitWorkerResult {
 
 fn run_git_operation(
     project_id: String,
-    cancellation: &harkness_core::Cancellation,
+    cancellation: &harkness_git::Cancellation,
     operation: impl FnOnce(
-        &harkness_core::GitService,
-        &harkness_core::Cancellation,
+        &harkness_git::GitService,
+        &harkness_git::Cancellation,
     ) -> Result<String, GitFailure>,
 ) -> GitWorkerResult {
     let git = load_project_git(&project_id);
@@ -2179,7 +2179,7 @@ fn run_git_operation(
     // A cancelled or failed mutation can still have changed the repository.
     // Use a fresh token so the mandatory post-operation refresh is not itself
     // suppressed by the user's cancellation request.
-    let state = match git.detailed_status(&harkness_core::Cancellation::default()) {
+    let state = match git.detailed_status(&harkness_git::Cancellation::default()) {
         Ok(status) => {
             let state = GitStateRow::from_status(project_id.clone(), status);
             Some(match &message {
@@ -2270,11 +2270,11 @@ impl HunkAction {
         }
     }
 
-    fn matches(self, target: &harkness_core::DiffTarget) -> bool {
+    fn matches(self, target: &harkness_git::DiffTarget) -> bool {
         matches!(
             (self, target),
-            (Self::Stage, harkness_core::DiffTarget::Unstaged)
-                | (Self::Unstage, harkness_core::DiffTarget::Staged)
+            (Self::Stage, harkness_git::DiffTarget::Unstaged)
+                | (Self::Unstage, harkness_git::DiffTarget::Staged)
         )
     }
 }
@@ -2286,10 +2286,10 @@ enum HunkMutationOutcome {
 }
 
 fn mutate_hunk_with_git(
-    git: &harkness_core::GitService,
+    git: &harkness_git::GitService,
     action: HunkAction,
-    selection: &harkness_core::HunkSelection,
-    cancellation: &harkness_core::Cancellation,
+    selection: &harkness_git::HunkSelection,
+    cancellation: &harkness_git::Cancellation,
 ) -> Result<HunkMutationOutcome, GitFailure> {
     let result = match action {
         HunkAction::Stage => git.stage_hunks(std::slice::from_ref(selection), cancellation),
@@ -2297,7 +2297,7 @@ fn mutate_hunk_with_git(
     };
     match result {
         Ok(outcome) => Ok(HunkMutationOutcome::Applied(outcome.hunks)),
-        Err(harkness_core::GitError::StaleHunkSelection { .. }) => Ok(HunkMutationOutcome::Stale),
+        Err(harkness_git::GitError::StaleHunkSelection { .. }) => Ok(HunkMutationOutcome::Stale),
         Err(error) => Err(GitFailure::from(error)),
     }
 }
@@ -2375,14 +2375,14 @@ struct BranchRow {
     detail: String,
 }
 
-impl From<harkness_core::Branch> for BranchRow {
-    fn from(branch: harkness_core::Branch) -> Self {
+impl From<harkness_git::Branch> for BranchRow {
+    fn from(branch: harkness_git::Branch) -> Self {
         let (current, selectable, detail) = match branch.checkout {
-            harkness_core::BranchCheckout::NotCheckedOut => (false, true, String::new()),
-            harkness_core::BranchCheckout::CurrentWorktree => {
+            harkness_git::BranchCheckout::NotCheckedOut => (false, true, String::new()),
+            harkness_git::BranchCheckout::CurrentWorktree => {
                 (true, true, "Checked out here".to_owned())
             }
-            harkness_core::BranchCheckout::OtherWorktree(path) => {
+            harkness_git::BranchCheckout::OtherWorktree(path) => {
                 (false, false, format!("Checked out at {}", path.display()))
             }
         };
@@ -2592,23 +2592,23 @@ fn worktree_base(
     mode: &str,
     branch: &str,
     start_point: &str,
-) -> Result<harkness_core::WorktreeBase, String> {
+) -> Result<harkness_git::WorktreeBase, String> {
     let branch = branch.trim();
     let start_point = start_point.trim();
     match mode {
         "new" if branch.is_empty() => Err("Enter a name for the new branch".to_owned()),
-        "new" => Ok(harkness_core::WorktreeBase::NewBranch {
+        "new" => Ok(harkness_git::WorktreeBase::NewBranch {
             name: branch.to_owned(),
             start_point: (!start_point.is_empty()).then(|| start_point.to_owned()),
         }),
         "existing" if branch.is_empty() => Err("Enter an existing branch name".to_owned()),
-        "existing" => Ok(harkness_core::WorktreeBase::ExistingBranch {
+        "existing" => Ok(harkness_git::WorktreeBase::ExistingBranch {
             name: branch.to_owned(),
         }),
         "detached" if start_point.is_empty() => {
             Err("Enter a commit or revision for detached HEAD".to_owned())
         }
-        "detached" => Ok(harkness_core::WorktreeBase::Detached {
+        "detached" => Ok(harkness_git::WorktreeBase::Detached {
             commit: start_point.to_owned(),
         }),
         _ => Err("invalid worktree creation mode".to_owned()),
@@ -2619,7 +2619,7 @@ fn remove_worktree_with_service(
     service: &mut harkness_core::ProjectService,
     project_id: &str,
     force: bool,
-    cancellation: &harkness_core::Cancellation,
+    cancellation: &harkness_git::Cancellation,
 ) -> Result<harkness_core::Project, String> {
     let id = project_id
         .parse()
@@ -2633,7 +2633,7 @@ fn move_worktree_with_service(
     service: &mut harkness_core::ProjectService,
     project_id: &str,
     destination: &str,
-    cancellation: &harkness_core::Cancellation,
+    cancellation: &harkness_git::Cancellation,
 ) -> Result<harkness_core::Project, String> {
     let id = project_id
         .parse()
@@ -2664,7 +2664,7 @@ fn change_worktree_lock_with_service(
     project_id: &str,
     expected_parent_id: &str,
     action: &WorktreeLockAction,
-    cancellation: &harkness_core::Cancellation,
+    cancellation: &harkness_git::Cancellation,
 ) -> Result<WorktreeLockOutcome, String> {
     let id = project_id
         .parse()
@@ -2701,7 +2701,7 @@ fn change_worktree_lock_with_service(
     // observed. Refresh even after an operation error, using a fresh token so
     // the row always reflects the repository's actual lock state.
     let rows = service
-        .worktrees(parent, &harkness_core::Cancellation::default())
+        .worktrees(parent, &harkness_git::Cancellation::default())
         .map(|rows| rows.into_iter().map(WorktreeRow::from).collect())
         .map_err(|error| error.to_string());
     Ok(WorktreeLockOutcome { message, rows })
@@ -2802,11 +2802,11 @@ fn load_branches(project_id: &str) -> Result<Vec<BranchRow>, String> {
     let service = harkness_core::ProjectService::load().map_err(|error| error.to_string())?;
     let git = service.git(id).map_err(|error| error.to_string())?;
     git.branches(
-        &harkness_core::BranchListOptions {
+        &harkness_git::BranchListOptions {
             include_remote_tracking: false,
             calculate_divergence: false,
         },
-        &harkness_core::Cancellation::default(),
+        &harkness_git::Cancellation::default(),
     )
     .map(|branches| branches.into_iter().map(BranchRow::from).collect())
     .map_err(|error| error.to_string())
@@ -3500,11 +3500,11 @@ impl ffi::HarknessBackend {
                         .paths
                         .into_iter()
                         .find_map(|outcome| match outcome.result {
-                            harkness_core::StagePathResult::Succeeded => None,
-                            harkness_core::StagePathResult::Failed(error) => {
+                            harkness_git::StagePathResult::Succeeded => None,
+                            harkness_git::StagePathResult::Failed(error) => {
                                 Some(GitFailure::from(error))
                             }
-                            harkness_core::StagePathResult::NotAttempted => Some(GitFailure {
+                            harkness_git::StagePathResult::NotAttempted => Some(GitFailure {
                                 kind: "not_attempted".to_owned(),
                                 message: format!("Git did not attempt to stage {display_path}"),
                             }),
@@ -3551,11 +3551,11 @@ impl ffi::HarknessBackend {
                         .map_err(GitFailure::from)?;
                     if let Some(failure) = outcome.paths.into_iter().find_map(|outcome| {
                         match outcome.result {
-                            harkness_core::StagePathResult::Succeeded => None,
-                            harkness_core::StagePathResult::Failed(error) => {
+                            harkness_git::StagePathResult::Succeeded => None,
+                            harkness_git::StagePathResult::Failed(error) => {
                                 Some(GitFailure::from(error))
                             }
-                            harkness_core::StagePathResult::NotAttempted => Some(GitFailure {
+                            harkness_git::StagePathResult::NotAttempted => Some(GitFailure {
                                 kind: "not_attempted".to_owned(),
                                 message: format!("Git did not attempt to unstage {display_path}"),
                             }),
@@ -3599,7 +3599,7 @@ impl ffi::HarknessBackend {
                 let outcome = git
                     .commit(
                         &message,
-                        &harkness_core::CommitOptions::default().with_amend(amend),
+                        &harkness_git::CommitOptions::default().with_amend(amend),
                         cancellation,
                     )
                     .map_err(GitFailure::from)?;
@@ -3630,7 +3630,7 @@ impl ffi::HarknessBackend {
             let result = run_git_operation(project_id, &cancellation, |git, cancellation| {
                 let outcome = git
                     .fetch(
-                        &harkness_core::FetchOptions::default(),
+                        &harkness_git::FetchOptions::default(),
                         cancellation,
                         move |message| {
                             let update_job_id = progress_job_id.clone();
@@ -3666,7 +3666,7 @@ impl ffi::HarknessBackend {
             let result = run_git_operation(project_id, &cancellation, |git, cancellation| {
                 let outcome = git
                     .pull(
-                        &harkness_core::PullOptions::default(),
+                        &harkness_git::PullOptions::default(),
                         cancellation,
                         move |message| {
                             let update_job_id = progress_job_id.clone();
@@ -3702,10 +3702,10 @@ impl ffi::HarknessBackend {
             let result = run_git_operation(project_id, &cancellation, |git, cancellation| {
                 let outcome = git
                     .push(
-                        &harkness_core::PushOptions {
+                        &harkness_git::PushOptions {
                             set_upstream: true,
                             allow_default_branch,
-                            ..harkness_core::PushOptions::default()
+                            ..harkness_git::PushOptions::default()
                         },
                         cancellation,
                         move |message| {
@@ -3730,7 +3730,7 @@ impl ffi::HarknessBackend {
 
     fn refresh_worktrees(self: Pin<&mut Self>, project_id: &QString) {
         let project_id = project_id.to_string();
-        let cancellation = harkness_core::Cancellation::default();
+        let cancellation = harkness_git::Cancellation::default();
         let qt_thread = self.qt_thread();
         std::thread::spawn(move || {
             let result = (|| {
@@ -3813,7 +3813,7 @@ impl ffi::HarknessBackend {
             let result = run_git_operation(project_id, &cancellation, |git, cancellation| {
                 git.create_branch(
                     &branch,
-                    &harkness_core::CreateBranchOptions {
+                    &harkness_git::CreateBranchOptions {
                         start_point: (!start_point.is_empty()).then_some(start_point),
                         checkout: true,
                     },
@@ -4128,7 +4128,7 @@ mod tests {
 
     fn project(
         source: harkness_core::ProjectSource,
-        git: Option<harkness_core::GitStatus>,
+        git: Option<harkness_git::GitStatus>,
     ) -> harkness_core::Project {
         harkness_core::Project {
             id: harkness_core::ProjectId::new(),
@@ -4222,10 +4222,10 @@ mod tests {
             harkness_core::ProjectSource::ManagedRepository {
                 remote: "github.com/example/sample".to_owned(),
             },
-            Some(harkness_core::GitStatus {
+            Some(harkness_git::GitStatus {
                 branch: Some("main".to_owned()),
                 dirty: true,
-                upstream: Some(harkness_core::UpstreamStatus {
+                upstream: Some(harkness_git::UpstreamStatus {
                     name: "origin/main".to_owned(),
                     ahead: 1,
                     behind: 2,
@@ -4371,8 +4371,8 @@ mod tests {
         assert_eq!(end_job(&mut records, &fetch.id), Some(fetch));
         assert_eq!(records.len(), 2);
 
-        let first = harkness_core::Cancellation::default();
-        let second = harkness_core::Cancellation::default();
+        let first = harkness_git::Cancellation::default();
+        let second = harkness_git::Cancellation::default();
         let mut cancellations = HashMap::from([
             ("job-1".to_owned(), first.clone()),
             ("job-2".to_owned(), second.clone()),
@@ -4388,20 +4388,20 @@ mod tests {
     fn detailed_status_entries_flatten_for_the_git_panel() {
         let state = GitStateRow::from_status(
             "project-1".to_owned(),
-            harkness_core::DetailedStatus {
-                head: harkness_core::HeadState::Branch {
+            harkness_git::DetailedStatus {
+                head: harkness_git::HeadState::Branch {
                     name: "topic".to_owned(),
                 },
-                upstream: Some(harkness_core::UpstreamStatus {
+                upstream: Some(harkness_git::UpstreamStatus {
                     name: "origin/topic".to_owned(),
                     ahead: 2,
                     behind: 1,
                 }),
-                pending: Some(harkness_core::PendingOperation::Merge),
-                entries: vec![harkness_core::StatusEntry {
+                pending: Some(harkness_git::PendingOperation::Merge),
+                entries: vec![harkness_git::StatusEntry {
                     path: "src/new.rs".into(),
-                    staged: Some(harkness_core::FileChange::Added),
-                    unstaged: Some(harkness_core::FileChange::Modified),
+                    staged: Some(harkness_git::FileChange::Added),
+                    unstaged: Some(harkness_git::FileChange::Modified),
                     rename_source: Some("src/old.rs".into()),
                     conflicted: true,
                 }],
@@ -4481,7 +4481,7 @@ mod tests {
         let root = fixture.path().join("byte-path-repository");
         initialize_repository(&root);
         fs::write(root.join(&first), b"byte-exact content\n").unwrap();
-        let git = harkness_core::GitService::new(&root, fixture.path().join("byte-path-locks"));
+        let git = harkness_git::GitService::new(&root, fixture.path().join("byte-path-locks"));
         let state =
             load_diff_with_git(&git, "project-1".to_owned(), first_id, first.clone()).unwrap();
         assert_eq!(state.path_id, "path-1");
@@ -4505,7 +4505,7 @@ mod tests {
             .replace("line 2\n", "line 2 changed\n")
             .replace("line 22\n", "line 22 changed\n");
         fs::write(root.join(path), &modified).unwrap();
-        let git = harkness_core::GitService::new(&root, fixture.path().join("diff-locks"));
+        let git = harkness_git::GitService::new(&root, fixture.path().join("diff-locks"));
 
         let state = load_diff_with_git(
             &git,
@@ -4517,7 +4517,7 @@ mod tests {
         let unstaged = state
             .files
             .iter()
-            .find(|file| matches!(file.target, harkness_core::DiffTarget::Unstaged))
+            .find(|file| matches!(file.target, harkness_git::DiffTarget::Unstaged))
             .unwrap();
         assert_eq!(unstaged.hunks.len(), 2);
         assert!(
@@ -4525,14 +4525,14 @@ mod tests {
                 .hunks
                 .iter()
                 .flat_map(|hunk| &hunk.lines)
-                .any(|line| matches!(line.kind, harkness_core::DiffLineKind::Addition))
+                .any(|line| matches!(line.kind, harkness_git::DiffLineKind::Addition))
         );
         assert!(
             unstaged
                 .hunks
                 .iter()
                 .flat_map(|hunk| &hunk.lines)
-                .any(|line| matches!(line.kind, harkness_core::DiffLineKind::Deletion))
+                .any(|line| matches!(line.kind, harkness_git::DiffLineKind::Deletion))
         );
 
         let (model, selections) = to_diff(&state, 7);
@@ -4546,13 +4546,13 @@ mod tests {
             .expect("diff files should flatten to a QVariantList");
         assert_eq!(files.len(), 1);
 
-        let selection = harkness_core::HunkSelection::new(unstaged, &unstaged.hunks[0]);
+        let selection = harkness_git::HunkSelection::new(unstaged, &unstaged.hunks[0]);
         assert_eq!(
             mutate_hunk_with_git(
                 &git,
                 HunkAction::Stage,
                 &selection,
-                &harkness_core::Cancellation::default(),
+                &harkness_git::Cancellation::default(),
             )
             .unwrap(),
             HunkMutationOutcome::Applied(1)
@@ -4568,23 +4568,23 @@ mod tests {
         let staged = refreshed
             .files
             .iter()
-            .find(|file| matches!(file.target, harkness_core::DiffTarget::Staged))
+            .find(|file| matches!(file.target, harkness_git::DiffTarget::Staged))
             .unwrap();
         let unstaged = refreshed
             .files
             .iter()
-            .find(|file| matches!(file.target, harkness_core::DiffTarget::Unstaged))
+            .find(|file| matches!(file.target, harkness_git::DiffTarget::Unstaged))
             .unwrap();
         assert_eq!(staged.hunks.len(), 1);
         assert_eq!(unstaged.hunks.len(), 1);
 
-        let staged_selection = harkness_core::HunkSelection::new(staged, &staged.hunks[0]);
+        let staged_selection = harkness_git::HunkSelection::new(staged, &staged.hunks[0]);
         assert_eq!(
             mutate_hunk_with_git(
                 &git,
                 HunkAction::Unstage,
                 &staged_selection,
-                &harkness_core::Cancellation::default(),
+                &harkness_git::Cancellation::default(),
             )
             .unwrap(),
             HunkMutationOutcome::Applied(1)
@@ -4600,20 +4600,20 @@ mod tests {
             unstaged_again
                 .files
                 .iter()
-                .all(|file| !matches!(file.target, harkness_core::DiffTarget::Staged))
+                .all(|file| !matches!(file.target, harkness_git::DiffTarget::Staged))
         );
         let file = unstaged_again
             .files
             .iter()
-            .find(|file| matches!(file.target, harkness_core::DiffTarget::Unstaged))
+            .find(|file| matches!(file.target, harkness_git::DiffTarget::Unstaged))
             .unwrap();
-        let selection = harkness_core::HunkSelection::new(file, &file.hunks[0]);
+        let selection = harkness_git::HunkSelection::new(file, &file.hunks[0]);
         assert_eq!(
             mutate_hunk_with_git(
                 &git,
                 HunkAction::Stage,
                 &selection,
-                &harkness_core::Cancellation::default(),
+                &harkness_git::Cancellation::default(),
             )
             .unwrap(),
             HunkMutationOutcome::Applied(1)
@@ -4634,7 +4634,7 @@ mod tests {
         let path = Path::new("stale.txt");
         commit_file(&root, path, "one\ntwo\nthree\n", "add stale fixture");
         fs::write(root.join(path), "one\ntwo changed\nthree\n").unwrap();
-        let git = harkness_core::GitService::new(&root, fixture.path().join("stale-locks"));
+        let git = harkness_git::GitService::new(&root, fixture.path().join("stale-locks"));
         let state = load_diff_with_git(
             &git,
             "project-1".to_owned(),
@@ -4645,9 +4645,9 @@ mod tests {
         let file = state
             .files
             .iter()
-            .find(|file| matches!(file.target, harkness_core::DiffTarget::Unstaged))
+            .find(|file| matches!(file.target, harkness_git::DiffTarget::Unstaged))
             .unwrap();
-        let selection = harkness_core::HunkSelection::new(file, &file.hunks[0]);
+        let selection = harkness_git::HunkSelection::new(file, &file.hunks[0]);
 
         fs::write(root.join(path), "one\ntwo changed again\nthree\n").unwrap();
         assert_eq!(
@@ -4655,15 +4655,15 @@ mod tests {
                 &git,
                 HunkAction::Stage,
                 &selection,
-                &harkness_core::Cancellation::default(),
+                &harkness_git::Cancellation::default(),
             )
             .unwrap(),
             HunkMutationOutcome::Stale
         );
         assert!(
             git.diff(
-                harkness_core::DiffTarget::Staged,
-                &harkness_core::DiffOptions::default(),
+                harkness_git::DiffTarget::Staged,
+                &harkness_git::DiffOptions::default(),
             )
             .unwrap()
             .is_empty()
@@ -4684,7 +4684,7 @@ mod tests {
         let fixture = TempDir::new().unwrap();
         let root = fixture.path().join("summary-repository");
         initialize_repository(&root);
-        let git = harkness_core::GitService::new(&root, fixture.path().join("summary-locks"));
+        let git = harkness_git::GitService::new(&root, fixture.path().join("summary-locks"));
 
         fs::write(root.join("binary.dat"), [0_u8, 1, 2, 0, 3]).unwrap();
         let binary = load_diff_with_git(
@@ -4700,7 +4700,7 @@ mod tests {
 
         fs::write(
             root.join("large.txt"),
-            vec![b'x'; usize::try_from(harkness_core::DEFAULT_MAX_DIFF_FILE_SIZE).unwrap() + 1],
+            vec![b'x'; usize::try_from(harkness_git::DEFAULT_MAX_DIFF_FILE_SIZE).unwrap() + 1],
         )
         .unwrap();
         let large = load_diff_with_git(
@@ -4713,7 +4713,7 @@ mod tests {
         assert_eq!(large.files.len(), 1);
         assert!(matches!(
             large.files[0].omission.as_ref(),
-            Some(harkness_core::DiffOmission::FileTooLarge { .. })
+            Some(harkness_git::DiffOmission::FileTooLarge { .. })
         ));
         assert!(file_content_summary(&large.files[0]).starts_with("File too large"));
     }
@@ -4727,7 +4727,7 @@ mod tests {
             .map(|line| format!("line {line}\n"))
             .collect::<String>();
         fs::write(root.join("many-lines.txt"), content).unwrap();
-        let git = harkness_core::GitService::new(&root, fixture.path().join("line-limit-locks"));
+        let git = harkness_git::GitService::new(&root, fixture.path().join("line-limit-locks"));
         let state = load_diff_with_git(
             &git,
             "project-1".to_owned(),
@@ -4772,8 +4772,8 @@ mod tests {
                 format!("revision {revision}").as_str(),
             );
         }
-        let git = harkness_core::GitService::new(&root, fixture.path().join("history-locks"));
-        let cancellation = harkness_core::Cancellation::default();
+        let git = harkness_git::GitService::new(&root, fixture.path().join("history-locks"));
+        let cancellation = harkness_git::Cancellation::default();
 
         let (first, cursor) = load_history_page_with_git(&git, None, &cancellation).unwrap();
         assert_eq!(first.len(), 50);
@@ -4834,7 +4834,7 @@ mod tests {
             "change topic",
         );
 
-        let git = harkness_core::GitService::new(&root, fixture.path().join("branch-locks"));
+        let git = harkness_git::GitService::new(&root, fixture.path().join("branch-locks"));
         let review = load_review_with_git(
             &git,
             "project-1".to_owned(),
@@ -4852,7 +4852,7 @@ mod tests {
         assert!(review.files[0].file.hunks.is_empty());
         assert!(matches!(
             review.files[0].file.omission.as_ref(),
-            Some(harkness_core::DiffOmission::ContentBudgetExhausted { limit: 0 })
+            Some(harkness_git::DiffOmission::ContentBudgetExhausted { limit: 0 })
         ));
     }
 
@@ -4876,7 +4876,7 @@ mod tests {
         );
         let repository = Repository::open(&root).unwrap();
         let revision = repository.head().unwrap().target().unwrap().to_string();
-        let git = harkness_core::GitService::new(&root, fixture.path().join("word-locks"));
+        let git = harkness_git::GitService::new(&root, fixture.path().join("word-locks"));
         let review = load_review_with_git(
             &git,
             "project-1".to_owned(),
@@ -4893,14 +4893,14 @@ mod tests {
         let deletion = loaded.file.hunks[0]
             .lines
             .iter()
-            .find(|line| matches!(line.kind, harkness_core::DiffLineKind::Deletion))
+            .find(|line| matches!(line.kind, harkness_git::DiffLineKind::Deletion))
             .unwrap();
         let addition = loaded.file.hunks[0]
             .lines
             .iter()
-            .find(|line| matches!(line.kind, harkness_core::DiffLineKind::Addition))
+            .find(|line| matches!(line.kind, harkness_git::DiffLineKind::Addition))
             .unwrap();
-        let changed = |line: &harkness_core::DiffLine| {
+        let changed = |line: &harkness_git::DiffLine| {
             line.intra_line_ranges
                 .as_ref()
                 .unwrap()
@@ -4943,7 +4943,7 @@ mod tests {
         drop(repository);
         let revision = commit_index(&root, "change both review files").to_string();
 
-        let git = harkness_core::GitService::new(&root, fixture.path().join("default-locks"));
+        let git = harkness_git::GitService::new(&root, fixture.path().join("default-locks"));
         let review = load_review_with_initial_file_with_git(
             &git,
             "project-1".to_owned(),
@@ -4996,7 +4996,7 @@ mod tests {
         drop(parent);
         drop(repository);
 
-        let git = harkness_core::GitService::new(&root, fixture.path().join("large-locks"));
+        let git = harkness_git::GitService::new(&root, fixture.path().join("large-locks"));
         let review = load_review_with_git(
             &git,
             "project-1".to_owned(),
@@ -5023,7 +5023,7 @@ mod tests {
         commit_file(&root, path, &changed, "change middle line");
         let repository = Repository::open(&root).unwrap();
         let revision = repository.head().unwrap().target().unwrap().to_string();
-        let git = harkness_core::GitService::new(&root, fixture.path().join("context-locks"));
+        let git = harkness_git::GitService::new(&root, fixture.path().join("context-locks"));
         let review = load_review_with_git(
             &git,
             "project-1".to_owned(),
@@ -5071,7 +5071,7 @@ mod tests {
         drop(index);
         drop(repository);
 
-        let git = harkness_core::GitService::new(&root, fixture.path().join("working-locks"));
+        let git = harkness_git::GitService::new(&root, fixture.path().join("working-locks"));
         let staged =
             load_review_with_git(&git, "project-1".to_owned(), ReviewSelection::Staged, 10)
                 .unwrap();
@@ -5125,7 +5125,7 @@ mod tests {
     fn local_and_detached_rows_distinguish_identity_states() {
         let detached = ProjectRow::from(project(
             harkness_core::ProjectSource::Local,
-            Some(harkness_core::GitStatus {
+            Some(harkness_git::GitStatus {
                 branch: None,
                 dirty: false,
                 upstream: None,
@@ -5162,12 +5162,12 @@ mod tests {
 
     #[test]
     fn branch_rows_disable_a_branch_checked_out_elsewhere() {
-        let row = BranchRow::from(harkness_core::Branch {
+        let row = BranchRow::from(harkness_git::Branch {
             name: "topic".to_owned(),
-            kind: harkness_core::BranchKind::Local,
+            kind: harkness_git::BranchKind::Local,
             tip: "0000000000000000000000000000000000000000".parse().unwrap(),
             upstream: None,
-            checkout: harkness_core::BranchCheckout::OtherWorktree("/tmp/other".into()),
+            checkout: harkness_git::BranchCheckout::OtherWorktree("/tmp/other".into()),
         });
         assert!(!row.current && !row.selectable);
         assert!(row.detail.contains("/tmp/other"));
@@ -5196,7 +5196,7 @@ mod tests {
                 parent,
                 worktree_branch: Some("agent/catalog-v2".to_owned()),
             },
-            Some(harkness_core::GitStatus {
+            Some(harkness_git::GitStatus {
                 branch: Some("agent/live".to_owned()),
                 dirty: false,
                 upstream: None,
@@ -5239,20 +5239,20 @@ mod tests {
     fn worktree_creation_modes_are_validated_before_spawning_git() {
         assert_eq!(
             worktree_base("new", "agent/topic", "HEAD").unwrap(),
-            harkness_core::WorktreeBase::NewBranch {
+            harkness_git::WorktreeBase::NewBranch {
                 name: "agent/topic".to_owned(),
                 start_point: Some("HEAD".to_owned()),
             }
         );
         assert_eq!(
             worktree_base("existing", "agent/topic", "ignored").unwrap(),
-            harkness_core::WorktreeBase::ExistingBranch {
+            harkness_git::WorktreeBase::ExistingBranch {
                 name: "agent/topic".to_owned(),
             }
         );
         assert_eq!(
             worktree_base("detached", "ignored", "HEAD~1").unwrap(),
-            harkness_core::WorktreeBase::Detached {
+            harkness_git::WorktreeBase::Detached {
                 commit: "HEAD~1".to_owned(),
             }
         );
@@ -5271,11 +5271,11 @@ mod tests {
         let worktree = service
             .create_worktree(
                 parent.id,
-                &harkness_core::WorktreeBase::NewBranch {
+                &harkness_git::WorktreeBase::NewBranch {
                     name: "agent/gui-force".to_owned(),
                     start_point: None,
                 },
-                &harkness_core::Cancellation::default(),
+                &harkness_git::Cancellation::default(),
             )
             .unwrap();
         fs::write(worktree.root.join("dirty.txt"), "discard me\n").unwrap();
@@ -5284,7 +5284,7 @@ mod tests {
             &mut service,
             &worktree.id.to_string(),
             false,
-            &harkness_core::Cancellation::default(),
+            &harkness_git::Cancellation::default(),
         )
         .unwrap_err();
         assert!(refused.contains("uncommitted changes"));
@@ -5292,7 +5292,7 @@ mod tests {
             &mut service,
             &worktree.id.to_string(),
             true,
-            &harkness_core::Cancellation::default(),
+            &harkness_git::Cancellation::default(),
         )
         .unwrap();
         assert!(!worktree.root.exists());
@@ -5310,11 +5310,11 @@ mod tests {
         let worktree = service
             .create_worktree(
                 parent.id,
-                &harkness_core::WorktreeBase::NewBranch {
+                &harkness_git::WorktreeBase::NewBranch {
                     name: "agent/gui-lock".to_owned(),
                     start_point: None,
                 },
-                &harkness_core::Cancellation::default(),
+                &harkness_git::Cancellation::default(),
             )
             .unwrap();
         let worktree_id = worktree.id.to_string();
@@ -5325,7 +5325,7 @@ mod tests {
             &worktree_id,
             &harkness_core::ProjectId::new().to_string(),
             &WorktreeLockAction::Lock("must not be applied".to_owned()),
-            &harkness_core::Cancellation::default(),
+            &harkness_git::Cancellation::default(),
         )
         .unwrap_err();
         assert!(wrong_parent.contains("does not belong to the open parent project"));
@@ -5335,7 +5335,7 @@ mod tests {
             &worktree_id,
             &parent_id,
             &WorktreeLockAction::Lock("   ".to_owned()),
-            &harkness_core::Cancellation::default(),
+            &harkness_git::Cancellation::default(),
         )
         .unwrap();
         assert!(
@@ -5351,7 +5351,7 @@ mod tests {
             &worktree_id,
             &parent_id,
             &WorktreeLockAction::Lock("  agent is still working  ".to_owned()),
-            &harkness_core::Cancellation::default(),
+            &harkness_git::Cancellation::default(),
         )
         .unwrap();
         let message = outcome.message.unwrap();
@@ -5365,7 +5365,7 @@ mod tests {
             &mut service,
             &worktree_id,
             true,
-            &harkness_core::Cancellation::default(),
+            &harkness_git::Cancellation::default(),
         )
         .unwrap_err();
         assert!(removal.contains("agent is still working"));
@@ -5375,7 +5375,7 @@ mod tests {
             &worktree_id,
             &parent_id,
             &WorktreeLockAction::Unlock,
-            &harkness_core::Cancellation::default(),
+            &harkness_git::Cancellation::default(),
         )
         .unwrap();
         let message = outcome.message.unwrap();
@@ -5401,11 +5401,11 @@ mod tests {
         let worktree = service
             .create_worktree(
                 parent.id,
-                &harkness_core::WorktreeBase::NewBranch {
+                &harkness_git::WorktreeBase::NewBranch {
                     name: "agent/gui-move".to_owned(),
                     start_point: None,
                 },
-                &harkness_core::Cancellation::default(),
+                &harkness_git::Cancellation::default(),
             )
             .unwrap();
 
@@ -5413,7 +5413,7 @@ mod tests {
             &mut service,
             &worktree.id.to_string(),
             "relative-checkout",
-            &harkness_core::Cancellation::default(),
+            &harkness_git::Cancellation::default(),
         )
         .unwrap_err();
         assert!(relative.contains("must be absolute"));
@@ -5422,13 +5422,13 @@ mod tests {
             &mut service,
             &worktree.id.to_string(),
             destination.to_str().unwrap(),
-            &harkness_core::Cancellation::default(),
+            &harkness_git::Cancellation::default(),
         )
         .unwrap();
         assert_eq!(moved.root, destination.canonicalize().unwrap());
         assert!(!worktree.root.exists());
         let rows = service
-            .worktrees(parent.id, &harkness_core::Cancellation::default())
+            .worktrees(parent.id, &harkness_git::Cancellation::default())
             .unwrap();
         assert!(rows.iter().any(|row| row.root == moved.root));
         assert!(rows.iter().all(|row| row.root != worktree.root));
