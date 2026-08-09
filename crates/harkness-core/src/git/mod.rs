@@ -9,6 +9,7 @@
 mod branch;
 pub(crate) mod clone;
 mod commit;
+mod context;
 mod diff;
 mod history;
 mod hunk;
@@ -31,6 +32,10 @@ pub use branch::{Branch, BranchCheckout, BranchKind, BranchListOptions, CreateBr
 pub use commit::{
     CommitOptions, CommitOutcome, StageOptions, StageOutcome, StagePathOutcome, StagePathResult,
     StatusRefreshOutcome,
+};
+pub use context::{
+    FileContextOmission, FileContextRange, FileContextRequest, FileContextResponse,
+    FileContextSource, FileSide,
 };
 pub use diff::{
     DEFAULT_DIFF_CONTEXT_LINES, DEFAULT_MAX_DIFF_FILE_SIZE, DEFAULT_MAX_DIFF_FILES,
@@ -357,6 +362,15 @@ pub enum GitError {
         source: io::Error,
     },
 
+    /// A file-context request did not contain a complete object ID valid for
+    /// its selected source.
+    #[error("'{blob_id}' is not a valid full blob object ID for this context source")]
+    InvalidBlobId { blob_id: String },
+
+    /// No blob object exists at the requested object ID.
+    #[error("blob '{blob_id}' was not found in the repository")]
+    BlobNotFound { blob_id: String },
+
     /// Libgit2 returned a diff record that violates Harkness's model contract.
     #[error("Git produced a diff that could not be represented: {detail}")]
     MalformedDiff { detail: String },
@@ -488,6 +502,8 @@ impl GitError {
         "detached_head",
         "inspection",
         "diff_content",
+        "invalid_blob_id",
+        "blob_not_found",
         "malformed_diff",
         "stale_hunk_selection",
         "binary_hunk_selection",
@@ -549,6 +565,8 @@ impl GitError {
             Self::DetachedHead { .. } => "detached_head",
             Self::Inspection { .. } => "inspection",
             Self::DiffContent { .. } => "diff_content",
+            Self::InvalidBlobId { .. } => "invalid_blob_id",
+            Self::BlobNotFound { .. } => "blob_not_found",
             Self::MalformedDiff { .. } => "malformed_diff",
             Self::StaleHunkSelection { .. } => "stale_hunk_selection",
             Self::BinaryHunkSelection { .. } => "binary_hunk_selection",
@@ -746,6 +764,22 @@ impl GitService {
         options: &DiffOptions,
     ) -> Result<Vec<FileDiff>, GitError> {
         diff::compute_targets(&self.root, targets, options)
+    }
+
+    /// Retrieves bounded source context without recomputing a diff.
+    ///
+    /// Immutable sides are addressed by the blob IDs recorded in [`FileDiff`],
+    /// so later index or working-tree changes cannot move their content. A
+    /// working-tree source is guarded by its recorded hash and refuses with
+    /// [`GitError::StaleHunkSelection`] when the path no longer produces the
+    /// same raw or clean-filtered representation.
+    /// The operation runs entirely in process, takes no repository lock and
+    /// never spawns system Git.
+    pub fn file_context(
+        &self,
+        request: &FileContextRequest,
+    ) -> Result<FileContextResponse, GitError> {
+        context::load(&self.root, request)
     }
 
     /// Stages selected working-tree hunks without writing the working tree.
@@ -1530,6 +1564,18 @@ mod tests {
                     source: io_error(),
                 },
                 "diff_content",
+            ),
+            (
+                GitError::InvalidBlobId {
+                    blob_id: "invalid".to_owned(),
+                },
+                "invalid_blob_id",
+            ),
+            (
+                GitError::BlobNotFound {
+                    blob_id: "1".repeat(40),
+                },
+                "blob_not_found",
             ),
             (
                 GitError::MalformedDiff {

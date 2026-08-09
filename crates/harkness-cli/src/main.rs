@@ -2517,7 +2517,8 @@ fn git_exit_code(error: &GitError) -> u8 {
         GitError::Cancelled => EXIT_CANCELLED,
         GitError::NoSuchBranch { .. }
         | GitError::NotARepository { .. }
-        | GitError::RevisionNotFound { .. } => EXIT_NOT_FOUND,
+        | GitError::RevisionNotFound { .. }
+        | GitError::BlobNotFound { .. } => EXIT_NOT_FOUND,
         GitError::RepositoryBusy { .. }
         | GitError::AmbiguousRevision { .. }
         | GitError::NoMergeBase { .. }
@@ -2528,6 +2529,7 @@ fn git_exit_code(error: &GitError) -> u8 {
         GitError::PathOutsideRepository { .. }
         | GitError::RevisionNotCommit { .. }
         | GitError::RevisionNotParent { .. }
+        | GitError::InvalidBlobId { .. }
         | GitError::InvalidLogLimit
         | GitError::InvalidLogCursor { .. }
         | GitError::EmptyCommitMessage
@@ -2636,6 +2638,8 @@ const GIT_KIND_EXIT_CODES: &[(&str, u8)] = &[
     ("detached_head", EXIT_REFUSED),
     ("inspection", EXIT_OPERATION_FAILED),
     ("diff_content", EXIT_OPERATION_FAILED),
+    ("invalid_blob_id", EXIT_REFUSED),
+    ("blob_not_found", EXIT_NOT_FOUND),
     ("malformed_diff", EXIT_OPERATION_FAILED),
     ("stale_hunk_selection", EXIT_REFUSED),
     ("binary_hunk_selection", EXIT_REFUSED),
@@ -2805,6 +2809,9 @@ fn git_error_details(error: &GitError) -> Value {
     match error {
         GitError::RevisionNotFound { revision } | GitError::AmbiguousRevision { revision } => {
             json!({ "revision": revision })
+        }
+        GitError::InvalidBlobId { blob_id } | GitError::BlobNotFound { blob_id } => {
+            json!({ "blob_id": blob_id })
         }
         GitError::RevisionNotCommit { revision, id } => {
             json!({ "revision": revision, "object_id": id.to_string() })
@@ -3026,7 +3033,7 @@ mod tests {
     }
 
     #[test]
-    fn history_errors_keep_agent_facing_classification_and_details() {
+    fn history_and_context_errors_keep_agent_facing_classification_and_details() {
         let object_id = git2::Oid::ZERO_SHA1;
         let cases = vec![
             (
@@ -3082,6 +3089,20 @@ mod tests {
                 GitError::InvalidLogCursor { cursor: object_id },
                 EXIT_REFUSED,
                 serde_json::json!({ "cursor": object_id.to_string() }),
+            ),
+            (
+                GitError::InvalidBlobId {
+                    blob_id: "invalid".to_owned(),
+                },
+                EXIT_REFUSED,
+                serde_json::json!({ "blob_id": "invalid" }),
+            ),
+            (
+                GitError::BlobNotFound {
+                    blob_id: "1".repeat(40),
+                },
+                EXIT_NOT_FOUND,
+                serde_json::json!({ "blob_id": "1".repeat(40) }),
             ),
         ];
 
