@@ -489,10 +489,10 @@ impl HunkArguments {
     /// error rather than a silent no-op that would look like a successful
     /// stage. Clap already enforces the flag form's requirements, so the checks
     /// here exist for the document form, whose contents it cannot see.
-    fn into_selections(self) -> Result<Option<Vec<HunkSelection>>, CliError> {
+    fn into_selections(self, consumes: &str) -> Result<Option<Vec<HunkSelection>>, CliError> {
         if let Some(source) = self.hunk_selection {
             let document = read_selection_document(&source)?;
-            let selections = parse_selection_document(&document)?;
+            let selections = parse_selection_document(&document, consumes)?;
             if selections.is_empty() {
                 return Err(CliError::Usage(
                     "the selection document names no hunks".to_owned(),
@@ -601,7 +601,15 @@ fn read_selection_document(source: &Path) -> Result<String, CliError> {
 /// The `files` shape is `git diff` output with unwanted hunks removed, so the
 /// round trip needs no reshaping by the caller. The `selections` shape is the
 /// flat form for callers that assemble coordinates themselves.
-fn parse_selection_document(document: &str) -> Result<Vec<HunkSelection>, CliError> {
+///
+/// `consumes` names the side of the index this command reads. A record from the
+/// other side would fail revalidation on its blob IDs and be reported as stale,
+/// which is true of the identities but useless as a diagnosis: nothing has gone
+/// out of date, the wrong half of a combined diff was piped in.
+fn parse_selection_document(
+    document: &str,
+    consumes: &str,
+) -> Result<Vec<HunkSelection>, CliError> {
     let value: Value = serde_json::from_str(document)
         .map_err(|error| CliError::Usage(format!("the selection document is not JSON: {error}")))?;
     let value = value
@@ -612,7 +620,9 @@ fn parse_selection_document(document: &str) -> Result<Vec<HunkSelection>, CliErr
         let files = array(files, "files")?;
         let mut selections = Vec::new();
         for (index, file) in files.iter().enumerate() {
-            selections.extend(file_selections(file, index)?);
+            let at = format!("files[{index}]");
+            check_target(file, consumes, &at)?;
+            selections.extend(file_selections(file, &at)?);
         }
         return Ok(selections);
     }
@@ -626,22 +636,47 @@ fn parse_selection_document(document: &str) -> Result<Vec<HunkSelection>, CliErr
     selections
         .iter()
         .enumerate()
-        .map(|(index, selection)| flat_selection(selection, index))
+        .map(|(index, selection)| {
+            let at = format!("selections[{index}]");
+            check_target(selection, consumes, &at)?;
+            flat_selection(selection, &at)
+        })
         .collect()
 }
 
-fn file_selections(file: &Value, index: usize) -> Result<Vec<HunkSelection>, CliError> {
-    let at = format!("files[{index}]");
-    let old_path = record_path(file, "old_path", &at)?;
-    let new_path = record_path(file, "new_path", &at)?;
+/// Refuses a record taken from the side of the index this command cannot use.
+///
+/// A record with no `target` is accepted: the flat form is not required to
+/// carry one, and revalidation still refuses anything that does not match.
+fn check_target(record: &Value, consumes: &str, at: &str) -> Result<(), CliError> {
+    let Some(target) = record.get("target").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    if target == consumes {
+        return Ok(());
+    }
+    let other = if consumes == "unstaged" {
+        "unstage"
+    } else {
+        "stage"
+    };
+    Err(CliError::Usage(format!(
+        "{at}.target is \"{target}\" but this command consumes {consumes} records; \
+         narrow the diff with --{consumes}, or pass the document to 'git {other}'"
+    )))
+}
+
+fn file_selections(file: &Value, at: &str) -> Result<Vec<HunkSelection>, CliError> {
+    let old_path = record_path(file, "old_path", at)?;
+    let new_path = record_path(file, "new_path", at)?;
     if old_path.is_none() && new_path.is_none() {
         return Err(CliError::Usage(format!(
             "{at} has neither an old_path nor a new_path"
         )));
     }
-    let old_blob_id = record_string(file, "old_blob_id", &at)?;
-    let new_blob_id = record_string(file, "new_blob_id", &at)?;
-    let context_lines = record_u32(file, "context_lines", &at)?;
+    let old_blob_id = record_string(file, "old_blob_id", at)?;
+    let new_blob_id = record_string(file, "new_blob_id", at)?;
+    let context_lines = record_u32(file, "context_lines", at)?;
     let hunks = array(
         file.get("hunks")
             .ok_or_else(|| CliError::Usage(format!("{at} has no \"hunks\"")))?,
@@ -671,10 +706,9 @@ fn file_selections(file: &Value, index: usize) -> Result<Vec<HunkSelection>, Cli
         .collect()
 }
 
-fn flat_selection(selection: &Value, index: usize) -> Result<HunkSelection, CliError> {
-    let at = format!("selections[{index}]");
-    let old_path = record_path(selection, "old_path", &at)?;
-    let new_path = record_path(selection, "new_path", &at)?;
+fn flat_selection(selection: &Value, at: &str) -> Result<HunkSelection, CliError> {
+    let old_path = record_path(selection, "old_path", at)?;
+    let new_path = record_path(selection, "new_path", at)?;
     if old_path.is_none() && new_path.is_none() {
         return Err(CliError::Usage(format!(
             "{at} has neither an old_path nor a new_path"
@@ -683,16 +717,16 @@ fn flat_selection(selection: &Value, index: usize) -> Result<HunkSelection, CliE
     Ok(HunkSelection::from_parts(
         old_path,
         new_path,
-        record_string(selection, "old_blob_id", &at)?,
-        record_string(selection, "new_blob_id", &at)?,
-        record_u32(selection, "context_lines", &at)?,
+        record_string(selection, "old_blob_id", at)?,
+        record_string(selection, "new_blob_id", at)?,
+        record_u32(selection, "context_lines", at)?,
         (
-            record_u32(selection, "old_start", &at)?,
-            record_u32(selection, "old_lines", &at)?,
+            record_u32(selection, "old_start", at)?,
+            record_u32(selection, "old_lines", at)?,
         ),
         (
-            record_u32(selection, "new_start", &at)?,
-            record_u32(selection, "new_lines", &at)?,
+            record_u32(selection, "new_start", at)?,
+            record_u32(selection, "new_lines", at)?,
         ),
     ))
 }
@@ -1186,11 +1220,13 @@ fn run_git(
             run_git_branch(command, &service, json_output, cancellation)
         }
         GitCommand::Stage(arguments) => {
-            let selections = arguments.hunk.into_selections()?;
+            let selections = arguments.hunk.into_selections("unstaged")?;
             let git = selected_git(&service, arguments.selection)?;
             if let Some(selections) = selections {
                 let outcome = git.stage_hunks(&selections, cancellation)?;
-                let count = selections.len();
+                // The applied count, not the supplied one: a batch deduplicates
+                // selections that resolve to the same hunk.
+                let count = outcome.hunks;
                 command_result(
                     json_output,
                     || hunk_outcome_line("staged", count),
@@ -1224,11 +1260,11 @@ fn run_git(
             }
         }
         GitCommand::Unstage(arguments) => {
-            let selections = arguments.hunk.into_selections()?;
+            let selections = arguments.hunk.into_selections("staged")?;
             let git = selected_git(&service, arguments.selection)?;
             if let Some(selections) = selections {
                 let outcome = git.unstage_hunks(&selections, cancellation)?;
-                let count = selections.len();
+                let count = outcome.hunks;
                 command_result(
                     json_output,
                     || hunk_outcome_line("unstaged", count),
@@ -3038,7 +3074,7 @@ mod tests {
         })
         .to_string();
 
-        let selections = parse_selection_document(&document).unwrap();
+        let selections = parse_selection_document(&document, "unstaged").unwrap();
 
         assert_eq!(selections.len(), 2);
         assert_eq!(
@@ -3067,7 +3103,7 @@ mod tests {
         })
         .to_string();
 
-        let error = parse_selection_document(&lossy).unwrap_err();
+        let error = parse_selection_document(&lossy, "unstaged").unwrap_err();
 
         assert_eq!(error.kind(), "usage_error");
         assert!(
@@ -3089,13 +3125,49 @@ mod tests {
         })
         .to_string();
 
-        let selections = parse_selection_document(&exact).unwrap();
+        let selections = parse_selection_document(&exact, "unstaged").unwrap();
 
         assert_eq!(selections.len(), 1);
         assert_ne!(
             selections[0].new_path.as_deref(),
             Some(Path::new("bad-\u{fffd}.txt")),
             "the Base64 spelling must win over the lossy one"
+        );
+    }
+
+    /// Piping a combined diff into one side's command is the obvious mistake,
+    /// and revalidation would call it stale — true of the identities, useless
+    /// as a diagnosis. The wrong side has to be named as the wrong side.
+    #[test]
+    fn a_record_from_the_other_side_of_the_index_is_named_not_called_stale() {
+        let document = serde_json::json!({
+            "files": [{
+                "target": "staged",
+                "new_path": "a.txt",
+                "old_path": "a.txt",
+                "old_blob_id": "aaaa",
+                "new_blob_id": "bbbb",
+                "context_lines": 3,
+                "hunks": [{ "old_start": 1, "old_lines": 1, "new_start": 1, "new_lines": 1 }],
+            }],
+        })
+        .to_string();
+
+        let error = parse_selection_document(&document, "unstaged").unwrap_err();
+
+        assert_eq!(error.kind(), "usage_error");
+        let message = error.message();
+        assert!(message.contains("\"staged\""), "{message}");
+        assert!(message.contains("--unstaged"), "{message}");
+        assert!(
+            !message.contains("stale"),
+            "the wrong side must not be reported as staleness: {message}"
+        );
+
+        // The same document is exactly what `git unstage` should accept.
+        assert_eq!(
+            parse_selection_document(&document, "staged").unwrap().len(),
+            1
         );
     }
 
@@ -3118,7 +3190,7 @@ mod tests {
             ),
         ];
         for (document, expected) in cases {
-            let error = parse_selection_document(document).unwrap_err();
+            let error = parse_selection_document(document, "unstaged").unwrap_err();
             assert_eq!(error.kind(), "usage_error", "for {document}");
             assert!(
                 error.message().contains(expected),

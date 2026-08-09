@@ -1500,6 +1500,189 @@ fn a_selection_document_stages_several_hunks_atomically() {
     );
 }
 
+/// A batch can name the same hunk twice, or two hunks that cover the same
+/// lines. The first is deduplicated and must be counted as what landed rather
+/// than as what was asked for; the second cannot be expressed as one patch and
+/// is refused with the path in hand. Neither is reachable one hunk at a time.
+#[test]
+fn a_batch_deduplicates_repeats_and_refuses_overlaps() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("batch-edges");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    let original = (1..=30)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    fs::write(root.join("tracked.txt"), original.as_bytes()).unwrap();
+    commit_all(&repository, "add tracked");
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+    fs::write(
+        root.join("tracked.txt"),
+        original
+            .replace("line 2\n", "FIRST\n")
+            .replace("line 15\n", "SECOND\n")
+            .as_bytes(),
+    )
+    .unwrap();
+    let apply = |document: &Value| {
+        harkness_with_stdin(
+            &data_dir,
+            &[
+                "--json",
+                "git",
+                "stage",
+                "--hunk-selection",
+                "-",
+                "--project",
+                &project_id,
+            ],
+            &document.to_string(),
+        )
+    };
+
+    let mut file = diff_file(&data_dir, &project_id, "--unstaged", "tracked.txt");
+    let first = file["hunks"][0].clone();
+    file["hunks"] = json!([first, first]);
+
+    let repeated = apply(&json!({ "files": [file] }));
+
+    assert_success(&repeated);
+    assert_eq!(
+        json_output(&repeated)["data"]["hunks"],
+        1,
+        "a repeated hunk must be counted once, not once per selection"
+    );
+
+    // A wider context setting produces a hunk that spans the narrow one.
+    let wide = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--unstaged",
+            "--context-lines",
+            "8",
+            "--project",
+            &project_id,
+        ],
+    );
+    let wide = json_output(&wide)["data"]["files"][0].clone();
+    let narrow = diff_file(&data_dir, &project_id, "--unstaged", "tracked.txt");
+    let selection = |file: &Value, hunk: &Value| {
+        json!({
+            "old_path": file["old_path"],
+            "new_path": file["new_path"],
+            "old_blob_id": file["old_blob_id"],
+            "new_blob_id": file["new_blob_id"],
+            "context_lines": file["context_lines"],
+            "old_start": hunk["old_start"],
+            "old_lines": hunk["old_lines"],
+            "new_start": hunk["new_start"],
+            "new_lines": hunk["new_lines"],
+        })
+    };
+    let overlapping = apply(&json!({
+        "selections": [
+            selection(&narrow, &narrow["hunks"][0]),
+            selection(&wide, &wide["hunks"][0]),
+        ],
+    }));
+
+    assert_eq!(overlapping.status.code(), Some(3));
+    let body = json_output(&overlapping);
+    assert_eq!(body["error"]["kind"], "overlapping_hunk_selection");
+    assert_eq!(body["error"]["details"]["path"], "tracked.txt");
+}
+
+/// Piping a whole combined diff into one side's command is the obvious
+/// mistake. Revalidation would refuse it as stale, which is true of the blob
+/// IDs and misleading as advice, so the wrong side is named as the wrong side.
+#[test]
+fn a_document_from_the_wrong_side_of_the_index_is_refused_with_advice() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("wrong-side");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    let original = (1..=30)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    fs::write(root.join("tracked.txt"), original.as_bytes()).unwrap();
+    commit_all(&repository, "add tracked");
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+    fs::write(
+        root.join("tracked.txt"),
+        original.replace("line 2\n", "FIRST\n").as_bytes(),
+    )
+    .unwrap();
+    assert_success(&harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "stage",
+            "tracked.txt",
+            "--project",
+            &project_id,
+        ],
+    ));
+    fs::write(
+        root.join("tracked.txt"),
+        original
+            .replace("line 2\n", "FIRST\n")
+            .replace("line 25\n", "SECOND\n")
+            .as_bytes(),
+    )
+    .unwrap();
+
+    let combined = harkness(
+        &data_dir,
+        &["--json", "git", "diff", "--project", &project_id],
+    );
+    assert_eq!(
+        json_output(&combined)["data"]["files"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "the fixture needs both a staged and an unstaged record"
+    );
+
+    let refused = harkness_with_stdin(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "stage",
+            "--hunk-selection",
+            "-",
+            "--project",
+            &project_id,
+        ],
+        &String::from_utf8(combined.stdout).unwrap(),
+    );
+
+    assert_eq!(refused.status.code(), Some(2));
+    let body = json_output(&refused);
+    assert_eq!(body["error"]["kind"], "usage_error");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("--unstaged"), "{message}");
+    assert!(
+        !message.contains("stale"),
+        "the wrong side must not be reported as staleness: {message}"
+    );
+}
+
 /// A path the diff can print is a path the mutation must accept. A leading
 /// hyphen has to survive ordinary argv, and a name that is not UTF-8 has to be
 /// nameable through its exact bytes rather than through a lossy stand-in.

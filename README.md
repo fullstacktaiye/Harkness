@@ -151,6 +151,14 @@ the whole batch is one atomic index write, whereas staging one hunk rewrites
 the index and shifts the blob IDs of every other selection taken from the same
 diff, so a second single-hunk call would be correctly refused as stale.
 
+`git stage` consumes unstaged records and `git unstage` consumes staged ones, so
+narrow the diff before piping it; a record carrying the other side's `target` is
+refused as a usage error rather than reported as stale. Two selections that
+resolve to the same hunk are deduplicated, and the reported `hunks` count is
+what reached the index rather than what was supplied. Two selections whose lines
+overlap cannot be expressed as one patch and are refused with
+`overlapping_hunk_selection` before the index is opened.
+
 Whole-path staging and unstaging keep their existing syntax. A path that begins
 with a hyphen goes after a `--` separator, as Git itself requires.
 

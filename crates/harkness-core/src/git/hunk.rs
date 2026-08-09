@@ -123,6 +123,13 @@ impl HunkSelection {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct HunkStageOutcome {
+    /// How many distinct hunks reached the index.
+    ///
+    /// This is not the number of selections supplied. Two selections can name
+    /// the same hunk — most easily when they were taken at different context
+    /// settings — and the batch deduplicates them, so reporting the input count
+    /// would tell a caller that more changed than actually did.
+    pub hunks: usize,
     /// The optional full-repository status refresh performed after the apply.
     pub status: StatusRefreshOutcome,
 }
@@ -198,12 +205,15 @@ fn mutate(
     // Validated and opened first even for an empty batch, so an accidental
     // no-op reports the same refusals and the same refreshed status a real one
     // would. Cancellation was already honoured by the caller's lock.
+    let mut hunks = 0;
     if !selections.is_empty() {
         refuse_filtered_paths(&repository, root, &paths)?;
         let prepared = prepare(root, selections, &paths, &target, cancellation)?;
+        hunks = prepared.iter().map(|file| file.hunks.len()).sum();
         apply(&repository, &prepared, &paths, direction)?;
     }
     Ok(HunkStageOutcome {
+        hunks,
         status: commit::refresh_status(git_executable, root, options.refresh_status, cancellation),
     })
 }
