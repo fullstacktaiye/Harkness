@@ -37,7 +37,7 @@ pub use diff::{
     DEFAULT_MAX_DIFF_TOTAL_BYTES, DiffLine, DiffLineKind, DiffOmission, DiffOptions, DiffTarget,
     FileDiff, Hunk,
 };
-pub use history::{CommitInfo, CommitSignature, LogOptions, LogPage, LogRange};
+pub use history::{CommitInfo, CommitSignature, LogCursor, LogOptions, LogPage, LogRange};
 pub use hunk::{HunkSelection, HunkStageOutcome};
 pub use lock::RepositoryLock;
 pub use runner::{Cancellation, CloneCancellation, GitAccess, GitCommand, GitOutput};
@@ -111,6 +111,11 @@ pub enum GitError {
     /// A zero-sized page cannot make progress or produce a continuation.
     #[error("a commit log page limit must be greater than zero")]
     InvalidLogLimit,
+
+    /// A continuation was copied to another range or no longer names its
+    /// recorded ancestry frontier.
+    #[error("commit log cursor {cursor} is not valid for the requested range")]
+    InvalidLogCursor { cursor: git2::Oid },
 
     /// An explicit path resolves beyond the repository working tree.
     #[error(
@@ -446,6 +451,7 @@ impl GitError {
         "revision_not_commit",
         "no_merge_base",
         "invalid_log_limit",
+        "invalid_log_cursor",
         "path_outside_repository",
         "empty_commit_message",
         "nothing_staged",
@@ -505,6 +511,7 @@ impl GitError {
             Self::RevisionNotCommit { .. } => "revision_not_commit",
             Self::NoMergeBase { .. } => "no_merge_base",
             Self::InvalidLogLimit => "invalid_log_limit",
+            Self::InvalidLogCursor { .. } => "invalid_log_cursor",
             Self::PathOutsideRepository { .. } => "path_outside_repository",
             Self::EmptyCommitMessage => "empty_commit_message",
             Self::NothingStaged => "nothing_staged",
@@ -672,8 +679,9 @@ impl GitService {
     ///
     /// History inspection runs entirely through libgit2: it takes no
     /// repository lock, spawns no process and never contacts a remote. A
-    /// continuation cursor is the first commit of the next page, so later
-    /// commits added above it cannot move that page.
+    /// continuation cursor is anchored at the first commit of the next page
+    /// and retains every pending ancestry path, so later commits added above it
+    /// cannot move that page and merges cannot strand an unvisited parent.
     pub fn log(
         &self,
         options: &LogOptions,
@@ -1323,6 +1331,12 @@ mod tests {
                 "no_merge_base",
             ),
             (GitError::InvalidLogLimit, "invalid_log_limit"),
+            (
+                GitError::InvalidLogCursor {
+                    cursor: git2::Oid::ZERO_SHA1,
+                },
+                "invalid_log_cursor",
+            ),
             (
                 GitError::PathOutsideRepository {
                     path: path.clone(),

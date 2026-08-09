@@ -16,10 +16,10 @@ pub use git::{
     DEFAULT_DIFF_CONTEXT_LINES, DEFAULT_MAX_DIFF_FILE_SIZE, DEFAULT_MAX_DIFF_FILES,
     DEFAULT_MAX_DIFF_TOTAL_BYTES, DetailedStatus, DiffLine, DiffLineKind, DiffOmission,
     DiffOptions, DiffTarget, FetchOptions, FetchOutcome, FileChange, FileDiff, GitAccess,
-    GitCommand, GitError, GitOutput, GitService, HeadState, Hunk, HunkSelection, LogOptions,
-    LogPage, LogRange, PendingOperation, PullOptions, PullOutcome, PullStrategy, PushOptions,
-    PushOutcome, RefUpdate, RepositoryLock, StageOptions, StageOutcome, StagePathOutcome,
-    StagePathResult, StatusEntry, StatusRefreshOutcome,
+    GitCommand, GitError, GitOutput, GitService, HeadState, Hunk, HunkSelection, LogCursor,
+    LogOptions, LogPage, LogRange, PendingOperation, PullOptions, PullOutcome, PullStrategy,
+    PushOptions, PushOutcome, RefUpdate, RepositoryLock, StageOptions, StageOutcome,
+    StagePathOutcome, StagePathResult, StatusEntry, StatusRefreshOutcome,
 };
 pub use listing::{DirEntry, list_directory};
 pub use project::{

@@ -25,6 +25,30 @@ pub enum LogRange {
     BranchAgainstBase { branch: String, base_branch: String },
 }
 
+/// An opaque, repository-local continuation for a commit log page.
+///
+/// The anchor is the first commit the next page will return. The cursor also
+/// retains the pending ancestry frontier so a merge cannot lose an unvisited
+/// parent when the walk resumes. Pass the cursor back unchanged with the same
+/// [`LogRange`]; [`GitService::log`](crate::GitService::log) rejects a cursor
+/// copied to another range.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct LogCursor {
+    anchor: Oid,
+    frontier: Vec<Oid>,
+    hidden: Option<Oid>,
+    range: LogRange,
+}
+
+impl LogCursor {
+    /// The first commit the continued page will return.
+    #[must_use]
+    pub fn anchor(&self) -> Oid {
+        self.anchor
+    }
+}
+
 /// Bounds and positions one commit log page.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -33,11 +57,12 @@ pub struct LogOptions {
     pub range: LogRange,
     /// Maximum number of commit rows in the returned page.
     pub limit: usize,
-    /// First commit to return, normally copied from [`LogPage::next_cursor`].
+    /// Continuation returned by an earlier [`LogPage`].
     ///
-    /// The cursor is an object ID instead of an offset so commits added at the
-    /// range tip cannot move an already-addressed page.
-    pub cursor: Option<Oid>,
+    /// The cursor is anchored to an object ID instead of an offset and retains
+    /// the remaining ancestry frontier, so commits added at the range tip
+    /// cannot move an already-addressed page.
+    pub cursor: Option<LogCursor>,
 }
 
 impl LogOptions {
@@ -90,7 +115,7 @@ impl LogOptions {
 
     /// Starts the page at a continuation returned by an earlier page.
     #[must_use]
-    pub fn with_cursor(mut self, cursor: Oid) -> Self {
+    pub fn with_cursor(mut self, cursor: LogCursor) -> Self {
         self.cursor = Some(cursor);
         self
     }
@@ -132,8 +157,8 @@ pub struct CommitInfo {
 pub struct LogPage {
     /// At most [`LogOptions::limit`] commit rows.
     pub commits: Vec<CommitInfo>,
-    /// First unreturned commit, if the selected range has another page.
-    pub next_cursor: Option<Oid>,
+    /// Continuation anchored at the first unreturned commit, if one exists.
+    pub next_cursor: Option<LogCursor>,
 }
 
 pub(crate) fn log(
@@ -147,15 +172,24 @@ pub(crate) fn log(
     refuse_cancelled(cancellation)?;
 
     let repository = open(root)?;
-    let Some(range) = resolve_range(&repository, root, &options.range)? else {
-        return Ok(LogPage {
-            commits: Vec::new(),
-            next_cursor: None,
-        });
-    };
-    let start = match options.cursor {
-        Some(cursor) => require_commit(&repository, root, &cursor.to_string())?,
-        None => range.start,
+    let (mut frontier, hidden, mut expected_anchor) = match &options.cursor {
+        Some(cursor)
+            if cursor.range == options.range
+                && !cursor.frontier.is_empty()
+                && cursor.frontier.contains(&cursor.anchor) =>
+        {
+            (cursor.frontier.clone(), cursor.hidden, Some(cursor.anchor))
+        }
+        Some(cursor) => return Err(invalid_cursor(cursor.anchor)),
+        None => {
+            let Some(range) = resolve_range(&repository, root, &options.range)? else {
+                return Ok(LogPage {
+                    commits: Vec::new(),
+                    next_cursor: None,
+                });
+            };
+            (vec![range.start], range.hidden, None)
+        }
     };
 
     let mut walk = repository
@@ -163,11 +197,25 @@ pub(crate) fn log(
         .map_err(|source| inspection(root, source))?;
     walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME)
         .map_err(|source| inspection(root, source))?;
-    walk.push(start)
-        .map_err(|source| inspection(root, source))?;
-    if let Some(hidden) = range.hidden {
+    // libgit2 uses the most recently pushed root first when commit times tie.
+    // Reverse the recorded discovery order and push the recorded anchor last
+    // so a rebuilt walk preserves the page boundary that produced the cursor.
+    let preferred_start = expected_anchor;
+    for start in frontier
+        .iter()
+        .rev()
+        .filter(|start| Some(**start) != preferred_start)
+    {
+        walk.push(*start)
+            .map_err(|source| cursor_or_inspection(root, preferred_start, source))?;
+    }
+    if let Some(anchor) = preferred_start {
+        walk.push(anchor)
+            .map_err(|source| cursor_or_inspection(root, preferred_start, source))?;
+    }
+    if let Some(hidden) = hidden {
         walk.hide(hidden)
-            .map_err(|source| inspection(root, source))?;
+            .map_err(|source| cursor_or_inspection(root, preferred_start, source))?;
     }
 
     // Do not trust a caller-provided bound as an allocation request. The walk
@@ -178,18 +226,36 @@ pub(crate) fn log(
         let Some(id) = walk.next() else {
             break;
         };
-        let id = id.map_err(|source| inspection(root, source))?;
+        let id = id.map_err(|source| cursor_or_inspection(root, preferred_start, source))?;
+        if let Some(anchor) = expected_anchor.take()
+            && anchor != id
+        {
+            return Err(invalid_cursor(anchor));
+        }
         let commit = repository
             .find_commit(id)
-            .map_err(|source| inspection(root, source))?;
+            .map_err(|source| cursor_or_inspection(root, preferred_start, source))?;
+        advance_frontier(&mut frontier, &commit).ok_or_else(|| {
+            invalid_cursor(options.cursor.as_ref().map_or(id, |cursor| cursor.anchor))
+        })?;
         commits.push(commit_info(&commit));
     }
 
+    if let Some(anchor) = expected_anchor {
+        return Err(invalid_cursor(anchor));
+    }
+
     refuse_cancelled(cancellation)?;
-    let next_cursor = walk
+    let next_anchor = walk
         .next()
         .transpose()
-        .map_err(|source| inspection(root, source))?;
+        .map_err(|source| cursor_or_inspection(root, preferred_start, source))?;
+    let next_cursor = next_anchor.map(|anchor| LogCursor {
+        anchor,
+        frontier,
+        hidden,
+        range: options.range.clone(),
+    });
     Ok(LogPage {
         commits,
         next_cursor,
@@ -368,6 +434,17 @@ fn commit_info(commit: &git2::Commit<'_>) -> CommitInfo {
     }
 }
 
+fn advance_frontier(frontier: &mut Vec<Oid>, commit: &git2::Commit<'_>) -> Option<()> {
+    let position = frontier.iter().position(|id| *id == commit.id())?;
+    frontier.remove(position);
+    for parent in commit.parent_ids() {
+        if !frontier.contains(&parent) {
+            frontier.push(parent);
+        }
+    }
+    Some(())
+}
+
 fn signature(signature: git2::Signature<'_>) -> CommitSignature {
     CommitSignature {
         name: signature.name_bytes().to_vec(),
@@ -404,6 +481,17 @@ fn inspection(path: &Path, source: git2::Error) -> GitError {
     }
 }
 
+fn invalid_cursor(cursor: Oid) -> GitError {
+    GitError::InvalidLogCursor { cursor }
+}
+
+fn cursor_or_inspection(root: &Path, cursor: Option<Oid>, source: git2::Error) -> GitError {
+    match (cursor, source.code()) {
+        (Some(cursor), ErrorCode::NotFound) => invalid_cursor(cursor),
+        _ => inspection(root, source),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, path::Path};
@@ -430,9 +518,14 @@ mod tests {
         let options = LogOptions::new("HEAD", 2);
         let first = service.log(&options, &Cancellation::default()).unwrap();
         assert_eq!(ids(&first), vec![fourth, third]);
-        assert_eq!(first.next_cursor, Some(second));
+        assert_eq!(
+            first.next_cursor.as_ref().map(super::LogCursor::anchor),
+            Some(second)
+        );
 
-        let continuation = options.clone().with_cursor(first.next_cursor.unwrap());
+        let continuation = options
+            .clone()
+            .with_cursor(first.next_cursor.clone().unwrap());
         let second_page = service
             .log(&continuation, &Cancellation::default())
             .unwrap();
@@ -487,6 +580,17 @@ mod tests {
             .unwrap();
         assert_eq!(ids(&excluding), vec![second, first]);
         assert_eq!(against_base, excluding);
+        assert_eq!(
+            paged_ids(&service, LogOptions::excluding("feature", "main", 1)),
+            ids(&excluding)
+        );
+        assert_eq!(
+            paged_ids(
+                &service,
+                LogOptions::branch_against_base("feature", "main", 1),
+            ),
+            ids(&against_base)
+        );
         assert_eq!(service.resolve_revision("feature").unwrap(), second);
         assert_eq!(service.resolve_revision("main").unwrap(), main);
         assert_eq!(service.merge_base("feature", "main").unwrap(), common);
@@ -514,6 +618,64 @@ mod tests {
             .unwrap();
         assert_eq!(page.commits[0].id, merge);
         assert_eq!(page.commits[0].parent_ids, vec![main, side]);
+    }
+
+    #[test]
+    fn merge_history_pages_keep_every_pending_parent_and_bind_the_range() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("merge-pagination");
+        let repository = initialize_repository(&root);
+        let initial = repository.head().unwrap().target().unwrap();
+        let initial_commit = repository.find_commit(initial).unwrap();
+        repository.branch("side", &initial_commit, false).unwrap();
+        drop(initial_commit);
+
+        let main = commit_file(&repository, &root, b"main", 1);
+        checkout(&repository, "side");
+        let side = commit_file(&repository, &root, b"side", 1);
+        checkout(&repository, "main");
+        let merge = merge_commit(&repository, b"merge", 3, &[main, side]);
+        let service = GitService::new(&root, &fixture.data_dir);
+        let cancellation = Cancellation::default();
+
+        let full = service
+            .log(&LogOptions::new("HEAD", 10), &cancellation)
+            .unwrap();
+        assert_eq!(ids(&full), vec![merge, main, side, initial]);
+
+        for limit in [1, 2, 3] {
+            let mut options = LogOptions::new("HEAD", limit);
+            let mut paged = Vec::new();
+            loop {
+                let page = service.log(&options, &cancellation).unwrap();
+                paged.extend(ids(&page));
+                let Some(cursor) = page.next_cursor else {
+                    break;
+                };
+                options = options.with_cursor(cursor);
+            }
+            assert_eq!(paged, ids(&full), "page limit {limit}");
+        }
+
+        let first = service
+            .log(&LogOptions::new("HEAD", 1), &cancellation)
+            .unwrap();
+        let cursor = first.next_cursor.unwrap();
+        let continuation = LogOptions::new("HEAD", 10).with_cursor(cursor.clone());
+        let stable_page = service.log(&continuation, &cancellation).unwrap();
+        commit_file(&repository, &root, b"new tip", 4);
+        assert_eq!(
+            service.log(&continuation, &cancellation).unwrap(),
+            stable_page
+        );
+
+        assert!(matches!(
+            service.log(
+                &LogOptions::new("side", 10).with_cursor(cursor),
+                &cancellation,
+            ),
+            Err(GitError::InvalidLogCursor { .. })
+        ));
     }
 
     #[test]
@@ -681,6 +843,19 @@ mod tests {
 
     fn ids(page: &super::LogPage) -> Vec<Oid> {
         page.commits.iter().map(|commit| commit.id).collect()
+    }
+
+    fn paged_ids(service: &GitService, mut options: LogOptions) -> Vec<Oid> {
+        let cancellation = Cancellation::default();
+        let mut commits = Vec::new();
+        loop {
+            let page = service.log(&options, &cancellation).unwrap();
+            commits.extend(ids(&page));
+            let Some(cursor) = page.next_cursor else {
+                return commits;
+            };
+            options = options.with_cursor(cursor);
+        }
     }
 
     fn checkout(repository: &Repository, branch: &str) {

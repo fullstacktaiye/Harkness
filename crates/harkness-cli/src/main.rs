@@ -2528,6 +2528,7 @@ fn git_exit_code(error: &GitError) -> u8 {
         GitError::PathOutsideRepository { .. }
         | GitError::RevisionNotCommit { .. }
         | GitError::InvalidLogLimit
+        | GitError::InvalidLogCursor { .. }
         | GitError::EmptyCommitMessage
         | GitError::EmptyWorktreeLockReason
         | GitError::NothingStaged
@@ -2602,6 +2603,7 @@ const GIT_KIND_EXIT_CODES: &[(&str, u8)] = &[
     ("revision_not_commit", EXIT_REFUSED),
     ("no_merge_base", EXIT_CONFLICT),
     ("invalid_log_limit", EXIT_REFUSED),
+    ("invalid_log_cursor", EXIT_REFUSED),
     ("path_outside_repository", EXIT_REFUSED),
     ("empty_commit_message", EXIT_REFUSED),
     ("nothing_staged", EXIT_REFUSED),
@@ -2810,6 +2812,7 @@ fn git_error_details(error: &GitError) -> Value {
             "two": two,
         }),
         GitError::InvalidLogLimit => json!({ "minimum": 1 }),
+        GitError::InvalidLogCursor { cursor } => json!({ "cursor": cursor.to_string() }),
         GitError::NothingStaged => json!({ "override_flag": "--allow-empty" }),
         GitError::UnmergedBranchDeletion { .. } => json!({ "override_flag": "--force" }),
         GitError::NoUpstream { .. } => json!({ "override_flag": "--set-upstream" }),
@@ -3058,6 +3061,11 @@ mod tests {
                 GitError::InvalidLogLimit,
                 EXIT_REFUSED,
                 serde_json::json!({ "minimum": 1 }),
+            ),
+            (
+                GitError::InvalidLogCursor { cursor: object_id },
+                EXIT_REFUSED,
+                serde_json::json!({ "cursor": object_id.to_string() }),
             ),
         ];
 
