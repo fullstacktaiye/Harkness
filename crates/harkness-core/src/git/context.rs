@@ -886,6 +886,8 @@ fn project_lines(
             old_line_number,
             new_line_number,
             content: raw_line.to_vec(),
+            paired_line_index: None,
+            intra_line_ranges: None,
         });
     }
 
