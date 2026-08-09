@@ -159,6 +159,19 @@ enum WorktreeCommand {
         #[arg(value_name = "DESTINATION")]
         destination: PathBuf,
     },
+    /// Protect a Harkness-managed linked worktree from removal and pruning.
+    Lock {
+        #[command(flatten)]
+        selection: ProjectSelection,
+        /// Why the worktree is protected. Git trims and stores this text.
+        #[arg(long, value_name = "TEXT")]
+        reason: String,
+        /// Replace an existing lock reason instead of refusing.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Clear the lock on a Harkness-managed linked worktree.
+    Unlock(ProjectSelection),
     /// Remove stale Harkness-owned worktree records selectively.
     #[command(visible_alias = "reconcile")]
     Prune(ProjectSelection),
@@ -1044,6 +1057,39 @@ fn run_worktree(
                 || Ok(json!({ "project": project_value(&project, true)? })),
             )
         }
+        WorktreeCommand::Lock {
+            selection,
+            reason,
+            replace,
+        } => {
+            let worktree = resolve_project(&service, selection.project.as_deref())?;
+            if replace {
+                service.relock_worktree(worktree.id, &reason, cancellation)?;
+            } else {
+                service.lock_worktree(worktree.id, &reason, cancellation)?;
+            }
+            // Report the text Git actually stored, not the text as typed.
+            let stored = reason.trim().to_owned();
+            command_result(
+                json_output,
+                || format!("locked {}\t{stored}", worktree.display_name),
+                || {
+                    Ok(json!({
+                        "project": project_value(&worktree, false)?,
+                        "lock_reason": stored,
+                    }))
+                },
+            )
+        }
+        WorktreeCommand::Unlock(selection) => {
+            let worktree = resolve_project(&service, selection.project.as_deref())?;
+            service.unlock_worktree(worktree.id, cancellation)?;
+            command_result(
+                json_output,
+                || format!("unlocked {}", worktree.display_name),
+                || Ok(json!({ "project": project_value(&worktree, false)? })),
+            )
+        }
         WorktreeCommand::Prune(selection) => {
             let parent = resolve_project(&service, selection.project.as_deref())?;
             let outcome = service.prune_worktrees(parent.id, cancellation)?;
@@ -1497,17 +1543,29 @@ fn worktree_line(worktree: &Worktree) -> String {
     } else {
         "external"
     };
+    // A lock reason is caller-supplied text that Git stores verbatim apart
+    // from trimming, so collapse its whitespace before it reaches a
+    // tab-separated line that a reader splits on.
     let state = if worktree.locked {
-        "locked"
+        worktree.lock_reason.as_deref().map_or_else(
+            || "locked".to_owned(),
+            |reason| format!("locked: {}", single_line(reason)),
+        )
     } else if worktree.prunable {
-        "prunable"
+        "prunable".to_owned()
     } else {
-        "active"
+        "active".to_owned()
     };
     format!(
         "{id}\t{branch}\t{}\t{owner}\t{state}",
         worktree.root.display()
     )
+}
+
+/// Collapses every run of whitespace so untrusted text cannot forge a column
+/// break or a new row in tab-separated output.
+fn single_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn worktree_value(worktree: &Worktree) -> Value {
@@ -1519,6 +1577,9 @@ fn worktree_value(worktree: &Worktree) -> Value {
         "path_is_lossy": path_is_lossy,
         "owner": if worktree.project.is_some() { "harkness" } else { "external" },
         "locked": worktree.locked,
+        // Null when the worktree is unlocked and when Git recorded a lock
+        // without a reason; `locked` remains the authoritative state.
+        "lock_reason": worktree.lock_reason,
         "prunable": worktree.prunable,
     })
 }
@@ -1662,6 +1723,7 @@ fn project_exit_code(error: &ProjectError) -> u8 {
         | ProjectError::UnsafeWorktreeRemoval { .. }
         | ProjectError::WorktreeParentUnsupported { .. }
         | ProjectError::DirtyWorktreeRemoval { .. }
+        | ProjectError::UnsafeWorktreeLock { .. }
         | ProjectError::UnsafeWorktreeMove { .. }
         | ProjectError::WorktreeDestinationExists { .. }
         | ProjectError::WorktreeDestinationNotAbsolute { .. }
@@ -1699,9 +1761,12 @@ fn git_exit_code(error: &GitError) -> u8 {
         GitError::RepositoryBusy { .. }
         | GitError::BranchAlreadyExists { .. }
         | GitError::BranchCheckedOutInWorktree { .. }
-        | GitError::WorktreeLocked { .. } => EXIT_CONFLICT,
+        | GitError::WorktreeLocked { .. }
+        | GitError::WorktreeAlreadyLocked { .. }
+        | GitError::WorktreeNotLocked { .. } => EXIT_CONFLICT,
         GitError::PathOutsideRepository { .. }
         | GitError::EmptyCommitMessage
+        | GitError::EmptyWorktreeLockReason
         | GitError::NothingStaged
         | GitError::AmendUnbornBranch
         | GitError::CurrentBranchDeletion { .. }
@@ -1723,9 +1788,90 @@ fn git_exit_code(error: &GitError) -> u8 {
         | GitError::FilteredHunkSelection { .. }
         | GitError::OverlappingHunkSelection { .. }
         | GitError::HunkNotFound { .. } => EXIT_REFUSED,
+        // Enumerated rather than left to the wildcard so the classification of
+        // every kind in `GitError::KINDS` is stated here, and a reader adding a
+        // variant sees that the published exit-code contract needs a decision.
+        // `GitError` is `#[non_exhaustive]`, so the wildcard below cannot be
+        // removed; `git_error_kinds_are_classified_for_the_exit_code_contract`
+        // is what actually keeps a new kind from defaulting silently.
+        GitError::Launch { .. }
+        | GitError::Failed { .. }
+        | GitError::TimedOut { .. }
+        | GitError::Lock { .. }
+        | GitError::InvalidBranchName { .. }
+        | GitError::InvalidStartPoint { .. }
+        | GitError::NonFastForward { .. }
+        | GitError::AuthenticationFailed { .. }
+        | GitError::Interrupted { .. }
+        | GitError::NoRemote { .. }
+        | GitError::Inspection { .. }
+        | GitError::DiffContent { .. }
+        | GitError::MalformedDiff { .. }
+        | GitError::HunkApplication { .. }
+        | GitError::MalformedStatus { .. } => EXIT_OPERATION_FAILED,
         _ => EXIT_OPERATION_FAILED,
     }
 }
+
+/// The exit code every stable Git error kind is expected to report, in
+/// `GitError::KINDS` order.
+///
+/// `GitError` is `#[non_exhaustive]`, so [`git_exit_code`] must keep a wildcard
+/// arm and a newly added variant cannot fail to compile here. This table is
+/// what refuses that silence instead: adding a kind upstream breaks
+/// `git_error_kinds_are_classified_for_the_exit_code_contract` until its
+/// exit code is stated.
+#[cfg(test)]
+const GIT_KIND_EXIT_CODES: &[(&str, u8)] = &[
+    ("launch", EXIT_OPERATION_FAILED),
+    ("failed", EXIT_OPERATION_FAILED),
+    ("cancelled", EXIT_CANCELLED),
+    ("timed_out", EXIT_OPERATION_FAILED),
+    ("repository_busy", EXIT_CONFLICT),
+    ("lock", EXIT_OPERATION_FAILED),
+    ("not_a_repository", EXIT_NOT_FOUND),
+    ("path_outside_repository", EXIT_REFUSED),
+    ("empty_commit_message", EXIT_REFUSED),
+    ("nothing_staged", EXIT_REFUSED),
+    ("amend_unborn_branch", EXIT_REFUSED),
+    ("invalid_branch_name", EXIT_OPERATION_FAILED),
+    ("no_such_branch", EXIT_NOT_FOUND),
+    ("branch_already_exists", EXIT_CONFLICT),
+    ("invalid_start_point", EXIT_OPERATION_FAILED),
+    ("current_branch_deletion", EXIT_REFUSED),
+    ("default_branch_deletion", EXIT_REFUSED),
+    ("branch_checked_out_in_worktree", EXIT_CONFLICT),
+    ("worktree_locked", EXIT_CONFLICT),
+    ("empty_worktree_lock_reason", EXIT_REFUSED),
+    ("worktree_already_locked", EXIT_CONFLICT),
+    ("worktree_not_locked", EXIT_CONFLICT),
+    ("worktree_move_across_devices", EXIT_REFUSED),
+    ("unmerged_branch_deletion", EXIT_REFUSED),
+    ("non_fast_forward", EXIT_OPERATION_FAILED),
+    ("authentication_failed", EXIT_OPERATION_FAILED),
+    ("no_upstream", EXIT_REFUSED),
+    ("unborn_branch", EXIT_REFUSED),
+    ("local_upstream_unsupported", EXIT_REFUSED),
+    ("operation_in_progress", EXIT_REFUSED),
+    ("interrupted", EXIT_OPERATION_FAILED),
+    ("no_remote", EXIT_OPERATION_FAILED),
+    ("default_branch_push", EXIT_REFUSED),
+    ("default_branch_unknown", EXIT_REFUSED),
+    ("detached_head", EXIT_REFUSED),
+    ("inspection", EXIT_OPERATION_FAILED),
+    ("diff_content", EXIT_OPERATION_FAILED),
+    ("malformed_diff", EXIT_OPERATION_FAILED),
+    ("stale_hunk_selection", EXIT_REFUSED),
+    ("binary_hunk_selection", EXIT_REFUSED),
+    ("rename_only_hunk_selection", EXIT_REFUSED),
+    ("metadata_only_hunk_selection", EXIT_REFUSED),
+    ("unsupported_hunk_change", EXIT_REFUSED),
+    ("filtered_hunk_selection", EXIT_REFUSED),
+    ("overlapping_hunk_selection", EXIT_REFUSED),
+    ("hunk_not_found", EXIT_REFUSED),
+    ("hunk_application", EXIT_OPERATION_FAILED),
+    ("malformed_status", EXIT_OPERATION_FAILED),
+];
 
 fn project_error_details(error: &ProjectError) -> Value {
     match error {
@@ -1736,6 +1882,7 @@ fn project_error_details(error: &ProjectError) -> Value {
             json!({ "override_flag": "--force" })
         }
         ProjectError::UnsafeWorktreeRemoval { id, path, reason }
+        | ProjectError::UnsafeWorktreeLock { id, path, reason }
         | ProjectError::UnsafeWorktreeMove { id, path, reason } => {
             let (path, path_is_lossy) = wire_path(path);
             json!({
@@ -1842,9 +1989,12 @@ fn git_error_details(error: &GitError) -> Value {
 mod tests {
     use std::{collections::HashSet, io};
 
+    use std::path::PathBuf;
+
     use super::{
-        CLI_ERROR_KINDS, CliError, EXIT_OPERATION_FAILED, EXIT_REFUSED, GitError, Project,
-        ProjectError, RefusalKind, project_value, requested_json,
+        CLI_ERROR_KINDS, CliError, EXIT_CONFLICT, EXIT_OPERATION_FAILED, EXIT_REFUSED,
+        GIT_KIND_EXIT_CODES, GitError, Project, ProjectError, RefusalKind, git_exit_code,
+        project_value, requested_json, single_line,
     };
 
     #[test]
@@ -1861,6 +2011,60 @@ mod tests {
             stderr: "network failed".to_owned(),
         });
         assert_eq!(failure.exit_code(), EXIT_OPERATION_FAILED);
+    }
+
+    /// The exit-code table and `GitError::KINDS` must stay in lockstep. A new
+    /// Git error kind reaches the published contract through `git_exit_code`'s
+    /// mandatory wildcard, which cannot fail to compile because `GitError` is
+    /// `#[non_exhaustive]`. This test is what refuses the default instead.
+    #[test]
+    fn git_error_kinds_are_classified_for_the_exit_code_contract() {
+        let declared = GIT_KIND_EXIT_CODES
+            .iter()
+            .map(|(kind, _)| *kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            declared,
+            GitError::KINDS,
+            "GIT_KIND_EXIT_CODES must classify every Git error kind, in order"
+        );
+    }
+
+    /// Proves the table describes what `git_exit_code` actually returns for the
+    /// worktree-lock kinds, so a state conflict is never reported as a generic
+    /// operation failure.
+    #[test]
+    fn worktree_lock_errors_report_conflict_and_refusal_exit_codes() {
+        let path = PathBuf::from("/tmp/worktree");
+        let cases: [(GitError, u8); 3] = [
+            (GitError::EmptyWorktreeLockReason, EXIT_REFUSED),
+            (
+                GitError::WorktreeAlreadyLocked {
+                    path: path.clone(),
+                    reason: Some("agent is still working".to_owned()),
+                },
+                EXIT_CONFLICT,
+            ),
+            (GitError::WorktreeNotLocked { path }, EXIT_CONFLICT),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(git_exit_code(&error), expected, "for {error:?}");
+            assert_ne!(git_exit_code(&error), EXIT_OPERATION_FAILED);
+            let declared = GIT_KIND_EXIT_CODES
+                .iter()
+                .find(|(kind, _)| *kind == error.kind())
+                .map(|(_, code)| *code);
+            assert_eq!(declared, Some(expected), "table disagrees for {error:?}");
+        }
+    }
+
+    #[test]
+    fn worktree_lock_reasons_cannot_forge_tab_separated_columns() {
+        assert_eq!(
+            single_line("agent\tis\nstill  working"),
+            "agent is still working"
+        );
+        assert_eq!(single_line("  padded  "), "padded");
     }
 
     #[test]

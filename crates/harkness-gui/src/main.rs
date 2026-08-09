@@ -167,6 +167,14 @@ Kirigami.ApplicationWindow {
             "branch": "agent/topic",
             "owned": true,
             "locked": false,
+            "lockReason": "",
+            "prunable": false
+        }, {
+            "root": "/tmp/worktree-locked",
+            "branch": "agent/locked",
+            "owned": true,
+            "locked": true,
+            "lockReason": "agent is still working",
             "prunable": false
         }]
         property var jobs: [{

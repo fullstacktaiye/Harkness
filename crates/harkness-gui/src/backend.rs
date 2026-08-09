@@ -800,6 +800,9 @@ struct WorktreeRow {
     branch: String,
     owned: bool,
     locked: bool,
+    /// Empty when unlocked and when Git recorded a lock without a reason;
+    /// `locked` stays the authoritative state.
+    lock_reason: String,
     prunable: bool,
 }
 
@@ -816,6 +819,7 @@ impl From<harkness_core::Worktree> for WorktreeRow {
             branch: worktree.branch.unwrap_or_default(),
             owned: worktree.project.is_some(),
             locked: worktree.locked,
+            lock_reason: worktree.lock_reason.unwrap_or_default(),
             prunable: worktree.prunable,
         }
     }
@@ -834,6 +838,10 @@ fn to_worktrees(rows: &[WorktreeRow]) -> QList<QVariant> {
         );
         insert("owned", QVariant::from(&row.owned));
         insert("locked", QVariant::from(&row.locked));
+        insert(
+            "lockReason",
+            QVariant::from(&QString::from(row.lock_reason.as_str())),
+        );
         insert("prunable", QVariant::from(&row.prunable));
         worktrees.append(QVariant::from(&entry));
     }
