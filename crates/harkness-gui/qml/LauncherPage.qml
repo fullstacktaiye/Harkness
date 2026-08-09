@@ -185,6 +185,7 @@ Kirigami.Page {
                         elide: Text.ElideRight
                         font: Kirigami.Theme.smallFont
                         text: launcher.backend.status
+                        textFormat: Text.PlainText
                         visible: text.length > 0
                     }
                 }
@@ -430,6 +431,7 @@ Kirigami.Page {
                                 elide: Text.ElideRight
                                 font: Kirigami.Theme.smallFont
                                 text: launcher.backend.status
+                                textFormat: Text.PlainText
                             }
                         }
                     }

@@ -198,7 +198,16 @@ under managed storage are left untouched.
 The GUI opens a Kirigami window on the project launcher backed by the Rust
 `HarknessBackend` and `FileTreeModel` QML objects. Its project shell exposes the
 same creation modes, live linked-worktree inventory, selective reconciliation,
-and a second confirmation before dirty files can be discarded.
+and a second confirmation before dirty files can be discarded. Selecting a
+changed path loads only that path's staged and unstaged content, marks added
+and removed lines, and stages or unstages one stale-safe hunk at a time. Binary,
+byte-bounded, and line-bounded content stays visible as a named summary instead
+of eagerly creating an unbounded number of QML delegates. Managed worktree rows
+expose move, lock, and unlock while showing the stored lock reason inline.
+
+### Git review UI
+
+![Git panel showing a selected hunk diff](docs/screenshots/git-panel.png)
 
 ### Worktree UI
 

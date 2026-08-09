@@ -163,6 +163,7 @@ Kirigami.ApplicationWindow {
             "detail": "Checked out here"
         }]
         property var worktrees: [{
+            "id": "10000000-0000-0000-0000-000000000000",
             "root": "/tmp/worktree",
             "branch": "agent/topic",
             "owned": true,
@@ -170,6 +171,7 @@ Kirigami.ApplicationWindow {
             "lockReason": "",
             "prunable": false
         }, {
+            "id": "20000000-0000-0000-0000-000000000000",
             "root": "/tmp/worktree-locked",
             "branch": "agent/locked",
             "owned": true,
@@ -198,6 +200,7 @@ Kirigami.ApplicationWindow {
             "error": "",
             "errorKind": "",
             "entries": [{
+                "pathId": "fixture-path",
                 "path": "src/main.rs",
                 "staged": "added",
                 "unstaged": "modified",
@@ -205,12 +208,65 @@ Kirigami.ApplicationWindow {
                 "conflicted": false
             }]
         })
+        property var diff: ({
+            "projectId": "00000000-0000-0000-0000-000000000000",
+            "pathId": "fixture-path",
+            "path": "src/main.rs",
+            "loading": false,
+            "error": "",
+            "errorKind": "",
+            "files": [{
+                "target": "staged",
+                "change": "modified",
+                "path": "src/main.rs",
+                "summary": "",
+                "binary": false,
+                "hunks": [{
+                    "selectionId": "fixture-staged",
+                    "header": "@@ -1,2 +1,2 @@",
+                    "oldStart": 1,
+                    "oldLines": 2,
+                    "newStart": 1,
+                    "newLines": 2,
+                    "lines": [{
+                        "kind": "deletion",
+                        "marker": "-",
+                        "oldLine": 1,
+                        "newLine": 0,
+                        "content": "old line"
+                    }, {
+                        "kind": "addition",
+                        "marker": "+",
+                        "oldLine": 0,
+                        "newLine": 1,
+                        "content": "<b>new line must stay literal</b>"
+                    }, {
+                        "kind": "context",
+                        "marker": " ",
+                        "oldLine": 2,
+                        "newLine": 2,
+                        "content": "unchanged"
+                    }]
+                }]
+            }, {
+                "target": "unstaged",
+                "change": "modified",
+                "path": "src/main.rs",
+                "summary": "Binary file - content diff and hunk staging are unavailable.",
+                "binary": true,
+                "hunks": []
+            }]
+        })
 
         function refreshGit(projectId) {}
+        function refreshDiff(projectId, pathId) {}
+        function clearDiff() {}
         function refreshBranches(projectId) {}
         function refreshWorktrees(projectId) {}
-        function stagePath(projectId, path) {}
-        function unstagePath(projectId, path) {}
+        function stagePath(projectId, pathId) {}
+        function unstagePath(projectId, pathId) {}
+        function stageHunk(projectId, selectionId) {}
+        function unstageHunk(projectId, selectionId) {}
         function commit(projectId, message, amend) {}
         function fetch(projectId) {}
         function pull(projectId) {}
@@ -219,13 +275,19 @@ Kirigami.ApplicationWindow {
         function checkoutBranch(projectId, branch) {}
         function createBranch(projectId, branch, startPoint) {}
         function createWorktree(projectId, mode, branch, startPoint) {}
+        function moveWorktree(projectId, destination) {}
+        function lockWorktree(projectId, reason) {}
+        function unlockWorktree(projectId) {}
         function reconcileWorktrees(projectId) {}
     }
 
     GitPanel {
         anchors.fill: parent
         backend: fixtureBackend
+        diffProjectId: String(projectFixture.id)
         project: projectFixture
+        selectedPathId: "fixture-path"
+        selectedPath: "src/main.rs"
     }
 }
 "#,
