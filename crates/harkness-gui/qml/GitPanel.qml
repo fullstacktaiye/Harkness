@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls as Controls
+import QtQuick.Dialogs
 import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
 
@@ -16,8 +17,22 @@ Item {
     readonly property var entries: stateReady && gitState.entries !== undefined
         ? gitState.entries
         : []
+    readonly property bool diffReady: backend.diff !== undefined
+        && backend.diff
+        && backend.diff.projectId !== undefined
+        && String(backend.diff.projectId) === String(project.id)
+        && String(backend.diff.path) === selectedPath
+    readonly property var diffState: diffReady ? backend.diff : ({})
+    readonly property var diffFiles: diffReady && diffState.files !== undefined
+        ? diffState.files
+        : []
+    property string diffProjectId: ""
+    property string selectedPath: ""
     property string movingWorktreeId: ""
     property string movingWorktreeName: ""
+    property string movingWorktreeRoot: ""
+    property string lockingWorktreeId: ""
+    property string lockingWorktreeName: ""
 
     implicitWidth: Kirigami.Units.gridUnit * 22
 
@@ -56,8 +71,45 @@ Item {
             backend.refreshWorktrees(project.id);
     }
 
-    onProjectChanged: refresh()
-    Component.onCompleted: refresh()
+    function handleProjectChange() {
+        const nextId = project && project.id !== undefined ? String(project.id) : "";
+        if (diffProjectId !== nextId) {
+            diffProjectId = nextId;
+            selectedPath = "";
+            backend.clearDiff();
+        }
+        refresh();
+    }
+
+    function selectPath(path) {
+        selectedPath = String(path);
+        backend.refreshDiff(project.id, selectedPath);
+    }
+
+    function diffTint(color) {
+        return Qt.rgba(color.r, color.g, color.b, 0.14);
+    }
+
+    function pathBaseName(path) {
+        let value = String(path).replace(/[\\/]+$/, "");
+        const separator = Math.max(value.lastIndexOf("/"), value.lastIndexOf("\\"));
+        return separator >= 0 ? value.substring(separator + 1) : value;
+    }
+
+    function joinPath(parent, child) {
+        const value = String(parent).replace(/[\\/]+$/, "");
+        return value + "/" + child;
+    }
+
+    function urlToPath(url) {
+        let value = url.toString();
+        if (value.startsWith("file://"))
+            value = value.substring(7);
+        return decodeURIComponent(value);
+    }
+
+    onProjectChanged: handleProjectChange()
+    Component.onCompleted: handleProjectChange()
 
     Controls.ScrollView {
         id: scroll
@@ -190,11 +242,27 @@ Item {
                         contentItem: ColumnLayout {
                             spacing: Kirigami.Units.smallSpacing
 
-                            Controls.Label {
+                            RowLayout {
                                 Layout.fillWidth: true
-                                elide: Text.ElideMiddle
-                                font.family: "monospace"
-                                text: modelData.path
+
+                                Controls.Label {
+                                    Layout.fillWidth: true
+                                    elide: Text.ElideMiddle
+                                    font.family: "monospace"
+                                    text: modelData.path
+                                }
+
+                                Controls.ToolButton {
+                                    Controls.ToolTip.text: checked
+                                        ? qsTr("Refresh selected diff")
+                                        : qsTr("View staged and unstaged diff")
+                                    Controls.ToolTip.visible: hovered
+                                    checkable: true
+                                    checked: panel.selectedPath === String(modelData.path)
+                                    display: Controls.AbstractButton.TextOnly
+                                    text: checked ? qsTr("Refresh diff") : qsTr("View diff")
+                                    onClicked: panel.selectPath(modelData.path)
+                                }
                             }
 
                             RowLayout {
@@ -230,6 +298,224 @@ Item {
                                     text: qsTr("Stage")
                                     visible: modelData.unstaged.length > 0
                                     onClicked: panel.backend.stagePath(panel.project.id, modelData.path)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    Layout.topMargin: Kirigami.Units.smallSpacing
+                    spacing: Kirigami.Units.smallSpacing
+                    visible: panel.selectedPath.length > 0
+
+                    RowLayout {
+                        Layout.fillWidth: true
+
+                        Kirigami.Heading {
+                            Layout.fillWidth: true
+                            elide: Text.ElideMiddle
+                            level: 5
+                            text: qsTr("Diff · %1").arg(panel.selectedPath)
+                        }
+
+                        Controls.BusyIndicator {
+                            Layout.preferredHeight: Kirigami.Units.iconSizes.small
+                            Layout.preferredWidth: Kirigami.Units.iconSizes.small
+                            running: panel.diffReady && panel.diffState.loading === true
+                            visible: running
+                        }
+
+                        Controls.ToolButton {
+                            Controls.ToolTip.text: qsTr("Refresh selected diff")
+                            Controls.ToolTip.visible: hovered
+                            display: Controls.AbstractButton.IconOnly
+                            enabled: !(panel.diffReady && panel.diffState.loading === true)
+                            icon.name: "view-refresh"
+                            text: qsTr("Refresh diff")
+                            onClicked: panel.selectPath(panel.selectedPath)
+                        }
+                    }
+
+                    Kirigami.InlineMessage {
+                        Layout.fillWidth: true
+                        text: panel.diffReady ? panel.diffState.error || "" : ""
+                        type: Kirigami.MessageType.Error
+                        visible: panel.diffReady
+                            && panel.diffState.error
+                            && panel.diffState.error.length > 0
+                    }
+
+                    Controls.Label {
+                        Layout.fillWidth: true
+                        color: Kirigami.Theme.disabledTextColor
+                        text: qsTr("No staged or unstaged content remains for this path.")
+                        visible: panel.diffReady
+                            && panel.diffState.loading !== true
+                            && (!panel.diffState.error || panel.diffState.error.length === 0)
+                            && panel.diffFiles.length === 0
+                        wrapMode: Text.Wrap
+                    }
+
+                    Repeater {
+                        model: panel.diffFiles
+
+                        delegate: Controls.Frame {
+                            id: fileDiffFrame
+
+                            required property var modelData
+                            readonly property var file: modelData
+
+                            Layout.fillWidth: true
+                            padding: Kirigami.Units.smallSpacing
+
+                            contentItem: ColumnLayout {
+                                spacing: Kirigami.Units.smallSpacing
+
+                                Controls.Label {
+                                    Layout.fillWidth: true
+                                    color: fileDiffFrame.file.target === "staged"
+                                        ? Kirigami.Theme.positiveTextColor
+                                        : Kirigami.Theme.textColor
+                                    font.bold: true
+                                    text: fileDiffFrame.file.target === "staged"
+                                        ? qsTr("Staged · %1").arg(fileDiffFrame.file.change)
+                                        : qsTr("Working tree · %1").arg(fileDiffFrame.file.change)
+                                }
+
+                                Controls.Label {
+                                    Layout.fillWidth: true
+                                    color: Kirigami.Theme.disabledTextColor
+                                    elide: Text.ElideMiddle
+                                    font.family: "monospace"
+                                    text: fileDiffFrame.file.path
+                                }
+
+                                Kirigami.InlineMessage {
+                                    Layout.fillWidth: true
+                                    text: fileDiffFrame.file.summary
+                                    type: Kirigami.MessageType.Information
+                                    visible: fileDiffFrame.file.summary.length > 0
+                                }
+
+                                Repeater {
+                                    model: fileDiffFrame.file.hunks
+
+                                    delegate: Controls.Frame {
+                                        id: hunkFrame
+
+                                        required property var modelData
+                                        readonly property var hunk: modelData
+
+                                        Layout.fillWidth: true
+                                        padding: Kirigami.Units.smallSpacing
+
+                                        contentItem: ColumnLayout {
+                                            spacing: 0
+
+                                            RowLayout {
+                                                Layout.fillWidth: true
+                                                Layout.bottomMargin: Kirigami.Units.smallSpacing
+
+                                                Controls.Label {
+                                                    Layout.fillWidth: true
+                                                    color: Kirigami.Theme.highlightColor
+                                                    font.family: "monospace"
+                                                    text: hunkFrame.hunk.header
+                                                    wrapMode: Text.WrapAnywhere
+                                                }
+
+                                                Controls.Button {
+                                                    enabled: panel.job(
+                                                        fileDiffFrame.file.target === "staged"
+                                                            ? "unstage_hunk"
+                                                            : "stage_hunk"
+                                                    ) === null
+                                                    text: fileDiffFrame.file.target === "staged"
+                                                        ? qsTr("Unstage hunk")
+                                                        : qsTr("Stage hunk")
+                                                    onClicked: {
+                                                        if (fileDiffFrame.file.target === "staged") {
+                                                            panel.backend.unstageHunk(
+                                                                panel.project.id,
+                                                                hunkFrame.hunk.selectionId
+                                                            );
+                                                        } else {
+                                                            panel.backend.stageHunk(
+                                                                panel.project.id,
+                                                                hunkFrame.hunk.selectionId
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            Repeater {
+                                                model: hunkFrame.hunk.lines
+
+                                                delegate: Rectangle {
+                                                    id: diffLine
+
+                                                    required property var modelData
+                                                    readonly property var line: modelData
+
+                                                    Layout.fillWidth: true
+                                                    color: line.kind === "addition"
+                                                        ? panel.diffTint(Kirigami.Theme.positiveTextColor)
+                                                        : line.kind === "deletion"
+                                                            ? panel.diffTint(Kirigami.Theme.negativeTextColor)
+                                                            : "transparent"
+                                                    implicitHeight: diffLineLayout.implicitHeight
+                                                        + Kirigami.Units.smallSpacing
+
+                                                    RowLayout {
+                                                        id: diffLineLayout
+
+                                                        anchors.fill: parent
+                                                        anchors.leftMargin: Kirigami.Units.smallSpacing
+                                                        anchors.rightMargin: Kirigami.Units.smallSpacing
+                                                        spacing: Kirigami.Units.smallSpacing
+
+                                                        Controls.Label {
+                                                            Layout.preferredWidth: Kirigami.Units.gridUnit * 3
+                                                            color: Kirigami.Theme.disabledTextColor
+                                                            font.family: "monospace"
+                                                            font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                                                            horizontalAlignment: Text.AlignRight
+                                                            text: "%1│%2"
+                                                                .arg(diffLine.line.oldLine > 0
+                                                                    ? diffLine.line.oldLine
+                                                                    : "")
+                                                                .arg(diffLine.line.newLine > 0
+                                                                    ? diffLine.line.newLine
+                                                                    : "")
+                                                        }
+
+                                                        Controls.Label {
+                                                            Layout.preferredWidth: Kirigami.Units.gridUnit
+                                                            color: diffLine.line.kind === "addition"
+                                                                ? Kirigami.Theme.positiveTextColor
+                                                                : diffLine.line.kind === "deletion"
+                                                                    ? Kirigami.Theme.negativeTextColor
+                                                                    : Kirigami.Theme.disabledTextColor
+                                                            font.bold: true
+                                                            font.family: "monospace"
+                                                            horizontalAlignment: Text.AlignHCenter
+                                                            text: diffLine.line.marker
+                                                        }
+
+                                                        Controls.Label {
+                                                            Layout.fillWidth: true
+                                                            font.family: "monospace"
+                                                            text: diffLine.line.content
+                                                            wrapMode: Text.WrapAnywhere
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -538,61 +824,140 @@ Item {
                 Repeater {
                     model: panel.project.worktree ? [] : panel.backend.worktrees
 
-                    delegate: RowLayout {
+                    delegate: Controls.Frame {
+                        id: worktreeRow
+
                         required property var modelData
+                        readonly property var row: modelData
 
                         Layout.fillWidth: true
+                        padding: Kirigami.Units.smallSpacing
 
-                        Controls.Label {
-                            Layout.fillWidth: true
-                            color: Kirigami.Theme.disabledTextColor
-                            elide: Text.ElideMiddle
-                            font: Kirigami.Theme.smallFont
-                            text: qsTr("%1 — %2 (%3)")
-                                .arg(modelData.branch.length > 0 ? modelData.branch : qsTr("detached HEAD"))
-                                .arg(modelData.root)
-                                .arg(modelData.owned ? qsTr("Harkness") : qsTr("external"))
-                        }
+                        contentItem: ColumnLayout {
+                            spacing: Kirigami.Units.smallSpacing
 
-                        // Git refuses to move or remove a locked worktree, so
-                        // the state is shown rather than left to surface as a
-                        // failed action. The reason is Git's own text and can
-                        // be absent even while the lock holds.
-                        Kirigami.Icon {
-                            Layout.preferredHeight: Kirigami.Units.iconSizes.small
-                            Layout.preferredWidth: Kirigami.Units.iconSizes.small
-                            source: "object-locked"
-                            visible: modelData.locked
+                            RowLayout {
+                                Layout.fillWidth: true
 
-                            Controls.ToolTip.text: modelData.lockReason.length > 0
-                                ? qsTr("Locked by Git: %1").arg(modelData.lockReason)
-                                : qsTr("Locked by Git without a recorded reason")
-                            Controls.ToolTip.visible: lockHover.hovered
+                                Controls.Label {
+                                    Layout.fillWidth: true
+                                    color: Kirigami.Theme.disabledTextColor
+                                    elide: Text.ElideMiddle
+                                    font: Kirigami.Theme.smallFont
+                                    text: qsTr("%1 — %2 (%3)")
+                                        .arg(worktreeRow.row.branch.length > 0
+                                            ? worktreeRow.row.branch
+                                            : qsTr("detached HEAD"))
+                                        .arg(worktreeRow.row.root)
+                                        .arg(worktreeRow.row.owned ? qsTr("Harkness") : qsTr("external"))
+                                }
 
-                            HoverHandler {
-                                id: lockHover
+                                Kirigami.Icon {
+                                    Layout.preferredHeight: Kirigami.Units.iconSizes.small
+                                    Layout.preferredWidth: Kirigami.Units.iconSizes.small
+                                    source: "object-locked"
+                                    visible: worktreeRow.row.locked
+                                }
+                            }
+
+                            // A lock is lifecycle policy owned by core. Show
+                            // Git's reason in the row so protection is visible
+                            // before a move or removal is attempted.
+                            Controls.Label {
+                                Layout.fillWidth: true
+                                color: Kirigami.Theme.neutralTextColor
+                                text: worktreeRow.row.lockReason.length > 0
+                                    ? qsTr("Locked: %1").arg(worktreeRow.row.lockReason)
+                                    : qsTr("Locked without a recorded reason")
+                                visible: worktreeRow.row.locked
+                                wrapMode: Text.Wrap
+                            }
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                visible: worktreeRow.row.owned
+
+                                Controls.Button {
+                                    Layout.fillWidth: true
+                                    enabled: panel.job(
+                                        worktreeRow.row.locked
+                                            ? "unlock_worktree"
+                                            : "lock_worktree",
+                                        worktreeRow.row.id
+                                    ) === null
+                                    icon.name: worktreeRow.row.locked
+                                        ? "object-unlocked"
+                                        : "object-locked"
+                                    text: worktreeRow.row.locked ? qsTr("Unlock") : qsTr("Lock…")
+                                    onClicked: {
+                                        if (worktreeRow.row.locked) {
+                                            panel.backend.unlockWorktree(worktreeRow.row.id);
+                                        } else {
+                                            panel.lockingWorktreeId = String(worktreeRow.row.id);
+                                            panel.lockingWorktreeName = worktreeRow.row.branch.length > 0
+                                                ? String(worktreeRow.row.branch)
+                                                : qsTr("detached HEAD");
+                                            lockReason.text = "";
+                                            lockWorktreeForm.visible = true;
+                                            moveWorktreeForm.visible = false;
+                                            lockReason.forceActiveFocus();
+                                        }
+                                    }
+                                }
+
+                                Controls.Button {
+                                    Layout.fillWidth: true
+                                    enabled: !worktreeRow.row.locked
+                                        && panel.job("move_worktree", worktreeRow.row.id) === null
+                                    icon.name: "folder-move"
+                                    text: worktreeRow.row.locked
+                                        ? qsTr("Unlock before moving")
+                                        : qsTr("Move…")
+                                    onClicked: {
+                                        panel.movingWorktreeId = String(worktreeRow.row.id);
+                                        panel.movingWorktreeName = worktreeRow.row.branch.length > 0
+                                            ? String(worktreeRow.row.branch)
+                                            : qsTr("detached HEAD");
+                                        panel.movingWorktreeRoot = String(worktreeRow.row.root);
+                                        moveDestination.text = "";
+                                        moveWorktreeForm.visible = true;
+                                        lockWorktreeForm.visible = false;
+                                        moveDestination.forceActiveFocus();
+                                    }
+                                }
                             }
                         }
+                    }
+                }
 
-                        Controls.Button {
-                            display: Controls.AbstractButton.IconOnly
-                            enabled: modelData.owned
-                                && !modelData.locked
-                                && panel.job("move_worktree", modelData.id) === null
-                            icon.name: "folder-move"
-                            text: modelData.locked
-                                ? qsTr("Unlock this worktree before moving it")
-                                : qsTr("Move worktree")
-                            visible: modelData.owned
-                            onClicked: {
-                                panel.movingWorktreeId = String(modelData.id);
-                                panel.movingWorktreeName = modelData.branch.length > 0
-                                    ? String(modelData.branch)
-                                    : qsTr("detached HEAD");
-                                moveDestination.text = "";
-                                moveWorktreeForm.visible = true;
-                                moveDestination.forceActiveFocus();
-                            }
+                ColumnLayout {
+                    id: lockWorktreeForm
+
+                    Layout.fillWidth: true
+                    spacing: Kirigami.Units.smallSpacing
+                    visible: false
+
+                    Controls.Label {
+                        Layout.fillWidth: true
+                        text: qsTr("Lock %1").arg(panel.lockingWorktreeName)
+                    }
+
+                    Controls.TextField {
+                        id: lockReason
+
+                        Layout.fillWidth: true
+                        placeholderText: qsTr("Required reason for protecting this worktree")
+                    }
+
+                    Controls.Button {
+                        Layout.fillWidth: true
+                        enabled: lockReason.text.trim().length > 0
+                            && panel.job("lock_worktree", panel.lockingWorktreeId) === null
+                        icon.name: "object-locked"
+                        text: qsTr("Lock worktree")
+                        onClicked: {
+                            panel.backend.lockWorktree(panel.lockingWorktreeId, lockReason.text);
+                            lockWorktreeForm.visible = false;
                         }
                     }
                 }
@@ -609,11 +974,24 @@ Item {
                         text: qsTr("Move %1").arg(panel.movingWorktreeName)
                     }
 
-                    Controls.TextField {
-                        id: moveDestination
-
+                    RowLayout {
                         Layout.fillWidth: true
-                        placeholderText: qsTr("Absolute destination path")
+
+                        Controls.TextField {
+                            id: moveDestination
+
+                            Layout.fillWidth: true
+                            placeholderText: qsTr("Absolute destination path")
+                        }
+
+                        Controls.ToolButton {
+                            Controls.ToolTip.text: qsTr("Choose destination parent folder")
+                            Controls.ToolTip.visible: hovered
+                            display: Controls.AbstractButton.IconOnly
+                            icon.name: "document-open-folder"
+                            text: qsTr("Choose destination")
+                            onClicked: moveParentDialog.open()
+                        }
                     }
 
                     Controls.Button {
@@ -626,6 +1004,17 @@ Item {
                     }
                 }
             }
+        }
+    }
+
+    FolderDialog {
+        id: moveParentDialog
+
+        title: qsTr("Choose the new parent folder")
+        onAccepted: {
+            const parent = panel.urlToPath(selectedFolder);
+            const leaf = panel.pathBaseName(panel.movingWorktreeRoot);
+            moveDestination.text = leaf.length > 0 ? panel.joinPath(parent, leaf) : parent;
         }
     }
 

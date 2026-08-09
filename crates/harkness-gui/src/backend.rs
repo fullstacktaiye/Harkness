@@ -33,6 +33,7 @@ pub mod ffi {
         #[qproperty(QList_QVariant, worktrees)]
         #[qproperty(QVariant, opened)]
         #[qproperty(QVariant, git)]
+        #[qproperty(QVariant, diff)]
         type HarknessBackend = super::HarknessBackendRust;
 
         #[qinvokable]
@@ -80,6 +81,16 @@ pub mod ffi {
         #[cxx_name = "refreshGit"]
         fn refresh_git(self: Pin<&mut HarknessBackend>, project_id: &QString);
 
+        /// Loads staged and unstaged content only for the selected path.
+        #[qinvokable]
+        #[cxx_name = "refreshDiff"]
+        fn refresh_diff(self: Pin<&mut HarknessBackend>, project_id: &QString, path: &QString);
+
+        /// Invalidates an in-flight diff request and clears its hunk tokens.
+        #[qinvokable]
+        #[cxx_name = "clearDiff"]
+        fn clear_diff(self: Pin<&mut HarknessBackend>);
+
         #[qinvokable]
         #[cxx_name = "stagePath"]
         fn stage_path(self: Pin<&mut HarknessBackend>, project_id: &QString, path: &QString);
@@ -87,6 +98,24 @@ pub mod ffi {
         #[qinvokable]
         #[cxx_name = "unstagePath"]
         fn unstage_path(self: Pin<&mut HarknessBackend>, project_id: &QString, path: &QString);
+
+        /// Stages one backend-owned selection from the current unstaged diff.
+        #[qinvokable]
+        #[cxx_name = "stageHunk"]
+        fn stage_hunk(
+            self: Pin<&mut HarknessBackend>,
+            project_id: &QString,
+            selection_id: &QString,
+        );
+
+        /// Unstages one backend-owned selection from the current staged diff.
+        #[qinvokable]
+        #[cxx_name = "unstageHunk"]
+        fn unstage_hunk(
+            self: Pin<&mut HarknessBackend>,
+            project_id: &QString,
+            selection_id: &QString,
+        );
 
         #[qinvokable]
         fn commit(
@@ -145,6 +174,16 @@ pub mod ffi {
             destination: &QString,
         );
 
+        /// Protects a Harkness-owned worktree with a mandatory core-validated reason.
+        #[qinvokable]
+        #[cxx_name = "lockWorktree"]
+        fn lock_worktree(self: Pin<&mut HarknessBackend>, project_id: &QString, reason: &QString);
+
+        /// Removes Git's lifecycle lock from a Harkness-owned worktree.
+        #[qinvokable]
+        #[cxx_name = "unlockWorktree"]
+        fn unlock_worktree(self: Pin<&mut HarknessBackend>, project_id: &QString);
+
         /// Reconciles missing or externally moved Harkness worktrees.
         #[qinvokable]
         #[cxx_name = "reconcileWorktrees"]
@@ -182,10 +221,14 @@ pub struct HarknessBackendRust {
     worktrees: QList<QVariant>,
     opened: QVariant,
     git: QVariant,
+    diff: QVariant,
     job_records: Vec<JobRecord>,
     cancellations: HashMap<String, harkness_core::Cancellation>,
+    diff_selections: HashMap<String, DiffSelectionRecord>,
     legacy_job: Option<String>,
     next_job_id: u64,
+    next_diff_request: u64,
+    next_diff_generation: u64,
 }
 
 impl Default for HarknessBackendRust {
@@ -199,10 +242,14 @@ impl Default for HarknessBackendRust {
             worktrees: QList::default(),
             opened: empty_opened(),
             git: empty_git(),
+            diff: empty_diff(),
             job_records: Vec::new(),
             cancellations: HashMap::new(),
+            diff_selections: HashMap::new(),
             legacy_job: None,
             next_job_id: 0,
+            next_diff_request: 0,
+            next_diff_generation: 0,
         }
     }
 }
@@ -516,6 +563,294 @@ fn empty_git() -> QVariant {
     QVariant::from(&QMap::<QMapPair_QString_QVariant>::default())
 }
 
+#[derive(Clone, Debug)]
+struct DiffSelectionRecord {
+    project_id: String,
+    target: harkness_core::DiffTarget,
+    selection: harkness_core::HunkSelection,
+}
+
+#[derive(Debug)]
+struct DiffStateRow {
+    project_id: String,
+    path: String,
+    files: Vec<harkness_core::FileDiff>,
+    loading: bool,
+    error: String,
+    error_kind: String,
+}
+
+impl DiffStateRow {
+    fn loading(project_id: String, path: String) -> Self {
+        Self {
+            project_id,
+            path,
+            files: Vec::new(),
+            loading: true,
+            error: String::new(),
+            error_kind: String::new(),
+        }
+    }
+
+    fn with_failure(project_id: String, path: String, failure: &GitFailure) -> Self {
+        Self {
+            project_id,
+            path,
+            files: Vec::new(),
+            loading: false,
+            error: failure.message.clone(),
+            error_kind: failure.kind.clone(),
+        }
+    }
+}
+
+fn empty_diff() -> QVariant {
+    QVariant::from(&QMap::<QMapPair_QString_QVariant>::default())
+}
+
+fn diff_target_name(target: &harkness_core::DiffTarget) -> &'static str {
+    match target {
+        harkness_core::DiffTarget::Staged => "staged",
+        harkness_core::DiffTarget::Unstaged => "unstaged",
+        _ => "unknown",
+    }
+}
+
+fn diff_line_name(line: harkness_core::DiffLineKind) -> (&'static str, &'static str) {
+    match line {
+        harkness_core::DiffLineKind::Context => ("context", " "),
+        harkness_core::DiffLineKind::Addition => ("addition", "+"),
+        harkness_core::DiffLineKind::Deletion => ("deletion", "-"),
+        harkness_core::DiffLineKind::BothEofNoNewline
+        | harkness_core::DiffLineKind::OldEofNoNewline
+        | harkness_core::DiffLineKind::NewEofNoNewline => ("eof", "\\"),
+        _ => ("unknown", "?"),
+    }
+}
+
+fn display_patch_bytes(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.strip_suffix('\n').unwrap_or(&text);
+    text.strip_suffix('\r').unwrap_or(text).to_owned()
+}
+
+fn display_diff_path(file: &harkness_core::FileDiff) -> String {
+    match (file.old_path.as_deref(), file.new_path.as_deref()) {
+        (Some(old), Some(new)) if old != new => {
+            format!("{} → {}", old.to_string_lossy(), new.to_string_lossy())
+        }
+        (_, Some(path)) | (Some(path), None) => path.to_string_lossy().into_owned(),
+        (None, None) => "(unnamed path)".to_owned(),
+    }
+}
+
+fn omission_summary(omission: &harkness_core::DiffOmission) -> String {
+    match omission {
+        harkness_core::DiffOmission::FileTooLarge { limit } => {
+            format!("File too large — content exceeds the {limit}-byte display limit.")
+        }
+        harkness_core::DiffOmission::Unmerged => {
+            "Unmerged file — resolve the conflict before viewing a two-sided diff.".to_owned()
+        }
+        harkness_core::DiffOmission::ContentBudgetExhausted { limit } => {
+            format!("Content budget exhausted — the diff reached its {limit}-byte limit.")
+        }
+        harkness_core::DiffOmission::FileBudgetExhausted { limit } => {
+            format!("File budget exhausted — the diff reached its {limit}-file limit.")
+        }
+        harkness_core::DiffOmission::Unrepresentable { detail } => {
+            format!("Unrepresentable diff — {detail}")
+        }
+        _ => "Content omitted for an unknown reason.".to_owned(),
+    }
+}
+
+fn file_content_summary(file: &harkness_core::FileDiff) -> String {
+    if let Some(omission) = &file.omission {
+        omission_summary(omission)
+    } else if file.binary {
+        "Binary file — content diff and hunk staging are unavailable.".to_owned()
+    } else if file.hunks.is_empty() {
+        "No textual hunks — stage or unstage the whole path instead.".to_owned()
+    } else {
+        String::new()
+    }
+}
+
+fn bounded_i32(value: u32) -> i32 {
+    i32::try_from(value).unwrap_or(i32::MAX)
+}
+
+fn to_diff(
+    row: &DiffStateRow,
+    generation: u64,
+) -> (QVariant, HashMap<String, DiffSelectionRecord>) {
+    let mut state = QMap::<QMapPair_QString_QVariant>::default();
+    let mut insert = |key: &str, value: QVariant| state.insert(QString::from(key), value);
+    insert(
+        "projectId",
+        QVariant::from(&QString::from(row.project_id.as_str())),
+    );
+    insert("path", QVariant::from(&QString::from(row.path.as_str())));
+    insert("loading", QVariant::from(&row.loading));
+    insert("error", QVariant::from(&QString::from(row.error.as_str())));
+    insert(
+        "errorKind",
+        QVariant::from(&QString::from(row.error_kind.as_str())),
+    );
+
+    let mut selections = HashMap::new();
+    let mut files = QList::<QVariant>::default();
+    for (file_index, file) in row.files.iter().enumerate() {
+        let mut file_value = QMap::<QMapPair_QString_QVariant>::default();
+        let mut insert_file = |key: &str, value: QVariant| {
+            file_value.insert(QString::from(key), value);
+        };
+        insert_file(
+            "target",
+            QVariant::from(&QString::from(diff_target_name(&file.target))),
+        );
+        insert_file(
+            "change",
+            QVariant::from(&QString::from(change_name(file.change))),
+        );
+        insert_file(
+            "path",
+            QVariant::from(&QString::from(display_diff_path(file).as_str())),
+        );
+        insert_file(
+            "summary",
+            QVariant::from(&QString::from(file_content_summary(file).as_str())),
+        );
+        insert_file("binary", QVariant::from(&file.binary));
+
+        let mut hunks = QList::<QVariant>::default();
+        for (hunk_index, hunk) in file.hunks.iter().enumerate() {
+            let selection_id = format!("diff-{generation}-{file_index}-{hunk_index}");
+            selections.insert(
+                selection_id.clone(),
+                DiffSelectionRecord {
+                    project_id: row.project_id.clone(),
+                    target: file.target.clone(),
+                    selection: harkness_core::HunkSelection::new(file, hunk),
+                },
+            );
+
+            let mut hunk_value = QMap::<QMapPair_QString_QVariant>::default();
+            let mut insert_hunk = |key: &str, value: QVariant| {
+                hunk_value.insert(QString::from(key), value);
+            };
+            insert_hunk(
+                "selectionId",
+                QVariant::from(&QString::from(selection_id.as_str())),
+            );
+            insert_hunk(
+                "header",
+                QVariant::from(&QString::from(display_patch_bytes(&hunk.header).as_str())),
+            );
+            insert_hunk("oldStart", QVariant::from(&bounded_i32(hunk.old_start)));
+            insert_hunk("oldLines", QVariant::from(&bounded_i32(hunk.old_lines)));
+            insert_hunk("newStart", QVariant::from(&bounded_i32(hunk.new_start)));
+            insert_hunk("newLines", QVariant::from(&bounded_i32(hunk.new_lines)));
+
+            let mut lines = QList::<QVariant>::default();
+            for line in &hunk.lines {
+                let (kind, marker) = diff_line_name(line.kind);
+                let mut line_value = QMap::<QMapPair_QString_QVariant>::default();
+                let mut insert_line = |key: &str, value: QVariant| {
+                    line_value.insert(QString::from(key), value);
+                };
+                insert_line("kind", QVariant::from(&QString::from(kind)));
+                insert_line("marker", QVariant::from(&QString::from(marker)));
+                insert_line(
+                    "oldLine",
+                    QVariant::from(&line.old_line_number.map_or(0, bounded_i32)),
+                );
+                insert_line(
+                    "newLine",
+                    QVariant::from(&line.new_line_number.map_or(0, bounded_i32)),
+                );
+                insert_line(
+                    "content",
+                    QVariant::from(&QString::from(display_patch_bytes(&line.content).as_str())),
+                );
+                lines.append(QVariant::from(&line_value));
+            }
+            insert_hunk("lines", QVariant::from(&lines));
+            hunks.append(QVariant::from(&hunk_value));
+        }
+        insert_file("hunks", QVariant::from(&hunks));
+        files.append(QVariant::from(&file_value));
+    }
+    insert("files", QVariant::from(&files));
+    (QVariant::from(&state), selections)
+}
+
+fn set_diff_state(mut backend: Pin<&mut ffi::HarknessBackend>, row: &DiffStateRow) {
+    let generation = {
+        let rust = backend.as_mut().rust_mut().get_mut();
+        rust.next_diff_generation += 1;
+        rust.next_diff_generation
+    };
+    let (value, selections) = to_diff(row, generation);
+    backend.as_mut().rust_mut().get_mut().diff_selections = selections;
+    backend.as_mut().set_diff(value);
+}
+
+fn clear_diff_state(mut backend: Pin<&mut ffi::HarknessBackend>) {
+    {
+        let rust = backend.as_mut().rust_mut().get_mut();
+        rust.next_diff_request += 1;
+        rust.diff_selections.clear();
+    }
+    backend.as_mut().set_diff(empty_diff());
+}
+
+fn diff_identity(diff: &QVariant) -> Option<(String, String)> {
+    let map = diff.value::<QMap<QMapPair_QString_QVariant>>()?;
+    let project_id = map
+        .get(&QString::from("projectId"))?
+        .value::<QString>()?
+        .to_string();
+    let path = map
+        .get(&QString::from("path"))?
+        .value::<QString>()?
+        .to_string();
+    (!project_id.is_empty() && !path.is_empty()).then_some((project_id, path))
+}
+
+fn load_diff_with_git(
+    git: &harkness_core::GitService,
+    project_id: String,
+    path: String,
+) -> Result<DiffStateRow, GitFailure> {
+    if path.is_empty() {
+        return Err(GitFailure {
+            kind: "invalid_path".to_owned(),
+            message: "select a changed path before loading its diff".to_owned(),
+        });
+    }
+    let options =
+        harkness_core::DiffOptions::default().with_paths([std::path::PathBuf::from(path.as_str())]);
+    let files = git
+        .diff_snapshot(
+            &[
+                harkness_core::DiffTarget::Staged,
+                harkness_core::DiffTarget::Unstaged,
+            ],
+            &options,
+        )
+        .map_err(GitFailure::from)?;
+    Ok(DiffStateRow {
+        project_id,
+        path,
+        files,
+        loading: false,
+        error: String::new(),
+        error_kind: String::new(),
+    })
+}
+
 #[derive(Debug)]
 struct GitFailure {
     kind: String,
@@ -529,6 +864,21 @@ impl From<harkness_core::GitError> for GitFailure {
             message: error.to_string(),
         }
     }
+}
+
+fn load_project_git(project_id: &str) -> Result<harkness_core::GitService, GitFailure> {
+    let id = project_id.parse().map_err(|_| GitFailure {
+        kind: "invalid_project".to_owned(),
+        message: "invalid project identifier".to_owned(),
+    })?;
+    let service = harkness_core::ProjectService::load().map_err(|error| GitFailure {
+        kind: "project".to_owned(),
+        message: error.to_string(),
+    })?;
+    service.git(id).map_err(|error| GitFailure {
+        kind: "project".to_owned(),
+        message: error.to_string(),
+    })
 }
 
 #[derive(Debug)]
@@ -546,20 +896,7 @@ fn run_git_operation(
         &harkness_core::Cancellation,
     ) -> Result<String, GitFailure>,
 ) -> GitWorkerResult {
-    let git = (|| {
-        let id = project_id.parse().map_err(|_| GitFailure {
-            kind: "invalid_project".to_owned(),
-            message: "invalid project identifier".to_owned(),
-        })?;
-        let service = harkness_core::ProjectService::load().map_err(|error| GitFailure {
-            kind: "project".to_owned(),
-            message: error.to_string(),
-        })?;
-        service.git(id).map_err(|error| GitFailure {
-            kind: "project".to_owned(),
-            message: error.to_string(),
-        })
-    })();
+    let git = load_project_git(&project_id);
     let git = match git {
         Ok(git) => git,
         Err(failure) => {
@@ -607,6 +944,8 @@ fn apply_git_result(
     finish_job(backend.as_mut(), job_id);
     let is_open =
         opened_project_id(backend.as_ref().opened()).as_deref() == Some(result.project_id.as_str());
+    let refresh_diff = is_open && result.state.is_some();
+    let project_id = result.project_id.clone();
     if is_open {
         if let Some(state) = &result.state {
             backend.as_mut().set_git(to_git(state));
@@ -625,6 +964,139 @@ fn apply_git_result(
     if refresh_catalog {
         backend.as_mut().refresh();
     }
+    if refresh_diff {
+        refresh_current_diff(backend.as_mut(), &project_id);
+    }
+}
+
+fn refresh_current_diff(mut backend: Pin<&mut ffi::HarknessBackend>, project_id: &str) {
+    let Some((diff_project_id, path)) = diff_identity(backend.as_ref().diff()) else {
+        return;
+    };
+    if diff_project_id != project_id {
+        return;
+    }
+    let project_id = QString::from(project_id);
+    let path = QString::from(path.as_str());
+    backend.as_mut().refresh_diff(&project_id, &path);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HunkAction {
+    Stage,
+    Unstage,
+}
+
+impl HunkAction {
+    fn kind(self) -> &'static str {
+        match self {
+            Self::Stage => "stage_hunk",
+            Self::Unstage => "unstage_hunk",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Stage => "Stage hunk",
+            Self::Unstage => "Unstage hunk",
+        }
+    }
+
+    fn matches(self, target: &harkness_core::DiffTarget) -> bool {
+        matches!(
+            (self, target),
+            (Self::Stage, harkness_core::DiffTarget::Unstaged)
+                | (Self::Unstage, harkness_core::DiffTarget::Staged)
+        )
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum HunkMutationOutcome {
+    Applied(usize),
+    Stale,
+}
+
+fn mutate_hunk_with_git(
+    git: &harkness_core::GitService,
+    action: HunkAction,
+    selection: &harkness_core::HunkSelection,
+    cancellation: &harkness_core::Cancellation,
+) -> Result<HunkMutationOutcome, GitFailure> {
+    let result = match action {
+        HunkAction::Stage => git.stage_hunks(std::slice::from_ref(selection), cancellation),
+        HunkAction::Unstage => git.unstage_hunks(std::slice::from_ref(selection), cancellation),
+    };
+    match result {
+        Ok(outcome) => Ok(HunkMutationOutcome::Applied(outcome.hunks)),
+        Err(harkness_core::GitError::StaleHunkSelection { .. }) => Ok(HunkMutationOutcome::Stale),
+        Err(error) => Err(GitFailure::from(error)),
+    }
+}
+
+fn launch_hunk_operation(
+    mut backend: Pin<&mut ffi::HarknessBackend>,
+    project_id: &QString,
+    selection_id: &QString,
+    action: HunkAction,
+) {
+    let project_id = project_id.to_string();
+    let selection_id = selection_id.to_string();
+    let selection = backend
+        .as_ref()
+        .rust()
+        .diff_selections
+        .get(&selection_id)
+        .cloned();
+    let Some(selection) = selection else {
+        backend
+            .as_mut()
+            .set_status("The selected hunk is no longer available; refresh the diff".into());
+        return;
+    };
+    if selection.project_id != project_id {
+        backend
+            .as_mut()
+            .set_status("The selected hunk belongs to a different project".into());
+        return;
+    }
+    if !action.matches(&selection.target) {
+        backend
+            .as_mut()
+            .set_status("The selected hunk belongs to the other side of the index".into());
+        return;
+    }
+    let Some((job_id, cancellation)) = start_job(
+        backend.as_mut(),
+        action.kind(),
+        &project_id,
+        action.label(),
+        true,
+    ) else {
+        return;
+    };
+    let qt_thread = backend.qt_thread();
+    std::thread::spawn(move || {
+        let result = run_git_operation(project_id, &cancellation, |git, cancellation| {
+            match mutate_hunk_with_git(git, action, &selection.selection, cancellation)? {
+                HunkMutationOutcome::Applied(count) => Ok(format!(
+                    "{} {count} hunk{}",
+                    if action == HunkAction::Stage {
+                        "Staged"
+                    } else {
+                        "Unstaged"
+                    },
+                    if count == 1 { "" } else { "s" }
+                )),
+                HunkMutationOutcome::Stale => Ok(
+                    "The file changed; refreshed the diff without changing the index".to_owned(),
+                ),
+            }
+        });
+        let _ = qt_thread.queue(move |mut backend| {
+            apply_git_result(backend.as_mut(), &job_id, result, true, false, false);
+        });
+    });
 }
 
 #[derive(Debug)]
@@ -907,6 +1379,89 @@ fn move_worktree_with_service(
         .map_err(|error| error.to_string())
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WorktreeLockAction {
+    Lock(String),
+    Unlock,
+}
+
+fn change_worktree_lock_with_service(
+    service: &mut harkness_core::ProjectService,
+    project_id: &str,
+    action: &WorktreeLockAction,
+    cancellation: &harkness_core::Cancellation,
+) -> Result<(String, Vec<WorktreeRow>), String> {
+    let id = project_id
+        .parse()
+        .map_err(|_| "invalid worktree project identifier".to_owned())?;
+    let worktree = service
+        .resolve(&harkness_core::ProjectSelector::Value(
+            project_id.to_owned(),
+        ))
+        .map_err(|error| error.to_string())?;
+    let harkness_core::ProjectSource::Worktree { parent, .. } = &worktree.source else {
+        return Err(format!(
+            "{} is not a Harkness-managed worktree",
+            worktree.display_name
+        ));
+    };
+    let message = match action {
+        WorktreeLockAction::Lock(reason) => {
+            service
+                .lock_worktree(id, reason, cancellation)
+                .map_err(|error| error.to_string())?;
+            format!("Locked {}: {}", worktree.display_name, reason.trim())
+        }
+        WorktreeLockAction::Unlock => {
+            service
+                .unlock_worktree(id, cancellation)
+                .map_err(|error| error.to_string())?;
+            format!("Unlocked {}", worktree.display_name)
+        }
+    };
+    let rows = service
+        .worktrees(*parent, cancellation)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(WorktreeRow::from)
+        .collect();
+    Ok((message, rows))
+}
+
+fn launch_worktree_lock_operation(
+    mut backend: Pin<&mut ffi::HarknessBackend>,
+    project_id: &QString,
+    action: WorktreeLockAction,
+) {
+    let project_id = project_id.to_string();
+    let (kind, label) = match &action {
+        WorktreeLockAction::Lock(_) => ("lock_worktree", "Lock worktree"),
+        WorktreeLockAction::Unlock => ("unlock_worktree", "Unlock worktree"),
+    };
+    let Some((job_id, cancellation)) = start_job(backend.as_mut(), kind, &project_id, label, true)
+    else {
+        return;
+    };
+    let qt_thread = backend.qt_thread();
+    std::thread::spawn(move || {
+        let result = (|| {
+            let mut service =
+                harkness_core::ProjectService::load().map_err(|error| error.to_string())?;
+            change_worktree_lock_with_service(&mut service, &project_id, &action, &cancellation)
+        })();
+        let _ = qt_thread.queue(move |mut backend| {
+            finish_job(backend.as_mut(), &job_id);
+            match result {
+                Ok((message, rows)) => {
+                    backend.as_mut().set_worktrees(to_worktrees(&rows));
+                    backend.as_mut().set_status(message.into());
+                }
+                Err(error) => backend.as_mut().set_status(error.into()),
+            }
+        });
+    });
+}
+
 fn to_projects(rows: &[ProjectRow]) -> QList<QVariant> {
     let mut projects = QList::<QVariant>::default();
     for row in rows {
@@ -1144,6 +1699,7 @@ impl ffi::HarknessBackend {
         self.as_mut().set_git(empty_git());
         self.as_mut().set_branches(QList::default());
         self.as_mut().set_worktrees(QList::default());
+        clear_diff_state(self.as_mut());
     }
 
     fn refresh_branches(self: Pin<&mut Self>, project_id: &QString) {
@@ -1188,6 +1744,53 @@ impl ffi::HarknessBackend {
                 apply_git_result(backend.as_mut(), &job_id, result, false, false, true);
             });
         });
+    }
+
+    fn refresh_diff(mut self: Pin<&mut Self>, project_id: &QString, path: &QString) {
+        let project_id = project_id.to_string();
+        let path = path.to_string();
+        if path.is_empty() {
+            clear_diff_state(self.as_mut());
+            self.as_mut()
+                .set_status("Select a changed path before loading its diff".into());
+            return;
+        }
+        let request_id = {
+            let rust = self.as_mut().rust_mut().get_mut();
+            rust.next_diff_request += 1;
+            rust.next_diff_request
+        };
+        set_diff_state(
+            self.as_mut(),
+            &DiffStateRow::loading(project_id.clone(), path.clone()),
+        );
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let result = load_project_git(&project_id)
+                .and_then(|git| load_diff_with_git(&git, project_id.clone(), path.clone()));
+            let _ = qt_thread.queue(move |mut backend| {
+                if backend.as_ref().rust().next_diff_request != request_id
+                    || opened_project_id(backend.as_ref().opened()).as_deref()
+                        != Some(project_id.as_str())
+                {
+                    return;
+                }
+                match result {
+                    Ok(row) => set_diff_state(backend.as_mut(), &row),
+                    Err(failure) => {
+                        backend.as_mut().set_status(failure.message.as_str().into());
+                        set_diff_state(
+                            backend.as_mut(),
+                            &DiffStateRow::with_failure(project_id, path, &failure),
+                        );
+                    }
+                }
+            });
+        });
+    }
+
+    fn clear_diff(self: Pin<&mut Self>) {
+        clear_diff_state(self);
     }
 
     fn stage_path(mut self: Pin<&mut Self>, project_id: &QString, path: &QString) {
@@ -1278,6 +1881,14 @@ impl ffi::HarknessBackend {
                 apply_git_result(backend.as_mut(), &job_id, result, true, false, false);
             });
         });
+    }
+
+    fn stage_hunk(self: Pin<&mut Self>, project_id: &QString, selection_id: &QString) {
+        launch_hunk_operation(self, project_id, selection_id, HunkAction::Stage);
+    }
+
+    fn unstage_hunk(self: Pin<&mut Self>, project_id: &QString, selection_id: &QString) {
+        launch_hunk_operation(self, project_id, selection_id, HunkAction::Unstage);
     }
 
     fn commit(mut self: Pin<&mut Self>, project_id: &QString, message: &QString, amend: bool) {
@@ -1679,6 +2290,18 @@ impl ffi::HarknessBackend {
         });
     }
 
+    fn lock_worktree(self: Pin<&mut Self>, project_id: &QString, reason: &QString) {
+        launch_worktree_lock_operation(
+            self,
+            project_id,
+            WorktreeLockAction::Lock(reason.to_string()),
+        );
+    }
+
+    fn unlock_worktree(self: Pin<&mut Self>, project_id: &QString) {
+        launch_worktree_lock_operation(self, project_id, WorktreeLockAction::Unlock);
+    }
+
     fn open_project(mut self: Pin<&mut Self>, project_id: &QString) {
         if *self.as_ref().busy() {
             return;
@@ -1794,9 +2417,11 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        BranchRow, GitStateRow, OpenedUpdate, ProjectRow, begin_job, empty_opened, end_job,
-        move_worktree_with_service, operation_outcome, project_rows, remove_worktree_with_service,
-        to_branches, to_git, to_jobs, to_map, to_projects, update_job, worktree_base,
+        BranchRow, GitStateRow, HunkAction, HunkMutationOutcome, OpenedUpdate, ProjectRow,
+        WorktreeLockAction, begin_job, change_worktree_lock_with_service, empty_opened, end_job,
+        file_content_summary, load_diff_with_git, move_worktree_with_service, mutate_hunk_with_git,
+        operation_outcome, project_rows, remove_worktree_with_service, to_branches, to_diff,
+        to_git, to_jobs, to_map, to_projects, update_job, worktree_base,
     };
 
     fn project(
@@ -1826,6 +2451,60 @@ mod tests {
         repository
             .commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
             .unwrap();
+    }
+
+    fn commit_file(root: &Path, path: &Path, contents: &str, message: &str) {
+        let full_path = root.join(path);
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&full_path, contents).unwrap();
+        let repository = Repository::open(root).unwrap();
+        let mut index = repository.index().unwrap();
+        index.add_path(path).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repository.find_tree(tree_id).unwrap();
+        let parent = repository.head().unwrap().peel_to_commit().unwrap();
+        let signature = Signature::now("Harkness Tests", "tests@example.com").unwrap();
+        repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                message,
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+    }
+
+    fn commit_index(root: &Path, message: &str) -> git2::Oid {
+        let repository = Repository::open(root).unwrap();
+        let mut index = repository.index().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repository.find_tree(tree_id).unwrap();
+        let parent = repository.head().unwrap().peel_to_commit().unwrap();
+        let signature = Signature::now("Harkness Tests", "tests@example.com").unwrap();
+        repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                message,
+                &tree,
+                &[&parent],
+            )
+            .unwrap()
+    }
+
+    fn committed_file(root: &Path, commit_id: git2::Oid, path: &Path) -> String {
+        let repository = Repository::open(root).unwrap();
+        let commit = repository.find_commit(commit_id).unwrap();
+        let tree = commit.tree().unwrap();
+        let entry = tree.get_path(path).unwrap();
+        let blob = repository.find_blob(entry.id()).unwrap();
+        String::from_utf8(blob.content().to_vec()).unwrap()
     }
 
     fn row_map(row: &ProjectRow) -> QMap<QMapPair_QString_QVariant> {
@@ -2062,6 +2741,198 @@ mod tests {
     }
 
     #[test]
+    fn backend_diff_model_stages_only_the_selected_hunk() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("diff-repository");
+        initialize_repository(&root);
+        let path = Path::new("story.txt");
+        let original = (1..=24)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        commit_file(&root, path, &original, "add story");
+        let modified = original
+            .replace("line 2\n", "line 2 changed\n")
+            .replace("line 22\n", "line 22 changed\n");
+        fs::write(root.join(path), &modified).unwrap();
+        let git = harkness_core::GitService::new(&root, fixture.path().join("diff-locks"));
+
+        let state =
+            load_diff_with_git(&git, "project-1".to_owned(), "story.txt".to_owned()).unwrap();
+        let unstaged = state
+            .files
+            .iter()
+            .find(|file| matches!(file.target, harkness_core::DiffTarget::Unstaged))
+            .unwrap();
+        assert_eq!(unstaged.hunks.len(), 2);
+        assert!(
+            unstaged
+                .hunks
+                .iter()
+                .flat_map(|hunk| &hunk.lines)
+                .any(|line| matches!(line.kind, harkness_core::DiffLineKind::Addition))
+        );
+        assert!(
+            unstaged
+                .hunks
+                .iter()
+                .flat_map(|hunk| &hunk.lines)
+                .any(|line| matches!(line.kind, harkness_core::DiffLineKind::Deletion))
+        );
+
+        let (model, selections) = to_diff(&state, 7);
+        assert_eq!(selections.len(), 2);
+        let map = model
+            .value::<QMap<QMapPair_QString_QVariant>>()
+            .expect("diff state should flatten to a QVariantMap");
+        let files = map
+            .get(&QString::from("files"))
+            .and_then(|value| value.value::<cxx_qt_lib::QList<QVariant>>())
+            .expect("diff files should flatten to a QVariantList");
+        assert_eq!(files.len(), 1);
+
+        let selection = harkness_core::HunkSelection::new(unstaged, &unstaged.hunks[0]);
+        assert_eq!(
+            mutate_hunk_with_git(
+                &git,
+                HunkAction::Stage,
+                &selection,
+                &harkness_core::Cancellation::default(),
+            )
+            .unwrap(),
+            HunkMutationOutcome::Applied(1)
+        );
+
+        let refreshed =
+            load_diff_with_git(&git, "project-1".to_owned(), "story.txt".to_owned()).unwrap();
+        let staged = refreshed
+            .files
+            .iter()
+            .find(|file| matches!(file.target, harkness_core::DiffTarget::Staged))
+            .unwrap();
+        let unstaged = refreshed
+            .files
+            .iter()
+            .find(|file| matches!(file.target, harkness_core::DiffTarget::Unstaged))
+            .unwrap();
+        assert_eq!(staged.hunks.len(), 1);
+        assert_eq!(unstaged.hunks.len(), 1);
+
+        let staged_selection = harkness_core::HunkSelection::new(staged, &staged.hunks[0]);
+        assert_eq!(
+            mutate_hunk_with_git(
+                &git,
+                HunkAction::Unstage,
+                &staged_selection,
+                &harkness_core::Cancellation::default(),
+            )
+            .unwrap(),
+            HunkMutationOutcome::Applied(1)
+        );
+        let unstaged_again =
+            load_diff_with_git(&git, "project-1".to_owned(), "story.txt".to_owned()).unwrap();
+        assert!(
+            unstaged_again
+                .files
+                .iter()
+                .all(|file| !matches!(file.target, harkness_core::DiffTarget::Staged))
+        );
+        let file = unstaged_again
+            .files
+            .iter()
+            .find(|file| matches!(file.target, harkness_core::DiffTarget::Unstaged))
+            .unwrap();
+        let selection = harkness_core::HunkSelection::new(file, &file.hunks[0]);
+        assert_eq!(
+            mutate_hunk_with_git(
+                &git,
+                HunkAction::Stage,
+                &selection,
+                &harkness_core::Cancellation::default(),
+            )
+            .unwrap(),
+            HunkMutationOutcome::Applied(1)
+        );
+
+        let commit_id = commit_index(&root, "stage one hunk");
+        let committed = committed_file(&root, commit_id, path);
+        assert!(committed.contains("line 2 changed\n"));
+        assert!(committed.contains("line 22\n"));
+        assert!(!committed.contains("line 22 changed\n"));
+    }
+
+    #[test]
+    fn backend_stale_hunk_refusal_leaves_the_index_unchanged() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("stale-repository");
+        initialize_repository(&root);
+        let path = Path::new("stale.txt");
+        commit_file(&root, path, "one\ntwo\nthree\n", "add stale fixture");
+        fs::write(root.join(path), "one\ntwo changed\nthree\n").unwrap();
+        let git = harkness_core::GitService::new(&root, fixture.path().join("stale-locks"));
+        let state =
+            load_diff_with_git(&git, "project-1".to_owned(), "stale.txt".to_owned()).unwrap();
+        let file = state
+            .files
+            .iter()
+            .find(|file| matches!(file.target, harkness_core::DiffTarget::Unstaged))
+            .unwrap();
+        let selection = harkness_core::HunkSelection::new(file, &file.hunks[0]);
+
+        fs::write(root.join(path), "one\ntwo changed again\nthree\n").unwrap();
+        assert_eq!(
+            mutate_hunk_with_git(
+                &git,
+                HunkAction::Stage,
+                &selection,
+                &harkness_core::Cancellation::default(),
+            )
+            .unwrap(),
+            HunkMutationOutcome::Stale
+        );
+        assert!(
+            git.diff(
+                harkness_core::DiffTarget::Staged,
+                &harkness_core::DiffOptions::default(),
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let refreshed =
+            load_diff_with_git(&git, "project-1".to_owned(), "stale.txt".to_owned()).unwrap();
+        assert_eq!(refreshed.files.len(), 1);
+        assert_eq!(refreshed.files[0].hunks.len(), 1);
+    }
+
+    #[test]
+    fn backend_diff_names_binary_and_oversize_omissions() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("summary-repository");
+        initialize_repository(&root);
+        let git = harkness_core::GitService::new(&root, fixture.path().join("summary-locks"));
+
+        fs::write(root.join("binary.dat"), [0_u8, 1, 2, 0, 3]).unwrap();
+        let binary =
+            load_diff_with_git(&git, "project-1".to_owned(), "binary.dat".to_owned()).unwrap();
+        assert_eq!(binary.files.len(), 1);
+        assert!(binary.files[0].binary);
+        assert!(file_content_summary(&binary.files[0]).starts_with("Binary file"));
+
+        fs::write(
+            root.join("large.txt"),
+            vec![b'x'; usize::try_from(harkness_core::DEFAULT_MAX_DIFF_FILE_SIZE).unwrap() + 1],
+        )
+        .unwrap();
+        let large =
+            load_diff_with_git(&git, "project-1".to_owned(), "large.txt".to_owned()).unwrap();
+        assert_eq!(large.files.len(), 1);
+        assert!(matches!(
+            large.files[0].omission.as_ref(),
+            Some(harkness_core::DiffOmission::FileTooLarge { .. })
+        ));
+        assert!(file_content_summary(&large.files[0]).starts_with("File too large"));
+    }
+
+    #[test]
     fn local_and_detached_rows_distinguish_identity_states() {
         let detached = ProjectRow::from(project(
             harkness_core::ProjectSource::Local,
@@ -2239,6 +3110,70 @@ mod tests {
     }
 
     #[test]
+    fn backend_worktree_lock_requires_and_surfaces_the_core_reason() {
+        let fixture = TempDir::new().unwrap();
+        let parent_root = fixture.path().join("lock-parent");
+        initialize_repository(&parent_root);
+        let mut service =
+            harkness_core::ProjectService::load_from_data_dir(fixture.path().join("lock-data"))
+                .unwrap();
+        let parent = service.import_local(&parent_root).unwrap();
+        let worktree = service
+            .create_worktree(
+                parent.id,
+                &harkness_core::WorktreeBase::NewBranch {
+                    name: "agent/gui-lock".to_owned(),
+                    start_point: None,
+                },
+                &harkness_core::Cancellation::default(),
+            )
+            .unwrap();
+        let worktree_id = worktree.id.to_string();
+
+        let blank = change_worktree_lock_with_service(
+            &mut service,
+            &worktree_id,
+            &WorktreeLockAction::Lock("   ".to_owned()),
+            &harkness_core::Cancellation::default(),
+        )
+        .unwrap_err();
+        assert!(blank.contains("reason cannot be empty"));
+
+        let (message, rows) = change_worktree_lock_with_service(
+            &mut service,
+            &worktree_id,
+            &WorktreeLockAction::Lock("  agent is still working  ".to_owned()),
+            &harkness_core::Cancellation::default(),
+        )
+        .unwrap();
+        assert_eq!(message, "Locked agent/gui-lock: agent is still working");
+        let row = rows.iter().find(|row| row.id == worktree_id).unwrap();
+        assert!(row.locked);
+        assert_eq!(row.lock_reason, "agent is still working");
+
+        let removal = remove_worktree_with_service(
+            &mut service,
+            &worktree_id,
+            true,
+            &harkness_core::Cancellation::default(),
+        )
+        .unwrap_err();
+        assert!(removal.contains("agent is still working"));
+
+        let (message, rows) = change_worktree_lock_with_service(
+            &mut service,
+            &worktree_id,
+            &WorktreeLockAction::Unlock,
+            &harkness_core::Cancellation::default(),
+        )
+        .unwrap();
+        assert_eq!(message, "Unlocked agent/gui-lock");
+        let row = rows.iter().find(|row| row.id == worktree_id).unwrap();
+        assert!(!row.locked);
+        assert!(row.lock_reason.is_empty());
+    }
+
+    #[test]
     fn backend_worktree_move_validates_and_relocates_the_checkout() {
         let fixture = TempDir::new().unwrap();
         let parent_root = fixture.path().join("move-parent");
@@ -2279,6 +3214,11 @@ mod tests {
         .unwrap();
         assert_eq!(moved.root, destination.canonicalize().unwrap());
         assert!(!worktree.root.exists());
+        let rows = service
+            .worktrees(parent.id, &harkness_core::Cancellation::default())
+            .unwrap();
+        assert!(rows.iter().any(|row| row.root == moved.root));
+        assert!(rows.iter().all(|row| row.root != worktree.root));
     }
 
     #[test]
