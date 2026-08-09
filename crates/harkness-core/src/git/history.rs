@@ -7,11 +7,13 @@
 use std::path::Path;
 
 use git2::{ErrorCode, Oid, Repository, Sort, Time};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use crate::git::{Cancellation, GitError};
 
 /// The revision set a commit log page walks.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum LogRange {
     /// Every commit reachable from one revision.
@@ -39,6 +41,61 @@ pub struct LogCursor {
     frontier: Vec<Oid>,
     hidden: Option<Oid>,
     range: LogRange,
+}
+
+/// The cursor's serialized form is deliberately versioned and remains opaque
+/// to callers. Front ends can serialize it into a token without exposing the
+/// ancestry frontier as public API, while a future internal representation can
+/// reject or migrate an older token explicitly.
+#[derive(Serialize, Deserialize)]
+struct LogCursorWire {
+    v: u8,
+    anchor: String,
+    frontier: Vec<String>,
+    hidden: Option<String>,
+    range: LogRange,
+}
+
+impl Serialize for LogCursor {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        LogCursorWire {
+            v: 1,
+            anchor: self.anchor.to_string(),
+            frontier: self.frontier.iter().map(ToString::to_string).collect(),
+            hidden: self.hidden.map(|id| id.to_string()),
+            range: self.range.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for LogCursor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = LogCursorWire::deserialize(deserializer)?;
+        if wire.v != 1 {
+            return Err(D::Error::custom(format!(
+                "unsupported log cursor version {}",
+                wire.v
+            )));
+        }
+        let parse_id = |id: &str| Oid::from_str(id).map_err(D::Error::custom);
+        Ok(Self {
+            anchor: parse_id(&wire.anchor)?,
+            frontier: wire
+                .frontier
+                .iter()
+                .map(|id| parse_id(id))
+                .collect::<Result<_, _>>()?,
+            hidden: wire.hidden.as_deref().map(parse_id).transpose()?,
+            range: wire.range,
+        })
+    }
 }
 
 impl LogCursor {
@@ -526,6 +583,9 @@ mod tests {
             first.next_cursor.as_ref().map(super::LogCursor::anchor),
             Some(second)
         );
+        let encoded = serde_json::to_vec(first.next_cursor.as_ref().unwrap()).unwrap();
+        let decoded: super::LogCursor = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, first.next_cursor.clone().unwrap());
 
         let continuation = options
             .clone()
