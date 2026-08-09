@@ -458,6 +458,8 @@ struct DiffArguments {
             "worktree",
             "branch",
             "intra_line",
+            "context_lines",
+            "max_files",
             "paths"
         ]
     )]
@@ -533,6 +535,20 @@ enum DiffContextMode {
     None,
     Expanded(u32),
     FullFile,
+}
+
+/// The high mode bits distinguish blob-backed entries from trees and gitlinks.
+/// Missing sides use mode zero and still have a valid empty context response.
+const GIT_MODE_TYPE_MASK: u32 = 0o170_000;
+const GIT_MODE_REGULAR_FILE: u32 = 0o100_000;
+const GIT_MODE_SYMBOLIC_LINK: u32 = 0o120_000;
+
+const fn mode_has_file_context(mode: u32) -> bool {
+    mode == 0
+        || matches!(
+            mode & GIT_MODE_TYPE_MASK,
+            GIT_MODE_REGULAR_FILE | GIT_MODE_SYMBOLIC_LINK
+        )
 }
 
 fn parse_log_range(range: &str) -> Result<LogRange, CliError> {
@@ -2138,15 +2154,17 @@ fn diff_values(
                     } else {
                         json!({
                             "kind": "full_file_context",
-                            "old": load_context_value(
+                            "old": load_diff_context_value(
                                 git,
+                                file,
                                 FileContextRequest::full_file(file, FileSide::Old),
                                 max_file_size,
                                 &mut context_budget,
                                 cancellation,
                             )?,
-                            "new": load_context_value(
+                            "new": load_diff_context_value(
                                 git,
+                                file,
                                 FileContextRequest::full_file(file, FileSide::New),
                                 max_file_size,
                                 &mut context_budget,
@@ -2168,8 +2186,9 @@ fn diff_values(
                             "kind": "hunk_context",
                             "lines_before": lines,
                             "lines_after": lines,
-                            "old": load_context_value(
+                            "old": load_diff_context_value(
                                 git,
+                                file,
                                 FileContextRequest::for_hunk(
                                     file,
                                     hunk,
@@ -2181,8 +2200,9 @@ fn diff_values(
                                 &mut context_budget,
                                 cancellation,
                             )?,
-                            "new": load_context_value(
+                            "new": load_diff_context_value(
                                 git,
+                                file,
                                 FileContextRequest::for_hunk(
                                     file,
                                     hunk,
@@ -2234,6 +2254,7 @@ fn context_values_from_document(
         .enumerate()
         .map(|(file_index, source_file)| {
             let at = format!("files[{file_index}]");
+            let _ = context_target_uses_worktree(source_file, &at)?;
             let mut projected = source_file.clone();
             match context_mode {
                 DiffContextMode::None => unreachable!("context mode was validated by the caller"),
@@ -2363,22 +2384,23 @@ fn load_record_context_value(
     remaining_bytes: &mut u64,
     cancellation: &Cancellation,
 ) -> Result<Value, CliError> {
-    let target = record_string(file, "target", at)?;
-    let (path_field, blob_field) = match side {
-        FileSide::Old => ("old_path", "old_blob_id"),
-        FileSide::New => ("new_path", "new_blob_id"),
+    let target_uses_worktree = context_target_uses_worktree(file, at)?;
+    let (path_field, blob_field, mode_field) = match side {
+        FileSide::Old => ("old_path", "old_blob_id", "old_mode"),
+        FileSide::New => ("new_path", "new_blob_id", "new_mode"),
         _ => return Err(CliError::Usage("unsupported context side".to_owned())),
     };
     let blob_id = record_string(file, blob_field, at)?;
+    if !mode_has_file_context(record_u32(file, mode_field, at)?) {
+        return Ok(Value::Null);
+    }
     let encoded_path_field = format!("{path_field}_base64");
     let path_is_absent = file.get(path_field).is_none_or(Value::is_null)
         && file.get(&encoded_path_field).is_none_or(Value::is_null);
     let request =
-        if path_is_absent && blob_id.len() == 40 && blob_id.bytes().all(|byte| byte == b'0') {
+        if path_is_absent && !blob_id.is_empty() && blob_id.bytes().all(|byte| byte == b'0') {
             FileContextRequest::absent(blob_id, side, range)
-        } else if side == FileSide::New
-            && matches!(target.as_str(), "unstaged" | "revision_against_worktree")
-        {
+        } else if side == FileSide::New && target_uses_worktree {
             let path = record_path(file, path_field, at)?.ok_or_else(|| {
                 CliError::Usage(format!(
                     "{at}.{path_field} is required for a working-tree context"
@@ -2388,6 +2410,36 @@ fn load_record_context_value(
         } else {
             FileContextRequest::blob(blob_id, side, range)
         };
+    load_context_value(git, request, max_file_size, remaining_bytes, cancellation)
+}
+
+fn context_target_uses_worktree(file: &Value, at: &str) -> Result<bool, CliError> {
+    let target = record_string(file, "target", at)?;
+    match target.as_str() {
+        "unstaged" | "revision_against_worktree" => Ok(true),
+        "staged" | "commit" | "revisions" | "branch_against_base" => Ok(false),
+        _ => Err(CliError::Usage(format!(
+            "{at}.target is an unsupported diff target \"{target}\""
+        ))),
+    }
+}
+
+fn load_diff_context_value(
+    git: &GitService,
+    file: &FileDiff,
+    request: FileContextRequest,
+    max_file_size: u64,
+    remaining_bytes: &mut u64,
+    cancellation: &Cancellation,
+) -> Result<Value, CliError> {
+    let mode = match request.side {
+        FileSide::Old => file.old_mode,
+        FileSide::New => file.new_mode,
+        _ => return Err(CliError::Usage("unsupported context side".to_owned())),
+    };
+    if !mode_has_file_context(mode) {
+        return Ok(Value::Null);
+    }
     load_context_value(git, request, max_file_size, remaining_bytes, cancellation)
 }
 

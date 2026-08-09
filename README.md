@@ -148,13 +148,16 @@ Context retrieval does not widen and recompute the diff. `--expand-context N`
 adds a `hunk_context` to every returned hunk, loading `N` additional lines on
 both sides from the recorded immutable blob IDs (or from a hash-guarded
 working-tree side). `--full-file-context` adds complete old and new
-`file_context` responses to each eligible file. The same file and total-byte
+`file_context` responses to each eligible file. The same per-file and total-byte
 bounds apply across these responses, and a bound produces a named omission in
 the success payload rather than partial content. To expand an earlier response
 without recomputing even the base diff, narrow that response's `files` and
 `hunks` arrays and pass it through `--context-from <path|->`; immutable sides
 still resolve by their recorded blob IDs, while a changed working-tree side is
-refused as stale. For example:
+refused as stale. A submodule entry names a commit rather than a file blob, so
+its context side is `null` while any blob-backed side remains available. The
+replayed input already fixes the original diff width and file set, so
+`--context-lines` and `--max-files` are rejected in that mode. For example:
 
 ```sh
 harkness --json git diff --staged --project <selector> \

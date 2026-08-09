@@ -1245,7 +1245,7 @@ fn new_command_help_offers_every_diff_and_hunk_flag() {
 #[test]
 fn rejected_flag_combinations_are_usage_errors() {
     let fixture = TempDir::new().unwrap();
-    let cases: [&[&str]; 13] = [
+    let cases: [&[&str]; 15] = [
         &["--json", "git", "diff", "--staged", "--unstaged"],
         &["--json", "git", "diff", "--staged", "--commit", "HEAD"],
         &["--json", "git", "diff", "--parent", "HEAD"],
@@ -1264,6 +1264,26 @@ fn rejected_flag_combinations_are_usage_errors() {
             "--staged",
             "--expand-context",
             "2",
+            "--context-from",
+            "-",
+        ],
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--context-lines",
+            "4",
+            "--full-file-context",
+            "--context-from",
+            "-",
+        ],
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--max-files",
+            "1",
+            "--full-file-context",
             "--context-from",
             "-",
         ],
@@ -1631,6 +1651,126 @@ fn diff_context_and_intra_line_metadata_are_opt_in_and_bounded() {
         degraded["hunks"][0]["intra_line_degradation"]["kind"],
         "line_too_long"
     );
+}
+
+#[test]
+fn context_expansion_handles_gitlinks_and_rejects_unknown_replay_targets() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("gitlink-context-project");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    let gitlink = repository.head().unwrap().target().unwrap().to_string();
+    let cache_entry = format!("160000,{gitlink},README.md");
+    run_git(
+        &root,
+        &["update-index", "--cacheinfo", cache_entry.as_str()],
+    );
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+
+    let full = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--staged",
+            "--full-file-context",
+            "--project",
+            &project_id,
+        ],
+    );
+    assert_success(&full);
+    let full_file = &json_output(&full)["data"]["files"][0];
+    assert_eq!(full_file["change"], "type_changed");
+    assert_eq!(
+        full_file["context"]["old"]["lines"][0]["content"],
+        "fixture\n"
+    );
+    assert!(full_file["context"]["new"].is_null());
+
+    commit_index(&repository, "record gitlink");
+    let next_gitlink = repository.head().unwrap().target().unwrap().to_string();
+    let next_cache_entry = format!("160000,{next_gitlink},README.md");
+    run_git(
+        &root,
+        &["update-index", "--cacheinfo", next_cache_entry.as_str()],
+    );
+
+    let plain = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--staged",
+            "--project",
+            &project_id,
+        ],
+    );
+    assert_success(&plain);
+
+    let expanded = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--staged",
+            "--expand-context",
+            "2",
+            "--project",
+            &project_id,
+        ],
+    );
+    assert_success(&expanded);
+    let expanded_hunk = &json_output(&expanded)["data"]["files"][0]["hunks"][0];
+    assert!(expanded_hunk["context"]["old"].is_null());
+    assert!(expanded_hunk["context"]["new"].is_null());
+
+    let replayed = harkness_with_stdin(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--expand-context",
+            "2",
+            "--context-from",
+            "-",
+            "--project",
+            &project_id,
+        ],
+        &String::from_utf8(plain.stdout.clone()).unwrap(),
+    );
+    assert_success(&replayed);
+    let replayed_hunk = &json_output(&replayed)["data"]["files"][0]["hunks"][0];
+    assert!(replayed_hunk["context"]["old"].is_null());
+    assert!(replayed_hunk["context"]["new"].is_null());
+
+    let mut unsupported = json_output(&plain);
+    unsupported["data"]["files"][0]["target"] = json!("future_target");
+    let refused = harkness_with_stdin(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--expand-context",
+            "2",
+            "--context-from",
+            "-",
+            "--project",
+            &project_id,
+        ],
+        &unsupported.to_string(),
+    );
+    assert_eq!(refused.status.code(), Some(2));
+    assert_eq!(json_output(&refused)["error"]["kind"], "usage_error");
 }
 
 #[test]
@@ -3094,6 +3234,15 @@ fn commit_all(repository: &Repository, message: &str) {
     index
         .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
         .unwrap();
+    commit_from_index(repository, message, &mut index);
+}
+
+fn commit_index(repository: &Repository, message: &str) {
+    let mut index = repository.index().unwrap();
+    commit_from_index(repository, message, &mut index);
+}
+
+fn commit_from_index(repository: &Repository, message: &str, index: &mut git2::Index) {
     let tree_id = index.write_tree().unwrap();
     index.write().unwrap();
     let tree = repository.find_tree(tree_id).unwrap();
