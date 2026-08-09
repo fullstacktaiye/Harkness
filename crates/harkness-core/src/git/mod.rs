@@ -99,10 +99,15 @@ pub enum GitError {
     #[error("revision '{revision}' is ambiguous")]
     AmbiguousRevision { revision: String },
 
-    /// A history operation requires a commit, but the revision names another
-    /// kind of Git object.
+    /// A history or diff operation requires a commit, but the revision names
+    /// another kind of Git object.
     #[error("revision '{revision}' resolves to {id}, which is not a commit")]
     RevisionNotCommit { revision: String, id: git2::Oid },
+
+    /// A commit diff's explicit comparison revision is not one of the
+    /// commit's recorded parents.
+    #[error("revision '{parent}' is not a parent of commit '{revision}'")]
+    RevisionNotParent { revision: String, parent: String },
 
     /// Two revisions have no common ancestor.
     #[error("revisions '{one}' and '{two}' have no merge base")]
@@ -449,6 +454,7 @@ impl GitError {
         "revision_not_found",
         "ambiguous_revision",
         "revision_not_commit",
+        "revision_not_parent",
         "no_merge_base",
         "invalid_log_limit",
         "invalid_log_cursor",
@@ -509,6 +515,7 @@ impl GitError {
             Self::RevisionNotFound { .. } => "revision_not_found",
             Self::AmbiguousRevision { .. } => "ambiguous_revision",
             Self::RevisionNotCommit { .. } => "revision_not_commit",
+            Self::RevisionNotParent { .. } => "revision_not_parent",
             Self::NoMergeBase { .. } => "no_merge_base",
             Self::InvalidLogLimit => "invalid_log_limit",
             Self::InvalidLogCursor { .. } => "invalid_log_cursor",
@@ -707,13 +714,16 @@ impl GitService {
         history::merge_base(&self.root, one, two)
     }
 
-    /// Computes content differences on one side of the index.
+    /// Computes structured content differences for one target.
     ///
     /// [`DiffTarget::Staged`] compares `HEAD` (or the empty tree before the
     /// first commit) with the index. [`DiffTarget::Unstaged`] compares the
-    /// index with the working tree, including untracked files. The operation
-    /// runs entirely in process, takes no repository lock, and never mutates
-    /// the index while inspecting it.
+    /// index with the working tree, including untracked files. Revision targets
+    /// compare commit trees, a commit with its parent, a revision with the
+    /// working tree, or a branch with its merge-base. Every revision expression
+    /// uses the same resolver as [`Self::resolve_revision`]. The operation runs
+    /// entirely in process, takes no repository lock, and never mutates the
+    /// index while inspecting it.
     pub fn diff(
         &self,
         target: DiffTarget,
@@ -724,12 +734,12 @@ impl GitService {
 
     /// Computes several targets against one repository and index snapshot.
     ///
-    /// Records are returned in the order the targets are given. Prefer this to
-    /// two [`Self::diff`] calls whenever both sides of the index are wanted at
-    /// once: separate calls each re-read the index, so a concurrent write can
-    /// land between them and yield a pair of results that never coexisted.
-    /// [`DiffOptions`] budgets apply to the combined model rather than to each
-    /// target, so the whole response stays bounded.
+    /// Records are returned in the order the targets are given. Every target is
+    /// resolved through one open repository, and every index-backed target uses
+    /// the same open index. Prefer this to separate [`Self::diff`] calls when a
+    /// coherent multi-target view is needed. [`DiffOptions`] budgets apply to
+    /// the combined model rather than to each target, so the whole response
+    /// stays bounded.
     pub fn diff_snapshot(
         &self,
         targets: &[DiffTarget],
@@ -1322,6 +1332,13 @@ mod tests {
                     id: git2::Oid::ZERO_SHA1,
                 },
                 "revision_not_commit",
+            ),
+            (
+                GitError::RevisionNotParent {
+                    revision: "commit".to_owned(),
+                    parent: "unrelated".to_owned(),
+                },
+                "revision_not_parent",
             ),
             (
                 GitError::NoMergeBase {

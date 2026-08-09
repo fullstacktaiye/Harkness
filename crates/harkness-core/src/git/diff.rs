@@ -1,10 +1,11 @@
 //! Structured, byte-preserving repository content diffs.
 //!
-//! The index is the boundary here just as it is in [`super::DetailedStatus`]:
+//! Working-tree targets use the index boundary from [`super::DetailedStatus`]:
 //! staged content is `HEAD` to index, and unstaged content is index to working
-//! tree. This module deliberately uses libgit2 only. A diff is local,
-//! read-only inspection and must neither acquire the repository lock nor spawn
-//! system Git.
+//! tree. Revision targets reuse the history resolver and feed different tree
+//! pairs into the same bounded file, hunk and line projection. This module
+//! deliberately uses libgit2 only. A diff is local, read-only inspection and
+//! must neither acquire the repository lock nor spawn system Git.
 
 use std::{
     ffi::OsStr,
@@ -17,7 +18,7 @@ use git2::{
     ErrorCode, FileMode, ObjectType, Oid, Patch, Repository,
 };
 
-use crate::git::{FileChange, GitError, commit};
+use crate::git::{FileChange, GitError, commit, history};
 
 /// The default largest file whose content Harkness will put in a diff model.
 pub const DEFAULT_MAX_DIFF_FILE_SIZE: u64 = 1024 * 1024;
@@ -42,10 +43,7 @@ pub const DEFAULT_MAX_DIFF_FILES: usize = 5_000;
 /// The default number of unchanged lines surrounding each hunk.
 pub const DEFAULT_DIFF_CONTEXT_LINES: u32 = 3;
 
-/// Which side of the index to inspect.
-///
-/// This enum is intentionally non-exhaustive: revision and merge-base targets
-/// can be added without changing the file and hunk contracts.
+/// The two content states to compare.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum DiffTarget {
@@ -53,6 +51,22 @@ pub enum DiffTarget {
     Staged,
     /// Compare the index with the working tree, including untracked files.
     Unstaged,
+    /// Compare a commit with its first parent, or with `parent` when supplied.
+    /// A root commit is compared with the empty tree.
+    Commit {
+        revision: String,
+        parent: Option<String>,
+    },
+    /// Compare the trees named by two commit-ish revision expressions.
+    Revisions {
+        old_revision: String,
+        new_revision: String,
+    },
+    /// Compare a commit-ish revision with the index and working tree combined,
+    /// including untracked files.
+    RevisionAgainstWorktree { revision: String },
+    /// Compare a branch with its merge-base with `base_branch`.
+    BranchAgainstBase { branch: String, base_branch: String },
 }
 
 /// Bounds and optional path selection for one diff.
@@ -168,7 +182,7 @@ pub enum DiffOmission {
     Unrepresentable { detail: String },
 }
 
-/// One changed file on one side of the index.
+/// One changed file in one requested comparison.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct FileDiff {
@@ -264,10 +278,11 @@ pub(crate) fn compute(
 
 /// Computes several targets against one repository and index snapshot.
 ///
-/// Every target is read from the same open index, so a combined staged and
-/// unstaged model describes one moment. Computing the sides separately would
-/// let a concurrent index write land between them and produce a response that
-/// duplicates or drops a change while looking internally consistent.
+/// Every index-backed target is read from the same open index, so a combined
+/// staged, unstaged or revision-to-worktree model describes one moment.
+/// Computing those targets separately would let a concurrent index write land
+/// between them and produce a response that duplicates or drops a change while
+/// looking internally consistent.
 pub(crate) fn compute_targets(
     root: &Path,
     targets: &[DiffTarget],
@@ -350,6 +365,10 @@ fn collect_target(
     budget: &mut Budget,
     files: &mut Vec<FileDiff>,
 ) -> Result<(), GitError> {
+    let uses_worktree = matches!(
+        target,
+        DiffTarget::Unstaged | DiffTarget::RevisionAgainstWorktree { .. }
+    );
     let mut native_options = GitDiffOptions::new();
     native_options
         .context_lines(options.context_lines)
@@ -357,7 +376,7 @@ fn collect_target(
         // Supplying the index explicitly prevents libgit2 from refreshing it.
         .update_index(false)
         .max_size(options.max_file_size.min(i64::MAX as u64) as i64);
-    if matches!(target, DiffTarget::Unstaged) {
+    if uses_worktree {
         native_options
             .include_untracked(true)
             .recurse_untracked_dirs(true)
@@ -367,21 +386,67 @@ fn collect_target(
     let mut diff = match target {
         DiffTarget::Staged => {
             let head_tree = head_tree(repository, root)?;
-            repository.diff_tree_to_index(
-                head_tree.as_ref(),
-                Some(index),
-                Some(&mut native_options),
-            )
+            repository
+                .diff_tree_to_index(head_tree.as_ref(), Some(index), Some(&mut native_options))
+                .map_err(|source| inspection(root, source))
         }
-        DiffTarget::Unstaged => {
-            repository.diff_index_to_workdir(Some(index), Some(&mut native_options))
+        DiffTarget::Unstaged => repository
+            .diff_index_to_workdir(Some(index), Some(&mut native_options))
+            .map_err(|source| inspection(root, source)),
+        DiffTarget::Commit { revision, parent } => {
+            let (old_tree, new_tree) = commit_trees(repository, root, revision, parent.as_deref())?;
+            repository
+                .diff_tree_to_tree(
+                    old_tree.as_ref(),
+                    Some(&new_tree),
+                    Some(&mut native_options),
+                )
+                .map_err(|source| inspection(root, source))
         }
-    }
-    .map_err(|source| inspection(root, source))?;
+        DiffTarget::Revisions {
+            old_revision,
+            new_revision,
+        } => {
+            let (_, old_tree) = revision_tree(repository, root, old_revision)?;
+            let (_, new_tree) = revision_tree(repository, root, new_revision)?;
+            repository
+                .diff_tree_to_tree(Some(&old_tree), Some(&new_tree), Some(&mut native_options))
+                .map_err(|source| inspection(root, source))
+        }
+        DiffTarget::RevisionAgainstWorktree { revision } => {
+            let (_, old_tree) = revision_tree(repository, root, revision)?;
+            // Build the combined comparison from the index object already
+            // opened for this snapshot. `diff_tree_to_workdir_with_index`
+            // would reopen it, allowing concurrent index writes to make two
+            // targets in one response describe different moments.
+            let mut diff = repository
+                .diff_tree_to_index(Some(&old_tree), Some(index), Some(&mut native_options))
+                .map_err(|source| inspection(root, source))?;
+            let worktree = repository
+                .diff_index_to_workdir(Some(index), Some(&mut native_options))
+                .map_err(|source| inspection(root, source))?;
+            diff.merge(&worktree)
+                .map_err(|source| inspection(root, source))?;
+            Ok(diff)
+        }
+        DiffTarget::BranchAgainstBase {
+            branch,
+            base_branch,
+        } => {
+            let (base_tree, branch_tree) = branch_trees(repository, root, branch, base_branch)?;
+            repository
+                .diff_tree_to_tree(
+                    Some(&base_tree),
+                    Some(&branch_tree),
+                    Some(&mut native_options),
+                )
+                .map_err(|source| inspection(root, source))
+        }
+    }?;
 
     let mut find = DiffFindOptions::new();
     find.renames(true);
-    if matches!(target, DiffTarget::Unstaged) {
+    if uses_worktree {
         find.for_untracked(true);
     }
     diff.find_similar(Some(&mut find))
@@ -631,6 +696,77 @@ fn head_tree<'repository>(
     }
 }
 
+fn revision_tree<'repository>(
+    repository: &'repository Repository,
+    root: &Path,
+    revision: &str,
+) -> Result<(Oid, git2::Tree<'repository>), GitError> {
+    let id = history::require_commit(repository, root, revision)?;
+    let tree = repository
+        .find_commit(id)
+        .and_then(|commit| commit.tree())
+        .map_err(|source| inspection(root, source))?;
+    Ok((id, tree))
+}
+
+fn commit_trees<'repository>(
+    repository: &'repository Repository,
+    root: &Path,
+    revision: &str,
+    parent: Option<&str>,
+) -> Result<(Option<git2::Tree<'repository>>, git2::Tree<'repository>), GitError> {
+    let commit_id = history::require_commit(repository, root, revision)?;
+    let commit = repository
+        .find_commit(commit_id)
+        .map_err(|source| inspection(root, source))?;
+    let parent_id = match parent {
+        Some(parent) => {
+            let parent_id = history::require_commit(repository, root, parent)?;
+            if !commit.parent_ids().any(|candidate| candidate == parent_id) {
+                return Err(GitError::RevisionNotParent {
+                    revision: revision.to_owned(),
+                    parent: parent.to_owned(),
+                });
+            }
+            Some(parent_id)
+        }
+        None => commit.parent_ids().next(),
+    };
+    let old_tree = parent_id
+        .map(|parent_id| {
+            repository
+                .find_commit(parent_id)
+                .and_then(|parent| parent.tree())
+                .map_err(|source| inspection(root, source))
+        })
+        .transpose()?;
+    let new_tree = commit.tree().map_err(|source| inspection(root, source))?;
+    Ok((old_tree, new_tree))
+}
+
+fn branch_trees<'repository>(
+    repository: &'repository Repository,
+    root: &Path,
+    branch: &str,
+    base_branch: &str,
+) -> Result<(git2::Tree<'repository>, git2::Tree<'repository>), GitError> {
+    // Resolve both moving names once so the old and new trees belong to one
+    // coherent branch snapshot.
+    let branch_id = history::require_commit(repository, root, branch)?;
+    let base_id = history::require_commit(repository, root, base_branch)?;
+    let merge_base =
+        history::merge_base_ids(repository, root, branch_id, base_id, branch, base_branch)?;
+    let base_tree = repository
+        .find_commit(merge_base)
+        .and_then(|commit| commit.tree())
+        .map_err(|source| inspection(root, source))?;
+    let branch_tree = repository
+        .find_commit(branch_id)
+        .and_then(|commit| commit.tree())
+        .map_err(|source| inspection(root, source))?;
+    Ok((base_tree, branch_tree))
+}
+
 /// Collects a patch's hunks, stopping once `limit` content bytes are reached.
 ///
 /// `Ok(None)` means the budget ran out. The check happens while lines are read
@@ -703,7 +839,12 @@ fn blob_id(
     if !file.exists() || (file.is_valid_id() && !file.id().is_zero()) {
         return (file.id().to_string(), None);
     }
-    if matches!(target, DiffTarget::Unstaged) && new_side && file.mode() != FileMode::Commit {
+    if matches!(
+        target,
+        DiffTarget::Unstaged | DiffTarget::RevisionAgainstWorktree { .. }
+    ) && new_side
+        && file.mode() != FileMode::Commit
+    {
         let Some(path) = path else {
             return (
                 file.id().to_string(),
@@ -852,7 +993,7 @@ fn malformed(detail: impl Into<String>) -> GitError {
 mod tests {
     use std::{fs, path::Path};
 
-    use git2::Repository;
+    use git2::{ObjectType, Oid, Repository};
 
     use super::{DiffLineKind, DiffOmission, DiffOptions, DiffTarget, FileDiff, Hunk};
     use crate::{
@@ -953,6 +1094,314 @@ mod tests {
         );
         assert_eq!(files[0].hunks.len(), 1);
         assert_eq!(added_lines(&files[0]), vec![b"THREE\n".to_vec()]);
+    }
+
+    #[test]
+    fn a_commit_diff_matches_git_show_for_every_file_change() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("commit-diff");
+        let repository = initialize_repository(&root);
+        fs::write(root.join("deleted.txt"), b"deleted content\n").unwrap();
+        fs::write(
+            root.join("old-name.txt"),
+            b"one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n",
+        )
+        .unwrap();
+        commit_all(&repository, "prepare every change kind");
+        let parent = repository.head().unwrap().target().unwrap();
+
+        fs::write(root.join("tracked.txt"), b"modified content\n").unwrap();
+        fs::remove_file(root.join("deleted.txt")).unwrap();
+        fs::rename(root.join("old-name.txt"), root.join("new-name.txt")).unwrap();
+        fs::write(
+            root.join("new-name.txt"),
+            b"one\ntwo\nTHREE\nfour\nfive\nsix\nseven\neight\n",
+        )
+        .unwrap();
+        fs::write(root.join("added.txt"), b"added content\n").unwrap();
+        commit_all(&repository, "change every file kind");
+        let commit = repository.head().unwrap().target().unwrap();
+        let target = DiffTarget::Commit {
+            revision: commit.to_string(),
+            parent: None,
+        };
+        let service = GitService::new(&root, &fixture.data_dir);
+
+        let files = service
+            .diff(target.clone(), &DiffOptions::default())
+            .unwrap();
+
+        assert_eq!(
+            model_name_status(&files),
+            git_show_name_status(&root, &commit.to_string())
+        );
+        assert_eq!(
+            added_lines(named(&files, Path::new("added.txt"))),
+            vec![b"added content\n".to_vec()]
+        );
+        assert_eq!(
+            deleted_lines(named(&files, Path::new("deleted.txt"))),
+            vec![b"deleted content\n".to_vec()]
+        );
+        assert_eq!(
+            added_lines(named(&files, Path::new("tracked.txt"))),
+            vec![b"modified content\n".to_vec()]
+        );
+        assert_eq!(
+            added_lines(named(&files, Path::new("new-name.txt"))),
+            vec![b"THREE\n".to_vec()]
+        );
+
+        let pair_target = DiffTarget::Revisions {
+            old_revision: parent.to_string(),
+            new_revision: commit.to_string(),
+        };
+        let mut pair = service.diff(pair_target, &DiffOptions::default()).unwrap();
+        for file in &mut pair {
+            file.target = target.clone();
+        }
+        assert_eq!(pair, files, "revision pairs must use the same projection");
+        assert!(!fixture.data_dir.exists(), "a revision diff took a lock");
+    }
+
+    #[test]
+    fn merge_commit_defaults_to_first_parent_and_accepts_a_named_second_parent() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("merge-commit-diff");
+        let repository = initialize_repository(&root);
+        let unrelated_ancestor = repository.head().unwrap().target().unwrap();
+
+        git(&root, ["checkout", "-b", "side"]);
+        fs::write(root.join("side.txt"), b"side\n").unwrap();
+        commit_all(&repository, "side change");
+        git(&root, ["checkout", "main"]);
+        fs::write(root.join("main.txt"), b"main\n").unwrap();
+        commit_all(&repository, "main change");
+        git(&root, ["merge", "--no-ff", "side", "-m", "merge side"]);
+        let merge = repository.head().unwrap().target().unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+
+        let first_parent = service
+            .diff(
+                DiffTarget::Commit {
+                    revision: merge.to_string(),
+                    parent: None,
+                },
+                &DiffOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(first_parent.len(), 1, "{first_parent:#?}");
+        assert_eq!(
+            first_parent[0].new_path.as_deref(),
+            Some(Path::new("side.txt"))
+        );
+
+        let second_parent = service
+            .diff(
+                DiffTarget::Commit {
+                    revision: merge.to_string(),
+                    parent: Some("side".to_owned()),
+                },
+                &DiffOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(second_parent.len(), 1, "{second_parent:#?}");
+        assert_eq!(
+            second_parent[0].new_path.as_deref(),
+            Some(Path::new("main.txt"))
+        );
+
+        assert!(matches!(
+            service.diff(
+                DiffTarget::Commit {
+                    revision: merge.to_string(),
+                    parent: Some(unrelated_ancestor.to_string()),
+                },
+                &DiffOptions::default(),
+            ),
+            Err(GitError::RevisionNotParent { revision, parent })
+                if revision == merge.to_string() && parent == unrelated_ancestor.to_string()
+        ));
+    }
+
+    #[test]
+    fn a_root_commit_is_compared_with_the_empty_tree() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("root-commit-diff");
+        let repository = Repository::init(&root).unwrap();
+        repository.set_head("refs/heads/main").unwrap();
+        configure_commit_identity(&repository);
+        fs::write(root.join("first.txt"), b"first\n").unwrap();
+        fs::write(root.join("second.txt"), b"second\n").unwrap();
+        commit_all(&repository, "root");
+        let root_commit = repository.head().unwrap().target().unwrap();
+
+        let files = GitService::new(&root, &fixture.data_dir)
+            .diff(
+                DiffTarget::Commit {
+                    revision: root_commit.to_string(),
+                    parent: None,
+                },
+                &DiffOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|file| file.change == FileChange::Added));
+        assert!(
+            files
+                .iter()
+                .all(|file| file.old_blob_id.chars().all(|byte| byte == '0'))
+        );
+        assert!(files.iter().all(|file| !file.hunks.is_empty()));
+    }
+
+    #[test]
+    fn branch_diff_uses_the_merge_base_when_the_base_has_moved() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("branch-merge-base-diff");
+        let repository = initialize_repository(&root);
+
+        git(&root, ["checkout", "-b", "feature"]);
+        fs::write(root.join("feature-only.txt"), b"feature\n").unwrap();
+        commit_all(&repository, "feature change");
+        git(&root, ["checkout", "main"]);
+        fs::write(root.join("base-only.txt"), b"base moved\n").unwrap();
+        commit_all(&repository, "base change");
+
+        let files = GitService::new(&root, &fixture.data_dir)
+            .diff(
+                DiffTarget::BranchAgainstBase {
+                    branch: "feature".to_owned(),
+                    base_branch: "main".to_owned(),
+                },
+                &DiffOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(files.len(), 1, "{files:#?}");
+        assert_eq!(files[0].change, FileChange::Added);
+        assert_eq!(
+            files[0].new_path.as_deref(),
+            Some(Path::new("feature-only.txt"))
+        );
+    }
+
+    #[test]
+    fn revision_against_worktree_blends_index_worktree_and_untracked_edits() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("revision-worktree-diff");
+        let repository = initialize_repository(&root);
+        let revision = repository.head().unwrap().target().unwrap();
+        fs::write(root.join("tracked.txt"), b"staged\n").unwrap();
+        stage(&repository, Path::new("tracked.txt"));
+        fs::write(root.join("tracked.txt"), b"worktree\n").unwrap();
+        fs::write(root.join("untracked.txt"), b"untracked\n").unwrap();
+
+        let files = GitService::new(&root, &fixture.data_dir)
+            .diff(
+                DiffTarget::RevisionAgainstWorktree {
+                    revision: revision.to_string(),
+                },
+                &DiffOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(files.len(), 2, "{files:#?}");
+        let tracked = named(&files, Path::new("tracked.txt"));
+        assert_eq!(added_lines(tracked), vec![b"worktree\n".to_vec()]);
+        assert_eq!(
+            tracked.new_blob_id,
+            Oid::hash_object_ext(ObjectType::Blob, b"worktree\n", repository.object_format(),)
+                .unwrap()
+                .to_string(),
+            "the merged target must identify final worktree bytes, not the index blob"
+        );
+        let untracked = named(&files, Path::new("untracked.txt"));
+        assert_eq!(untracked.change, FileChange::Untracked);
+        assert_eq!(added_lines(untracked), vec![b"untracked\n".to_vec()]);
+        assert!(!fixture.data_dir.exists(), "a worktree diff took a lock");
+    }
+
+    #[test]
+    fn revision_targets_keep_binary_and_named_size_degradation() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("bounded-revision-diff");
+        let repository = initialize_repository(&root);
+        fs::write(root.join("binary.dat"), b"old\0").unwrap();
+        fs::write(root.join("large.txt"), b"small\n").unwrap();
+        commit_all(&repository, "revision baseline");
+        let old = repository.head().unwrap().target().unwrap();
+        fs::write(root.join("binary.dat"), b"new\0more").unwrap();
+        fs::write(root.join("large.txt"), b"0123456789abcdef\n").unwrap();
+        commit_all(&repository, "revision content");
+        let new = repository.head().unwrap().target().unwrap();
+
+        let files = GitService::new(&root, &fixture.data_dir)
+            .diff(
+                DiffTarget::Revisions {
+                    old_revision: old.to_string(),
+                    new_revision: new.to_string(),
+                },
+                &DiffOptions::default().with_max_file_size(10),
+            )
+            .unwrap();
+        let binary = named(&files, Path::new("binary.dat"));
+        let large = named(&files, Path::new("large.txt"));
+
+        assert!(binary.binary);
+        assert_eq!((binary.old_size, binary.new_size), (4, 8));
+        assert!(binary.hunks.is_empty());
+        assert_eq!(
+            large.omission,
+            Some(DiffOmission::FileTooLarge { limit: 10 })
+        );
+        assert!(!large.binary);
+        assert!(large.hunks.is_empty());
+    }
+
+    #[test]
+    fn revision_targets_reuse_typed_resolution_and_validate_paths_first() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("revision-errors");
+        let repository = initialize_repository(&root);
+        let service = GitService::new(&root, &fixture.data_dir);
+
+        assert!(matches!(
+            service.diff(
+                DiffTarget::Commit {
+                    revision: "missing".to_owned(),
+                    parent: None,
+                },
+                &DiffOptions::default(),
+            ),
+            Err(GitError::RevisionNotFound { revision }) if revision == "missing"
+        ));
+
+        let blob = repository.blob(b"not a commit").unwrap();
+        assert!(matches!(
+            service.diff(
+                DiffTarget::Revisions {
+                    old_revision: blob.to_string(),
+                    new_revision: "HEAD".to_owned(),
+                },
+                &DiffOptions::default(),
+            ),
+            Err(GitError::RevisionNotCommit { revision, id })
+                if revision == blob.to_string() && id == blob
+        ));
+
+        assert!(matches!(
+            service.diff(
+                DiffTarget::Commit {
+                    revision: "still-missing".to_owned(),
+                    parent: None,
+                },
+                &DiffOptions::default().with_paths(["../outside.txt"]),
+            ),
+            Err(GitError::PathOutsideRepository { path, .. })
+                if path == Path::new("../outside.txt")
+        ));
     }
 
     #[test]
@@ -1222,13 +1671,28 @@ mod tests {
         stage(&repository, Path::new("tracked.txt"));
         fs::write(root.join("tracked.txt"), b"worktree\n").unwrap();
 
-        let files = GitService::new(&root, &fixture.data_dir)
+        let service = GitService::new(&root, &fixture.data_dir);
+        let expected = service
+            .diff(DiffTarget::Staged, &DiffOptions::default())
+            .unwrap()
+            .into_iter()
+            .chain(
+                service
+                    .diff(DiffTarget::Unstaged, &DiffOptions::default())
+                    .unwrap(),
+            )
+            .collect::<Vec<_>>();
+        let files = service
             .diff_snapshot(
                 &[DiffTarget::Staged, DiffTarget::Unstaged],
                 &DiffOptions::default(),
             )
             .unwrap();
 
+        assert_eq!(
+            files, expected,
+            "legacy target records changed byte-for-byte"
+        );
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].target, DiffTarget::Staged);
         assert_eq!(files[1].target, DiffTarget::Unstaged);
@@ -1347,6 +1811,70 @@ mod tests {
             .filter(|line| line.kind == DiffLineKind::Addition)
             .map(|line| line.content.clone())
             .collect()
+    }
+
+    fn deleted_lines(file: &FileDiff) -> Vec<Vec<u8>> {
+        file.hunks
+            .iter()
+            .flat_map(|hunk| &hunk.lines)
+            .filter(|line| line.kind == DiffLineKind::Deletion)
+            .map(|line| line.content.clone())
+            .collect()
+    }
+
+    fn model_name_status(files: &[FileDiff]) -> Vec<(char, String, Option<String>)> {
+        let display = |path: Option<&Path>| {
+            path.unwrap_or_else(|| panic!("a present diff side has no path in {files:#?}"))
+                .to_string_lossy()
+                .into_owned()
+        };
+        let mut status = files
+            .iter()
+            .map(|file| match file.change {
+                FileChange::Added => ('A', display(file.new_path.as_deref()), None),
+                FileChange::Deleted => ('D', display(file.old_path.as_deref()), None),
+                FileChange::Modified => ('M', display(file.new_path.as_deref()), None),
+                FileChange::Renamed => (
+                    'R',
+                    display(file.old_path.as_deref()),
+                    Some(display(file.new_path.as_deref())),
+                ),
+                other => panic!("unexpected {other:?} change in git-show fixture"),
+            })
+            .collect::<Vec<_>>();
+        status.sort();
+        status
+    }
+
+    fn git_show_name_status(root: &Path, revision: &str) -> Vec<(char, String, Option<String>)> {
+        let output = git(
+            root,
+            [
+                "show",
+                "--format=",
+                "--find-renames=50%",
+                "--name-status",
+                revision,
+                "--",
+            ],
+        );
+        let mut status = output
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let mut fields = line.split('\t');
+                let marker = fields.next().unwrap();
+                let kind = marker.chars().next().unwrap();
+                let first = fields.next().unwrap().to_owned();
+                if matches!(kind, 'R' | 'C') {
+                    (kind, first, Some(fields.next().unwrap().to_owned()))
+                } else {
+                    (kind, first, None)
+                }
+            })
+            .collect::<Vec<_>>();
+        status.sort();
+        status
     }
 
     fn render_patch(file: &FileDiff) -> Vec<u8> {
