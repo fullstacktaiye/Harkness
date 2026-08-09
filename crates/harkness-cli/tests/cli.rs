@@ -1,11 +1,12 @@
 use std::{
     collections::BTreeSet,
     fs,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use git2::{Repository, Signature};
 use harkness_core::{Project, ProjectService};
 use serde_json::{Value, json};
@@ -28,7 +29,7 @@ fn version_output_is_exact_and_remains_text_with_json() {
 #[test]
 fn no_arguments_is_a_usage_error_with_no_stdout() {
     let fixture = TempDir::new().unwrap();
-    let output = harkness(fixture.path(), &[]);
+    let output = harkness::<&str>(fixture.path(), &[]);
 
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
@@ -545,6 +546,24 @@ fn git_and_worktree_commands_round_trip_end_to_end_through_json() {
 
     let moved_parent = fixture.path().join("cli-moved-worktrees");
     fs::create_dir(&moved_parent).unwrap();
+    let occupied_checkout = moved_parent.join("occupied");
+    fs::create_dir(&occupied_checkout).unwrap();
+    let occupied_move = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "worktree",
+            "move",
+            occupied_checkout.to_str().unwrap(),
+            "--project",
+            &worktree_id,
+        ],
+    );
+    assert_eq!(occupied_move.status.code(), Some(5));
+    assert_eq!(
+        json_output(&occupied_move)["error"]["kind"],
+        "worktree_destination_exists"
+    );
     let requested_checkout = moved_parent.join("checkout");
     let moved = harkness(
         &data_dir,
@@ -978,6 +997,173 @@ fn git_and_worktree_commands_round_trip_end_to_end_through_json() {
 }
 
 #[test]
+fn structured_diff_reports_both_sides_binary_renames_and_lossless_lines() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("diff-project");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    fs::write(root.join("staged.txt"), b"staged before\n").unwrap();
+    fs::write(root.join("unstaged.txt"), b"unstaged before\n").unwrap();
+    fs::write(root.join("binary.bin"), b"before\0bytes").unwrap();
+    fs::write(root.join("old-name.txt"), b"rename me\n").unwrap();
+    fs::write(root.join("encoded.txt"), b"before\xff\n").unwrap();
+    commit_all(&repository, "prepare diff fixture");
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+
+    fs::write(root.join("staged.txt"), b"staged after\n").unwrap();
+    run_git(&root, &["add", "--", "staged.txt"]);
+    fs::write(root.join("unstaged.txt"), b"unstaged after\n").unwrap();
+    fs::write(root.join("binary.bin"), b"after\0bytes").unwrap();
+    fs::rename(root.join("old-name.txt"), root.join("new-name.txt")).unwrap();
+    run_git(&root, &["add", "--", "old-name.txt", "new-name.txt"]);
+    fs::write(root.join("encoded.txt"), b"after\xfe\n").unwrap();
+
+    let output = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--project",
+            &project.id.to_string(),
+        ],
+    );
+
+    assert_success(&output);
+    assert!(output.stderr.is_empty());
+    let body = json_output(&output);
+    assert_envelope(&body, "success", true);
+    let files = body["data"]["files"].as_array().unwrap();
+    assert!(files.iter().any(|file| {
+        file["target"] == "staged" && file["new_path"] == "staged.txt" && file["binary"] == false
+    }));
+    assert!(files.iter().any(|file| {
+        file["target"] == "unstaged"
+            && file["new_path"] == "unstaged.txt"
+            && file["binary"] == false
+    }));
+    let binary = files
+        .iter()
+        .find(|file| file["new_path"] == "binary.bin")
+        .expect("binary diff is present");
+    assert_eq!(binary["binary"], true);
+    assert!(binary["hunks"].as_array().unwrap().is_empty());
+    assert!(files.iter().any(|file| {
+        file["change"] == "renamed"
+            && file["old_path"] == "old-name.txt"
+            && file["new_path"] == "new-name.txt"
+    }));
+
+    let encoded = files
+        .iter()
+        .find(|file| file["new_path"] == "encoded.txt")
+        .expect("non-UTF-8 diff is present");
+    let encoded_lines = encoded["hunks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|hunk| hunk["lines"].as_array().unwrap())
+        .filter(|line| line["content_encoding"] == "base64")
+        .map(|line| BASE64.decode(line["content"].as_str().unwrap()).unwrap())
+        .collect::<Vec<_>>();
+    assert!(encoded_lines.contains(&b"before\xff\n".to_vec()));
+    assert!(encoded_lines.contains(&b"after\xfe\n".to_vec()));
+}
+
+#[test]
+fn diff_hunk_flags_stage_unstage_and_refuse_a_stale_selection() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("hunk-project");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    let original = b"one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nfourteen\nfifteen\n";
+    let changed = b"one\nTWO\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nFOURTEEN\nfifteen\n";
+    fs::write(root.join("tracked.txt"), original).unwrap();
+    commit_all(&repository, "prepare hunk fixture");
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+    fs::write(root.join("tracked.txt"), changed).unwrap();
+
+    let unstaged = diff_file(&data_dir, &project_id, "--unstaged", "tracked.txt");
+    assert_eq!(unstaged["hunks"].as_array().unwrap().len(), 2);
+    let stage_arguments = hunk_arguments("stage", &project_id, &unstaged, 0);
+    let staged = harkness(&data_dir, &stage_arguments);
+    assert_success(&staged);
+
+    let status = harkness(
+        &data_dir,
+        &["--json", "git", "status", "--project", &project_id],
+    );
+    let tracked = json_output(&status)["data"]["status"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == "tracked.txt")
+        .cloned()
+        .unwrap();
+    assert_eq!(tracked["staged"], "modified");
+    assert_eq!(tracked["unstaged"], "modified");
+
+    let staged_file = diff_file(&data_dir, &project_id, "--staged", "tracked.txt");
+    let unstage_arguments = hunk_arguments("unstage", &project_id, &staged_file, 0);
+    let unstaged_again = harkness(&data_dir, &unstage_arguments);
+    assert_success(&unstaged_again);
+    let staged_after_unstage = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--staged",
+            "--project",
+            &project_id,
+        ],
+    );
+    assert!(
+        json_output(&staged_after_unstage)["data"]["files"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    assert_success(&harkness(&data_dir, &stage_arguments));
+    fs::write(
+        root.join("tracked.txt"),
+        b"one\nTWO AGAIN\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nFOURTEEN\nfifteen\n",
+    )
+    .unwrap();
+    let stale = harkness(&data_dir, &stage_arguments);
+    assert_eq!(stale.status.code(), Some(3));
+    let stale_body = json_output(&stale);
+    assert_eq!(stale_body["error"]["kind"], "stale_hunk_selection");
+    assert_eq!(stale_body["error"]["details"]["path"], "tracked.txt");
+
+    // Unstaging revalidates the same way. The selection is captured, the index
+    // is then moved underneath it, and the refusal must arrive before any
+    // write rather than after a patch is applied to the wrong content.
+    let staged_now = diff_file(&data_dir, &project_id, "--staged", "tracked.txt");
+    let unstage_stale = hunk_arguments("unstage", &project_id, &staged_now, 0);
+    assert_success(&harkness(
+        &data_dir,
+        &["--json", "git", "stage", "--all", "--project", &project_id],
+    ));
+    let refused = harkness(&data_dir, &unstage_stale);
+    assert_eq!(refused.status.code(), Some(3));
+    assert_eq!(
+        json_output(&refused)["error"]["kind"],
+        "stale_hunk_selection"
+    );
+}
+
+#[test]
 fn selector_help_is_exposed_only_where_it_is_accepted() {
     let fixture = TempDir::new().unwrap();
     let list_help = harkness(fixture.path(), &["project", "list", "--help"]);
@@ -1004,6 +1190,777 @@ fn selector_help_is_exposed_only_where_it_is_accepted() {
     assert_eq!(json_output(&root_selector)["error"]["kind"], "usage_error");
 }
 
+/// Help is checked for the flags it must offer, not for the prose around them.
+/// Both mutating commands flatten the same hunk arguments, so both are checked.
+#[test]
+fn new_command_help_offers_every_diff_and_hunk_flag() {
+    let fixture = TempDir::new().unwrap();
+    let diff_help =
+        String::from_utf8(harkness(fixture.path(), &["git", "diff", "--help"]).stdout).unwrap();
+    for flag in [
+        "--staged",
+        "--unstaged",
+        "--context-lines",
+        "--max-file-size",
+        "--max-total-bytes",
+        "--max-files",
+    ] {
+        assert!(diff_help.contains(flag), "git diff --help lacks {flag}");
+    }
+
+    for command in ["stage", "unstage"] {
+        let help = String::from_utf8(harkness(fixture.path(), &["git", command, "--help"]).stdout)
+            .unwrap();
+        for flag in [
+            "--hunk",
+            "--hunk-selection",
+            "--old-path",
+            "--old-path-base64",
+            "--new-path-base64",
+            "--old-blob-id",
+            "--new-lines",
+        ] {
+            assert!(help.contains(flag), "git {command} --help lacks {flag}");
+        }
+    }
+}
+
+/// Every flag combination the argument grammar forbids has to be a usage error
+/// rather than a surprising success, and every one of them exits 2.
+#[test]
+fn rejected_flag_combinations_are_usage_errors() {
+    let fixture = TempDir::new().unwrap();
+    let cases: [&[&str]; 6] = [
+        &["--json", "git", "diff", "--staged", "--unstaged"],
+        &["--json", "git", "diff", "--context-lines", "100001"],
+        &["--json", "git", "stage", "--hunk"],
+        &["--json", "git", "stage", "--hunk", "--all"],
+        &["--json", "git", "stage", "--hunk", "some-path.txt"],
+        &["--json", "git", "unstage", "--hunk-selection", "-", "path"],
+    ];
+    for arguments in cases {
+        let output = harkness(fixture.path(), arguments);
+        assert_eq!(output.status.code(), Some(2), "for {arguments:?}");
+        assert_eq!(
+            json_output(&output)["error"]["kind"],
+            "usage_error",
+            "for {arguments:?}"
+        );
+    }
+
+    // The first line of a clap diagnostic names no argument, so the list that
+    // follows it has to survive as data or the message is unactionable.
+    let missing = harkness(fixture.path(), &["--json", "git", "stage", "--hunk"]);
+    let listed = json_output(&missing)["error"]["details"]["missing"]
+        .as_array()
+        .expect("the missing arguments are reported as data")
+        .iter()
+        .map(|value| value.as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        listed.iter().any(|line| line.contains("--old-blob-id")),
+        "missing list is unhelpful: {listed:?}"
+    );
+}
+
+/// An unresolved merge is where an agent most needs a diff, and the index has
+/// no resolved blob for the conflicted path. The command must still succeed,
+/// name the conflict, and return every other file's content.
+#[test]
+fn a_merge_conflict_is_named_without_failing_the_whole_diff() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("conflict-project");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    fs::write(root.join("conflict.txt"), b"base\n").unwrap();
+    fs::write(root.join("clean.txt"), b"base\n").unwrap();
+    commit_all(&repository, "base");
+    run_git(&root, &["checkout", "-b", "side"]);
+    fs::write(root.join("conflict.txt"), b"side\n").unwrap();
+    commit_all(&repository, "side");
+    run_git(&root, &["checkout", "main"]);
+    fs::write(root.join("conflict.txt"), b"main\n").unwrap();
+    commit_all(&repository, "main");
+    Command::new("git")
+        .args(["merge", "side"])
+        .current_dir(&root)
+        .output()
+        .expect("git merge should run");
+    fs::write(root.join("clean.txt"), b"edited\n").unwrap();
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+
+    let output = harkness(
+        &data_dir,
+        &["--json", "git", "diff", "--project", &project_id],
+    );
+
+    assert_success(&output);
+    let files = json_output(&output)["data"]["files"]
+        .as_array()
+        .cloned()
+        .unwrap();
+    let unmerged = files
+        .iter()
+        .filter(|file| file["change"] == "unmerged")
+        .collect::<Vec<_>>();
+    assert!(!unmerged.is_empty(), "the conflict is missing: {files:#?}");
+    for file in unmerged {
+        assert_eq!(file["omission"]["kind"], "unmerged");
+        assert!(file["hunks"].as_array().unwrap().is_empty());
+    }
+    let clean = files
+        .iter()
+        .find(|file| file["new_path"] == "clean.txt")
+        .expect("an unrelated file survived the conflict");
+    assert!(clean["omission"].is_null());
+    assert!(!clean["hunks"].as_array().unwrap().is_empty());
+}
+
+/// Each diff bound has to reach core and be reported when it bites, or the
+/// flags are decoration and a wiring mistake ships green.
+#[test]
+fn diff_bounds_narrow_the_response_and_name_what_they_withheld() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("bounded-project");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    let body = (1..=30)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    for name in ["first.txt", "second.txt", "third.txt"] {
+        fs::write(root.join(name), body.as_bytes()).unwrap();
+    }
+    commit_all(&repository, "add bounded files");
+    for name in ["first.txt", "second.txt", "third.txt"] {
+        fs::write(root.join(name), body.replace("line 15\n", "CHANGED\n")).unwrap();
+    }
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+    let files = |arguments: &[&str]| {
+        let mut all = vec!["--json", "git", "diff", "--unstaged"];
+        all.extend_from_slice(arguments);
+        all.extend(["--project", &project_id]);
+        let output = harkness(&data_dir, &all);
+        assert_success(&output);
+        json_output(&output)["data"]["files"]
+            .as_array()
+            .cloned()
+            .unwrap()
+    };
+
+    assert_eq!(files(&[]).len(), 3);
+    let narrowed = files(&["second.txt"]);
+    assert_eq!(narrowed.len(), 1, "the path argument did not narrow");
+    assert_eq!(narrowed[0]["new_path"], "second.txt");
+
+    let tight = &files(&["--context-lines", "1", "second.txt"])[0]["hunks"][0];
+    let wide = &files(&["--context-lines", "5", "second.txt"])[0]["hunks"][0];
+    assert_eq!(tight["old_lines"], 3);
+    assert_eq!(wide["old_lines"], 11);
+
+    let sized = files(&["--max-file-size", "10"]);
+    assert_eq!(sized.len(), 3, "a bounded file must still be listed");
+    for file in &sized {
+        assert_eq!(file["omission"]["kind"], "file_too_large");
+        assert_eq!(file["omission"]["limit"], 10);
+        assert!(file["hunks"].as_array().unwrap().is_empty());
+    }
+
+    let counted = files(&["--max-files", "1"]);
+    assert_eq!(counted.len(), 3);
+    assert_eq!(
+        counted
+            .iter()
+            .filter(|file| file["omission"]["kind"] == "file_budget_exhausted")
+            .count(),
+        2
+    );
+
+    let budgeted = files(&["--max-total-bytes", "60"]);
+    assert_eq!(budgeted.len(), 3);
+    assert!(
+        budgeted
+            .iter()
+            .any(|file| file["omission"]["kind"] == "content_budget_exhausted"),
+        "the content budget never reported itself: {budgeted:#?}"
+    );
+}
+
+/// Staging one hunk rewrites the index and shifts every other selection taken
+/// from the same diff, so a batch has to be expressible in one atomic call.
+/// The document is `git diff` output with the unwanted hunks removed.
+#[test]
+fn a_selection_document_stages_several_hunks_atomically() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("batch-project");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    let original = (1..=30)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    fs::write(root.join("tracked.txt"), original.as_bytes()).unwrap();
+    commit_all(&repository, "add tracked");
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+    let changed = original
+        .replace("line 2\n", "FIRST\n")
+        .replace("line 15\n", "SECOND\n")
+        .replace("line 28\n", "THIRD\n");
+    fs::write(root.join("tracked.txt"), changed.as_bytes()).unwrap();
+
+    let mut file = diff_file(&data_dir, &project_id, "--unstaged", "tracked.txt");
+    assert_eq!(file["hunks"].as_array().unwrap().len(), 3);
+    let hunks = file["hunks"].as_array().unwrap().clone();
+    file["hunks"] = json!([hunks[0], hunks[2]]);
+    let document = json!({ "files": [file] }).to_string();
+    let document_path = fixture.path().join("selection.json");
+    fs::write(&document_path, &document).unwrap();
+
+    let staged = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "stage",
+            "--hunk-selection",
+            document_path.to_str().unwrap(),
+            "--project",
+            &project_id,
+        ],
+    );
+
+    assert_success(&staged);
+    assert_eq!(json_output(&staged)["data"]["hunks"], 2);
+    let staged_after = diff_file(&data_dir, &project_id, "--staged", "tracked.txt");
+    assert_eq!(staged_after["hunks"].as_array().unwrap().len(), 2);
+    let unstaged_after = diff_file(&data_dir, &project_id, "--unstaged", "tracked.txt");
+    assert_eq!(
+        unstaged_after["hunks"].as_array().unwrap().len(),
+        1,
+        "the unselected hunk must remain unstaged"
+    );
+
+    // The whole staged response is fed back verbatim through standard input.
+    let response = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--staged",
+            "--project",
+            &project_id,
+        ],
+    );
+    let unstaged_again = harkness_with_stdin(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "unstage",
+            "--hunk-selection",
+            "-",
+            "--project",
+            &project_id,
+        ],
+        &String::from_utf8(response.stdout).unwrap(),
+    );
+
+    assert_success(&unstaged_again);
+    assert_eq!(json_output(&unstaged_again)["data"]["hunks"], 2);
+    let staged_files = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--staged",
+            "--project",
+            &project_id,
+        ],
+    );
+    assert!(
+        json_output(&staged_files)["data"]["files"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A batch can name the same hunk twice, or two hunks that cover the same
+/// lines. The first is deduplicated and must be counted as what landed rather
+/// than as what was asked for; the second cannot be expressed as one patch and
+/// is refused with the path in hand. Neither is reachable one hunk at a time.
+#[test]
+fn a_batch_deduplicates_repeats_and_refuses_overlaps() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("batch-edges");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    let original = (1..=30)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    fs::write(root.join("tracked.txt"), original.as_bytes()).unwrap();
+    commit_all(&repository, "add tracked");
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+    fs::write(
+        root.join("tracked.txt"),
+        original
+            .replace("line 2\n", "FIRST\n")
+            .replace("line 15\n", "SECOND\n")
+            .as_bytes(),
+    )
+    .unwrap();
+    let apply = |document: &Value| {
+        harkness_with_stdin(
+            &data_dir,
+            &[
+                "--json",
+                "git",
+                "stage",
+                "--hunk-selection",
+                "-",
+                "--project",
+                &project_id,
+            ],
+            &document.to_string(),
+        )
+    };
+
+    let mut file = diff_file(&data_dir, &project_id, "--unstaged", "tracked.txt");
+    let first = file["hunks"][0].clone();
+    file["hunks"] = json!([first, first]);
+
+    let repeated = apply(&json!({ "files": [file] }));
+
+    assert_success(&repeated);
+    assert_eq!(
+        json_output(&repeated)["data"]["hunks"],
+        1,
+        "a repeated hunk must be counted once, not once per selection"
+    );
+
+    // A wider context setting produces a hunk that spans the narrow one.
+    let wide = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--unstaged",
+            "--context-lines",
+            "8",
+            "--project",
+            &project_id,
+        ],
+    );
+    let wide = json_output(&wide)["data"]["files"][0].clone();
+    let narrow = diff_file(&data_dir, &project_id, "--unstaged", "tracked.txt");
+    let selection = |file: &Value, hunk: &Value| {
+        json!({
+            "old_path": file["old_path"],
+            "new_path": file["new_path"],
+            "old_blob_id": file["old_blob_id"],
+            "new_blob_id": file["new_blob_id"],
+            "context_lines": file["context_lines"],
+            "old_start": hunk["old_start"],
+            "old_lines": hunk["old_lines"],
+            "new_start": hunk["new_start"],
+            "new_lines": hunk["new_lines"],
+        })
+    };
+    let overlapping = apply(&json!({
+        "selections": [
+            selection(&narrow, &narrow["hunks"][0]),
+            selection(&wide, &wide["hunks"][0]),
+        ],
+    }));
+
+    assert_eq!(overlapping.status.code(), Some(3));
+    let body = json_output(&overlapping);
+    assert_eq!(body["error"]["kind"], "overlapping_hunk_selection");
+    assert_eq!(body["error"]["details"]["path"], "tracked.txt");
+}
+
+/// Piping a whole combined diff into one side's command is the obvious
+/// mistake. Revalidation would refuse it as stale, which is true of the blob
+/// IDs and misleading as advice, so the wrong side is named as the wrong side.
+#[test]
+fn a_document_from_the_wrong_side_of_the_index_is_refused_with_advice() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("wrong-side");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    let original = (1..=30)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    fs::write(root.join("tracked.txt"), original.as_bytes()).unwrap();
+    commit_all(&repository, "add tracked");
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+    fs::write(
+        root.join("tracked.txt"),
+        original.replace("line 2\n", "FIRST\n").as_bytes(),
+    )
+    .unwrap();
+    assert_success(&harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "stage",
+            "tracked.txt",
+            "--project",
+            &project_id,
+        ],
+    ));
+    fs::write(
+        root.join("tracked.txt"),
+        original
+            .replace("line 2\n", "FIRST\n")
+            .replace("line 25\n", "SECOND\n")
+            .as_bytes(),
+    )
+    .unwrap();
+
+    let combined = harkness(
+        &data_dir,
+        &["--json", "git", "diff", "--project", &project_id],
+    );
+    assert_eq!(
+        json_output(&combined)["data"]["files"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "the fixture needs both a staged and an unstaged record"
+    );
+
+    let refused = harkness_with_stdin(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "stage",
+            "--hunk-selection",
+            "-",
+            "--project",
+            &project_id,
+        ],
+        &String::from_utf8(combined.stdout).unwrap(),
+    );
+
+    assert_eq!(refused.status.code(), Some(2));
+    let body = json_output(&refused);
+    assert_eq!(body["error"]["kind"], "usage_error");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("--unstaged"), "{message}");
+    assert!(
+        !message.contains("stale"),
+        "the wrong side must not be reported as staleness: {message}"
+    );
+}
+
+/// A path the diff can print is a path the mutation must accept. A leading
+/// hyphen has to survive ordinary argv, and a name that is not UTF-8 has to be
+/// nameable through its exact bytes rather than through a lossy stand-in.
+#[test]
+fn unusual_paths_survive_the_diff_to_stage_round_trip() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("unusual-project");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    fs::write(root.join("-leading.txt"), b"one\ntwo\n").unwrap();
+    #[cfg(target_os = "linux")]
+    let lossy_name = {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+        PathBuf::from(OsStr::from_bytes(b"lossy-\xff.txt"))
+    };
+    #[cfg(target_os = "linux")]
+    fs::write(root.join(&lossy_name), b"one\ntwo\n").unwrap();
+    commit_all(&repository, "add unusual paths");
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+    fs::write(root.join("-leading.txt"), b"ONE\ntwo\n").unwrap();
+    #[cfg(target_os = "linux")]
+    fs::write(root.join(&lossy_name), b"ONE\ntwo\n").unwrap();
+
+    let hyphenated = diff_file(&data_dir, &project_id, "--unstaged", "-leading.txt");
+    assert_eq!(hyphenated["new_path"], "-leading.txt");
+    let staged = harkness(
+        &data_dir,
+        &hunk_arguments("stage", &project_id, &hyphenated, 0),
+    );
+    assert_success(&staged);
+
+    #[cfg(target_os = "linux")]
+    {
+        let output = harkness(
+            &data_dir,
+            &[
+                "--json",
+                "git",
+                "diff",
+                "--unstaged",
+                "--project",
+                &project_id,
+            ],
+        );
+        assert_success(&output);
+        let file = json_output(&output)["data"]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["new_path_is_lossy"] == true)
+            .cloned()
+            .expect("the non-UTF-8 path is listed");
+        assert_eq!(
+            BASE64
+                .decode(file["new_path_base64"].as_str().unwrap())
+                .unwrap(),
+            b"lossy-\xff.txt".to_vec(),
+            "the exact path bytes must reach the wire"
+        );
+
+        // Replaying only the lossy spelling names a different file, so it is
+        // refused with the field that fixes it rather than reported as stale.
+        let mut without_bytes = file.clone();
+        without_bytes["old_path_base64"] = Value::Null;
+        without_bytes["new_path_base64"] = Value::Null;
+        let refused = harkness_with_stdin(
+            &data_dir,
+            &[
+                "--json",
+                "git",
+                "stage",
+                "--hunk-selection",
+                "-",
+                "--project",
+                &project_id,
+            ],
+            &json!({ "files": [without_bytes] }).to_string(),
+        );
+        assert_eq!(refused.status.code(), Some(2));
+        let message = json_output(&refused)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            message.contains("path_base64"),
+            "the refusal must name the field that fixes it: {message}"
+        );
+
+        let accepted = harkness_with_stdin(
+            &data_dir,
+            &[
+                "--json",
+                "git",
+                "stage",
+                "--hunk-selection",
+                "-",
+                "--project",
+                &project_id,
+            ],
+            &json!({ "files": [file] }).to_string(),
+        );
+        assert_success(&accepted);
+    }
+}
+
+/// Every hunk refusal names an alternative in its message; the path that
+/// alternative applies to has to arrive as data, not only as prose.
+#[test]
+fn hunk_refusals_carry_structured_details() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("refusal-project");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    fs::write(root.join("mode.sh"), b"#!/bin/sh\n").unwrap();
+    fs::write(root.join("filtered.bin"), b"payload\n").unwrap();
+    commit_all(&repository, "add refusal fixtures");
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+    // Blob IDs are taken from the live record where one exists, because
+    // revalidation compares identities before it classifies the change.
+    let coordinates = |path: &str, old_blob: &str, new_blob: &str| {
+        vec![
+            "--json".to_owned(),
+            "git".to_owned(),
+            "stage".to_owned(),
+            "--hunk".to_owned(),
+            "--old-path".to_owned(),
+            path.to_owned(),
+            "--new-path".to_owned(),
+            path.to_owned(),
+            "--old-blob-id".to_owned(),
+            old_blob.to_owned(),
+            "--new-blob-id".to_owned(),
+            new_blob.to_owned(),
+            "--context-lines".to_owned(),
+            "3".to_owned(),
+            "--old-start".to_owned(),
+            "1".to_owned(),
+            "--old-lines".to_owned(),
+            "1".to_owned(),
+            "--new-start".to_owned(),
+            "1".to_owned(),
+            "--new-lines".to_owned(),
+            "1".to_owned(),
+            "--project".to_owned(),
+            project_id.clone(),
+        ]
+    };
+
+    fs::write(root.join(".gitattributes"), b"*.bin filter=lfs\n").unwrap();
+    fs::write(root.join("filtered.bin"), b"changed\n").unwrap();
+    let zero = "0".repeat(40);
+    let filtered = harkness(&data_dir, &coordinates("filtered.bin", &zero, &zero));
+    assert_eq!(filtered.status.code(), Some(3));
+    let body = json_output(&filtered);
+    assert_eq!(body["error"]["kind"], "filtered_hunk_selection");
+    assert_eq!(body["error"]["details"]["path"], "filtered.bin");
+    assert_eq!(body["error"]["details"]["driver"], "lfs");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(root.join("mode.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        let record = diff_file(&data_dir, &project_id, "--unstaged", "mode.sh");
+        assert!(
+            record["hunks"].as_array().unwrap().is_empty(),
+            "a mode change carries no content to select"
+        );
+        let metadata_only = harkness(
+            &data_dir,
+            &coordinates(
+                "mode.sh",
+                record["old_blob_id"].as_str().unwrap(),
+                record["new_blob_id"].as_str().unwrap(),
+            ),
+        );
+        assert_eq!(metadata_only.status.code(), Some(3));
+        let body = json_output(&metadata_only);
+        assert_eq!(body["error"]["kind"], "metadata_only_hunk_selection");
+        assert_eq!(body["error"]["details"]["path"], "mode.sh");
+        assert_eq!(body["error"]["details"]["old_mode"], 0o100_644);
+        assert_eq!(body["error"]["details"]["new_mode"], 0o100_755);
+    }
+
+    // A parent-relative escape is refused on every platform, unlike an
+    // absolute Unix path, which on Windows is merely a rooted relative one.
+    let outside = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--project",
+            &project_id,
+            "--",
+            "../outside.txt",
+        ],
+    );
+    assert_eq!(outside.status.code(), Some(3));
+    let body = json_output(&outside);
+    assert_eq!(body["error"]["kind"], "path_outside_repository");
+    assert_eq!(body["error"]["details"]["path"], "../outside.txt");
+    assert!(body["error"]["details"]["repository"].is_string());
+}
+
+/// A consumer must be able to learn which exit code an error kind reports
+/// instead of hardcoding it, or a deliberate reclassification is
+/// indistinguishable from an unannounced break.
+#[test]
+fn the_contract_publishes_an_exit_code_for_every_error_kind() {
+    let fixture = TempDir::new().unwrap();
+    let output = harkness(fixture.path(), &["--json", "contract"]);
+
+    assert_success(&output);
+    let body = json_output(&output);
+    let data = &body["data"];
+    let map = &data["exit_code_by_kind"];
+    for namespace in ["cli", "project", "git"] {
+        let kinds = data["error_kinds"][namespace].as_array().unwrap();
+        let mapped = map[namespace].as_object().unwrap();
+        assert_eq!(
+            kinds.len(),
+            mapped.len(),
+            "{namespace} kinds and exit codes disagree"
+        );
+        for kind in kinds {
+            let kind = kind.as_str().unwrap();
+            assert!(
+                mapped.contains_key(kind),
+                "{namespace} kind {kind} has no published exit code"
+            );
+        }
+    }
+    assert_eq!(map["git"]["worktree_locked"], 3);
+    assert_eq!(map["git"]["worktree_already_locked"], 5);
+    assert_eq!(map["project"]["worktree_destination_exists"], 5);
+    assert_eq!(map["cli"]["usage_error"], 2);
+}
+
+/// The plain-text path is secondary but still has to answer which files
+/// changed and which came back without content.
+#[test]
+fn human_diff_output_names_every_file_and_its_omission() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("human-project");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    fs::write(root.join("text.txt"), b"one\n").unwrap();
+    fs::write(root.join("blob.bin"), b"old\0bytes").unwrap();
+    commit_all(&repository, "add human fixtures");
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+    fs::write(root.join("text.txt"), b"two\n").unwrap();
+    fs::write(root.join("blob.bin"), b"new\0bytes\0here").unwrap();
+
+    let output = harkness(&data_dir, &["git", "diff", "--project", &project_id]);
+
+    assert_success(&output);
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.starts_with("0 staged, 2 unstaged\n"), "{text}");
+    assert!(text.contains("text.txt\t1 hunks"), "{text}");
+    assert!(text.contains("blob.bin\tno content (binary)"), "{text}");
+}
+
 #[test]
 fn json_detection_ignores_a_literal_after_the_argument_terminator() {
     let fixture = TempDir::new().unwrap();
@@ -1017,7 +1974,7 @@ fn json_detection_ignores_a_literal_after_the_argument_terminator() {
 }
 
 /// The lock reason has to reach the wire and come back, and the state
-/// refusals have to carry conflict exit codes rather than a generic failure.
+/// refusals have to carry their deliberate refusal or conflict exit codes.
 #[test]
 fn worktree_lock_and_unlock_round_trip_through_the_json_contract() {
     let fixture = TempDir::new().unwrap();
@@ -1045,6 +2002,13 @@ fn worktree_lock_and_unlock_round_trip_through_the_json_contract() {
         .as_str()
         .unwrap()
         .to_owned();
+
+    let missing_reason = harkness(
+        &data_dir,
+        &["--json", "worktree", "lock", "--project", &worktree_id],
+    );
+    assert_eq!(missing_reason.status.code(), Some(2));
+    assert_eq!(json_output(&missing_reason)["error"]["kind"], "usage_error");
 
     let blank = harkness(
         &data_dir,
@@ -1129,8 +2093,12 @@ fn worktree_lock_and_unlock_round_trip_through_the_json_contract() {
             "--force",
         ],
     );
-    assert_eq!(forced.status.code(), Some(5));
+    assert_eq!(forced.status.code(), Some(3));
     assert_eq!(json_output(&forced)["error"]["kind"], "worktree_locked");
+    assert_eq!(
+        json_output(&forced)["error"]["details"]["reason"],
+        "agent is still working"
+    );
 
     let replaced = harkness(
         &data_dir,
@@ -1532,6 +2500,73 @@ fn ctrl_c_cancels_fetch_with_exit_130_and_kills_its_process_group() {
     );
 }
 
+/// The single record for `path` on `target`.
+///
+/// The length and target are asserted rather than assumed: taking the first
+/// element would keep passing if path narrowing or target narrowing regressed,
+/// which is exactly what a helper positioned here exists to notice.
+fn diff_file(data_dir: &Path, project_id: &str, target: &str, path: &str) -> Value {
+    // The path follows `--` so a leading hyphen is a path rather than a flag,
+    // which is the same separator `git` itself requires.
+    let output = harkness(
+        data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            target,
+            "--project",
+            project_id,
+            "--",
+            path,
+        ],
+    );
+    assert_success(&output);
+    let files = json_output(&output)["data"]["files"]
+        .as_array()
+        .cloned()
+        .unwrap();
+    assert_eq!(files.len(), 1, "expected exactly one record: {files:#?}");
+    assert_eq!(files[0]["target"], target.trim_start_matches("--"));
+    files.into_iter().next().unwrap()
+}
+
+fn hunk_arguments(command: &str, project_id: &str, file: &Value, hunk_index: usize) -> Vec<String> {
+    let hunk = &file["hunks"][hunk_index];
+    let mut arguments = vec![
+        "--json".to_owned(),
+        "git".to_owned(),
+        command.to_owned(),
+        "--hunk".to_owned(),
+        "--project".to_owned(),
+        project_id.to_owned(),
+    ];
+    for (flag, value) in [
+        ("--old-path", &file["old_path"]),
+        ("--new-path", &file["new_path"]),
+    ] {
+        if let Some(value) = value.as_str() {
+            arguments.extend([flag.to_owned(), value.to_owned()]);
+        }
+    }
+    for (flag, value) in [
+        ("--old-blob-id", &file["old_blob_id"]),
+        ("--new-blob-id", &file["new_blob_id"]),
+        ("--context-lines", &file["context_lines"]),
+        ("--old-start", &hunk["old_start"]),
+        ("--old-lines", &hunk["old_lines"]),
+        ("--new-start", &hunk["new_start"]),
+        ("--new-lines", &hunk["new_lines"]),
+    ] {
+        let value = value
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| value.as_u64().unwrap().to_string());
+        arguments.extend([flag.to_owned(), value]);
+    }
+    arguments
+}
+
 fn initialize_repository(root: &Path) {
     fs::create_dir_all(root).unwrap();
     let repository = Repository::init(root).unwrap();
@@ -1622,12 +2657,35 @@ fn write_catalog(data_dir: &Path, projects: Vec<Value>) {
     .unwrap();
 }
 
-fn harkness(data_dir: &Path, arguments: &[&str]) -> std::process::Output {
+fn harkness<S: AsRef<std::ffi::OsStr>>(data_dir: &Path, arguments: &[S]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_harkness"))
         .env("HARKNESS_DATA_DIR", data_dir)
         .args(arguments)
         .output()
         .expect("harkness command should start")
+}
+
+/// Runs the CLI with a document on standard input.
+fn harkness_with_stdin<S: AsRef<std::ffi::OsStr>>(
+    data_dir: &Path,
+    arguments: &[S],
+    stdin: &str,
+) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_harkness"))
+        .env("HARKNESS_DATA_DIR", data_dir)
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("harkness command should start");
+    child
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(stdin.as_bytes())
+        .expect("the document should be written");
+    child.wait_with_output().expect("harkness should finish")
 }
 
 fn harkness_from(data_dir: &Path, current_dir: &Path, arguments: &[&str]) -> std::process::Output {

@@ -79,6 +79,34 @@ impl HunkSelection {
         }
     }
 
+    /// Reconstructs a selection carried across a serialization boundary.
+    ///
+    /// The values are intentionally the same identity fields emitted by a
+    /// [`FileDiff`] and its [`Hunk`]. They remain untrusted until staging
+    /// recomputes the diff and validates every value under the repository lock.
+    #[must_use]
+    pub fn from_parts(
+        old_path: Option<PathBuf>,
+        new_path: Option<PathBuf>,
+        old_blob_id: impl Into<String>,
+        new_blob_id: impl Into<String>,
+        context_lines: u32,
+        old_range: (u32, u32),
+        new_range: (u32, u32),
+    ) -> Self {
+        Self {
+            old_path,
+            new_path,
+            old_blob_id: old_blob_id.into(),
+            new_blob_id: new_blob_id.into(),
+            context_lines,
+            old_start: old_range.0,
+            old_lines: old_range.1,
+            new_start: new_range.0,
+            new_lines: new_range.1,
+        }
+    }
+
     /// The path callers should normally show in an error or selection list.
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
@@ -95,6 +123,13 @@ impl HunkSelection {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct HunkStageOutcome {
+    /// How many distinct hunks reached the index.
+    ///
+    /// This is not the number of selections supplied. Two selections can name
+    /// the same hunk — most easily when they were taken at different context
+    /// settings — and the batch deduplicates them, so reporting the input count
+    /// would tell a caller that more changed than actually did.
+    pub hunks: usize,
     /// The optional full-repository status refresh performed after the apply.
     pub status: StatusRefreshOutcome,
 }
@@ -170,12 +205,15 @@ fn mutate(
     // Validated and opened first even for an empty batch, so an accidental
     // no-op reports the same refusals and the same refreshed status a real one
     // would. Cancellation was already honoured by the caller's lock.
+    let mut hunks = 0;
     if !selections.is_empty() {
         refuse_filtered_paths(&repository, root, &paths)?;
         let prepared = prepare(root, selections, &paths, &target, cancellation)?;
+        hunks = prepared.iter().map(|file| file.hunks.len()).sum();
         apply(&repository, &prepared, &paths, direction)?;
     }
     Ok(HunkStageOutcome {
+        hunks,
         status: commit::refresh_status(git_executable, root, options.refresh_status, cancellation),
     })
 }
@@ -245,11 +283,10 @@ fn prepare(
         if cancellation.is_cancelled() {
             return Err(GitError::Cancelled);
         }
-        // An unbounded size keeps this model a superset of whatever the caller
-        // diffed: a file the caller could legitimately select from is never
-        // omitted here merely for exceeding that caller's own display limit.
-        let options = DiffOptions::default()
-            .with_max_file_size(u64::MAX)
+        // Unbounded keeps this model a superset of whatever the caller diffed:
+        // a file the caller could legitimately select from is never omitted
+        // here merely for exceeding that caller's own display budget.
+        let options = DiffOptions::unbounded()
             .with_context_lines(context_lines)
             .with_paths(paths);
         current.push((

@@ -67,6 +67,7 @@ harkness project forget --project <selector>
 harkness project delete --project <selector> --yes
 
 harkness --json git status [--paths] [--project <selector>]
+harkness --json git diff [--staged | --unstaged] [--context-lines <lines>] [--max-file-size <bytes>] [--max-total-bytes <bytes>] [--max-files <count>] [--] [<path>...] [--project <selector>]
 harkness --json git fetch [--remote <name>] [--prune] [--project <selector>]
 harkness --json git pull [--ff-only | --rebase | --merge] [--project <selector>]
 harkness --json git push [--set-upstream] [--allow-default-branch] [--force-with-lease] [--project <selector>]
@@ -74,8 +75,8 @@ harkness --json git branch list [--all] [--project <selector>]
 harkness --json git branch create <name> [--from <ref>] [--checkout] [--project <selector>]
 harkness --json git branch checkout <name> [--project <selector>]
 harkness --json git branch delete <name> [--force] [--project <selector>]
-harkness --json git stage (<path>... | --all) [--project <selector>]
-harkness --json git unstage <path>... [--project <selector>]
+harkness --json git stage (<path>... | --all | --hunk <selection-flags> | --hunk-selection <path|->) [--project <selector>]
+harkness --json git unstage (<path>... | --hunk <selection-flags> | --hunk-selection <path|->) [--project <selector>]
 harkness --json git commit --message <message> [--amend] [--allow-empty] [--project <selector>]
 
 harkness --json worktree list [--project <parent-selector>]
@@ -98,7 +99,68 @@ Clone, fetch, pull, and push progress remains on standard error as one versioned
 JSON object per line, keeping standard output parseable. Help and version are
 deliberately plain text even when `--json` is present. `harkness --json contract`
 reports the current envelope version, exit codes, streams, and complete
-error-kind namespaces.
+error-kind namespaces. It also reports `exit_code_by_kind`, which maps every
+CLI, project, and Git error kind to the exit code it returns, so a caller reads
+the classification instead of hardcoding it.
+
+`git diff` returns one structured `files` array, staged records first and
+unstaged records second; `--staged` or `--unstaged` narrows it to one side of
+the index. Both sides are read from a single index snapshot, so a combined
+response always describes one moment. Each file carries its blob IDs, paths,
+modes, sizes, and hunks. Every hunk line names its `content_encoding`: valid
+UTF-8 is emitted directly, while arbitrary bytes use Base64, so consumers can
+reconstruct the exact content. Paths additionally carry `old_path_base64` and
+`new_path_base64` holding their exact bytes, because a name that is not UTF-8
+cannot be spelled in the lossy `old_path` and `new_path` strings.
+
+Inspection is total: a file always appears in the listing, and when it carries
+no hunks the `omission` object says why. The reasons are `file_too_large`,
+`unmerged` for an unresolved merge conflict, `content_budget_exhausted`,
+`file_budget_exhausted`, and `unrepresentable` for a record Git described in a
+shape the model cannot carry. One such file never fails the whole command.
+`--max-file-size` bounds a single file, while `--max-total-bytes` and
+`--max-files` bound the whole response; `--context-lines` is capped at 100
+because context multiplies every hunk in every file. Binary files remain
+summary records with `binary: true`.
+
+There are two ways to stage or unstage below path granularity, and both are
+refused before any mutation if an identity or coordinate has gone stale: the
+diff is recomputed under the repository lock, and a mismatch exits 3 with the
+index untouched.
+
+For a single hunk, pass `--hunk` with the selected file's `--old-path` and/or
+`--new-path`, `--old-blob-id`, `--new-blob-id`, and `--context-lines`, plus the
+hunk's `--old-start`, `--old-lines`, `--new-start`, and `--new-lines`. Use
+`--old-path-base64` or `--new-path-base64` instead when the diff marked the path
+lossy.
+
+For more than one hunk, pass `--hunk-selection` a JSON document, or `-` to read
+it from standard input. The document is the `git diff` response with the hunks
+you do not want removed, so no reshaping is needed:
+
+```sh
+harkness --json git diff --unstaged --project <selector> \
+  | jq '{files: [.data.files[] | select(.new_path == "src/main.rs")
+                               | .hunks |= [.[0], .[2]]]}' \
+  | harkness --json git stage --hunk-selection - --project <selector>
+```
+
+A flat `{"selections": [...]}` form is also accepted for callers that assemble
+coordinates themselves. Prefer a document over repeated single-hunk calls:
+the whole batch is one atomic index write, whereas staging one hunk rewrites
+the index and shifts the blob IDs of every other selection taken from the same
+diff, so a second single-hunk call would be correctly refused as stale.
+
+`git stage` consumes unstaged records and `git unstage` consumes staged ones, so
+narrow the diff before piping it; a record carrying the other side's `target` is
+refused as a usage error rather than reported as stale. Two selections that
+resolve to the same hunk are deduplicated, and the reported `hunks` count is
+what reached the index rather than what was supplied. Two selections whose lines
+overlap cannot be expressed as one patch and are refused with
+`overlapping_hunk_selection` before the index is opened.
+
+Whole-path staging and unstaging keep their existing syntax. A path that begins
+with a hyphen goes after a `--` separator, as Git itself requires.
 
 Project JSON uses an explicit CLI projection rather than the catalog's storage
 serializer. `last_opened` is RFC 3339, source-specific optional fields are

@@ -1,7 +1,8 @@
 use std::{
     env,
     ffi::OsString,
-    io::{self, Write},
+    fs,
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::ExitCode,
     sync::atomic::{AtomicBool, Ordering},
@@ -9,17 +10,20 @@ use std::{
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use clap::{
     ArgGroup, Args, Parser, Subcommand,
     error::{Error as ClapError, ErrorKind},
 };
 use harkness_core::{
     Branch, BranchCheckout, BranchKind, BranchListOptions, Cancellation, CommitOptions,
-    CommitOutcome, CreateBranchOptions, DetailedStatus, FetchOptions, FetchOutcome, FileChange,
-    GitError, GitStatus, HeadState, PendingOperation, Project, ProjectError, ProjectSelector,
-    ProjectService, ProjectSource, PullOptions, PullOutcome, PullStrategy, PushOptions,
-    PushOutcome, RefUpdate, StageOutcome, StagePathResult, StatusRefreshOutcome, UpstreamStatus,
-    Worktree, WorktreeBase,
+    CommitOutcome, CreateBranchOptions, DEFAULT_DIFF_CONTEXT_LINES, DEFAULT_MAX_DIFF_FILE_SIZE,
+    DEFAULT_MAX_DIFF_FILES, DEFAULT_MAX_DIFF_TOTAL_BYTES, DetailedStatus, DiffLine, DiffLineKind,
+    DiffOmission, DiffOptions, DiffTarget, FetchOptions, FetchOutcome, FileChange, FileDiff,
+    GitError, GitStatus, HeadState, Hunk, HunkSelection, PendingOperation, Project, ProjectError,
+    ProjectSelector, ProjectService, ProjectSource, PullOptions, PullOutcome, PullStrategy,
+    PushOptions, PushOutcome, RefUpdate, StageOutcome, StagePathResult, StatusRefreshOutcome,
+    UpstreamStatus, Worktree, WorktreeBase,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -147,7 +151,7 @@ enum WorktreeCommand {
     Remove {
         #[command(flatten)]
         selection: ProjectSelection,
-        /// Discard uncommitted changes in the worktree.
+        /// Discard uncommitted changes. This never bypasses a worktree lock.
         #[arg(long)]
         force: bool,
     },
@@ -159,7 +163,7 @@ enum WorktreeCommand {
         #[arg(value_name = "DESTINATION")]
         destination: PathBuf,
     },
-    /// Protect a Harkness-managed linked worktree from removal and pruning.
+    /// Protect a worktree from move, removal, and pruning; there is no force bypass.
     Lock {
         #[command(flatten)]
         selection: ProjectSelection,
@@ -187,6 +191,8 @@ enum GitCommand {
         #[arg(long)]
         paths: bool,
     },
+    /// Inspect structured, byte-preserving changes; raw patch text is never emitted.
+    Diff(DiffArguments),
     /// Update local remote-tracking refs.
     Fetch {
         #[command(flatten)]
@@ -222,13 +228,7 @@ enum GitCommand {
     /// Add paths to the index.
     Stage(StageArguments),
     /// Remove paths from the index without changing the working tree.
-    Unstage {
-        #[command(flatten)]
-        selection: ProjectSelection,
-        /// Repository-relative or absolute paths to unstage.
-        #[arg(required = true, value_name = "PATH")]
-        paths: Vec<PathBuf>,
-    },
+    Unstage(UnstageArguments),
     /// Create a commit from the index.
     Commit {
         #[command(flatten)]
@@ -310,11 +310,494 @@ struct StageArguments {
     #[command(flatten)]
     selection: ProjectSelection,
     /// Repository-relative or absolute paths to stage.
-    #[arg(required_unless_present = "all", value_name = "PATH")]
+    #[arg(required_unless_present_any = ["all", "hunk", "hunk_selection"], value_name = "PATH")]
     paths: Vec<PathBuf>,
     /// Stage every change, including deletions.
-    #[arg(long, conflicts_with = "paths")]
+    #[arg(long, conflicts_with_all = ["paths", "hunk", "hunk_selection"])]
     all: bool,
+    #[command(flatten)]
+    hunk: HunkArguments,
+}
+
+#[derive(Debug, Args)]
+struct UnstageArguments {
+    #[command(flatten)]
+    selection: ProjectSelection,
+    /// Repository-relative or absolute paths to unstage.
+    #[arg(required_unless_present_any = ["hunk", "hunk_selection"], value_name = "PATH")]
+    paths: Vec<PathBuf>,
+    #[command(flatten)]
+    hunk: HunkArguments,
+}
+
+/// The largest context setting the CLI will ask libgit2 to render.
+///
+/// Context multiplies every hunk in every file, and each rendered line costs
+/// far more as a structured record than as bytes, so an unbounded setting turns
+/// a modest repository into a response nobody can hold. A hundred lines either
+/// side already covers "show me the whole neighbourhood"; wanting the rest of
+/// the file is a request to read the file, not to widen a diff.
+const MAX_DIFF_CONTEXT_LINES: u32 = 100;
+
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("diff_target")
+        .multiple(false)
+        .args(["staged", "unstaged"])
+))]
+struct DiffArguments {
+    #[command(flatten)]
+    selection: ProjectSelection,
+    /// Return only changes between HEAD and the index.
+    #[arg(long)]
+    staged: bool,
+    /// Return only changes between the index and working tree.
+    #[arg(long)]
+    unstaged: bool,
+    /// Number of unchanged lines surrounding each hunk.
+    #[arg(
+        long,
+        value_name = "LINES",
+        default_value_t = DEFAULT_DIFF_CONTEXT_LINES,
+        value_parser = clap::value_parser!(u32).range(0..=i64::from(MAX_DIFF_CONTEXT_LINES)),
+    )]
+    context_lines: u32,
+    /// Largest old or new file whose content is included.
+    #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_MAX_DIFF_FILE_SIZE)]
+    max_file_size: u64,
+    /// Combined budget for hunk content across every file in the response.
+    #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_MAX_DIFF_TOTAL_BYTES)]
+    max_total_bytes: u64,
+    /// Number of files that carry content before the rest are named only.
+    #[arg(long, value_name = "COUNT", default_value_t = DEFAULT_MAX_DIFF_FILES)]
+    max_files: usize,
+    /// Restrict the diff to these repository-relative or absolute paths. A
+    /// directory selects everything beneath it. Put a path that begins with a
+    /// hyphen after a `--` separator, as Git itself requires.
+    #[arg(value_name = "PATH")]
+    paths: Vec<PathBuf>,
+}
+
+impl DiffArguments {
+    /// The sides of the index to inspect, in response order.
+    ///
+    /// Both sides are read from one snapshot, so the absence of a narrowing
+    /// flag is expressed as two targets rather than as two separate diffs.
+    fn targets(&self) -> Vec<DiffTarget> {
+        match (self.staged, self.unstaged) {
+            (true, false) => vec![DiffTarget::Staged],
+            (false, true) => vec![DiffTarget::Unstaged],
+            _ => vec![DiffTarget::Staged, DiffTarget::Unstaged],
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("hunk_path")
+        .multiple(true)
+        .args(["old_path", "new_path", "old_path_base64", "new_path_base64"])
+        .requires("hunk")
+))]
+struct HunkArguments {
+    /// Stage or unstage one named hunk; a stale identity is refused before any
+    /// mutation. Use --hunk-selection for more than one hunk at a time.
+    #[arg(
+        long,
+        conflicts_with_all = ["paths", "hunk_selection"],
+        requires_all = [
+            "hunk_path",
+            "old_blob_id",
+            "new_blob_id",
+            "context_lines",
+            "old_start",
+            "old_lines",
+            "new_start",
+            "new_lines"
+        ]
+    )]
+    hunk: bool,
+    /// Apply every hunk named by a JSON selection document, atomically. Accepts
+    /// a file path, or "-" to read standard input. The document is either
+    /// {"files": [...]} holding whole `git diff` file records whose "hunks"
+    /// arrays have been narrowed to the wanted hunks, or {"selections": [...]}
+    /// holding flat records. One invocation is one atomic index write, so the
+    /// coordinate shift that invalidates a second single-hunk call cannot occur.
+    #[arg(long, value_name = "PATH", conflicts_with = "paths")]
+    hunk_selection: Option<PathBuf>,
+    /// Old-side path from the diff file record; omit for an addition.
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "hunk",
+        allow_hyphen_values = true
+    )]
+    old_path: Option<PathBuf>,
+    /// New-side path from the diff file record; omit for a deletion.
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "hunk",
+        allow_hyphen_values = true
+    )]
+    new_path: Option<PathBuf>,
+    /// Old-side path as the Base64 of its exact bytes, from `old_path_base64`.
+    /// Required instead of --old-path when the diff marked the path lossy.
+    #[arg(
+        long,
+        value_name = "BASE64",
+        requires = "hunk",
+        conflicts_with = "old_path"
+    )]
+    old_path_base64: Option<String>,
+    /// New-side path as the Base64 of its exact bytes, from `new_path_base64`.
+    /// Required instead of --new-path when the diff marked the path lossy.
+    #[arg(
+        long,
+        value_name = "BASE64",
+        requires = "hunk",
+        conflicts_with = "new_path"
+    )]
+    new_path_base64: Option<String>,
+    /// Old-side blob ID from the diff file record.
+    #[arg(long, value_name = "OID", requires = "hunk")]
+    old_blob_id: Option<String>,
+    /// New-side blob ID from the diff file record.
+    #[arg(long, value_name = "OID", requires = "hunk")]
+    new_blob_id: Option<String>,
+    /// Context-line count from the diff file record.
+    #[arg(long, value_name = "LINES", requires = "hunk")]
+    context_lines: Option<u32>,
+    /// Old-side start line from the selected hunk.
+    #[arg(long, value_name = "LINE", requires = "hunk")]
+    old_start: Option<u32>,
+    /// Old-side line count from the selected hunk.
+    #[arg(long, value_name = "COUNT", requires = "hunk")]
+    old_lines: Option<u32>,
+    /// New-side start line from the selected hunk.
+    #[arg(long, value_name = "LINE", requires = "hunk")]
+    new_start: Option<u32>,
+    /// New-side line count from the selected hunk.
+    #[arg(long, value_name = "COUNT", requires = "hunk")]
+    new_lines: Option<u32>,
+}
+
+impl HunkArguments {
+    /// The batch this invocation names, or `None` when it is a path operation.
+    ///
+    /// A returned batch is never empty: an empty selection document is a usage
+    /// error rather than a silent no-op that would look like a successful
+    /// stage. Clap already enforces the flag form's requirements, so the checks
+    /// here exist for the document form, whose contents it cannot see.
+    fn into_selections(self, consumes: &str) -> Result<Option<Vec<HunkSelection>>, CliError> {
+        if let Some(source) = self.hunk_selection {
+            let document = read_selection_document(&source)?;
+            let selections = parse_selection_document(&document, consumes)?;
+            if selections.is_empty() {
+                return Err(CliError::Usage(
+                    "the selection document names no hunks".to_owned(),
+                ));
+            }
+            return Ok(Some(selections));
+        }
+        if !self.hunk {
+            return Ok(None);
+        }
+        let missing =
+            |field: &str| CliError::Usage(format!("--hunk requires --{}", field.replace('_', "-")));
+        let old_path = flag_path(self.old_path, self.old_path_base64, "old-path-base64")?;
+        let new_path = flag_path(self.new_path, self.new_path_base64, "new-path-base64")?;
+        if old_path.is_none() && new_path.is_none() {
+            return Err(CliError::Usage(
+                "--hunk requires at least one of --old-path and --new-path".to_owned(),
+            ));
+        }
+        Ok(Some(vec![HunkSelection::from_parts(
+            old_path,
+            new_path,
+            self.old_blob_id.ok_or_else(|| missing("old_blob_id"))?,
+            self.new_blob_id.ok_or_else(|| missing("new_blob_id"))?,
+            self.context_lines.ok_or_else(|| missing("context_lines"))?,
+            (
+                self.old_start.ok_or_else(|| missing("old_start"))?,
+                self.old_lines.ok_or_else(|| missing("old_lines"))?,
+            ),
+            (
+                self.new_start.ok_or_else(|| missing("new_start"))?,
+                self.new_lines.ok_or_else(|| missing("new_lines"))?,
+            ),
+        )]))
+    }
+}
+
+/// Resolves one side's path from its plain and Base64 spellings.
+fn flag_path(
+    plain: Option<PathBuf>,
+    encoded: Option<String>,
+    flag: &str,
+) -> Result<Option<PathBuf>, CliError> {
+    match encoded {
+        Some(encoded) => decode_path(&encoded, flag).map(Some),
+        None => Ok(plain),
+    }
+}
+
+fn decode_path(encoded: &str, field: &str) -> Result<PathBuf, CliError> {
+    let bytes = BASE64
+        .decode(encoded)
+        .map_err(|error| CliError::Usage(format!("{field} is not valid Base64: {error}")))?;
+    path_from_bytes(bytes, field)
+}
+
+#[cfg(unix)]
+fn path_from_bytes(bytes: Vec<u8>, _field: &str) -> Result<PathBuf, CliError> {
+    use std::os::unix::ffi::OsStringExt;
+
+    Ok(PathBuf::from(OsString::from_vec(bytes)))
+}
+
+/// Where a path is UTF-16 rather than bytes, arbitrary bytes name no file.
+///
+/// Refusing is the only honest answer: Git cannot create such a path here
+/// either, so decoding it lossily would hand back a name pointing somewhere
+/// else, and a mutation would then be revalidated against the wrong file.
+#[cfg(not(unix))]
+fn path_from_bytes(bytes: Vec<u8>, field: &str) -> Result<PathBuf, CliError> {
+    String::from_utf8(bytes).map(PathBuf::from).map_err(|_| {
+        CliError::Usage(format!(
+            "{field} decodes to bytes that are not a valid path on this platform"
+        ))
+    })
+}
+
+/// The exact bytes of a path, or `None` when this platform cannot supply them.
+///
+/// A Unix path is already bytes. A Windows path is UTF-16, and one holding an
+/// unpaired surrogate has no faithful byte spelling, so the field is withheld
+/// rather than filled with a lossy conversion. A caller then sees a lossy path
+/// with no exact alternative and is refused, which is the truth, instead of
+/// receiving an encoding that silently decodes to a different name.
+#[cfg(unix)]
+fn path_bytes(path: &Path) -> Option<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    Some(path.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(not(unix))]
+fn path_bytes(path: &Path) -> Option<Vec<u8>> {
+    path.to_str().map(|path| path.as_bytes().to_vec())
+}
+
+fn read_selection_document(source: &Path) -> Result<String, CliError> {
+    if source == Path::new("-") {
+        let mut document = String::new();
+        return io::stdin()
+            .read_to_string(&mut document)
+            .map(|_| document)
+            .map_err(|error| {
+                CliError::Usage(format!("the selection document could not be read: {error}"))
+            });
+    }
+    fs::read_to_string(source).map_err(|error| {
+        CliError::Usage(format!(
+            "the selection document '{}' could not be read: {error}",
+            source.display()
+        ))
+    })
+}
+
+/// Reads a selection batch from either accepted document shape.
+///
+/// The `files` shape is `git diff` output with unwanted hunks removed, so the
+/// round trip needs no reshaping by the caller. The `selections` shape is the
+/// flat form for callers that assemble coordinates themselves.
+///
+/// `consumes` names the side of the index this command reads. A record from the
+/// other side would fail revalidation on its blob IDs and be reported as stale,
+/// which is true of the identities but useless as a diagnosis: nothing has gone
+/// out of date, the wrong half of a combined diff was piped in.
+fn parse_selection_document(
+    document: &str,
+    consumes: &str,
+) -> Result<Vec<HunkSelection>, CliError> {
+    let value: Value = serde_json::from_str(document)
+        .map_err(|error| CliError::Usage(format!("the selection document is not JSON: {error}")))?;
+    let value = value
+        .get("data")
+        .filter(|data| data.get("files").is_some())
+        .unwrap_or(&value);
+    if let Some(files) = value.get("files") {
+        let files = array(files, "files")?;
+        let mut selections = Vec::new();
+        for (index, file) in files.iter().enumerate() {
+            let at = format!("files[{index}]");
+            check_target(file, consumes, &at)?;
+            selections.extend(file_selections(file, &at)?);
+        }
+        return Ok(selections);
+    }
+    let selections = match value.get("selections") {
+        Some(selections) => array(selections, "selections")?,
+        None => array(
+            value,
+            "the document root; expected an object with \"files\" or \"selections\"",
+        )?,
+    };
+    selections
+        .iter()
+        .enumerate()
+        .map(|(index, selection)| {
+            let at = format!("selections[{index}]");
+            check_target(selection, consumes, &at)?;
+            flat_selection(selection, &at)
+        })
+        .collect()
+}
+
+/// Refuses a record taken from the side of the index this command cannot use.
+///
+/// A record with no `target` is accepted: the flat form is not required to
+/// carry one, and revalidation still refuses anything that does not match.
+fn check_target(record: &Value, consumes: &str, at: &str) -> Result<(), CliError> {
+    let Some(target) = record.get("target").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    if target == consumes {
+        return Ok(());
+    }
+    let other = if consumes == "unstaged" {
+        "unstage"
+    } else {
+        "stage"
+    };
+    Err(CliError::Usage(format!(
+        "{at}.target is \"{target}\" but this command consumes {consumes} records; \
+         narrow the diff with --{consumes}, or pass the document to 'git {other}'"
+    )))
+}
+
+fn file_selections(file: &Value, at: &str) -> Result<Vec<HunkSelection>, CliError> {
+    let old_path = record_path(file, "old_path", at)?;
+    let new_path = record_path(file, "new_path", at)?;
+    if old_path.is_none() && new_path.is_none() {
+        return Err(CliError::Usage(format!(
+            "{at} has neither an old_path nor a new_path"
+        )));
+    }
+    let old_blob_id = record_string(file, "old_blob_id", at)?;
+    let new_blob_id = record_string(file, "new_blob_id", at)?;
+    let context_lines = record_u32(file, "context_lines", at)?;
+    let hunks = array(
+        file.get("hunks")
+            .ok_or_else(|| CliError::Usage(format!("{at} has no \"hunks\"")))?,
+        &format!("{at}.hunks"),
+    )?;
+    hunks
+        .iter()
+        .enumerate()
+        .map(|(hunk_index, hunk)| {
+            let at = format!("{at}.hunks[{hunk_index}]");
+            Ok(HunkSelection::from_parts(
+                old_path.clone(),
+                new_path.clone(),
+                old_blob_id.clone(),
+                new_blob_id.clone(),
+                context_lines,
+                (
+                    record_u32(hunk, "old_start", &at)?,
+                    record_u32(hunk, "old_lines", &at)?,
+                ),
+                (
+                    record_u32(hunk, "new_start", &at)?,
+                    record_u32(hunk, "new_lines", &at)?,
+                ),
+            ))
+        })
+        .collect()
+}
+
+fn flat_selection(selection: &Value, at: &str) -> Result<HunkSelection, CliError> {
+    let old_path = record_path(selection, "old_path", at)?;
+    let new_path = record_path(selection, "new_path", at)?;
+    if old_path.is_none() && new_path.is_none() {
+        return Err(CliError::Usage(format!(
+            "{at} has neither an old_path nor a new_path"
+        )));
+    }
+    Ok(HunkSelection::from_parts(
+        old_path,
+        new_path,
+        record_string(selection, "old_blob_id", at)?,
+        record_string(selection, "new_blob_id", at)?,
+        record_u32(selection, "context_lines", at)?,
+        (
+            record_u32(selection, "old_start", at)?,
+            record_u32(selection, "old_lines", at)?,
+        ),
+        (
+            record_u32(selection, "new_start", at)?,
+            record_u32(selection, "new_lines", at)?,
+        ),
+    ))
+}
+
+fn array<'a>(value: &'a Value, at: &str) -> Result<&'a Vec<Value>, CliError> {
+    value
+        .as_array()
+        .ok_or_else(|| CliError::Usage(format!("{at} is not an array")))
+}
+
+/// Reads one side's path, preferring the Base64 spelling of its exact bytes.
+///
+/// A path the diff marked lossy is refused rather than replayed: the lossy
+/// string names a different file, so accepting it would report a stale
+/// selection for a path that is merely unspellable in JSON.
+fn record_path(record: &Value, field: &str, at: &str) -> Result<Option<PathBuf>, CliError> {
+    let encoded_field = format!("{field}_base64");
+    match record.get(&encoded_field) {
+        Some(Value::String(encoded)) => {
+            return decode_path(encoded, &format!("{at}.{encoded_field}")).map(Some);
+        }
+        Some(Value::Null) | None => {}
+        Some(_) => {
+            return Err(CliError::Usage(format!(
+                "{at}.{encoded_field} is not a string"
+            )));
+        }
+    }
+    match record.get(field) {
+        Some(Value::String(path)) => {
+            if record.get(format!("{field}_is_lossy")) == Some(&Value::Bool(true)) {
+                return Err(CliError::Usage(format!(
+                    "{at}.{field} is lossy; supply {encoded_field} to name its exact bytes"
+                )));
+            }
+            Ok(Some(PathBuf::from(path)))
+        }
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(CliError::Usage(format!("{at}.{field} is not a string"))),
+    }
+}
+
+fn record_string(record: &Value, field: &str, at: &str) -> Result<String, CliError> {
+    record
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| CliError::Usage(format!("{at}.{field} is missing or not a string")))
+}
+
+fn record_u32(record: &Value, field: &str, at: &str) -> Result<u32, CliError> {
+    record
+        .get(field)
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            CliError::Usage(format!(
+                "{at}.{field} is missing or not a 32-bit unsigned integer"
+            ))
+        })
 }
 
 #[derive(Debug, Args)]
@@ -374,6 +857,7 @@ impl RefusalKind {
 #[derive(Debug)]
 enum CliError {
     Project(ProjectError),
+    Usage(String),
     CurrentDirectory(io::Error),
     InterruptHandler(io::Error),
     WireProjection(String),
@@ -404,6 +888,7 @@ impl CliError {
     fn kind(&self) -> &'static str {
         match self {
             Self::Project(error) => error.kind(),
+            Self::Usage(_) => "usage_error",
             Self::CurrentDirectory(_) => "current_directory_unavailable",
             Self::InterruptHandler(_) => "interrupt_handler_unavailable",
             Self::WireProjection(_) => "wire_projection_failed",
@@ -415,6 +900,7 @@ impl CliError {
     fn message(&self) -> String {
         match self {
             Self::Project(error) => error.to_string(),
+            Self::Usage(message) => message.clone(),
             Self::WireProjection(message) => message.clone(),
             Self::PathOperation { operation, .. } => {
                 format!("{operation} failed for one or more paths")
@@ -432,6 +918,7 @@ impl CliError {
     fn exit_code(&self) -> u8 {
         match self {
             Self::Project(error) => project_exit_code(error),
+            Self::Usage(_) => EXIT_USAGE,
             Self::CurrentDirectory(_)
             | Self::InterruptHandler(_)
             | Self::WireProjection(_)
@@ -445,7 +932,10 @@ impl CliError {
             Self::Project(error) => project_error_details(error),
             Self::Refused { details, .. } => details.clone(),
             Self::PathOperation { details, .. } => details.clone(),
-            Self::CurrentDirectory(_) | Self::InterruptHandler(_) | Self::WireProjection(_) => {
+            Self::Usage(_)
+            | Self::CurrentDirectory(_)
+            | Self::InterruptHandler(_)
+            | Self::WireProjection(_) => {
                 json!({})
             }
         }
@@ -500,7 +990,11 @@ fn main() -> ExitCode {
         Err(error) => {
             let code = error.exit_code() as u8;
             let output = if requested_json {
-                emit_error("usage_error", &clap_error_message(&error), &json!({}))
+                emit_error(
+                    "usage_error",
+                    &clap_error_message(&error),
+                    &clap_error_details(&error),
+                )
             } else {
                 error.print()
             };
@@ -536,6 +1030,28 @@ fn clap_error_message(error: &ClapError) -> String {
         .strip_prefix("error: ")
         .unwrap_or("invalid command-line arguments")
         .to_owned()
+}
+
+/// The rest of a clap diagnostic, as data rather than as discarded prose.
+///
+/// The message is only the first line, and for an argument that requires eight
+/// companions — `--hunk` — that line is the useless half: it says arguments are
+/// missing and names none of them. The list lives in the lines that follow, so
+/// they are carried through as `missing` instead of being dropped.
+fn clap_error_details(error: &ClapError) -> Value {
+    let rendered = error.to_string();
+    let missing = rendered
+        .lines()
+        .skip(1)
+        .map(str::trim)
+        .take_while(|line| !line.is_empty())
+        .filter(|line| !line.starts_with("Usage:") && !line.starts_with("For more information"))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return json!({});
+    }
+    json!({ "missing": missing })
 }
 
 fn finish_result(result: CommandResult) -> ExitCode {
@@ -604,6 +1120,28 @@ fn run_git(
                 json_output,
                 || detailed_status_line(&status, paths),
                 || Ok(json!({ "status": detailed_status_value(&status) })),
+            )
+        }
+        GitCommand::Diff(arguments) => {
+            let targets = arguments.targets();
+            let git = selected_git(&service, arguments.selection)?;
+            let options = DiffOptions::default()
+                .with_context_lines(arguments.context_lines)
+                .with_max_file_size(arguments.max_file_size)
+                .with_max_total_bytes(arguments.max_total_bytes)
+                .with_max_files(arguments.max_files)
+                .with_paths(arguments.paths);
+            if cancellation.is_cancelled() {
+                return Err(GitError::Cancelled.into());
+            }
+            let files = git.diff_snapshot(&targets, &options)?;
+            if cancellation.is_cancelled() {
+                return Err(GitError::Cancelled.into());
+            }
+            command_result(
+                json_output,
+                || diff_summary_line(&files),
+                || Ok(json!({ "files": files.iter().map(file_diff_value).collect::<Vec<_>>() })),
             )
         }
         GitCommand::Fetch {
@@ -693,8 +1231,24 @@ fn run_git(
             run_git_branch(command, &service, json_output, cancellation)
         }
         GitCommand::Stage(arguments) => {
+            let selections = arguments.hunk.into_selections("unstaged")?;
             let git = selected_git(&service, arguments.selection)?;
-            if arguments.all {
+            if let Some(selections) = selections {
+                let outcome = git.stage_hunks(&selections, cancellation)?;
+                // The applied count, not the supplied one: a batch deduplicates
+                // selections that resolve to the same hunk.
+                let count = outcome.hunks;
+                command_result(
+                    json_output,
+                    || hunk_outcome_line("staged", count),
+                    || {
+                        Ok(json!({
+                            "hunks": count,
+                            "status": status_refresh_value(&outcome.status),
+                        }))
+                    },
+                )
+            } else if arguments.all {
                 let status = git.stage_all(cancellation)?;
                 command_result(
                     json_output,
@@ -716,20 +1270,36 @@ fn run_git(
                 )
             }
         }
-        GitCommand::Unstage { selection, paths } => {
-            let git = selected_git(&service, selection)?;
-            let outcome = git.unstage(paths, cancellation)?;
-            if !outcome.all_succeeded() {
-                return Err(CliError::PathOperation {
-                    operation: "unstaging",
-                    details: stage_outcome_value(&outcome),
-                });
+        GitCommand::Unstage(arguments) => {
+            let selections = arguments.hunk.into_selections("staged")?;
+            let git = selected_git(&service, arguments.selection)?;
+            if let Some(selections) = selections {
+                let outcome = git.unstage_hunks(&selections, cancellation)?;
+                let count = outcome.hunks;
+                command_result(
+                    json_output,
+                    || hunk_outcome_line("unstaged", count),
+                    || {
+                        Ok(json!({
+                            "hunks": count,
+                            "status": status_refresh_value(&outcome.status),
+                        }))
+                    },
+                )
+            } else {
+                let outcome = git.unstage(arguments.paths, cancellation)?;
+                if !outcome.all_succeeded() {
+                    return Err(CliError::PathOperation {
+                        operation: "unstaging",
+                        details: stage_outcome_value(&outcome),
+                    });
+                }
+                command_result(
+                    json_output,
+                    || stage_outcome_line("unstaged", &outcome),
+                    || Ok(stage_outcome_value(&outcome)),
+                )
             }
-            command_result(
-                json_output,
-                || stage_outcome_line("unstaged", &outcome),
-                || Ok(stage_outcome_value(&outcome)),
-            )
         }
         GitCommand::Commit {
             selection,
@@ -1256,6 +1826,107 @@ fn detailed_status_value(status: &DetailedStatus) -> Value {
     })
 }
 
+fn file_diff_value(file: &FileDiff) -> Value {
+    let (old_path, old_path_is_lossy) = optional_wire_path(file.old_path.as_deref());
+    let (new_path, new_path_is_lossy) = optional_wire_path(file.new_path.as_deref());
+    json!({
+        "target": diff_target_name(&file.target),
+        "change": file_change_name(file.change),
+        "old_path": old_path,
+        "old_path_is_lossy": old_path_is_lossy,
+        "old_path_base64": encoded_path(file.old_path.as_deref()),
+        "new_path": new_path,
+        "new_path_is_lossy": new_path_is_lossy,
+        "new_path_base64": encoded_path(file.new_path.as_deref()),
+        "old_blob_id": file.old_blob_id,
+        "new_blob_id": file.new_blob_id,
+        "old_mode": file.old_mode,
+        "new_mode": file.new_mode,
+        "context_lines": file.context_lines,
+        "old_size": file.old_size,
+        "new_size": file.new_size,
+        "binary": file.binary,
+        "omission": file.omission.as_ref().map_or(Value::Null, diff_omission_value),
+        "hunks": file.hunks.iter().map(hunk_value).collect::<Vec<_>>(),
+    })
+}
+
+/// A path and its lossy flag, both null when the side has no path at all.
+///
+/// The flag is null rather than false so the two questions stay separable: a
+/// consumer can tell "there is no path here" from "there is a path and it
+/// survived the wire intact" without consulting a second field.
+fn optional_wire_path(path: Option<&Path>) -> (Value, Value) {
+    path.map_or((Value::Null, Value::Null), |path| {
+        let (path, is_lossy) = wire_path(path);
+        (json!(path), json!(is_lossy))
+    })
+}
+
+/// The exact path bytes, so a lossy wire string is never the only spelling.
+///
+/// Hunk content is Base64 whenever it is not valid UTF-8, and a path deserves
+/// the same treatment: without this a file whose name is not UTF-8 could be
+/// listed by `git diff` and then never named back to `git stage --hunk`.
+fn encoded_path(path: Option<&Path>) -> Value {
+    path.and_then(path_bytes)
+        .map_or(Value::Null, |bytes| json!(BASE64.encode(bytes)))
+}
+
+fn diff_omission_value(omission: &DiffOmission) -> Value {
+    match omission {
+        DiffOmission::FileTooLarge { limit } => json!({
+            "kind": "file_too_large",
+            "limit": limit,
+        }),
+        DiffOmission::Unmerged => json!({ "kind": "unmerged" }),
+        DiffOmission::ContentBudgetExhausted { limit } => json!({
+            "kind": "content_budget_exhausted",
+            "limit": limit,
+        }),
+        DiffOmission::FileBudgetExhausted { limit } => json!({
+            "kind": "file_budget_exhausted",
+            "limit": limit,
+        }),
+        DiffOmission::Unrepresentable { detail } => json!({
+            "kind": "unrepresentable",
+            "detail": detail,
+        }),
+        _ => json!({ "kind": "unknown" }),
+    }
+}
+
+fn hunk_value(hunk: &Hunk) -> Value {
+    let (header, header_encoding) = encoded_bytes(&hunk.header);
+    json!({
+        "old_start": hunk.old_start,
+        "old_lines": hunk.old_lines,
+        "new_start": hunk.new_start,
+        "new_lines": hunk.new_lines,
+        "header": header,
+        "header_encoding": header_encoding,
+        "lines": hunk.lines.iter().map(diff_line_value).collect::<Vec<_>>(),
+    })
+}
+
+fn diff_line_value(line: &DiffLine) -> Value {
+    let (content, content_encoding) = encoded_bytes(&line.content);
+    json!({
+        "kind": diff_line_kind_name(line.kind),
+        "old_line_number": line.old_line_number,
+        "new_line_number": line.new_line_number,
+        "content": content,
+        "content_encoding": content_encoding,
+    })
+}
+
+fn encoded_bytes(bytes: &[u8]) -> (String, &'static str) {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => (text.to_owned(), "utf8"),
+        Err(_) => (BASE64.encode(bytes), "base64"),
+    }
+}
+
 fn head_value(head: &HeadState) -> Value {
     match head {
         HeadState::Unborn { branch } => json!({
@@ -1276,13 +1947,7 @@ fn head_value(head: &HeadState) -> Value {
 fn status_entry_value(entry: &harkness_core::StatusEntry) -> Value {
     let (path, path_is_lossy) = wire_path(&entry.path);
     let (rename_source, rename_source_is_lossy) =
-        entry
-            .rename_source
-            .as_ref()
-            .map_or((Value::Null, Value::Null), |source| {
-                let (source, is_lossy) = wire_path(source);
-                (json!(source), json!(is_lossy))
-            });
+        optional_wire_path(entry.rename_source.as_deref());
     json!({
         "path": path,
         "path_is_lossy": path_is_lossy,
@@ -1438,6 +2103,61 @@ fn detailed_status_line(status: &DetailedStatus, include_paths: bool) -> String 
     lines.join("\n")
 }
 
+/// One line per changed file, plus a counted header.
+///
+/// The JSON projection is the contract, but a human running this still needs to
+/// see which paths changed and which of them came back without content; a pair
+/// of totals alone answers no question worth asking.
+fn diff_summary_line(files: &[FileDiff]) -> String {
+    let staged = files
+        .iter()
+        .filter(|file| matches!(file.target, DiffTarget::Staged))
+        .count();
+    let mut lines = vec![format!(
+        "{staged} staged, {} unstaged",
+        files.len() - staged
+    )];
+    lines.extend(files.iter().map(|file| {
+        let path = display_diff_path(file);
+        let content = match (&file.omission, file.binary) {
+            (Some(omission), _) => format!("\tno content ({})", omission_reason(omission)),
+            (None, true) => "\tno content (binary)".to_owned(),
+            (None, false) => format!("\t{} hunks", file.hunks.len()),
+        };
+        format!(
+            "{}\t{}\t{path}{content}",
+            diff_target_name(&file.target),
+            file_change_name(file.change),
+        )
+    }));
+    lines.join("\n")
+}
+
+fn display_diff_path(file: &FileDiff) -> String {
+    match (file.old_path.as_deref(), file.new_path.as_deref()) {
+        (Some(old), Some(new)) if old != new => {
+            format!("{} -> {}", wire_path(old).0, wire_path(new).0)
+        }
+        (_, Some(path)) | (Some(path), None) => wire_path(path).0,
+        (None, None) => "(unnamed)".to_owned(),
+    }
+}
+
+const fn omission_reason(omission: &DiffOmission) -> &'static str {
+    match omission {
+        DiffOmission::FileTooLarge { .. } => "too large",
+        DiffOmission::Unmerged => "unmerged",
+        DiffOmission::ContentBudgetExhausted { .. } => "content budget spent",
+        DiffOmission::FileBudgetExhausted { .. } => "file budget spent",
+        DiffOmission::Unrepresentable { .. } => "unrepresentable",
+        _ => "omitted",
+    }
+}
+
+fn hunk_outcome_line(verb: &str, count: usize) -> String {
+    format!("{verb} {count} hunk{}", if count == 1 { "" } else { "s" })
+}
+
 fn branch_line(branch: &Branch) -> String {
     let checkout = match &branch.checkout {
         BranchCheckout::NotCheckedOut => "".to_owned(),
@@ -1469,6 +2189,26 @@ const fn file_change_name(change: FileChange) -> &'static str {
         FileChange::TypeChanged => "type_changed",
         FileChange::Untracked => "untracked",
         FileChange::Unmerged => "unmerged",
+    }
+}
+
+const fn diff_target_name(target: &DiffTarget) -> &'static str {
+    match target {
+        DiffTarget::Staged => "staged",
+        DiffTarget::Unstaged => "unstaged",
+        _ => "unknown",
+    }
+}
+
+const fn diff_line_kind_name(kind: DiffLineKind) -> &'static str {
+    match kind {
+        DiffLineKind::Context => "context",
+        DiffLineKind::Addition => "addition",
+        DiffLineKind::Deletion => "deletion",
+        DiffLineKind::BothEofNoNewline => "both_eof_no_newline",
+        DiffLineKind::OldEofNoNewline => "old_eof_no_newline",
+        DiffLineKind::NewEofNoNewline => "new_eof_no_newline",
+        _ => "unknown",
     }
 }
 
@@ -1601,6 +2341,15 @@ fn contract_result(json_output: bool) -> CommandResult {
             "project": ProjectError::DIRECT_KINDS,
             "git": GitError::KINDS,
         },
+        // The category map above names the codes; this names which code each
+        // error kind actually reports. Without it a caller has to hardcode the
+        // mapping, and a deliberate reclassification looks to that caller like
+        // an unannounced break rather than a contract change it can observe.
+        "exit_code_by_kind": {
+            "cli": kind_exit_codes(CLI_KIND_EXIT_CODES),
+            "project": kind_exit_codes(PROJECT_KIND_EXIT_CODES),
+            "git": kind_exit_codes(GIT_KIND_EXIT_CODES),
+        },
         "streams": {
             "result": "stdout",
             "progress": "stderr",
@@ -1709,15 +2458,25 @@ fn install_interrupt_handler() -> io::Result<Cancellation> {
     Ok(cancellation)
 }
 
+/// Classifies a project failure for the published exit-code contract.
+///
+/// The worktree-destination checks deliberately split across two classes. An
+/// occupied destination is a conflict, in the same family as an existing branch
+/// name: nothing is wrong with the request, the world is simply already using
+/// that place, and the same command succeeds once it is free. Every other
+/// destination check is a refusal, because a relative path, a destination
+/// inside the project, or one inside the data directory is a request Harkness
+/// will never accept no matter what the filesystem does next. Keep that split
+/// when adding a variant, and add it to `PROJECT_KIND_EXIT_CODES` too.
 fn project_exit_code(error: &ProjectError) -> u8 {
     match error {
         ProjectError::CloneCancelled => EXIT_CANCELLED,
         ProjectError::ProjectSelectorNotFound { .. } | ProjectError::ProjectNotFound(_) => {
             EXIT_NOT_FOUND
         }
-        ProjectError::AmbiguousProjectSelector { .. } | ProjectError::ParentHasWorktrees { .. } => {
-            EXIT_CONFLICT
-        }
+        ProjectError::AmbiguousProjectSelector { .. }
+        | ProjectError::ParentHasWorktrees { .. }
+        | ProjectError::WorktreeDestinationExists { .. } => EXIT_CONFLICT,
         ProjectError::UnsafeManagedRemoval { .. }
         | ProjectError::WorktreeRemovalRequired { .. }
         | ProjectError::UnsafeWorktreeRemoval { .. }
@@ -1725,7 +2484,6 @@ fn project_exit_code(error: &ProjectError) -> u8 {
         | ProjectError::DirtyWorktreeRemoval { .. }
         | ProjectError::UnsafeWorktreeLock { .. }
         | ProjectError::UnsafeWorktreeMove { .. }
-        | ProjectError::WorktreeDestinationExists { .. }
         | ProjectError::WorktreeDestinationNotAbsolute { .. }
         | ProjectError::WorktreeDestinationParentUnavailable { .. }
         | ProjectError::WorktreeDestinationInsideProject { .. }
@@ -1761,7 +2519,6 @@ fn git_exit_code(error: &GitError) -> u8 {
         GitError::RepositoryBusy { .. }
         | GitError::BranchAlreadyExists { .. }
         | GitError::BranchCheckedOutInWorktree { .. }
-        | GitError::WorktreeLocked { .. }
         | GitError::WorktreeAlreadyLocked { .. }
         | GitError::WorktreeNotLocked { .. } => EXIT_CONFLICT,
         GitError::PathOutsideRepository { .. }
@@ -1779,6 +2536,7 @@ fn git_exit_code(error: &GitError) -> u8 {
         | GitError::DefaultBranchPush { .. }
         | GitError::DefaultBranchUnknown { .. }
         | GitError::DetachedHead { .. }
+        | GitError::WorktreeLocked { .. }
         | GitError::WorktreeMoveAcrossDevices { .. }
         | GitError::StaleHunkSelection { .. }
         | GitError::BinaryHunkSelection { .. }
@@ -1821,7 +2579,10 @@ fn git_exit_code(error: &GitError) -> u8 {
 /// what refuses that silence instead: adding a kind upstream breaks
 /// `git_error_kinds_are_classified_for_the_exit_code_contract` until its
 /// exit code is stated.
-#[cfg(test)]
+///
+/// It is also published by `harkness contract`, so a caller never has to
+/// hardcode the mapping and a reclassification is observable rather than a
+/// silent change in what an existing script sees.
 const GIT_KIND_EXIT_CODES: &[(&str, u8)] = &[
     ("launch", EXIT_OPERATION_FAILED),
     ("failed", EXIT_OPERATION_FAILED),
@@ -1841,7 +2602,7 @@ const GIT_KIND_EXIT_CODES: &[(&str, u8)] = &[
     ("current_branch_deletion", EXIT_REFUSED),
     ("default_branch_deletion", EXIT_REFUSED),
     ("branch_checked_out_in_worktree", EXIT_CONFLICT),
-    ("worktree_locked", EXIT_CONFLICT),
+    ("worktree_locked", EXIT_REFUSED),
     ("empty_worktree_lock_reason", EXIT_REFUSED),
     ("worktree_already_locked", EXIT_CONFLICT),
     ("worktree_not_locked", EXIT_CONFLICT),
@@ -1872,6 +2633,78 @@ const GIT_KIND_EXIT_CODES: &[(&str, u8)] = &[
     ("hunk_application", EXIT_OPERATION_FAILED),
     ("malformed_status", EXIT_OPERATION_FAILED),
 ];
+
+/// The exit code every project error kind reports, in
+/// `ProjectError::DIRECT_KINDS` order.
+///
+/// [`project_exit_code`] is exhaustive today, so a new variant does fail to
+/// compile there. That is not enough on its own: the compiler will happily
+/// accept a variant grouped under the wrong existing arm, which is exactly how
+/// a classification drifts. This table states the intended answer separately,
+/// and `project_error_kinds_are_classified_for_the_exit_code_contract` holds
+/// the two in agreement.
+const PROJECT_KIND_EXIT_CODES: &[(&str, u8)] = &[
+    ("data_directory_unavailable", EXIT_OPERATION_FAILED),
+    ("invalid_directory", EXIT_OPERATION_FAILED),
+    ("unreadable_directory", EXIT_OPERATION_FAILED),
+    ("catalog_read", EXIT_OPERATION_FAILED),
+    ("catalog_lock", EXIT_OPERATION_FAILED),
+    ("malformed_catalog", EXIT_OPERATION_FAILED),
+    ("catalog_version_too_old", EXIT_OPERATION_FAILED),
+    ("catalog_version_too_new", EXIT_OPERATION_FAILED),
+    ("invalid_catalog", EXIT_OPERATION_FAILED),
+    ("project_selector_not_found", EXIT_NOT_FOUND),
+    ("ambiguous_project_selector", EXIT_CONFLICT),
+    ("project_not_found", EXIT_NOT_FOUND),
+    ("project_unavailable", EXIT_OPERATION_FAILED),
+    ("git_inspection", EXIT_OPERATION_FAILED),
+    ("persistence", EXIT_OPERATION_FAILED),
+    ("invalid_remote", EXIT_OPERATION_FAILED),
+    ("git_launch", EXIT_OPERATION_FAILED),
+    ("clone_failed", EXIT_OPERATION_FAILED),
+    ("clone_cancelled", EXIT_CANCELLED),
+    ("unsafe_managed_removal", EXIT_REFUSED),
+    ("managed_removal", EXIT_OPERATION_FAILED),
+    ("managed_repository_lock", EXIT_OPERATION_FAILED),
+    ("managed_repository_reconciliation", EXIT_OPERATION_FAILED),
+    ("parent_has_worktrees", EXIT_CONFLICT),
+    ("worktree_removal_required", EXIT_REFUSED),
+    ("unsafe_worktree_removal", EXIT_REFUSED),
+    ("worktree_parent_unsupported", EXIT_REFUSED),
+    ("dirty_worktree_removal", EXIT_REFUSED),
+    ("unsafe_worktree_lock", EXIT_REFUSED),
+    ("unsafe_worktree_move", EXIT_REFUSED),
+    ("worktree_destination_exists", EXIT_CONFLICT),
+    ("worktree_destination_not_absolute", EXIT_REFUSED),
+    ("worktree_destination_parent_unavailable", EXIT_REFUSED),
+    ("worktree_destination_inside_project", EXIT_REFUSED),
+    ("worktree_destination_contains_project", EXIT_REFUSED),
+    ("worktree_destination_inside_data_directory", EXIT_REFUSED),
+    ("worktree_moved_catalog_stale", EXIT_OPERATION_FAILED),
+];
+
+/// The exit code every CLI-originated error kind reports, in
+/// `CLI_ERROR_KINDS` order.
+const CLI_KIND_EXIT_CODES: &[(&str, u8)] = &[
+    ("usage_error", EXIT_USAGE),
+    ("current_directory_unavailable", EXIT_OPERATION_FAILED),
+    ("interrupt_handler_unavailable", EXIT_OPERATION_FAILED),
+    ("wire_projection_failed", EXIT_OPERATION_FAILED),
+    ("path_operation_failed", EXIT_OPERATION_FAILED),
+    ("confirmation_required", EXIT_REFUSED),
+    ("managed_project_requires_delete", EXIT_REFUSED),
+    ("local_project_requires_forget", EXIT_REFUSED),
+    ("worktree_requires_remove", EXIT_REFUSED),
+];
+
+fn kind_exit_codes(table: &[(&str, u8)]) -> Value {
+    Value::Object(
+        table
+            .iter()
+            .map(|(kind, code)| ((*kind).to_owned(), json!(code)))
+            .collect(),
+    )
+}
 
 fn project_error_details(error: &ProjectError) -> Value {
     match error {
@@ -1981,20 +2814,151 @@ fn git_error_details(error: &GitError) -> Value {
                 "destination_is_lossy": destination_is_lossy,
             })
         }
+        GitError::WorktreeLocked { path, reason }
+        | GitError::WorktreeAlreadyLocked { path, reason } => {
+            let (path, path_is_lossy) = wire_path(path);
+            json!({
+                "path": path,
+                "path_is_lossy": path_is_lossy,
+                "reason": reason,
+            })
+        }
+        GitError::WorktreeNotLocked { path }
+        | GitError::StaleHunkSelection { path }
+        | GitError::BinaryHunkSelection { path }
+        | GitError::OverlappingHunkSelection { path }
+        | GitError::RepositoryBusy { path }
+        | GitError::NotARepository { path }
+        | GitError::DiffContent { path, .. } => {
+            let (path, path_is_lossy) = wire_path(path);
+            json!({ "path": path, "path_is_lossy": path_is_lossy })
+        }
+        // Every hunk refusal below names an alternative in its message, and the
+        // path that alternative applies to has to reach the caller as data. A
+        // machine consumer choosing to fall back to path staging cannot be made
+        // to recover the path by matching prose.
+        GitError::RenameOnlyHunkSelection { old_path, new_path } => {
+            let (old_path, old_path_is_lossy) = wire_path(old_path);
+            let (new_path, new_path_is_lossy) = wire_path(new_path);
+            json!({
+                "old_path": old_path,
+                "old_path_is_lossy": old_path_is_lossy,
+                "new_path": new_path,
+                "new_path_is_lossy": new_path_is_lossy,
+            })
+        }
+        GitError::MetadataOnlyHunkSelection {
+            path,
+            old_mode,
+            new_mode,
+        } => {
+            let (path, path_is_lossy) = wire_path(path);
+            json!({
+                "path": path,
+                "path_is_lossy": path_is_lossy,
+                "old_mode": old_mode,
+                "new_mode": new_mode,
+            })
+        }
+        GitError::UnsupportedHunkChange { path, change } => {
+            let (path, path_is_lossy) = wire_path(path);
+            json!({
+                "path": path,
+                "path_is_lossy": path_is_lossy,
+                "change": file_change_name(*change),
+            })
+        }
+        GitError::FilteredHunkSelection { path, driver } => {
+            let (path, path_is_lossy) = wire_path(path);
+            json!({
+                "path": path,
+                "path_is_lossy": path_is_lossy,
+                "driver": driver,
+            })
+        }
+        GitError::HunkApplication { paths, .. } => json!({
+            "paths": paths.iter().map(|path| wire_path(path).0).collect::<Vec<_>>(),
+            "paths_are_lossy": paths.iter().any(|path| wire_path(path).1),
+        }),
+        GitError::PathOutsideRepository { path, repository } => {
+            let (path, path_is_lossy) = wire_path(path);
+            let (repository, repository_is_lossy) = wire_path(repository);
+            json!({
+                "path": path,
+                "path_is_lossy": path_is_lossy,
+                "repository": repository,
+                "repository_is_lossy": repository_is_lossy,
+            })
+        }
+        GitError::MalformedDiff { detail } | GitError::MalformedStatus { detail } => {
+            json!({ "detail": detail })
+        }
+        GitError::OperationInProgress { path, pending } => {
+            let (path, path_is_lossy) = wire_path(path);
+            json!({
+                "path": path,
+                "path_is_lossy": path_is_lossy,
+                "pending": pending_name(*pending),
+            })
+        }
+        GitError::BranchCheckedOutInWorktree { branch, worktree } => {
+            let (worktree, worktree_is_lossy) = wire_path(worktree);
+            json!({
+                "branch": branch,
+                "worktree": worktree,
+                "worktree_is_lossy": worktree_is_lossy,
+            })
+        }
+        GitError::UnbornBranch { path, branch } => {
+            let (path, path_is_lossy) = wire_path(path);
+            json!({
+                "path": path,
+                "path_is_lossy": path_is_lossy,
+                "branch": branch,
+            })
+        }
+        GitError::DetachedHead { path, detail } => {
+            let (path, path_is_lossy) = wire_path(path);
+            json!({
+                "path": path,
+                "path_is_lossy": path_is_lossy,
+                "detail": detail,
+            })
+        }
+        GitError::HunkNotFound {
+            path,
+            old_start,
+            old_lines,
+            new_start,
+            new_lines,
+        } => {
+            let (path, path_is_lossy) = wire_path(path);
+            json!({
+                "path": path,
+                "path_is_lossy": path_is_lossy,
+                "old_start": old_start,
+                "old_lines": old_lines,
+                "new_start": new_start,
+                "new_lines": new_lines,
+            })
+        }
         _ => json!({}),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, io};
-
-    use std::path::PathBuf;
+    use std::{
+        collections::HashSet,
+        io,
+        path::{Path, PathBuf},
+    };
 
     use super::{
-        CLI_ERROR_KINDS, CliError, EXIT_CONFLICT, EXIT_OPERATION_FAILED, EXIT_REFUSED,
-        GIT_KIND_EXIT_CODES, GitError, Project, ProjectError, RefusalKind, git_exit_code,
-        project_value, requested_json, single_line,
+        CLI_ERROR_KINDS, CLI_KIND_EXIT_CODES, CliError, EXIT_CANCELLED, EXIT_CONFLICT,
+        EXIT_OPERATION_FAILED, EXIT_REFUSED, EXIT_USAGE, GIT_KIND_EXIT_CODES, GitError,
+        PROJECT_KIND_EXIT_CODES, Project, ProjectError, RefusalKind, git_exit_code,
+        parse_selection_document, project_exit_code, project_value, requested_json, single_line,
     };
 
     #[test]
@@ -2030,14 +2994,259 @@ mod tests {
         );
     }
 
+    /// The project table has no wildcard to defend against, but it does have to
+    /// agree with `project_exit_code`. A new variant grouped under the wrong
+    /// existing arm compiles perfectly; this is what notices.
+    #[test]
+    fn project_error_kinds_are_classified_for_the_exit_code_contract() {
+        let declared = PROJECT_KIND_EXIT_CODES
+            .iter()
+            .map(|(kind, _)| *kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            declared,
+            ProjectError::DIRECT_KINDS,
+            "PROJECT_KIND_EXIT_CODES must classify every project error kind, in order"
+        );
+    }
+
+    /// The published tables must describe what the classifiers actually return,
+    /// or `harkness contract` documents a mapping the binary does not honour.
+    #[test]
+    fn published_exit_codes_match_the_classifiers() {
+        let cases: [(ProjectError, u8); 4] = [
+            (
+                ProjectError::WorktreeDestinationExists {
+                    path: PathBuf::from("/tmp/occupied"),
+                },
+                EXIT_CONFLICT,
+            ),
+            (
+                ProjectError::WorktreeDestinationNotAbsolute {
+                    path: PathBuf::from("relative"),
+                },
+                EXIT_REFUSED,
+            ),
+            (
+                ProjectError::CloneFailed {
+                    stderr: "fixture".to_owned(),
+                },
+                EXIT_OPERATION_FAILED,
+            ),
+            (ProjectError::CloneCancelled, EXIT_CANCELLED),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(project_exit_code(&error), expected, "for {error:?}");
+            let declared = PROJECT_KIND_EXIT_CODES
+                .iter()
+                .find(|(kind, _)| *kind == error.kind())
+                .map(|(_, code)| *code);
+            assert_eq!(declared, Some(expected), "table disagrees for {error:?}");
+        }
+        let cli_kinds = CLI_KIND_EXIT_CODES
+            .iter()
+            .map(|(kind, _)| *kind)
+            .collect::<Vec<_>>();
+        assert_eq!(cli_kinds, CLI_ERROR_KINDS);
+        assert_eq!(
+            CLI_KIND_EXIT_CODES
+                .iter()
+                .find(|(kind, _)| *kind == "usage_error")
+                .map(|(_, code)| *code),
+            Some(EXIT_USAGE)
+        );
+    }
+
+    /// A `git diff` response is meant to be usable as a selection document with
+    /// nothing but its unwanted hunks removed, so the parser is pinned against
+    /// the exact shape `file_diff_value` emits, envelope and all.
+    #[test]
+    fn a_diff_response_round_trips_as_a_selection_document() {
+        let document = serde_json::json!({
+            "v": 1,
+            "type": "success",
+            "ok": true,
+            "data": {
+                "files": [{
+                    "old_path": "kept.txt",
+                    "old_path_is_lossy": false,
+                    "old_path_base64": "a2VwdC50eHQ=",
+                    "new_path": "kept.txt",
+                    "new_path_is_lossy": false,
+                    "new_path_base64": "a2VwdC50eHQ=",
+                    "old_blob_id": "aaaa",
+                    "new_blob_id": "bbbb",
+                    "context_lines": 3,
+                    "hunks": [
+                        { "old_start": 1, "old_lines": 5, "new_start": 1, "new_lines": 5 },
+                        { "old_start": 11, "old_lines": 5, "new_start": 11, "new_lines": 6 },
+                    ],
+                }],
+            },
+        })
+        .to_string();
+
+        let selections = parse_selection_document(&document, "unstaged").unwrap();
+
+        assert_eq!(selections.len(), 2);
+        assert_eq!(
+            selections[0].old_path.as_deref(),
+            Some(Path::new("kept.txt"))
+        );
+        assert_eq!(selections[0].context_lines, 3);
+        assert_eq!(selections[1].new_start, 11);
+        assert_eq!(selections[1].new_lines, 6);
+    }
+
+    /// A lossy path names a different file than the one on disk, so replaying
+    /// it must be refused with an actionable message rather than accepted and
+    /// later reported as a stale selection the caller cannot possibly refresh.
+    #[test]
+    fn a_lossy_path_is_refused_until_its_exact_bytes_are_supplied() {
+        let lossy = serde_json::json!({
+            "selections": [{
+                "new_path": "bad-\u{fffd}.txt",
+                "new_path_is_lossy": true,
+                "old_blob_id": "aaaa",
+                "new_blob_id": "bbbb",
+                "context_lines": 3,
+                "old_start": 1, "old_lines": 1, "new_start": 1, "new_lines": 1,
+            }],
+        })
+        .to_string();
+
+        let error = parse_selection_document(&lossy, "unstaged").unwrap_err();
+
+        assert_eq!(error.kind(), "usage_error");
+        assert!(
+            error.message().contains("new_path_base64"),
+            "the refusal must name the field that fixes it: {}",
+            error.message()
+        );
+
+        let exact = serde_json::json!({
+            "selections": [{
+                "new_path": "bad-\u{fffd}.txt",
+                "new_path_is_lossy": true,
+                "new_path_base64": "YmFkLf8udHh0",
+                "old_blob_id": "aaaa",
+                "new_blob_id": "bbbb",
+                "context_lines": 3,
+                "old_start": 1, "old_lines": 1, "new_start": 1, "new_lines": 1,
+            }],
+        })
+        .to_string();
+
+        let parsed = parse_selection_document(&exact, "unstaged");
+
+        // Whether those bytes name a file at all is a platform question. A
+        // Unix path is bytes, so the exact spelling wins; a Windows path is
+        // UTF-16 and cannot hold them, so the only honest answer is to say so
+        // rather than to substitute a name that points somewhere else.
+        #[cfg(unix)]
+        {
+            let selections = parsed.unwrap();
+            assert_eq!(selections.len(), 1);
+            assert_ne!(
+                selections[0].new_path.as_deref(),
+                Some(Path::new("bad-\u{fffd}.txt")),
+                "the Base64 spelling must win over the lossy one"
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            let error = parsed.unwrap_err();
+            assert_eq!(error.kind(), "usage_error");
+            assert!(
+                error
+                    .message()
+                    .contains("not a valid path on this platform"),
+                "the refusal must explain why: {}",
+                error.message()
+            );
+        }
+    }
+
+    /// Piping a combined diff into one side's command is the obvious mistake,
+    /// and revalidation would call it stale — true of the identities, useless
+    /// as a diagnosis. The wrong side has to be named as the wrong side.
+    #[test]
+    fn a_record_from_the_other_side_of_the_index_is_named_not_called_stale() {
+        let document = serde_json::json!({
+            "files": [{
+                "target": "staged",
+                "new_path": "a.txt",
+                "old_path": "a.txt",
+                "old_blob_id": "aaaa",
+                "new_blob_id": "bbbb",
+                "context_lines": 3,
+                "hunks": [{ "old_start": 1, "old_lines": 1, "new_start": 1, "new_lines": 1 }],
+            }],
+        })
+        .to_string();
+
+        let error = parse_selection_document(&document, "unstaged").unwrap_err();
+
+        assert_eq!(error.kind(), "usage_error");
+        let message = error.message();
+        assert!(message.contains("\"staged\""), "{message}");
+        assert!(message.contains("--unstaged"), "{message}");
+        assert!(
+            !message.contains("stale"),
+            "the wrong side must not be reported as staleness: {message}"
+        );
+
+        // The same document is exactly what `git unstage` should accept.
+        assert_eq!(
+            parse_selection_document(&document, "staged").unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn malformed_selection_documents_are_usage_errors_that_name_the_field() {
+        let cases = [
+            ("not json", "not JSON"),
+            (r#"{"files": {}}"#, "files is not an array"),
+            (
+                r#"{"selections": [{"new_path": "a"}]}"#,
+                "selections[0].old_blob_id",
+            ),
+            (
+                r#"{"files": [{"new_path": "a", "old_blob_id": "x", "new_blob_id": "y", "context_lines": 3}]}"#,
+                "has no \"hunks\"",
+            ),
+            (
+                r#"{"selections": [{"old_blob_id": "x", "new_blob_id": "y", "context_lines": 3, "old_start": 1, "old_lines": 1, "new_start": 1, "new_lines": 1}]}"#,
+                "neither an old_path nor a new_path",
+            ),
+        ];
+        for (document, expected) in cases {
+            let error = parse_selection_document(document, "unstaged").unwrap_err();
+            assert_eq!(error.kind(), "usage_error", "for {document}");
+            assert!(
+                error.message().contains(expected),
+                "expected {expected:?} in {:?}",
+                error.message()
+            );
+        }
+    }
+
     /// Proves the table describes what `git_exit_code` actually returns for the
     /// worktree-lock kinds, so a state conflict is never reported as a generic
     /// operation failure.
     #[test]
     fn worktree_lock_errors_report_conflict_and_refusal_exit_codes() {
         let path = PathBuf::from("/tmp/worktree");
-        let cases: [(GitError, u8); 3] = [
+        let cases: [(GitError, u8); 4] = [
             (GitError::EmptyWorktreeLockReason, EXIT_REFUSED),
+            (
+                GitError::WorktreeLocked {
+                    path: path.clone(),
+                    reason: Some("agent is still working".to_owned()),
+                },
+                EXIT_REFUSED,
+            ),
             (
                 GitError::WorktreeAlreadyLocked {
                     path: path.clone(),
@@ -2087,6 +3296,7 @@ mod tests {
             details: serde_json::json!({}),
         };
         let cases = [
+            CliError::Usage("fixture".to_owned()),
             CliError::CurrentDirectory(io::Error::other("fixture")),
             CliError::InterruptHandler(io::Error::other("fixture")),
             CliError::WireProjection("fixture".to_owned()),
@@ -2100,7 +3310,7 @@ mod tests {
             refused(RefusalKind::WorktreeRequiresRemove),
         ];
         let kinds = cases.iter().map(CliError::kind).collect::<Vec<_>>();
-        assert_eq!(kinds, CLI_ERROR_KINDS[1..]);
+        assert_eq!(kinds, CLI_ERROR_KINDS);
     }
 
     #[test]

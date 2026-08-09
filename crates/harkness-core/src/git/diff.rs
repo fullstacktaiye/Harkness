@@ -13,14 +13,34 @@ use std::{
 };
 
 use git2::{
-    Delta, DiffFindOptions, DiffLineType as GitDiffLineType, DiffOptions as GitDiffOptions,
+    Delta, Diff, DiffFindOptions, DiffLineType as GitDiffLineType, DiffOptions as GitDiffOptions,
     ErrorCode, FileMode, ObjectType, Oid, Patch, Repository,
 };
 
 use crate::git::{FileChange, GitError, commit};
 
 /// The default largest file whose content Harkness will put in a diff model.
-const DEFAULT_MAX_DIFF_FILE_SIZE: u64 = 1024 * 1024;
+pub const DEFAULT_MAX_DIFF_FILE_SIZE: u64 = 1024 * 1024;
+
+/// The default budget for all hunk content in one diff model.
+///
+/// A per-file bound alone does not bound a response: a tree of files that are
+/// each individually small still renders an unbounded model, and a generous
+/// context setting multiplies every one of them. This caps the whole batch.
+///
+/// It is deliberately far below what a machine could hold. Raw content is the
+/// cheapest thing a caller pays for: every line becomes its own allocation, and
+/// then its own object in a serialised projection, so peak memory runs an order
+/// of magnitude above the figure counted here. A caller that genuinely wants
+/// more can raise it and will see [`DiffOmission::ContentBudgetExhausted`]
+/// saying so, which is the outcome to prefer over a diff nobody can render.
+pub const DEFAULT_MAX_DIFF_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The default number of files whose content one diff model will carry.
+pub const DEFAULT_MAX_DIFF_FILES: usize = 5_000;
+
+/// The default number of unchanged lines surrounding each hunk.
+pub const DEFAULT_DIFF_CONTEXT_LINES: u32 = 3;
 
 /// Which side of the index to inspect.
 ///
@@ -42,6 +62,13 @@ pub struct DiffOptions {
     /// The largest old or new file, in bytes, whose hunks will be returned.
     /// Defaults to one mebibyte.
     pub max_file_size: u64,
+    /// The combined budget, in bytes, for hunk content across the whole model.
+    /// Files reached after it is spent keep their identity record and report
+    /// [`DiffOmission::ContentBudgetExhausted`] instead of hunks.
+    pub max_total_bytes: u64,
+    /// The number of files whose content the model will carry. Later files
+    /// report [`DiffOmission::FileBudgetExhausted`] rather than disappearing.
+    pub max_files: usize,
     /// The number of unchanged lines surrounding each hunk.
     pub context_lines: u32,
     /// Literal paths to inspect. An empty list selects the whole tree.
@@ -52,17 +79,46 @@ impl Default for DiffOptions {
     fn default() -> Self {
         Self {
             max_file_size: DEFAULT_MAX_DIFF_FILE_SIZE,
-            context_lines: 3,
+            max_total_bytes: DEFAULT_MAX_DIFF_TOTAL_BYTES,
+            max_files: DEFAULT_MAX_DIFF_FILES,
+            context_lines: DEFAULT_DIFF_CONTEXT_LINES,
             paths: Vec::new(),
         }
     }
 }
 
 impl DiffOptions {
+    /// Removes every size and count bound.
+    ///
+    /// Revalidation in [`super::hunk`] must see a superset of whatever a caller
+    /// diffed, so a file the caller could legitimately select from is never
+    /// omitted merely for exceeding that caller's own display budget.
+    #[must_use]
+    pub fn unbounded() -> Self {
+        Self::default()
+            .with_max_file_size(u64::MAX)
+            .with_max_total_bytes(u64::MAX)
+            .with_max_files(usize::MAX)
+    }
+
     /// Sets the largest file whose content will be returned.
     #[must_use]
     pub fn with_max_file_size(mut self, max_file_size: u64) -> Self {
         self.max_file_size = max_file_size;
+        self
+    }
+
+    /// Sets the combined hunk-content budget for the whole model.
+    #[must_use]
+    pub fn with_max_total_bytes(mut self, max_total_bytes: u64) -> Self {
+        self.max_total_bytes = max_total_bytes;
+        self
+    }
+
+    /// Sets how many files carry content before the rest are named only.
+    #[must_use]
+    pub fn with_max_files(mut self, max_files: usize) -> Self {
+        self.max_files = max_files;
         self
     }
 
@@ -89,11 +145,27 @@ impl DiffOptions {
 }
 
 /// Why a changed file has no content hunks.
+///
+/// Every reason a file's content is missing is named here rather than reported
+/// by failing the whole diff. One delta Harkness cannot project must not cost a
+/// caller the other thousand it can, so inspection is total: the file list is
+/// always complete and each entry says for itself why it carries no hunks.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum DiffOmission {
     /// At least one side exceeded [`DiffOptions::max_file_size`].
     FileTooLarge { limit: u64 },
+    /// The path is an unresolved merge conflict. The index holds stage 1, 2 and
+    /// 3 entries and no single resolved blob, so there is no two-sided content
+    /// comparison to render. Resolve the path, or inspect the staged side.
+    Unmerged,
+    /// [`DiffOptions::max_total_bytes`] was spent before this file was reached.
+    ContentBudgetExhausted { limit: u64 },
+    /// [`DiffOptions::max_files`] was reached before this file.
+    FileBudgetExhausted { limit: usize },
+    /// Libgit2 described this delta in a shape the file contract cannot carry.
+    /// The detail names what was unexpected; the record itself stays valid.
+    Unrepresentable { detail: String },
 }
 
 /// One changed file on one side of the index.
@@ -187,6 +259,20 @@ pub(crate) fn compute(
     target: DiffTarget,
     options: &DiffOptions,
 ) -> Result<Vec<FileDiff>, GitError> {
+    compute_targets(root, std::slice::from_ref(&target), options)
+}
+
+/// Computes several targets against one repository and index snapshot.
+///
+/// Every target is read from the same open index, so a combined staged and
+/// unstaged model describes one moment. Computing the sides separately would
+/// let a concurrent index write land between them and produce a response that
+/// duplicates or drops a change while looking internally consistent.
+pub(crate) fn compute_targets(
+    root: &Path,
+    targets: &[DiffTarget],
+    options: &DiffOptions,
+) -> Result<Vec<FileDiff>, GitError> {
     commit::validate_paths(root, &options.paths)?;
     let selected_paths = selected_paths(root, &options.paths);
     let repository = commit::open(root)?;
@@ -194,6 +280,76 @@ pub(crate) fn compute(
         .index()
         .map_err(|source| inspection(root, source))?;
 
+    let mut budget = Budget::new(options);
+    let mut files = Vec::new();
+    for target in targets {
+        collect_target(
+            &repository,
+            &index,
+            root,
+            target,
+            options,
+            &selected_paths,
+            &mut budget,
+            &mut files,
+        )?;
+    }
+    Ok(files)
+}
+
+/// What remains of the whole-model content allowance.
+struct Budget {
+    remaining_files: usize,
+    remaining_bytes: u64,
+    max_files: usize,
+    max_total_bytes: u64,
+}
+
+impl Budget {
+    fn new(options: &DiffOptions) -> Self {
+        Self {
+            remaining_files: options.max_files,
+            remaining_bytes: options.max_total_bytes,
+            max_files: options.max_files,
+            max_total_bytes: options.max_total_bytes,
+        }
+    }
+
+    /// The reason this file must be named without content, if any.
+    fn exhausted(&self) -> Option<DiffOmission> {
+        if self.remaining_files == 0 {
+            return Some(DiffOmission::FileBudgetExhausted {
+                limit: self.max_files,
+            });
+        }
+        if self.remaining_bytes == 0 {
+            return Some(DiffOmission::ContentBudgetExhausted {
+                limit: self.max_total_bytes,
+            });
+        }
+        None
+    }
+
+    fn spend(&mut self, bytes: u64) {
+        self.remaining_files = self.remaining_files.saturating_sub(1);
+        self.remaining_bytes = self.remaining_bytes.saturating_sub(bytes);
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one snapshot is threaded through rather than reopened per target"
+)]
+fn collect_target(
+    repository: &Repository,
+    index: &git2::Index,
+    root: &Path,
+    target: &DiffTarget,
+    options: &DiffOptions,
+    selected_paths: &[PathBuf],
+    budget: &mut Budget,
+    files: &mut Vec<FileDiff>,
+) -> Result<(), GitError> {
     let mut native_options = GitDiffOptions::new();
     native_options
         .context_lines(options.context_lines)
@@ -210,15 +366,15 @@ pub(crate) fn compute(
 
     let mut diff = match target {
         DiffTarget::Staged => {
-            let head_tree = head_tree(&repository, root)?;
+            let head_tree = head_tree(repository, root)?;
             repository.diff_tree_to_index(
                 head_tree.as_ref(),
-                Some(&index),
+                Some(index),
                 Some(&mut native_options),
             )
         }
         DiffTarget::Unstaged => {
-            repository.diff_index_to_workdir(Some(&index), Some(&mut native_options))
+            repository.diff_index_to_workdir(Some(index), Some(&mut native_options))
         }
     }
     .map_err(|source| inspection(root, source))?;
@@ -239,75 +395,139 @@ pub(crate) fn compute(
     // caller saw in a whole-tree diff. Filtering before `find_similar` would
     // silently repair against a different pairing.
 
-    let mut files = Vec::new();
-    for index in 0..diff.deltas().len() {
-        let Some(delta) = diff.get_delta(index) else {
-            return Err(malformed(format!("diff delta {index} disappeared")));
+    for position in 0..diff.deltas().len() {
+        let Some(delta) = diff.get_delta(position) else {
+            return Err(malformed(format!("diff delta {position} disappeared")));
         };
-        if delta.status() == Delta::Unmodified
-            || !path_selected(
-                delta.old_file().path(),
-                delta.new_file().path(),
-                &selected_paths,
-            )
-        {
+        let status = delta.status();
+        if !path_selected(
+            delta.old_file().path(),
+            delta.new_file().path(),
+            selected_paths,
+        ) {
+            continue;
+        }
+        // Neither is ever requested: `include_ignored` and `include_unreadable`
+        // stay off, so a match here would be libgit2 volunteering a delta this
+        // model has no side to describe.
+        if matches!(status, Delta::Unmodified | Delta::Ignored) {
             continue;
         }
 
-        let old_size = delta.old_file().size();
-        let new_size = delta.new_file().size();
-        let omission = (old_size > options.max_file_size || new_size > options.max_file_size)
-            .then_some(DiffOmission::FileTooLarge {
-                limit: options.max_file_size,
-            });
+        let Some(change) = file_change(status) else {
+            files.push(unrepresentable(
+                &diff,
+                position,
+                target,
+                options,
+                format!("unexpected {status:?} delta"),
+            ));
+            continue;
+        };
 
-        let patch = if omission.is_none() {
-            Patch::from_diff(&diff, index).map_err(|source| inspection(root, source))?
+        let old_size = resolved_size(repository, &delta.old_file());
+        let new_size = resolved_size(repository, &delta.new_file());
+        // An unresolved path has stage 1, 2 and 3 index entries and no single
+        // resolved blob, so it has no two-sided content comparison to render.
+        // It is named and skipped rather than failing the whole inspection.
+        let mut omission = if change == FileChange::Unmerged {
+            Some(DiffOmission::Unmerged)
+        } else if old_size > options.max_file_size || new_size > options.max_file_size {
+            Some(DiffOmission::FileTooLarge {
+                limit: options.max_file_size,
+            })
         } else {
-            None
+            budget.exhausted()
+        };
+
+        let patch = match omission {
+            Some(_) => None,
+            None => match Patch::from_diff(&diff, position) {
+                Ok(patch) => patch,
+                Err(source) => {
+                    omission = Some(DiffOmission::Unrepresentable {
+                        detail: source.message().to_owned(),
+                    });
+                    None
+                }
+            },
         };
         // Patch construction performs binary detection and may populate IDs,
         // so reacquire the delta afterward rather than retaining stale flags.
         let delta = match patch.as_ref() {
             Some(patch) => patch.delta(),
-            None => diff
-                .get_delta(index)
-                .ok_or_else(|| malformed(format!("diff delta {index} disappeared")))?,
+            None => match diff.get_delta(position) {
+                Some(delta) => delta,
+                None => return Err(malformed(format!("diff delta {position} disappeared"))),
+            },
         };
-        let old_file = delta.old_file();
-        let new_file = delta.new_file();
-        let old_path = old_file
-            .exists()
-            .then(|| path_buf(old_file.path(), "old"))
-            .transpose()?;
-        let new_path = new_file
-            .exists()
-            .then(|| path_buf(new_file.path(), "new"))
-            .transpose()?;
+        let old_file = &delta.old_file();
+        let new_file = &delta.new_file();
+        let old_path = old_file.exists().then(|| old_file.path()).flatten();
+        let new_path = new_file.exists().then(|| new_file.path()).flatten();
+        if old_path.is_none() && old_file.exists() {
+            omission.get_or_insert(DiffOmission::Unrepresentable {
+                detail: "a present old diff side has no path".to_owned(),
+            });
+        }
+        if new_path.is_none() && new_file.exists() {
+            omission.get_or_insert(DiffOmission::Unrepresentable {
+                detail: "a present new diff side has no path".to_owned(),
+            });
+        }
+        let new_path = new_path.map(Path::to_path_buf);
+
         let binary = omission.is_none() && (old_file.is_binary() || new_file.is_binary());
+        let mut content_bytes = 0;
         let hunks = match patch.as_ref() {
-            Some(patch) if !binary => collect_hunks(patch, root)?,
+            Some(patch) if !binary => {
+                match collect_hunks(patch, root, budget.remaining_bytes, &mut content_bytes) {
+                    Ok(Some(hunks)) => hunks,
+                    Ok(None) => {
+                        omission = Some(DiffOmission::ContentBudgetExhausted {
+                            limit: budget.max_total_bytes,
+                        });
+                        content_bytes = 0;
+                        Vec::new()
+                    }
+                    Err(source) => {
+                        omission = Some(DiffOmission::Unrepresentable {
+                            detail: source.to_string(),
+                        });
+                        content_bytes = 0;
+                        Vec::new()
+                    }
+                }
+            }
             Some(_) | None => Vec::new(),
         };
-        let old_mode = file_mode(old_file.mode());
-        let new_mode = file_mode(new_file.mode());
+        if !hunks.is_empty() {
+            budget.spend(content_bytes);
+        }
+
+        let (old_blob_id, old_blob_detail) =
+            blob_id(repository, root, target, false, old_file, None);
+        let (new_blob_id, new_blob_detail) = blob_id(
+            repository,
+            root,
+            target,
+            true,
+            new_file,
+            new_path.as_deref(),
+        );
+        for detail in [old_blob_detail, new_blob_detail].into_iter().flatten() {
+            omission.get_or_insert(DiffOmission::Unrepresentable { detail });
+        }
 
         files.push(FileDiff {
             target: target.clone(),
-            change: file_change(delta.status())?,
-            old_path,
-            new_path: new_path.clone(),
-            old_blob_id: blob_id(&repository, root, &target, false, old_file, None)?,
-            new_blob_id: blob_id(
-                &repository,
-                root,
-                &target,
-                true,
-                new_file,
-                new_path.as_deref(),
-            )?,
-            old_mode,
-            new_mode,
+            change,
+            old_path: old_path.map(Path::to_path_buf),
+            new_path,
+            old_blob_id,
+            new_blob_id,
+            old_mode: file_mode(old_file.mode()),
+            new_mode: file_mode(new_file.mode()),
             context_lines: options.context_lines,
             old_size,
             new_size,
@@ -316,7 +536,83 @@ pub(crate) fn compute(
             hunks,
         });
     }
-    Ok(files)
+    Ok(())
+}
+
+/// Names a delta whose status this model cannot classify.
+///
+/// The identity that is still readable is kept so a caller can see which path
+/// was skipped; only the change classification and content are given up.
+fn unrepresentable(
+    diff: &Diff<'_>,
+    position: usize,
+    target: &DiffTarget,
+    options: &DiffOptions,
+    detail: String,
+) -> FileDiff {
+    let delta = diff.get_delta(position);
+    let side = |new_side: bool| {
+        delta.as_ref().map(|delta| {
+            if new_side {
+                delta.new_file()
+            } else {
+                delta.old_file()
+            }
+        })
+    };
+    let old_file = side(false);
+    let new_file = side(true);
+    let identity = |file: Option<git2::DiffFile<'_>>| {
+        file.map_or_else(
+            || (None, String::new(), 0),
+            |file| {
+                (
+                    file.path().map(Path::to_path_buf),
+                    file.id().to_string(),
+                    file_mode(file.mode()),
+                )
+            },
+        )
+    };
+    let (old_path, old_blob_id, old_mode) = identity(old_file);
+    let (new_path, new_blob_id, new_mode) = identity(new_file);
+    FileDiff {
+        target: target.clone(),
+        change: FileChange::Modified,
+        old_path,
+        new_path,
+        old_blob_id,
+        new_blob_id,
+        old_mode,
+        new_mode,
+        context_lines: options.context_lines,
+        old_size: 0,
+        new_size: 0,
+        binary: false,
+        omission: Some(DiffOmission::Unrepresentable { detail }),
+        hunks: Vec::new(),
+    }
+}
+
+/// The byte size of one diff side, resolving the blob when libgit2 left it zero.
+///
+/// Libgit2 populates `size` from a stat for a working-tree side and from the
+/// index entry for an index side, but leaves a tree side at zero until the blob
+/// is loaded. Trusting that zero would silently exempt the whole `HEAD` side of
+/// a staged diff from [`DiffOptions::max_file_size`], and an oversized text file
+/// would then come back flagged binary by libgit2's own guard instead of being
+/// named as too large.
+fn resolved_size(repository: &Repository, file: &git2::DiffFile<'_>) -> u64 {
+    let size = file.size();
+    if size > 0 || !file.exists() || file.mode() == FileMode::Commit {
+        return size;
+    }
+    if !file.is_valid_id() || file.id().is_zero() {
+        return size;
+    }
+    repository
+        .find_blob(file.id())
+        .map_or(size, |blob| blob.size() as u64)
 }
 
 fn head_tree<'repository>(
@@ -335,19 +631,44 @@ fn head_tree<'repository>(
     }
 }
 
-fn collect_hunks(patch: &Patch<'_>, root: &Path) -> Result<Vec<Hunk>, GitError> {
+/// Collects a patch's hunks, stopping once `limit` content bytes are reached.
+///
+/// `Ok(None)` means the budget ran out. The check happens while lines are read
+/// rather than after, so an oversized patch is never fully materialised only to
+/// be discarded. `spent` reports the bytes the returned hunks actually hold.
+fn collect_hunks(
+    patch: &Patch<'_>,
+    root: &Path,
+    limit: u64,
+    spent: &mut u64,
+) -> Result<Option<Vec<Hunk>>, GitError> {
     let mut hunks = Vec::with_capacity(patch.num_hunks());
+    let mut used: u64 = 0;
     for hunk_index in 0..patch.num_hunks() {
         let (hunk, line_count) = patch
             .hunk(hunk_index)
             .map_err(|source| inspection(root, source))?;
+        used = used.saturating_add(hunk.header().len() as u64);
+        if used > limit {
+            return Ok(None);
+        }
         let mut lines = Vec::with_capacity(line_count);
         for line_index in 0..line_count {
             let line = patch
                 .line_in_hunk(hunk_index, line_index)
                 .map_err(|source| inspection(root, source))?;
+            used = used.saturating_add(line.content().len() as u64);
+            if used > limit {
+                return Ok(None);
+            }
+            let Some(kind) = line_kind(line.origin_value()) else {
+                return Err(malformed(format!(
+                    "patch hunk returned a {:?} line",
+                    line.origin_value()
+                )));
+            };
             lines.push(DiffLine {
-                kind: line_kind(line.origin_value())?,
+                kind,
                 old_line_number: line.old_lineno(),
                 new_line_number: line.new_lineno(),
                 content: line.content().to_vec(),
@@ -362,28 +683,42 @@ fn collect_hunks(patch: &Patch<'_>, root: &Path) -> Result<Vec<Hunk>, GitError> 
             lines,
         });
     }
-    Ok(hunks)
+    *spent = used;
+    Ok(Some(hunks))
 }
 
+/// The object ID of one diff side, with a detail when none could be determined.
+///
+/// A missing ID names the file rather than failing the diff, because the one
+/// routine cause is an unresolved merge: a conflicted index entry carries
+/// stages 1 to 3 and no stage-0 blob for either side to point at.
 fn blob_id(
     repository: &Repository,
     root: &Path,
     target: &DiffTarget,
     new_side: bool,
-    file: git2::DiffFile<'_>,
+    file: &git2::DiffFile<'_>,
     path: Option<&Path>,
-) -> Result<String, GitError> {
-    if !file.exists() {
-        return Ok(file.id().to_string());
-    }
-    if file.is_valid_id() && !file.id().is_zero() {
-        return Ok(file.id().to_string());
+) -> (String, Option<String>) {
+    if !file.exists() || (file.is_valid_id() && !file.id().is_zero()) {
+        return (file.id().to_string(), None);
     }
     if matches!(target, DiffTarget::Unstaged) && new_side && file.mode() != FileMode::Commit {
-        let path = path.ok_or_else(|| malformed("an existing worktree side has no path"))?;
-        return hash_worktree_file(repository, &root.join(path)).map(|id| id.to_string());
+        let Some(path) = path else {
+            return (
+                file.id().to_string(),
+                Some("an existing worktree side has no path".to_owned()),
+            );
+        };
+        return match hash_worktree_file(repository, &root.join(path)) {
+            Ok(id) => (id.to_string(), None),
+            Err(error) => (file.id().to_string(), Some(error.to_string())),
+        };
     }
-    Err(malformed("a present diff side has no valid blob object ID"))
+    (
+        file.id().to_string(),
+        Some("a present diff side has no valid blob object ID".to_owned()),
+    )
 }
 
 fn hash_worktree_file(repository: &Repository, path: &Path) -> Result<Oid, GitError> {
@@ -416,13 +751,8 @@ fn file_mode(mode: FileMode) -> u32 {
     u32::try_from(i32::from(mode)).unwrap_or_default()
 }
 
-fn path_buf(path: Option<&Path>, side: &str) -> Result<PathBuf, GitError> {
-    path.map(Path::to_path_buf)
-        .ok_or_else(|| malformed(format!("a present {side} diff side has no path")))
-}
-
-fn file_change(delta: Delta) -> Result<FileChange, GitError> {
-    Ok(match delta {
+fn file_change(delta: Delta) -> Option<FileChange> {
+    Some(match delta {
         Delta::Added => FileChange::Added,
         Delta::Deleted => FileChange::Deleted,
         Delta::Modified => FileChange::Modified,
@@ -431,14 +761,12 @@ fn file_change(delta: Delta) -> Result<FileChange, GitError> {
         Delta::Typechange => FileChange::TypeChanged,
         Delta::Conflicted => FileChange::Unmerged,
         Delta::Untracked => FileChange::Untracked,
-        Delta::Unmodified | Delta::Ignored | Delta::Unreadable => {
-            return Err(malformed(format!("unexpected {delta:?} delta")));
-        }
+        Delta::Unmodified | Delta::Ignored | Delta::Unreadable => return None,
     })
 }
 
-fn line_kind(kind: GitDiffLineType) -> Result<DiffLineKind, GitError> {
-    Ok(match kind {
+fn line_kind(kind: GitDiffLineType) -> Option<DiffLineKind> {
+    Some(match kind {
         GitDiffLineType::Context => DiffLineKind::Context,
         GitDiffLineType::Addition => DiffLineKind::Addition,
         GitDiffLineType::Deletion => DiffLineKind::Deletion,
@@ -446,7 +774,7 @@ fn line_kind(kind: GitDiffLineType) -> Result<DiffLineKind, GitError> {
         GitDiffLineType::AddEOFNL => DiffLineKind::OldEofNoNewline,
         GitDiffLineType::DeleteEOFNL => DiffLineKind::NewEofNoNewline,
         GitDiffLineType::FileHeader | GitDiffLineType::HunkHeader | GitDiffLineType::Binary => {
-            return Err(malformed(format!("patch hunk returned a {kind:?} line")));
+            return None;
         }
     })
 }
@@ -723,6 +1051,191 @@ mod tests {
         assert_eq!(large.new_size, 17);
         assert_eq!(small.omission, None);
         assert!(!small.hunks.is_empty());
+    }
+
+    /// An unresolved merge is the state a caller most needs a diff in, and the
+    /// index has no stage-0 blob for either side of the conflicted path. The
+    /// path must be named as unmerged and every other file must still arrive:
+    /// one delta with no representable content cannot cost the caller the rest.
+    #[test]
+    fn an_unresolved_merge_names_the_conflict_and_keeps_every_other_file() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("conflicted-diff");
+        let repository = initialize_repository(&root);
+        fs::write(root.join("conflict.txt"), b"base\n").unwrap();
+        fs::write(root.join("clean.txt"), b"base\n").unwrap();
+        commit_all(&repository, "base");
+        git(&root, ["checkout", "-b", "side"]);
+        fs::write(root.join("conflict.txt"), b"side\n").unwrap();
+        commit_all(&repository, "side");
+        git(&root, ["checkout", "main"]);
+        fs::write(root.join("conflict.txt"), b"main\n").unwrap();
+        commit_all(&repository, "main");
+        // The merge is expected to fail; `git` unwraps, so it is run directly.
+        std::process::Command::new("git")
+            .args(["merge", "side"])
+            .current_dir(&root)
+            .output()
+            .expect("git merge should run");
+        fs::write(root.join("clean.txt"), b"edited\n").unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+
+        let files = service
+            .diff_snapshot(
+                &[DiffTarget::Staged, DiffTarget::Unstaged],
+                &DiffOptions::default(),
+            )
+            .expect("a conflicted repository still has a representable diff");
+
+        let conflicted = files
+            .iter()
+            .filter(|file| file.change == FileChange::Unmerged)
+            .collect::<Vec<_>>();
+        assert!(
+            !conflicted.is_empty(),
+            "the unmerged path must appear: {files:#?}"
+        );
+        for file in conflicted {
+            assert_eq!(file.omission, Some(DiffOmission::Unmerged));
+            assert!(file.hunks.is_empty());
+        }
+        let clean = named(&files, Path::new("clean.txt"));
+        assert_eq!(clean.omission, None);
+        assert!(
+            !clean.hunks.is_empty(),
+            "an unrelated file lost its content to the conflict"
+        );
+    }
+
+    /// Libgit2 leaves a tree side's size at zero until the blob is loaded.
+    /// Trusting that would exempt the whole `HEAD` side of a staged diff from
+    /// the size bound, and libgit2's own guard would then report an oversized
+    /// text file as binary, which reads as permanent rather than as a setting.
+    #[test]
+    fn an_oversized_head_side_is_named_too_large_rather_than_binary() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("head-side-size");
+        let repository = initialize_repository(&root);
+        let large = "line\n".repeat(4_000);
+        fs::write(root.join("shrunk.txt"), large.as_bytes()).unwrap();
+        commit_all(&repository, "add a large file");
+        fs::write(root.join("shrunk.txt"), b"tiny\n").unwrap();
+        stage(&repository, Path::new("shrunk.txt"));
+        let service = GitService::new(&root, &fixture.data_dir);
+
+        let bounded = service
+            .diff(
+                DiffTarget::Staged,
+                &DiffOptions::default().with_max_file_size(1_000),
+            )
+            .unwrap();
+        let file = named(&bounded, Path::new("shrunk.txt"));
+
+        assert_eq!(file.old_size, large.len() as u64);
+        assert_eq!(file.new_size, 5);
+        assert!(!file.binary, "a size bound was reported as binary content");
+        assert_eq!(
+            file.omission,
+            Some(DiffOmission::FileTooLarge { limit: 1_000 })
+        );
+
+        let raised = service
+            .diff(
+                DiffTarget::Staged,
+                &DiffOptions::default().with_max_file_size(u64::MAX),
+            )
+            .unwrap();
+
+        assert!(
+            !named(&raised, Path::new("shrunk.txt")).hunks.is_empty(),
+            "raising the bound must actually return the content"
+        );
+    }
+
+    /// A per-file bound does not bound a response. Both whole-model budgets
+    /// have to stop content without dropping the file from the list, so a
+    /// caller can see exactly what it did not receive and ask for more.
+    #[test]
+    fn whole_model_budgets_name_what_they_withheld() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("budgeted-diff");
+        let repository = initialize_repository(&root);
+        for index in 0..5 {
+            fs::write(root.join(format!("file{index}.txt")), b"old\n").unwrap();
+        }
+        commit_all(&repository, "add files");
+        for index in 0..5 {
+            fs::write(root.join(format!("file{index}.txt")), b"new content\n").unwrap();
+        }
+        let service = GitService::new(&root, &fixture.data_dir);
+
+        let by_count = service
+            .diff(
+                DiffTarget::Unstaged,
+                &DiffOptions::default().with_max_files(2),
+            )
+            .unwrap();
+
+        assert_eq!(by_count.len(), 5, "no file may vanish from the listing");
+        assert_eq!(
+            by_count
+                .iter()
+                .filter(|file| file.omission
+                    == Some(DiffOmission::FileBudgetExhausted { limit: 2 }))
+                .count(),
+            3
+        );
+
+        // Each file renders one header plus two short lines, so this admits the
+        // first file's content and leaves too little for the second.
+        let by_bytes = service
+            .diff(
+                DiffTarget::Unstaged,
+                &DiffOptions::default().with_max_total_bytes(40),
+            )
+            .unwrap();
+
+        assert_eq!(by_bytes.len(), 5);
+        assert!(
+            by_bytes.iter().any(|file| matches!(
+                file.omission,
+                Some(DiffOmission::ContentBudgetExhausted { limit: 40 })
+            )),
+            "the content budget must name itself: {by_bytes:#?}"
+        );
+        assert!(
+            by_bytes.iter().any(|file| !file.hunks.is_empty()),
+            "the budget must not withhold everything"
+        );
+    }
+
+    /// Both sides must be read from one index, or a concurrent write between
+    /// them yields a response describing two different moments.
+    #[test]
+    fn a_snapshot_reads_every_target_from_one_index() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("snapshot-diff");
+        let repository = initialize_repository(&root);
+        fs::write(root.join("tracked.txt"), b"committed\n").unwrap();
+        commit_all(&repository, "base");
+        fs::write(root.join("tracked.txt"), b"staged\n").unwrap();
+        stage(&repository, Path::new("tracked.txt"));
+        fs::write(root.join("tracked.txt"), b"worktree\n").unwrap();
+
+        let files = GitService::new(&root, &fixture.data_dir)
+            .diff_snapshot(
+                &[DiffTarget::Staged, DiffTarget::Unstaged],
+                &DiffOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].target, DiffTarget::Staged);
+        assert_eq!(files[1].target, DiffTarget::Unstaged);
+        assert_eq!(
+            files[0].new_blob_id, files[1].old_blob_id,
+            "the two targets described different index states"
+        );
     }
 
     #[test]
