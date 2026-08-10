@@ -134,9 +134,11 @@ than letting a backup be taken on a checkpoint that never finished.
 `run_events` is append-only in the strict sense: the repository layer contains no
 `UPDATE` and no `DELETE` against it, and must never gain one. The log is the
 audit trail approvals are read out of and the timeline front ends render; a row
-that can be rewritten afterwards is not evidence of anything. The one permitted
-mutation anywhere in this area is `artifacts.availability`, because only the
-filesystem knows whether bytes are still present.
+that can be rewritten afterwards is not evidence of anything. Nothing in the
+`artifacts` table is updated either — `availability` records what was true at
+finalization and reads probe the file and refine the answer without writing, so a
+retention pass that later wants to mark a row `missing` would be the first
+mutation in this area and should be reviewed as one.
 
 A sequence number is per run, starts at one, and is allocated as `1 + MAX(seq)`
 *inside* the transaction that inserts the row, so two appenders cannot be handed
@@ -162,6 +164,14 @@ spelling this build does not define decodes to an opaque entry rather than
 failing the read, and adding a kind is never a migration. Do not turn the column
 into a checked enumeration.
 
+Every association an event or an artifact carries is composite with `run_id` —
+`(step_id, run_id)`, `(tool_call_id, run_id)`, `(artifact_id, run_id)` — so the
+database refuses one naming another run's record, exactly as it already refuses a
+tool call whose denormalized run disagrees with its step. A NULL association
+satisfies a composite key, so "no step" stays unconstrained while "that step"
+must be this run's. A timeline naming another run's step is worse than a refused
+write: nothing downstream re-checks it.
+
 Artifacts live under `<data_dir>/artifacts/<run_id>/<artifact_id>`, a sibling of
 `repositories/`, `worktrees/` and `locks/` and covered by the same
 `HARKNESS_DATA_DIR` override. Finalization is **write, sync, rename, then insert
@@ -169,7 +179,10 @@ the row** — file first, always. Every other ordering can leave a metadata row
 pointing at bytes that were never made durable, which a reader cannot tell from a
 good row; this ordering can only leave an orphan file, which costs disk and
 nothing else. Orphan collection is deliberately absent: a collector that ran
-before the insert committed would delete live artifacts.
+before the insert committed would delete live artifacts. That reasoning covers
+crashes only — a write rejected for an ordinary reason removes what it spilled,
+because a caller retrying a rejected transition must not leave a file per
+attempt in a store with no collector.
 
 `storage_path` is derivable from `(run_id, id)` and is stored anyway so the
 layout is legible from the database alone. It is compared against the derived
@@ -189,6 +202,16 @@ through `wrap_stream`, which sits above the hasher so the recorded size and
 SHA-256 describe the bytes actually on disk. Object keys are never rewritten:
 a key is a published field name, and a secret is a value. The v0.3 default
 changes nothing; the point of the hook is that no write path bypasses it.
+
+Each shape is redacted by its own method, exactly once. A spilled event payload
+has already been through `redact_text`, so it is written in `Redaction::Applied`
+mode and the stream wrapper does not run over it again. Passing the caller's
+original through `wrap_stream` instead would be worse in both directions: a rule
+implemented only in `redact_text` — which the trait permits — would scrub a
+payload under the threshold and persist the same secret in the clear above it,
+and a rule that did run would rewrite the object keys, so recovering a payload
+would yield different field names depending only on its size. There is no public
+route to `Redaction::Applied`; do not add one.
 
 ## Tool Contract & Registry Invariants
 

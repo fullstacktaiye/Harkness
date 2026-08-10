@@ -150,8 +150,13 @@ pub enum StoreError {
     /// An artifact's path is derivable from its run and its own identity, so a
     /// row disagreeing with that derivation was edited outside Harkness.
     /// Refusing it is what stops a tampered row from making the store read or
-    /// overwrite an arbitrary file; the rest of the run stays readable, because
-    /// nothing else in it resolves an artifact path.
+    /// overwrite an arbitrary file.
+    ///
+    /// The run itself stays readable: loading it and paging its events resolve
+    /// no artifact path at all, and every other artifact still reads on its own.
+    /// A *listing* of the run's artifacts does fail, deliberately — a row that
+    /// cannot be true is reported rather than quietly dropped from a list the
+    /// caller would then read as complete.
     #[error(
         "artifact {id} is recorded at {path}, which is not the location reserved for it; refusing to resolve it"
     )]

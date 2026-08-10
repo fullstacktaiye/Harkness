@@ -37,6 +37,12 @@
 //! holds more than the threshold — without making a caller decide in advance
 //! how big its own diagnostics are going to be.
 //!
+//! The threshold is measured *after* redaction, and the artifact holds the
+//! redacted encoding: exactly the bytes the row would have held had they fit.
+//! Spilling the caller's original and leaving the artifact stream's wrapper to
+//! scrub it would make redaction depend on payload size, since a rule may
+//! legitimately be implemented in `redact_text` alone.
+//!
 //! # Unknown kinds
 //!
 //! [`EventKind`] is extensible the way the project catalog is extensible: a
@@ -237,8 +243,11 @@ impl<'de> Deserialize<'de> for EventKind {
 ///
 /// The associations are optional because they are genuinely optional: a run
 /// state change belongs to no step, and a diagnostic may belong to no tool
-/// call. Each one that *is* present is enforced by a foreign key, so an event
-/// cannot name a step or a call that was never stored.
+/// call. Each one that *is* present is enforced by a foreign key composite with
+/// the run, so an event cannot name a step, call, or artifact that was never
+/// stored — nor one belonging to a different run. A timeline naming another
+/// run's step would be a worse outcome than a refused write, because nothing
+/// downstream re-checks it; the wrong step would simply be rendered.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunEvent {
     kind: EventKind,
@@ -426,8 +435,10 @@ pub(super) fn append_event(
                     record: RUN_EVENT,
                     // Four foreign keys reach out of this row and SQLite names
                     // none of them, so the refusal names the set rather than
-                    // guessing which one the caller broke.
-                    parent: "run, step, tool call, or artifact",
+                    // guessing which one the caller broke. Three of them are
+                    // composite with `run_id`, so "not stored" covers both an
+                    // absent record and one belonging to a different run.
+                    parent: "run, or a step, tool call, or artifact of that run,",
                 },
                 &format!("{run_id}:{seq}"),
                 "appending a run event",

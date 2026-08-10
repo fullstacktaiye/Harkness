@@ -47,6 +47,14 @@ pub trait Redactor: fmt::Debug + Send + Sync {
     /// size and SHA-256 describe the bytes that actually landed on disk. An
     /// implementation must not retain the sink it is handed beyond the wrapper
     /// it returns.
+    ///
+    /// **The returned writer's `write` must report how much of its *input* it
+    /// consumed, not how much it passed downstream.** A rule that shortens what
+    /// it rewrites — masking a long secret with a short marker — would otherwise
+    /// return fewer bytes than it was given, and `write_all` would resend the
+    /// difference, duplicating content in the file and in its digest. Writing
+    /// the transformed bytes with `write_all` and returning `buffer.len()` is
+    /// the shape that is always correct.
     fn wrap_stream(&self, sink: Box<dyn Write + Send>) -> Box<dyn Write + Send>;
 }
 
@@ -116,6 +124,35 @@ pub(super) mod tests {
 
         fn wrap_stream(&self, sink: Box<dyn Write + Send>) -> Box<dyn Write + Send> {
             Box::new(ShoutingStream(sink))
+        }
+    }
+
+    /// A redactor shaped like a real rule: it scrubs values and leaves streams
+    /// alone.
+    ///
+    /// The trait permits exactly this — a rule about JSON string values has
+    /// nothing to say about arbitrary bytes — so it is the shape that catches a
+    /// store relying on `wrap_stream` to scrub something it had already decided
+    /// to redact by value.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub(in crate::store) struct Masking;
+
+    /// The one thing [`Masking`] knows to look for.
+    pub(in crate::store) const SECRET: &str = "hunter2";
+
+    /// What [`Masking`] leaves in its place.
+    pub(in crate::store) const MASK: &str = "[redacted]";
+
+    impl Redactor for Masking {
+        fn redact_text<'a>(&self, text: &'a str) -> Cow<'a, str> {
+            if text.contains(SECRET) {
+                return Cow::Owned(text.replace(SECRET, MASK));
+            }
+            Cow::Borrowed(text)
+        }
+
+        fn wrap_stream(&self, sink: Box<dyn Write + Send>) -> Box<dyn Write + Send> {
+            sink
         }
     }
 

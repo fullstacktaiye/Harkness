@@ -624,7 +624,7 @@ impl Store {
     /// [`StoreError::ArtifactIo`] when an oversized payload cannot be spilled.
     pub fn append_event(&self, run_id: RunId, event: RunEvent) -> Result<EventSeq, StoreError> {
         let prepared = self.prepare_event(run_id, event)?;
-        self.in_write_transaction("appending a run event", |connection| {
+        self.commit_event("appending a run event", prepared, |connection, prepared| {
             prepared.append(connection, run_id)
         })
     }
@@ -648,14 +648,18 @@ impl Store {
         event: RunEvent,
     ) -> Result<(Run, EventSeq), StoreError> {
         let prepared = self.prepare_event(id, event)?;
-        self.in_write_transaction("transitioning a run with its event", |connection| {
-            let mut run = repository::load_run(connection, id)?;
-            run.transition(to, at)
-                .map_err(StoreError::InvalidTransition)?;
-            repository::update_run(connection, &run)?;
-            let seq = prepared.append(connection, id)?;
-            Ok((run, seq))
-        })
+        self.commit_event(
+            "transitioning a run with its event",
+            prepared,
+            |connection, prepared| {
+                let mut run = repository::load_run(connection, id)?;
+                run.transition(to, at)
+                    .map_err(StoreError::InvalidTransition)?;
+                repository::update_run(connection, &run)?;
+                let seq = prepared.append(connection, id)?;
+                Ok((run, seq))
+            },
+        )
     }
 
     /// Applies a tool-call transition and appends its event in one transaction.
@@ -675,14 +679,18 @@ impl Store {
         // touches the filesystem.
         let run_id = self.load_tool_call(id)?.run_id();
         let prepared = self.prepare_event(run_id, event)?;
-        self.in_write_transaction("transitioning a tool call with its event", |connection| {
-            let mut call = repository::load_tool_call(connection, id)?;
-            call.transition(to, at)
-                .map_err(StoreError::InvalidTransition)?;
-            repository::update_tool_call(connection, &call)?;
-            let seq = prepared.append(connection, call.run_id())?;
-            Ok((call, seq))
-        })
+        self.commit_event(
+            "transitioning a tool call with its event",
+            prepared,
+            |connection, prepared| {
+                let mut call = repository::load_tool_call(connection, id)?;
+                call.transition(to, at)
+                    .map_err(StoreError::InvalidTransition)?;
+                repository::update_tool_call(connection, &call)?;
+                let seq = prepared.append(connection, call.run_id())?;
+                Ok((call, seq))
+            },
+        )
     }
 
     /// Returns one page of a run's event log, oldest first.
@@ -728,7 +736,14 @@ impl Store {
         media_type: &str,
         at: OffsetDateTime,
     ) -> Result<ArtifactSink<'_>, StoreError> {
-        ArtifactSink::create(self, run_id, name, media_type, at)
+        ArtifactSink::create(
+            self,
+            run_id,
+            name,
+            media_type,
+            at,
+            artifact::Redaction::Pending,
+        )
     }
 
     /// Loads one artifact's metadata, probing whether its bytes are still there.
@@ -801,6 +816,32 @@ impl Store {
         &self.redactor
     }
 
+    /// Runs a prepared event's write, cleaning up its spill if the write fails.
+    ///
+    /// The crash matrix in [`artifact`](self::artifact) accounts for the orphan
+    /// file a *crash* between the rename and the insert leaves behind. An
+    /// ordinary rejection is not a crash: an invalid transition or an event
+    /// naming an unstored step returns `Err` on a perfectly healthy store, and a
+    /// caller retrying one must not accumulate a file per attempt in a store
+    /// with no collector. Removal is best effort — the write's own failure is
+    /// what the caller needs to hear about.
+    fn commit_event<T, F>(
+        &self,
+        operation: &'static str,
+        prepared: PreparedEvent,
+        change: F,
+    ) -> Result<T, StoreError>
+    where
+        F: FnOnce(&Connection, &PreparedEvent) -> Result<T, StoreError>,
+    {
+        let result =
+            self.in_write_transaction(operation, |connection| change(connection, &prepared));
+        if result.is_err() {
+            prepared.discard_spill(self);
+        }
+        result
+    }
+
     /// Redacts an event's payload and spills it to an artifact when oversized.
     ///
     /// Everything expensive happens here, before any transaction opens: the
@@ -822,21 +863,24 @@ impl Store {
             });
         }
 
-        // The artifact carries the payload the caller supplied, not the
-        // redacted copy: an artifact's own bytes are redacted by the stream
-        // wrapper as they are written, so redacting twice would be the only way
-        // to get a different answer here than every other artifact gets.
-        let original =
-            serde_json::to_vec(event.payload()).map_err(|error| StoreError::ColumnEncoding {
-                record: "run_event",
-                field: "payload",
-                reason: error.to_string(),
-            })?;
-        let mut sink = self.create_artifact(
+        // The artifact carries the *redacted* encoding — the exact bytes the row
+        // would have held had they fit — so it is created in `Redaction::Applied`
+        // mode and the stream wrapper does not scrub them a second time.
+        //
+        // Spilling the caller's original and leaving the wrapper to do the work
+        // would make redaction depend on payload size: a rule implemented in
+        // `redact_text` alone, which the trait allows, would scrub a payload
+        // under the threshold and persist the same secret in the clear above it.
+        // It would also rewrite object keys, so the recovered payload would not
+        // be the one the inline path produces.
+        let spilled = encoded.into_bytes();
+        let mut sink = artifact::ArtifactSink::create(
+            self,
             run_id,
             event::OVERFLOW_PAYLOAD_NAME,
             event::OVERFLOW_PAYLOAD_MEDIA_TYPE,
             event.at(),
+            artifact::Redaction::Applied,
         )?;
         if let Some(step_id) = event.step_id() {
             sink = sink.for_step(step_id);
@@ -844,11 +888,11 @@ impl Store {
         if let Some(tool_call_id) = event.tool_call_id() {
             sink = sink.for_tool_call(tool_call_id);
         }
-        let spilled_to = sink.id();
-        std::io::Write::write_all(&mut sink, &original).map_err(|source| {
+        let staged = sink.temporary().to_path_buf();
+        std::io::Write::write_all(&mut sink, &spilled).map_err(|source| {
             StoreError::ArtifactIo {
                 operation: "spilling an oversized event payload",
-                path: artifact::artifact_path(&self.data_dir, run_id, spilled_to),
+                path: staged,
                 source,
             }
         })?;
@@ -985,6 +1029,20 @@ impl PreparedEvent {
             artifact::insert_artifact(connection, sealed)?;
         }
         event::append_event(connection, run_id, &self.event, &self.payload_json)
+    }
+
+    /// Removes the spilled artifact's bytes after a rejected write.
+    ///
+    /// Best effort: the caller is about to be told why the write failed, and a
+    /// file that outlives its row is the harmless half of the crash matrix.
+    fn discard_spill(&self, store: &Store) {
+        if let Some(sealed) = &self.sealed {
+            let _ = fs::remove_file(artifact::artifact_path(
+                store.data_dir(),
+                sealed.run_id(),
+                sealed.id(),
+            ));
+        }
     }
 }
 

@@ -26,7 +26,7 @@ use crate::tool::ArtifactWriter;
 
 use super::artifact::artifact_path;
 use super::migration::{MIGRATIONS, Migration, SCHEMA_VERSION, apply, recorded_version};
-use super::redaction::tests::Shouting;
+use super::redaction::tests::{MASK, Masking, SECRET, Shouting};
 use super::{
     ARTIFACTS_DIRECTORY, Artifact, Availability, DATABASE_FILE, EventKind, EventSeq,
     MAX_EVENT_PAGE_LIMIT, MAX_INLINE_PAYLOAD_BYTES, Redactor, RunCursor, RunEvent, RunPage, Store,
@@ -1807,6 +1807,34 @@ fn an_abandoned_artifact_leaves_no_row_and_no_file() {
 }
 
 #[test]
+fn a_seal_that_fails_partway_still_removes_its_temporary_file() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+
+    let mut sink = fixture
+        .store
+        .create_artifact(run.id(), "notes.txt", "text/plain", at(20))
+        .unwrap();
+    let id = sink.id();
+    sink.write_all(b"never reaches its final name").unwrap();
+    let staged = sink.temporary().to_path_buf();
+    // A directory where the artifact wants to land, so the rename inside `seal`
+    // fails after the stream has already been taken.
+    std::fs::create_dir(artifact_path(fixture.data_dir.path(), run.id(), id)).unwrap();
+
+    let error = sink.finish().unwrap_err();
+
+    assert_eq!(error.kind(), "artifact_io");
+    assert!(
+        !staged.exists(),
+        "a seal that gave up must not strand its temporary file at {}",
+        staged.display()
+    );
+    assert_eq!(fixture.store.artifact(id).unwrap_err().kind(), "not_found");
+}
+
+#[test]
 fn a_missing_artifact_file_degrades_to_availability_missing() {
     let fixture = Fixture::new();
     let task = stored_task(&fixture.store);
@@ -1891,9 +1919,18 @@ fn a_storage_path_outside_the_artifacts_directory_is_refused_on_read() {
         );
     }
 
-    // The rest of the run is untouched by one tampered row.
+    // The run itself is untouched by one tampered row, and every other artifact
+    // still reads on its own.
     assert_eq!(store.load_run(run.id()).unwrap(), run);
+    assert!(store.events(run.id(), None, 10).unwrap().is_empty());
     assert_eq!(store.artifact(intact.id()).unwrap(), intact);
+
+    // A *listing* does fail, deliberately: dropping the bad row would hand back
+    // a list the caller reads as complete when it is not.
+    assert_eq!(
+        store.run_artifacts(run.id()).unwrap_err().kind(),
+        "forbidden_artifact_path"
+    );
 }
 
 #[test]
@@ -2048,14 +2085,18 @@ fn every_event_payload_and_artifact_byte_passes_through_the_redactor() {
     assert_eq!(stored[0].event.payload(), &json!({"note": "QUIET"}));
     assert_eq!(stored[1].event.payload(), &json!({"reason": "STARTED"}));
 
-    // An artifact's bytes are redacted by the stream wrapper, so the overflowed
-    // payload is scrubbed on the way to the file rather than left as it arrived.
+    // A spilled payload holds exactly what the row would have held had it fit:
+    // values scrubbed, keys intact. Redacting it through the stream wrapper
+    // instead would scrub it twice and rewrite its keys, so the same content
+    // would come back differently depending only on its size.
     let spilled = stored[2].event.overflowed_payload().unwrap();
     let bytes = fixture.store.read_artifact(spilled.id).unwrap();
     assert_eq!(
         bytes,
-        format!(r#"{{"STDERR":"{}"}}"#, "B".repeat(MAX_INLINE_PAYLOAD_BYTES)).into_bytes()
+        format!(r#"{{"stderr":"{}"}}"#, "B".repeat(MAX_INLINE_PAYLOAD_BYTES)).into_bytes()
     );
+    assert_eq!(spilled.byte_size, bytes.len() as u64);
+    assert_eq!(spilled.sha256, sha256_hex(&bytes));
 
     // And the size and digest describe what actually landed, not what arrived.
     let content = fixture.store.read_artifact(artifact.id()).unwrap();
@@ -2070,6 +2111,145 @@ fn every_event_payload_and_artifact_byte_passes_through_the_redactor() {
             .availability(),
         Availability::Available,
         "the recorded size must match the redacted file, or every probe would disagree"
+    );
+}
+
+#[test]
+fn a_redactor_that_only_scrubs_values_still_scrubs_an_oversized_payload() {
+    let fixture = Fixture::redacting(Arc::new(Masking));
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    // Still oversized after the rule has run, so it takes the spill path.
+    let noisy = format!("{}{SECRET}", "-".repeat(MAX_INLINE_PAYLOAD_BYTES));
+
+    fixture
+        .store
+        .append_event(
+            run.id(),
+            RunEvent::new(EventKind::Diagnostic, at(20)).with_payload(json!({"stderr": noisy})),
+        )
+        .unwrap();
+
+    // `Masking` leaves `wrap_stream` as the identity, which the trait permits.
+    // If a spilled payload relied on the stream wrapper to scrub it, the secret
+    // would be durable here purely because the payload was over the threshold.
+    let stored = fixture.store.events(run.id(), None, 10).unwrap();
+    let spilled = stored[0].event.overflowed_payload().unwrap();
+    let bytes = fixture.store.read_artifact(spilled.id).unwrap();
+    let content = String::from_utf8(bytes).unwrap();
+    assert!(
+        !content.contains(SECRET),
+        "a value scrubbed under the threshold must stay scrubbed above it"
+    );
+    assert!(content.contains(MASK), "the rule should have run once");
+    assert!(
+        content.starts_with(r#"{"stderr":"#),
+        "the spilled payload should keep its published field names: {}",
+        &content[..40.min(content.len())]
+    );
+}
+
+#[test]
+fn a_rejected_write_leaves_no_spilled_artifact_behind() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let oversized = json!({"stderr": "a".repeat(MAX_INLINE_PAYLOAD_BYTES)});
+
+    // An invalid transition is an ordinary refusal, not a crash, so the spill
+    // written on the way in has to be cleaned up: an agent retrying would
+    // otherwise leave one file per attempt in a store with no collector.
+    for attempt in 0..3 {
+        let error = fixture
+            .store
+            .transition_run_with_event(
+                run.id(),
+                ExecutionState::Succeeded,
+                at(10 + attempt),
+                RunEvent::new(EventKind::RunStateChanged, at(10 + attempt))
+                    .with_payload(oversized.clone()),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), "invalid_transition");
+    }
+
+    assert!(fixture.store.run_artifacts(run.id()).unwrap().is_empty());
+    assert!(fixture.store.events(run.id(), None, 10).unwrap().is_empty());
+    let directory = fixture
+        .data_dir
+        .path()
+        .join(ARTIFACTS_DIRECTORY)
+        .join(run.id().to_string());
+    assert_eq!(
+        std::fs::read_dir(&directory).unwrap().count(),
+        0,
+        "a retried rejection must not accumulate spilled payloads"
+    );
+}
+
+#[test]
+fn an_event_cannot_associate_a_step_or_call_from_another_run() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let elsewhere = queued_run(&fixture.store, &task, 5);
+    let step = stored_step(&fixture.store, &run);
+    let call = stored_tool_call(&fixture.store, &step);
+
+    // Both records exist; neither belongs to `elsewhere`. A timeline that could
+    // name another run's step is worse than a refused write, because nothing
+    // downstream re-checks it — the wrong step is simply rendered.
+    for event in [
+        RunEvent::new(EventKind::StepStarted, at(20)).for_step(step.id()),
+        RunEvent::new(EventKind::ToolProgress, at(20)).for_tool_call(call.id()),
+    ] {
+        let error = fixture
+            .store
+            .append_event(elsewhere.id(), event)
+            .unwrap_err();
+        assert_eq!(error.kind(), "missing_parent");
+    }
+    assert!(
+        fixture
+            .store
+            .events(elsewhere.id(), None, 10)
+            .unwrap()
+            .is_empty()
+    );
+
+    // The same association against its own run is accepted.
+    fixture
+        .store
+        .append_event(
+            run.id(),
+            RunEvent::new(EventKind::StepStarted, at(20)).for_step(step.id()),
+        )
+        .unwrap();
+}
+
+#[test]
+fn an_artifact_cannot_be_attributed_to_a_step_from_another_run() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let elsewhere = queued_run(&fixture.store, &task, 5);
+    let step = stored_step(&fixture.store, &run);
+
+    let mut sink = fixture
+        .store
+        .create_artifact(elsewhere.id(), "notes.txt", "text/plain", at(20))
+        .unwrap()
+        .for_step(step.id());
+    sink.write_all(b"attributed to the wrong run").unwrap();
+    let error = sink.finish().unwrap_err();
+
+    assert_eq!(error.kind(), "missing_parent");
+    assert!(
+        fixture
+            .store
+            .run_artifacts(elsewhere.id())
+            .unwrap()
+            .is_empty()
     );
 }
 

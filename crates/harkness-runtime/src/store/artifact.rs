@@ -24,6 +24,12 @@
 //! would delete live artifacts, so it is a job for a later pass that can reason
 //! about which runs are finished.
 //!
+//! That table is about *crashes*. An ordinary refusal is not one: a rejected
+//! transition or an event naming an unstored step returns an error from a
+//! perfectly healthy store, and a caller retrying it must not leave a file per
+//! attempt behind. Those paths remove what they spilled; see
+//! [`Store::append_event`](super::Store::append_event).
+//!
 //! # A missing file degrades a read, never fails one
 //!
 //! Deleting an artifact's bytes from outside Harkness is something a user may
@@ -50,6 +56,13 @@
 //! through a hasher and a counter, then into the file, so the recorded size and
 //! SHA-256 describe exactly the bytes on disk. Memory is one buffer regardless
 //! of artifact size.
+//!
+//! # Containment
+//!
+//! An artifact may name a step or a tool call only of the run it claims. The
+//! composite foreign keys in migration 2 enforce that in the database, exactly
+//! as migration 1 does for a tool call's denormalized run, so no Rust path has
+//! to re-check it and none can forget to.
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -303,6 +316,11 @@ impl SealedArtifact {
         self.id
     }
 
+    /// Run the artifact belongs to, which is half of where its bytes live.
+    pub(super) const fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
     /// Media type the content was stored under.
     pub(super) fn media_type(&self) -> &str {
         &self.media_type
@@ -317,6 +335,28 @@ impl SealedArtifact {
     pub(super) fn sha256(&self) -> &str {
         &self.sha256
     }
+}
+
+/// Whether an artifact's bytes still owe the redactor a pass.
+///
+/// Content that arrived from a caller is [`Pending`](Self::Pending) and is
+/// scrubbed by [`Redactor::wrap_stream`](super::Redactor::wrap_stream) as it
+/// streams. Content the store itself produced from an already-redacted value is
+/// [`Applied`](Self::Applied): it has been through
+/// [`redact_text`](super::Redactor::redact_text) once, on the strings inside it,
+/// and wrapping it again would redact twice.
+///
+/// This is not a way to skip redaction, and there is no public route to it. It
+/// exists because a spilled event payload has one job — to hold exactly what the
+/// row would have held had it fit — and a second pass would break that for any
+/// rule that is not idempotent, while a rule implemented only in `redact_text`
+/// would leave a payload scrubbed under the threshold and bare above it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Redaction {
+    /// Caller bytes; wrap the sink.
+    Pending,
+    /// Bytes the store already redacted by value; do not wrap the sink.
+    Applied,
 }
 
 /// A streaming write into the artifact store.
@@ -336,6 +376,12 @@ pub struct ArtifactSink<'a> {
     temporary: PathBuf,
     stream: Option<Box<dyn Write + Send>>,
     recorded: RecordedHandle,
+    /// Set once the bytes are durable under their final name.
+    ///
+    /// Distinct from having taken `stream`, because a seal that fails partway —
+    /// a full disk on the sync, a rename that loses a race — still owes the
+    /// temporary file a removal.
+    sealed: bool,
 }
 
 impl<'a> ArtifactSink<'a> {
@@ -345,6 +391,7 @@ impl<'a> ArtifactSink<'a> {
         name: &str,
         media_type: &str,
         created_at: OffsetDateTime,
+        redaction: Redaction,
     ) -> Result<Self, StoreError> {
         // Both land in bounded columns, so they are refused here rather than
         // after a whole artifact has been streamed to disk.
@@ -367,12 +414,14 @@ impl<'a> ArtifactSink<'a> {
         })));
         // Redactor on the outside, recording on the inside: what is hashed and
         // counted is what the file receives, not what the caller handed over.
-        let stream = store
-            .redactor()
-            .wrap_stream(Box::new(io::BufWriter::with_capacity(
-                STREAM_BUFFER_BYTES,
-                recorded.clone(),
-            )));
+        let buffered: Box<dyn Write + Send> = Box::new(io::BufWriter::with_capacity(
+            STREAM_BUFFER_BYTES,
+            recorded.clone(),
+        ));
+        let stream = match redaction {
+            Redaction::Pending => store.redactor().wrap_stream(buffered),
+            Redaction::Applied => buffered,
+        };
 
         Ok(Self {
             store,
@@ -386,7 +435,17 @@ impl<'a> ArtifactSink<'a> {
             temporary,
             stream: Some(stream),
             recorded,
+            sealed: false,
         })
+    }
+
+    /// Where the bytes are staged before the rename.
+    ///
+    /// The path a failure during streaming should name: the destination does not
+    /// exist yet, and reporting it would send a reader looking in the wrong
+    /// place.
+    pub(super) fn temporary(&self) -> &Path {
+        &self.temporary
     }
 
     /// Attributes the artifact to a step of the same run.
@@ -467,6 +526,7 @@ impl<'a> ArtifactSink<'a> {
                 .map_err(|error| artifact_io("syncing the artifact directory", directory, error))?;
         }
 
+        self.sealed = true;
         Ok(SealedArtifact {
             id: self.id,
             run_id: self.run_id,
@@ -498,13 +558,18 @@ impl Write for ArtifactSink<'_> {
 }
 
 impl Drop for ArtifactSink<'_> {
-    /// Removes the partial file of a write that was never finished.
+    /// Removes the partial file of a write that never reached its final name.
+    ///
+    /// The condition is `!sealed` rather than "the stream is still here": a seal
+    /// that gave up on the sync or the rename has already taken the stream, and
+    /// it is exactly the case that leaves a `.tmp-` file nothing will ever come
+    /// back for.
     ///
     /// A temporary file is invisible to readers either way — nothing resolves a
     /// name beginning `.tmp-` — so this is tidiness rather than correctness, and
     /// a failure to remove it is not worth turning into a panic during unwind.
     fn drop(&mut self) {
-        if self.stream.is_some() {
+        if !self.sealed {
             self.recorded.locked().file = None;
             let _ = fs::remove_file(&self.temporary);
         }
@@ -570,10 +635,13 @@ impl StoreArtifacts {
         if let Some(tool_call_id) = self.tool_call_id {
             sink = sink.for_tool_call(tool_call_id);
         }
+        // The staging path, not the caller's label: an error naming "build.log"
+        // points at a location that does not exist.
+        let staged = sink.temporary().to_path_buf();
         sink.write_all(bytes)
             .map_err(|error| StoreError::ArtifactIo {
-                operation: "writing a tool artifact",
-                path: PathBuf::from(name),
+                operation: "streaming a tool artifact",
+                path: staged,
                 source: error,
             })?;
         sink.finish()
@@ -637,7 +705,10 @@ pub(super) fn insert_artifact(
             insert_failed(
                 Containment {
                     record: ARTIFACT,
-                    parent: "run, step, or tool call",
+                    // As for an event: the step and tool-call keys are composite
+                    // with `run_id`, so this also covers naming one of another
+                    // run's.
+                    parent: "run, or a step or tool call of that run,",
                 },
                 &sealed.id,
                 "recording an artifact",
