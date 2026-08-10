@@ -13,6 +13,8 @@ Harkness is a Rust 2024 workspace split into six crates under `crates/`:
 
 Desktop integration assets are in `data/`. The root `CMakeLists.txt` provides release build and local installation support; Cargo remains the primary development interface.
 
+Architecture Decision Records live in `docs/adr/`; read them before proposing a change to a crate boundary, a dependency direction, a persisted format, a trust boundary, or the concurrency model. This file states the invariants; an ADR states why an alternative was refused.
+
 ## Build, Test, and Development Commands
 
 - `cargo run -p harkness-cli` runs the command-line binary.
