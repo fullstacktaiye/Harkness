@@ -740,7 +740,7 @@ RowLayout {
                 toolbar.backend.push(toolbar.project.id, false);
                 break;
             default:
-                toolbar.backend.fetch(toolbar.project.id);
+                toolbar.backend.fetch(toolbar.project.id, false);
                 break;
             }
         }

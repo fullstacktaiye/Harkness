@@ -91,6 +91,34 @@ Kirigami.ApplicationWindow {
         return false;
     }
 
+    /// When the last focus-driven fetch ran, in milliseconds since the epoch.
+    /// Zero until the first one, which is what lets it fire immediately.
+    property double lastFocusFetch: 0
+
+    /// Shortest gap between two focus-driven fetches. Returning to the window
+    /// is a frequent gesture and a fetch is a network round trip holding the
+    /// repository lock for its whole duration, so alt-tabbing must not be able
+    /// to queue one behind another.
+    readonly property int focusFetchInterval: 60000
+
+    /// Brings remote-tracking state current when the user comes back to the
+    /// window, so the ahead/behind counts they return to are not from whenever
+    /// they last happened to press Fetch.
+    onActiveChanged: {
+        if (!root.active || !root.projectOpen || root.repositoryOperationRunning())
+            return;
+        const project = root.openedProject;
+        if (!project.available || !project.isGit)
+            return;
+        const now = Date.now();
+        if (now - root.lastFocusFetch < root.focusFetchInterval)
+            return;
+        root.lastFocusFetch = now;
+        // Quiet: this fetch answers no request of the user's, so its success
+        // has nothing to report. A failure still reaches the status line.
+        appBackend.fetch(root.openedProjectId, true);
+    }
+
     /// Re-reads whatever is on screen: the open project's availability and Git
     /// state, or the catalog behind the launcher.
     function refreshCurrent() {

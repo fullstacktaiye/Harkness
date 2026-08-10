@@ -184,8 +184,15 @@ pub mod ffi {
             path_ids: &QString,
         );
 
+        /// Updates remote-tracking state without touching the working tree.
+        ///
+        /// `quiet` suppresses only the success line in the status bar, for the
+        /// callers that fetch on their own schedule rather than because the
+        /// user asked. A failure is always reported: a background fetch that
+        /// cannot reach the remote is exactly what the user needs told, and
+        /// silence would leave a stale ahead/behind count looking current.
         #[qinvokable]
-        fn fetch(self: Pin<&mut HarknessBackend>, project_id: &QString);
+        fn fetch(self: Pin<&mut HarknessBackend>, project_id: &QString, quiet: bool);
 
         #[qinvokable]
         fn pull(self: Pin<&mut HarknessBackend>, project_id: &QString);
@@ -4158,7 +4165,7 @@ impl ffi::HarknessBackend {
         });
     }
 
-    fn fetch(mut self: Pin<&mut Self>, project_id: &QString) {
+    fn fetch(mut self: Pin<&mut Self>, project_id: &QString, quiet: bool) {
         let project_id = project_id.to_string();
         let Some((job_id, cancellation)) =
             start_job(self.as_mut(), "fetch", &project_id, "Fetch", true)
@@ -4189,7 +4196,7 @@ impl ffi::HarknessBackend {
                 })
             });
             let _ = qt_thread.queue(move |mut backend| {
-                apply_git_result(backend.as_mut(), &job_id, result, true, false, false, true);
+                apply_git_result(backend.as_mut(), &job_id, result, true, false, quiet, true);
             });
         });
     }

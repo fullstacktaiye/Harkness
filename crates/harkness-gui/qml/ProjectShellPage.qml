@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls as Controls
 import QtQuick.Layouts
+import QtQuick.Window
 import org.kde.kirigami as Kirigami
 import io.github.fullstacktaiye.harkness
 
@@ -109,6 +110,32 @@ Kirigami.Page {
 
         backend: shell.backend
         project: shell.project
+    }
+
+    /// Keeps the working-tree status current on its own. Nothing else re-reads
+    /// the repository unprompted, so an edit made outside Harkness stayed
+    /// invisible until the user asked for a refresh or ran another operation.
+    ///
+    /// Only status is polled. It is a local read, whereas rerunning history or
+    /// branches on a timer would repeat the log walk and reset what those
+    /// panes have scrolled to.
+    Timer {
+        interval: 15000
+        repeat: true
+        // An unfocused window is looking at nothing, and the focus fetch in
+        // Main.qml already brings state current on the way back in. The
+        // attached property is read through the page rather than here: it is
+        // offered to Items and Windows only, and a Timer is neither.
+        running: shell.project.available && shell.project.isGit
+            && shell.Window.window !== null && shell.Window.window.active
+        onTriggered: {
+            // A tick during another operation would be refused by the backend
+            // and reported as "wait for … to finish", overwriting the running
+            // job's own status line every interval.
+            if (shellActivity.repositoryOperationRunning())
+                return;
+            shell.backend.refreshGit(shell.project.id);
+        }
     }
 
     // The whole shell — header band, activity bar and the current view — sits
