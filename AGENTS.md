@@ -180,9 +180,17 @@ pointing at bytes that were never made durable, which a reader cannot tell from 
 good row; this ordering can only leave an orphan file, which costs disk and
 nothing else. Orphan collection is deliberately absent: a collector that ran
 before the insert committed would delete live artifacts. That reasoning covers
-crashes only — a write rejected for an ordinary reason removes what it spilled,
-because a caller retrying a rejected transition must not leave a file per
+crashes only — every path that fails for an ordinary reason removes what it
+wrote, whether that is a refused metadata insert or a rejected event write
+cleaning up its spill, because a caller retrying one must not leave a file per
 attempt in a store with no collector.
+
+An abandoned sink cleans up by *where the bytes currently are*, not by whether a
+flag was set: before the rename it owes the `.tmp-` file, after the rename it
+owes the destination, and once a sealed record has been handed to a caller it
+owes nothing. A boolean cannot express that, and answering "the temporary file"
+after a successful rename removes a path that no longer exists while orphaning
+the artifact that does.
 
 `storage_path` is derivable from `(run_id, id)` and is stored anyway so the
 layout is legible from the database alone. It is compared against the derived
@@ -196,12 +204,15 @@ probe the file and report `missing` or `size_mismatch`, and loading a run or
 paging its events never opens an artifact at all, so deleting content cannot
 break a run. Only asking for the content itself fails.
 
-Every event payload and every artifact byte passes through a `Redactor` before it
-becomes durable — payload string *values* through `redact_text`, artifact streams
-through `wrap_stream`, which sits above the hasher so the recorded size and
-SHA-256 describe the bytes actually on disk. Object keys are never rewritten:
-a key is a published field name, and a secret is a value. The v0.3 default
-changes nothing; the point of the hook is that no write path bypasses it.
+Every caller value that becomes durable here passes through a `Redactor` first —
+payload string *values* and an artifact's label and media type through
+`redact_text`, artifact content through `wrap_stream`, which sits above the
+hasher so the recorded size and SHA-256 describe the bytes actually on disk. An
+artifact's metadata is not exempt: a tool naming its artifact after the
+credential it just leaked would otherwise persist it in the one place redaction
+never looks. Object keys *are* exempt: a key is a published field name, and a
+secret is a value. The v0.3 default changes nothing; the point of the hook is
+that no write path bypasses it.
 
 Each shape is redacted by its own method, exactly once. A spilled event payload
 has already been through `redact_text`, so it is written in `Redaction::Applied`

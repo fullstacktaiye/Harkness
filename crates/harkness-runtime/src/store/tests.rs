@@ -2241,6 +2241,7 @@ fn an_artifact_cannot_be_attributed_to_a_step_from_another_run() {
         .unwrap()
         .for_step(step.id());
     sink.write_all(b"attributed to the wrong run").unwrap();
+    let id = sink.id();
     let error = sink.finish().unwrap_err();
 
     assert_eq!(error.kind(), "missing_parent");
@@ -2250,6 +2251,100 @@ fn an_artifact_cannot_be_attributed_to_a_step_from_another_run() {
             .run_artifacts(elsewhere.id())
             .unwrap()
             .is_empty()
+    );
+    // A refused insert is an ordinary rejection, not the crash the orphan-file
+    // trade-off is about: a tool retrying a failing artifact write must not
+    // leave a full copy of its content behind each time.
+    assert!(
+        !artifact_path(fixture.data_dir.path(), elsewhere.id(), id).exists(),
+        "a refused artifact must not leave its content behind"
+    );
+}
+
+#[test]
+fn a_retried_tool_artifact_write_does_not_accumulate_content() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = stored_step(&fixture.store, &run);
+    let call = stored_tool_call(&fixture.store, &step);
+    let elsewhere = queued_run(&fixture.store, &task, 5);
+    let store = Arc::new(fixture.reopen());
+    // The run exists, so the content is streamed and sealed in full; the step
+    // belongs to a different run, so the insert is refused afterwards. That is
+    // the window where a whole build log can be left behind once per attempt.
+    let mut artifacts =
+        StoreArtifacts::new(Arc::clone(&store), elsewhere.id(), step.id(), call.id());
+
+    for _ in 0..3 {
+        assert_eq!(
+            artifacts
+                .write("build.log", "text/plain", b"compiling harkness")
+                .unwrap_err()
+                .kind(),
+            "execution_failed"
+        );
+    }
+
+    let directory = fixture
+        .data_dir
+        .path()
+        .join(ARTIFACTS_DIRECTORY)
+        .join(elsewhere.id().to_string());
+    assert_eq!(
+        std::fs::read_dir(&directory).unwrap().count(),
+        0,
+        "a retried tool artifact write accumulated content"
+    );
+    assert!(store.run_artifacts(elsewhere.id()).unwrap().is_empty());
+}
+
+#[test]
+fn artifact_metadata_passes_through_the_redactor_like_its_content() {
+    let fixture = Fixture::redacting(Arc::new(Masking));
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+
+    // A label is caller text that becomes durable in a column, so a tool naming
+    // its artifact after the credential it just leaked must not persist it in
+    // the one place redaction does not look.
+    let mut sink = fixture
+        .store
+        .create_artifact(
+            run.id(),
+            &format!("token-{SECRET}.log"),
+            "text/plain",
+            at(20),
+        )
+        .unwrap();
+    sink.write_all(b"content").unwrap();
+    let artifact = sink.finish().unwrap();
+
+    assert_eq!(artifact.name(), format!("token-{MASK}.log"));
+    assert!(!artifact.name().contains(SECRET));
+    assert_eq!(
+        fixture.store.artifact(artifact.id()).unwrap().name(),
+        artifact.name()
+    );
+
+    // A store-generated value is left exactly as this module wrote it, so the
+    // spilled-payload media type still reads back as its published constant.
+    fixture
+        .store
+        .append_event(
+            run.id(),
+            RunEvent::new(EventKind::Diagnostic, at(21))
+                .with_payload(json!({"stderr": "-".repeat(MAX_INLINE_PAYLOAD_BYTES)})),
+        )
+        .unwrap();
+    let spilled = fixture.store.events(run.id(), None, 10).unwrap()[0]
+        .event
+        .overflowed_payload()
+        .unwrap();
+    assert_eq!(spilled.media_type, super::OVERFLOW_PAYLOAD_MEDIA_TYPE);
+    assert_eq!(
+        fixture.store.artifact(spilled.id).unwrap().name(),
+        super::OVERFLOW_PAYLOAD_NAME
     );
 }
 

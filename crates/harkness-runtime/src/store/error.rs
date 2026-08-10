@@ -131,9 +131,15 @@ pub enum StoreError {
 
     /// An artifact's content could not be written, synced, renamed, or read.
     ///
-    /// The metadata row and the file are recorded in that order — file first —
-    /// so this failure means no row was written and nothing refers to whatever
-    /// bytes reached the disk.
+    /// On a *write*, the file and its metadata row are recorded in that order —
+    /// file first — so this failure means no row was written and nothing refers
+    /// to whatever bytes reached the disk.
+    ///
+    /// On a *read* it means the opposite: the row is there and its content is
+    /// not, because something outside Harkness removed or replaced it. The
+    /// metadata still loads, reporting
+    /// [`Availability::Missing`](crate::store::Availability::Missing); only
+    /// asking for the bytes fails.
     #[error("the run store failed while {operation} at {}: {source}", .path.display())]
     ArtifactIo {
         /// What the store was doing to the file.

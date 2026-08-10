@@ -80,6 +80,17 @@ pub const DEFAULT_EVENT_PAGE_LIMIT: usize = 200;
 /// Higher than the run listing's limit because a timeline is read in bulk: the
 /// latency target is stated for a thousand-event run, and a consumer meeting it
 /// should not have to pay for three round trips to do so.
+///
+/// # This is a row bound, not a byte bound
+///
+/// Each payload may be up to [`MAX_INLINE_PAYLOAD_BYTES`], so a full page can in
+/// principle materialize `MAX_EVENT_PAGE_LIMIT * MAX_INLINE_PAYLOAD_BYTES` — 64
+/// MiB — of events at once. Real payloads are progress counters and state
+/// spellings, and anything genuinely large has already been spilled to an
+/// artifact and replaced by a reference of a couple of hundred bytes, so the
+/// worst case is not the expected one. It is still the caller's arithmetic to
+/// do: a consumer with a memory budget should size its page against the
+/// payloads it expects rather than asking for the maximum.
 pub const MAX_EVENT_PAGE_LIMIT: usize = 1_000;
 
 /// Payload field naming the artifact that holds an overflowed payload.
@@ -152,8 +163,14 @@ pub enum EventKind {
     Diagnostic,
     /// A kind this build does not define, preserved exactly as stored.
     ///
-    /// Construct one through [`EventKind::parse`] rather than directly, so a
-    /// spelling this build *does* define never ends up wearing this variant.
+    /// Sealed against construction from outside this crate so
+    /// [`parse`](Self::parse) is the only way to reach it. Without that seal a
+    /// caller could write `Unrecognized("diagnostic".into())`, which stores as
+    /// `diagnostic` and reads back as [`Diagnostic`](Self::Diagnostic) — one
+    /// meaning with two in-memory spellings, and an appended event that no
+    /// longer equals the one that comes back. Read the text with
+    /// [`as_str`](Self::as_str).
+    #[non_exhaustive]
     Unrecognized(String),
 }
 

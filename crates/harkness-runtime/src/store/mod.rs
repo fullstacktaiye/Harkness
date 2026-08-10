@@ -82,9 +82,11 @@
 //! consumer can prove they have not changed, and probed on read so deleting one
 //! degrades an artifact rather than breaking a run.
 //!
-//! Every byte either of them persists passes through a [`Redactor`]. The v0.3
-//! default changes nothing; the point of the hook is that supplying real rules
-//! is a change in one place rather than an audit of every caller.
+//! Every caller value either of them persists passes through a [`Redactor`]
+//! first — payload values and an artifact's label and media type by value,
+//! artifact content by stream. The v0.3 default changes nothing; the point of
+//! the hook is that supplying real rules is a change in one place rather than an
+//! audit of every caller.
 //!
 //! # Backups
 //!

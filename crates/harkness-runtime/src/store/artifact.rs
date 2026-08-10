@@ -25,10 +25,12 @@
 //! about which runs are finished.
 //!
 //! That table is about *crashes*. An ordinary refusal is not one: a rejected
-//! transition or an event naming an unstored step returns an error from a
-//! perfectly healthy store, and a caller retrying it must not leave a file per
-//! attempt behind. Those paths remove what they spilled; see
-//! [`Store::append_event`](super::Store::append_event).
+//! transition, an insert naming another run's step, a database that stayed busy
+//! — each returns an error from a perfectly healthy store, and a caller
+//! retrying one must not leave a file per attempt behind. Every such path
+//! removes what it wrote, whether that is [`ArtifactSink::finish`] cleaning up
+//! after a refused insert or
+//! [`Store::append_event`](super::Store::append_event) cleaning up a spill.
 //!
 //! # A missing file degrades a read, never fails one
 //!
@@ -57,6 +59,11 @@
 //! SHA-256 describe exactly the bytes on disk. Memory is one buffer regardless
 //! of artifact size.
 //!
+//! The label and media type go through the redactor too, by value rather than
+//! by stream. They are caller text that becomes durable in a column, and an
+//! artifact named after the credential a tool just leaked would otherwise
+//! persist it in the one place redaction never looks.
+//!
 //! # Containment
 //!
 //! An artifact may name a step or a tool call only of the run it claims. The
@@ -64,6 +71,7 @@
 //! as migration 1 does for a tool call's denormalized run, so no Rust path has
 //! to re-check it and none can forget to.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -359,10 +367,27 @@ pub(super) enum Redaction {
     Applied,
 }
 
+/// Where a sink's bytes currently are, and therefore what abandoning it must
+/// clean up.
+///
+/// A boolean cannot express this. The rename is the moment the bytes change
+/// name, so a failure *after* it owes the destination a removal and a failure
+/// before it owes the temporary file one — and asking "is it sealed" gets the
+/// second answer for both.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Staging {
+    /// Under the `.tmp-` name; no reader resolves it.
+    Temporary,
+    /// Under the final name, with nothing yet responsible for it.
+    Final,
+    /// A [`SealedArtifact`] owns the bytes now; the sink must not touch them.
+    Released,
+}
+
 /// A streaming write into the artifact store.
 ///
 /// Write to it like any other [`io::Write`], then [`finish`](Self::finish) it.
-/// Dropping it without finishing removes the partial file: an abandoned write
+/// Dropping it without finishing removes whatever it wrote: an abandoned write
 /// leaves neither a row nor bytes anybody could mistake for an artifact.
 pub struct ArtifactSink<'a> {
     store: &'a Store,
@@ -374,14 +399,10 @@ pub struct ArtifactSink<'a> {
     media_type: String,
     created_at: OffsetDateTime,
     temporary: PathBuf,
+    destination: PathBuf,
     stream: Option<Box<dyn Write + Send>>,
     recorded: RecordedHandle,
-    /// Set once the bytes are durable under their final name.
-    ///
-    /// Distinct from having taken `stream`, because a seal that fails partway —
-    /// a full disk on the sync, a rename that loses a race — still owes the
-    /// temporary file a removal.
-    sealed: bool,
+    staging: Staging,
 }
 
 impl<'a> ArtifactSink<'a> {
@@ -393,10 +414,25 @@ impl<'a> ArtifactSink<'a> {
         created_at: OffsetDateTime,
         redaction: Redaction,
     ) -> Result<Self, StoreError> {
+        // The label and the media type are caller text that becomes durable in
+        // a column, so they go through the redactor like everything else here —
+        // a tool naming its artifact after the token it just leaked would
+        // otherwise persist it somewhere redaction never looks. Store-generated
+        // values arrive `Applied` and are left exactly as this module wrote
+        // them, so a constant like the spilled-payload media type still reads
+        // back as the constant.
+        let (name, media_type) = match redaction {
+            Redaction::Pending => (
+                store.redactor().redact_text(name),
+                store.redactor().redact_text(media_type),
+            ),
+            Redaction::Applied => (Cow::Borrowed(name), Cow::Borrowed(media_type)),
+        };
         // Both land in bounded columns, so they are refused here rather than
-        // after a whole artifact has been streamed to disk.
-        encode_text(ARTIFACT, "name", name)?;
-        encode_text(ARTIFACT, "media_type", media_type)?;
+        // after a whole artifact has been streamed to disk — and after
+        // redaction, because a rule may lengthen what it rewrites.
+        encode_text(ARTIFACT, "name", &name)?;
+        encode_text(ARTIFACT, "media_type", &media_type)?;
         // A row can only be inserted against a stored run, and finding that out
         // now costs one index seek instead of a whole wasted stream.
         require_run(store, run_id)?;
@@ -429,13 +465,14 @@ impl<'a> ArtifactSink<'a> {
             run_id,
             step_id: None,
             tool_call_id: None,
-            name: name.to_owned(),
-            media_type: media_type.to_owned(),
+            name: name.into_owned(),
+            media_type: media_type.into_owned(),
             created_at,
             temporary,
+            destination: artifact_path(store.data_dir(), run_id, id),
             stream: Some(stream),
             recorded,
-            sealed: false,
+            staging: Staging::Temporary,
         })
     }
 
@@ -480,10 +517,20 @@ impl<'a> ArtifactSink<'a> {
     /// written.
     pub fn finish(mut self) -> Result<Artifact, StoreError> {
         let sealed = self.seal()?;
-        self.store
+        let recorded = self
+            .store
             .in_write_transaction("recording an artifact", |connection| {
                 insert_artifact(connection, &sealed)
-            })
+            });
+        if recorded.is_err() {
+            // Sealing released the bytes, so `Drop` will leave them alone. An
+            // insert refused for an ordinary reason — an association naming
+            // another run, a database that stayed busy — is not the crash the
+            // orphan-file trade-off is about, and a caller retrying it must not
+            // leave a full copy of its content behind each time.
+            let _ = fs::remove_file(&self.destination);
+        }
+        recorded
     }
 
     /// Makes the bytes durable and stops, leaving no row behind.
@@ -513,20 +560,26 @@ impl<'a> ArtifactSink<'a> {
             (recorded.byte_size, recorded.hasher.clone().finalize())
         };
 
-        let destination = artifact_path(self.store.data_dir(), self.run_id, self.id);
-        fs::rename(&self.temporary, &destination)
-            .map_err(|error| artifact_io("renaming an artifact", &destination, error))?;
+        fs::rename(&self.temporary, &self.destination)
+            .map_err(|error| artifact_io("renaming an artifact", &self.destination, error))?;
+        // From here the bytes answer to their final name, and anything that
+        // fails below owes *that* path a removal — the temporary one no longer
+        // exists, so cleaning it up would tidy nothing and orphan the artifact.
+        self.staging = Staging::Final;
+
         // The bytes are already durable; what the rename still needs is a sync
         // of the directory holding the new entry. Windows has no equivalent
         // handle to sync, exactly as the project catalog's write does not.
         #[cfg(unix)]
-        if let Some(directory) = destination.parent() {
+        if let Some(directory) = self.destination.parent() {
             File::open(directory)
                 .and_then(|handle| handle.sync_all())
                 .map_err(|error| artifact_io("syncing the artifact directory", directory, error))?;
         }
 
-        self.sealed = true;
+        // The returned record is now what accounts for the bytes; whoever holds
+        // it decides whether they survive.
+        self.staging = Staging::Released;
         Ok(SealedArtifact {
             id: self.id,
             run_id: self.run_id,
@@ -558,21 +611,25 @@ impl Write for ArtifactSink<'_> {
 }
 
 impl Drop for ArtifactSink<'_> {
-    /// Removes the partial file of a write that never reached its final name.
+    /// Removes whatever the sink wrote, wherever it currently is.
     ///
-    /// The condition is `!sealed` rather than "the stream is still here": a seal
-    /// that gave up on the sync or the rename has already taken the stream, and
-    /// it is exactly the case that leaves a `.tmp-` file nothing will ever come
-    /// back for.
+    /// Which path that is depends on how far the seal got, which is why the
+    /// staging state has three values rather than being a flag: a write
+    /// abandoned before the rename owes the `.tmp-` file, one abandoned after it
+    /// owes the destination, and one whose sealed record has been handed to a
+    /// caller owes nothing — cleaning that up would delete the bytes the caller
+    /// is about to record.
     ///
-    /// A temporary file is invisible to readers either way — nothing resolves a
-    /// name beginning `.tmp-` — so this is tidiness rather than correctness, and
-    /// a failure to remove it is not worth turning into a panic during unwind.
+    /// A failure to remove the file is not worth turning into a panic during
+    /// unwind; the worst case is the orphan the crash matrix already allows for.
     fn drop(&mut self) {
-        if !self.sealed {
-            self.recorded.locked().file = None;
-            let _ = fs::remove_file(&self.temporary);
-        }
+        let abandoned = match self.staging {
+            Staging::Temporary => &self.temporary,
+            Staging::Final => &self.destination,
+            Staging::Released => return,
+        };
+        self.recorded.locked().file = None;
+        let _ = fs::remove_file(abandoned);
     }
 }
 
