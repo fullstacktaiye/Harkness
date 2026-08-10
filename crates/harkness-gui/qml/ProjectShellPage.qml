@@ -35,8 +35,12 @@ Kirigami.Page {
 
     // The page itself is the window-coloured band the framed surface floats
     // on, so the gutter around the frame matches the title bar above it.
+    // Inheritance is off here, so the window's black ground is restated.
     Kirigami.Theme.colorSet: Kirigami.Theme.Window
     Kirigami.Theme.inherit: false
+    Kirigami.Theme.backgroundColor: "#000000"
+    Kirigami.Theme.alternateBackgroundColor: "#0d0d0d"
+    Kirigami.Theme.textColor: "#ffffff"
 
     background: Rectangle {
         color: Kirigami.Theme.backgroundColor
@@ -139,6 +143,9 @@ Kirigami.Page {
 
                 Kirigami.Theme.colorSet: Kirigami.Theme.Header
                 Kirigami.Theme.inherit: false
+                Kirigami.Theme.backgroundColor: "#000000"
+                Kirigami.Theme.alternateBackgroundColor: "#0d0d0d"
+                Kirigami.Theme.textColor: "#ffffff"
 
                 Rectangle {
                     anchors.fill: parent

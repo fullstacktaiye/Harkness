@@ -21,9 +21,12 @@ Item {
     readonly property Window window: Window.window
 
     // The title bar is window chrome, not page content, so it takes the
-    // header palette instead of inheriting the page background below it.
+    // header palette instead of inheriting the page background below it. That
+    // also cuts it off from the window's black ground, so it restates it.
     Kirigami.Theme.colorSet: Kirigami.Theme.Header
     Kirigami.Theme.inherit: false
+    Kirigami.Theme.backgroundColor: "#000000"
+    Kirigami.Theme.textColor: "#ffffff"
 
     implicitHeight: Math.max(menuBar.implicitHeight, Kirigami.Units.gridUnit * 1.8)
 

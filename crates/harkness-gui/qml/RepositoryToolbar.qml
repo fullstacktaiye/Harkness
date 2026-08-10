@@ -107,6 +107,17 @@ RowLayout {
             width: Kirigami.Units.gridUnit * 20
             y: branchSegment.height
 
+            // A popup is drawn by the widget style, which answers to the
+            // desktop scheme rather than to the black ground the window
+            // states, so it brings its own. The border is what gives it an
+            // edge against the black surface underneath.
+            background: Rectangle {
+                border.color: Qt.rgba(1, 1, 1, 0.18)
+                border.width: 1
+                color: "#000000"
+                radius: Kirigami.Units.cornerRadius
+            }
+
             onOpened: branchFilter.forceActiveFocus()
             onClosed: newBranchForm.visible = false
 
@@ -287,6 +298,14 @@ RowLayout {
             padding: Kirigami.Units.smallSpacing
             width: Kirigami.Units.gridUnit * 24
             y: worktreeSegment.height
+
+            // See branchPopup: the style would otherwise draw it in grey.
+            background: Rectangle {
+                border.color: Qt.rgba(1, 1, 1, 0.18)
+                border.width: 1
+                color: "#000000"
+                radius: Kirigami.Units.cornerRadius
+            }
 
             onClosed: {
                 worktreeForm.visible = false;

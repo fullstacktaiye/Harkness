@@ -23,6 +23,27 @@ Kirigami.ApplicationWindow {
     visible: true
     width: 1280
 
+    // The application draws on one jet-black ground rather than on whatever
+    // scheme the desktop happens to supply. Stating it on the window is what
+    // makes it the default everywhere: every item below inherits these colours
+    // unless it turns inheritance off, and the few chrome items that do repeat
+    // the same values. `palette` carries the same ground to the QtQuick
+    // Controls, which read it instead of Kirigami's theme.
+    Kirigami.Theme.colorSet: Kirigami.Theme.Window
+    Kirigami.Theme.inherit: false
+    Kirigami.Theme.backgroundColor: "#000000"
+    // Barely off black: the one step that keeps side panels, tiles and rows
+    // legible as separate surfaces without lifting the window off black.
+    Kirigami.Theme.alternateBackgroundColor: "#0d0d0d"
+    Kirigami.Theme.textColor: "#ffffff"
+    palette.alternateBase: "#0d0d0d"
+    palette.base: "#000000"
+    palette.button: "#0d0d0d"
+    palette.buttonText: "#ffffff"
+    palette.text: "#ffffff"
+    palette.window: "#000000"
+    palette.windowText: "#ffffff"
+
     // The launcher and project shell are alternative application states, not
     // master/detail columns. Always show only the current page.
     pageStack.columnView.columnResizeMode: Kirigami.ColumnView.SingleColumn
@@ -101,12 +122,52 @@ Kirigami.ApplicationWindow {
         palette.windowText: "#ffffff"
     }
 
+    /// A prompt dialog on the application's own black ground. Kirigami paints
+    /// a dialog's background from the view colour set with inheritance turned
+    /// off inside the component, so no colour stated out here reaches it and
+    /// replacing the background outright is the only way onto black. The
+    /// border stands in for the shadow that background carried: against a
+    /// black window and a translucent scrim, an unbordered dialog has no edge.
+    component BlackPromptDialog: Kirigami.PromptDialog {
+        Kirigami.Theme.colorSet: Kirigami.Theme.Window
+        Kirigami.Theme.inherit: false
+        Kirigami.Theme.backgroundColor: "#000000"
+        Kirigami.Theme.alternateBackgroundColor: "#0d0d0d"
+        Kirigami.Theme.textColor: "#ffffff"
+        palette.base: "#000000"
+        palette.button: "#0d0d0d"
+        palette.buttonText: "#ffffff"
+        palette.text: "#ffffff"
+        palette.window: "#000000"
+        palette.windowText: "#ffffff"
+
+        background: Rectangle {
+            border.color: Qt.rgba(1, 1, 1, 0.18)
+            border.width: 1
+            color: "#000000"
+            radius: Kirigami.Units.cornerRadius
+        }
+    }
+
+    /// A menu on the same black ground, for the same reason the dialog needs
+    /// one: a menu is drawn by the widget style, which answers to the desktop
+    /// scheme rather than to anything the window states.
+    component BlackMenu: Controls.Menu {
+        delegate: LegibleMenuItem {}
+
+        background: Rectangle {
+            border.color: Qt.rgba(1, 1, 1, 0.18)
+            border.width: 1
+            color: "#000000"
+            radius: Kirigami.Units.cornerRadius
+        }
+    }
+
     menuBar: AppTitleBar {
-        Controls.Menu {
+        BlackMenu {
             // The style sizes a menu to its labels alone, so the widest entry
             // and its shortcut would be printed on top of each other. Reserve
             // the column the shortcuts need.
-            delegate: LegibleMenuItem {}
             implicitWidth: Kirigami.Units.gridUnit * 16
             title: qsTr("&File")
 
@@ -154,8 +215,7 @@ Kirigami.ApplicationWindow {
             }
         }
 
-        Controls.Menu {
-            delegate: LegibleMenuItem {}
+        BlackMenu {
             title: qsTr("&Help")
 
             Controls.Action {
@@ -257,7 +317,7 @@ Kirigami.ApplicationWindow {
         onAccepted: appBackend.importLocal(root.urlToPath(selectedFolder))
     }
 
-    Kirigami.PromptDialog {
+    BlackPromptDialog {
         id: removeLocalDialog
 
         property string projectId: ""
@@ -267,7 +327,7 @@ Kirigami.ApplicationWindow {
         onAccepted: appBackend.removeProject(projectId)
     }
 
-    Kirigami.PromptDialog {
+    BlackPromptDialog {
         id: removeManagedDialog
 
         property string projectId: ""
@@ -277,7 +337,7 @@ Kirigami.ApplicationWindow {
         onAccepted: appBackend.removeManaged(projectId)
     }
 
-    Kirigami.PromptDialog {
+    BlackPromptDialog {
         id: removeWorktreeDialog
 
         property string projectId: ""
@@ -299,7 +359,7 @@ Kirigami.ApplicationWindow {
         }
     }
 
-    Kirigami.PromptDialog {
+    BlackPromptDialog {
         id: forceWorktreeDialog
 
         property string projectId: ""
@@ -309,7 +369,7 @@ Kirigami.ApplicationWindow {
         onAccepted: appBackend.removeWorktree(projectId, true)
     }
 
-    Kirigami.PromptDialog {
+    BlackPromptDialog {
         id: aboutDialog
 
         standardButtons: Kirigami.Dialog.Ok

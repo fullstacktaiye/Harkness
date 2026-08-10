@@ -13,6 +13,14 @@ Kirigami.Page {
     // project-page transition and clear the backend's open-project state.
     readonly property bool isLauncher: true
 
+    // A page takes its own colour set rather than the window's, so the black
+    // ground stated in Main.qml stops at the page boundary. Restate it here.
+    Kirigami.Theme.colorSet: Kirigami.Theme.Window
+    Kirigami.Theme.inherit: false
+    Kirigami.Theme.backgroundColor: "#000000"
+    Kirigami.Theme.alternateBackgroundColor: "#0d0d0d"
+    Kirigami.Theme.textColor: "#ffffff"
+
 
     function tinted(color, alpha) {
         return Qt.rgba(color.r, color.g, color.b, alpha);

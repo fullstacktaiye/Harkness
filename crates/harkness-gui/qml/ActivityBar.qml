@@ -24,9 +24,13 @@ Item {
     implicitWidth: Kirigami.Units.gridUnit * 2.5
 
     // The bar is chrome rather than content, so it keeps the window colour
-    // instead of inheriting the panel background beside it.
+    // instead of inheriting the panel background beside it. Turning inheritance
+    // off also cuts it off from the window's black ground, so it restates it.
     Kirigami.Theme.colorSet: Kirigami.Theme.Window
     Kirigami.Theme.inherit: false
+    Kirigami.Theme.backgroundColor: "#000000"
+    Kirigami.Theme.alternateBackgroundColor: "#0d0d0d"
+    Kirigami.Theme.textColor: "#ffffff"
 
     Rectangle {
         anchors.fill: parent
