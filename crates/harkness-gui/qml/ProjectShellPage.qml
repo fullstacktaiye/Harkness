@@ -22,10 +22,25 @@ Kirigami.Page {
     /// Whether the side panel is showing beside the review surface.
     property bool sidePanelExpanded: true
 
+    /// The hairline drawn around the shell surface and between its regions.
+    /// One colour for the frame and every internal divider is what makes the
+    /// whole shell read as a single bordered panel instead of stacked strips.
+    readonly property color frameColor: Qt.alpha(Kirigami.Theme.textColor, 0.18)
+    readonly property real frameRadius: Kirigami.Units.smallSpacing
+
     title: shell.shellName
     // The activity bar and the panels beside it are chrome: they run to the
     // window edge instead of floating inside the page's content padding.
     padding: 0
+
+    // The page itself is the window-coloured band the framed surface floats
+    // on, so the gutter around the frame matches the title bar above it.
+    Kirigami.Theme.colorSet: Kirigami.Theme.Window
+    Kirigami.Theme.inherit: false
+
+    background: Rectangle {
+        color: Kirigami.Theme.backgroundColor
+    }
 
     /// Applies an activity-bar pick the way Visual Studio Code does: another
     /// view switches the panel, the current one toggles it away and back.
@@ -98,23 +113,52 @@ Kirigami.Page {
         project: shell.project
     }
 
-    // The shell draws its own header instead of handing it to Kirigami's
-    // `header` slot: with the global toolbar switched off, that slot is laid
-    // out against a toolbar row that is no longer there and squeezes its
-    // content into a fraction of the height it asked for.
-    ColumnLayout {
+    // The whole shell — header band, activity bar and the current view — sits
+    // on this one framed surface, floated inside a gutter so the border wraps
+    // the entire look rather than each strip drawing its own edge.
+    Rectangle {
+        id: frame
+
         anchors.fill: parent
-        spacing: 0
+        anchors.margins: Kirigami.Units.largeSpacing
+        border.color: shell.frameColor
+        border.width: 1
+        color: Kirigami.Theme.backgroundColor
+        radius: shell.frameRadius
 
-        Controls.Pane {
-            Layout.fillWidth: true
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: frame.border.width
+            spacing: 0
 
-            ColumnLayout {
-                spacing: Kirigami.Units.smallSpacing
-                width: parent.width
+            // The shell draws its own header instead of handing it to
+            // Kirigami's `header` slot: with the global toolbar switched off,
+            // that slot is laid out against a toolbar row that is no longer
+            // there and squeezes its content into a fraction of the height it
+            // asked for. It takes the Header palette so it reads as chrome,
+            // matching the title bar above the frame.
+            Item {
+                id: headerBand
+
+                Layout.fillWidth: true
+                implicitHeight: headerRow.implicitHeight + Kirigami.Units.largeSpacing * 2
+
+                Kirigami.Theme.colorSet: Kirigami.Theme.Header
+                Kirigami.Theme.inherit: false
+
+                Rectangle {
+                    anchors.fill: parent
+                    color: Kirigami.Theme.backgroundColor
+                }
 
                 RowLayout {
-                    Layout.fillWidth: true
+                    id: headerRow
+
+                    anchors.left: parent.left
+                    anchors.leftMargin: Kirigami.Units.largeSpacing
+                    anchors.right: parent.right
+                    anchors.rightMargin: Kirigami.Units.largeSpacing
+                    anchors.verticalCenter: parent.verticalCenter
                     spacing: Kirigami.Units.largeSpacing
 
                     // Leaving the project is the one navigation step the shell
@@ -127,10 +171,23 @@ Kirigami.Page {
                         onClicked: shell.backend.closeProject()
                     }
 
-                    Kirigami.Icon {
-                        Layout.preferredHeight: Kirigami.Units.iconSizes.large
-                        Layout.preferredWidth: Kirigami.Units.iconSizes.large
-                        source: shell.project.isGit ? "folder-git" : "folder"
+                    // The project icon sits on its own tile so the identity
+                    // block has an anchor point instead of an icon floating
+                    // in the row.
+                    Rectangle {
+                        Layout.preferredHeight: Kirigami.Units.iconSizes.medium + Kirigami.Units.smallSpacing * 3
+                        Layout.preferredWidth: Kirigami.Units.iconSizes.medium + Kirigami.Units.smallSpacing * 3
+                        border.color: shell.frameColor
+                        border.width: 1
+                        color: Kirigami.Theme.alternateBackgroundColor
+                        radius: shell.frameRadius
+
+                        Kirigami.Icon {
+                            anchors.centerIn: parent
+                            height: Kirigami.Units.iconSizes.medium
+                            source: shell.project.isGit ? "folder-git" : "folder"
+                            width: Kirigami.Units.iconSizes.medium
+                        }
                     }
 
                     ColumnLayout {
@@ -202,96 +259,114 @@ Kirigami.Page {
                     }
                 }
             }
-        }
 
-        RowLayout {
-            Layout.fillHeight: true
-            Layout.fillWidth: true
-            spacing: 0
-
-            ActivityBar {
-                Layout.fillHeight: true
-                currentViewId: shell.currentViewId
-                panelExpanded: shell.sidePanelExpanded
-                views: sidePanel.views
-                visible: sidePanel.hasAvailableView
-                onViewTriggered: viewId => shell.activateView(viewId)
+            Rectangle {
+                Layout.fillWidth: true
+                color: shell.frameColor
+                implicitHeight: 1
             }
 
-            Kirigami.Separator {
-                Layout.fillHeight: true
-                visible: sidePanel.hasAvailableView
-            }
-
-            // The current view owns everything right of the activity bar, so
-            // collapsing it takes the whole surface rather than baring a companion
-            // pane the activity bar never advertised.
-            SidePanel {
-                id: sidePanel
-
+            RowLayout {
                 Layout.fillHeight: true
                 Layout.fillWidth: true
-                currentViewId: shell.currentViewId
-                visible: shell.sidePanelExpanded && sidePanel.currentPanelReady
+                spacing: 0
 
-                GitPanel {
-                    id: gitPanel
-
-                    backend: shell.backend
-                    project: shell.project
-                    onHideRequested: shell.sidePanelExpanded = false
+                ActivityBar {
+                    Layout.fillHeight: true
+                    currentViewId: shell.currentViewId
+                    panelExpanded: shell.sidePanelExpanded
+                    views: sidePanel.views
+                    visible: sidePanel.hasAvailableView
+                    onViewTriggered: viewId => shell.activateView(viewId)
                 }
-            }
 
-            /*
-            FileTreeModel {
-                id: fileModel
-            }
+                Rectangle {
+                    Layout.fillHeight: true
+                    color: shell.frameColor
+                    implicitWidth: 1
+                    visible: sidePanel.hasAvailableView
+                }
 
-            TreeView {
-                id: tree
+                // The current view owns everything right of the activity bar, so
+                // collapsing it takes the whole surface rather than baring a companion
+                // pane the activity bar never advertised.
+                SidePanel {
+                    id: sidePanel
 
-                Layout.fillHeight: true
-                Layout.fillWidth: true
-                Layout.minimumWidth: Kirigami.Units.gridUnit * 12
-                clip: true
-                model: fileModel
-                selectionModel: ItemSelectionModel {}
-                visible: shell.project.available
+                    Layout.fillHeight: true
+                    Layout.fillWidth: true
+                    currentViewId: shell.currentViewId
+                    visible: shell.sidePanelExpanded && sidePanel.currentPanelReady
 
-                delegate: Controls.TreeViewDelegate {
-                    id: treeDelegate
+                    GitPanel {
+                        id: gitPanel
 
-                    // The KDE TreeViewDelegate already requires a `model` object.
-                    // Consequently custom roles are exposed through that object,
-                    // not injected as standalone required properties.
-                    readonly property string fileName: model.fileName
-                    readonly property string filePath: model.filePath
-                    readonly property bool isDirectory: model.isDirectory
-
-                    Controls.ToolTip.text: treeDelegate.filePath
-                    Controls.ToolTip.visible: treeDelegate.hovered
-
-                    contentItem: RowLayout {
-                        spacing: Kirigami.Units.smallSpacing
-
-                        Kirigami.Icon {
-                            Layout.preferredHeight: Kirigami.Units.iconSizes.small
-                            Layout.preferredWidth: Kirigami.Units.iconSizes.small
-                            source: treeDelegate.isDirectory ? "folder" : "text-plain"
-                        }
-
-                        Controls.Label {
-                            Layout.fillWidth: true
-                            elide: Text.ElideRight
-                            text: treeDelegate.fileName
-                        }
+                        backend: shell.backend
+                        project: shell.project
+                        onHideRequested: shell.sidePanelExpanded = false
                     }
                 }
 
-                Component.onCompleted: fileModel.setRoot(shell.project.root)
+                /*
+                FileTreeModel {
+                    id: fileModel
+                }
+
+                TreeView {
+                    id: tree
+
+                    Layout.fillHeight: true
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: Kirigami.Units.gridUnit * 12
+                    clip: true
+                    model: fileModel
+                    selectionModel: ItemSelectionModel {}
+                    visible: shell.project.available
+
+                    delegate: Controls.TreeViewDelegate {
+                        id: treeDelegate
+
+                        // The KDE TreeViewDelegate already requires a `model` object.
+                        // Consequently custom roles are exposed through that object,
+                        // not injected as standalone required properties.
+                        readonly property string fileName: model.fileName
+                        readonly property string filePath: model.filePath
+                        readonly property bool isDirectory: model.isDirectory
+
+                        Controls.ToolTip.text: treeDelegate.filePath
+                        Controls.ToolTip.visible: treeDelegate.hovered
+
+                        contentItem: RowLayout {
+                            spacing: Kirigami.Units.smallSpacing
+
+                            Kirigami.Icon {
+                                Layout.preferredHeight: Kirigami.Units.iconSizes.small
+                                Layout.preferredWidth: Kirigami.Units.iconSizes.small
+                                source: treeDelegate.isDirectory ? "folder" : "text-plain"
+                            }
+
+                            Controls.Label {
+                                Layout.fillWidth: true
+                                elide: Text.ElideRight
+                                text: treeDelegate.fileName
+                            }
+                        }
+                    }
+
+                    Component.onCompleted: fileModel.setRoot(shell.project.root)
+                }
+                */
             }
-            */
+        }
+
+        // The panels inside paint square corners, so the frame's stroke is
+        // drawn once more on top of them to keep the rounded outline crisp.
+        Rectangle {
+            anchors.fill: parent
+            border.color: shell.frameColor
+            border.width: 1
+            color: "transparent"
+            radius: frame.radius
         }
     }
 
