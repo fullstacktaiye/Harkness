@@ -7,7 +7,7 @@ Harkness is a Rust 2024 workspace split into six crates under `crates/`:
 - `harkness-core`: project catalog, storage layout, cross-domain project workflows, and directory-listing logic shared by front ends.
 - `harkness-git`: all production Git behavior: inspection, diffs and history, file context and hunk staging, branch and worktree mutation, commits, clone and synchronization, hermetic process execution, and repository locking.
 - `harkness-test-fixtures`: hermetic repository, filesystem, and process fixtures shared only by crate tests.
-- `harkness-runtime`: typed task, run, step, and tool-call records, the execution contracts shared by front ends, and the SQLite run store that makes those records durable.
+- `harkness-runtime`: typed task, run, step, and tool-call records, the typed tool contract and registry every executable operation implements, the execution contracts shared by front ends, and the SQLite run store that makes those records durable.
 - `harkness-cli`: the `harkness` command and its integration tests in `tests/`.
 - `harkness-gui`: the Qt 6/KDE Kirigami application. Rust/CXX-Qt bindings live in `src/` and `cxx/`; UI components live in `qml/`.
 
@@ -128,6 +128,62 @@ and check that the checkpoint returned success. A checkpoint reports an
 incomplete fold in its result row instead of failing, so a reader on another
 connection can leave frames behind; the store reads that row and refuses rather
 than letting a backup be taken on a checkpoint that never finished.
+
+## Tool Contract & Registry Invariants
+
+A tool identifier and version are part of the published contract, not internal
+names: they are persisted in `tool_calls.tool_id` and `tool_calls.tool_version`,
+enumerated by `harkness contract`, and bound into approval scopes. Identifiers
+use one narrow grammar — dot-separated lowercase ASCII segments, at least a
+namespace and a verb — and versions are parsed as semantic versions so "the
+latest version of an id" is decided by precedence rather than by string order.
+Renaming either is a breaking change for every record that named it.
+
+A registered `(id, version)` is immutable. The registry rejects a duplicate and
+offers no way to replace or remove a registration, because a recorded call and an
+approval both name a version and expect it to keep meaning what it meant.
+Publishing a change means registering a new version beside the old one.
+Descriptor enumeration is ordered by identifier and then by version precedence,
+so any projection built from it is diff-stable regardless of registration order.
+
+Schemas are generated from the `Input` and `Output` associated types and never
+declared by hand, so a published contract cannot disagree with the type the tool
+body deserializes. They are compiled at registration: a schema that cannot be
+compiled is a refusal to declare the tool, not a surprise on the first call.
+`schemars` closes an object schema only for a type carrying
+`#[serde(deny_unknown_fields)]`, so every tool `Input` type must carry it —
+otherwise an agent's misspelled field is discarded silently instead of reported.
+
+Validation runs in both directions and the order carries the guarantees. Input is
+validated before the body runs, so a rejected input means nothing executed and a
+corrected retry is safe; it is also validated before policy evaluation, so policy
+classifies what will actually execute rather than an unparsed blob. Output is
+validated before delivery, so a consumer that trusted the published schema never
+receives a shape it cannot handle. Both gates locate findings with RFC 6901 JSON
+Pointers.
+
+`jsonschema` is built with `default-features = false`, which drops
+`resolve-http` and `resolve-file`. A `$ref` to a URL or a local file therefore
+cannot be followed: schema compilation reaches nothing outside the process.
+
+Declared risk and capabilities are frozen in the descriptor. A tool cannot lower
+its declared risk for one call; whether a specific invocation is more dangerous
+than its level suggests is decided when that invocation is evaluated. `RiskLevel`
+has one definition and one total order — `observe < workspace_write < execute <
+network < remote_write < destructive` — because a policy comparison that means
+different things in different modules is not a policy.
+
+The tool body is the only foreign code in the pipeline and runs under
+`catch_unwind`; a panic becomes a structured `tool_panicked` error and leaves the
+registry and calling thread usable, so one buggy tool cannot orphan a run record.
+This relies on the workspace unwinding rather than aborting on panic; do not set
+`panic = "abort"` without replacing the containment. A contained panic ends that
+call rather than resuming it, and an abort is not a panic and is not contained.
+
+`ToolError`, `RegistryError`, and the other stable namespaces each own a `KINDS`
+table in declaration order with a round-trip test. Adding a variant requires
+adding its kind; the two namespaces must not collide, because `harkness contract`
+publishes their concatenation.
 
 ## Commit & Pull Request Guidelines
 
