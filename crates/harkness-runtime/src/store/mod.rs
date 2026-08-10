@@ -84,7 +84,8 @@ mod repository;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, TransactionBehavior};
 use serde_json::Value;
@@ -109,6 +110,9 @@ pub const MAX_INLINE_PAYLOAD_BYTES: usize = 64 * 1024;
 
 /// How long a connection waits for another writer before giving up.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often the write-ahead-log transition re-checks a contended database.
+const WAL_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Read connections retained for reuse; extra readers are opened and dropped.
 const POOLED_READERS: usize = 4;
@@ -659,14 +663,44 @@ fn connect(path: &Path) -> Result<Connection, OpenFailure> {
 /// `PRAGMA journal_mode` reports the mode actually in force rather than
 /// failing, so a filesystem that cannot support WAL would otherwise leave the
 /// store silently running in rollback-journal mode.
+///
+/// # Why this retries
+///
+/// Moving a database into WAL takes an exclusive lock, and SQLite does not
+/// route that acquisition through the busy handler on every platform: on
+/// Windows a second connection opening the same new database is told the
+/// database is locked rather than being made to wait, even with a busy timeout
+/// set. The mode is a persistent property of the file, so the contention only
+/// exists while a new database is being created and it always resolves — the
+/// winner's transition makes every other connection's next read report `wal`.
+/// Waiting for that is the whole of the fix.
 fn enable_wal(connection: &Connection) -> Result<(), OpenFailure> {
-    let mode: String =
-        connection.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
-    if !mode.eq_ignore_ascii_case("wal") {
-        return Err(OpenFailure::JournalMode { mode });
+    let deadline = Instant::now() + BUSY_TIMEOUT;
+    loop {
+        match request_wal(connection) {
+            Ok(mode) if mode.eq_ignore_ascii_case("wal") => break,
+            Ok(mode) => return Err(OpenFailure::JournalMode { mode }),
+            Err(error) if error::is_busy(&error) && Instant::now() < deadline => {
+                thread::sleep(WAL_RETRY_INTERVAL);
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
     connection.pragma_update(None, "synchronous", "NORMAL")?;
     Ok(())
+}
+
+/// Reports the journal mode, asking for WAL only when it is not already set.
+///
+/// The read costs nothing and the write costs an exclusive lock, so checking
+/// first keeps every connection after the first — including every pooled
+/// reader — off the contended path entirely.
+fn request_wal(connection: &Connection) -> Result<String, rusqlite::Error> {
+    let current: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    if current.eq_ignore_ascii_case("wal") {
+        return Ok(current);
+    }
+    connection.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
 }
 
 fn open_failed(path: &Path, source: OpenFailure) -> StoreError {

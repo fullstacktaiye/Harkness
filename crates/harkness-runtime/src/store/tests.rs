@@ -223,29 +223,71 @@ fn a_newer_schema_is_refused_as_upgrade_and_leaves_the_file_untouched() {
 
 #[test]
 fn concurrent_opens_of_a_new_database_all_succeed() {
+    // Creating a database is the only moment openers contend, and the two ways
+    // it can go wrong are platform-dependent: climbing the migration ladder on
+    // a version read outside the write lock replays `CREATE TABLE`, and the
+    // switch into WAL takes an exclusive lock that SQLite refuses outright
+    // rather than waiting for on some platforms. Several fresh databases give
+    // both windows more than one chance to be hit.
+    for attempt in 0..4 {
+        let data_dir = TempDir::new().unwrap();
+        let path = Arc::new(data_dir.path().to_path_buf());
+
+        let openers = (0..8)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                thread::spawn(move || Store::open(&path).map(|_| ()))
+            })
+            .collect::<Vec<_>>();
+
+        let failures = openers
+            .into_iter()
+            .filter_map(|opener| opener.join().unwrap().err())
+            .map(|error| format!("{}: {error}", error.kind()))
+            .collect::<Vec<_>>();
+        assert!(
+            failures.is_empty(),
+            "concurrent opens failed on attempt {attempt}: {failures:?}"
+        );
+        assert_eq!(
+            recorded_version(&Connection::open(path.join(DATABASE_FILE)).unwrap()).unwrap(),
+            SCHEMA_VERSION
+        );
+    }
+}
+
+#[test]
+fn the_write_ahead_log_transition_waits_out_an_exclusive_lock() {
     let data_dir = TempDir::new().unwrap();
-    let path = Arc::new(data_dir.path().to_path_buf());
+    let path = data_dir.path().join(DATABASE_FILE);
 
-    // Every opener observes an unmigrated database and races to climb the
-    // ladder. Applying a migration on the strength of a version read outside
-    // the write lock replays `CREATE TABLE` against a database that already
-    // has one.
-    let openers = (0..8)
-        .map(|_| {
-            let path = Arc::clone(&path);
-            thread::spawn(move || Store::open(&path).map(|_| ()))
-        })
-        .collect::<Vec<_>>();
+    // A rollback-journal database another connection holds exclusively. Moving
+    // it into WAL needs that same exclusive lock.
+    let holder = Connection::open(&path).unwrap();
+    holder
+        .execute_batch("PRAGMA journal_mode = DELETE; BEGIN EXCLUSIVE;")
+        .unwrap();
 
-    let failures = openers
-        .into_iter()
-        .filter_map(|opener| opener.join().unwrap().err())
-        .map(|error| format!("{}: {error}", error.kind()))
-        .collect::<Vec<_>>();
-    assert!(failures.is_empty(), "concurrent opens failed: {failures:?}");
+    // Disabling the busy handler makes this connection be refused outright
+    // instead of being made to wait, which is what Windows does to the WAL
+    // transition even with a busy timeout set. Reproducing it here keeps the
+    // regression visible on every platform rather than only in Windows CI.
+    let waiter = Connection::open(&path).unwrap();
+    waiter.busy_timeout(Duration::ZERO).unwrap();
+    let transition =
+        thread::spawn(move || super::enable_wal(&waiter).map_err(|error| error.to_string()));
+
+    thread::sleep(Duration::from_millis(300));
+    holder.execute_batch("COMMIT").unwrap();
+    drop(holder);
+
+    transition
+        .join()
+        .unwrap()
+        .expect("the transition should have waited for the lock");
     assert_eq!(
-        recorded_version(&Connection::open(path.join(DATABASE_FILE)).unwrap()).unwrap(),
-        SCHEMA_VERSION
+        pragma::<String>(&Connection::open(&path).unwrap(), "journal_mode").to_ascii_lowercase(),
+        "wal"
     );
 }
 
