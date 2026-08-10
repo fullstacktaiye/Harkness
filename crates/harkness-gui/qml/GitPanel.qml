@@ -128,6 +128,20 @@ Item {
             || job("remove_managed") !== null;
     }
 
+    // Mirrors the ahead/behind summary in the header: pulling takes
+    // priority when behind (a push would be rejected anyway), otherwise
+    // push if there's anything to push, otherwise just fetch to refresh
+    // the remote-tracking state.
+    function syncAction() {
+        const behind = stateReady ? Number(gitState.behind || 0) : 0;
+        const ahead = stateReady ? Number(gitState.ahead || 0) : 0;
+        if (behind > 0)
+            return "pull";
+        if (ahead > 0)
+            return "push";
+        return "fetch";
+    }
+
     function reviewReadRunning() {
         return job("review") !== null
             || job("review_file") !== null
@@ -452,33 +466,35 @@ Item {
                     text: qsTr("Remote")
                 }
 
-                RowLayout {
+                Controls.Button {
                     Layout.fillWidth: true
-
-                    Controls.Button {
-                        Layout.fillWidth: true
-                        enabled: !panel.repositoryOperationRunning()
-                        icon.name: "download"
-                        text: qsTr("Fetch")
-                        onClicked: panel.backend.fetch(panel.project.id)
+                    enabled: !panel.repositoryOperationRunning()
+                    icon.name: {
+                        switch (panel.syncAction()) {
+                        case "pull": return "go-down";
+                        case "push": return "go-up";
+                        default: return "download";
+                        }
                     }
-
-                    Controls.Button {
-                        Layout.fillWidth: true
-                        enabled: panel.job("pull") === null
-                            && panel.job("push") === null
-                            && !panel.repositoryOperationRunning()
-                        icon.name: "go-down"
-                        text: qsTr("Pull")
-                        onClicked: panel.backend.pull(panel.project.id)
+                    text: {
+                        switch (panel.syncAction()) {
+                        case "pull": return qsTr("Pull (%1)").arg(panel.gitState.behind || 0);
+                        case "push": return qsTr("Push (%1)").arg(panel.gitState.ahead || 0);
+                        default: return qsTr("Fetch");
+                        }
                     }
-
-                    Controls.Button {
-                        Layout.fillWidth: true
-                        enabled: !panel.repositoryOperationRunning()
-                        icon.name: "go-up"
-                        text: qsTr("Push")
-                        onClicked: panel.backend.push(panel.project.id, false)
+                    onClicked: {
+                        switch (panel.syncAction()) {
+                        case "pull":
+                            panel.backend.pull(panel.project.id);
+                            break;
+                        case "push":
+                            panel.backend.push(panel.project.id, false);
+                            break;
+                        default:
+                            panel.backend.fetch(panel.project.id);
+                            break;
+                        }
                     }
                 }
 
