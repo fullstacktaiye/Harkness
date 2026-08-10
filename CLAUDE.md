@@ -166,7 +166,10 @@ generalization of the `impl FnMut(String)` callback Git verbs take.
 
 Three error namespaces meet here: `RegistryError` (declaring and resolving), `ToolError` (invoking),
 and `InvocationError` as their union — `InvocationError::kinds()` is what #99 publishes, so the two
-`KINDS` tables must not collide.
+`KINDS` tables must not collide. `InvocationError::Tool` carries the resolved `ToolIdentity` beside
+the error, so a caller that named no version can still record `tool_calls.tool_version` for a failed
+row without re-resolving. That is also why there is no `From<ToolError> for InvocationError`: a `?`
+would silently drop the identity, so constructing the variant requires naming the tool.
 
 ## Data directory
 

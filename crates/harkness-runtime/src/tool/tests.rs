@@ -760,13 +760,18 @@ fn schema_invalid_input_is_refused_before_the_tool_body_runs() {
         .unwrap_err();
 
         assert_eq!(error.kind(), "invalid_input", "accepted {input}");
-        let InvocationError::Tool(ToolError::InvalidInput {
+        let Some(ToolError::InvalidInput {
             tool, violations, ..
-        }) = &error
+        }) = error.tool_error()
         else {
             panic!("expected an input refusal for {input}, got {error:?}");
         };
         assert_eq!(tool.to_string(), "fixture.echo@1.0.0");
+        assert_eq!(
+            error.tool().map(ToString::to_string),
+            Some("fixture.echo@1.0.0".to_owned()),
+            "the refused call must name the version it resolved"
+        );
         assert!(
             !violations.is_empty(),
             "no violation was located for {input}"
@@ -826,9 +831,9 @@ fn schema_invalid_output_is_refused_before_delivery() {
     .unwrap_err();
 
     assert_eq!(error.kind(), "invalid_output");
-    let InvocationError::Tool(ToolError::InvalidOutput {
+    let Some(ToolError::InvalidOutput {
         tool, violations, ..
-    }) = &error
+    }) = error.tool_error()
     else {
         panic!("expected an output refusal, got {error:?}");
     };
@@ -884,7 +889,7 @@ fn a_panicking_tool_becomes_a_structured_error_and_the_registry_survives() {
     std::panic::set_hook(previous);
 
     assert_eq!(error.kind(), "tool_panicked");
-    let InvocationError::Tool(ToolError::ToolPanicked { tool, payload }) = &error else {
+    let Some(ToolError::ToolPanicked { tool, payload }) = error.tool_error() else {
         panic!("expected a contained panic, got {error:?}");
     };
     assert_eq!(tool.to_string(), "fixture.panics@1.0.0");
@@ -951,6 +956,77 @@ fn a_panic_payload_is_recovered_when_it_is_a_string_and_omitted_otherwise() {
                 .starts_with("fixture.panics@1.0.0 panicked")
         );
     }
+}
+
+#[test]
+fn a_failed_unpinned_call_still_reports_the_version_that_ran() {
+    // The row a coordinator writes for a failed call needs `tool_version`, and
+    // the caller named no version. Re-resolving to find it is a second lookup
+    // that could disagree with the first — for instance if a newer version were
+    // registered in between — so the failure carries the resolved identity.
+    let mut registry = ToolRegistry::new();
+    registry.register(Failing).unwrap();
+    let mut context = context();
+
+    let error = invoke(
+        &registry,
+        &id("fixture.failing"),
+        None,
+        &raw("{}"),
+        &mut context,
+    )
+    .unwrap_err();
+
+    // `execution_failed` is authored by the tool, which does not know its own
+    // identity, so this is the variant that would otherwise have nothing to
+    // record against.
+    assert_eq!(error.kind(), "execution_failed");
+    assert_eq!(
+        error.tool(),
+        Some(&ToolIdentity::parse("fixture.failing", "1.0.0").unwrap())
+    );
+
+    // Every failure path that reached a tool answers, not just the ones whose
+    // ToolError variant happens to name it.
+    let cancelled = {
+        let cancellation = Cancellation::default();
+        let mut cancelled_context = ExecutionContext::new(
+            RunId::new(),
+            StepId::new(),
+            ToolCallId::new(),
+            WORKSPACE,
+            cancellation.clone(),
+            Box::new(DiscardedProgress),
+            Box::new(UnsupportedArtifacts),
+        )
+        .unwrap();
+        cancellation.cancel();
+        invoke(
+            &registry,
+            &id("fixture.failing"),
+            None,
+            &raw("{}"),
+            &mut cancelled_context,
+        )
+        .unwrap_err()
+    };
+    assert_eq!(cancelled.kind(), "cancelled");
+    assert_eq!(
+        cancelled.tool().map(|tool| tool.version.to_string()),
+        Some("1.0.0".to_owned())
+    );
+
+    // A resolution failure is the one case with no version, because resolving is
+    // what failed.
+    let unresolved = invoke(
+        &registry,
+        &id("fixture.absent"),
+        None,
+        &raw("{}"),
+        &mut context,
+    )
+    .unwrap_err();
+    assert_eq!(unresolved.tool(), None);
 }
 
 #[test]

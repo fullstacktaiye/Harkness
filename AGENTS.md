@@ -212,6 +212,12 @@ table in declaration order with a round-trip test. Adding a variant requires
 adding its kind; the two namespaces must not collide, because `harkness contract`
 publishes their concatenation.
 
+The resolved `(id, version)` accompanies an invocation on both its success and its
+failure path, so a caller that asked for a tool without naming a version never has
+to resolve twice to learn what ran — and two lookups can disagree where one
+cannot. `InvocationError` therefore has no `From<ToolError>` conversion: building
+a tool failure requires naming the tool, so a `?` cannot produce one that forgot.
+
 ## Commit & Pull Request Guidelines
 
 Write short, imperative commit subjects, matching history such as `Prevent concurrent imports from orphaning managed checkouts`. Keep each commit focused; append the PR number only when added by the merge workflow. Pull requests should explain the behavior change, testing performed, and relevant issue. Include screenshots for visible QML changes and call out platform or Qt/KDE dependency assumptions.

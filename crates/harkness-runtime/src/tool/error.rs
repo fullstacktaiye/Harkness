@@ -428,26 +428,84 @@ impl RegistryError {
 /// while a tool failure is an outcome worth recording against the call. This
 /// type is the union a single entry point has to return, and
 /// [`kinds`](Self::kinds) is the flattened list `harkness contract` publishes.
+///
+/// A tool failure carries the resolved [`ToolIdentity`] beside the error. That
+/// matters for the same reason [`ToolOutcome`](super::ToolOutcome) carries it on
+/// success: a caller that asked for a tool without naming a version still has to
+/// write `tool_calls.tool_version` for the row it is failing, and re-resolving to
+/// find out is a second lookup that can disagree with the first. Only some
+/// [`ToolError`] variants name the tool themselves — a tool reporting
+/// `execution_failed` does not know its own identity — so attaching it here is
+/// what makes the version available on *every* failure path rather than most of
+/// them.
+///
+/// There is deliberately no `From<ToolError>` conversion. Building this variant
+/// requires naming the tool, so a `?` cannot produce a tool failure that forgot
+/// to say which tool failed.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[non_exhaustive]
 pub enum InvocationError {
     /// The named tool or version does not exist in the registry.
+    ///
+    /// No identity accompanies this variant because resolving one is precisely
+    /// what failed.
     #[error(transparent)]
     Resolution(#[from] RegistryError),
 
     /// The invocation reached a real tool and failed.
-    #[error(transparent)]
-    Tool(#[from] ToolError),
+    #[error("{error}")]
+    Tool {
+        /// The `(id, version)` that was resolved and attempted.
+        tool: ToolIdentity,
+        /// What the invocation reported.
+        ///
+        /// Boxed because this variant carries both an identity and a whole
+        /// [`ToolError`] — itself the widest type in this module — and every
+        /// `Result<_, InvocationError>` in the runtime would otherwise be as wide
+        /// as the rarest failure in it.
+        #[source]
+        error: Box<ToolError>,
+    },
 }
 
 impl InvocationError {
+    /// Reports a failure against the tool that was resolved and attempted.
+    #[must_use]
+    pub fn from_tool(tool: ToolIdentity, error: ToolError) -> Self {
+        Self::Tool {
+            tool,
+            error: Box::new(error),
+        }
+    }
+
     /// Stable machine-readable discriminant, delegated to the namespace that
     /// owns the failure.
     #[must_use]
-    pub const fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> &'static str {
         match self {
             Self::Resolution(error) => error.kind(),
-            Self::Tool(error) => error.kind(),
+            Self::Tool { error, .. } => error.kind(),
+        }
+    }
+
+    /// The tool that was attempted, when one was resolved.
+    ///
+    /// `None` only for [`Self::Resolution`], where no tool was found to attempt.
+    /// A caller recording a failed call reads the version to persist from here.
+    #[must_use]
+    pub const fn tool(&self) -> Option<&ToolIdentity> {
+        match self {
+            Self::Resolution(_) => None,
+            Self::Tool { tool, .. } => Some(tool),
+        }
+    }
+
+    /// The invocation failure, when the call reached a real tool.
+    #[must_use]
+    pub fn tool_error(&self) -> Option<&ToolError> {
+        match self {
+            Self::Resolution(_) => None,
+            Self::Tool { error, .. } => Some(error),
         }
     }
 
@@ -471,7 +529,7 @@ impl InvocationError {
     pub fn as_failure(&self) -> Failure {
         match self {
             Self::Resolution(error) => Failure::new(error.kind(), error.to_string()),
-            Self::Tool(error) => error.as_failure(),
+            Self::Tool { error, .. } => error.as_failure(),
         }
     }
 }
@@ -682,9 +740,44 @@ mod tests {
             id: "fixture.tool".to_owned(),
         });
         assert_eq!(resolution.kind(), "unknown_tool");
-        let execution = InvocationError::from(ToolError::Cancelled);
+        let execution = InvocationError::from_tool(identity(), ToolError::Cancelled);
         assert_eq!(execution.kind(), "cancelled");
         assert_eq!(execution.as_failure().kind(), "cancelled");
+    }
+
+    #[test]
+    fn a_tool_failure_names_the_tool_and_a_resolution_failure_cannot() {
+        // Every failure that reached a tool carries the resolved identity, so a
+        // caller recording the failed row reads the version from the error itself
+        // instead of resolving a second time — a second lookup can disagree with
+        // the first.
+        let attempted = InvocationError::from_tool(
+            identity(),
+            ToolError::execution_failed("the remote refused"),
+        );
+        assert_eq!(attempted.tool(), Some(&identity()));
+        assert_eq!(
+            attempted.tool().map(|tool| tool.version.to_string()),
+            Some("1.0.0".to_owned())
+        );
+        assert_eq!(
+            attempted.tool_error(),
+            Some(&ToolError::execution_failed("the remote refused"))
+        );
+        // The identity does not leak into the message; the wrapper is transparent.
+        assert_eq!(attempted.to_string(), "the tool failed: the remote refused");
+        assert!(
+            std::error::Error::source(&attempted).is_some(),
+            "the tool error must stay reachable as a source"
+        );
+
+        // Resolution is the one case with no identity, because finding one is
+        // exactly what failed.
+        let unresolved = InvocationError::from(RegistryError::UnknownTool {
+            id: "fixture.absent".to_owned(),
+        });
+        assert_eq!(unresolved.tool(), None);
+        assert_eq!(unresolved.tool_error(), None);
     }
 
     #[test]

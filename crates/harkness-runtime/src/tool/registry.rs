@@ -263,25 +263,18 @@ impl std::fmt::Debug for ToolRegistry {
 /// the CLI, and a coordinator all drive tools through exactly the interface an
 /// agent will use.
 ///
-/// `version` of `None` resolves the highest registered *stable* version, and the
-/// version that actually ran is reported in the [`ToolOutcome`] so the caller
-/// records what executed rather than what it asked for.
-///
-/// On the failure path that identity is not returned. Only
-/// [`ToolError::InvalidInput`], [`ToolError::InvalidOutput`], and
-/// [`ToolError::ToolPanicked`] name the tool themselves; a tool's own
-/// `execution_failed` does not. A caller that must record
-/// `tool_calls.tool_version` for a *failed* unpinned call should therefore
-/// [`ToolRegistry::resolve`] first and use [`invoke_resolved`], which is the
-/// shape a coordinator wants anyway — it has to write the pending row, and
-/// evaluate policy against the descriptor, before anything executes.
+/// `version` of `None` resolves the highest registered *stable* version. The
+/// version that actually ran is reported on both paths — in the [`ToolOutcome`]
+/// on success and on [`InvocationError::Tool`] on failure — so a caller records
+/// what executed rather than what it asked for, and never has to re-resolve to
+/// find out. Two lookups can disagree; one cannot.
 ///
 /// # Errors
 ///
 /// Returns [`InvocationError::Resolution`] when the tool or version does not
-/// exist, and [`InvocationError::Tool`] for everything the invocation itself can
-/// report — schema violations in either direction, a contained panic, or the
-/// tool's own failure.
+/// exist, and [`InvocationError::Tool`] — carrying the resolved identity — for
+/// everything the invocation itself can report: schema violations in either
+/// direction, a contained panic, or the tool's own failure.
 pub fn invoke(
     registry: &ToolRegistry,
     id: &ToolId,
@@ -290,23 +283,30 @@ pub fn invoke(
     context: &mut ExecutionContext,
 ) -> Result<ToolOutcome, InvocationError> {
     let tool = registry.resolve(id, version)?;
+    // Resolved once, then used for both the outcome and any failure. A `?` on
+    // `execute_json` would drop it, which is why `InvocationError` has no
+    // `From<ToolError>` to make that easy.
     let identity = tool.descriptor().identity().clone();
-    let output = tool.execute_json(input, context)?;
-    Ok(ToolOutcome {
-        tool: identity,
-        output,
-    })
+    match tool.execute_json(input, context) {
+        Ok(output) => Ok(ToolOutcome {
+            tool: identity,
+            output,
+        }),
+        Err(error) => Err(InvocationError::from_tool(identity, error)),
+    }
 }
 
 /// Runs one invocation against an already-resolved tool.
 ///
 /// The half of [`invoke`] a caller wants when it resolved the tool earlier — to
-/// evaluate policy against the descriptor, or to record the pinned version
+/// evaluate policy against the descriptor, or to write the pending record —
 /// before anything executes.
 ///
 /// # Errors
 ///
-/// Returns whatever the invocation reports; see [`ErasedTool::execute_json`].
+/// Returns whatever the invocation reports; see [`ErasedTool::execute_json`]. The
+/// identity is not attached here because the caller already holds the tool it
+/// resolved and can read the descriptor directly.
 pub fn invoke_resolved(
     tool: &Arc<dyn ErasedTool>,
     input: &RawValue,
