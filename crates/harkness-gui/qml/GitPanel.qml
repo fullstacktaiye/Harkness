@@ -72,6 +72,21 @@ Item {
             backend.refreshWorktrees(project.id);
     }
 
+    // `ComboBox.valueAt()` does not reliably resolve roles from the QVariant
+    // maps produced by the Rust backend while its model is being populated.
+    // Read the map directly, as ReviewSurface does, so the picker always
+    // reflects the branch Git reports as checked out rather than its first
+    // alphabetical entry.
+    function currentBranchIndex() {
+        const currentBranch = String(gitState.branch || project.branch || "");
+        for (let index = 0; index < backend.branches.length; ++index) {
+            const branch = backend.branches[index];
+            if (String(branch.name || "") === currentBranch)
+                return index;
+        }
+        return -1;
+    }
+
     function handleProjectChange() {
         const nextId = project && project.id !== undefined ? String(project.id) : "";
         if (selectedProjectId !== nextId) {
@@ -525,13 +540,7 @@ Item {
                     textRole: "name"
                     valueRole: "name"
 
-                    currentIndex: {
-                        for (let index = 0; index < count; ++index) {
-                            if (valueAt(index) === panel.project.branch)
-                                return index;
-                        }
-                        return -1;
-                    }
+                    currentIndex: panel.currentBranchIndex()
 
                     delegate: Controls.ItemDelegate {
                         required property var modelData
