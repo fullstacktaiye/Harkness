@@ -7,7 +7,7 @@ Harkness is a Rust 2024 workspace split into six crates under `crates/`:
 - `harkness-core`: project catalog, storage layout, cross-domain project workflows, and directory-listing logic shared by front ends.
 - `harkness-git`: all production Git behavior: inspection, diffs and history, file context and hunk staging, branch and worktree mutation, commits, clone and synchronization, hermetic process execution, and repository locking.
 - `harkness-test-fixtures`: hermetic repository, filesystem, and process fixtures shared only by crate tests.
-- `harkness-runtime`: typed task, run, step, and tool-call records plus the execution contracts shared by front ends.
+- `harkness-runtime`: typed task, run, step, and tool-call records, the execution contracts shared by front ends, and the SQLite run store that makes those records durable.
 - `harkness-cli`: the `harkness` command and its integration tests in `tests/`.
 - `harkness-gui`: the Qt 6/KDE Kirigami application. Rust/CXX-Qt bindings live in `src/` and `cxx/`; UI components live in `qml/`.
 
@@ -66,6 +66,39 @@ deletes the checkout, but never holds the global catalog lock during that
 potentially long operation. Remove worktrees only through Git so the checkout
 and `.git/worktrees` administration disappear together; reconciliation must be
 selective and must not prune external worktree records.
+
+## Run Store Schema & Connection Invariants
+
+Run history lives in `runtime.db` beside `projects.json`, never inside it. The
+two stores are versioned the same way and for the same reason: `PRAGMA
+user_version` is probed before any statement runs, so a database written by a
+newer build produces an upgrade message rather than a corruption message, and
+the refusal happens before the connection requests WAL so the file it declined
+is left byte-identical. Migrations are numbered, applied in ascending order, and
+each shares one transaction with the `user_version` bump it establishes. Adding
+a table, a column, or a persisted spelling requires a new numbered migration and
+a frozen fixture database; never edit an already-released migration.
+
+Every connection applies `journal_mode=WAL`, `foreign_keys=ON`,
+`busy_timeout=5000`, and `synchronous=NORMAL`. All writes serialize through one
+mutex-guarded connection, and every read-modify-write runs inside one `BEGIN
+IMMEDIATE` transaction so a lifecycle change cannot be split by another process.
+No transaction is ever held across a user wait: approval-gated work persists the
+request, commits, and only then waits. The store takes neither the repository
+lock nor the catalog lock, and no caller may hold a store transaction while
+acquiring either, so the existing repository-before-catalog ordering is
+unchanged.
+
+Timestamps are RFC 3339 UTC written at fixed nanosecond precision so byte order
+and chronological order agree; run listing pages by `(created_at, id)` keyset and
+never by offset. No column holds more than 64 KiB of caller data — the inline
+threshold is a named constant, and oversized tool input or output is refused with
+a structured error rather than stored. Every stored row is rebuilt into its wire
+record and re-validated by the domain on load, so a hand-edited row fails to load
+instead of entering the process as an impossible record.
+
+A WAL database is three files. Backups must copy `runtime.db`, `runtime.db-wal`,
+and `runtime.db-shm` together, or checkpoint first and copy `runtime.db` alone.
 
 ## Commit & Pull Request Guidelines
 

@@ -19,6 +19,7 @@ pub use harkness_git::{
     Cancellation, GitError, GitService, GitStatus, InspectionSource, WorktreeBase,
 };
 pub use listing::{DirEntry, list_directory};
+pub use paths::data_directory;
 pub use project::{
     ProjectError, ProjectSelector, ProjectService, Worktree, WorktreeReconciliation,
     WorktreeReconciliationSkip,
