@@ -5,12 +5,17 @@
 //! re-earns its record type by passing the same lifecycle rules a freshly built
 //! record passes. A row edited outside Harkness therefore fails to load instead
 //! of entering the process as an impossible record.
+//!
+//! A row's `schema_version` is probed before any other column is decoded. A
+//! record written by a future build may spell a field in a way this one cannot
+//! parse, and the caller needs to be told to upgrade rather than told that some
+//! column looks corrupt.
 
 use rusqlite::{Connection, Row, named_params};
 
 use crate::domain::{
     RUNTIME_RECORD_SCHEMA_VERSION, Run, RunId, RunWire, Step, StepId, StepWire, Task, TaskId,
-    TaskWire, ToolCall, ToolCallId, ToolCallWire,
+    TaskWire, ToolCall, ToolCallId, ToolCallWire, validate_record_schema_version,
 };
 
 use super::column::{
@@ -18,7 +23,7 @@ use super::column::{
     decode_optional_timestamp, decode_ordinal, decode_owner_pid, decode_payload, decode_revision,
     decode_timestamp, decode_tool_call_state, encode_approvals, encode_failure,
     encode_optional_payload, encode_optional_timestamp, encode_path, encode_payload,
-    encode_revision, encode_timestamp,
+    encode_revision, encode_text, encode_timestamp, within_inline_limit,
 };
 use super::error::{Containment, StoreError, insert_failed, query_failed};
 
@@ -48,7 +53,7 @@ pub(super) fn insert_task(connection: &Connection, task: &Task) -> Result<(), St
             named_params! {
                 ":schema_version": RUNTIME_RECORD_SCHEMA_VERSION,
                 ":id": task.id().to_string(),
-                ":title": task.title(),
+                ":title": encode_text(TASK, "title", task.title())?,
                 ":workspace_root": encode_path(TASK, "workspace_root", task.workspace_root())?,
                 ":project_id": task.project_id().map(|id| id.to_string()),
                 ":created_at": encode_timestamp(TASK, "created_at", task.created_at())?,
@@ -89,8 +94,9 @@ pub(super) fn load_task(connection: &Connection, id: TaskId) -> Result<Task, Sto
 }
 
 fn task_wire(row: &Row<'_>) -> Result<TaskWire, StoreError> {
+    let schema_version = schema_version(row, TASK)?;
     Ok(TaskWire {
-        schema_version: schema_version(row, TASK)?,
+        schema_version,
         id: decode_id(TASK, "id", &text(row, TASK, "id")?)?,
         title: text(row, TASK, "title")?,
         workspace_root: text(row, TASK, "workspace_root")?.into(),
@@ -104,7 +110,7 @@ fn task_wire(row: &Row<'_>) -> Result<TaskWire, StoreError> {
 // -- runs -------------------------------------------------------------------
 
 pub(super) fn insert_run(connection: &Connection, run: &Run) -> Result<(), StoreError> {
-    let (failure_kind, failure_message) = encode_failure(run.failure());
+    let (failure_kind, failure_message) = encode_failure(RUN, run.failure())?;
     connection
         .execute(
             &format!(
@@ -143,7 +149,7 @@ pub(super) fn insert_run(connection: &Connection, run: &Run) -> Result<(), Store
 }
 
 pub(super) fn update_run(connection: &Connection, run: &Run) -> Result<(), StoreError> {
-    let (failure_kind, failure_message) = encode_failure(run.failure());
+    let (failure_kind, failure_message) = encode_failure(RUN, run.failure())?;
     let updated = connection
         .execute(
             "UPDATE runs SET state = :state, revision = :revision, updated_at = :updated_at, \
@@ -214,8 +220,9 @@ pub(super) fn run_from_wire(wire: RunWire) -> Result<Run, StoreError> {
 }
 
 pub(super) fn run_wire(row: &Row<'_>) -> Result<RunWire, StoreError> {
+    let schema_version = schema_version(row, RUN)?;
     Ok(RunWire {
-        schema_version: schema_version(row, RUN)?,
+        schema_version,
         id: decode_id(RUN, "id", &text(row, RUN, "id")?)?,
         task_id: decode_id(RUN, "task_id", &text(row, RUN, "task_id")?)?,
         state: decode_execution_state(RUN, &text(row, RUN, "state")?)?,
@@ -244,7 +251,7 @@ pub(super) fn run_wire(row: &Row<'_>) -> Result<RunWire, StoreError> {
 // -- steps ------------------------------------------------------------------
 
 pub(super) fn insert_step(connection: &Connection, step: &Step) -> Result<(), StoreError> {
-    let (failure_kind, failure_message) = encode_failure(step.failure());
+    let (failure_kind, failure_message) = encode_failure(STEP, step.failure())?;
     connection
         .execute(
             &format!(
@@ -257,7 +264,7 @@ pub(super) fn insert_step(connection: &Connection, step: &Step) -> Result<(), St
                 ":id": step.id().to_string(),
                 ":run_id": step.run_id().to_string(),
                 ":ordinal": step.ordinal(),
-                ":title": step.title(),
+                ":title": encode_text(STEP, "title", step.title())?,
                 ":state": step.state().as_str(),
                 ":revision": encode_revision(STEP, step.revision())?,
                 ":created_at": encode_timestamp(STEP, "created_at", step.created_at())?,
@@ -294,7 +301,7 @@ fn duplicate_ordinal(step: &Step, error: rusqlite::Error) -> StoreError {
 }
 
 pub(super) fn update_step(connection: &Connection, step: &Step) -> Result<(), StoreError> {
-    let (failure_kind, failure_message) = encode_failure(step.failure());
+    let (failure_kind, failure_message) = encode_failure(STEP, step.failure())?;
     let updated = connection
         .execute(
             "UPDATE steps SET state = :state, revision = :revision, updated_at = :updated_at, \
@@ -358,8 +365,9 @@ fn step_from_wire(wire: StepWire) -> Result<Step, StoreError> {
 }
 
 fn step_wire(row: &Row<'_>) -> Result<StepWire, StoreError> {
+    let schema_version = schema_version(row, STEP)?;
     Ok(StepWire {
-        schema_version: schema_version(row, STEP)?,
+        schema_version,
         id: decode_id(STEP, "id", &text(row, STEP, "id")?)?,
         run_id: decode_id(STEP, "run_id", &text(row, STEP, "run_id")?)?,
         ordinal: decode_ordinal(STEP, integer(row, STEP, "ordinal")?)?,
@@ -390,7 +398,7 @@ fn step_wire(row: &Row<'_>) -> Result<StepWire, StoreError> {
 // -- tool calls -------------------------------------------------------------
 
 pub(super) fn insert_tool_call(connection: &Connection, call: &ToolCall) -> Result<(), StoreError> {
-    let (failure_kind, failure_message) = encode_failure(call.failure());
+    let (failure_kind, failure_message) = encode_failure(TOOL_CALL, call.failure())?;
     connection
         .execute(
             &format!(
@@ -404,8 +412,8 @@ pub(super) fn insert_tool_call(connection: &Connection, call: &ToolCall) -> Resu
                 ":id": call.id().to_string(),
                 ":run_id": call.run_id().to_string(),
                 ":step_id": call.step_id().to_string(),
-                ":tool_id": call.tool_id(),
-                ":tool_version": call.tool_version(),
+                ":tool_id": encode_text(TOOL_CALL, "tool_id", call.tool_id())?,
+                ":tool_version": encode_text(TOOL_CALL, "tool_version", call.tool_version())?,
                 ":input_json": encode_payload(TOOL_CALL, "input", call.input())?,
                 ":output_json": encode_optional_payload(TOOL_CALL, "output", call.output())?,
                 ":state": call.state().as_str(),
@@ -434,7 +442,7 @@ pub(super) fn insert_tool_call(connection: &Connection, call: &ToolCall) -> Resu
 }
 
 pub(super) fn update_tool_call(connection: &Connection, call: &ToolCall) -> Result<(), StoreError> {
-    let (failure_kind, failure_message) = encode_failure(call.failure());
+    let (failure_kind, failure_message) = encode_failure(TOOL_CALL, call.failure())?;
     let updated = connection
         .execute(
             "UPDATE tool_calls SET state = :state, revision = :revision, \
@@ -506,8 +514,9 @@ fn tool_call_from_wire(wire: ToolCallWire) -> Result<ToolCall, StoreError> {
 }
 
 fn tool_call_wire(row: &Row<'_>) -> Result<ToolCallWire, StoreError> {
+    let schema_version = schema_version(row, TOOL_CALL)?;
     Ok(ToolCallWire {
-        schema_version: schema_version(row, TOOL_CALL)?,
+        schema_version,
         id: decode_id(TOOL_CALL, "id", &text(row, TOOL_CALL, "id")?)?,
         run_id: decode_id(TOOL_CALL, "run_id", &text(row, TOOL_CALL, "run_id")?)?,
         step_id: decode_id(TOOL_CALL, "step_id", &text(row, TOOL_CALL, "step_id")?)?,
@@ -552,17 +561,31 @@ fn tool_call_wire(row: &Row<'_>) -> Result<ToolCallWire, StoreError> {
 
 // -- shared column plumbing -------------------------------------------------
 
+/// Reads and validates a row's schema version before anything else is decoded.
 fn schema_version(row: &Row<'_>, record: &'static str) -> Result<u32, StoreError> {
     let stored = integer(row, record, "schema_version")?;
-    u32::try_from(stored).map_err(|_| StoreError::ColumnEncoding {
+    let found = u32::try_from(stored).map_err(|_| StoreError::ColumnEncoding {
         record,
         field: "schema_version",
         reason: format!("{stored} is not a representable schema version"),
-    })
+    })?;
+    validate_record_schema_version(record, found)
+        .map_err(|source| StoreError::InvalidRecord { record, source })?;
+    Ok(found)
 }
 
+/// Reads a text column and holds it to the bound its writer was held to.
+///
+/// The write side refuses oversized data, so an oversized column can only have
+/// arrived from outside Harkness. Reading it back would import exactly the
+/// memory and query cost the threshold exists to prevent, so the row is refused
+/// on the way in as well as on the way out.
 fn text(row: &Row<'_>, record: &'static str, field: &'static str) -> Result<String, StoreError> {
-    row.get(field).map_err(|error| column(record, field, error))
+    let stored: String = row
+        .get(field)
+        .map_err(|error| column(record, field, error))?;
+    within_inline_limit(record, field, stored.len())?;
+    Ok(stored)
 }
 
 fn optional_text(
@@ -570,7 +593,13 @@ fn optional_text(
     record: &'static str,
     field: &'static str,
 ) -> Result<Option<String>, StoreError> {
-    row.get(field).map_err(|error| column(record, field, error))
+    let stored: Option<String> = row
+        .get(field)
+        .map_err(|error| column(record, field, error))?;
+    if let Some(stored) = stored.as_deref() {
+        within_inline_limit(record, field, stored.len())?;
+    }
+    Ok(stored)
 }
 
 fn integer(row: &Row<'_>, record: &'static str, field: &'static str) -> Result<i64, StoreError> {

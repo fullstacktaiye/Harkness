@@ -12,7 +12,7 @@ use time::OffsetDateTime;
 
 use crate::domain::{Run, RunId};
 
-use super::column::{decode_id, decode_timestamp, encode_timestamp};
+use super::column::{decode_cursor_timestamp, decode_id, encode_timestamp};
 use super::error::{StoreError, query_failed};
 use super::repository::{RUN_COLUMNS, run_from_wire, run_wire};
 
@@ -28,6 +28,16 @@ pub const MAX_RUN_PAGE_LIMIT: usize = 500;
 /// callers, and it is versioned so an older token is refused explicitly rather
 /// than silently misread. Front ends serialize it into whatever transport token
 /// they already use, exactly as the Git log cursor is serialized today.
+///
+/// # A cursor is a position, not a claim that a row exists
+///
+/// Validity is structural and is settled at deserialization: a supported
+/// version, a parseable identifier, and a parseable timestamp normalized to
+/// UTC. The store deliberately does not verify that the anchor row is still
+/// present, because a keyset page addressing a pruned or deleted run must keep
+/// working — resuming from the position it names is the whole reason the token
+/// is a key rather than an offset. A caller that assembles its own coordinates
+/// gets the page that key selects.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct RunCursor {
@@ -71,7 +81,7 @@ impl<'de> Deserialize<'de> for RunCursor {
             )));
         }
         Ok(Self {
-            created_at: decode_timestamp("run_cursor", "created_at", &wire.created_at)
+            created_at: decode_cursor_timestamp("run_cursor", "created_at", &wire.created_at)
                 .map_err(D::Error::custom)?,
             id: decode_id("run_cursor", "id", &wire.id).map_err(D::Error::custom)?,
         })

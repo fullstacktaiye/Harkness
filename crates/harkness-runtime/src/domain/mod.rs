@@ -43,4 +43,5 @@ pub use state::{EXECUTION_TRANSITIONS, ExecutionState, TOOL_CALL_TRANSITIONS, To
 pub use wire::{
     MINIMUM_RUNTIME_RECORD_SCHEMA_VERSION, RUNTIME_RECORD_SCHEMA_VERSION, RunWire, RunWireRef,
     StepWire, StepWireRef, TaskWire, TaskWireRef, ToolCallWire, ToolCallWireRef,
+    validate_record_schema_version,
 };

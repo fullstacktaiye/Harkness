@@ -75,9 +75,13 @@ user_version` is probed before any statement runs, so a database written by a
 newer build produces an upgrade message rather than a corruption message, and
 the refusal happens before the connection requests WAL so the file it declined
 is left byte-identical. Migrations are numbered, applied in ascending order, and
-each shares one transaction with the `user_version` bump it establishes. Adding
-a table, a column, or a persisted spelling requires a new numbered migration and
-a frozen fixture database; never edit an already-released migration.
+each shares one `BEGIN IMMEDIATE` transaction with the `user_version` bump it
+establishes. That version is re-read under the write lock and the step is
+skipped if it moved, because a version read outside the lock only describes the
+past: two processes opening one new database would otherwise both replay the
+same `CREATE TABLE`. Adding a table, a column, or a persisted spelling requires
+a new numbered migration and a frozen fixture database; never edit an
+already-released migration.
 
 Every connection applies `journal_mode=WAL`, `foreign_keys=ON`,
 `busy_timeout=5000`, and `synchronous=NORMAL`. All writes serialize through one
@@ -91,14 +95,35 @@ unchanged.
 
 Timestamps are RFC 3339 UTC written at fixed nanosecond precision so byte order
 and chronological order agree; run listing pages by `(created_at, id)` keyset and
-never by offset. No column holds more than 64 KiB of caller data — the inline
-threshold is a named constant, and oversized tool input or output is refused with
-a structured error rather than stored. Every stored row is rebuilt into its wire
-record and re-validated by the domain on load, so a hand-edited row fails to load
-instead of entering the process as an impossible record.
+never by offset. That one spelling is the only one a stored row may hold: a
+column carrying another valid RFC 3339 form is refused on load, because a
+variable-width or offset-bearing timestamp does not fail, it just stops sorting
+chronologically. Encoding normalizes to UTC rather than trusting its caller. A
+continuation token is the one place that stays lenient — it has travelled
+through a front end's transport — so it accepts any RFC 3339 spelling and
+normalizes it to UTC before it becomes a key. A run cursor is a position, not a
+claim that a row exists: it is never validated against the anchor, so paging
+still works after a prune.
+
+No column holds more than 64 KiB of caller data — the inline threshold is a
+named constant, and it binds every caller-controlled column, not tool payloads
+alone: titles, workspace paths, tool identifiers, failure detail, and the
+approval history are each held to it in both directions, so a row that arrived
+from outside Harkness oversized also fails to load. A caller whose failure
+message exceeds the threshold is refused with the record left in its previous
+state and must summarize and retry; truncating silently would store something
+the caller never wrote. Every stored row is rebuilt into its wire record and
+re-validated by the domain on load, so a hand-edited row fails to load instead
+of entering the process as an impossible record, and its `schema_version` is
+probed before any other column is decoded so a future row reads as an upgrade
+request rather than as a corrupt column.
 
 A WAL database is three files. Backups must copy `runtime.db`, `runtime.db-wal`,
-and `runtime.db-shm` together, or checkpoint first and copy `runtime.db` alone.
+and `runtime.db-shm` together, or checkpoint first and copy `runtime.db` alone —
+and check that the checkpoint returned success. A checkpoint reports an
+incomplete fold in its result row instead of failing, so a reader on another
+connection can leave frames behind; the store reads that row and refuses rather
+than letting a backup be taken on a checkpoint that never finished.
 
 ## Commit & Pull Request Guidelines
 

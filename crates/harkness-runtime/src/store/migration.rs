@@ -7,8 +7,18 @@
 //! next one whole. A version above [`SCHEMA_VERSION`] is refused as an upgrade
 //! request rather than treated as corruption, exactly as the project catalog
 //! refuses a newer `projects.json`.
+//!
+//! # Two processes climbing the same ladder
+//!
+//! Reading `user_version` outside a write transaction only says what was true
+//! at the moment of the read. Two Harkness processes starting against the same
+//! new database both see version 0, and the second would replay a migration the
+//! first has already committed — `CREATE TABLE tasks` against a database that
+//! already has one. Each step therefore takes the write lock with `BEGIN
+//! IMMEDIATE` and re-reads `user_version` underneath it, treating a version that
+//! moved as another process's work rather than as a step still owed.
 
-use rusqlite::{Connection, Transaction};
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use super::error::{StoreError, query_failed};
 
@@ -54,18 +64,40 @@ pub(super) fn refuse_newer_schema(
 
 /// Applies every pending migration in ascending order.
 ///
-/// Each migration and its `user_version` bump share one transaction, so a
-/// crash between two migrations cannot leave a half-applied schema recorded as
-/// complete.
+/// Each migration and its `user_version` bump share one `BEGIN IMMEDIATE`
+/// transaction, so a crash between two migrations cannot leave a half-applied
+/// schema recorded as complete, and a concurrent migrator cannot slip a commit
+/// between the version this one read and the statements it runs.
+///
+/// The recorded version is re-derived after every step rather than iterated
+/// over a snapshot: a step another process landed first is simply no longer
+/// pending. The loop terminates because each turn either advances
+/// `user_version` or observes that someone else did.
 pub(super) fn apply(
     connection: &mut Connection,
     migrations: &[Migration],
 ) -> Result<(), StoreError> {
-    let found = recorded_version(connection)?;
-    for migration in migrations.iter().filter(|entry| entry.version > found) {
+    let maximum = migrations.last().map_or(0, |migration| migration.version);
+    loop {
+        let found = recorded_version(connection)?;
+        // A newer build may have climbed past this one's ladder while this
+        // process was opening. That is the same refusal `refuse_newer_schema`
+        // makes, arrived at a moment later.
+        if found > maximum {
+            return Err(StoreError::SchemaTooNew { found, maximum });
+        }
+        let Some(migration) = migrations.iter().find(|entry| entry.version > found) else {
+            return Ok(());
+        };
+
         let transaction = connection
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| query_failed("starting a migration", error))?;
+        if recorded_version(&transaction)? >= migration.version {
+            // Another process committed this step between the read above and
+            // the write lock. Roll back and re-derive what is still pending.
+            continue;
+        }
         apply_one(&transaction, migration)?;
         transaction
             .commit()
@@ -74,7 +106,6 @@ pub(super) fn apply(
                 source: error,
             })?;
     }
-    Ok(())
 }
 
 fn apply_one(transaction: &Transaction<'_>, migration: &Migration) -> Result<(), StoreError> {

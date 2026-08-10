@@ -37,6 +37,22 @@ pub enum StoreError {
         operation: &'static str,
     },
 
+    /// A checkpoint left frames in the write-ahead log.
+    ///
+    /// The database is intact; only the assumption that `runtime.db` now holds
+    /// every commit is not. Retry once the reader holding the log has finished,
+    /// or copy all three WAL files together instead.
+    #[error(
+        "the write-ahead log was not fully checkpointed: {checkpointed_frames} of {log_frames} frames were folded in; copy runtime.db, runtime.db-wal and runtime.db-shm together, or retry once other connections are idle"
+    )]
+    IncompleteCheckpoint {
+        /// Frames the log held when the checkpoint gave up, or `-1` when
+        /// another connection held the log outright.
+        log_frames: i64,
+        /// Frames actually folded into the database file.
+        checkpointed_frames: i64,
+    },
+
     /// The database was written by a newer build of Harkness.
     #[error(
         "run store schema version {found} is newer than the maximum supported version {maximum}; upgrade Harkness to read it"
@@ -143,10 +159,6 @@ pub enum StoreError {
         reason: String,
     },
 
-    /// A listing continuation token does not address this store.
-    #[error("the run listing cursor is not a valid Harkness run cursor")]
-    InvalidCursor,
-
     /// A page asked for no runs at all, or for more than one query may return.
     #[error("a run page of {limit} is outside the supported range 1..={maximum}")]
     InvalidPageLimit {
@@ -193,6 +205,7 @@ impl StoreError {
         "data_directory_unavailable",
         "store_open",
         "store_busy",
+        "incomplete_checkpoint",
         "schema_too_new",
         "migration_failed",
         "not_found",
@@ -204,7 +217,6 @@ impl StoreError {
         "invalid_transition",
         "invalid_record",
         "column_encoding",
-        "invalid_cursor",
         "invalid_page_limit",
         "query_failed",
     ];
@@ -216,6 +228,7 @@ impl StoreError {
             Self::DataDirectoryUnavailable => "data_directory_unavailable",
             Self::Open { .. } => "store_open",
             Self::Busy { .. } => "store_busy",
+            Self::IncompleteCheckpoint { .. } => "incomplete_checkpoint",
             Self::SchemaTooNew { .. } => "schema_too_new",
             Self::Migration { .. } => "migration_failed",
             Self::NotFound { .. } => "not_found",
@@ -227,7 +240,6 @@ impl StoreError {
             Self::InvalidTransition(_) => "invalid_transition",
             Self::InvalidRecord { .. } => "invalid_record",
             Self::ColumnEncoding { .. } => "column_encoding",
-            Self::InvalidCursor => "invalid_cursor",
             Self::InvalidPageLimit { .. } => "invalid_page_limit",
             Self::Query { .. } => "query_failed",
         }
@@ -334,6 +346,13 @@ mod tests {
                 "store_busy",
             ),
             (
+                StoreError::IncompleteCheckpoint {
+                    log_frames: 12,
+                    checkpointed_frames: 4,
+                },
+                "incomplete_checkpoint",
+            ),
+            (
                 StoreError::SchemaTooNew {
                     found: 2,
                     maximum: 1,
@@ -418,7 +437,6 @@ mod tests {
                 },
                 "column_encoding",
             ),
-            (StoreError::InvalidCursor, "invalid_cursor"),
             (
                 StoreError::InvalidPageLimit {
                     limit: 0,

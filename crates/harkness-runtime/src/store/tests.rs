@@ -3,14 +3,18 @@
 //! Every test opens its own database under a temporary directory, so nothing
 //! here can read or write the real Harkness data directory.
 
+use std::path::PathBuf;
+use std::process::Command;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+use time::{OffsetDateTime, UtcOffset};
 
 use crate::domain::{
     ExecutionState, Failure, Run, RunId, Step, StepId, Task, TaskId, ToolCall, ToolCallId,
@@ -18,7 +22,12 @@ use crate::domain::{
 };
 
 use super::migration::{MIGRATIONS, Migration, SCHEMA_VERSION, apply, recorded_version};
-use super::{DATABASE_FILE, MAX_INLINE_PAYLOAD_BYTES, RunPage, Store, guard};
+use super::{DATABASE_FILE, MAX_INLINE_PAYLOAD_BYTES, RunCursor, RunPage, Store, guard};
+
+/// Text one byte past the largest value any column will hold.
+fn oversized_text() -> String {
+    "a".repeat(MAX_INLINE_PAYLOAD_BYTES + 1)
+}
 
 /// The frozen v1 database committed beside this module.
 ///
@@ -212,6 +221,141 @@ fn a_newer_schema_is_refused_as_upgrade_and_leaves_the_file_untouched() {
     );
 }
 
+#[test]
+fn concurrent_opens_of_a_new_database_all_succeed() {
+    let data_dir = TempDir::new().unwrap();
+    let path = Arc::new(data_dir.path().to_path_buf());
+
+    // Every opener observes an unmigrated database and races to climb the
+    // ladder. Applying a migration on the strength of a version read outside
+    // the write lock replays `CREATE TABLE` against a database that already
+    // has one.
+    let openers = (0..8)
+        .map(|_| {
+            let path = Arc::clone(&path);
+            thread::spawn(move || Store::open(&path).map(|_| ()))
+        })
+        .collect::<Vec<_>>();
+
+    let failures = openers
+        .into_iter()
+        .filter_map(|opener| opener.join().unwrap().err())
+        .map(|error| format!("{}: {error}", error.kind()))
+        .collect::<Vec<_>>();
+    assert!(failures.is_empty(), "concurrent opens failed: {failures:?}");
+    assert_eq!(
+        recorded_version(&Connection::open(path.join(DATABASE_FILE)).unwrap()).unwrap(),
+        SCHEMA_VERSION
+    );
+}
+
+const CONCURRENT_OPEN_CHILD: &str = "store::tests::open_the_store_in_the_shared_data_dir";
+
+/// Re-entered as a child process by the cross-process migration test.
+#[test]
+#[ignore = "only run as a child process by the concurrent migration test"]
+fn open_the_store_in_the_shared_data_dir() {
+    let data_dir = std::env::var_os(CHILD_DATA_DIR_ENV)
+        .map(PathBuf::from)
+        .expect("child data directory was not set");
+
+    let store = Store::open(&data_dir).unwrap();
+
+    // Opening is not enough: the schema has to be usable, not merely recorded.
+    store.list_runs(RunPage::new(1)).unwrap();
+}
+
+#[test]
+fn independent_processes_migrate_a_new_database_exactly_once() {
+    let data_dir = TempDir::new().unwrap();
+    let path = data_dir.path().join(DATABASE_FILE);
+
+    // Holding the write lock over an empty database lets every child get as far
+    // as reading `user_version` 0 and then block requesting the lock, so they
+    // are all released into the migration at once holding the same stale
+    // answer. A fresh data directory produces that interleaving on its own;
+    // this only makes it reliable. A child that arrives late simply finds the
+    // work done, so the test cannot fail for being too slow.
+    let mut blocker = Connection::open(&path).unwrap();
+    blocker.pragma_update(None, "journal_mode", "WAL").unwrap();
+    let held = blocker
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+
+    let children = (0..4)
+        .map(|_| {
+            Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(CONCURRENT_OPEN_CHILD)
+                .arg("--ignored")
+                .env(CHILD_DATA_DIR_ENV, data_dir.path())
+                .spawn()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    thread::sleep(Duration::from_millis(500));
+    held.rollback().unwrap();
+    drop(blocker);
+
+    for mut child in children {
+        assert!(
+            child.wait().unwrap().success(),
+            "a concurrent opener failed to migrate the shared database"
+        );
+    }
+    assert_eq!(
+        recorded_version(&Connection::open(&path).unwrap()).unwrap(),
+        SCHEMA_VERSION
+    );
+}
+
+// -- checkpointing ----------------------------------------------------------
+
+#[test]
+fn a_successful_checkpoint_empties_the_write_ahead_log() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    drop(queued_run(&fixture.store, &task, 1));
+    let log = fixture.store.path().with_extension("db-wal");
+    assert!(log.metadata().unwrap().len() > 0, "nothing was logged");
+
+    fixture.store.checkpoint().unwrap();
+
+    assert_eq!(
+        log.metadata().unwrap().len(),
+        0,
+        "a checkpoint that reported success left frames in the log"
+    );
+}
+
+#[test]
+fn a_checkpoint_a_reader_prevents_is_refused_rather_than_reported_as_done() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    drop(queued_run(&fixture.store, &task, 1));
+
+    // A second connection parked in a read transaction pins the log. SQLite
+    // reports that in the checkpoint's result row instead of failing the
+    // statement, so a store that discarded the row would call this a backup.
+    // The wait costs the busy timeout, which is why this is the one slow test
+    // in the module.
+    let reader = Connection::open(fixture.store.path()).unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT count(*) FROM runs;")
+        .unwrap();
+
+    let error = fixture.store.checkpoint().unwrap_err();
+
+    assert_eq!(error.kind(), "incomplete_checkpoint");
+    assert!(
+        error.to_string().contains("runtime.db-wal"),
+        "the refusal should say how to take a correct backup anyway: {error}"
+    );
+
+    reader.execute_batch("COMMIT").unwrap();
+    fixture.store.checkpoint().unwrap();
+}
+
 // -- round trips ------------------------------------------------------------
 
 #[test]
@@ -392,6 +536,145 @@ fn an_oversized_tool_call_output_is_refused_and_leaves_the_call_running() {
 
     assert_eq!(error.kind(), "payload_too_large");
     assert_eq!(fixture.store.load_tool_call(call.id()).unwrap(), running);
+}
+
+#[test]
+fn an_oversized_task_title_is_refused_and_nothing_is_written() {
+    let fixture = Fixture::new();
+    let task = Task::new(oversized_text(), "/workspace/harkness", None, at(0));
+
+    let error = fixture.store.insert_task(&task).unwrap_err();
+
+    assert_eq!(error.kind(), "payload_too_large");
+    assert_eq!(
+        fixture.store.load_task(task.id()).unwrap_err().kind(),
+        "not_found"
+    );
+}
+
+#[test]
+fn an_oversized_workspace_path_is_refused() {
+    let fixture = Fixture::new();
+    let task = Task::new(
+        "Long workspace",
+        format!("/{}", oversized_text()),
+        None,
+        at(0),
+    );
+
+    let error = fixture.store.insert_task(&task).unwrap_err();
+
+    assert_eq!(error.kind(), "payload_too_large");
+}
+
+#[test]
+fn an_oversized_step_title_is_refused() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = Step::new(run.id(), 0, oversized_text(), at(2));
+
+    let error = fixture.store.insert_step(&step).unwrap_err();
+
+    assert_eq!(error.kind(), "payload_too_large");
+    assert!(fixture.store.load_run_steps(run.id()).unwrap().is_empty());
+}
+
+#[test]
+fn oversized_tool_metadata_is_refused() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = stored_step(&fixture.store, &run);
+
+    for call in [
+        ToolCall::new(&step, oversized_text(), "1.0.0", json!({}), at(4)),
+        ToolCall::new(&step, "fs.read", oversized_text(), json!({}), at(4)),
+    ] {
+        let error = fixture.store.insert_tool_call(&call).unwrap_err();
+        assert_eq!(error.kind(), "payload_too_large");
+    }
+    assert!(
+        fixture
+            .store
+            .load_run_tool_calls(run.id())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn an_oversized_failure_message_is_refused_and_leaves_the_run_as_it_was() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let running = fixture
+        .store
+        .transition_run(run.id(), ExecutionState::Running, at(10))
+        .unwrap();
+
+    let error = fixture
+        .store
+        .fail_run(
+            run.id(),
+            Failure::new("tool_failed", oversized_text()),
+            at(11),
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "payload_too_large");
+    // The caller has to summarize and retry, so the record must still be in a
+    // state a retry can transition out of.
+    assert_eq!(fixture.store.load_run(run.id()).unwrap(), running);
+    let failed = fixture
+        .store
+        .fail_run(run.id(), Failure::new("tool_failed", "summarized"), at(12))
+        .unwrap();
+    assert_eq!(failed.state(), ExecutionState::Failed);
+}
+
+#[test]
+fn an_oversized_approval_audit_record_is_refused_and_keeps_the_run_waiting() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    fixture
+        .store
+        .transition_run(run.id(), ExecutionState::Running, at(10))
+        .unwrap();
+    let waiting = fixture
+        .store
+        .transition_run(run.id(), ExecutionState::WaitingForApproval, at(11))
+        .unwrap();
+
+    // The approval history is the one column that grows with each write rather
+    // than arriving whole, so it is the one that could outgrow the threshold
+    // unnoticed.
+    let error = fixture
+        .store
+        .approve_run(run.id(), &oversized_text(), at(12))
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "payload_too_large");
+    assert_eq!(fixture.store.load_run(run.id()).unwrap(), waiting);
+}
+
+#[test]
+fn a_row_holding_more_than_a_column_may_hold_fails_to_load() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    // Only something outside Harkness can produce this row, and reading it back
+    // would import exactly the cost the threshold exists to prevent.
+    guard(&fixture.store.writer)
+        .execute(
+            "UPDATE tasks SET title = ?2 WHERE id = ?1",
+            rusqlite::params![task.id().to_string(), oversized_text()],
+        )
+        .unwrap();
+
+    let error = fixture.store.load_task(task.id()).unwrap_err();
+
+    assert_eq!(error.kind(), "payload_too_large");
 }
 
 // -- lifecycle --------------------------------------------------------------
@@ -686,6 +969,44 @@ fn a_page_outside_the_supported_range_is_refused() {
     }
 }
 
+#[test]
+fn a_cursor_token_spelled_with_an_offset_continues_from_the_same_place() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let runs = (1..=5)
+        .map(|offset| queued_run(&fixture.store, &task, offset))
+        .collect::<Vec<_>>();
+
+    let first = fixture.store.list_runs(RunPage::new(2)).unwrap();
+    let cursor = first.next_cursor.expect("a continuation should exist");
+    let canonical = fixture.store.list_runs(RunPage::after(cursor, 2)).unwrap();
+
+    // A front end serializes this token into its own transport and hands it
+    // back. Coming home spelled with an offset must not move the position it
+    // names: re-encoding the offset's own clock reading under a literal `Z`
+    // would silently skip every run in between.
+    let shifted: RunCursor = serde_json::from_str(&token_spelled_with_an_offset(&cursor)).unwrap();
+    let continued = fixture.store.list_runs(RunPage::after(shifted, 2)).unwrap();
+
+    assert_eq!(ids(&continued.runs), ids(&canonical.runs));
+    assert_eq!(
+        ids(&continued.runs),
+        vec![runs[2].id(), runs[1].id()],
+        "the continued page should be the third and fourth newest runs"
+    );
+}
+
+/// Re-spells a cursor's timestamp with a `-05:00` offset naming the same instant.
+fn token_spelled_with_an_offset(cursor: &RunCursor) -> String {
+    let mut token = serde_json::to_value(cursor).unwrap();
+    let canonical = token["created_at"].as_str().unwrap();
+    let shifted = OffsetDateTime::parse(canonical, &Rfc3339)
+        .unwrap()
+        .to_offset(UtcOffset::from_hms(-5, 0, 0).unwrap());
+    token["created_at"] = json!(shifted.format(&Rfc3339).unwrap());
+    token.to_string()
+}
+
 fn ids(runs: &[Run]) -> Vec<RunId> {
     runs.iter().map(Run::id).collect()
 }
@@ -728,6 +1049,30 @@ fn a_row_breaking_a_lifecycle_rule_fails_to_load() {
 }
 
 #[test]
+fn a_row_holding_a_noncanonical_timestamp_fails_to_load() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    // A real instant, spelled a way that sorts differently from the canonical
+    // form. Accepting it would not fail; the recency index would just stop
+    // agreeing with chronological order.
+    guard(&fixture.store.writer)
+        .execute(
+            "UPDATE runs SET created_at = '2026-08-10T12:34:56Z' WHERE id = ?1",
+            [run.id().to_string()],
+        )
+        .unwrap();
+
+    let error = fixture.store.load_run(run.id()).unwrap_err();
+
+    assert_eq!(error.kind(), "column_encoding");
+    assert!(
+        error.to_string().contains("YYYY-MM-DDThh:mm:ss.nnnnnnnnnZ"),
+        "the refusal should name the spelling the store writes: {error}"
+    );
+}
+
+#[test]
 fn a_row_from_a_newer_record_schema_fails_to_load_as_an_upgrade() {
     let fixture = Fixture::new();
     let task = stored_task(&fixture.store);
@@ -745,6 +1090,31 @@ fn a_row_from_a_newer_record_schema_fails_to_load_as_an_upgrade() {
     assert!(
         error.to_string().contains("upgrade Harkness"),
         "the refusal should read as an upgrade request: {error}"
+    );
+}
+
+#[test]
+fn a_future_row_is_an_upgrade_request_even_when_its_body_is_unreadable() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    // The reason a version is worth recording is that a future build may spell
+    // a column in a way this one cannot parse. That row has to read as "upgrade
+    // Harkness", not as a corrupt column, so the version is probed before
+    // anything else in the row is decoded.
+    guard(&fixture.store.writer)
+        .execute(
+            "UPDATE tasks SET schema_version = 99, created_at = 'a future spelling' \
+             WHERE id = ?1",
+            [task.id().to_string()],
+        )
+        .unwrap();
+
+    let error = fixture.store.load_task(task.id()).unwrap_err();
+
+    assert_eq!(error.kind(), "invalid_record");
+    assert!(
+        error.to_string().contains("upgrade Harkness"),
+        "an undecodable future row should still read as an upgrade request: {error}"
     );
 }
 

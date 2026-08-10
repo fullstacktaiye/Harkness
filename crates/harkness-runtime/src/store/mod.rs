@@ -18,7 +18,10 @@
 //! consistency is the guarantee this store makes, not power-loss durability.
 //!
 //! The schema version is probed before WAL is requested, so refusing a database
-//! written by a newer build leaves its bytes exactly as they were found.
+//! written by a newer build leaves its bytes exactly as they were found. Each
+//! migration then re-reads that version under its own write lock, so two
+//! processes opening the same new database climb one ladder instead of both
+//! replaying the same step.
 //!
 //! # Single writer, short transactions
 //!
@@ -42,19 +45,35 @@
 //!
 //! # Inline payload threshold
 //!
-//! No column holds more than [`MAX_INLINE_PAYLOAD_BYTES`] of caller data. Tool
-//! input and output above that are refused with
-//! [`StoreError::PayloadTooLarge`] naming the threshold, because a row is the
-//! wrong home for a large payload: it inflates every query that touches the
-//! table and defeats the page cache. Large content belongs in the artifact
-//! store instead.
+//! No column holds more than [`MAX_INLINE_PAYLOAD_BYTES`] of caller data, and
+//! the bound covers every caller-controlled column rather than tool payloads
+//! alone: titles, workspace paths, tool identifiers, failure detail, and the
+//! approval history are each held to it. A row is the wrong home for a large
+//! value whatever its column name — it inflates every query that touches the
+//! table and defeats the page cache — and a limit with exceptions is not a
+//! limit anyone can rely on. Oversized data is refused with
+//! [`StoreError::PayloadTooLarge`] naming the threshold; large content belongs
+//! in the artifact store instead.
+//!
+//! The refusal is symmetric: a row that arrived from outside Harkness holding
+//! more than the threshold fails to load, because reading it back would import
+//! the very cost the bound exists to prevent.
+//!
+//! One consequence is worth stating plainly. A caller recording a failure whose
+//! message exceeds the threshold is refused, and the record keeps its previous
+//! state; the caller must summarize the detail and retry. Truncating silently
+//! would store something the caller never wrote, and storing it whole would
+//! break the bound every other column keeps.
 //!
 //! # Backups
 //!
 //! A WAL database is three files: `runtime.db`, `runtime.db-wal`, and
 //! `runtime.db-shm`. Copying only `runtime.db` from a running Harkness loses
 //! every commit still in the log. Either copy all three, or call
-//! [`Store::checkpoint`] first and copy `runtime.db` alone.
+//! [`Store::checkpoint`] first and copy `runtime.db` alone — and check that it
+//! returned `Ok`, because a reader on another connection can leave frames
+//! behind, which is reported as [`StoreError::IncompleteCheckpoint`] rather
+//! than by failing the statement.
 
 mod column;
 mod error;
@@ -161,15 +180,37 @@ impl Store {
     /// Call this before copying `runtime.db` on its own; otherwise the copy is
     /// missing every commit still held in the log.
     ///
+    /// A checkpoint reports how far it got in a result row rather than by
+    /// failing: a reader on another connection can leave frames behind while
+    /// SQLite still returns success. Discarding that row would let a backup
+    /// procedure copy `runtime.db` alone on the strength of a checkpoint that
+    /// never finished, so the row is read and an incomplete fold is refused.
+    ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Busy`] when another connection holds the database
+    /// Returns [`StoreError::IncompleteCheckpoint`] when frames remain in the
+    /// log, and [`StoreError::Busy`] when another connection holds the database
     /// past the busy timeout.
     pub fn checkpoint(&self) -> Result<(), StoreError> {
         let writer = guard(&self.writer);
-        writer
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
-            .map_err(|error| error::query_failed("checkpointing the write-ahead log", error))
+        let (busy, log_frames, checkpointed_frames) = writer
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|error| error::query_failed("checkpointing the write-ahead log", error))?;
+        // A busy checkpoint reports -1 frames, so the counts are only
+        // meaningful once the busy flag is clear.
+        if busy != 0 || checkpointed_frames != log_frames {
+            return Err(StoreError::IncompleteCheckpoint {
+                log_frames,
+                checkpointed_frames,
+            });
+        }
+        Ok(())
     }
 
     // -- tasks --------------------------------------------------------------

@@ -540,6 +540,19 @@ impl TryFrom<ToolCallWire> for ToolCall {
     }
 }
 
+/// Refuses a record schema version this build cannot read.
+///
+/// Exposed so a persistence layer can probe a row's version before it decodes
+/// anything else. A future record may spell a field in a way this build cannot
+/// parse, and the caller should learn that it needs an upgrade rather than that
+/// some column looked corrupt.
+pub fn validate_record_schema_version(
+    record: &'static str,
+    found: u32,
+) -> Result<(), RunDomainError> {
+    validate_schema_version(record, found)
+}
+
 fn validate_schema_version(record: &'static str, found: u32) -> Result<(), RunDomainError> {
     if found < MINIMUM_RUNTIME_RECORD_SCHEMA_VERSION {
         return Err(RunDomainError::SchemaVersionTooOld {
