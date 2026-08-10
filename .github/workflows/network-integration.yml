@@ -73,6 +73,8 @@ jobs:
         run: cargo test --locked -p harkness-core
       - name: Test Git
         run: cargo test --locked -p harkness-git
+      - name: Test runtime
+        run: cargo test --locked -p harkness-runtime
       - name: Test shared fixtures
         run: cargo test --locked -p harkness-test-fixtures
       - name: Test CLI
