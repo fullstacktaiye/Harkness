@@ -7,7 +7,7 @@ Harkness is a Rust 2024 workspace split into six crates under `crates/`:
 - `harkness-core`: project catalog, storage layout, cross-domain project workflows, and directory-listing logic shared by front ends.
 - `harkness-git`: all production Git behavior: inspection, diffs and history, file context and hunk staging, branch and worktree mutation, commits, clone and synchronization, hermetic process execution, and repository locking.
 - `harkness-test-fixtures`: hermetic repository, filesystem, and process fixtures shared only by crate tests.
-- `harkness-runtime`: typed task, run, step, and tool-call records, the execution contracts shared by front ends, and the SQLite run store that makes those records durable.
+- `harkness-runtime`: typed task, run, step, and tool-call records, the typed tool contract and registry every executable operation implements, the execution contracts shared by front ends, and the SQLite run store that makes those records durable.
 - `harkness-cli`: the `harkness` command and its integration tests in `tests/`.
 - `harkness-gui`: the Qt 6/KDE Kirigami application. Rust/CXX-Qt bindings live in `src/` and `cxx/`; UI components live in `qml/`.
 
@@ -128,6 +128,136 @@ and check that the checkpoint returned success. A checkpoint reports an
 incomplete fold in its result row instead of failing, so a reader on another
 connection can leave frames behind; the store reads that row and refuses rather
 than letting a backup be taken on a checkpoint that never finished.
+
+## Tool Contract & Registry Invariants
+
+A tool identifier and version are part of the published contract, not internal
+names: they are persisted in `tool_calls.tool_id` and `tool_calls.tool_version`,
+enumerated by `harkness contract`, and bound into approval scopes. Identifiers
+use one narrow grammar — dot-separated lowercase ASCII segments, at least a
+namespace and a verb — and versions are parsed as semantic versions so "the
+latest version of an id" is decided by precedence rather than by string order.
+Renaming either is a breaking change for every record that named it.
+
+A registered `(id, version)` is immutable. The registry rejects a duplicate and
+offers no way to replace or remove a registration, because a recorded call and an
+approval both name a version and expect it to keep meaning what it meant.
+Publishing a change means registering a new version beside the old one.
+Descriptor enumeration is ordered by identifier and then by version precedence,
+so any projection built from it is diff-stable regardless of registration order.
+
+Build metadata is refused outright rather than accepted and ignored. The
+specification requires precedence to disregard it, but `semver::Version` derives
+`Eq` and `Ord` over it, so `1.0.0` and `1.0.0+hotfix` would be two registry keys
+that compare unequal while denoting one version: the duplicate guard would not
+fire, neither would look like a pre-release, and unversioned resolution would
+silently move onto the build-tagged one while an approval bound to the plain
+spelling still resolved to the original. An identity component the ordering must
+ignore has no coherent meaning here; publishing a fix means bumping the patch.
+
+Resolving without a version selects the highest *stable* version, falling back to
+a pre-release only when nothing stable is registered. Raw semver precedence puts
+`2.0.0-rc.1` above `1.10.0`, so an unfiltered "highest version" would mean that
+registering a release candidate silently redirects every caller that named no
+version — the documented default entry point — onto the candidate. Publishing a
+pre-release must never change what production runs.
+
+Both a tool id and a tool version are length-bounded, because both are persisted
+in adjacent `tool_calls` columns held to the store's 64 KiB inline limit. Semver
+places no limit on pre-release identifiers, so without the bound a version could
+register cleanly and then make every record of its own calls unpersistable.
+
+The same reasoning bounds everything a failure carries, and the bound belongs on
+the projection rather than on the variants. `ToolError::as_failure` is how a
+refusal gets recorded, so it clamps whatever it is handed; a message too large is
+refused by the store as `payload_too_large` and leaves the call stuck in `running`
+with nothing written about why it failed. Bounding variants alone leaves the
+invariant one new variant away from breaking — and there are more sources than the
+obvious one. A validator quotes the value it rejected. A JSON Pointer names the map
+keys it traverses, so a caller choosing a long key chooses the pointer's length. A
+tool flattening a `GitError` into `execution_failed` carries whatever stderr Git
+produced. A panic payload can quote the tool's own input. Every field of a
+`SchemaViolation` is truncated, its fields are private, and deserialization
+re-applies the bound, so no construction path yields an unbounded one.
+
+Cancellation is checked by the pipeline, not only by tools. `execute_json` gates
+on the token before validating and again before the body, so a tool dispatched
+after a cancel never starts even if it never polls. Stopping a call already in
+flight still depends on the tool polling `check_cancelled`.
+
+`ToolError::happened_before_execution` answers `true` for exactly one kind,
+`invalid_input`, because that is the only one the pipeline itself raises before
+calling the body. Do not widen it. `forbidden_path` in particular is raised by
+`ExecutionContext::resolve`, which tools call mid-body, so treating it as
+pre-execution would licence a retry that double-applies an earlier write.
+
+`#[non_exhaustive]` on an enum does not seal its variants, so a tool *can*
+construct `invalid_input` itself and return it after doing work. The erasure
+boundary therefore re-attributes a schema error raised by the body to
+`execution_failed`, keeping the detail in the message. Only the pipeline's own gate
+may produce a kind that promises nothing ran.
+
+`jsonschema` is built with `default-features = false`, which drops `resolve-http`
+and `resolve-file`. A test asserts each refusal *names the missing feature*, not
+merely that compilation failed — an unreachable host or a malformed file fails
+either way, so a weaker assertion would stay green if Cargo feature unification
+restored retrieval because some other workspace member depended on `jsonschema`
+with default features. Note that the draft meta-schemas ship inside the crate and
+resolve from its built-in registry; that is local resolution, not retrieval.
+
+`ErasedTool` is sealed: `erase` is the only way to produce one. Without the seal a
+hand-written implementation reachable through the public `register_erased` could
+publish a descriptor unrelated to what it deserializes and skip the cancellation
+gate, the panic boundary, and both validation gates, while `harkness contract`
+still advertised it as validated — every guarantee in this section would be on the
+honour system.
+
+Tool output is re-serialized through `serde_json::Value`, whose object map is a
+`BTreeMap`, so a delivered result has canonical key order whatever order the tool
+declares its fields in. Approval and provenance hashing depends on that stability.
+
+Schemas are generated from the `Input` and `Output` associated types and never
+declared by hand, so a published contract cannot disagree with the type the tool
+body deserializes. Any type appearing in an `Input` or `Output` therefore needs
+`JsonSchema` — including `ArtifactRef`, whose whole purpose is to be returned
+inside an output. They are compiled at registration: a schema that cannot be
+compiled is a refusal to declare the tool, not a surprise on the first call.
+`schemars` closes an object schema only for a type carrying
+`#[serde(deny_unknown_fields)]`, so every tool `Input` type must carry it —
+otherwise an agent's misspelled field is discarded silently instead of reported.
+
+Validation runs in both directions and the order carries the guarantees. Input is
+validated before the body runs, so a rejected input means nothing executed and a
+corrected retry is safe; it is also validated before policy evaluation, so policy
+classifies what will actually execute rather than an unparsed blob. Output is
+validated before delivery, so a consumer that trusted the published schema never
+receives a shape it cannot handle. Both gates locate findings with RFC 6901 JSON
+Pointers.
+
+Declared risk and capabilities are frozen in the descriptor. A tool cannot lower
+its declared risk for one call; whether a specific invocation is more dangerous
+than its level suggests is decided when that invocation is evaluated. `RiskLevel`
+has one definition and one total order — `observe < workspace_write < execute <
+network < remote_write < destructive` — because a policy comparison that means
+different things in different modules is not a policy.
+
+The tool body is the only foreign code in the pipeline and runs under
+`catch_unwind`; a panic becomes a structured `tool_panicked` error and leaves the
+registry and calling thread usable, so one buggy tool cannot orphan a run record.
+This relies on the workspace unwinding rather than aborting on panic; do not set
+`panic = "abort"` without replacing the containment. A contained panic ends that
+call rather than resuming it, and an abort is not a panic and is not contained.
+
+`ToolError`, `RegistryError`, and the other stable namespaces each own a `KINDS`
+table in declaration order with a round-trip test. Adding a variant requires
+adding its kind; the two namespaces must not collide, because `harkness contract`
+publishes their concatenation.
+
+The resolved `(id, version)` accompanies an invocation on both its success and its
+failure path, so a caller that asked for a tool without naming a version never has
+to resolve twice to learn what ran — and two lookups can disagree where one
+cannot. `InvocationError` therefore has no `From<ToolError>` conversion: building
+a tool failure requires naming the tool, so a `?` cannot produce one that forgot.
 
 ## Commit & Pull Request Guidelines
 

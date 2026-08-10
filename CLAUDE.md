@@ -44,7 +44,7 @@ build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing lin
 - **Fixture regeneration**: `cargo test -p harkness-runtime regenerate_the_frozen_v1_fixture --
   --ignored` rewrites `crates/harkness-runtime/src/store/fixtures/runtime-v1.db`. Run only when
   migration 1 itself changes; a released migration is otherwise never edited.
-- **Latency targets** (`store/tests.rs`): meaningful only under `--release`.
+- **Latency targets** (`store/tests.rs`, `tool/tests.rs`): meaningful only under `--release`.
 
 ### Frozen fixtures
 
@@ -60,10 +60,15 @@ an existing one.
 Dependencies flow strictly downward; nothing lower reaches back up.
 
 ```
-harkness-cli ──┐
-harkness-gui ──┴─> harkness-core ─> harkness-git
-                   harkness-runtime (domain -> store)
+harkness-cli ──┐                              ┌─> harkness-git
+harkness-gui ──┴─> harkness-core ─────────────┤
+                   harkness-runtime ──────────┘
+                   (domain | store | tool)
 ```
+
+`harkness-runtime` depends on `harkness-git` for one thing: `Cancellation`, which `tool`'s
+`ExecutionContext` carries so a tool that shells out to Git passes the same token down instead of
+translating between two cancellation mechanisms.
 
 - **`harkness-git`** owns *all* Git behavior and is addressed purely by filesystem path. It has no
   knowledge of the project catalog, which is the mechanism that makes the lock ordering below
@@ -72,9 +77,12 @@ harkness-gui ──┴─> harkness-core ─> harkness-git
 - **`harkness-core`** owns the project catalog (`projects.json` + `projects.lock`), the data
   directory layout, and cross-domain workflows (import, clone, worktree lifecycle, reconcile).
   `project.rs` is ~7k lines and holds `ProjectService`, the composition point for catalog + Git.
-- **`harkness-runtime`** is split into `domain` (pure records and lifecycle state machines, no I/O)
-  and `store` (SQLite persistence). Every row is rebuilt into its wire record and re-validated by
-  `domain` on load, so an impossible record cannot enter the process.
+- **`harkness-runtime`** is split into `domain` (pure records and lifecycle state machines, no I/O),
+  `store` (SQLite persistence), and `tool` (the typed tool contract and registry). Every row is
+  rebuilt into its wire record and re-validated by `domain` on load, so an impossible record cannot
+  enter the process. `domain::ToolCall` records *that* a tool ran; `tool` is what defines and
+  executes one. `store` and `tool` both build on `domain` but not on each other, so persistence and
+  execution can be reasoned about — and tested — separately.
 - **`harkness-test-fixtures`** is dev-only: hermetic temp repos, process fixtures, and the
   child-re-execution helpers. `COMMIT_EPOCH_SECONDS` is fixed so fixture repos hash identically.
 
@@ -139,6 +147,29 @@ transition tables (`EXECUTION_TRANSITIONS`, `TOOL_CALL_TRANSITIONS`). Constructo
 outcome-specific methods attach failure detail, tool output, or approval audit atomically with the
 transition. Serialization uses borrowing `*WireRef` types that must stay byte-compatible with their
 owned `*Wire` counterparts.
+
+### Runtime tool contract
+
+`tool/mod.rs` documents the whole layer; read it before adding a tool. The shape that is easy to get
+wrong: `Tool` declares *metadata*, never schemas. Schemas are generated from the `Input`/`Output`
+associated types by `schemars` in `erase()` and compiled into validators there, so a descriptor
+cannot publish a contract that disagrees with the type the body deserializes — and a broken schema
+fails registration rather than the first call. Give every `Input` type
+`#[serde(deny_unknown_fields)]`; that attribute is the only thing that closes the published schema.
+
+`ErasedTool::execute_json` is the fixed pipeline — validate input, deserialize, execute under
+`catch_unwind`, serialize, validate output — and each step's position is a guarantee, not a
+preference. `invoke()` is the entire entry point: registry + id + JSON + `ExecutionContext`, with no
+agent, policy engine, or database involved. `ExecutionContext` reuses `harkness_git::Cancellation`
+rather than introducing a second cancellation mechanism, and `ProgressEvent` is the typed
+generalization of the `impl FnMut(String)` callback Git verbs take.
+
+Three error namespaces meet here: `RegistryError` (declaring and resolving), `ToolError` (invoking),
+and `InvocationError` as their union — `InvocationError::kinds()` is what #99 publishes, so the two
+`KINDS` tables must not collide. `InvocationError::Tool` carries the resolved `ToolIdentity` beside
+the error, so a caller that named no version can still record `tool_calls.tool_version` for a failed
+row without re-resolving. That is also why there is no `From<ToolError> for InvocationError`: a `?`
+would silently drop the identity, so constructing the variant requires naming the tool.
 
 ## Data directory
 
