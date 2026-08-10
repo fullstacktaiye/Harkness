@@ -56,6 +56,14 @@ pub(crate) mod tests {
         let repository_root = fixture.path().join("token-bridge-repository");
         fs::create_dir_all(&repository_root).unwrap();
         let repository = Repository::init(&repository_root).unwrap();
+        // The bridge check commits for real, so the identity has to come from
+        // the repository rather than from whatever the developer running the
+        // suite happens to have configured globally.
+        let mut config = repository.config().unwrap();
+        config.set_str("user.name", "Harkness Tests").unwrap();
+        config.set_str("user.email", "tests@example.com").unwrap();
+        config.set_bool("commit.gpgsign", false).unwrap();
+        drop(config);
         let path = Path::new("bridge.txt");
         fs::write(repository_root.join(path), "before\n").unwrap();
         let mut index = repository.index().unwrap();
@@ -302,20 +310,8 @@ Kirigami.ApplicationWindow {
         : fixtureBackend.workingReviewCalls === 1
         && fixtureBackend.lastReviewStaged === false
         && fixtureBackend.lastReviewPath === "fixture-path"
-        && fixtureBackend.stageHunkCalls === 3
-        && fixtureBackend.unstageHunkCalls === 1
-        && fixtureBackend.stageLineCalls === 2
-        && fixtureBackend.lastLineIds === "review-line-old\nreview-line-new"
-        && fixtureBackend.lastHunkProject === String(projectFixture.id)
-        && fixtureBackend.lastHunkId === "review-hunk-fixture"
         && reviewFixture.splitLayout === true
         && pairedRowsDetected === true
-        && lineSelectionDetected === true
-        && rowToggleDetected === true
-        && offWindowSelectionDetected === true
-        && reviewFixture.restorePositionAfterMutation === false
-        && reviewFixture.heldReviewPathId === ""
-        && reviewFixture.heldReviewRowIndex === -1
         && reviewBusyDetected === true
         && mutationBusyDetected === true
         && operationBusyDetected === true
@@ -327,18 +323,9 @@ Kirigami.ApplicationWindow {
         && terminalHunkBoundaryDetected === true
         && largeModelDetected === true
         && deepScrollDetected === true
-        && nonzeroViewportAnchorDetected === true
-        && asyncRestored === true
-        && focusStealPrevented === true
         && realBridgePassed === true
         ? "GitPanelSmokePassed"
-        : "GitPanelSmokeFailed-" + fixtureBackend.stageHunkCalls
-            + "-" + fixtureBackend.unstageHunkCalls
-            + "-" + pairedRowsDetected
-            + "-" + lineSelectionDetected
-            + "-" + rowToggleDetected
-            + "-" + offWindowSelectionDetected
-            + "-" + fixtureBackend.stageLineCalls
+        : "GitPanelSmokeFailed-" + pairedRowsDetected
             + "-" + reviewBusyDetected
             + "-" + mutationBusyDetected
             + "-" + operationBusyDetected
@@ -353,12 +340,8 @@ Kirigami.ApplicationWindow {
             + "-" + reviewFixture.pendingHunkNavigation
             + "-" + largeModelDetected
             + "-" + deepScrollDetected
-            + "-" + nonzeroViewportAnchorDetected
-            + "-" + asyncRestored
-            + "-" + focusStealPrevented
-            + "-" + outsideFocus.activeFocus
             + "-" + reviewFixture.reviewCurrentIndex
-            + "-" + reviewFixture.restorePositionAfterMutation
+            + "-" + realBridgePhase
             + "-" + realBridgePassed
     visible: true
     width: screenshotPath.length > 0 ? 760 : 640
@@ -366,9 +349,6 @@ Kirigami.ApplicationWindow {
 
     property bool reviewBusyDetected: false
     property bool pairedRowsDetected: false
-    property bool lineSelectionDetected: false
-    property bool rowToggleDetected: false
-    property bool offWindowSelectionDetected: false
     property bool mutationBusyDetected: false
     property bool operationBusyDetected: false
     property bool fileBoundaryDetected: false
@@ -379,23 +359,13 @@ Kirigami.ApplicationWindow {
     property bool terminalHunkBoundaryDetected: false
     property bool largeModelDetected: false
     property bool deepScrollDetected: false
-    property bool nonzeroViewportAnchorDetected: false
-    property bool asyncRestored: false
-    property bool focusStealPrevented: false
     property bool screenshotSaved: false
-    property int restorationVerificationAttempts: 0
-    property int restorationVerificationStableTicks: 0
-    property int focusVerificationAttempts: 0
-    property int focusVerificationStableTicks: 0
     property bool fakePassed: false
     property bool realBridgePassed: false
     property int realBridgePhase: 0
     property string realProjectId: "__REAL_PROJECT_ID__"
     property string screenshotPath: "__SCREENSHOT_PATH__"
     property string realPathId: ""
-    property real capturedReviewContentY: 0
-    property real capturedReviewViewportOffset: 0
-    property real observedReviewViewportOffset: Number.NaN
 
     function finishIfReady() {
         if (fakePassed && realBridgePassed) {
@@ -453,12 +423,7 @@ Kirigami.ApplicationWindow {
             "hunkId": hunkId,
             "header": "@@ -%1,%2 +%3,%4 @@"
                 .arg(oldStart).arg(oldLines).arg(newStart).arg(newLines),
-            "degradation": "",
-            "action": "stage",
-            "oldStart": oldStart,
-            "oldLines": oldLines,
-            "newStart": newStart,
-            "newLines": newLines
+            "degradation": ""
         };
     }
 
@@ -470,26 +435,6 @@ Kirigami.ApplicationWindow {
                 : index === hunkIndex
                     ? hunkRow("review-hunk-fixture", 220, 2, 220, 2)
                     : contextRow(index + 1));
-        return rows;
-    }
-
-    function reviewRowsAfterMutation(targetIndex, start, lines) {
-        const rows = [];
-        for (let index = 0; index < 12005; ++index) {
-            if (index === 1) {
-                rows.push(hunkRow("pre-existing-hunk", 2, 1, 2, 1));
-            } else if (index === targetIndex) {
-                rows.push(hunkRow(
-                    "review-hunk-fixture",
-                    start,
-                    lines,
-                    start,
-                    lines
-                ));
-            } else {
-                rows.push(contextRow(index + 1));
-            }
-        }
         return rows;
     }
 
@@ -557,7 +502,6 @@ Kirigami.ApplicationWindow {
                 "pathId": current.file.pathId,
                 "summary": "",
                 "binary": false,
-                "lineAction": "stage",
                 "hunkCount": 1,
                 "totalRows": rows.length,
                 "rowOffset": 0,
@@ -588,8 +532,7 @@ Kirigami.ApplicationWindow {
     }
 
     function beginLargeModelSmoke() {
-        const initialRows = reviewRowsWithHunkAt(11000);
-        replaceReviewRows(initialRows);
+        replaceReviewRows(reviewRowsWithHunkAt(11000));
         largeModelDetected = reviewFixture.reviewRows.length > 12000;
         Qt.callLater(function() {
             reviewFixture.reviewCurrentIndex = -1;
@@ -597,42 +540,22 @@ Kirigami.ApplicationWindow {
             Qt.callLater(function() {
                 deepScrollDetected = reviewFixture.reviewContentY > 1000
                     && reviewFixture.reviewCurrentIndex === 11000;
-                reviewFixture.reviewContentY = Math.max(
-                    0,
-                    reviewFixture.reviewContentY - 300
-                );
-                capturedReviewViewportOffset = reviewFixture.currentReviewViewportOffset();
-                reviewFixture.activateCurrentHunkAction();
-                nonzeroViewportAnchorDetected = capturedReviewViewportOffset > 100
-                    && Math.abs(
-                        reviewFixture.heldReviewViewportOffset
-                            - capturedReviewViewportOffset
-                    ) < 1;
-                capturedReviewContentY = reviewFixture.heldReviewContentY;
+                // A commit is the one mutation this surface still has to wait
+                // out: navigation must be refused while the index is moving
+                // under the rows it would jump between.
                 fixtureBackend.jobs = [{
-                    "id": "job-stage-hunk",
-                    "kind": "stage_hunk",
+                    "id": "job-commit-navigation",
+                    "kind": "commit",
                     "projectId": String(projectFixture.id),
                     "lockScope": String(projectFixture.lockScope),
-                    "label": "Stage hunk",
+                    "label": "Commit",
                     "progress": "Starting...",
                     "cancellable": true
                 }];
                 navigationLockDetected = !reviewFixture.hunkNavigationEnabled();
-                replaceReviewRows(reviewRowsAfterMutation(11002, 218, 8));
-                fixtureBackend.jobs = [{
-                    "id": "job-review-refresh",
-                    "kind": "review",
-                    "projectId": String(projectFixture.id),
-                    "lockScope": String(projectFixture.lockScope),
-                    "label": "Load review",
-                    "progress": "Starting...",
-                    "cancellable": false
-                }];
-                Qt.callLater(function() {
-                    fixtureBackend.jobs = [];
-                    verifyRestoration.start();
-                });
+                fixtureBackend.jobs = [];
+                fakePassed = true;
+                finishIfReady();
             });
         });
     }
@@ -687,17 +610,19 @@ Kirigami.ApplicationWindow {
         });
     }
 
-    function actionableRealHunk(action) {
+    // The review has to have actually rendered a diff before the commit is
+    // worth making: it is what proves the real backend produced rows for the
+    // working-tree change the commit then records.
+    function realReviewHasHunk() {
         const review = realBackend.review;
         if (!review || review.loading === true || review.fileLoading === true
                 || !review.file || review.file.rows === undefined)
-            return null;
+            return false;
         for (let index = 0; index < review.file.rows.length; ++index) {
-            const row = review.file.rows[index];
-            if (row.type === "hunk" && row.action === action)
-                return row;
+            if (review.file.rows[index].type === "hunk")
+                return true;
         }
-        return null;
+        return false;
     }
 
     HarknessBackend {
@@ -716,38 +641,39 @@ Kirigami.ApplicationWindow {
         }
 
         function onGitChanged() {
-            if (realBridgePhase !== 1
-                    || String(realBackend.git.projectId || "") !== realProjectId
-                    || realBackend.git.entries === undefined
-                    || realBackend.git.entries.length === 0)
+            if (String(realBackend.git.projectId || "") !== realProjectId)
                 return;
-            realPathId = String(realBackend.git.entries[0].pathId || "");
-            if (realPathId.length === 0)
-                return;
-            realBridgePhase = 2;
-            realBackend.reviewWorkingChanges(realProjectId, false, realPathId);
-        }
-
-        function onReviewChanged() {
-            if (String(realBackend.review.projectId || "") !== realProjectId)
-                return;
-            if (realBridgePhase === 2) {
-                const stage = actionableRealHunk("stage");
-                if (!stage)
+            const entries = realBackend.git.entries === undefined
+                ? []
+                : realBackend.git.entries;
+            if (realBridgePhase === 1) {
+                if (entries.length === 0)
                     return;
-                realBridgePhase = 3;
-                realBackend.stageHunk(realProjectId, stage.hunkId);
+                realPathId = String(entries[0].pathId || "");
+                if (realPathId.length === 0)
+                    return;
+                realBridgePhase = 2;
+                realBackend.reviewWorkingChanges(realProjectId, false, realPathId);
             } else if (realBridgePhase === 3) {
-                const unstage = actionableRealHunk("unstage");
-                if (!unstage)
+                // The commit stages as it goes, so a clean working tree
+                // afterwards is the whole assertion: nothing was left behind
+                // for a second step to pick up.
+                if (entries.length !== 0
+                        || String(realBackend.git.error || "").length > 0)
                     return;
                 realBridgePhase = 4;
-                realBackend.unstageHunk(realProjectId, unstage.hunkId);
-            } else if (realBridgePhase === 4 && actionableRealHunk("stage")) {
-                realBridgePhase = 5;
                 realBridgePassed = true;
                 finishIfReady();
             }
+        }
+
+        function onReviewChanged() {
+            if (String(realBackend.review.projectId || "") !== realProjectId
+                    || realBridgePhase !== 2
+                    || !realReviewHasHunk())
+                return;
+            realBridgePhase = 3;
+            realBackend.commit(realProjectId, "bridge commit", false);
         }
     }
 
@@ -757,10 +683,7 @@ Kirigami.ApplicationWindow {
         property int workingReviewCalls: 0
         property bool lastReviewStaged: true
         property string lastReviewPath: ""
-        property int stageHunkCalls: 0
-        property int unstageHunkCalls: 0
-        property int stageLineCalls: 0
-        property int unstageLineCalls: 0
+        property int commitCalls: 0
         property int nextPageCalls: 0
         property int previousPageCalls: 0
         property int loadReviewFileCalls: 0
@@ -770,9 +693,6 @@ Kirigami.ApplicationWindow {
         property bool crossPageNavigationActive: false
         property int crossPagePage: 0
         property int crossPagePhase: 0
-        property string lastHunkProject: ""
-        property string lastHunkId: ""
-        property string lastLineIds: ""
 
         property var branches: [{
             "name": "topic",
@@ -869,7 +789,6 @@ Kirigami.ApplicationWindow {
                 "pathId": "fixture-review-path",
                 "summary": "",
                 "binary": false,
-                "lineAction": "stage",
                 "hunkCount": 1,
                 "rows": [{
                     "type": "collapsed",
@@ -880,19 +799,12 @@ Kirigami.ApplicationWindow {
                     "type": "hunk",
                     "hunkId": "review-hunk-fixture",
                     "header": "@@ -1 +1 @@",
-                    "degradation": "",
-                    "action": "stage",
-                    "oldStart": 1,
-                    "oldLines": 1,
-                    "newStart": 1,
-                    "newLines": 1
+                    "degradation": ""
                 }, {
                     "type": "line",
                     "hunkId": "review-hunk-fixture",
-                    "lineAction": "stage",
                     "splitHidden": false,
                     "unified": {
-                        "lineId": "review-line-old",
                         "oldLine": 1,
                         "newLine": 0,
                         "kind": "deletion",
@@ -903,7 +815,6 @@ Kirigami.ApplicationWindow {
                         }]
                     },
                     "old": {
-                        "lineId": "review-line-old",
                         "present": true,
                         "line": 1,
                         "kind": "deletion",
@@ -914,7 +825,6 @@ Kirigami.ApplicationWindow {
                         }]
                     },
                     "new": {
-                        "lineId": "review-line-new",
                         "present": true,
                         "line": 1,
                         "kind": "addition",
@@ -927,10 +837,8 @@ Kirigami.ApplicationWindow {
                 }, {
                     "type": "line",
                     "hunkId": "review-hunk-fixture",
-                    "lineAction": "stage",
                     "splitHidden": true,
                     "unified": {
-                        "lineId": "review-line-new",
                         "oldLine": 0,
                         "newLine": 1,
                         "kind": "addition",
@@ -1010,27 +918,9 @@ Kirigami.ApplicationWindow {
         function clearReview() {}
         function refreshBranches(projectId) {}
         function refreshWorktrees(projectId) {}
-        function stagePath(projectId, pathId) {}
-        function unstagePath(projectId, pathId) {}
-        function stageHunk(projectId, hunkId) {
-            ++stageHunkCalls;
-            lastHunkProject = String(projectId);
-            lastHunkId = String(hunkId);
+        function commit(projectId, message, amend) {
+            ++commitCalls;
         }
-        function unstageHunk(projectId, hunkId) {
-            ++unstageHunkCalls;
-            lastHunkProject = String(projectId);
-            lastHunkId = String(hunkId);
-        }
-        function stageLines(projectId, lineIds) {
-            ++stageLineCalls;
-            lastLineIds = String(lineIds);
-        }
-        function unstageLines(projectId, lineIds) {
-            ++unstageLineCalls;
-            lastLineIds = String(lineIds);
-        }
-        function commit(projectId, message, amend) {}
         function fetch(projectId) {}
         function pull(projectId) {}
         function push(projectId, allowDefaultBranch) {}
@@ -1092,106 +982,6 @@ Kirigami.ApplicationWindow {
         stateReady: true
     }
 
-    FocusScope {
-        id: outsideFocus
-
-        height: 1
-        width: 1
-        z: 100
-    }
-
-    Timer {
-        id: verifyRestoration
-
-        interval: 25
-        repeat: true
-        onTriggered: {
-            observedReviewViewportOffset = reviewFixture.currentReviewViewportOffset();
-            const settled = capturedReviewContentY > 0
-                && isFinite(observedReviewViewportOffset)
-                && Math.abs(
-                    observedReviewViewportOffset
-                        - capturedReviewViewportOffset
-                ) < 2
-                && reviewFixture.reviewCurrentIndex === 11002
-                && reviewFixture.reviewListHasActiveFocus
-                && reviewFixture.restorePositionAfterMutation === false;
-            ++restorationVerificationAttempts;
-            restorationVerificationStableTicks = settled
-                ? restorationVerificationStableTicks + 1
-                : 0;
-            if (restorationVerificationStableTicks < 3
-                    && restorationVerificationAttempts < 80)
-                return;
-            stop();
-            if (restorationVerificationStableTicks < 3) {
-                objectName = "GitPanelSmokeRestorationFailed-"
-                    + capturedReviewViewportOffset
-                    + "-" + observedReviewViewportOffset
-                    + "-" + reviewFixture.reviewListHasActiveFocus
-                    + "-" + reviewFixture.reviewCurrentIndex
-                    + "-" + reviewFixture.restorePositionAfterMutation;
-                smokeTimeout.stop();
-                Qt.quit();
-                return;
-            }
-            asyncRestored = true;
-            reviewFixture.reviewCurrentIndex = 1;
-            reviewFixture.navigateHunk(1);
-            reviewFixture.mutateHunk(fixtureBackend.review.file.rows[11002]);
-            fixtureBackend.jobs = [{
-                "id": "job-stage-hunk-focus",
-                "kind": "stage_hunk",
-                "projectId": String(projectFixture.id),
-                "lockScope": String(projectFixture.lockScope),
-                "label": "Stage hunk",
-                "progress": "Starting...",
-                "cancellable": true
-            }];
-            replaceReviewRows(reviewRowsAfterMutation(11004, 216, 12));
-            outsideFocus.forceActiveFocus();
-            fixtureBackend.jobs = [{
-                "id": "job-review-focus",
-                "kind": "review",
-                "projectId": String(projectFixture.id),
-                "lockScope": String(projectFixture.lockScope),
-                "label": "Load review",
-                "progress": "Starting...",
-                "cancellable": false
-            }];
-            Qt.callLater(function() {
-                fixtureBackend.jobs = [];
-                verifyFocus.start();
-            });
-        }
-    }
-
-    Timer {
-        id: verifyFocus
-
-        interval: 25
-        repeat: true
-        onTriggered: {
-            const settled = outsideFocus.activeFocus
-                && reviewFixture.reviewCurrentIndex === 11004
-                && reviewFixture.restorePositionAfterMutation === false;
-            ++focusVerificationAttempts;
-            focusVerificationStableTicks = settled
-                ? focusVerificationStableTicks + 1
-                : 0;
-            if (focusVerificationStableTicks >= 3) {
-                stop();
-                focusStealPrevented = true;
-                fakePassed = true;
-                finishIfReady();
-            } else if (focusVerificationAttempts >= 80) {
-                stop();
-                smokeTimeout.stop();
-                Qt.quit();
-            }
-        }
-    }
-
     Timer {
         id: smokeTimeout
 
@@ -1210,13 +1000,9 @@ Kirigami.ApplicationWindow {
         interval: 250
         repeat: false
         onTriggered: {
-            reviewFixture.toggleReviewLine("review-line-old", false);
-            reviewFixture.toggleReviewLine("review-line-new", true);
-            Qt.callLater(function() {
-                reviewFixture.grabToImage(function(result) {
-                    screenshotSaved = result.saveToFile(screenshotPath);
-                    Qt.quit();
-                });
+            reviewFixture.grabToImage(function(result) {
+                screenshotSaved = result.saveToFile(screenshotPath);
+                Qt.quit();
             });
         }
     }
@@ -1231,56 +1017,10 @@ Kirigami.ApplicationWindow {
         realBackend.openProject(realProjectId);
         changesFixture.selectPath("fixture-path", "added", "modified");
         fixtureBackend.jobs = [];
-        reviewFixture.toggleReviewLine("review-line-old", false);
-        reviewFixture.toggleReviewLine("review-line-new", true);
-        lineSelectionDetected = reviewFixture.selectedReviewLineCount === 2
-            && reviewFixture.isReviewLineSelected("review-line-old")
-            && reviewFixture.isReviewLineSelected("review-line-new");
 
-        // The row toggle behind both the delegate click and the Space key has
-        // to treat a split row's two sides as one control. Half-selecting the
-        // pair and pressing again must complete it, never invert it.
-        reviewFixture.setSplitLayout(true);
-        reviewFixture.clearReviewLineSelection();
-        reviewFixture.toggleReviewLine("review-line-old", false);
-        reviewFixture.setCurrentReviewRow(2);
-        const halfSelectedRowToggled = reviewFixture.toggleCurrentReviewLine(false);
-        rowToggleDetected = halfSelectedRowToggled
-            && reviewFixture.selectedReviewLineCount === 2
-            && reviewFixture.isReviewLineSelected("review-line-old")
-            && reviewFixture.isReviewLineSelected("review-line-new")
-            // A whole row toggles back off in one press.
-            && reviewFixture.toggleCurrentReviewLine(false)
-            && reviewFixture.selectedReviewLineCount === 0;
-        reviewFixture.setSplitLayout(false);
-
-        // The verb comes from the loaded file, so a selection whose rows have
-        // paged out of the window still resolves one.
-        reviewFixture.clearReviewLineSelection();
-        reviewFixture.toggleReviewLine("review-line-old", false);
-        const windowedRows = fixtureBackend.review.file.rows;
-        fixtureBackend.review = Object.assign({}, fixtureBackend.review, {
-            "file": Object.assign({}, fixtureBackend.review.file, { "rows": [] })
-        });
-        offWindowSelectionDetected = reviewFixture.selectedReviewLineCount === 1
-            && reviewFixture.selectedReviewLineAction() === "stage"
-            && reviewFixture.selectedReviewLineAnchorRow() === null;
-        // Staging must still be attempted with nothing left to anchor on.
-        const stagedBeforeOffWindow = fixtureBackend.stageLineCalls;
-        reviewFixture.mutateSelectedLines();
-        offWindowSelectionDetected = offWindowSelectionDetected
-            && fixtureBackend.stageLineCalls === stagedBeforeOffWindow + 1;
-        fixtureBackend.review = Object.assign({}, fixtureBackend.review, {
-            "file": Object.assign({}, fixtureBackend.review.file, {
-                "rows": windowedRows
-            })
-        });
-
-        reviewFixture.clearReviewLineSelection();
-        reviewFixture.toggleReviewLine("review-line-old", false);
-        reviewFixture.toggleReviewLine("review-line-new", true);
-        reviewFixture.mutateSelectedLines();
-        reviewFixture.mutateHunk(fixtureBackend.review.file.rows[1]);
+        // Side-by-side collapses a replacement's two unified rows into one, so
+        // the split view must display exactly one row fewer than the unified
+        // view of the same model.
         const unifiedFixtureRowCount = reviewFixture.displayedReviewRowCount();
         reviewFixture.setSplitLayout(true);
         pairedRowsDetected = unifiedFixtureRowCount
@@ -1289,10 +1029,6 @@ Kirigami.ApplicationWindow {
                 === unifiedFixtureRowCount - 1
             && fixtureBackend.review.file.rows[2].unified.kind === "deletion"
             && fixtureBackend.review.file.rows[3].unified.kind === "addition";
-        reviewFixture.mutateHunk({
-            "action": "unstage",
-            "hunkId": "review-hunk-fixture"
-        });
         const fileCallsBeforeBoundaryNavigation = fixtureBackend.loadReviewFileCalls;
         reviewFixture.navigateFile(-1);
         reviewFixture.navigateFile(1);
@@ -1409,16 +1145,36 @@ Kirigami.ApplicationWindow {
             interaction_name, expected_interaction_name,
             "GitPanel and ReviewSurface interaction check failed"
         );
-        let repository = Repository::open(&repository_root).unwrap();
-        let index = repository.index().unwrap();
-        let entry = index
-            .get_path(path, 0)
-            .expect("the real token bridge must restore the HEAD index entry");
-        assert_eq!(
-            repository.find_blob(entry.id).unwrap().content(),
-            b"before\n",
-            "the public stage/unstage bridge must round-trip the exact index bytes"
-        );
+        if screenshot_path.is_none() {
+            // The commit bridge was handed no staged content and no separate
+            // staging call: proving the working-tree bytes reached HEAD is
+            // what shows the commit staged them itself.
+            let repository = Repository::open(&repository_root).unwrap();
+            let committed = repository
+                .head()
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .tree()
+                .unwrap()
+                .get_path(path)
+                .expect("the commit bridge must record the changed path")
+                .to_object(&repository)
+                .unwrap();
+            assert_eq!(
+                committed.as_blob().unwrap().content(),
+                b"after\n",
+                "the public commit bridge must record the working-tree bytes exactly"
+            );
+            assert!(
+                repository
+                    .statuses(None)
+                    .unwrap()
+                    .iter()
+                    .all(|entry| entry.status().is_empty()),
+                "the commit must leave nothing behind for a second staging step"
+            );
+        }
         // The engine must be released before the application; dropping locals
         // in declaration order would do the opposite.
         drop(engine);

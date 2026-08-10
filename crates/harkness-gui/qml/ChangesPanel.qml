@@ -3,12 +3,14 @@ import QtQuick.Controls as Controls
 import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
 
-/// The "Changes" tab of the source-control view: what the index and working
-/// tree hold right now, and the diff each entry opens beside it.
+/// The "Changes" tab of the source-control view: what the working tree holds
+/// right now, and the diff each entry opens beside it.
 ///
-/// Everything here is about the uncommitted state. Anything that reaches the
-/// remote or switches what is checked out lives in the header toolbar, so this
-/// column stays a list the commit footer below it acts on.
+/// The list is a statement of what the commit footer below will record, not a
+/// set of controls. There is no staging step to perform here: committing takes
+/// the whole working tree, so a row has nothing to toggle. Anything that
+/// reaches the remote or switches what is checked out lives in the header
+/// toolbar.
 ColumnLayout {
     id: changes
 
@@ -37,14 +39,31 @@ ColumnLayout {
 
     function selectPath(pathId, staged, unstaged) {
         const selectedPathId = String(pathId);
-        // Prefer the working-tree side when both exist. The staged side stays
-        // one click away in the same review surface.
+        // The working tree is the side this view is about. The staged side is
+        // only ever reached for a path some other tool — the CLI, or a terminal
+        // — has already staged and not touched since, which is the one case
+        // where the working-tree diff would come back empty.
         backend.reviewWorkingChanges(
             project.id,
             String(unstaged || "").length === 0
                 && String(staged || "").length > 0,
             selectedPathId
         );
+    }
+
+    /// The single change description for a row.
+    ///
+    /// Which side of the index a change sits on is not a distinction this view
+    /// asks the user to act on, so the row reports the change itself and
+    /// prefers the working tree, which is what the next commit will record.
+    function changeSummary(entry) {
+        const states = [];
+        const change = String(entry.unstaged || "") || String(entry.staged || "");
+        if (change.length > 0)
+            states.push(change);
+        if (entry.conflicted)
+            states.push(qsTr("conflict"));
+        return states.join(" · ");
     }
 
     ColumnLayout {
@@ -118,23 +137,15 @@ ColumnLayout {
             textFormat: Text.PlainText
         }
 
-        // The whole-diff entry points: a single review of everything staged, or
-        // of everything still in the working tree, without picking a path.
+        // The whole-diff entry point: everything the next commit would record,
+        // without having to pick a path first.
         Controls.ToolButton {
-            Controls.ToolTip.text: qsTr("Review every staged change")
+            Controls.ToolTip.text: qsTr("Review every change in the working tree")
             Controls.ToolTip.visible: hovered
-            enabled: !changes.activity.repositoryMutationRunning()
+            enabled: changes.entries.length > 0
+                && !changes.activity.repositoryMutationRunning()
                 && !changes.activity.reviewReadRunning()
-            text: qsTr("Staged")
-            onClicked: changes.backend.reviewWorkingChanges(changes.project.id, true, "")
-        }
-
-        Controls.ToolButton {
-            Controls.ToolTip.text: qsTr("Review every unstaged change")
-            Controls.ToolTip.visible: hovered
-            enabled: !changes.activity.repositoryMutationRunning()
-                && !changes.activity.reviewReadRunning()
-            text: qsTr("Unstaged")
+            text: qsTr("Review all")
             onClicked: changes.backend.reviewWorkingChanges(changes.project.id, false, "")
         }
     }
@@ -185,48 +196,16 @@ ColumnLayout {
                     textFormat: Text.PlainText
                 }
 
-                RowLayout {
+                Controls.Label {
                     Layout.fillWidth: true
-
-                    Controls.Label {
-                        Layout.fillWidth: true
-                        color: entryDelegate.modelData.conflicted
-                            ? Kirigami.Theme.negativeTextColor
-                            : Kirigami.Theme.disabledTextColor
-                        elide: Text.ElideRight
-                        font: Kirigami.Theme.smallFont
-                        text: {
-                            const states = [];
-                            if (entryDelegate.modelData.staged)
-                                states.push(qsTr("staged: %1").arg(entryDelegate.modelData.staged));
-                            if (entryDelegate.modelData.unstaged)
-                                states.push(qsTr("working tree: %1").arg(entryDelegate.modelData.unstaged));
-                            if (entryDelegate.modelData.conflicted)
-                                states.push(qsTr("conflict"));
-                            return states.join(" · ");
-                        }
-                        textFormat: Text.PlainText
-                    }
-
-                    Controls.Button {
-                        enabled: !changes.activity.repositoryOperationRunning()
-                        text: qsTr("Unstage")
-                        visible: entryDelegate.modelData.staged.length > 0
-                        onClicked: changes.backend.unstagePath(
-                            changes.project.id,
-                            entryDelegate.modelData.pathId
-                        )
-                    }
-
-                    Controls.Button {
-                        enabled: !changes.activity.repositoryOperationRunning()
-                        text: qsTr("Stage")
-                        visible: entryDelegate.modelData.unstaged.length > 0
-                        onClicked: changes.backend.stagePath(
-                            changes.project.id,
-                            entryDelegate.modelData.pathId
-                        )
-                    }
+                    color: entryDelegate.modelData.conflicted
+                        ? Kirigami.Theme.negativeTextColor
+                        : Kirigami.Theme.disabledTextColor
+                    elide: Text.ElideRight
+                    font: Kirigami.Theme.smallFont
+                    text: changes.changeSummary(entryDelegate.modelData)
+                    textFormat: Text.PlainText
+                    visible: text.length > 0
                 }
             }
         }

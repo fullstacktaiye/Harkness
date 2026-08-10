@@ -36,42 +36,8 @@ ColumnLayout {
     )
     property alias reviewContentY: reviewLineView.contentY
     property alias reviewCurrentIndex: reviewLineView.currentIndex
-    readonly property bool reviewListHasActiveFocus: reviewLineView.activeFocus
     property bool splitLayout: false
-    property real heldReviewContentY: 0
-    property real heldReviewViewportOffset: 0
-    property string heldReviewPathId: ""
-    property string heldReviewProjectId: ""
-    property int heldReviewRowIndex: -1
-    property int heldReviewOldStart: 0
-    property int heldReviewOldLines: 0
-    property int heldReviewNewStart: 0
-    property int heldReviewNewLines: 0
-    property string heldReviewAction: ""
-    property bool heldReviewHadFocus: false
-    property bool heldRestorationScheduled: false
-    property int heldRestorationAttempts: 0
-    property int heldRestorationStableTicks: 0
-    property real heldRestorationLastDelegateY: Number.NaN
-    property real heldRestorationLastContentHeight: Number.NaN
-    readonly property int heldRestorationMaxAttempts: 80
-    property bool restorePositionAfterMutation: false
     property int pendingHunkNavigation: 0
-    property var selectedReviewLineIds: []
-    property string reviewLineSelectionAnchor: ""
-    readonly property int selectedReviewLineCount: selectedReviewLineIds.length
-    // Every changed-line delegate tests membership on every rebind, so the
-    // selection is kept as a lookup as well as an ordered list.
-    readonly property var selectedReviewLineIndex: {
-        const index = {};
-        for (let position = 0; position < selectedReviewLineIds.length; ++position)
-            index[selectedReviewLineIds[position]] = true;
-        return index;
-    }
-    readonly property string reviewLineSelectionScope: String(project.id)
-        + "|" + String(reviewState.title || "")
-        + "|" + String(reviewState.detail || "")
-        + "|" + String(reviewFile.fileId || "")
 
     spacing: Kirigami.Units.smallSpacing
 
@@ -97,154 +63,6 @@ ColumnLayout {
         if (kind === "deletion")
             return tint(Kirigami.Theme.negativeTextColor, 0.14);
         return "transparent";
-    }
-
-    function selectedLineColor(kind, lineId) {
-        return isReviewLineSelected(lineId)
-            ? tint(Kirigami.Theme.highlightColor, 0.32)
-            : lineColor(kind);
-    }
-
-    function isReviewLineSelected(lineId) {
-        const id = String(lineId || "");
-        return id.length > 0 && selectedReviewLineIndex[id] === true;
-    }
-
-    function reviewLineIds(row) {
-        const ids = [];
-        if (!row || row.type !== "line")
-            return ids;
-        if (!splitLayout) {
-            const unifiedId = String((row.unified || {}).lineId || "");
-            if (unifiedId.length > 0)
-                ids.push(unifiedId);
-            return ids;
-        }
-        const oldId = String((row.old || {}).lineId || "");
-        const newId = String((row.new || {}).lineId || "");
-        if (oldId.length > 0)
-            ids.push(oldId);
-        if (newId.length > 0 && ids.indexOf(newId) === -1)
-            ids.push(newId);
-        return ids;
-    }
-
-    // Range order is always the unified one: it lists every changed line of the
-    // window exactly once and in file order, which is what a split row's two
-    // sides collapse back to.
-    function orderedReviewLineIds() {
-        const ids = [];
-        for (let index = 0; index < reviewRows.length; ++index) {
-            const row = reviewRows[index];
-            if (row.type !== "line")
-                continue;
-            const id = String((row.unified || {}).lineId || "");
-            if (id.length > 0 && ids.indexOf(id) === -1)
-                ids.push(id);
-        }
-        return ids;
-    }
-
-    function setReviewLinesSelected(ids, select) {
-        if (repositoryOperationRunning())
-            return false;
-        let selected = selectedReviewLineIds.slice();
-        let changed = false;
-        let anchor = "";
-        for (let index = 0; index < ids.length; ++index) {
-            const id = String(ids[index] || "");
-            if (id.length === 0)
-                continue;
-            if (anchor.length === 0)
-                anchor = id;
-            const existing = selected.indexOf(id);
-            if (select && existing === -1) {
-                selected.push(id);
-                changed = true;
-            } else if (!select && existing !== -1) {
-                selected.splice(existing, 1);
-                changed = true;
-            }
-        }
-        if (!changed)
-            return false;
-        selectedReviewLineIds = selected;
-        reviewLineSelectionAnchor = anchor;
-        return true;
-    }
-
-    function toggleReviewLine(lineId, extendRange) {
-        const id = String(lineId || "");
-        if (id.length === 0 || repositoryOperationRunning())
-            return false;
-        if (extendRange === true && reviewLineSelectionAnchor.length > 0) {
-            const ordered = orderedReviewLineIds();
-            const anchorIndex = ordered.indexOf(reviewLineSelectionAnchor);
-            const selectedIndex = ordered.indexOf(id);
-            if (anchorIndex >= 0 && selectedIndex >= 0) {
-                let selected = selectedReviewLineIds.slice();
-                const first = Math.min(anchorIndex, selectedIndex);
-                const last = Math.max(anchorIndex, selectedIndex);
-                for (let index = first; index <= last; ++index) {
-                    if (selected.indexOf(ordered[index]) === -1)
-                        selected.push(ordered[index]);
-                }
-                selectedReviewLineIds = selected;
-                return true;
-            }
-        }
-        return setReviewLinesSelected([id], !isReviewLineSelected(id));
-    }
-
-    function toggleCurrentReviewLine(extendRange) {
-        if (reviewLineView.currentIndex < 0
-                || reviewLineView.currentIndex >= reviewRows.length)
-            return false;
-        const ids = reviewLineIds(reviewRows[reviewLineView.currentIndex]);
-        if (ids.length === 0)
-            return false;
-        if (extendRange === true && reviewLineSelectionAnchor.length > 0) {
-            let extended = false;
-            for (let index = 0; index < ids.length; ++index)
-                extended = toggleReviewLine(ids[index], true) || extended;
-            return extended;
-        }
-        // A split row carries both sides of a replacement. Toggling each side in
-        // turn would invert the pair whenever only one of them was selected, so
-        // the row acts as a single control: it selects unless already whole.
-        let whole = true;
-        for (let index = 0; index < ids.length && whole; ++index)
-            whole = isReviewLineSelected(ids[index]);
-        return setReviewLinesSelected(ids, !whole);
-    }
-
-    function clearReviewLineSelection() {
-        selectedReviewLineIds = [];
-        reviewLineSelectionAnchor = "";
-    }
-
-    // The verb belongs to the loaded file, not to any row: a selection outlives
-    // the row window, and scanning the visible rows for it used to hide the
-    // action button as soon as the selected line paged out of view.
-    function selectedReviewLineAction() {
-        return String(reviewFile.lineAction || "");
-    }
-
-    function selectedReviewLineAnchorRow() {
-        for (let index = 0; index < reviewRows.length; ++index) {
-            const row = reviewRows[index];
-            const ids = reviewLineIds(row);
-            for (let idIndex = 0; idIndex < ids.length; ++idIndex) {
-                if (isReviewLineSelected(ids[idIndex])) {
-                    // The hunk header carries the coordinates the refresh
-                    // anchors on, but a hunk taller than one row page can leave
-                    // it outside the window. The selected row is then the
-                    // closest anchor there is, and it is visible by definition.
-                    return reviewHunkRow(row.hunkId) || row;
-                }
-            }
-        }
-        return null;
     }
 
     function markerColor(kind) {
@@ -415,14 +233,6 @@ ColumnLayout {
         return count;
     }
 
-    // Moves the keyboard cursor, which is what the Space binding acts on.
-    function setCurrentReviewRow(index) {
-        if (index < 0 || index >= reviewRows.length)
-            return false;
-        reviewLineView.currentIndex = index;
-        return true;
-    }
-
     function loadReviewRowPage(direction, continueHunkNavigation) {
         if (continueHunkNavigation !== true)
             pendingHunkNavigation = 0;
@@ -434,9 +244,7 @@ ColumnLayout {
         Qt.callLater(function() {
             if (continueHunkNavigation === true && pendingHunkNavigation !== 0) {
                 const offset = pendingHunkNavigation;
-                if (repositoryMutationRunning()
-                        || reviewReadRunning()
-                        || restorePositionAfterMutation) {
+                if (repositoryMutationRunning() || reviewReadRunning()) {
                     pendingHunkNavigation = 0;
                     return;
                 }
@@ -466,93 +274,8 @@ ColumnLayout {
         });
     }
 
-    function reviewHunkRow(hunkId) {
-        for (let index = 0; index < reviewRows.length; ++index) {
-            const row = reviewRows[index];
-            if (row.type === "hunk"
-                    && String(row.hunkId || "") === String(hunkId || ""))
-                return row;
-        }
-        return null;
-    }
-
-    function holdReviewMutationPosition(row) {
-        heldReviewContentY = reviewLineView.contentY;
-        heldReviewViewportOffset = 0;
-        heldReviewPathId = String(reviewFile.pathId || "");
-        heldReviewProjectId = String(project.id);
-        heldReviewOldStart = Number(row.oldStart || 0);
-        heldReviewOldLines = Number(row.oldLines || 0);
-        heldReviewNewStart = Number(row.newStart || 0);
-        heldReviewNewLines = Number(row.newLines || 0);
-        heldReviewAction = String(row.action || "");
-        heldReviewHadFocus = reviewOwnsActiveFocus();
-        heldReviewRowIndex = -1;
-        for (let index = 0; index < reviewRows.length; ++index) {
-            if (reviewRows[index].type === "hunk"
-                    && String(reviewRows[index].hunkId || "") === String(row.hunkId || "")) {
-                heldReviewRowIndex = index;
-                const delegate = reviewLineView.itemAtIndex(index);
-                if (delegate)
-                    heldReviewViewportOffset = delegate.y - reviewLineView.contentY;
-                break;
-            }
-        }
-        heldRestorationAttempts = 0;
-        heldRestorationStableTicks = 0;
-        heldRestorationLastDelegateY = Number.NaN;
-        heldRestorationLastContentHeight = Number.NaN;
-        restorePositionAfterMutation = true;
-    }
-
-    function mutateHunk(row) {
-        if (!row || (row.action !== "stage" && row.action !== "unstage"))
-            return;
-        holdReviewMutationPosition(row);
-        if (row.action === "stage") {
-            backend.stageHunk(project.id, row.hunkId);
-        } else {
-            backend.unstageHunk(project.id, row.hunkId);
-        }
-        Qt.callLater(function() {
-            if (restorePositionAfterMutation
-                    && !repositoryMutationRunning()
-                    && !reviewReadRunning())
-                clearHeldPosition();
-        });
-    }
-
-    function mutateSelectedLines() {
-        const action = selectedReviewLineAction();
-        if (selectedReviewLineIds.length === 0
-                || (action !== "stage" && action !== "unstage"))
-            return;
-        // A selection can outlive the rows that produced it, leaving nothing on
-        // screen to anchor on. Only the scroll restoration depends on that; the
-        // mutation itself must still happen.
-        const anchorRow = selectedReviewLineAnchorRow();
-        if (anchorRow)
-            holdReviewMutationPosition(anchorRow);
-        const lineIds = selectedReviewLineIds.join("\n");
-        clearReviewLineSelection();
-        if (action === "stage")
-            backend.stageLines(project.id, lineIds);
-        else
-            backend.unstageLines(project.id, lineIds);
-        Qt.callLater(function() {
-            if (restorePositionAfterMutation
-                    && !repositoryMutationRunning()
-                    && !reviewReadRunning())
-                clearHeldPosition();
-        });
-    }
-
     function repositoryMutationRunning() {
-        return job("stage") !== null
-            || job("unstage") !== null
-            || job("stage_hunk") !== null
-            || job("unstage_hunk") !== null
-            || job("commit") !== null
+        return job("commit") !== null
             || job("fetch") !== null
             || job("pull") !== null
             || job("push") !== null
@@ -607,26 +330,7 @@ ColumnLayout {
     function hunkNavigationEnabled(offset) {
         return hunkNavigationAvailable(offset === undefined ? 1 : offset)
             && !repositoryMutationRunning()
-            && !reviewReadRunning()
-            && !restorePositionAfterMutation;
-    }
-
-    function clearHeldPosition() {
-        restorePositionAfterMutation = false;
-        heldReviewPathId = "";
-        heldReviewProjectId = "";
-        heldReviewRowIndex = -1;
-        heldReviewOldStart = 0;
-        heldReviewOldLines = 0;
-        heldReviewNewStart = 0;
-        heldReviewNewLines = 0;
-        heldReviewAction = "";
-        heldReviewHadFocus = false;
-        heldRestorationScheduled = false;
-        heldRestorationAttempts = 0;
-        heldRestorationStableTicks = 0;
-        heldRestorationLastDelegateY = Number.NaN;
-        heldRestorationLastContentHeight = Number.NaN;
+            && !reviewReadRunning();
     }
 
     function nearestHunkIndex(origin) {
@@ -644,66 +348,6 @@ ColumnLayout {
         return -1;
     }
 
-    function coordinateDistance(start, lines, anchorStart, anchorLines) {
-        const firstStart = Number(start || 0);
-        const secondStart = Number(anchorStart || 0);
-        const firstEnd = firstStart + Math.max(1, Number(lines || 0)) - 1;
-        const secondEnd = secondStart + Math.max(1, Number(anchorLines || 0)) - 1;
-        if (firstEnd >= secondStart && secondEnd >= firstStart)
-            return 0;
-        return firstEnd < secondStart
-            ? secondStart - firstEnd
-            : firstStart - secondEnd;
-    }
-
-    function semanticHunkIndex() {
-        if (heldReviewNewStart <= 0 && heldReviewOldStart <= 0)
-            return nearestHunkIndex(heldReviewRowIndex);
-        let bestIndex = -1;
-        let bestCoordinateDistance = Number.MAX_VALUE;
-        let bestSpanDistance = Number.MAX_VALUE;
-        let bestRowDistance = Number.MAX_VALUE;
-        for (let index = 0; index < reviewRows.length; ++index) {
-            const row = reviewRows[index];
-            if (row.type !== "hunk")
-                continue;
-            const destinationStart = heldReviewAction === "stage"
-                ? row.newStart
-                : row.oldStart;
-            const destinationLines = heldReviewAction === "stage"
-                ? row.newLines
-                : row.oldLines;
-            const sourceStart = heldReviewAction === "stage"
-                ? heldReviewOldStart
-                : heldReviewNewStart;
-            const sourceLines = heldReviewAction === "stage"
-                ? heldReviewOldLines
-                : heldReviewNewLines;
-            const distance = coordinateDistance(
-                destinationStart,
-                destinationLines,
-                sourceStart,
-                sourceLines
-            );
-            const spanDistance = Math.abs(
-                Number(destinationLines || 0) - Number(sourceLines || 0)
-            );
-            const rowDistance = Math.abs(index - heldReviewRowIndex);
-            if (distance < bestCoordinateDistance
-                    || (distance === bestCoordinateDistance
-                        && spanDistance < bestSpanDistance)
-                    || (distance === bestCoordinateDistance
-                        && spanDistance === bestSpanDistance
-                        && rowDistance < bestRowDistance)) {
-                bestIndex = index;
-                bestCoordinateDistance = distance;
-                bestSpanDistance = spanDistance;
-                bestRowDistance = rowDistance;
-            }
-        }
-        return bestCoordinateDistance === 0 ? bestIndex : -1;
-    }
-
     function focusIsInside(item, ancestor) {
         for (let candidate = item; candidate; candidate = candidate.parent) {
             if (candidate === ancestor)
@@ -715,148 +359,6 @@ ColumnLayout {
     function reviewOwnsActiveFocus() {
         const window = reviewLineView.Window.window;
         return window && focusIsInside(window.activeFocusItem, reviewLineView);
-    }
-
-    function mayRestoreReviewFocus() {
-        const window = reviewLineView.Window.window;
-        return !window || !window.activeFocusItem
-            || focusIsInside(window.activeFocusItem, reviewLineView);
-    }
-
-    function restoreHeldPosition() {
-        if (!restorePositionAfterMutation
-                || !reviewReady
-                || reviewState.loading === true
-                || reviewState.fileLoading === true
-                || repositoryMutationRunning()
-                || reviewReadRunning()
-                || heldRestorationScheduled)
-            return;
-        if (String(project.id) !== heldReviewProjectId
-                || String(reviewFile.pathId || "") !== heldReviewPathId) {
-            clearHeldPosition();
-            return;
-        }
-        heldRestorationScheduled = true;
-        Qt.callLater(function() {
-            reviewSurface.restoreHeldPositionStep();
-        });
-    }
-
-    function restoreHeldPositionStep() {
-        if (!restorePositionAfterMutation) {
-            heldRestorationScheduled = false;
-            return;
-        }
-        if (String(project.id) !== heldReviewProjectId
-                || String(reviewFile.pathId || "") !== heldReviewPathId) {
-            clearHeldPosition();
-            return;
-        }
-        if (reviewState.loading === true
-                || reviewState.fileLoading === true
-                || repositoryMutationRunning()
-                || reviewReadRunning()) {
-            heldRestorationScheduled = false;
-            heldRestorationStableTicks = 0;
-            return;
-        }
-
-        ++heldRestorationAttempts;
-        const focusIndex = semanticHunkIndex();
-        let delegate = null;
-        if (focusIndex >= 0) {
-            const indexChanged = reviewLineView.currentIndex !== focusIndex;
-            reviewLineView.currentIndex = focusIndex;
-            delegate = reviewLineView.itemAtIndex(focusIndex);
-            if (indexChanged || !delegate) {
-                reviewLineView.positionViewAtIndex(focusIndex, ListView.Contain);
-                reviewLineView.forceLayout();
-                delegate = reviewLineView.itemAtIndex(focusIndex);
-            }
-            if (!delegate) {
-                heldRestorationStableTicks = 0;
-                heldRestorationLastDelegateY = Number.NaN;
-                heldRestorationLastContentHeight = reviewLineView.contentHeight;
-                if (heldRestorationAttempts >= heldRestorationMaxAttempts) {
-                    clearHeldPosition();
-                } else {
-                    Qt.callLater(function() {
-                        reviewSurface.restoreHeldPositionStep();
-                    });
-                }
-                return;
-            }
-        }
-
-        reviewLineView.forceLayout();
-        if (focusIndex >= 0)
-            delegate = reviewLineView.itemAtIndex(focusIndex);
-        if (focusIndex >= 0 && !delegate) {
-            heldRestorationStableTicks = 0;
-            heldRestorationLastDelegateY = Number.NaN;
-            heldRestorationLastContentHeight = reviewLineView.contentHeight;
-            if (heldRestorationAttempts >= heldRestorationMaxAttempts) {
-                clearHeldPosition();
-            } else {
-                Qt.callLater(function() {
-                    reviewSurface.restoreHeldPositionStep();
-                });
-            }
-            return;
-        }
-        const maximum = Math.max(
-            0,
-            reviewLineView.contentHeight - reviewLineView.height
-        );
-        const desiredPosition = Math.max(
-            0,
-            Math.min(
-                delegate
-                    ? delegate.y - heldReviewViewportOffset
-                    : heldReviewContentY,
-                maximum
-            )
-        );
-        const positionStable = Math.abs(
-            reviewLineView.contentY - desiredPosition
-        ) < 1;
-        const heightStable = isFinite(heldRestorationLastContentHeight)
-            && Math.abs(
-                reviewLineView.contentHeight
-                    - heldRestorationLastContentHeight
-            ) < 1;
-        const delegateStable = !delegate
-            || (isFinite(heldRestorationLastDelegateY)
-                && Math.abs(delegate.y - heldRestorationLastDelegateY) < 1);
-        if (!positionStable)
-            reviewLineView.contentY = desiredPosition;
-
-        const viewportStable = positionStable
-            && heightStable
-            && delegateStable
-            && (focusIndex < 0
-                || reviewLineView.currentIndex === focusIndex);
-        const focusMayBeRestored = heldReviewHadFocus
-            && mayRestoreReviewFocus();
-        if (viewportStable && focusMayBeRestored)
-            reviewLineView.forceActiveFocus();
-        const focusStable = !focusMayBeRestored
-            || reviewLineView.activeFocus;
-        heldRestorationStableTicks = viewportStable && focusStable
-            ? heldRestorationStableTicks + 1
-            : 0;
-        heldRestorationLastDelegateY = delegate ? delegate.y : Number.NaN;
-        heldRestorationLastContentHeight = reviewLineView.contentHeight;
-
-        if (heldRestorationStableTicks >= 3
-                || heldRestorationAttempts >= heldRestorationMaxAttempts) {
-            clearHeldPosition();
-            return;
-        }
-        Qt.callLater(function() {
-            reviewSurface.restoreHeldPositionStep();
-        });
     }
 
     function selectedFileIndex() {
@@ -970,41 +472,7 @@ ColumnLayout {
         continueNavigateHunk(offset, index);
     }
 
-    function activateCurrentHunkAction() {
-        const loader = reviewLineView.itemAtIndex(reviewLineView.currentIndex);
-        const button = loader && loader.item ? loader.item.actionButton : null;
-        if (!button || !button.visible || !button.enabled)
-            return false;
-        button.forceActiveFocus();
-        button.click();
-        return true;
-    }
-
-    function currentReviewViewportOffset() {
-        const delegate = reviewLineView.itemAtIndex(reviewLineView.currentIndex);
-        return delegate ? delegate.y - reviewLineView.contentY : Number.NaN;
-    }
-
-    onProjectChanged: {
-        pendingHunkNavigation = 0;
-        clearReviewLineSelection();
-        clearHeldPosition();
-    }
-    onReviewLineSelectionScopeChanged: clearReviewLineSelection()
-    onReviewStateChanged: restoreHeldPosition()
-
-    Connections {
-        target: reviewSurface.backend
-
-        function onJobsChanged() {
-            // A mutation job is replaced by a review-refresh job in the same
-            // backend callback. Re-check on the next turn so the transient gap
-            // cannot consume the held scroll position.
-            Qt.callLater(function() {
-                reviewSurface.restoreHeldPosition();
-            });
-        }
-    }
+    onProjectChanged: pendingHunkNavigation = 0
 
     Shortcut {
         enabled: reviewSurface.reviewReady
@@ -1320,39 +788,6 @@ ColumnLayout {
                             onClicked: reviewSurface.navigateHunk(1)
                         }
 
-                        Controls.Button {
-                            readonly property string lineAction: reviewSurface.selectedReviewLineAction()
-
-                            Accessible.name: text
-                            enabled: reviewSurface.selectedReviewLineCount > 0
-                                && !reviewSurface.repositoryOperationRunning()
-                            icon.name: lineAction === "stage"
-                                ? "list-add"
-                                : "edit-undo"
-                            text: lineAction === "stage"
-                                ? qsTr("Stage %1 selected line(s)").arg(
-                                    reviewSurface.selectedReviewLineCount
-                                )
-                                : qsTr("Unstage %1 selected line(s)").arg(
-                                    reviewSurface.selectedReviewLineCount
-                                )
-                            visible: reviewSurface.selectedReviewLineCount > 0
-                                && (lineAction === "stage" || lineAction === "unstage")
-                            onClicked: reviewSurface.mutateSelectedLines()
-                        }
-
-                        Controls.ToolButton {
-                            Accessible.name: text
-                            Controls.ToolTip.text: text
-                            Controls.ToolTip.visible: hovered
-                            display: Controls.AbstractButton.IconOnly
-                            enabled: reviewSurface.selectedReviewLineCount > 0
-                            icon.name: "edit-clear"
-                            text: qsTr("Clear selected lines")
-                            visible: reviewSurface.selectedReviewLineCount > 0
-                            onClicked: reviewSurface.clearReviewLineSelection()
-                        }
-
                         Item {
                             Layout.fillWidth: true
                         }
@@ -1424,15 +859,6 @@ ColumnLayout {
                         reuseItems: true
                         visible: reviewSurface.reviewRows.length > 0
 
-                        Keys.onPressed: function(event) {
-                            if (event.key === Qt.Key_Space
-                                    && reviewSurface.toggleCurrentReviewLine(
-                                        (event.modifiers & Qt.ShiftModifier) !== 0
-                                    )) {
-                                event.accepted = true;
-                            }
-                        }
-
                         delegate: Loader {
                             id: reviewRowLoader
 
@@ -1485,7 +911,6 @@ ColumnLayout {
 
             property var row: ({})
             property int rowIndex: -1
-            property alias actionButton: reviewHunkAction
 
             Accessible.name: qsTr("Diff hunk %1").arg(row.header || "")
             Accessible.role: Accessible.ListItem
@@ -1506,29 +931,13 @@ ColumnLayout {
             contentItem: ColumnLayout {
                 spacing: Kirigami.Units.smallSpacing
 
-                RowLayout {
+                Controls.Label {
                     Layout.fillWidth: true
-
-                    Controls.Label {
-                        Layout.fillWidth: true
-                        color: Kirigami.Theme.highlightColor
-                        font.family: "monospace"
-                        text: reviewHunk.row.header || ""
-                        textFormat: Text.PlainText
-                        wrapMode: Text.WrapAnywhere
-                    }
-
-                    Controls.Button {
-                        id: reviewHunkAction
-
-                        enabled: !reviewSurface.repositoryOperationRunning()
-                        text: reviewHunk.row.action === "stage"
-                            ? qsTr("Stage hunk")
-                            : qsTr("Unstage hunk")
-                        visible: reviewHunk.row.action === "stage"
-                            || reviewHunk.row.action === "unstage"
-                        onClicked: reviewSurface.mutateHunk(reviewHunk.row)
-                    }
+                    color: Kirigami.Theme.highlightColor
+                    font.family: "monospace"
+                    text: reviewHunk.row.header || ""
+                    textFormat: Text.PlainText
+                    wrapMode: Text.WrapAnywhere
                 }
 
                 Controls.Label {
@@ -1616,10 +1025,7 @@ ColumnLayout {
 
                 anchors.left: parent.left
                 anchors.right: parent.right
-                color: reviewSurface.selectedLineColor(
-                    reviewLineDelegate.unified.kind,
-                    reviewLineDelegate.unified.lineId
-                )
+                color: reviewSurface.lineColor(reviewLineDelegate.unified.kind)
                 implicitHeight: unifiedLayout.implicitHeight + Kirigami.Units.smallSpacing
                 visible: !reviewSurface.splitLayout
 
@@ -1669,31 +1075,6 @@ ColumnLayout {
                     }
                 }
 
-                MouseArea {
-                    anchors.fill: parent
-                    Accessible.checked: reviewSurface.isReviewLineSelected(
-                        reviewLineDelegate.unified.lineId
-                    )
-                    Accessible.name: reviewLineDelegate.unified.kind === "deletion"
-                        ? qsTr("Select removed line %1").arg(
-                            reviewLineDelegate.unified.oldLine
-                        )
-                        : qsTr("Select added line %1").arg(
-                            reviewLineDelegate.unified.newLine
-                        )
-                    Accessible.role: Accessible.CheckBox
-                    cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
-                    enabled: String(reviewLineDelegate.unified.lineId || "").length > 0
-                        && !reviewSurface.repositoryOperationRunning()
-                    onClicked: function(mouse) {
-                        reviewLineView.currentIndex = reviewLineDelegate.rowIndex;
-                        reviewLineView.forceActiveFocus();
-                        reviewSurface.toggleReviewLine(
-                            reviewLineDelegate.unified.lineId,
-                            (mouse.modifiers & Qt.ShiftModifier) !== 0
-                        );
-                    }
-                }
             }
 
             RowLayout {
@@ -1715,11 +1096,9 @@ ColumnLayout {
 
                         required property var modelData
 
-                        readonly property string lineId: String(modelData.lineId || "")
-
                         Layout.fillWidth: true
                         color: modelData.present === true
-                            ? reviewSurface.selectedLineColor(modelData.kind, lineId)
+                            ? reviewSurface.lineColor(modelData.kind)
                             : reviewSurface.tint(Kirigami.Theme.disabledTextColor, 0.04)
                         implicitHeight: splitSideLayout.implicitHeight
                             + Kirigami.Units.smallSpacing
@@ -1771,31 +1150,6 @@ ColumnLayout {
                             }
                         }
 
-                        MouseArea {
-                            anchors.fill: parent
-                            Accessible.checked: reviewSurface.isReviewLineSelected(
-                                splitSide.lineId
-                            )
-                            Accessible.name: splitSide.modelData.kind === "deletion"
-                                ? qsTr("Select removed line %1").arg(
-                                    splitSide.modelData.line || ""
-                                )
-                                : qsTr("Select added line %1").arg(
-                                    splitSide.modelData.line || ""
-                                )
-                            Accessible.role: Accessible.CheckBox
-                            cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
-                            enabled: splitSide.lineId.length > 0
-                                && !reviewSurface.repositoryOperationRunning()
-                            onClicked: function(mouse) {
-                                reviewLineView.currentIndex = reviewLineDelegate.rowIndex;
-                                reviewLineView.forceActiveFocus();
-                                reviewSurface.toggleReviewLine(
-                                    splitSide.lineId,
-                                    (mouse.modifiers & Qt.ShiftModifier) !== 0
-                                );
-                            }
-                        }
                     }
                 }
             }

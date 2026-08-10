@@ -76,10 +76,14 @@ Item {
         return description.length > 0 ? summary + "\n\n" + description : summary;
     }
 
+    /// A commit records the whole working tree, so there is nothing to commit
+    /// when nothing has changed — the backend would refuse it, and offering the
+    /// button anyway would make the refusal the only way to find that out.
     function commitAllowed() {
         return gitActivity.job("commit") === null
             && gitActivity.job("push") === null
             && !gitActivity.repositoryOperationRunning()
+            && entries.length > 0
             && commitSummary.text.trim().length > 0;
     }
 
@@ -270,13 +274,23 @@ Item {
                                     )
                                 }
 
+                                // The count is on the button because the button
+                                // is what decides it: every changed file goes
+                                // in, so the number says exactly what pressing
+                                // this will record.
                                 Controls.Button {
+                                    readonly property string destination: gitActivity.currentBranch.length > 0
+                                        ? gitActivity.currentBranch
+                                        : qsTr("detached HEAD")
+
                                     Layout.fillWidth: true
                                     enabled: panel.commitAllowed()
                                     highlighted: true
-                                    text: gitActivity.currentBranch.length > 0
-                                        ? qsTr("Commit to %1").arg(gitActivity.currentBranch)
-                                        : qsTr("Commit to detached HEAD")
+                                    text: panel.entries.length === 1
+                                        ? qsTr("Commit 1 file to %1").arg(destination)
+                                        : qsTr("Commit %1 files to %2")
+                                            .arg(panel.entries.length)
+                                            .arg(destination)
                                     onClicked: panel.backend.commit(
                                         panel.project.id,
                                         panel.composedCommitMessage(),

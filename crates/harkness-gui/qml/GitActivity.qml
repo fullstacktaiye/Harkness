@@ -68,11 +68,7 @@ QtObject {
     }
 
     function repositoryMutationRunning() {
-        return job("stage") !== null
-            || job("unstage") !== null
-            || job("stage_hunk") !== null
-            || job("unstage_hunk") !== null
-            || job("commit") !== null
+        return job("commit") !== null
             || job("fetch") !== null
             || job("pull") !== null
             || job("push") !== null

@@ -28,6 +28,15 @@ pub struct CommitOptions {
     pub amend: bool,
     /// Permit a commit whose tree is identical to its parent.
     pub allow_empty: bool,
+    /// Stage every working-tree change before committing.
+    ///
+    /// This exists so a front end that presents committing as one action does
+    /// not have to stage and commit as two operations. Two operations would
+    /// release the repository lock between them, and a sibling worktree's
+    /// mutation landing in that window would be swept into the commit. Staging
+    /// here happens under the lock the commit already holds, so what the caller
+    /// saw in the status it staged from is what the commit records.
+    pub stage_all: bool,
     /// Refresh the full repository status after the commit.
     ///
     /// Disable this when the caller will refresh separately. The default is
@@ -40,6 +49,7 @@ impl Default for CommitOptions {
         Self {
             amend: false,
             allow_empty: false,
+            stage_all: false,
             refresh_status: true,
         }
     }
@@ -57,6 +67,13 @@ impl CommitOptions {
     #[must_use]
     pub fn with_allow_empty(mut self, allow_empty: bool) -> Self {
         self.allow_empty = allow_empty;
+        self
+    }
+
+    /// Sets whether every working-tree change is staged before committing.
+    #[must_use]
+    pub fn with_stage_all(mut self, stage_all: bool) -> Self {
+        self.stage_all = stage_all;
         self
     }
 
@@ -211,15 +228,25 @@ pub(crate) fn stage_all(
     cancellation: &Cancellation,
 ) -> Result<StatusRefreshOutcome, GitError> {
     open(root)?;
-    GitCommand::new(git_executable, root, GitAccess::LocalWrite)
-        .args(["add", "--all"])
-        .run(cancellation)?;
+    add_all(git_executable, root, cancellation)?;
     Ok(refresh_status(
         git_executable,
         root,
         options.refresh_status,
         cancellation,
     ))
+}
+
+/// Stages every change in the working tree, additions and deletions alike.
+fn add_all(
+    git_executable: &Path,
+    root: &Path,
+    cancellation: &Cancellation,
+) -> Result<(), GitError> {
+    GitCommand::new(git_executable, root, GitAccess::LocalWrite)
+        .args(["add", "--all"])
+        .run(cancellation)
+        .map(|_| ())
 }
 
 pub(crate) fn unstage(
@@ -276,6 +303,16 @@ pub(crate) fn commit(
     if options.amend && unborn {
         return Err(GitError::AmendUnbornBranch);
     }
+    // Staging happens after the refusals above so a commit this function was
+    // never going to make cannot leave the index rewritten behind it.
+    let repository = if options.stage_all {
+        add_all(git_executable, root, cancellation)?;
+        // `git add` rewrote the index on disk, and the handle opened above still
+        // describes the index as it was before that write.
+        open(root)?
+    } else {
+        repository
+    };
     if !options.allow_empty && !has_staged_changes(&repository, root)? {
         return Err(GitError::NothingStaged);
     }
@@ -984,6 +1021,96 @@ mod tests {
             .unwrap();
 
         assert!(status.success(), "isolated commit child failed: {status}");
+    }
+
+    #[test]
+    fn a_stage_all_commit_records_the_whole_working_tree_without_staging_first() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("stage-all-commit");
+        let repository = initialize_repository(&root);
+        fs::write(root.join("deleted.txt"), "delete me\n").unwrap();
+        commit_all(&repository, "add deletion fixture");
+        drop(repository);
+        let service = GitService::new(&root, &fixture.data_dir);
+        let cancellation = Cancellation::default();
+
+        fs::write(root.join("tracked.txt"), "modified\n").unwrap();
+        fs::remove_file(root.join("deleted.txt")).unwrap();
+        fs::write(root.join("added.txt"), "added\n").unwrap();
+
+        let outcome = service
+            .commit(
+                "commit everything in one action",
+                &CommitOptions::default().with_stage_all(true),
+                &cancellation,
+            )
+            .unwrap();
+
+        assert!(refreshed(&outcome.status).entries.is_empty());
+        let repository = Repository::open(&root).unwrap();
+        let commit = repository
+            .find_commit(outcome.commit_id.parse().unwrap())
+            .unwrap();
+        let tree = commit.tree().unwrap();
+        assert!(tree.get_name("added.txt").is_some());
+        assert!(tree.get_name("deleted.txt").is_none());
+        let modified = tree
+            .get_name("tracked.txt")
+            .unwrap()
+            .to_object(&repository)
+            .unwrap();
+        assert_eq!(modified.as_blob().unwrap().content(), b"modified\n");
+    }
+
+    #[test]
+    fn a_stage_all_commit_with_a_clean_tree_leaves_no_staged_changes_behind() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("stage-all-clean");
+        initialize_repository(&root);
+        let service = GitService::new(&root, &fixture.data_dir);
+
+        let error = service
+            .commit(
+                "nothing to record",
+                &CommitOptions::default().with_stage_all(true),
+                &Cancellation::default(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, GitError::NothingStaged), "{error:?}");
+    }
+
+    #[test]
+    fn a_stage_all_commit_refuses_a_pending_operation_before_touching_the_index() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("stage-all-pending");
+        let repository = initialize_repository(&root);
+        let head = repository.head().unwrap().target().unwrap();
+        fs::write(root.join(".git/MERGE_HEAD"), format!("{head}\n")).unwrap();
+        fs::write(root.join("tracked.txt"), "must not be staged\n").unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+
+        let error = service
+            .commit(
+                "must not finish an unknown merge",
+                &CommitOptions::default().with_stage_all(true),
+                &Cancellation::default(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            GitError::OperationInProgress {
+                pending: PendingOperation::Merge,
+                ..
+            }
+        ));
+        let status = service.detailed_status(&Cancellation::default()).unwrap();
+        assert_eq!(
+            entry(&status.entries, Path::new("tracked.txt")).staged,
+            None,
+            "the refused commit staged the working tree anyway"
+        );
     }
 
     #[test]
