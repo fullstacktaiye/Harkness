@@ -209,9 +209,22 @@ impl ToolRegistry {
         self.ordered.keys()
     }
 
-    /// The highest-precedence entry registered for `id`.
+    /// The entry an unversioned resolution selects for `id`.
+    ///
+    /// The highest *stable* version wins, and a pre-release is chosen only when no
+    /// stable version is registered. Taking the highest by raw precedence would
+    /// mean that registering `2.0.0-rc.1` beside a production `1.10.0` instantly
+    /// redirects every caller that passes no version — which is the documented
+    /// default entry point — onto the release candidate. Publishing a pre-release
+    /// must not be a way to change what production runs; a caller that wants one
+    /// asks for it by version.
     fn latest(&self, id: &ToolId) -> Option<(&ToolVersion, &Arc<dyn ErasedTool>)> {
-        self.ordered.get(id)?.last_key_value()
+        let by_version = self.ordered.get(id)?;
+        by_version
+            .iter()
+            .rev()
+            .find(|(version, _)| !version.is_prerelease())
+            .or_else(|| by_version.last_key_value())
     }
 
     /// How many `(id, version)` pairs are registered.
@@ -250,9 +263,18 @@ impl std::fmt::Debug for ToolRegistry {
 /// the CLI, and a coordinator all drive tools through exactly the interface an
 /// agent will use.
 ///
-/// `version` of `None` resolves the highest registered version, and the version
-/// that actually ran is reported in the [`ToolOutcome`] so the caller records
-/// what executed rather than what it asked for.
+/// `version` of `None` resolves the highest registered *stable* version, and the
+/// version that actually ran is reported in the [`ToolOutcome`] so the caller
+/// records what executed rather than what it asked for.
+///
+/// On the failure path that identity is not returned. Only
+/// [`ToolError::InvalidInput`], [`ToolError::InvalidOutput`], and
+/// [`ToolError::ToolPanicked`] name the tool themselves; a tool's own
+/// `execution_failed` does not. A caller that must record
+/// `tool_calls.tool_version` for a *failed* unpinned call should therefore
+/// [`ToolRegistry::resolve`] first and use [`invoke_resolved`], which is the
+/// shape a coordinator wants anyway — it has to write the pending row, and
+/// evaluate policy against the descriptor, before anything executes.
 ///
 /// # Errors
 ///

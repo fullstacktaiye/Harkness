@@ -27,17 +27,29 @@
 //! The order carries the guarantees. Validation precedes execution, so a
 //! rejected input means the body provably never ran and a caller may retry a
 //! correction without wondering about side effects —
-//! [`ToolError::happened_before_execution`] states that in the type. Validation
-//! also precedes policy evaluation, because policy must classify what will
-//! actually execute rather than an unparsed blob. And validation of the *output*
-//! precedes delivery, so a consumer that trusted the published schema never
-//! receives a shape it cannot handle; a tool that emits the wrong thing produces
-//! a structured [`ToolError::InvalidOutput`] instead of a downstream crash.
+//! [`ToolError::happened_before_execution`] states that in the type, and is
+//! deliberately true of nothing else. Validation also precedes policy
+//! evaluation, because policy must classify what will actually execute rather
+//! than an unparsed blob. And validation of the *output* precedes delivery, so a
+//! consumer that trusted the published schema never receives a shape it cannot
+//! handle; a tool that emits the wrong thing produces a structured
+//! [`ToolError::InvalidOutput`] instead of a downstream crash.
+//!
+//! Cancellation is gated by the pipeline as well as by tools: the token is
+//! checked before validation and again before the body, so a tool dispatched
+//! after a cancel never starts even if it never polls. Stopping a call already
+//! in flight still needs the tool to check
+//! [`ExecutionContext::check_cancelled`].
 //!
 //! Both gates locate their findings. A [`SchemaViolation`] carries an RFC 6901
 //! JSON Pointer into the offending value and another into the schema rule it
 //! broke, which is what makes a refusal actionable for an agent retrying on its
-//! own.
+//! own. Reports are bounded in both directions — at most
+//! [`MAX_REPORTED_VIOLATIONS`] violations, each explanation truncated to
+//! [`MAX_VIOLATION_MESSAGE_BYTES`], with the true number of omitted violations
+//! stated — because a validator quotes the value it rejected, that value is
+//! caller-supplied, and [`ToolError::as_failure`] has to fit the run store's
+//! inline payload limit to be recorded at all.
 //!
 //! # Risk and capabilities
 //!
@@ -96,9 +108,13 @@
 //! generated documentation and the `harkness contract` projection are
 //! diff-stable regardless of registration order.
 //!
-//! Resolving without a version selects the highest by semantic-version
-//! precedence — which is why a version is parsed rather than compared as text:
-//! `0.10.0` follows `0.9.0`, and `1.0.0-alpha.1` does not outrank `1.0.0`.
+//! Resolving without a version selects the highest *stable* version by
+//! semantic-version precedence — which is why a version is parsed rather than
+//! compared as text: `0.10.0` follows `0.9.0`, not the other way round. A
+//! pre-release is chosen only when nothing stable is registered, so registering
+//! `2.0.0-rc.1` beside a production `1.10.0` does not quietly move every
+//! unversioned caller onto the candidate. A caller that wants a pre-release names
+//! it.
 //!
 //! # What this module does not do
 //!
@@ -131,8 +147,8 @@ pub use descriptor::{
 };
 pub use erased::{ErasedTool, Tool, erase};
 pub use error::{
-    InvocationError, MAX_REPORTED_VIOLATIONS, RegistryError, SchemaDirection, SchemaViolation,
-    ToolError,
+    InvocationError, MAX_REPORTED_VIOLATIONS, MAX_VIOLATION_MESSAGE_BYTES, RegistryError,
+    SchemaDirection, SchemaViolation, ToolError,
 };
 pub use identifier::{Capability, MAX_IDENTIFIER_LENGTH, ToolId, ToolIdentity, ToolVersion};
 pub use registry::{ToolOutcome, ToolRegistry, invoke, invoke_resolved};

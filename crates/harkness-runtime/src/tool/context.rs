@@ -545,9 +545,12 @@ mod tests {
         for path in rejected {
             let error = context.resolve(path).unwrap_err();
             assert_eq!(error.kind(), "forbidden_path", "accepted {path:?}");
+            // Deliberately *not* `happened_before_execution`: tools call this
+            // mid-body, so a refused second path says nothing about whether an
+            // earlier one was already written.
             assert!(
-                error.happened_before_execution(),
-                "a refused path must promise nothing ran"
+                !error.happened_before_execution(),
+                "a mid-body path refusal must not claim the tool never ran"
             );
         }
 

@@ -91,6 +91,17 @@ impl ToolVersion {
     /// complete `major.minor.patch` semantic version.
     pub fn new(value: impl Into<String>) -> Result<Self, RegistryError> {
         let value = value.into();
+        // Bounded for the same reason a tool id is: this string is persisted in
+        // `tool_calls.tool_version` beside the id and rendered everywhere the id
+        // is. Semver places no limit on pre-release or build identifiers, so
+        // without this a version could register cleanly and then make every
+        // record of its own calls unpersistable.
+        if value.chars().count() > MAX_IDENTIFIER_LENGTH {
+            return Err(RegistryError::InvalidToolVersion {
+                value,
+                reason: TOO_LONG.to_owned(),
+            });
+        }
         match semver::Version::parse(&value) {
             Ok(version) => Ok(Self(version)),
             Err(error) => Err(RegistryError::InvalidToolVersion {
@@ -104,6 +115,15 @@ impl ToolVersion {
     #[must_use]
     pub const fn as_semver(&self) -> &semver::Version {
         &self.0
+    }
+
+    /// Whether this version carries a pre-release identifier.
+    ///
+    /// An unversioned lookup skips these unless nothing stable is registered, so
+    /// publishing a release candidate does not change what existing callers run.
+    #[must_use]
+    pub fn is_prerelease(&self) -> bool {
+        !self.0.pre.is_empty()
     }
 }
 
@@ -368,6 +388,36 @@ mod tests {
                 ToolVersion::new(rejected).unwrap_err().kind(),
                 "invalid_tool_version",
                 "accepted {rejected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_versions_are_length_bounded_like_identifiers() {
+        // Semver places no limit on pre-release identifiers, but this string is
+        // persisted in `tool_calls.tool_version` beside the id, so an unbounded
+        // version would register cleanly and then make its own calls
+        // unpersistable.
+        let overlong = format!("1.0.0-{}", "a".repeat(MAX_IDENTIFIER_LENGTH));
+        let error = ToolVersion::new(overlong).unwrap_err();
+        assert_eq!(error.kind(), "invalid_tool_version");
+        assert!(error.to_string().contains(super::TOO_LONG), "{error}");
+
+        assert!(ToolVersion::new("1.0.0-rc.1+build.5").is_ok());
+    }
+
+    #[test]
+    fn a_pre_release_version_identifies_itself() {
+        for (spelling, expected) in [
+            ("1.0.0", false),
+            ("1.0.0+build.5", false),
+            ("1.0.0-rc.1", true),
+            ("2.0.0-alpha", true),
+        ] {
+            assert_eq!(
+                ToolVersion::new(spelling).unwrap().is_prerelease(),
+                expected,
+                "for {spelling}"
             );
         }
     }

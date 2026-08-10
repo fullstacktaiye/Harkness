@@ -62,12 +62,10 @@ pub(super) fn validate(
     direction: SchemaDirection,
     instance: &Value,
 ) -> Result<(), ToolError> {
-    // One extra violation is collected past the reporting bound so the rendered
-    // message can say how many were dropped without draining an unbounded
-    // iterator over a large instance.
-    let violations = validator
-        .iter_errors(instance)
-        .take(MAX_REPORTED_VIOLATIONS + 1)
+    let mut errors = validator.iter_errors(instance);
+    let violations = errors
+        .by_ref()
+        .take(MAX_REPORTED_VIOLATIONS)
         .map(|error| {
             SchemaViolation::new(
                 error.instance_path().to_string(),
@@ -80,7 +78,12 @@ pub(super) fn validate(
     if violations.is_empty() {
         return Ok(());
     }
-    Err(refusal(tool, direction, violations))
+
+    // The iterator is lazy and taken by reference, so counting the remainder
+    // finishes the same single pass rather than validating a second time. This
+    // only ever runs on the failure path.
+    let omitted = errors.count();
+    Err(refusal(tool, direction, violations, omitted))
 }
 
 /// Builds the refusal for one direction from located violations.
@@ -88,15 +91,18 @@ pub(super) fn refusal(
     tool: &ToolIdentity,
     direction: SchemaDirection,
     violations: Vec<SchemaViolation>,
+    omitted: usize,
 ) -> ToolError {
     match direction {
         SchemaDirection::Input => ToolError::InvalidInput {
             tool: tool.clone(),
             violations,
+            omitted,
         },
         SchemaDirection::Output => ToolError::InvalidOutput {
             tool: tool.clone(),
             violations,
+            omitted,
         },
     }
 }
@@ -120,7 +126,7 @@ where
     serde_path_to_error::deserialize(instance).map_err(|error| {
         let pointer = json_pointer(error.path());
         let violation = SchemaViolation::new(pointer, "", error.inner().to_string());
-        refusal(tool, SchemaDirection::Input, vec![violation])
+        refusal(tool, SchemaDirection::Input, vec![violation], 0)
     })
 }
 
@@ -279,6 +285,38 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn a_large_violation_set_reports_its_real_remainder() {
+        // The reported list is capped, but the count of what was dropped is the
+        // true remainder rather than the difference between the list and the cap.
+        #[derive(Deserialize, JsonSchema)]
+        #[serde(deny_unknown_fields)]
+        struct Wide {
+            #[allow(dead_code)]
+            values: Vec<u8>,
+        }
+
+        let schema = generate::<Wide>();
+        let validator = compile(&identity(), SchemaDirection::Input, &schema).unwrap();
+
+        // Thirty elements of the wrong type is thirty violations.
+        let instance = json!({"values": vec!["not a number"; 30]});
+        let error =
+            validate(&validator, &identity(), SchemaDirection::Input, &instance).unwrap_err();
+        let crate::tool::ToolError::InvalidInput {
+            violations,
+            omitted,
+            ..
+        } = &error
+        else {
+            panic!("expected an input refusal, got {error:?}");
+        };
+
+        assert_eq!(violations.len(), crate::tool::MAX_REPORTED_VIOLATIONS);
+        assert_eq!(*omitted, 20, "the remainder must be exact, not the cap + 1");
+        assert!(error.to_string().contains("(and 20 more)"), "{error}");
     }
 
     #[test]

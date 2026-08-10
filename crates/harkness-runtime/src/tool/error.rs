@@ -13,9 +13,23 @@ use super::ToolIdentity;
 ///
 /// A schema violation report is a diagnostic for whoever produced the value —
 /// often an agent retrying with a correction — and the first handful of
-/// violations locate the mistake. The bound also keeps the rendered message
-/// small enough to persist as a [`Failure`] beside the tool call.
+/// violations locate the mistake.
 pub const MAX_REPORTED_VIOLATIONS: usize = 10;
+
+/// Longest explanation one violation retains.
+///
+/// A validator's explanation quotes the value it rejected, and the value is
+/// caller-supplied and unbounded: a 200 KB instance rejected at its root
+/// produces a 200 KB sentence. That matters beyond tidiness, because
+/// [`ToolError::as_failure`] is how a refusal gets recorded against the tool
+/// call, and the run store refuses an inline payload over 64 KiB — an untruncated
+/// diagnostic would leave the call stuck in `running` with nothing written about
+/// why. Bounding each explanation, at the one place violations are constructed,
+/// keeps a whole report to roughly 5 KB.
+pub const MAX_VIOLATION_MESSAGE_BYTES: usize = 512;
+
+/// Appended to an explanation that was cut short.
+const TRUNCATION_MARKER: &str = "… (truncated)";
 
 /// Which side of an invocation a schema describes.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -66,6 +80,10 @@ pub struct SchemaViolation {
 
 impl SchemaViolation {
     /// Records a violation at the given instance and schema locations.
+    ///
+    /// The explanation is truncated to [`MAX_VIOLATION_MESSAGE_BYTES`]. This is
+    /// the only constructor, so no violation from any gate can carry an
+    /// unbounded quotation of the value it rejected.
     #[must_use]
     pub fn new(
         pointer: impl Into<String>,
@@ -75,9 +93,26 @@ impl SchemaViolation {
         Self {
             pointer: pointer.into(),
             schema_pointer: schema_pointer.into(),
-            message: message.into(),
+            message: truncate(message.into()),
         }
     }
+}
+
+/// Bounds one explanation, cutting on a character boundary.
+fn truncate(mut message: String) -> String {
+    if message.len() <= MAX_VIOLATION_MESSAGE_BYTES {
+        return message;
+    }
+
+    // `floor_char_boundary` is unstable, so walk back to one by hand; a cut
+    // inside a multi-byte character would panic on `truncate`.
+    let mut boundary = MAX_VIOLATION_MESSAGE_BYTES;
+    while boundary > 0 && !message.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    message.truncate(boundary);
+    message.push_str(TRUNCATION_MARKER);
+    message
 }
 
 impl fmt::Display for SchemaViolation {
@@ -110,12 +145,15 @@ pub enum ToolError {
     /// The supplied input does not satisfy the tool's declared input schema.
     ///
     /// Raised before the tool body runs, so nothing was executed.
-    #[error("{tool} input does not satisfy its declared schema: {}", render_violations(.violations))]
+    #[error("{tool} input does not satisfy its declared schema: {}", render_violations(.violations, *.omitted))]
     InvalidInput {
         /// Tool whose schema refused the value.
         tool: ToolIdentity,
-        /// Where the value broke the schema.
+        /// Where the value broke the schema, at most
+        /// [`MAX_REPORTED_VIOLATIONS`] of them.
         violations: Vec<SchemaViolation>,
+        /// Further violations found but not retained.
+        omitted: usize,
     },
 
     /// The tool returned a value that does not satisfy its declared output
@@ -123,12 +161,15 @@ pub enum ToolError {
     ///
     /// The result is discarded rather than delivered: a consumer that trusted
     /// the published schema would otherwise receive a shape it cannot handle.
-    #[error("{tool} output does not satisfy its declared schema: {}", render_violations(.violations))]
+    #[error("{tool} output does not satisfy its declared schema: {}", render_violations(.violations, *.omitted))]
     InvalidOutput {
         /// Tool whose own output was refused.
         tool: ToolIdentity,
-        /// Where the value broke the schema.
+        /// Where the value broke the schema, at most
+        /// [`MAX_REPORTED_VIOLATIONS`] of them.
         violations: Vec<SchemaViolation>,
+        /// Further violations found but not retained.
+        omitted: usize,
     },
 
     /// The tool ran and reported failure.
@@ -233,17 +274,26 @@ impl ToolError {
         }
     }
 
-    /// Whether the tool body ran before this failure was reported.
+    /// Whether the invocation pipeline guarantees the tool body never started.
     ///
-    /// The two validation failures and every pre-execution refusal answer
-    /// `false`, which is what lets a caller retry a corrected input without
-    /// wondering whether the first attempt had a side effect.
+    /// Only [`Self::InvalidInput`] qualifies, and only because the erasure
+    /// boundary raises it before it calls the body at all. That is what lets a
+    /// caller retry a corrected input without wondering whether the first attempt
+    /// had a side effect.
+    ///
+    /// Every other kind is deliberately excluded, because whether the body ran
+    /// depends on who raised it and this type cannot tell. [`Self::Denied`] is
+    /// pre-execution when the policy engine raises it and mid-body when a tool
+    /// does. [`Self::ForbiddenPath`] is pre-execution from
+    /// [`ExecutionContext::new`](super::ExecutionContext::new) but mid-body from
+    /// [`ExecutionContext::resolve`](super::ExecutionContext::resolve), which
+    /// tools are told to route every path argument through — a tool that wrote
+    /// one file and then refused a second path has already had its side effect.
+    /// Answering `true` there would licence exactly the double-apply this method
+    /// exists to prevent.
     #[must_use]
     pub const fn happened_before_execution(&self) -> bool {
-        matches!(
-            self,
-            Self::InvalidInput { .. } | Self::Denied { .. } | Self::ForbiddenPath { .. }
-        )
+        matches!(self, Self::InvalidInput { .. })
     }
 
     /// Projects this failure into the durable form a tool call records.
@@ -426,24 +476,25 @@ impl InvocationError {
     }
 }
 
-/// Renders a bounded violation list for an error message.
-fn render_violations(violations: &[SchemaViolation]) -> String {
+/// Renders a violation list, naming how many further violations were omitted.
+///
+/// `omitted` is supplied by the gate that found them rather than derived from
+/// the list's own length, because the list has already been truncated by the time
+/// it gets here — deriving it could only ever report the difference between the
+/// list and the bound, understating a large report.
+fn render_violations(violations: &[SchemaViolation], omitted: usize) -> String {
     if violations.is_empty() {
         return "no violation was reported".to_owned();
     }
 
-    let shown = violations.len().min(MAX_REPORTED_VIOLATIONS);
     let mut rendered = violations
         .iter()
-        .take(shown)
+        .take(MAX_REPORTED_VIOLATIONS)
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("; ");
-    if violations.len() > shown {
-        rendered.push_str(&format!(
-            " (and {} more)",
-            violations.len().saturating_sub(shown)
-        ));
+    if omitted > 0 {
+        rendered.push_str(&format!(" (and {omitted} more)"));
     }
     rendered
 }
@@ -463,8 +514,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        InvocationError, MAX_REPORTED_VIOLATIONS, RegistryError, SchemaDirection, SchemaViolation,
-        ToolError,
+        InvocationError, MAX_REPORTED_VIOLATIONS, MAX_VIOLATION_MESSAGE_BYTES, RegistryError,
+        SchemaDirection, SchemaViolation, TRUNCATION_MARKER, ToolError,
     };
     use crate::tool::ToolIdentity;
 
@@ -487,6 +538,7 @@ mod tests {
                 ToolError::InvalidInput {
                     tool: identity(),
                     violations: vec![violation()],
+                    omitted: 0,
                 },
                 "invalid_input",
             ),
@@ -494,6 +546,7 @@ mod tests {
                 ToolError::InvalidOutput {
                     tool: identity(),
                     violations: vec![violation()],
+                    omitted: 0,
                 },
                 "invalid_output",
             ),
@@ -635,10 +688,11 @@ mod tests {
     }
 
     #[test]
-    fn a_violation_message_names_the_pointer_and_truncates_a_long_list() {
+    fn a_violation_message_names_the_pointer_and_reports_omitted_violations() {
         let single = ToolError::InvalidInput {
             tool: identity(),
             violations: vec![violation()],
+            omitted: 0,
         };
         assert_eq!(
             single.to_string(),
@@ -646,15 +700,20 @@ mod tests {
              /depth: \"deep\" is not of type integer"
         );
 
-        let many = (0..MAX_REPORTED_VIOLATIONS + 3)
+        // The omitted count comes from the gate that found them, so a large
+        // report states its real remainder rather than the difference between the
+        // truncated list and the bound.
+        let reported = (0..MAX_REPORTED_VIOLATIONS)
             .map(|index| SchemaViolation::new(format!("/field{index}"), "/properties", "wrong"))
             .collect::<Vec<_>>();
         let truncated = ToolError::InvalidInput {
             tool: identity(),
-            violations: many,
+            violations: reported,
+            omitted: 40,
         }
         .to_string();
-        assert!(truncated.contains("(and 3 more)"), "{truncated}");
+        assert!(truncated.contains("(and 40 more)"), "{truncated}");
+        assert!(truncated.contains("/field9"), "{truncated}");
         assert!(!truncated.contains("/field10"), "{truncated}");
     }
 
@@ -667,6 +726,7 @@ mod tests {
                 "/type",
                 "42 is not of type object",
             )],
+            omitted: 0,
         };
         assert!(
             error
@@ -677,30 +737,78 @@ mod tests {
     }
 
     #[test]
-    fn only_pre_execution_failures_promise_the_tool_body_never_ran() {
+    fn a_violation_explanation_is_bounded_so_the_failure_can_be_recorded() {
+        // A validator quotes the value it rejected, and the value is
+        // caller-supplied. Left whole, one violation over a 200 KB instance would
+        // exceed the run store's 64 KiB inline bound and the refusal could not be
+        // written against the call at all.
+        let enormous = format!("{:?} is not of type object", "x".repeat(200 * 1024));
+        let violation = SchemaViolation::new("", "/type", enormous);
+        assert!(
+            violation.message.len() <= MAX_VIOLATION_MESSAGE_BYTES + TRUNCATION_MARKER.len(),
+            "one explanation is {} bytes",
+            violation.message.len()
+        );
+        assert!(violation.message.ends_with(TRUNCATION_MARKER));
+
+        let full = ToolError::InvalidInput {
+            tool: identity(),
+            violations: vec![violation; MAX_REPORTED_VIOLATIONS],
+            omitted: 3,
+        };
+        assert!(
+            full.as_failure().message().len() < crate::store::MAX_INLINE_PAYLOAD_BYTES,
+            "a full report is {} bytes, which the run store would refuse",
+            full.as_failure().message().len()
+        );
+    }
+
+    #[test]
+    fn truncation_cuts_on_a_character_boundary() {
+        // A cut inside a multi-byte character would panic, so the boundary walk
+        // matters for any value containing non-ASCII text.
+        let multibyte = "é".repeat(MAX_VIOLATION_MESSAGE_BYTES);
+        let violation = SchemaViolation::new("/name", "/type", multibyte);
+        assert!(violation.message.ends_with(TRUNCATION_MARKER));
+        assert!(
+            violation.message.len() <= MAX_VIOLATION_MESSAGE_BYTES + TRUNCATION_MARKER.len(),
+            "{}",
+            violation.message.len()
+        );
+    }
+
+    #[test]
+    fn only_a_refused_input_promises_the_tool_body_never_ran() {
         assert!(
             ToolError::InvalidInput {
                 tool: identity(),
                 violations: vec![violation()],
-            }
-            .happened_before_execution()
-        );
-        assert!(ToolError::denied("policy").happened_before_execution());
-        assert!(
-            ToolError::ForbiddenPath {
-                path: PathBuf::from(".."),
-                reason: "fixture",
+                omitted: 0,
             }
             .happened_before_execution()
         );
 
+        // Everything else is excluded because whether the body ran depends on who
+        // raised it. `ForbiddenPath` in particular comes from
+        // `ExecutionContext::resolve`, which tools call mid-body, so claiming it
+        // is pre-execution would licence a retry that double-applies an earlier
+        // write.
         for ran in [
+            ToolError::denied("policy"),
+            ToolError::ForbiddenPath {
+                path: PathBuf::from(".."),
+                reason: "fixture",
+            },
             ToolError::Cancelled,
             ToolError::Interrupted,
             ToolError::execution_failed("boom"),
+            ToolError::TimedOut {
+                limit: Duration::from_secs(1),
+            },
             ToolError::InvalidOutput {
                 tool: identity(),
                 violations: vec![violation()],
+                omitted: 0,
             },
             ToolError::ToolPanicked {
                 tool: identity(),

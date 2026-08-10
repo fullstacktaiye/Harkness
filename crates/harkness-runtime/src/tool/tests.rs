@@ -503,11 +503,12 @@ fn lookup_resolves_an_exact_version_and_the_latest_of_an_id() {
         assert_eq!(resolved.descriptor().version(), &version(spelling));
     }
 
-    // Latest is by precedence, so `1.10.0` beats `1.9.0` and a pre-release does
-    // not outrank the release it precedes.
+    // Latest is by precedence among *stable* versions, so `1.10.0` beats `1.9.0`
+    // rather than losing to it on string order, and the registered `2.0.0-rc.1`
+    // does not hijack callers that named no version.
     assert_eq!(
         registry.latest_version(&id("fixture.echo")),
-        Some(&version("2.0.0-rc.1"))
+        Some(&version("1.10.0"))
     );
     assert_eq!(
         registry
@@ -515,14 +516,130 @@ fn lookup_resolves_an_exact_version_and_the_latest_of_an_id() {
             .unwrap()
             .descriptor()
             .version(),
-        &version("2.0.0-rc.1")
+        &version("1.10.0")
     );
 
     registry.register(Echo::new("2.0.0")).unwrap();
     assert_eq!(
         registry.latest_version(&id("fixture.echo")),
         Some(&version("2.0.0")),
-        "a release must outrank its own pre-release"
+        "a released version becomes the new default"
+    );
+}
+
+#[test]
+fn a_pre_release_does_not_become_the_default_for_unversioned_callers() {
+    let mut registry = ToolRegistry::new();
+    registry.register(Echo::new("1.10.0")).unwrap();
+    assert_eq!(
+        registry.latest_version(&id("fixture.echo")),
+        Some(&version("1.10.0"))
+    );
+
+    // Publishing a release candidate must not silently redirect production. Raw
+    // semver precedence puts 2.0.0-rc.1 above 1.10.0, so an unfiltered
+    // "highest version" would move every unpinned caller onto the candidate.
+    registry.register(Echo::new("2.0.0-rc.1")).unwrap();
+    assert_eq!(
+        registry.latest_version(&id("fixture.echo")),
+        Some(&version("1.10.0")),
+        "a pre-release must not take over unversioned resolution"
+    );
+
+    // It is still reachable, by asking for it.
+    assert_eq!(
+        registry
+            .resolve(&id("fixture.echo"), Some(&version("2.0.0-rc.1")))
+            .unwrap()
+            .descriptor()
+            .version(),
+        &version("2.0.0-rc.1")
+    );
+
+    // With nothing stable registered, a pre-release is better than refusing.
+    let mut only_prerelease = ToolRegistry::new();
+    only_prerelease
+        .register(Echo::new("0.1.0-alpha.1"))
+        .unwrap();
+    only_prerelease
+        .register(Echo::new("0.1.0-alpha.2"))
+        .unwrap();
+    assert_eq!(
+        only_prerelease.latest_version(&id("fixture.echo")),
+        Some(&version("0.1.0-alpha.2")),
+        "the highest pre-release wins when there is no stable version"
+    );
+}
+
+#[test]
+fn a_tool_dispatched_after_cancellation_never_starts() {
+    // Cooperative cancellation inside the body is not enough: a tool that does
+    // its work in one non-polling call would otherwise complete a push or a
+    // delete after the user cancelled. The pipeline gates on the token itself.
+    struct NeverPolls {
+        executions: Arc<AtomicUsize>,
+    }
+
+    impl Tool for NeverPolls {
+        type Input = Empty;
+        type Output = EchoOutput;
+
+        fn metadata(&self) -> ToolMetadata {
+            ToolMetadata::new(
+                ToolIdentity::parse("fixture.never_polls", "1.0.0").unwrap(),
+                "Never polls",
+                "Does its work in one call without checking cancellation.",
+                RiskLevel::RemoteWrite,
+            )
+        }
+
+        fn execute(
+            &self,
+            _input: Empty,
+            _context: &mut ExecutionContext,
+        ) -> Result<EchoOutput, ToolError> {
+            self.executions.fetch_add(1, Ordering::Release);
+            Ok(EchoOutput {
+                echoed: "pushed".to_owned(),
+            })
+        }
+    }
+
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(NeverPolls {
+            executions: Arc::clone(&executions),
+        })
+        .unwrap();
+
+    let cancellation = Cancellation::default();
+    let mut context = ExecutionContext::new(
+        RunId::new(),
+        StepId::new(),
+        ToolCallId::new(),
+        WORKSPACE,
+        cancellation.clone(),
+        Box::new(DiscardedProgress),
+        Box::new(UnsupportedArtifacts),
+    )
+    .unwrap();
+    cancellation.cancel();
+
+    let error = invoke(
+        &registry,
+        &id("fixture.never_polls"),
+        None,
+        &raw("{}"),
+        &mut context,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.kind(), "cancelled");
+    assert_eq!(
+        executions.load(Ordering::Acquire),
+        0,
+        "a tool that does not poll still ran after cancellation"
     );
 }
 
@@ -643,7 +760,10 @@ fn schema_invalid_input_is_refused_before_the_tool_body_runs() {
         .unwrap_err();
 
         assert_eq!(error.kind(), "invalid_input", "accepted {input}");
-        let InvocationError::Tool(ToolError::InvalidInput { tool, violations }) = &error else {
+        let InvocationError::Tool(ToolError::InvalidInput {
+            tool, violations, ..
+        }) = &error
+        else {
             panic!("expected an input refusal for {input}, got {error:?}");
         };
         assert_eq!(tool.to_string(), "fixture.echo@1.0.0");
@@ -672,6 +792,7 @@ fn schema_invalid_input_is_refused_before_the_tool_body_runs() {
         ToolError::InvalidInput {
             tool: ToolIdentity::parse("fixture.echo", "1.0.0").unwrap(),
             violations: Vec::new(),
+            omitted: 0,
         }
         .happened_before_execution()
     );
@@ -705,7 +826,10 @@ fn schema_invalid_output_is_refused_before_delivery() {
     .unwrap_err();
 
     assert_eq!(error.kind(), "invalid_output");
-    let InvocationError::Tool(ToolError::InvalidOutput { tool, violations }) = &error else {
+    let InvocationError::Tool(ToolError::InvalidOutput {
+        tool, violations, ..
+    }) = &error
+    else {
         panic!("expected an output refusal, got {error:?}");
     };
     assert_eq!(tool.to_string(), "fixture.bad_output@1.0.0");

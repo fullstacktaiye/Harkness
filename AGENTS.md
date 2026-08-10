@@ -146,6 +146,33 @@ Publishing a change means registering a new version beside the old one.
 Descriptor enumeration is ordered by identifier and then by version precedence,
 so any projection built from it is diff-stable regardless of registration order.
 
+Resolving without a version selects the highest *stable* version, falling back to
+a pre-release only when nothing stable is registered. Raw semver precedence puts
+`2.0.0-rc.1` above `1.10.0`, so an unfiltered "highest version" would mean that
+registering a release candidate silently redirects every caller that named no
+version — the documented default entry point — onto the candidate. Publishing a
+pre-release must never change what production runs.
+
+Both a tool id and a tool version are length-bounded, because both are persisted
+in adjacent `tool_calls` columns held to the store's 64 KiB inline limit. Semver
+places no limit on pre-release identifiers, so without the bound a version could
+register cleanly and then make every record of its own calls unpersistable. The
+same reasoning bounds each schema-violation explanation: a validator quotes the
+value it rejected, that value is caller-supplied, and `ToolError::as_failure` is
+how a refusal gets recorded — an untruncated diagnostic would leave the call stuck
+in `running` with nothing written about why it failed.
+
+Cancellation is checked by the pipeline, not only by tools. `execute_json` gates
+on the token before validating and again before the body, so a tool dispatched
+after a cancel never starts even if it never polls. Stopping a call already in
+flight still depends on the tool polling `check_cancelled`.
+
+`ToolError::happened_before_execution` answers `true` for exactly one kind,
+`invalid_input`, because that is the only one the pipeline itself raises before
+calling the body. Do not widen it. `forbidden_path` in particular is raised by
+`ExecutionContext::resolve`, which tools call mid-body, so treating it as
+pre-execution would licence a retry that double-applies an earlier write.
+
 Schemas are generated from the `Input` and `Output` associated types and never
 declared by hand, so a published contract cannot disagree with the type the tool
 body deserializes. They are compiled at registration: a schema that cannot be

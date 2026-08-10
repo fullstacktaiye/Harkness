@@ -223,15 +223,29 @@ where
     ) -> Result<Box<RawValue>, ToolError> {
         let identity = self.descriptor.identity();
 
+        // Cancellation is checked before anything else, and again immediately
+        // before the body. Honouring it only inside the body would make
+        // "cancelled work does not happen" a property of well-written tools
+        // rather than of the pipeline: a tool that does its work in one
+        // non-polling call — a push, a request, a delete — would run to
+        // completion after the user had already cancelled the run. These two
+        // gates cannot close the window entirely, because a token cancelled
+        // during a long call still relies on the tool polling, but they do
+        // guarantee that a tool dispatched after cancellation never starts.
+        context.check_cancelled()?;
+
         let instance = serde_json::from_str::<Value>(input.get()).map_err(|error| {
             schema::refusal(
                 identity,
                 SchemaDirection::Input,
                 vec![SchemaViolation::new("", "", error.to_string())],
+                0,
             )
         })?;
         schema::validate(&self.input, identity, SchemaDirection::Input, &instance)?;
         let typed = schema::deserialize_input::<T::Input>(identity, instance)?;
+
+        context.check_cancelled()?;
 
         // The body is the only foreign code in this pipeline, so it is the only
         // part that runs inside a panic boundary. Everything before it has
@@ -254,6 +268,7 @@ where
                 identity,
                 SchemaDirection::Output,
                 vec![SchemaViolation::new("", "", error.to_string())],
+                0,
             )
         })?;
         schema::validate(&self.output, identity, SchemaDirection::Output, &produced)?;
@@ -263,6 +278,7 @@ where
                 identity,
                 SchemaDirection::Output,
                 vec![SchemaViolation::new("", "", error.to_string())],
+                0,
             )
         })
     }

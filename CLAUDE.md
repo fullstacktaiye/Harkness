@@ -60,10 +60,15 @@ an existing one.
 Dependencies flow strictly downward; nothing lower reaches back up.
 
 ```
-harkness-cli ──┐
-harkness-gui ──┴─> harkness-core ─> harkness-git
-                   harkness-runtime (domain -> store)
+harkness-cli ──┐                              ┌─> harkness-git
+harkness-gui ──┴─> harkness-core ─────────────┤
+                   harkness-runtime ──────────┘
+                   (domain | store | tool)
 ```
+
+`harkness-runtime` depends on `harkness-git` for one thing: `Cancellation`, which `tool`'s
+`ExecutionContext` carries so a tool that shells out to Git passes the same token down instead of
+translating between two cancellation mechanisms.
 
 - **`harkness-git`** owns *all* Git behavior and is addressed purely by filesystem path. It has no
   knowledge of the project catalog, which is the mechanism that makes the lock ordering below
@@ -76,7 +81,8 @@ harkness-gui ──┴─> harkness-core ─> harkness-git
   `store` (SQLite persistence), and `tool` (the typed tool contract and registry). Every row is
   rebuilt into its wire record and re-validated by `domain` on load, so an impossible record cannot
   enter the process. `domain::ToolCall` records *that* a tool ran; `tool` is what defines and
-  executes one. The three modules do not depend on each other.
+  executes one. `store` and `tool` both build on `domain` but not on each other, so persistence and
+  execution can be reasoned about — and tested — separately.
 - **`harkness-test-fixtures`** is dev-only: hermetic temp repos, process fixtures, and the
   child-re-execution helpers. `COMMIT_EPOCH_SECONDS` is fixed so fixture repos hash identically.
 
