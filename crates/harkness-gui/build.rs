@@ -4,6 +4,8 @@ fn main() {
     CxxQtBuilder::new_qml_module(
         QmlModule::new("io.github.fullstacktaiye.harkness").qml_files([
             "qml/Main.qml",
+            "qml/AppTitleBar.qml",
+            "qml/WindowResizeBorders.qml",
             "qml/LauncherPage.qml",
             "qml/LauncherActionCard.qml",
             "qml/SidebarProjectRow.qml",

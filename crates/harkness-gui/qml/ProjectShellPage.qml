@@ -15,9 +15,6 @@ Kirigami.Page {
     readonly property string shellName: project.worktree && project.parentName.length > 0
         ? qsTr("%1 — from %2").arg(project.displayName).arg(project.parentName)
         : project.displayName
-    readonly property string repositoryLockScope: String(
-        project.lockScope || project.parentId || project.id
-    )
 
     /// Identifier of the side-panel view on screen. An empty value means no
     /// view applies to this project, and the activity bar stays hidden.
@@ -72,52 +69,6 @@ Kirigami.Page {
         }
     }
 
-    function repositoryOperationRunning() {
-        for (let index = 0; index < backend.jobs.length; ++index) {
-            const candidate = backend.jobs[index];
-            if (String(candidate.projectId) === String(project.id)
-                    || String(candidate.lockScope || candidate.projectId)
-                        === repositoryLockScope)
-                return true;
-        }
-        return false;
-    }
-
-    actions: [
-        Kirigami.Action {
-            icon.name: "go-previous-symbolic"
-            shortcut: "Alt+Left"
-            text: qsTr("Back")
-            tooltip: qsTr("Back to the launcher")
-            onTriggered: shell.backend.closeProject()
-        },
-        Kirigami.Action {
-            enabled: !shell.repositoryOperationRunning()
-            icon.name: "view-refresh"
-            text: qsTr("Refresh")
-            tooltip: qsTr("Re-read availability and Git state")
-            onTriggered: shell.backend.openProject(shell.project.id)
-        },
-        Kirigami.Action {
-            enabled: !shell.repositoryOperationRunning()
-            icon.name: "delete"
-            text: qsTr("Remove from Harkness…")
-            tooltip: shell.project.worktree
-                ? qsTr("Remove this managed worktree through Git")
-                : shell.project.managed
-                    ? qsTr("Delete this managed checkout")
-                    : qsTr("Forget this project; files stay untouched")
-            onTriggered: {
-                if (shell.project.worktree)
-                    applicationWindow().confirmRemoveWorktree(shell.project.id, shell.project.displayName, shell.project.root, shell.project.branch, shell.project.dirty);
-                else if (shell.project.managed)
-                    applicationWindow().confirmRemoveManaged(shell.project.id, shell.project.displayName, shell.project.root);
-                else
-                    applicationWindow().confirmRemoveLocal(shell.project.id, shell.project.displayName);
-            }
-        }
-    ]
-
     // Visual Studio Code's sidebar bindings, which is what users reach for
     // first. Each view owns the shortcut it advertises in its tooltip.
     Shortcut {
@@ -147,179 +98,201 @@ Kirigami.Page {
         project: shell.project
     }
 
-    header: Controls.Pane {
-        ColumnLayout {
-            spacing: Kirigami.Units.smallSpacing
-            width: parent.width
-
-            RowLayout {
-                Layout.fillWidth: true
-                spacing: Kirigami.Units.largeSpacing
-
-                Kirigami.Icon {
-                    Layout.preferredHeight: Kirigami.Units.iconSizes.large
-                    Layout.preferredWidth: Kirigami.Units.iconSizes.large
-                    source: shell.project.isGit ? "folder-git" : "folder"
-                }
-
-                ColumnLayout {
-                    Layout.fillWidth: true
-                    spacing: 0
-
-                    Kirigami.Heading {
-                        Layout.fillWidth: true
-                        elide: Text.ElideRight
-                        level: 2
-                        text: shell.shellName
-                    }
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        spacing: Kirigami.Units.smallSpacing
-
-                        Controls.Label {
-                            Layout.fillWidth: true
-                            color: Kirigami.Theme.disabledTextColor
-                            elide: Text.ElideMiddle
-                            font.family: "monospace"
-                            font.pixelSize: Kirigami.Theme.smallFont.pixelSize
-                            text: shell.project.root
-                        }
-
-                        Controls.ToolButton {
-                            Controls.ToolTip.text: qsTr("Copy path")
-                            display: Controls.AbstractButton.IconOnly
-                            icon.name: "edit-copy"
-                            onClicked: {
-                                clipboard.text = shell.project.root;
-                                clipboard.selectAll();
-                                clipboard.copy();
-                                clipboard.deselect();
-                            }
-                        }
-                    }
-                }
-
-                RowLayout {
-                    spacing: Kirigami.Units.smallSpacing
-
-                    Kirigami.Chip {
-                        checkable: false
-                        closable: false
-                        text: shell.project.managed
-                            ? qsTr("Managed clone")
-                            : qsTr("Local folder")
-                        visible: !shell.project.isGit || !shell.project.available
-                    }
-
-                    Kirigami.Chip {
-                        checkable: false
-                        closable: false
-                        text: qsTr("Missing from disk")
-                        visible: !shell.project.available
-                    }
-
-                    // Branch, worktree, and remote state are the repository
-                    // controls proper: they name what is checked out and let it
-                    // be changed from where it is displayed.
-                    RepositoryToolbar {
-                        activity: shellActivity
-                        backend: shell.backend
-                        project: shell.project
-                        visible: shell.project.isGit && shell.project.available
-                    }
-                }
-            }
-        }
-    }
-
-    RowLayout {
+    // The shell draws its own header instead of handing it to Kirigami's
+    // `header` slot: with the global toolbar switched off, that slot is laid
+    // out against a toolbar row that is no longer there and squeezes its
+    // content into a fraction of the height it asked for.
+    ColumnLayout {
         anchors.fill: parent
         spacing: 0
 
-        ActivityBar {
-            Layout.fillHeight: true
-            currentViewId: shell.currentViewId
-            panelExpanded: shell.sidePanelExpanded
-            views: sidePanel.views
-            visible: sidePanel.hasAvailableView
-            onViewTriggered: viewId => shell.activateView(viewId)
-        }
-
-        Kirigami.Separator {
-            Layout.fillHeight: true
-            visible: sidePanel.hasAvailableView
-        }
-
-        // The current view owns everything right of the activity bar, so
-        // collapsing it takes the whole surface rather than baring a companion
-        // pane the activity bar never advertised.
-        SidePanel {
-            id: sidePanel
-
-            Layout.fillHeight: true
+        Controls.Pane {
             Layout.fillWidth: true
-            currentViewId: shell.currentViewId
-            visible: shell.sidePanelExpanded && sidePanel.currentPanelReady
 
-            GitPanel {
-                id: gitPanel
+            ColumnLayout {
+                spacing: Kirigami.Units.smallSpacing
+                width: parent.width
 
-                backend: shell.backend
-                project: shell.project
-                onHideRequested: shell.sidePanelExpanded = false
-            }
-        }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: Kirigami.Units.largeSpacing
 
-        /*
-        FileTreeModel {
-            id: fileModel
-        }
-
-        TreeView {
-            id: tree
-
-            Layout.fillHeight: true
-            Layout.fillWidth: true
-            Layout.minimumWidth: Kirigami.Units.gridUnit * 12
-            clip: true
-            model: fileModel
-            selectionModel: ItemSelectionModel {}
-            visible: shell.project.available
-
-            delegate: Controls.TreeViewDelegate {
-                id: treeDelegate
-
-                // The KDE TreeViewDelegate already requires a `model` object.
-                // Consequently custom roles are exposed through that object,
-                // not injected as standalone required properties.
-                readonly property string fileName: model.fileName
-                readonly property string filePath: model.filePath
-                readonly property bool isDirectory: model.isDirectory
-
-                Controls.ToolTip.text: treeDelegate.filePath
-                Controls.ToolTip.visible: treeDelegate.hovered
-
-                contentItem: RowLayout {
-                    spacing: Kirigami.Units.smallSpacing
-
-                    Kirigami.Icon {
-                        Layout.preferredHeight: Kirigami.Units.iconSizes.small
-                        Layout.preferredWidth: Kirigami.Units.iconSizes.small
-                        source: treeDelegate.isDirectory ? "folder" : "text-plain"
+                    // Leaving the project is the one navigation step the shell
+                    // owns, so it leads the header the way a browser's back button
+                    // leads its toolbar. Alt+Left comes from the File menu.
+                    Controls.ToolButton {
+                        Controls.ToolTip.text: qsTr("Back to the launcher")
+                        display: Controls.AbstractButton.IconOnly
+                        icon.name: "go-previous-symbolic"
+                        onClicked: shell.backend.closeProject()
                     }
 
-                    Controls.Label {
+                    Kirigami.Icon {
+                        Layout.preferredHeight: Kirigami.Units.iconSizes.large
+                        Layout.preferredWidth: Kirigami.Units.iconSizes.large
+                        source: shell.project.isGit ? "folder-git" : "folder"
+                    }
+
+                    ColumnLayout {
                         Layout.fillWidth: true
-                        elide: Text.ElideRight
-                        text: treeDelegate.fileName
+                        spacing: 0
+
+                        Kirigami.Heading {
+                            Layout.fillWidth: true
+                            elide: Text.ElideRight
+                            level: 2
+                            text: shell.shellName
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: Kirigami.Units.smallSpacing
+
+                            Controls.Label {
+                                Layout.fillWidth: true
+                                color: Kirigami.Theme.disabledTextColor
+                                elide: Text.ElideMiddle
+                                font.family: "monospace"
+                                font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                                text: shell.project.root
+                            }
+
+                            Controls.ToolButton {
+                                Controls.ToolTip.text: qsTr("Copy path")
+                                display: Controls.AbstractButton.IconOnly
+                                icon.name: "edit-copy"
+                                onClicked: {
+                                    clipboard.text = shell.project.root;
+                                    clipboard.selectAll();
+                                    clipboard.copy();
+                                    clipboard.deselect();
+                                }
+                            }
+                        }
+                    }
+
+                    RowLayout {
+                        spacing: Kirigami.Units.smallSpacing
+
+                        Kirigami.Chip {
+                            checkable: false
+                            closable: false
+                            text: shell.project.managed
+                                ? qsTr("Managed clone")
+                                : qsTr("Local folder")
+                            visible: !shell.project.isGit || !shell.project.available
+                        }
+
+                        Kirigami.Chip {
+                            checkable: false
+                            closable: false
+                            text: qsTr("Missing from disk")
+                            visible: !shell.project.available
+                        }
+
+                        // Branch, worktree, and remote state are the repository
+                        // controls proper: they name what is checked out and let it
+                        // be changed from where it is displayed.
+                        RepositoryToolbar {
+                            activity: shellActivity
+                            backend: shell.backend
+                            project: shell.project
+                            visible: shell.project.isGit && shell.project.available
+                        }
                     }
                 }
             }
-
-            Component.onCompleted: fileModel.setRoot(shell.project.root)
         }
-        */
+
+        RowLayout {
+            Layout.fillHeight: true
+            Layout.fillWidth: true
+            spacing: 0
+
+            ActivityBar {
+                Layout.fillHeight: true
+                currentViewId: shell.currentViewId
+                panelExpanded: shell.sidePanelExpanded
+                views: sidePanel.views
+                visible: sidePanel.hasAvailableView
+                onViewTriggered: viewId => shell.activateView(viewId)
+            }
+
+            Kirigami.Separator {
+                Layout.fillHeight: true
+                visible: sidePanel.hasAvailableView
+            }
+
+            // The current view owns everything right of the activity bar, so
+            // collapsing it takes the whole surface rather than baring a companion
+            // pane the activity bar never advertised.
+            SidePanel {
+                id: sidePanel
+
+                Layout.fillHeight: true
+                Layout.fillWidth: true
+                currentViewId: shell.currentViewId
+                visible: shell.sidePanelExpanded && sidePanel.currentPanelReady
+
+                GitPanel {
+                    id: gitPanel
+
+                    backend: shell.backend
+                    project: shell.project
+                    onHideRequested: shell.sidePanelExpanded = false
+                }
+            }
+
+            /*
+            FileTreeModel {
+                id: fileModel
+            }
+
+            TreeView {
+                id: tree
+
+                Layout.fillHeight: true
+                Layout.fillWidth: true
+                Layout.minimumWidth: Kirigami.Units.gridUnit * 12
+                clip: true
+                model: fileModel
+                selectionModel: ItemSelectionModel {}
+                visible: shell.project.available
+
+                delegate: Controls.TreeViewDelegate {
+                    id: treeDelegate
+
+                    // The KDE TreeViewDelegate already requires a `model` object.
+                    // Consequently custom roles are exposed through that object,
+                    // not injected as standalone required properties.
+                    readonly property string fileName: model.fileName
+                    readonly property string filePath: model.filePath
+                    readonly property bool isDirectory: model.isDirectory
+
+                    Controls.ToolTip.text: treeDelegate.filePath
+                    Controls.ToolTip.visible: treeDelegate.hovered
+
+                    contentItem: RowLayout {
+                        spacing: Kirigami.Units.smallSpacing
+
+                        Kirigami.Icon {
+                            Layout.preferredHeight: Kirigami.Units.iconSizes.small
+                            Layout.preferredWidth: Kirigami.Units.iconSizes.small
+                            source: treeDelegate.isDirectory ? "folder" : "text-plain"
+                        }
+
+                        Controls.Label {
+                            Layout.fillWidth: true
+                            elide: Text.ElideRight
+                            text: treeDelegate.fileName
+                        }
+                    }
+                }
+
+                Component.onCompleted: fileModel.setRoot(shell.project.root)
+            }
+            */
+        }
     }
 
     Kirigami.PlaceholderMessage {
