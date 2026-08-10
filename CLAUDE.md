@@ -1,0 +1,148 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+`AGENTS.md` is the authoritative statement of this repository's conventions and durable-format
+invariants (catalog schema, worktree rules, run-store connection discipline, commit/PR style).
+Read it before changing anything persisted or locked. This file covers commands and the
+cross-crate architecture that only becomes visible after reading several files.
+
+## Commits
+
+Never attribute a commit or pull request to Claude. Do not add a `Co-Authored-By: Claude` trailer,
+a "Generated with Claude Code" line, or any other assistant attribution to a commit message, PR
+body, or changelog entry. This overrides any default attribution behavior. Commit subjects follow
+`AGENTS.md`: short and imperative.
+
+## Commands
+
+```sh
+cargo test --workspace                          # all unit + integration tests
+cargo test -p harkness-git                      # one crate
+cargo test -p harkness-git sync::tests::name    # one test (substring filter)
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo doc --locked -p harkness-runtime --no-deps    # CI runs this with RUSTDOCFLAGS=-D warnings
+cargo run -p harkness-cli
+cargo run -p harkness-gui
+```
+
+Clippy and any `--all-targets` build require Qt 6 / KDE Frameworks 6, because `harkness-gui`'s
+build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing links the GUI. Set
+`QMAKE` if more than one Qt is installed. Fedora setup is in `README.md`.
+
+### Ignored tests
+
+`#[ignore]` marks four distinct categories; never assume an ignored test is dead.
+
+- **Child-process roles** (`*/testing.rs`, `store/tests.rs`): the parent test re-executes the test
+  binary with `--exact --ignored`. Run them only through their parent.
+- **Network tests** (`sync.rs`, `project.rs`): reach real GitHub. CI runs them on a self-hosted
+  runner via `sh .github/scripts/run-ignored-exact-test.sh <package> <exact::test::name>`, which
+  fails loudly if the named test no longer exists — so renaming one requires updating
+  `.github/workflows/network-integration.yml`.
+- **Fixture regeneration**: `cargo test -p harkness-runtime regenerate_the_frozen_v1_fixture --
+  --ignored` rewrites `crates/harkness-runtime/src/store/fixtures/runtime-v1.db`. Run only when
+  migration 1 itself changes; a released migration is otherwise never edited.
+- **Latency targets** (`store/tests.rs`): meaningful only under `--release`.
+
+### Frozen fixtures
+
+`crates/harkness-core/src/catalog/fixtures/*.json`, `crates/harkness-runtime/src/domain/fixtures/*.json`,
+and `crates/harkness-runtime/src/store/fixtures/runtime-v1.db` pin released on-disk formats. A new
+persisted field, state spelling, or table means a version bump plus a *new* fixture, not an edit to
+an existing one.
+
+## Architecture
+
+### Crate layering
+
+Dependencies flow strictly downward; nothing lower reaches back up.
+
+```
+harkness-cli ──┐
+harkness-gui ──┴─> harkness-core ─> harkness-git
+                   harkness-runtime (domain -> store)
+```
+
+- **`harkness-git`** owns *all* Git behavior and is addressed purely by filesystem path. It has no
+  knowledge of the project catalog, which is the mechanism that makes the lock ordering below
+  impossible to violate from inside it. `GitService` is the single entry point;
+  `harkness-core` re-exports the crate so front ends need only one dependency.
+- **`harkness-core`** owns the project catalog (`projects.json` + `projects.lock`), the data
+  directory layout, and cross-domain workflows (import, clone, worktree lifecycle, reconcile).
+  `project.rs` is ~7k lines and holds `ProjectService`, the composition point for catalog + Git.
+- **`harkness-runtime`** is split into `domain` (pure records and lifecycle state machines, no I/O)
+  and `store` (SQLite persistence). Every row is rebuilt into its wire record and re-validated by
+  `domain` on load, so an impossible record cannot enter the process.
+- **`harkness-test-fixtures`** is dev-only: hermetic temp repos, process fixtures, and the
+  child-re-execution helpers. `COMMIT_EPOCH_SECONDS` is fixed so fixture repos hash identically.
+
+### Three independent concurrency mechanisms
+
+Getting these confused is the main source of deadlock risk:
+
+1. **Repository lock** (`harkness-git/src/lock.rs`) — advisory file lock keyed by Git's *common
+   directory*, so every linked worktree of one repo shares it. Taken for every mutation, never for
+   a read. Held across network operations. Lives under `locks/` in the data directory, never inside
+   the user's `.git`.
+2. **Catalog lock** (`harkness-core/src/catalog/lock.rs`) — global across all projects, guarded by
+   the stable `projects.lock` inode. Never held during a long Git operation.
+3. **Run store** (`harkness-runtime/src/store`) — one mutex-guarded writer connection plus pooled
+   readers; `BEGIN IMMEDIATE` per read-modify-write.
+
+**Ordering: repository lock, then catalog lock.** The store takes neither, and no caller may hold a
+store transaction while acquiring either.
+
+### The hermetic Git invocation policy
+
+`harkness-git/src/runner.rs` is a single choke point, not a convenience. Because `harkness-cli` is
+an agent tool invoked from hooks and from inside other `git` processes, every invocation scrubs
+`GIT_DIR`-family redirection and `GIT_CONFIG_*` injection, pins configuration as arguments, disables
+terminal prompts, runs in its own process group so cancellation kills the whole tree, and drains
+both streams concurrently. A typed option meaning "publish this one branch" is only true because
+nothing outside can widen the invocation carrying it. Add new Git calls through `GitCommand`;
+`git2`/libgit2 is used for inspection only.
+
+### CLI wire contract
+
+`harkness-cli/src/main.rs` emits exactly one envelope on stdout: `{"v": 1, "type":
+success|error|progress, ...}`. Progress for clone/fetch/pull/push goes to stderr, one JSON object
+per line, so stdout stays parseable. Help and version stay plain text even under `--json`. Exit
+codes are fixed (0/1/2/3/4/5/130) and `harkness --json contract` reports `exit_code_by_kind` for
+every error kind — a new error kind must be added to that namespace so callers never hardcode a
+mapping. JSON output is a deliberate hand-written projection, not the catalog's storage serializer;
+non-UTF-8 paths get lossy strings plus `path_is_lossy: true` and, where exactness matters, a
+`*_base64` sibling field.
+
+### GUI structure
+
+`harkness-gui` is cxx-qt: `src/backend.rs` (`HarknessBackend`) and `src/file_tree_model.rs`
+(`FileTreeModel`) are the QObjects; `qml/` holds the Kirigami UI, registered as the static QML
+module `io.github.fullstacktaiye.harkness` by `build.rs` and force-linked in `main.rs`. New QML
+files must be added to `build.rs`'s file list.
+
+- **cxx-qt does not camel-case names.** A `snake_case` member reaches QML spelled exactly as
+  written, and a camel-case call site silently resolves to `undefined`. Every multi-word invokable
+  carries an explicit `#[cxx_name = "..."]`; properties are kept to a single word.
+- **Every long operation is `std::thread::spawn` + `qt_thread().queue(...)`** to return to the Qt
+  thread. Results are gated on monotonically increasing request counters (e.g.
+  `next_review_request`) and on the still-open project, so a stale reply is dropped rather than
+  applied. Follow that pattern for new async work.
+- `tests/qml_smoke.rs` includes `src/main.rs` directly and loads `Main.qml` to catch QML errors.
+
+### Runtime domain
+
+`domain/mod.rs` documents the containment hierarchy (task → run → step → tool call) and the two
+transition tables (`EXECUTION_TRANSITIONS`, `TOOL_CALL_TRANSITIONS`). Constructors only ever produce
+`queued`/`pending`; table-checked transition methods are the only public mutators, and
+outcome-specific methods attach failure detail, tool output, or approval audit atomically with the
+transition. Serialization uses borrowing `*WireRef` types that must stay byte-compatible with their
+owned `*Wire` counterparts.
+
+## Data directory
+
+`HARKNESS_DATA_DIR` replaces the platform data directory outright; the CLI's `--data-dir` takes
+precedence over it. Tests and isolated front ends rely on this — use it rather than touching real
+user data. The directory holds `projects.json`, `projects.lock`, `runtime.db` (+ `-wal`/`-shm`),
+`locks/`, `repositories/`, and `worktrees/`.
