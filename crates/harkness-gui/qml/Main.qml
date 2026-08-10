@@ -122,12 +122,8 @@ Kirigami.ApplicationWindow {
         palette.windowText: "#ffffff"
     }
 
-    /// A prompt dialog on the application's own black ground. Kirigami paints
-    /// a dialog's background from the view colour set with inheritance turned
-    /// off inside the component, so no colour stated out here reaches it and
-    /// replacing the background outright is the only way onto black. The
-    /// border stands in for the shadow that background carried: against a
-    /// black window and a translucent scrim, an unbordered dialog has no edge.
+    /// A prompt dialog on the application's own black ground; see
+    /// FloatingSurface.qml for why the background has to be replaced.
     component BlackPromptDialog: Kirigami.PromptDialog {
         Kirigami.Theme.colorSet: Kirigami.Theme.Window
         Kirigami.Theme.inherit: false
@@ -141,12 +137,7 @@ Kirigami.ApplicationWindow {
         palette.window: "#000000"
         palette.windowText: "#ffffff"
 
-        background: Rectangle {
-            border.color: Qt.rgba(1, 1, 1, 0.18)
-            border.width: 1
-            color: "#000000"
-            radius: Kirigami.Units.cornerRadius
-        }
+        background: FloatingSurface {}
     }
 
     /// A menu on the same black ground, for the same reason the dialog needs
@@ -155,12 +146,7 @@ Kirigami.ApplicationWindow {
     component BlackMenu: Controls.Menu {
         delegate: LegibleMenuItem {}
 
-        background: Rectangle {
-            border.color: Qt.rgba(1, 1, 1, 0.18)
-            border.width: 1
-            color: "#000000"
-            radius: Kirigami.Units.cornerRadius
-        }
+        background: FloatingSurface {}
     }
 
     menuBar: AppTitleBar {

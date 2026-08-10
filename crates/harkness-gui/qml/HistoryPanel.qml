@@ -150,6 +150,10 @@ ColumnLayout {
             onActivated: history.baseBranch = String(currentText).trim()
             onAccepted: history.baseBranch = String(editText).trim()
             onEditTextChanged: history.baseBranch = String(editText).trim()
+
+            background: FieldSurface {
+                field: basePicker
+            }
         }
 
         Controls.ToolButton {

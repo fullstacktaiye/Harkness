@@ -31,6 +31,30 @@ Item {
     readonly property int viewBadge: entries.length
     readonly property bool viewAvailable: project.available && project.isGit
 
+    /// The ground a tab in the section bar is drawn on. Flat and unfilled
+    /// until the tab is current, which is marked along the bottom edge.
+    component SectionTabBackground: Rectangle {
+        required property Controls.TabButton tab
+
+        // Stated rather than themed, for the reason FieldSurface.qml gives: a
+        // control carries the style's own colour set, so the theme read from
+        // inside one answers with the desktop scheme's grey.
+        color: tab.checked
+            ? "#000000"
+            : tab.hovered
+                ? Qt.rgba(1, 1, 1, 0.06)
+                : "transparent"
+
+        Rectangle {
+            anchors.bottom: parent.bottom
+            anchors.left: parent.left
+            anchors.right: parent.right
+            color: Kirigami.Theme.highlightColor
+            height: Math.round(Kirigami.Units.smallSpacing / 2)
+            visible: parent.tab.checked
+        }
+    }
+
     GitActivity {
         id: gitActivity
 
@@ -207,14 +231,36 @@ Item {
 
                     Layout.fillWidth: true
 
-                    Controls.TabButton {
-                        text: panel.entries.length > 0
-                            ? qsTr("Changes (%1)").arg(panel.entries.length)
-                            : qsTr("Changes")
+                    // A tab bar is painted by the widget style, which answers
+                    // to the desktop colour scheme rather than to anything the
+                    // window states, so the strip and its tabs are drawn here
+                    // instead. The current tab is marked along its bottom edge
+                    // the way the activity bar marks the current view: the mark
+                    // stays readable while the pointer hovers the other tab.
+                    background: Rectangle {
+                        color: "transparent"
                     }
 
                     Controls.TabButton {
+                        id: changesTab
+
+                        text: panel.entries.length > 0
+                            ? qsTr("Changes (%1)").arg(panel.entries.length)
+                            : qsTr("Changes")
+
+                        background: SectionTabBackground {
+                            tab: changesTab
+                        }
+                    }
+
+                    Controls.TabButton {
+                        id: historyTab
+
                         text: qsTr("History")
+
+                        background: SectionTabBackground {
+                            tab: historyTab
+                        }
                     }
                 }
 
@@ -287,6 +333,10 @@ Item {
                                     && gitActivity.job("push") === null
                                     && !gitActivity.repositoryOperationRunning()
                                 placeholderText: qsTr("Summary (required)")
+
+                                background: FieldSurface {
+                                    field: commitSummary
+                                }
                             }
 
                             Controls.TextArea {
@@ -298,6 +348,10 @@ Item {
                                 enabled: commitSummary.enabled
                                 placeholderText: qsTr("Description")
                                 wrapMode: TextEdit.Wrap
+
+                                background: FieldSurface {
+                                    field: commitDescription
+                                }
                             }
 
                             RowLayout {
@@ -376,6 +430,10 @@ Item {
 
     Kirigami.PromptDialog {
         id: pushOverrideDialog
+
+        // Kirigami paints a dialog from the desktop colour scheme with theme
+        // inheritance turned off inside the component; see FloatingSurface.qml.
+        background: FloatingSurface {}
 
         standardButtons: Kirigami.Dialog.Ok | Kirigami.Dialog.Cancel
         subtitle: qsTr("This publishes %1 directly to the remote's default branch. Confirm only if that protected action is intended.")

@@ -107,16 +107,7 @@ RowLayout {
             width: Kirigami.Units.gridUnit * 20
             y: branchSegment.height
 
-            // A popup is drawn by the widget style, which answers to the
-            // desktop scheme rather than to the black ground the window
-            // states, so it brings its own. The border is what gives it an
-            // edge against the black surface underneath.
-            background: Rectangle {
-                border.color: Qt.rgba(1, 1, 1, 0.18)
-                border.width: 1
-                color: "#000000"
-                radius: Kirigami.Units.cornerRadius
-            }
+            background: FloatingSurface {}
 
             onOpened: branchFilter.forceActiveFocus()
             onClosed: newBranchForm.visible = false
@@ -153,6 +144,10 @@ RowLayout {
 
                     Layout.fillWidth: true
                     placeholderText: qsTr("Filter branches")
+
+                    background: FieldSurface {
+                        field: branchFilter
+                    }
                 }
 
                 Controls.Label {
@@ -235,6 +230,10 @@ RowLayout {
                         enabled: toolbar.activity.job("create_branch") === null
                             && !toolbar.activity.repositoryOperationRunning()
                         placeholderText: qsTr("New branch name")
+
+                        background: FieldSurface {
+                            field: newBranch
+                        }
                     }
 
                     Controls.TextField {
@@ -245,6 +244,10 @@ RowLayout {
                             && !toolbar.activity.repositoryOperationRunning()
                         placeholderText: qsTr("Start point")
                         text: "HEAD"
+
+                        background: FieldSurface {
+                            field: branchStart
+                        }
                     }
 
                     Controls.Button {
@@ -299,13 +302,7 @@ RowLayout {
             width: Kirigami.Units.gridUnit * 24
             y: worktreeSegment.height
 
-            // See branchPopup: the style would otherwise draw it in grey.
-            background: Rectangle {
-                border.color: Qt.rgba(1, 1, 1, 0.18)
-                border.width: 1
-                color: "#000000"
-                radius: Kirigami.Units.cornerRadius
-            }
+            background: FloatingSurface {}
 
             onClosed: {
                 worktreeForm.visible = false;
@@ -550,6 +547,10 @@ RowLayout {
 
                         Layout.fillWidth: true
                         model: [qsTr("New branch"), qsTr("Existing branch"), qsTr("Detached HEAD")]
+
+                        background: FieldSurface {
+                            field: worktreeMode
+                        }
                     }
 
                     Controls.TextField {
@@ -560,6 +561,10 @@ RowLayout {
                             ? qsTr("Existing branch")
                             : qsTr("New branch name")
                         visible: worktreeMode.mode !== "detached"
+
+                        background: FieldSurface {
+                            field: worktreeBranch
+                        }
                     }
 
                     Controls.TextField {
@@ -571,6 +576,10 @@ RowLayout {
                             : qsTr("Start point")
                         text: worktreeMode.mode === "new" ? "HEAD" : ""
                         visible: worktreeMode.mode !== "existing"
+
+                        background: FieldSurface {
+                            field: worktreeStart
+                        }
                     }
 
                     Controls.Button {
@@ -603,6 +612,10 @@ RowLayout {
 
                         Layout.fillWidth: true
                         placeholderText: qsTr("Required reason for protecting this worktree")
+
+                        background: FieldSurface {
+                            field: lockReason
+                        }
                     }
 
                     Controls.Button {
@@ -643,6 +656,10 @@ RowLayout {
 
                             Layout.fillWidth: true
                             placeholderText: qsTr("Absolute destination path")
+
+                            background: FieldSurface {
+                                field: moveDestination
+                            }
                         }
 
                         Controls.ToolButton {
@@ -759,6 +776,10 @@ RowLayout {
     Kirigami.PromptDialog {
         id: createWorktreeDialog
 
+        // Kirigami paints a dialog from the desktop colour scheme with theme
+        // inheritance turned off inside the component; see FloatingSurface.qml.
+        background: FloatingSurface {}
+
         standardButtons: Kirigami.Dialog.Ok | Kirigami.Dialog.Cancel
         subtitle: toolbar.project.managed
             ? qsTr("Harkness will add a linked worktree from the repository at:\n%1\n\nThe current checkout is untouched.").arg(toolbar.project.root)
@@ -777,6 +798,10 @@ RowLayout {
 
     Kirigami.PromptDialog {
         id: moveWorktreeDialog
+
+        // Kirigami paints a dialog from the desktop colour scheme with theme
+        // inheritance turned off inside the component; see FloatingSurface.qml.
+        background: FloatingSurface {}
 
         standardButtons: Kirigami.Dialog.Ok | Kirigami.Dialog.Cancel
         subtitle: qsTr("Git will relocate %1 to:\n%2\n\nThe destination must be an absolute path that does not already exist.")
