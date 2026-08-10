@@ -12,7 +12,12 @@ fn main() {
             "qml/ActivityBarItem.qml",
             "qml/SidePanel.qml",
             "qml/PanelHeader.qml",
+            "qml/GitActivity.qml",
+            "qml/ToolbarSegment.qml",
+            "qml/RepositoryToolbar.qml",
             "qml/GitPanel.qml",
+            "qml/ChangesPanel.qml",
+            "qml/HistoryPanel.qml",
             "qml/ReviewSurface.qml",
         ]),
     )

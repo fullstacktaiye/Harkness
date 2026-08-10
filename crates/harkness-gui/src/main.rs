@@ -1053,6 +1053,33 @@ Kirigami.ApplicationWindow {
         selectedProjectId: String(projectFixture.id)
     }
 
+    GitActivity {
+        id: activityFixture
+
+        backend: fixtureBackend
+        project: projectFixture
+    }
+
+    // The tab and the header toolbar are what GitPanel hosts; instantiating
+    // them here as well is what makes their functions callable by name below.
+    ChangesPanel {
+        id: changesFixture
+
+        activity: activityFixture
+        backend: fixtureBackend
+        project: projectFixture
+        visible: false
+    }
+
+    RepositoryToolbar {
+        id: toolbarFixture
+
+        activity: activityFixture
+        backend: fixtureBackend
+        project: projectFixture
+        visible: false
+    }
+
     ReviewSurface {
         id: reviewFixture
 
@@ -1202,7 +1229,7 @@ Kirigami.ApplicationWindow {
             return;
         }
         realBackend.openProject(realProjectId);
-        gitPanel.selectPath("fixture-path", "added", "modified");
+        changesFixture.selectPath("fixture-path", "added", "modified");
         fixtureBackend.jobs = [];
         reviewFixture.toggleReviewLine("review-line-old", false);
         reviewFixture.toggleReviewLine("review-line-new", true);
@@ -1300,7 +1327,7 @@ Kirigami.ApplicationWindow {
             "progress": "Starting...",
             "cancellable": false
         }];
-        reviewBusyDetected = gitPanel.reviewReadRunning()
+        reviewBusyDetected = activityFixture.reviewReadRunning()
             && reviewFixture.reviewReadRunning();
         fixtureBackend.jobs = [{
             "id": "job-commit",
@@ -1311,7 +1338,7 @@ Kirigami.ApplicationWindow {
             "progress": "Starting...",
             "cancellable": true
         }];
-        mutationBusyDetected = gitPanel.repositoryMutationRunning()
+        mutationBusyDetected = activityFixture.repositoryMutationRunning()
             && reviewFixture.repositoryMutationRunning();
         fixtureBackend.jobs = [{
             "id": "job-status",
@@ -1322,7 +1349,7 @@ Kirigami.ApplicationWindow {
             "progress": "Starting...",
             "cancellable": true
         }];
-        operationBusyDetected = gitPanel.repositoryOperationRunning()
+        operationBusyDetected = activityFixture.repositoryOperationRunning()
             && reviewFixture.repositoryOperationRunning();
         fixtureBackend.jobs = [];
         reviewFixture.loadReviewRowPage("next");

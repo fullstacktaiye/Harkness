@@ -137,6 +137,16 @@ Kirigami.Page {
         visible: false
     }
 
+    // The header toolbar answers the same job and Git-state questions the
+    // source-control view does; both derive them from this projection so a
+    // running operation disables the toolbar and the panel together.
+    GitActivity {
+        id: shellActivity
+
+        backend: shell.backend
+        project: shell.project
+    }
+
     header: Controls.Pane {
         ColumnLayout {
             spacing: Kirigami.Units.smallSpacing
@@ -194,33 +204,12 @@ Kirigami.Page {
                     spacing: Kirigami.Units.smallSpacing
 
                     Kirigami.Chip {
-                        Controls.ToolTip.text: qsTr("Parent project: %1").arg(shell.project.parentName)
-                        Controls.ToolTip.visible: hovered && shell.project.worktree
                         checkable: false
                         closable: false
-                        hoverEnabled: true
-                        text: shell.project.worktree
-                            ? shell.project.branch.length > 0
-                                ? qsTr("Worktree: %1").arg(shell.project.branch)
-                                : qsTr("Worktree: detached HEAD")
-                            : shell.project.managed
-                                ? qsTr("Managed clone")
-                                : qsTr("Local folder")
-                    }
-
-                    Kirigami.Chip {
-                        checkable: false
-                        closable: false
-                        enabled: false
-                        text: shell.project.branch.length > 0 ? shell.project.branch : qsTr("detached HEAD")
-                        visible: shell.project.isGit
-                    }
-
-                    Kirigami.Chip {
-                        checkable: false
-                        closable: false
-                        text: qsTr("Uncommitted changes")
-                        visible: shell.project.isGit && shell.project.dirty
+                        text: shell.project.managed
+                            ? qsTr("Managed clone")
+                            : qsTr("Local folder")
+                        visible: !shell.project.isGit || !shell.project.available
                     }
 
                     Kirigami.Chip {
@@ -228,6 +217,16 @@ Kirigami.Page {
                         closable: false
                         text: qsTr("Missing from disk")
                         visible: !shell.project.available
+                    }
+
+                    // Branch, worktree, and remote state are the repository
+                    // controls proper: they name what is checked out and let it
+                    // be changed from where it is displayed.
+                    RepositoryToolbar {
+                        activity: shellActivity
+                        backend: shell.backend
+                        project: shell.project
+                        visible: shell.project.isGit && shell.project.available
                     }
                 }
             }

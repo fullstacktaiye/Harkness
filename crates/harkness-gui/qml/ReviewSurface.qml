@@ -11,14 +11,6 @@ ColumnLayout {
     required property var gitState
     required property bool stateReady
 
-    readonly property bool historyReady: backend.history !== undefined
-        && backend.history
-        && backend.history.projectId !== undefined
-        && String(backend.history.projectId) === String(project.id)
-    readonly property var historyState: historyReady ? backend.history : ({})
-    readonly property var commits: historyReady && historyState.commits !== undefined
-        ? historyState.commits
-        : []
     readonly property bool reviewReady: backend.review !== undefined
         && backend.review
         && backend.review.projectId !== undefined
@@ -45,7 +37,6 @@ ColumnLayout {
     property alias reviewContentY: reviewLineView.contentY
     property alias reviewCurrentIndex: reviewLineView.currentIndex
     readonly property bool reviewListHasActiveFocus: reviewLineView.activeFocus
-    property string baseBranch: ""
     property bool splitLayout: false
     property real heldReviewContentY: 0
     property real heldReviewViewportOffset: 0
@@ -94,33 +85,6 @@ ColumnLayout {
                 return candidate;
         }
         return null;
-    }
-
-    function chooseBaseBranch() {
-        if (!backend || backend.branches === undefined)
-            return;
-        if (baseBranch.length > 0 && baseBranch !== String(gitState.branch || ""))
-            return;
-        let fallback = "";
-        for (let index = 0; index < backend.branches.length; ++index) {
-            const branch = String(backend.branches[index].name || "");
-            if (branch === String(gitState.branch || ""))
-                continue;
-            if (branch === "main" || branch === "master") {
-                baseBranch = branch;
-                return;
-            }
-            if (fallback.length === 0)
-                fallback = branch;
-        }
-        baseBranch = fallback;
-    }
-
-    function formatCommitTime(seconds) {
-        const value = Number(seconds);
-        if (!isFinite(value))
-            return "";
-        return new Date(value * 1000).toLocaleString(Qt.locale(), Locale.ShortFormat);
     }
 
     function tint(color, opacity) {
@@ -1021,31 +985,16 @@ ColumnLayout {
         return delegate ? delegate.y - reviewLineView.contentY : Number.NaN;
     }
 
-    onStateReadyChanged: chooseBaseBranch()
     onProjectChanged: {
         pendingHunkNavigation = 0;
         clearReviewLineSelection();
         clearHeldPosition();
     }
     onReviewLineSelectionScopeChanged: clearReviewLineSelection()
-    onReviewStateChanged: {
-        if (String(reviewState.commitId || "").length === 0)
-            historyList.currentIndex = -1;
-        restoreHeldPosition();
-    }
-    Component.onCompleted: chooseBaseBranch()
-    onBaseBranchChanged: {
-        reviewBasePicker.currentIndex = -1;
-        if (reviewBasePicker.editText !== baseBranch)
-            reviewBasePicker.editText = baseBranch;
-    }
+    onReviewStateChanged: restoreHeldPosition()
 
     Connections {
         target: reviewSurface.backend
-
-        function onBranchesChanged() {
-            reviewSurface.chooseBaseBranch();
-        }
 
         function onJobsChanged() {
             // A mutation job is replaced by a review-refresh job in the same
@@ -1087,263 +1036,15 @@ ColumnLayout {
         onActivated: reviewSurface.navigateHunk(-1)
     }
 
-    RowLayout {
+    // The surface is driven entirely from the column beside it: a changed file,
+    // a commit, or a branch comparison picked there is what loads here.
+    Kirigami.PlaceholderMessage {
         Layout.fillWidth: true
-
-        Kirigami.Heading {
-            Layout.fillWidth: true
-            level: 4
-            text: qsTr("Review")
-        }
-
-        Controls.BusyIndicator {
-            Layout.preferredHeight: Kirigami.Units.iconSizes.small
-            Layout.preferredWidth: Kirigami.Units.iconSizes.small
-            running: reviewSurface.job("history") !== null
-                || reviewSurface.job("review") !== null
-            visible: running
-        }
-
-        Controls.ToolButton {
-            Accessible.name: text
-            Controls.ToolTip.text: qsTr("Refresh commit history")
-            Controls.ToolTip.visible: hovered
-            display: Controls.AbstractButton.IconOnly
-            enabled: reviewSurface.job("history") === null
-                && !reviewSurface.repositoryMutationRunning()
-            icon.name: "view-refresh"
-            text: qsTr("Refresh commit history")
-            onClicked: reviewSurface.backend.refreshHistory(reviewSurface.project.id)
-        }
-    }
-
-    Controls.Label {
-        Layout.fillWidth: true
-        color: Kirigami.Theme.disabledTextColor
-        text: qsTr("Review a commit, or compare the current branch with its merge-base.")
-        wrapMode: Text.Wrap
-    }
-
-    RowLayout {
-        Layout.fillWidth: true
-
-        Controls.Label {
-            Layout.fillWidth: true
-            elide: Text.ElideRight
-            font.bold: true
-            text: reviewSurface.stateReady && reviewSurface.gitState.branch
-                ? reviewSurface.gitState.branch
-                : qsTr("Detached HEAD")
-            textFormat: Text.PlainText
-        }
-
-        Controls.Label {
-            color: Kirigami.Theme.disabledTextColor
-            text: qsTr("against")
-        }
-
-        Controls.ComboBox {
-            id: reviewBasePicker
-
-            Layout.preferredWidth: Kirigami.Units.gridUnit * 7
-            editable: true
-            enabled: reviewSurface.stateReady && reviewSurface.gitState.branch
-                && !reviewSurface.reviewReadRunning()
-                && !reviewSurface.repositoryMutationRunning()
-            model: reviewSurface.backend.branches
-            textRole: "name"
-
-            Component.onCompleted: {
-                currentIndex = -1;
-                editText = reviewSurface.baseBranch;
-            }
-            onActivated: reviewSurface.baseBranch = String(currentText).trim()
-            onAccepted: reviewSurface.baseBranch = String(editText).trim()
-            onEditTextChanged: reviewSurface.baseBranch = String(editText).trim()
-        }
-
-        Controls.ToolButton {
-            Accessible.name: text
-            Controls.ToolTip.text: qsTr("Review branch against merge-base")
-            Controls.ToolTip.visible: hovered
-            display: Controls.AbstractButton.IconOnly
-            enabled: reviewSurface.stateReady
-                && reviewSurface.gitState.branch
-                && reviewSurface.baseBranch.length > 0
-                && !reviewSurface.reviewReadRunning()
-                && !reviewSurface.repositoryMutationRunning()
-            icon.name: "vcs-diff"
-            text: qsTr("Review branch against merge-base")
-            onClicked: {
-                historyList.currentIndex = -1;
-                reviewSurface.backend.reviewBranch(
-                    reviewSurface.project.id,
-                    reviewSurface.gitState.branch,
-                    reviewSurface.baseBranch
-                );
-            }
-        }
-    }
-
-    RowLayout {
-        Layout.fillWidth: true
-
-        Controls.Label {
-            Layout.fillWidth: true
-            color: Kirigami.Theme.disabledTextColor
-            text: qsTr("Working changes")
-        }
-
-        Controls.Button {
-            enabled: !reviewSurface.reviewReadRunning()
-                && !reviewSurface.repositoryMutationRunning()
-            text: qsTr("Staged")
-            onClicked: {
-                historyList.currentIndex = -1;
-                reviewSurface.backend.reviewWorkingChanges(
-                    reviewSurface.project.id,
-                    true,
-                    ""
-                );
-            }
-        }
-
-        Controls.Button {
-            enabled: !reviewSurface.reviewReadRunning()
-                && !reviewSurface.repositoryMutationRunning()
-            text: qsTr("Unstaged")
-            onClicked: {
-                historyList.currentIndex = -1;
-                reviewSurface.backend.reviewWorkingChanges(
-                    reviewSurface.project.id,
-                    false,
-                    ""
-                );
-            }
-        }
-    }
-
-    Kirigami.InlineMessage {
-        Layout.fillWidth: true
-        text: reviewSurface.historyReady ? reviewSurface.historyState.error || "" : ""
-        type: Kirigami.MessageType.Error
-        visible: text.length > 0
-    }
-
-    Controls.Label {
-        Layout.fillWidth: true
-        color: Kirigami.Theme.disabledTextColor
-        text: reviewSurface.historyReady && reviewSurface.historyState.loading !== true
-            ? qsTr("No commits yet")
-            : qsTr("Loading commit history…")
-        visible: reviewSurface.commits.length === 0
-        wrapMode: Text.Wrap
-    }
-
-    ListView {
-        id: historyList
-
-        Layout.fillWidth: true
-        Layout.preferredHeight: Math.min(
-            Kirigami.Units.gridUnit * 12,
-            Math.max(Kirigami.Units.gridUnit * 3, contentHeight)
-        )
-        activeFocusOnTab: true
-        boundsBehavior: Flickable.StopAtBounds
-        clip: true
-        currentIndex: -1
-        keyNavigationEnabled: true
-        model: reviewSurface.commits
-        reuseItems: true
-        spacing: Kirigami.Units.smallSpacing
-        visible: reviewSurface.commits.length > 0
-
-        delegate: Controls.ItemDelegate {
-            id: commitDelegate
-
-            required property int index
-            required property var modelData
-
-            Accessible.name: qsTr("Commit %1: %2 by %3")
-                .arg(modelData.shortId)
-                .arg(modelData.summary.length > 0
-                    ? modelData.summary
-                    : qsTr("no commit message"))
-                .arg(modelData.author)
-            Controls.ToolTip.text: modelData.message
-            Controls.ToolTip.visible: hovered && modelData.message.length > 0
-            highlighted: String(reviewSurface.reviewState.commitId || "")
-                === String(modelData.id)
-            enabled: !reviewSurface.repositoryMutationRunning()
-                && !reviewSurface.reviewReadRunning()
-            width: historyList.width
-            onClicked: {
-                historyList.currentIndex = index;
-                reviewSurface.backend.reviewCommit(
-                    reviewSurface.project.id,
-                    modelData.id
-                );
-            }
-
-            contentItem: ColumnLayout {
-                spacing: 0
-
-                Controls.Label {
-                    Layout.fillWidth: true
-                    elide: Text.ElideRight
-                    font.bold: true
-                    text: commitDelegate.modelData.summary.length > 0
-                        ? commitDelegate.modelData.summary
-                        : qsTr("(no commit message)")
-                    textFormat: Text.PlainText
-                }
-
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: Kirigami.Units.smallSpacing
-
-                    Controls.Label {
-                        color: Kirigami.Theme.linkColor
-                        font.family: "monospace"
-                        font.pixelSize: Kirigami.Theme.smallFont.pixelSize
-                        text: commitDelegate.modelData.shortId
-                        textFormat: Text.PlainText
-                    }
-
-                    Controls.Label {
-                        Layout.fillWidth: true
-                        color: Kirigami.Theme.disabledTextColor
-                        elide: Text.ElideRight
-                        font: Kirigami.Theme.smallFont
-                        text: qsTr("%1 · %2")
-                            .arg(commitDelegate.modelData.author)
-                            .arg(reviewSurface.formatCommitTime(
-                                commitDelegate.modelData.authorTime
-                            ))
-                        textFormat: Text.PlainText
-                    }
-                }
-            }
-        }
-
-        Controls.ScrollBar.vertical: Controls.ScrollBar {}
-    }
-
-    Controls.Button {
-        Layout.alignment: Qt.AlignHCenter
-        enabled: reviewSurface.job("history") === null
-            && !reviewSurface.repositoryMutationRunning()
-        icon.name: "go-down"
-        text: reviewSurface.job("history") === null
-            ? qsTr("Load older commits")
-            : qsTr("Loading…")
-        visible: reviewSurface.historyReady && reviewSurface.historyState.hasMore === true
-        onClicked: reviewSurface.backend.loadMoreHistory(reviewSurface.project.id)
-    }
-
-    Kirigami.Separator {
-        Layout.fillWidth: true
-        visible: reviewSurface.reviewReady
+        Layout.topMargin: Kirigami.Units.gridUnit * 2
+        explanation: qsTr("Pick a changed file, a commit, or a branch comparison in the Changes and History tabs.")
+        icon.name: "vcs-diff"
+        text: qsTr("No diff selected")
+        visible: !reviewSurface.reviewReady
     }
 
     ColumnLayout {
