@@ -97,12 +97,6 @@ Kirigami.Page {
         onActivated: shell.activateView(gitPanel.viewId)
     }
 
-    // Clipboard helper: Qt exposes no direct clipboard API to QML.
-    TextEdit {
-        id: clipboard
-        visible: false
-    }
-
     // The header toolbar answers the same job and Git-state questions the
     // source-control view does; both derive them from this projection so a
     // running operation disables the toolbar and the panel together.
@@ -214,15 +208,23 @@ Kirigami.Page {
                             text: shell.project.root
                         }
 
+                        // Refreshes every repository projection the header and
+                        // the source-control view read, mirroring GitPanel's
+                        // own refresh so both surfaces stay in step.
                         Controls.ToolButton {
-                            Controls.ToolTip.text: qsTr("Copy path")
+                            Controls.ToolTip.text: qsTr("Refresh repository")
+                            Controls.ToolTip.visible: hovered
                             display: Controls.AbstractButton.IconOnly
-                            icon.name: "edit-copy"
+                            enabled: !shellActivity.repositoryOperationRunning()
+                            icon.name: "view-refresh"
+                            text: qsTr("Refresh repository")
+                            visible: shell.project.isGit && shell.project.available
                             onClicked: {
-                                clipboard.text = shell.project.root;
-                                clipboard.selectAll();
-                                clipboard.copy();
-                                clipboard.deselect();
+                                shell.backend.refreshGit(shell.project.id);
+                                shell.backend.refreshBranches(shell.project.id);
+                                shell.backend.refreshHistory(shell.project.id);
+                                if (!shell.project.worktree)
+                                    shell.backend.refreshWorktrees(shell.project.id);
                             }
                         }
                     }

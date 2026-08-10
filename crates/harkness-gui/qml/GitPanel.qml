@@ -189,12 +189,14 @@ Item {
                 anchors.fill: parent
                 spacing: 0
 
+                /*
                 PanelHeader {
                     Layout.fillWidth: true
                     actions: [refreshAction]
                     title: panel.viewTitle
                     onHideRequested: panel.hideRequested()
                 }
+                */
 
                 Kirigami.Separator {
                     Layout.fillWidth: true

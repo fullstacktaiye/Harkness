@@ -59,6 +59,16 @@ RowLayout {
         return decodeURIComponent(value);
     }
 
+    /// The hairline drawn at the leading edge of each segment, so the toolbar
+    /// reads as divided cells rather than free-floating buttons.
+    component SegmentDivider: Kirigami.Separator {
+        Layout.bottomMargin: Kirigami.Units.smallSpacing
+        Layout.fillHeight: true
+        Layout.topMargin: Kirigami.Units.smallSpacing
+    }
+
+    SegmentDivider {}
+
     ToolbarSegment {
         id: branchSegment
 
@@ -89,6 +99,10 @@ RowLayout {
 
             closePolicy: Controls.Popup.CloseOnEscape
                 | Controls.Popup.CloseOnPressOutsideParent
+            // Keeps the popup inside the shell frame: the segments sit at the
+            // window's trailing edge, so an unclamped popup this wide would
+            // hang past the border the shell draws around itself.
+            margins: Kirigami.Units.largeSpacing * 2
             padding: Kirigami.Units.smallSpacing
             width: Kirigami.Units.gridUnit * 20
             y: branchSegment.height
@@ -244,6 +258,8 @@ RowLayout {
         }
     }
 
+    SegmentDivider {}
+
     ToolbarSegment {
         id: worktreeSegment
 
@@ -266,6 +282,8 @@ RowLayout {
 
             closePolicy: Controls.Popup.CloseOnEscape
                 | Controls.Popup.CloseOnPressOutsideParent
+            // See branchPopup: clamped so the list never overhangs the frame.
+            margins: Kirigami.Units.largeSpacing * 2
             padding: Kirigami.Units.smallSpacing
             width: Kirigami.Units.gridUnit * 24
             y: worktreeSegment.height
@@ -634,6 +652,8 @@ RowLayout {
             }
         }
     }
+
+    SegmentDivider {}
 
     ToolbarSegment {
         id: syncSegment

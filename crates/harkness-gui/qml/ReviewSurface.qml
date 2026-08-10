@@ -506,13 +506,21 @@ ColumnLayout {
 
     // The surface is driven entirely from the column beside it: a changed file,
     // a commit, or a branch comparison picked there is what loads here.
-    Kirigami.PlaceholderMessage {
+    Item {
+        Layout.fillHeight: true
         Layout.fillWidth: true
-        Layout.topMargin: Kirigami.Units.gridUnit * 2
-        explanation: qsTr("Pick a changed file, a commit, or a branch comparison in the Changes and History tabs.")
-        icon.name: "vcs-diff"
-        text: qsTr("No diff selected")
         visible: !reviewSurface.reviewReady
+
+        Kirigami.PlaceholderMessage {
+            anchors.centerIn: parent
+            explanation: qsTr("Pick a changed file, a commit, or a branch comparison in the Changes and History tabs.")
+            icon.name: "vcs-diff"
+            text: qsTr("No diff selected")
+            width: Math.min(
+                parent.width - Kirigami.Units.gridUnit * 2,
+                Kirigami.Units.gridUnit * 24
+            )
+        }
     }
 
     ColumnLayout {
@@ -563,14 +571,27 @@ ColumnLayout {
             visible: text.length > 0
         }
 
-        Controls.Label {
+        // An empty comparison is the surface's resting state, not an error:
+        // it takes the room the diff would and says so in the middle of it,
+        // instead of leaving a stray line of text under the header.
+        Item {
+            Layout.fillHeight: true
             Layout.fillWidth: true
-            color: Kirigami.Theme.disabledTextColor
-            text: qsTr("No files changed in this comparison.")
             visible: reviewSurface.reviewState.loading !== true
                 && reviewSurface.reviewFiles.length === 0
                 && (!reviewSurface.reviewState.error
                     || reviewSurface.reviewState.error.length === 0)
+
+            Kirigami.PlaceholderMessage {
+                anchors.centerIn: parent
+                explanation: qsTr("No files changed in this comparison. New edits show up here as soon as they land in the working tree.")
+                icon.name: "checkmark"
+                text: qsTr("Nothing to review")
+                width: Math.min(
+                    parent.width - Kirigami.Units.gridUnit * 2,
+                    Kirigami.Units.gridUnit * 24
+                )
+            }
         }
 
         Kirigami.Separator {
