@@ -130,8 +130,11 @@ impl ToolRegistry {
 
     /// Looks a tool up, or returns `None`.
     ///
-    /// `version` of `None` selects the highest registered version of `id` by
-    /// semantic-version precedence.
+    /// `version` of `None` resolves exactly as [`Self::resolve`] does: the highest
+    /// registered *stable* version by semantic-version precedence, falling back to
+    /// a pre-release only when no stable version exists. The two methods differ
+    /// only in whether a miss is an `Option` or a typed error — never in which tool
+    /// they pick.
     #[must_use]
     pub fn get(&self, id: &ToolId, version: Option<&ToolVersion>) -> Option<&Arc<dyn ErasedTool>> {
         match version {

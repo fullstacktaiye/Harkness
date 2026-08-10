@@ -16,19 +16,34 @@ use super::ToolIdentity;
 /// violations locate the mistake.
 pub const MAX_REPORTED_VIOLATIONS: usize = 10;
 
-/// Longest explanation one violation retains.
+/// Longest any single field of one violation retains.
 ///
-/// A validator's explanation quotes the value it rejected, and the value is
-/// caller-supplied and unbounded: a 200 KB instance rejected at its root
-/// produces a 200 KB sentence. That matters beyond tidiness, because
-/// [`ToolError::as_failure`] is how a refusal gets recorded against the tool
-/// call, and the run store refuses an inline payload over 64 KiB — an untruncated
-/// diagnostic would leave the call stuck in `running` with nothing written about
-/// why. Bounding each explanation, at the one place violations are constructed,
-/// keeps a whole report to roughly 5 KB.
-pub const MAX_VIOLATION_MESSAGE_BYTES: usize = 512;
+/// Every field of a violation derives from caller-supplied data, not just the
+/// explanation. A validator's explanation quotes the value it rejected, so a
+/// 200 KB instance rejected at its root produces a 200 KB sentence. Less
+/// obviously, the *pointer* is caller-controlled too: a JSON Pointer names the
+/// keys it traverses, so an input type with a map-valued field lets the caller
+/// pick the pointer's length by choosing a long key. Both are bounded, and for
+/// the same reason.
+///
+/// That reason is not tidiness. [`ToolError::as_failure`] is how a refusal gets
+/// recorded against the tool call, and the run store refuses an inline payload
+/// over 64 KiB — an unbounded diagnostic would leave the call stuck in `running`
+/// with nothing written about why it failed.
+pub const MAX_VIOLATION_FIELD_BYTES: usize = 512;
 
-/// Appended to an explanation that was cut short.
+/// Hard bound on the message [`ToolError::as_failure`] produces.
+///
+/// The per-field and per-list bounds keep a *schema* report small, but not every
+/// failure is a schema report: a tool flattening a verbose `GitError` into
+/// [`ToolError::ExecutionFailed`], or panicking with a payload that quotes its
+/// own input, reaches the same durable path. Rather than bound each variant
+/// separately and hope the next one remembers, the projection to a [`Failure`]
+/// clamps whatever it is handed. This is the invariant the run store depends on,
+/// so it is enforced where the record is actually made.
+pub const MAX_FAILURE_MESSAGE_BYTES: usize = 8 * 1024;
+
+/// Appended to text that was cut short.
 const TRUNCATION_MARKER: &str = "… (truncated)";
 
 /// Which side of an invocation a schema describes.
@@ -63,27 +78,46 @@ impl fmt::Display for SchemaDirection {
 
 /// One place a value failed to satisfy its declared schema.
 ///
-/// Both pointers are RFC 6901 JSON Pointers: `pointer` locates the offending
-/// value inside the instance and `schema_pointer` locates the rule it broke
-/// inside the published schema. An empty pointer refers to the whole document,
-/// which is what a wrong top-level type reports.
+/// Both pointers are RFC 6901 JSON Pointers: [`pointer`](Self::pointer) locates
+/// the offending value inside the instance and
+/// [`schema_pointer`](Self::schema_pointer) locates the rule it broke inside the
+/// published schema. An empty pointer refers to the whole document, which is what
+/// a wrong top-level type reports.
+///
+/// Every field is bounded to [`MAX_VIOLATION_FIELD_BYTES`]. The fields are
+/// private and deserialization re-applies the bound, so there is no way — a
+/// struct literal, a field assignment, or a value read back from JSON — to obtain
+/// a violation whose text is unbounded. A truncated field ends in an ellipsis
+/// marker, which also means a truncated pointer is visibly not a resolvable
+/// pointer rather than one that silently addresses the wrong place.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, from = "SchemaViolationWire")]
 pub struct SchemaViolation {
-    /// JSON Pointer into the rejected value.
-    pub pointer: String,
-    /// JSON Pointer into the schema rule that rejected it.
-    pub schema_pointer: String,
-    /// Human-readable explanation from the validator.
-    pub message: String,
+    pointer: String,
+    schema_pointer: String,
+    message: String,
+}
+
+/// Deserialization target for [`SchemaViolation`], so a violation read from JSON
+/// is bounded exactly as one built in process is.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchemaViolationWire {
+    pointer: String,
+    schema_pointer: String,
+    message: String,
+}
+
+impl From<SchemaViolationWire> for SchemaViolation {
+    fn from(wire: SchemaViolationWire) -> Self {
+        Self::new(wire.pointer, wire.schema_pointer, wire.message)
+    }
 }
 
 impl SchemaViolation {
     /// Records a violation at the given instance and schema locations.
     ///
-    /// The explanation is truncated to [`MAX_VIOLATION_MESSAGE_BYTES`]. This is
-    /// the only constructor, so no violation from any gate can carry an
-    /// unbounded quotation of the value it rejected.
+    /// Each field is truncated to [`MAX_VIOLATION_FIELD_BYTES`].
     #[must_use]
     pub fn new(
         pointer: impl Into<String>,
@@ -91,28 +125,49 @@ impl SchemaViolation {
         message: impl Into<String>,
     ) -> Self {
         Self {
-            pointer: pointer.into(),
-            schema_pointer: schema_pointer.into(),
-            message: truncate(message.into()),
+            pointer: truncate(pointer.into(), MAX_VIOLATION_FIELD_BYTES),
+            schema_pointer: truncate(schema_pointer.into(), MAX_VIOLATION_FIELD_BYTES),
+            message: truncate(message.into(), MAX_VIOLATION_FIELD_BYTES),
         }
+    }
+
+    /// JSON Pointer into the rejected value.
+    #[must_use]
+    pub fn pointer(&self) -> &str {
+        &self.pointer
+    }
+
+    /// JSON Pointer into the schema rule that rejected it.
+    #[must_use]
+    pub fn schema_pointer(&self) -> &str {
+        &self.schema_pointer
+    }
+
+    /// Human-readable explanation from the validator.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
     }
 }
 
-/// Bounds one explanation, cutting on a character boundary.
-fn truncate(mut message: String) -> String {
-    if message.len() <= MAX_VIOLATION_MESSAGE_BYTES {
-        return message;
+/// Bounds one string to `maximum` bytes, cutting on a character boundary.
+///
+/// The single truncation used by every bounded field in this module, so the cut
+/// and its marker cannot drift between them.
+pub(super) fn truncate(mut text: String, maximum: usize) -> String {
+    if text.len() <= maximum {
+        return text;
     }
 
     // `floor_char_boundary` is unstable, so walk back to one by hand; a cut
     // inside a multi-byte character would panic on `truncate`.
-    let mut boundary = MAX_VIOLATION_MESSAGE_BYTES;
-    while boundary > 0 && !message.is_char_boundary(boundary) {
+    let mut boundary = maximum;
+    while boundary > 0 && !text.is_char_boundary(boundary) {
         boundary -= 1;
     }
-    message.truncate(boundary);
-    message.push_str(TRUNCATION_MARKER);
-    message
+    text.truncate(boundary);
+    text.push_str(TRUNCATION_MARKER);
+    text
 }
 
 impl fmt::Display for SchemaViolation {
@@ -259,10 +314,16 @@ impl ToolError {
     /// The cause is flattened into text rather than retained as a source chain
     /// because this error is designed to become a durable [`Failure`], and a
     /// stored record cannot hold a live error object.
+    ///
+    /// The flattened text is clamped to [`MAX_FAILURE_MESSAGE_BYTES`]. A cause
+    /// worth reporting is often verbose — `GitError::Failed` interpolates the
+    /// whole captured stderr, and a rejected push or a chatty hook can make that
+    /// arbitrarily long — and a failure nobody can record is worse than a failure
+    /// described in less detail.
     #[must_use]
     pub fn execution_failed(cause: impl fmt::Display) -> Self {
         Self::ExecutionFailed {
-            message: cause.to_string(),
+            message: truncate(cause.to_string(), MAX_FAILURE_MESSAGE_BYTES),
         }
     }
 
@@ -299,11 +360,20 @@ impl ToolError {
     /// Projects this failure into the durable form a tool call records.
     ///
     /// The kind is the stable discriminant and the message is this error's
-    /// [`Display`](fmt::Display), which is bounded because violation lists are
-    /// truncated at [`MAX_REPORTED_VIOLATIONS`].
+    /// [`Display`](fmt::Display), clamped to [`MAX_FAILURE_MESSAGE_BYTES`].
+    ///
+    /// The clamp is here rather than on each variant because this is the single
+    /// point at which a `ToolError` becomes something the run store has to accept.
+    /// Bounding the variants alone would leave the invariant one new variant away
+    /// from being broken again, and the consequence of breaking it is not a long
+    /// message — it is a `payload_too_large` refusal that leaves the tool call in
+    /// `running` with no record of why it failed.
     #[must_use]
     pub fn as_failure(&self) -> Failure {
-        Failure::new(self.kind(), self.to_string())
+        Failure::new(
+            self.kind(),
+            truncate(self.to_string(), MAX_FAILURE_MESSAGE_BYTES),
+        )
     }
 }
 
@@ -525,10 +595,17 @@ impl InvocationError {
     }
 
     /// Projects this failure into the durable form a tool call records.
+    ///
+    /// Clamped to [`MAX_FAILURE_MESSAGE_BYTES`] on both paths. A resolution
+    /// message is built from an identifier a caller supplied, so it is bounded for
+    /// the same reason everything else on this path is.
     #[must_use]
     pub fn as_failure(&self) -> Failure {
         match self {
-            Self::Resolution(error) => Failure::new(error.kind(), error.to_string()),
+            Self::Resolution(error) => Failure::new(
+                error.kind(),
+                truncate(error.to_string(), MAX_FAILURE_MESSAGE_BYTES),
+            ),
             Self::Tool { error, .. } => error.as_failure(),
         }
     }
@@ -572,8 +649,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        InvocationError, MAX_REPORTED_VIOLATIONS, MAX_VIOLATION_MESSAGE_BYTES, RegistryError,
-        SchemaDirection, SchemaViolation, TRUNCATION_MARKER, ToolError,
+        InvocationError, MAX_FAILURE_MESSAGE_BYTES, MAX_REPORTED_VIOLATIONS,
+        MAX_VIOLATION_FIELD_BYTES, RegistryError, SchemaDirection, SchemaViolation,
+        TRUNCATION_MARKER, ToolError,
     };
     use crate::tool::ToolIdentity;
 
@@ -838,11 +916,11 @@ mod tests {
         let enormous = format!("{:?} is not of type object", "x".repeat(200 * 1024));
         let violation = SchemaViolation::new("", "/type", enormous);
         assert!(
-            violation.message.len() <= MAX_VIOLATION_MESSAGE_BYTES + TRUNCATION_MARKER.len(),
+            violation.message().len() <= MAX_VIOLATION_FIELD_BYTES + TRUNCATION_MARKER.len(),
             "one explanation is {} bytes",
-            violation.message.len()
+            violation.message().len()
         );
-        assert!(violation.message.ends_with(TRUNCATION_MARKER));
+        assert!(violation.message().ends_with(TRUNCATION_MARKER));
 
         let full = ToolError::InvalidInput {
             tool: identity(),
@@ -857,14 +935,108 @@ mod tests {
     }
 
     #[test]
+    fn a_pointer_is_bounded_because_a_map_key_is_caller_chosen() {
+        // The explanation is the obvious unbounded field; the pointer is the one
+        // that is easy to miss. A JSON Pointer names the keys it traverses, so an
+        // input type with a map-valued field lets the caller decide the pointer's
+        // length by choosing a long key.
+        let key = "k".repeat(100 * 1024);
+        let violation = SchemaViolation::new(format!("/labels/{key}"), "/properties", "wrong");
+        for field in [
+            violation.pointer(),
+            violation.schema_pointer(),
+            violation.message(),
+        ] {
+            assert!(
+                field.len() <= MAX_VIOLATION_FIELD_BYTES + TRUNCATION_MARKER.len(),
+                "a field is {} bytes",
+                field.len()
+            );
+        }
+        assert!(violation.pointer().ends_with(TRUNCATION_MARKER));
+
+        let report = ToolError::InvalidInput {
+            tool: identity(),
+            violations: vec![violation; MAX_REPORTED_VIOLATIONS],
+            omitted: 0,
+        };
+        assert!(
+            report.as_failure().message().len() < crate::store::MAX_INLINE_PAYLOAD_BYTES,
+            "a report of long pointers is {} bytes",
+            report.as_failure().message().len()
+        );
+    }
+
+    #[test]
+    fn the_bound_cannot_be_bypassed_by_deserializing_a_violation() {
+        // The fields are private, so a struct literal cannot smuggle a long value
+        // in. Deserialization is the other door, and it routes through the same
+        // constructor.
+        let json = serde_json::json!({
+            "pointer": "/".to_owned() + &"p".repeat(100 * 1024),
+            "schema_pointer": "s".repeat(100 * 1024),
+            "message": "m".repeat(100 * 1024),
+        });
+        let violation = serde_json::from_value::<SchemaViolation>(json).unwrap();
+        for field in [
+            violation.pointer(),
+            violation.schema_pointer(),
+            violation.message(),
+        ] {
+            assert!(
+                field.len() <= MAX_VIOLATION_FIELD_BYTES + TRUNCATION_MARKER.len(),
+                "a deserialized field is {} bytes",
+                field.len()
+            );
+            assert!(field.ends_with(TRUNCATION_MARKER));
+        }
+    }
+
+    #[test]
+    fn every_failure_projection_is_bounded_not_only_the_schema_reports() {
+        // A tool flattening a verbose cause, or panicking with a payload that
+        // quotes its input, reaches the same durable path as a schema report. The
+        // clamp lives on the projection so a variant added later cannot escape it.
+        let verbose = "stderr line\n".repeat(20 * 1024);
+        let cases = [
+            ToolError::execution_failed(&verbose),
+            ToolError::ExecutionFailed {
+                message: verbose.clone(),
+            },
+            ToolError::ToolPanicked {
+                tool: identity(),
+                payload: Some(verbose.clone()),
+            },
+            ToolError::Denied {
+                reason: verbose.clone(),
+            },
+        ];
+
+        for error in cases {
+            let failure = error.as_failure();
+            assert!(
+                failure.message().len() <= MAX_FAILURE_MESSAGE_BYTES + TRUNCATION_MARKER.len(),
+                "{} projected {} bytes",
+                error.kind(),
+                failure.message().len()
+            );
+            assert!(
+                failure.message().len() < crate::store::MAX_INLINE_PAYLOAD_BYTES,
+                "{} would be refused by the run store",
+                error.kind()
+            );
+        }
+    }
+
+    #[test]
     fn truncation_cuts_on_a_character_boundary() {
         // A cut inside a multi-byte character would panic, so the boundary walk
         // matters for any value containing non-ASCII text.
-        let multibyte = "é".repeat(MAX_VIOLATION_MESSAGE_BYTES);
+        let multibyte = "é".repeat(MAX_VIOLATION_FIELD_BYTES);
         let violation = SchemaViolation::new("/name", "/type", multibyte);
         assert!(violation.message.ends_with(TRUNCATION_MARKER));
         assert!(
-            violation.message.len() <= MAX_VIOLATION_MESSAGE_BYTES + TRUNCATION_MARKER.len(),
+            violation.message.len() <= MAX_VIOLATION_FIELD_BYTES + TRUNCATION_MARKER.len(),
             "{}",
             violation.message.len()
         );

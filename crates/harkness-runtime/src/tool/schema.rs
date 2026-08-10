@@ -2,11 +2,16 @@
 //!
 //! Schemas are generated from the `Input` and `Output` associated types by
 //! `schemars`, compiled into validators once at registration, and then applied
-//! to every call. Nothing here reads a schema from outside the process:
-//! `jsonschema` is built without its `resolve-http` and `resolve-file`
-//! features, so a `$ref` to a URL or a local file cannot be followed. A
-//! generated schema only ever refers to its own `$defs`, and a schema that
-//! reaches further is refused at registration rather than fetched at call time.
+//! to every call. Nothing here retrieves a schema from outside the process:
+//! `jsonschema` is built without its `resolve-http` and `resolve-file` features,
+//! so a `$ref` to a URL or a local file is refused at registration rather than
+//! fetched. A schema `schemars` generates only ever refers to its own `$defs`
+//! anyway; the point of the missing features is that nothing else could either.
+//!
+//! One reference does resolve without being retrieved: the JSON Schema draft
+//! meta-schemas ship inside `jsonschema`, so a `$ref` to one is satisfied from its
+//! built-in registry. That is local resolution, not retrieval, and the tests keep
+//! the two apart deliberately.
 
 use jsonschema::Validator;
 use schemars::{JsonSchema, SchemaGenerator};
@@ -241,9 +246,9 @@ mod tests {
             panic!("expected an input refusal, got {error:?}");
         };
         assert_eq!(violations.len(), 1);
-        assert_eq!(violations[0].pointer, "/depth");
+        assert_eq!(violations[0].pointer(), "/depth");
         assert!(
-            violations[0].schema_pointer.contains("depth"),
+            violations[0].schema_pointer().contains("depth"),
             "{:?}",
             violations[0]
         );
@@ -259,7 +264,7 @@ mod tests {
         let crate::tool::ToolError::InvalidInput { violations, .. } = &nested else {
             panic!("expected an input refusal, got {nested:?}");
         };
-        assert_eq!(violations[0].pointer, "/nested/0/label");
+        assert_eq!(violations[0].pointer(), "/nested/0/label");
     }
 
     #[test]
@@ -328,7 +333,7 @@ mod tests {
         let crate::tool::ToolError::InvalidInput { violations, .. } = &error else {
             panic!("expected an input refusal, got {error:?}");
         };
-        assert_eq!(violations[0].pointer, "");
+        assert_eq!(violations[0].pointer(), "");
     }
 
     #[test]
@@ -353,21 +358,54 @@ mod tests {
     }
 
     #[test]
-    fn an_external_reference_cannot_be_retrieved() {
-        // Built without `resolve-http`/`resolve-file`, so a schema that reaches
-        // outside the process fails to compile instead of fetching anything.
-        for reference in [
-            json!({"$ref": "https://example.invalid/schema.json"}),
-            json!({"$ref": "file:///etc/passwd"}),
-        ] {
-            assert_eq!(
-                compile(&identity(), SchemaDirection::Input, &reference)
-                    .unwrap_err()
-                    .kind(),
-                "invalid_schema",
-                "retrieved {reference}"
+    fn an_external_reference_is_refused_for_want_of_a_retriever() {
+        // `jsonschema` is built without `resolve-file` or `resolve-http`, so a
+        // `$ref` outside the document cannot be followed.
+        //
+        // Two things make this test actually pin that. The file reference points at
+        // a file that *exists* and holds a *valid* schema, and the HTTP reference
+        // uses a host that is not one of the draft meta-schemas `jsonschema`
+        // bundles — otherwise the reference would resolve from the built-in
+        // registry and prove nothing. And each assertion names the missing feature
+        // rather than merely checking that compilation failed: an unreachable host
+        // or a malformed file fails either way, so a weaker test would stay green
+        // if retrieval came back. It could come back without anyone editing this
+        // crate — through Cargo feature unification, if some other workspace member
+        // ever depends on `jsonschema` with default features.
+        let directory = tempfile::tempdir().unwrap();
+        let schema_path = directory.path().join("referenced.json");
+        std::fs::write(&schema_path, br#"{"type": "string"}"#).unwrap();
+
+        let cases = [
+            (
+                json!({"$ref": format!("file://{}", schema_path.display())}),
+                "`resolve-file` feature",
+            ),
+            (
+                json!({"$ref": "https://example.com/schema.json"}),
+                "`resolve-http` feature",
+            ),
+        ];
+
+        for (reference, required) in cases {
+            let error = compile(&identity(), SchemaDirection::Input, &reference).unwrap_err();
+            assert_eq!(error.kind(), "invalid_schema", "retrieved {reference}");
+            assert!(
+                error.to_string().contains(required),
+                "{reference} failed for some other reason than a missing retriever: {error}"
             );
         }
+    }
+
+    #[test]
+    fn a_bundled_meta_schema_reference_resolves_without_retrieval() {
+        // The counterpart to the test above, and the reason it cannot simply use
+        // any URL: the draft meta-schemas ship inside `jsonschema`, so a `$ref` to
+        // one compiles from the built-in registry with nothing fetched. Recording
+        // that here keeps the distinction between "resolved locally" and
+        // "retrieved" explicit rather than looking like an inconsistency.
+        let reference = json!({"$ref": "https://json-schema.org/draft/2020-12/schema"});
+        assert!(compile(&identity(), SchemaDirection::Input, &reference).is_ok());
     }
 
     #[test]
@@ -385,7 +423,7 @@ mod tests {
         let crate::tool::ToolError::InvalidInput { violations, .. } = &error else {
             panic!("expected an input refusal, got {error:?}");
         };
-        assert_eq!(violations[0].pointer, "/depth");
+        assert_eq!(violations[0].pointer(), "/depth");
     }
 
     #[test]
@@ -401,7 +439,7 @@ mod tests {
         let crate::tool::ToolError::InvalidInput { violations, .. } = &error else {
             panic!("expected an input refusal, got {error:?}");
         };
-        assert_eq!(violations[0].pointer, "/labels/a~1b~0c");
+        assert_eq!(violations[0].pointer(), "/labels/a~1b~0c");
     }
 
     #[test]

@@ -293,12 +293,18 @@ pub struct ExecutionContext {
 impl ExecutionContext {
     /// Builds a context for one tool call.
     ///
+    /// The root is stored lexically normalized: redundant `.` components are
+    /// dropped, so [`workspace_root`](Self::workspace_root) can be compared
+    /// against a canonical project path as a string. `..` is *refused* rather than
+    /// normalized, because resolving it lexically would silently disagree with the
+    /// filesystem wherever a symlink is involved.
+    ///
     /// # Errors
     ///
-    /// Returns [`ToolError::ForbiddenPath`] when `workspace_root` is not
-    /// absolute or is not already lexically normal. Both are refused here, once,
-    /// so [`resolve`](Self::resolve) can reason about containment by prefix
-    /// alone rather than re-deriving it on every path a tool touches.
+    /// Returns [`ToolError::ForbiddenPath`] when `workspace_root` is not absolute
+    /// or contains a `..` component. Both are refused here, once, so
+    /// [`resolve`](Self::resolve) can reason about containment by prefix alone
+    /// rather than re-deriving it on every path a tool touches.
     pub fn new(
         run: RunId,
         step: StepId,
@@ -308,21 +314,28 @@ impl ExecutionContext {
         progress: Box<dyn ProgressSink>,
         artifacts: Box<dyn ArtifactWriter>,
     ) -> Result<Self, ToolError> {
-        let workspace_root = workspace_root.into();
-        if !workspace_root.is_absolute() {
+        let supplied = workspace_root.into();
+        if !supplied.is_absolute() {
             return Err(ToolError::ForbiddenPath {
-                path: workspace_root,
+                path: supplied,
                 reason: "the workspace root must be an absolute path",
             });
         }
-        if workspace_root
-            .components()
-            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
-        {
-            return Err(ToolError::ForbiddenPath {
-                path: workspace_root,
-                reason: "the workspace root must not contain . or .. components",
-            });
+
+        // Rebuilding from components is what normalizes the root: `Components`
+        // already drops `.` for an absolute path, so collecting it yields the
+        // normal form. There is deliberately no `CurDir` arm below — for an
+        // absolute path it is unreachable, and a match arm that cannot fire reads
+        // like a check that is happening when it is not.
+        let mut workspace_root = PathBuf::new();
+        for component in supplied.components() {
+            if component == Component::ParentDir {
+                return Err(ToolError::ForbiddenPath {
+                    path: supplied,
+                    reason: "the workspace root must not contain a .. component",
+                });
+            }
+            workspace_root.push(component);
         }
 
         Ok(Self {
@@ -584,6 +597,34 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains(".."), "{error}");
+    }
+
+    #[test]
+    fn the_workspace_root_is_stored_lexically_normalized() {
+        // `.` is dropped rather than refused: `Path::components` already elides it
+        // for an absolute path, so refusing it would need a check that cannot fire.
+        // Normalizing means `workspace_root()` can be compared against a canonical
+        // project path as a string, which a consumer will do.
+        let noisy = Path::new(ROOT).join(".").join("sub");
+        let context =
+            ExecutionContext::detached(RunId::new(), StepId::new(), ToolCallId::new(), noisy)
+                .unwrap();
+
+        let expected = Path::new(ROOT).join("sub");
+        assert_eq!(context.workspace_root(), expected);
+        assert!(
+            !context.workspace_root().to_string_lossy().contains("/./"),
+            "the stored root kept a redundant component: {:?}",
+            context.workspace_root()
+        );
+        assert_eq!(context.resolve("a.txt").unwrap(), expected.join("a.txt"));
+
+        // A trailing separator is likewise normalized away.
+        let trailing = format!("{}{}", expected.display(), std::path::MAIN_SEPARATOR);
+        let context =
+            ExecutionContext::detached(RunId::new(), StepId::new(), ToolCallId::new(), trailing)
+                .unwrap();
+        assert_eq!(context.workspace_root(), expected);
     }
 
     #[test]

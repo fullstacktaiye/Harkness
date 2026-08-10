@@ -777,7 +777,8 @@ fn schema_invalid_input_is_refused_before_the_tool_body_runs() {
             "no violation was located for {input}"
         );
         assert_eq!(
-            violations[0].pointer, pointer,
+            violations[0].pointer(),
+            pointer,
             "unexpected pointer for {input}: {violations:?}"
         );
         assert!(
@@ -839,7 +840,8 @@ fn schema_invalid_output_is_refused_before_delivery() {
     };
     assert_eq!(tool.to_string(), "fixture.bad_output@1.0.0");
     assert_eq!(
-        violations[0].pointer, "",
+        violations[0].pointer(),
+        "",
         "a wrong top-level output type is located at the root: {violations:?}"
     );
     assert!(
@@ -1027,6 +1029,90 @@ fn a_failed_unpinned_call_still_reports_the_version_that_ran() {
     )
     .unwrap_err();
     assert_eq!(unresolved.tool(), None);
+}
+
+#[test]
+fn a_body_raised_schema_error_cannot_claim_the_body_never_ran() {
+    // `ToolError` is `#[non_exhaustive]` at the enum level, which does not seal its
+    // variants, so a tool can construct `InvalidInput` itself and return it after
+    // having already done work. Left alone that error would tell a coordinator
+    // nothing ran and licence a retry that repeats the earlier side effect.
+    struct ValidatesItself {
+        writes: Arc<AtomicUsize>,
+    }
+
+    impl Tool for ValidatesItself {
+        type Input = Empty;
+        type Output = EchoOutput;
+
+        fn metadata(&self) -> ToolMetadata {
+            ToolMetadata::new(
+                ToolIdentity::parse("fixture.self_validating", "1.0.0").unwrap(),
+                "Self validating",
+                "Writes, then reports an input violation of its own.",
+                RiskLevel::WorkspaceWrite,
+            )
+        }
+
+        fn execute(
+            &self,
+            _input: Empty,
+            _context: &mut ExecutionContext,
+        ) -> Result<EchoOutput, ToolError> {
+            self.writes.fetch_add(1, Ordering::Release);
+            Err(ToolError::InvalidInput {
+                tool: ToolIdentity::parse("fixture.self_validating", "1.0.0").unwrap(),
+                violations: vec![super::SchemaViolation::new(
+                    "/nested",
+                    "",
+                    "the tool's own opinion",
+                )],
+                omitted: 0,
+            })
+        }
+    }
+
+    let writes = Arc::new(AtomicUsize::new(0));
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(ValidatesItself {
+            writes: Arc::clone(&writes),
+        })
+        .unwrap();
+    let mut context = context();
+
+    let error = invoke(
+        &registry,
+        &id("fixture.self_validating"),
+        None,
+        &raw("{}"),
+        &mut context,
+    )
+    .unwrap_err();
+
+    assert_eq!(writes.load(Ordering::Acquire), 1, "the body did run");
+    assert_eq!(
+        error.kind(),
+        "execution_failed",
+        "a body-raised schema error must be re-attributed"
+    );
+    let Some(tool_error) = error.tool_error() else {
+        panic!("expected a tool failure, got {error:?}");
+    };
+    assert!(
+        !tool_error.happened_before_execution(),
+        "the retry guarantee must not survive a body that already wrote"
+    );
+    // The tool's complaint is still readable, it just cannot pose as a
+    // pre-execution refusal.
+    assert!(
+        error.to_string().contains("the tool's own opinion"),
+        "the detail should be preserved: {error}"
+    );
+    assert!(
+        error.to_string().contains("had already validated"),
+        "the re-attribution should say what happened: {error}"
+    );
 }
 
 #[test]

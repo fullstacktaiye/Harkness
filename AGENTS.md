@@ -156,11 +156,20 @@ pre-release must never change what production runs.
 Both a tool id and a tool version are length-bounded, because both are persisted
 in adjacent `tool_calls` columns held to the store's 64 KiB inline limit. Semver
 places no limit on pre-release identifiers, so without the bound a version could
-register cleanly and then make every record of its own calls unpersistable. The
-same reasoning bounds each schema-violation explanation: a validator quotes the
-value it rejected, that value is caller-supplied, and `ToolError::as_failure` is
-how a refusal gets recorded — an untruncated diagnostic would leave the call stuck
-in `running` with nothing written about why it failed.
+register cleanly and then make every record of its own calls unpersistable.
+
+The same reasoning bounds everything a failure carries, and the bound belongs on
+the projection rather than on the variants. `ToolError::as_failure` is how a
+refusal gets recorded, so it clamps whatever it is handed; a message too large is
+refused by the store as `payload_too_large` and leaves the call stuck in `running`
+with nothing written about why it failed. Bounding variants alone leaves the
+invariant one new variant away from breaking — and there are more sources than the
+obvious one. A validator quotes the value it rejected. A JSON Pointer names the map
+keys it traverses, so a caller choosing a long key chooses the pointer's length. A
+tool flattening a `GitError` into `execution_failed` carries whatever stderr Git
+produced. A panic payload can quote the tool's own input. Every field of a
+`SchemaViolation` is truncated, its fields are private, and deserialization
+re-applies the bound, so no construction path yields an unbounded one.
 
 Cancellation is checked by the pipeline, not only by tools. `execute_json` gates
 on the token before validating and again before the body, so a tool dispatched
@@ -172,6 +181,20 @@ flight still depends on the tool polling `check_cancelled`.
 calling the body. Do not widen it. `forbidden_path` in particular is raised by
 `ExecutionContext::resolve`, which tools call mid-body, so treating it as
 pre-execution would licence a retry that double-applies an earlier write.
+
+`#[non_exhaustive]` on an enum does not seal its variants, so a tool *can*
+construct `invalid_input` itself and return it after doing work. The erasure
+boundary therefore re-attributes a schema error raised by the body to
+`execution_failed`, keeping the detail in the message. Only the pipeline's own gate
+may produce a kind that promises nothing ran.
+
+`jsonschema` is built with `default-features = false`, which drops `resolve-http`
+and `resolve-file`. A test asserts each refusal *names the missing feature*, not
+merely that compilation failed — an unreachable host or a malformed file fails
+either way, so a weaker assertion would stay green if Cargo feature unification
+restored retrieval because some other workspace member depended on `jsonschema`
+with default features. Note that the draft meta-schemas ship inside the crate and
+resolve from its built-in registry; that is local resolution, not retrieval.
 
 Schemas are generated from the `Input` and `Output` associated types and never
 declared by hand, so a published contract cannot disagree with the type the tool

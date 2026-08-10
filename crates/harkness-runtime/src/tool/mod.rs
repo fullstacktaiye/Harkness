@@ -44,12 +44,19 @@
 //! Both gates locate their findings. A [`SchemaViolation`] carries an RFC 6901
 //! JSON Pointer into the offending value and another into the schema rule it
 //! broke, which is what makes a refusal actionable for an agent retrying on its
-//! own. Reports are bounded in both directions — at most
-//! [`MAX_REPORTED_VIOLATIONS`] violations, each explanation truncated to
-//! [`MAX_VIOLATION_MESSAGE_BYTES`], with the true number of omitted violations
-//! stated — because a validator quotes the value it rejected, that value is
-//! caller-supplied, and [`ToolError::as_failure`] has to fit the run store's
-//! inline payload limit to be recorded at all.
+//! own.
+//!
+//! Everything on that path is bounded, because all of it derives from
+//! caller-supplied data: at most [`MAX_REPORTED_VIOLATIONS`] violations with the
+//! true number of omissions stated, each *field* of each violation truncated to
+//! [`MAX_VIOLATION_FIELD_BYTES`] — the pointer as well as the explanation, since a
+//! pointer names the map keys it traverses — and finally the whole projection
+//! clamped to [`MAX_FAILURE_MESSAGE_BYTES`] by [`ToolError::as_failure`]. The last
+//! of those is the one that matters most: it is not a schema-specific bound but
+//! the guarantee that *any* failure, including a tool flattening a verbose cause
+//! or a panic payload quoting its own input, fits the run store's inline payload
+//! limit. A failure too large to record leaves the tool call stuck in `running`
+//! with no account of why, which is worse than a failure described in less detail.
 //!
 //! # Risk and capabilities
 //!
@@ -90,8 +97,11 @@
 //! surprise on the first call.
 //!
 //! Nothing here retrieves a schema from outside the process: `jsonschema` is
-//! built without its `resolve-http` and `resolve-file` features, so a `$ref` to
-//! a URL or a local file cannot be followed.
+//! built without its `resolve-http` and `resolve-file` features, so a `$ref` to a
+//! URL or a local file is refused at registration rather than fetched. The one
+//! exception is not an exception to that: the draft meta-schemas ship inside
+//! `jsonschema`, so a `$ref` to one resolves from its built-in registry with
+//! nothing retrieved.
 //!
 //! One thing is the tool author's responsibility. `schemars` closes an object
 //! schema only when the type carries `#[serde(deny_unknown_fields)]`, so **every
@@ -147,8 +157,8 @@ pub use descriptor::{
 };
 pub use erased::{ErasedTool, Tool, erase};
 pub use error::{
-    InvocationError, MAX_REPORTED_VIOLATIONS, MAX_VIOLATION_MESSAGE_BYTES, RegistryError,
-    SchemaDirection, SchemaViolation, ToolError,
+    InvocationError, MAX_FAILURE_MESSAGE_BYTES, MAX_REPORTED_VIOLATIONS, MAX_VIOLATION_FIELD_BYTES,
+    RegistryError, SchemaDirection, SchemaViolation, ToolError,
 };
 pub use identifier::{Capability, MAX_IDENTIFIER_LENGTH, ToolId, ToolIdentity, ToolVersion};
 pub use registry::{ToolOutcome, ToolRegistry, invoke, invoke_resolved};

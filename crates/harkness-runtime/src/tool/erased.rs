@@ -8,10 +8,11 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use serde_json::value::RawValue;
 
+use super::error::truncate;
 use super::schema;
 use super::{
-    ExecutionContext, RegistryError, SchemaDirection, SchemaViolation, ToolDescriptor, ToolError,
-    ToolMetadata,
+    ExecutionContext, MAX_FAILURE_MESSAGE_BYTES, RegistryError, SchemaDirection, SchemaViolation,
+    ToolDescriptor, ToolError, ToolIdentity, ToolMetadata,
 };
 
 /// One typed operation the runtime can execute.
@@ -254,7 +255,7 @@ where
         // must not take down the coordinator thread and orphan the run record.
         let executed = catch_unwind(AssertUnwindSafe(|| self.tool.execute(typed, context)));
         let produced = match executed {
-            Ok(result) => result?,
+            Ok(result) => result.map_err(|error| reattribute(identity, error))?,
             Err(payload) => {
                 return Err(ToolError::ToolPanicked {
                     tool: identity.clone(),
@@ -284,15 +285,46 @@ where
     }
 }
 
+/// Re-labels a failure a tool body raised but is not entitled to claim.
+///
+/// [`ToolError::happened_before_execution`] answers `true` for
+/// [`ToolError::InvalidInput`] because *this* pipeline raises it before calling
+/// the body. `ToolError` is `#[non_exhaustive]` at the enum level, which does not
+/// seal its variants, so a tool that validates a sub-field itself can construct
+/// one and return it — after having already written a file. Left alone, that error
+/// would tell a coordinator the body never started and licence a retry that
+/// applies the earlier write twice.
+///
+/// The detail is kept, as an `execution_failed` message: the tool's complaint is
+/// still worth reading, it just cannot masquerade as a pre-execution refusal.
+/// `InvalidOutput` is re-labelled too, for the same reason — it is this module's
+/// verdict on the tool's result, not the tool's own.
+fn reattribute(identity: &ToolIdentity, error: ToolError) -> ToolError {
+    match error {
+        ToolError::InvalidInput { .. } | ToolError::InvalidOutput { .. } => {
+            ToolError::execution_failed(format!(
+                "{identity} reported a schema violation from inside its own body, \
+                 which the invocation pipeline had already validated: {error}"
+            ))
+        }
+        other => other,
+    }
+}
+
 /// Recovers a panic payload's text when it is one of the two shapes the standard
 /// library produces for `panic!`.
 ///
 /// A payload of any other type is reported as `None` rather than guessed at: the
 /// kind is already `tool_panicked`, and inventing a message for an opaque
 /// payload would misattribute it.
+///
+/// A recovered payload is a formatted string a tool chose, which can quote its own
+/// input, so it is clamped like every other text that reaches
+/// [`ToolError::as_failure`].
 fn panic_message(payload: &(dyn Any + Send)) -> Option<String> {
-    if let Some(message) = payload.downcast_ref::<&'static str>() {
-        return Some((*message).to_owned());
-    }
-    payload.downcast_ref::<String>().cloned()
+    let recovered = payload
+        .downcast_ref::<&'static str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())?;
+    Some(truncate(recovered, MAX_FAILURE_MESSAGE_BYTES))
 }
