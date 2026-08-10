@@ -181,10 +181,15 @@ Kirigami.ApplicationWindow {
         && fixtureBackend.lastReviewPath === "fixture-path"
         && fixtureBackend.stageHunkCalls === 3
         && fixtureBackend.unstageHunkCalls === 1
+        && fixtureBackend.stageLineCalls === 2
+        && fixtureBackend.lastLineIds === "review-line-old\nreview-line-new"
         && fixtureBackend.lastHunkProject === String(projectFixture.id)
         && fixtureBackend.lastHunkId === "review-hunk-fixture"
         && reviewFixture.splitLayout === true
         && pairedRowsDetected === true
+        && lineSelectionDetected === true
+        && rowToggleDetected === true
+        && offWindowSelectionDetected === true
         && reviewFixture.restorePositionAfterMutation === false
         && reviewFixture.heldReviewPathId === ""
         && reviewFixture.heldReviewRowIndex === -1
@@ -207,6 +212,10 @@ Kirigami.ApplicationWindow {
         : "GitPanelSmokeFailed-" + fixtureBackend.stageHunkCalls
             + "-" + fixtureBackend.unstageHunkCalls
             + "-" + pairedRowsDetected
+            + "-" + lineSelectionDetected
+            + "-" + rowToggleDetected
+            + "-" + offWindowSelectionDetected
+            + "-" + fixtureBackend.stageLineCalls
             + "-" + reviewBusyDetected
             + "-" + mutationBusyDetected
             + "-" + operationBusyDetected
@@ -234,6 +243,9 @@ Kirigami.ApplicationWindow {
 
     property bool reviewBusyDetected: false
     property bool pairedRowsDetected: false
+    property bool lineSelectionDetected: false
+    property bool rowToggleDetected: false
+    property bool offWindowSelectionDetected: false
     property bool mutationBusyDetected: false
     property bool operationBusyDetected: false
     property bool fileBoundaryDetected: false
@@ -422,6 +434,7 @@ Kirigami.ApplicationWindow {
                 "pathId": current.file.pathId,
                 "summary": "",
                 "binary": false,
+                "lineAction": "stage",
                 "hunkCount": 1,
                 "totalRows": rows.length,
                 "rowOffset": 0,
@@ -623,6 +636,8 @@ Kirigami.ApplicationWindow {
         property string lastReviewPath: ""
         property int stageHunkCalls: 0
         property int unstageHunkCalls: 0
+        property int stageLineCalls: 0
+        property int unstageLineCalls: 0
         property int nextPageCalls: 0
         property int previousPageCalls: 0
         property int loadReviewFileCalls: 0
@@ -634,6 +649,7 @@ Kirigami.ApplicationWindow {
         property int crossPagePhase: 0
         property string lastHunkProject: ""
         property string lastHunkId: ""
+        property string lastLineIds: ""
 
         property var branches: [{
             "name": "topic",
@@ -730,6 +746,7 @@ Kirigami.ApplicationWindow {
                 "pathId": "fixture-review-path",
                 "summary": "",
                 "binary": false,
+                "lineAction": "stage",
                 "hunkCount": 1,
                 "rows": [{
                     "type": "collapsed",
@@ -748,8 +765,11 @@ Kirigami.ApplicationWindow {
                     "newLines": 1
                 }, {
                     "type": "line",
+                    "hunkId": "review-hunk-fixture",
+                    "lineAction": "stage",
                     "splitHidden": false,
                     "unified": {
+                        "lineId": "review-line-old",
                         "oldLine": 1,
                         "newLine": 0,
                         "kind": "deletion",
@@ -760,6 +780,7 @@ Kirigami.ApplicationWindow {
                         }]
                     },
                     "old": {
+                        "lineId": "review-line-old",
                         "present": true,
                         "line": 1,
                         "kind": "deletion",
@@ -770,6 +791,7 @@ Kirigami.ApplicationWindow {
                         }]
                     },
                     "new": {
+                        "lineId": "review-line-new",
                         "present": true,
                         "line": 1,
                         "kind": "addition",
@@ -781,8 +803,11 @@ Kirigami.ApplicationWindow {
                     }
                 }, {
                     "type": "line",
+                    "hunkId": "review-hunk-fixture",
+                    "lineAction": "stage",
                     "splitHidden": true,
                     "unified": {
+                        "lineId": "review-line-new",
                         "oldLine": 0,
                         "newLine": 1,
                         "kind": "addition",
@@ -873,6 +898,14 @@ Kirigami.ApplicationWindow {
             ++unstageHunkCalls;
             lastHunkProject = String(projectId);
             lastHunkId = String(hunkId);
+        }
+        function stageLines(projectId, lineIds) {
+            ++stageLineCalls;
+            lastLineIds = String(lineIds);
+        }
+        function unstageLines(projectId, lineIds) {
+            ++unstageLineCalls;
+            lastLineIds = String(lineIds);
         }
         function commit(projectId, message, amend) {}
         function fetch(projectId) {}
@@ -1027,9 +1060,13 @@ Kirigami.ApplicationWindow {
         interval: 250
         repeat: false
         onTriggered: {
-            gitPanel.grabToImage(function(result) {
-                screenshotSaved = result.saveToFile(screenshotPath);
-                Qt.quit();
+            reviewFixture.toggleReviewLine("review-line-old", false);
+            reviewFixture.toggleReviewLine("review-line-new", true);
+            Qt.callLater(function() {
+                reviewFixture.grabToImage(function(result) {
+                    screenshotSaved = result.saveToFile(screenshotPath);
+                    Qt.quit();
+                });
             });
         }
     }
@@ -1043,6 +1080,56 @@ Kirigami.ApplicationWindow {
         }
         realBackend.openProject(realProjectId);
         gitPanel.selectPath("fixture-path", "added", "modified");
+        fixtureBackend.jobs = [];
+        reviewFixture.toggleReviewLine("review-line-old", false);
+        reviewFixture.toggleReviewLine("review-line-new", true);
+        lineSelectionDetected = reviewFixture.selectedReviewLineCount === 2
+            && reviewFixture.isReviewLineSelected("review-line-old")
+            && reviewFixture.isReviewLineSelected("review-line-new");
+
+        // The row toggle behind both the delegate click and the Space key has
+        // to treat a split row's two sides as one control. Half-selecting the
+        // pair and pressing again must complete it, never invert it.
+        reviewFixture.setSplitLayout(true);
+        reviewFixture.clearReviewLineSelection();
+        reviewFixture.toggleReviewLine("review-line-old", false);
+        reviewFixture.setCurrentReviewRow(2);
+        const halfSelectedRowToggled = reviewFixture.toggleCurrentReviewLine(false);
+        rowToggleDetected = halfSelectedRowToggled
+            && reviewFixture.selectedReviewLineCount === 2
+            && reviewFixture.isReviewLineSelected("review-line-old")
+            && reviewFixture.isReviewLineSelected("review-line-new")
+            // A whole row toggles back off in one press.
+            && reviewFixture.toggleCurrentReviewLine(false)
+            && reviewFixture.selectedReviewLineCount === 0;
+        reviewFixture.setSplitLayout(false);
+
+        // The verb comes from the loaded file, so a selection whose rows have
+        // paged out of the window still resolves one.
+        reviewFixture.clearReviewLineSelection();
+        reviewFixture.toggleReviewLine("review-line-old", false);
+        const windowedRows = fixtureBackend.review.file.rows;
+        fixtureBackend.review = Object.assign({}, fixtureBackend.review, {
+            "file": Object.assign({}, fixtureBackend.review.file, { "rows": [] })
+        });
+        offWindowSelectionDetected = reviewFixture.selectedReviewLineCount === 1
+            && reviewFixture.selectedReviewLineAction() === "stage"
+            && reviewFixture.selectedReviewLineAnchorRow() === null;
+        // Staging must still be attempted with nothing left to anchor on.
+        const stagedBeforeOffWindow = fixtureBackend.stageLineCalls;
+        reviewFixture.mutateSelectedLines();
+        offWindowSelectionDetected = offWindowSelectionDetected
+            && fixtureBackend.stageLineCalls === stagedBeforeOffWindow + 1;
+        fixtureBackend.review = Object.assign({}, fixtureBackend.review, {
+            "file": Object.assign({}, fixtureBackend.review.file, {
+                "rows": windowedRows
+            })
+        });
+
+        reviewFixture.clearReviewLineSelection();
+        reviewFixture.toggleReviewLine("review-line-old", false);
+        reviewFixture.toggleReviewLine("review-line-new", true);
+        reviewFixture.mutateSelectedLines();
         reviewFixture.mutateHunk(fixtureBackend.review.file.rows[1]);
         const unifiedFixtureRowCount = reviewFixture.displayedReviewRowCount();
         reviewFixture.setSplitLayout(true);

@@ -28,9 +28,9 @@ use harkness_git::{
     DetailedStatus, DiffLine, DiffLineKind, DiffOmission, DiffOptions, DiffTarget, FetchOptions,
     FetchOutcome, FileChange, FileContextOmission, FileContextRange, FileContextRequest,
     FileContextResponse, FileDiff, FileSide, GitError, GitService, GitStatus, HeadState, Hunk,
-    HunkSelection, IntraLineDegradation, LogCursor, LogOptions, LogRange, PendingOperation,
-    PullOptions, PullOutcome, PullStrategy, PushOptions, PushOutcome, RefUpdate, StageOutcome,
-    StagePathResult, StatusEntry, StatusRefreshOutcome, UpstreamStatus, WorktreeBase,
+    HunkSelection, IntraLineDegradation, LineSelection, LogCursor, LogOptions, LogRange,
+    PendingOperation, PullOptions, PullOutcome, PullStrategy, PushOptions, PushOutcome, RefUpdate,
+    StageOutcome, StagePathResult, StatusEntry, StatusRefreshOutcome, UpstreamStatus, WorktreeBase,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -90,7 +90,7 @@ enum Command {
     /// Inspect and change Git repositories through the dedicated Git service.
     Git {
         #[command(subcommand)]
-        command: GitCommand,
+        command: Box<GitCommand>,
     },
     /// Manage linked Git worktree workspaces.
     Worktree {
@@ -319,10 +319,16 @@ struct StageArguments {
     #[command(flatten)]
     selection: ProjectSelection,
     /// Repository-relative or absolute paths to stage.
-    #[arg(required_unless_present_any = ["all", "hunk", "hunk_selection"], value_name = "PATH")]
+    #[arg(
+        required_unless_present_any = ["all", "hunk", "hunk_selection", "line_selection"],
+        value_name = "PATH"
+    )]
     paths: Vec<PathBuf>,
     /// Stage every change, including deletions.
-    #[arg(long, conflicts_with_all = ["paths", "hunk", "hunk_selection"])]
+    #[arg(
+        long,
+        conflicts_with_all = ["paths", "hunk", "hunk_selection", "line_selection"]
+    )]
     all: bool,
     #[command(flatten)]
     hunk: HunkArguments,
@@ -333,7 +339,10 @@ struct UnstageArguments {
     #[command(flatten)]
     selection: ProjectSelection,
     /// Repository-relative or absolute paths to unstage.
-    #[arg(required_unless_present_any = ["hunk", "hunk_selection"], value_name = "PATH")]
+    #[arg(
+        required_unless_present_any = ["hunk", "hunk_selection", "line_selection"],
+        value_name = "PATH"
+    )]
     paths: Vec<PathBuf>,
     #[command(flatten)]
     hunk: HunkArguments,
@@ -634,7 +643,7 @@ struct HunkArguments {
     /// mutation. Use --hunk-selection for more than one hunk at a time.
     #[arg(
         long,
-        conflicts_with_all = ["paths", "hunk_selection"],
+        conflicts_with_all = ["paths", "hunk_selection", "line_selection"],
         requires_all = [
             "hunk_path",
             "old_blob_id",
@@ -653,8 +662,22 @@ struct HunkArguments {
     /// arrays have been narrowed to the wanted hunks, or {"selections": [...]}
     /// holding flat records. One invocation is one atomic index write, so the
     /// coordinate shift that invalidates a second single-hunk call cannot occur.
-    #[arg(long, value_name = "PATH", conflicts_with = "paths")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["paths", "line_selection"]
+    )]
     hunk_selection: Option<PathBuf>,
+    /// Apply changed lines named by a JSON selection document, atomically.
+    /// The shape matches --hunk-selection, but each retained hunk's "lines"
+    /// array is narrowed to the additions and deletions to apply. Context and
+    /// EOF-marker records may remain and are ignored.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["paths", "hunk", "hunk_selection"]
+    )]
+    line_selection: Option<PathBuf>,
     /// Old-side path from the diff file record; omit for an addition.
     #[arg(
         long,
@@ -712,6 +735,11 @@ struct HunkArguments {
     new_lines: Option<u32>,
 }
 
+enum GranularSelections {
+    Hunks(Vec<HunkSelection>),
+    Lines(Vec<LineSelection>),
+}
+
 impl HunkArguments {
     /// The batch this invocation names, or `None` when it is a path operation.
     ///
@@ -719,7 +747,17 @@ impl HunkArguments {
     /// error rather than a silent no-op that would look like a successful
     /// stage. Clap already enforces the flag form's requirements, so the checks
     /// here exist for the document form, whose contents it cannot see.
-    fn into_selections(self, consumes: &str) -> Result<Option<Vec<HunkSelection>>, CliError> {
+    fn into_selections(self, consumes: &str) -> Result<Option<GranularSelections>, CliError> {
+        if let Some(source) = self.line_selection {
+            let document = read_selection_document(&source)?;
+            let selections = parse_line_selection_document(&document, consumes)?;
+            if selections.is_empty() {
+                return Err(CliError::Usage(
+                    "the line-selection document names no changed lines".to_owned(),
+                ));
+            }
+            return Ok(Some(GranularSelections::Lines(selections)));
+        }
         if let Some(source) = self.hunk_selection {
             let document = read_selection_document(&source)?;
             let selections = parse_selection_document(&document, consumes)?;
@@ -728,7 +766,7 @@ impl HunkArguments {
                     "the selection document names no hunks".to_owned(),
                 ));
             }
-            return Ok(Some(selections));
+            return Ok(Some(GranularSelections::Hunks(selections)));
         }
         if !self.hunk {
             return Ok(None);
@@ -742,21 +780,23 @@ impl HunkArguments {
                 "--hunk requires at least one of --old-path and --new-path".to_owned(),
             ));
         }
-        Ok(Some(vec![HunkSelection::from_parts(
-            old_path,
-            new_path,
-            self.old_blob_id.ok_or_else(|| missing("old_blob_id"))?,
-            self.new_blob_id.ok_or_else(|| missing("new_blob_id"))?,
-            self.context_lines.ok_or_else(|| missing("context_lines"))?,
-            (
-                self.old_start.ok_or_else(|| missing("old_start"))?,
-                self.old_lines.ok_or_else(|| missing("old_lines"))?,
+        Ok(Some(GranularSelections::Hunks(vec![
+            HunkSelection::from_parts(
+                old_path,
+                new_path,
+                self.old_blob_id.ok_or_else(|| missing("old_blob_id"))?,
+                self.new_blob_id.ok_or_else(|| missing("new_blob_id"))?,
+                self.context_lines.ok_or_else(|| missing("context_lines"))?,
+                (
+                    self.old_start.ok_or_else(|| missing("old_start"))?,
+                    self.old_lines.ok_or_else(|| missing("old_lines"))?,
+                ),
+                (
+                    self.new_start.ok_or_else(|| missing("new_start"))?,
+                    self.new_lines.ok_or_else(|| missing("new_lines"))?,
+                ),
             ),
-            (
-                self.new_start.ok_or_else(|| missing("new_start"))?,
-                self.new_lines.ok_or_else(|| missing("new_lines"))?,
-            ),
-        )]))
+        ])))
     }
 }
 
@@ -885,6 +925,48 @@ fn parse_selection_document(
         .collect()
 }
 
+/// Reads the same two document shapes as hunk selection, with each selected
+/// hunk retaining only the changed lines the caller wants to apply. Context and
+/// EOF-marker records may remain in a diff projection and are ignored.
+fn parse_line_selection_document(
+    document: &str,
+    consumes: &str,
+) -> Result<Vec<LineSelection>, CliError> {
+    let value: Value = serde_json::from_str(document).map_err(|error| {
+        CliError::Usage(format!("the line-selection document is not JSON: {error}"))
+    })?;
+    let value = value
+        .get("data")
+        .filter(|data| data.get("files").is_some())
+        .unwrap_or(&value);
+    if let Some(files) = value.get("files") {
+        let files = array(files, "files")?;
+        let mut selections = Vec::new();
+        for (index, file) in files.iter().enumerate() {
+            let at = format!("files[{index}]");
+            check_target(file, consumes, &at)?;
+            selections.extend(file_line_selections(file, &at)?);
+        }
+        return Ok(selections);
+    }
+    let selections = match value.get("selections") {
+        Some(selections) => array(selections, "selections")?,
+        None => array(
+            value,
+            "the document root; expected an object with \"files\" or \"selections\"",
+        )?,
+    };
+    selections
+        .iter()
+        .enumerate()
+        .map(|(index, selection)| {
+            let at = format!("selections[{index}]");
+            check_target(selection, consumes, &at)?;
+            flat_line_selection(selection, &at)
+        })
+        .collect()
+}
+
 /// Refuses a record taken from the side of the index this command cannot use.
 ///
 /// A record with no `target` is accepted: the flat form is not required to
@@ -947,6 +1029,69 @@ fn file_selections(file: &Value, at: &str) -> Result<Vec<HunkSelection>, CliErro
         .collect()
 }
 
+fn file_line_selections(file: &Value, at: &str) -> Result<Vec<LineSelection>, CliError> {
+    let old_path = record_path(file, "old_path", at)?;
+    let new_path = record_path(file, "new_path", at)?;
+    if old_path.is_none() && new_path.is_none() {
+        return Err(CliError::Usage(format!(
+            "{at} has neither an old_path nor a new_path"
+        )));
+    }
+    let old_blob_id = record_string(file, "old_blob_id", at)?;
+    let new_blob_id = record_string(file, "new_blob_id", at)?;
+    let context_lines = record_u32(file, "context_lines", at)?;
+    let hunks = array(
+        file.get("hunks")
+            .ok_or_else(|| CliError::Usage(format!("{at} has no \"hunks\"")))?,
+        &format!("{at}.hunks"),
+    )?;
+    let mut selections = Vec::new();
+    for (hunk_index, hunk) in hunks.iter().enumerate() {
+        let hunk_at = format!("{at}.hunks[{hunk_index}]");
+        let old_range = (
+            record_u32(hunk, "old_start", &hunk_at)?,
+            record_u32(hunk, "old_lines", &hunk_at)?,
+        );
+        let new_range = (
+            record_u32(hunk, "new_start", &hunk_at)?,
+            record_u32(hunk, "new_lines", &hunk_at)?,
+        );
+        let lines = array(
+            hunk.get("lines")
+                .ok_or_else(|| CliError::Usage(format!("{hunk_at} has no \"lines\"")))?,
+            &format!("{hunk_at}.lines"),
+        )?;
+        for (line_index, line) in lines.iter().enumerate() {
+            let line_at = format!("{hunk_at}.lines[{line_index}]");
+            let kind = record_string(line, "kind", &line_at)?;
+            if !matches!(kind.as_str(), "addition" | "deletion") {
+                if matches!(
+                    kind.as_str(),
+                    "context" | "both_eof_no_newline" | "old_eof_no_newline" | "new_eof_no_newline"
+                ) {
+                    continue;
+                }
+                return Err(CliError::Usage(format!(
+                    "{line_at}.kind is not a selectable diff-line kind"
+                )));
+            }
+            let (old_line_number, new_line_number) = line_coordinates(line, Some(&kind), &line_at)?;
+            selections.push(LineSelection::from_parts(
+                old_path.clone(),
+                new_path.clone(),
+                old_blob_id.clone(),
+                new_blob_id.clone(),
+                context_lines,
+                old_range,
+                new_range,
+                old_line_number,
+                new_line_number,
+            ));
+        }
+    }
+    Ok(selections)
+}
+
 fn flat_selection(selection: &Value, at: &str) -> Result<HunkSelection, CliError> {
     let old_path = record_path(selection, "old_path", at)?;
     let new_path = record_path(selection, "new_path", at)?;
@@ -970,6 +1115,60 @@ fn flat_selection(selection: &Value, at: &str) -> Result<HunkSelection, CliError
             record_u32(selection, "new_lines", at)?,
         ),
     ))
+}
+
+fn flat_line_selection(selection: &Value, at: &str) -> Result<LineSelection, CliError> {
+    let old_path = record_path(selection, "old_path", at)?;
+    let new_path = record_path(selection, "new_path", at)?;
+    if old_path.is_none() && new_path.is_none() {
+        return Err(CliError::Usage(format!(
+            "{at} has neither an old_path nor a new_path"
+        )));
+    }
+    let kind = selection.get("kind").and_then(Value::as_str);
+    let (old_line_number, new_line_number) = line_coordinates(selection, kind, at)?;
+    Ok(LineSelection::from_parts(
+        old_path,
+        new_path,
+        record_string(selection, "old_blob_id", at)?,
+        record_string(selection, "new_blob_id", at)?,
+        record_u32(selection, "context_lines", at)?,
+        (
+            record_u32(selection, "old_start", at)?,
+            record_u32(selection, "old_lines", at)?,
+        ),
+        (
+            record_u32(selection, "new_start", at)?,
+            record_u32(selection, "new_lines", at)?,
+        ),
+        old_line_number,
+        new_line_number,
+    ))
+}
+
+fn line_coordinates(
+    line: &Value,
+    kind: Option<&str>,
+    at: &str,
+) -> Result<(Option<u32>, Option<u32>), CliError> {
+    let old = record_optional_u32(line, "old_line_number", at)?;
+    let new = record_optional_u32(line, "new_line_number", at)?;
+    let expected = match kind {
+        Some("addition") => old.is_none() && new.is_some(),
+        Some("deletion") => old.is_some() && new.is_none(),
+        Some(other) => {
+            return Err(CliError::Usage(format!(
+                "{at}.kind \"{other}\" is not selectable"
+            )));
+        }
+        None => old.is_some() ^ new.is_some(),
+    };
+    if !expected {
+        return Err(CliError::Usage(format!(
+            "{at} must identify one addition or deletion by its old/new line numbers"
+        )));
+    }
+    Ok((old, new))
 }
 
 fn array<'a>(value: &'a Value, at: &str) -> Result<&'a Vec<Value>, CliError> {
@@ -1028,6 +1227,21 @@ fn record_u32(record: &Value, field: &str, at: &str) -> Result<u32, CliError> {
                 "{at}.{field} is missing or not a 32-bit unsigned integer"
             ))
         })
+}
+
+fn record_optional_u32(record: &Value, field: &str, at: &str) -> Result<Option<u32>, CliError> {
+    match record.get(field) {
+        Some(Value::Null) | None => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(|| {
+                CliError::Usage(format!(
+                    "{at}.{field} is not a 32-bit unsigned integer or null"
+                ))
+            }),
+    }
 }
 
 #[derive(Debug, Args)]
@@ -1327,7 +1541,7 @@ fn run(cli: Cli, cancellation: &Cancellation) -> Result<CommandResult, CliError>
         Command::Project { command } => {
             run_project(command, data_dir.as_deref(), json, cancellation)
         }
-        Command::Git { command } => run_git(command, data_dir.as_deref(), json, cancellation),
+        Command::Git { command } => run_git(*command, data_dir.as_deref(), json, cancellation),
         Command::Worktree { command } => {
             run_worktree(command, data_dir.as_deref(), json, cancellation)
         }
@@ -1536,20 +1750,38 @@ fn run_git(
             let selections = arguments.hunk.into_selections("unstaged")?;
             let git = selected_git(&service, arguments.selection)?;
             if let Some(selections) = selections {
-                let outcome = git.stage_hunks(&selections, cancellation)?;
-                // The applied count, not the supplied one: a batch deduplicates
-                // selections that resolve to the same hunk.
-                let count = outcome.hunks;
-                command_result(
-                    json_output,
-                    || hunk_outcome_line("staged", count),
-                    || {
-                        Ok(json!({
-                            "hunks": count,
-                            "status": status_refresh_value(&outcome.status),
-                        }))
-                    },
-                )
+                match selections {
+                    GranularSelections::Hunks(selections) => {
+                        let outcome = git.stage_hunks(&selections, cancellation)?;
+                        // The applied count, not the supplied one: a batch deduplicates
+                        // selections that resolve to the same hunk.
+                        let count = outcome.hunks;
+                        command_result(
+                            json_output,
+                            || hunk_outcome_line("staged", count),
+                            || {
+                                Ok(json!({
+                                    "hunks": count,
+                                    "status": status_refresh_value(&outcome.status),
+                                }))
+                            },
+                        )
+                    }
+                    GranularSelections::Lines(selections) => {
+                        let outcome = git.stage_lines(&selections, cancellation)?;
+                        command_result(
+                            json_output,
+                            || line_outcome_line("staged", outcome.lines),
+                            || {
+                                Ok(json!({
+                                    "lines": outcome.lines,
+                                    "hunks": outcome.hunks,
+                                    "status": status_refresh_value(&outcome.status),
+                                }))
+                            },
+                        )
+                    }
+                }
             } else if arguments.all {
                 let status = git.stage_all(cancellation)?;
                 command_result(
@@ -1576,18 +1808,36 @@ fn run_git(
             let selections = arguments.hunk.into_selections("staged")?;
             let git = selected_git(&service, arguments.selection)?;
             if let Some(selections) = selections {
-                let outcome = git.unstage_hunks(&selections, cancellation)?;
-                let count = outcome.hunks;
-                command_result(
-                    json_output,
-                    || hunk_outcome_line("unstaged", count),
-                    || {
-                        Ok(json!({
-                            "hunks": count,
-                            "status": status_refresh_value(&outcome.status),
-                        }))
-                    },
-                )
+                match selections {
+                    GranularSelections::Hunks(selections) => {
+                        let outcome = git.unstage_hunks(&selections, cancellation)?;
+                        let count = outcome.hunks;
+                        command_result(
+                            json_output,
+                            || hunk_outcome_line("unstaged", count),
+                            || {
+                                Ok(json!({
+                                    "hunks": count,
+                                    "status": status_refresh_value(&outcome.status),
+                                }))
+                            },
+                        )
+                    }
+                    GranularSelections::Lines(selections) => {
+                        let outcome = git.unstage_lines(&selections, cancellation)?;
+                        command_result(
+                            json_output,
+                            || line_outcome_line("unstaged", outcome.lines),
+                            || {
+                                Ok(json!({
+                                    "lines": outcome.lines,
+                                    "hunks": outcome.hunks,
+                                    "status": status_refresh_value(&outcome.status),
+                                }))
+                            },
+                        )
+                    }
+                }
             } else {
                 let outcome = git.unstage(arguments.paths, cancellation)?;
                 if !outcome.all_succeeded() {
@@ -3017,6 +3267,10 @@ fn hunk_outcome_line(verb: &str, count: usize) -> String {
     format!("{verb} {count} hunk{}", if count == 1 { "" } else { "s" })
 }
 
+fn line_outcome_line(verb: &str, count: usize) -> String {
+    format!("{verb} {count} line{}", if count == 1 { "" } else { "s" })
+}
+
 fn branch_line(branch: &Branch) -> String {
     let checkout = match &branch.checkout {
         BranchCheckout::NotCheckedOut => "".to_owned(),
@@ -3455,7 +3709,9 @@ fn git_exit_code(error: &GitError) -> u8 {
         | GitError::UnsupportedHunkChange { .. }
         | GitError::FilteredHunkSelection { .. }
         | GitError::OverlappingHunkSelection { .. }
-        | GitError::HunkNotFound { .. } => EXIT_REFUSED,
+        | GitError::HunkNotFound { .. }
+        | GitError::LineNotFound { .. }
+        | GitError::UnrepresentableLineSelection { .. } => EXIT_REFUSED,
         // Enumerated rather than left to the wildcard so the classification of
         // every kind in `GitError::KINDS` is stated here, and a reader adding a
         // variant sees that the published exit-code contract needs a decision.
@@ -3557,6 +3813,8 @@ const GIT_KIND_EXIT_CODES: &[(&str, u8)] = &[
     ("filtered_hunk_selection", EXIT_REFUSED),
     ("overlapping_hunk_selection", EXIT_REFUSED),
     ("hunk_not_found", EXIT_REFUSED),
+    ("line_not_found", EXIT_REFUSED),
+    ("unrepresentable_line_selection", EXIT_REFUSED),
     ("hunk_application", EXIT_OPERATION_FAILED),
     ("malformed_status", EXIT_OPERATION_FAILED),
 ];
@@ -3774,6 +4032,7 @@ fn git_error_details(error: &GitError) -> Value {
         | GitError::StaleHunkSelection { path }
         | GitError::BinaryHunkSelection { path }
         | GitError::OverlappingHunkSelection { path }
+        | GitError::UnrepresentableLineSelection { path }
         | GitError::RepositoryBusy { path }
         | GitError::NotARepository { path }
         | GitError::DiffContent { path, .. } => {
@@ -3895,6 +4154,19 @@ fn git_error_details(error: &GitError) -> Value {
                 "old_lines": old_lines,
                 "new_start": new_start,
                 "new_lines": new_lines,
+            })
+        }
+        GitError::LineNotFound {
+            path,
+            old_line_number,
+            new_line_number,
+        } => {
+            let (path, path_is_lossy) = wire_path(path);
+            json!({
+                "path": path,
+                "path_is_lossy": path_is_lossy,
+                "old_line_number": old_line_number,
+                "new_line_number": new_line_number,
             })
         }
         _ => json!({}),

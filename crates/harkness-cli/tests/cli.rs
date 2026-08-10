@@ -2145,6 +2145,183 @@ fn a_selection_document_stages_several_hunks_atomically() {
     );
 }
 
+#[test]
+fn a_line_selection_document_stages_and_unstages_only_retained_changed_lines() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("line-selection-project");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    fs::write(root.join("tracked.txt"), b"one\ntwo\nthree\nfour\n").unwrap();
+    commit_all(&repository, "prepare line selection");
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+    fs::write(
+        root.join("tracked.txt"),
+        b"one\nselected\ntwo\nthree\nnot selected\nfour\n",
+    )
+    .unwrap();
+
+    let mut file = diff_file(&data_dir, &project_id, "--unstaged", "tracked.txt");
+    assert_eq!(file["hunks"].as_array().unwrap().len(), 1);
+    file["hunks"][0]["lines"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|line| line["kind"] != "addition" || line["content"] == "selected\n");
+    let document = json!({ "files": [file] }).to_string();
+    let staged = harkness_with_stdin(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "stage",
+            "--line-selection",
+            "-",
+            "--project",
+            &project_id,
+        ],
+        &document,
+    );
+
+    assert_success(&staged);
+    assert_eq!(json_output(&staged)["data"]["lines"], 1);
+    assert_eq!(json_output(&staged)["data"]["hunks"], 1);
+    let repository = Repository::open(&root).unwrap();
+    let index = repository.index().unwrap();
+    let entry = index.get_path(Path::new("tracked.txt"), 0).unwrap();
+    assert_eq!(
+        repository.find_blob(entry.id).unwrap().content(),
+        b"one\nselected\ntwo\nthree\nfour\n"
+    );
+    assert_eq!(
+        fs::read(root.join("tracked.txt")).unwrap(),
+        b"one\nselected\ntwo\nthree\nnot selected\nfour\n"
+    );
+
+    let response = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--staged",
+            "--project",
+            &project_id,
+        ],
+    );
+    let unstaged = harkness_with_stdin(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "unstage",
+            "--line-selection",
+            "-",
+            "--project",
+            &project_id,
+        ],
+        &String::from_utf8(response.stdout).unwrap(),
+    );
+    assert_success(&unstaged);
+    assert_eq!(json_output(&unstaged)["data"]["lines"], 1);
+    let repository = Repository::open(&root).unwrap();
+    let index = repository.index().unwrap();
+    let entry = index.get_path(Path::new("tracked.txt"), 0).unwrap();
+    assert_eq!(
+        repository.find_blob(entry.id).unwrap().content(),
+        b"one\ntwo\nthree\nfour\n"
+    );
+}
+
+/// The two refusals a line-selection document can earn that hunk selection
+/// cannot: a changed line the fresh diff does not have, and a selection whose
+/// retained side would leave an unterminated line somewhere other than last.
+/// Both exit 3 with the index untouched, like every other selection refusal.
+#[test]
+fn line_selection_documents_are_refused_line_by_line_without_touching_the_index() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("line-refusal-project");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    fs::write(root.join("tracked.txt"), b"one\ntwo\nthree\n").unwrap();
+    fs::write(root.join("tail.txt"), b"one\ntwo\nlast").unwrap();
+    commit_all(&repository, "prepare line refusals");
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+    fs::write(root.join("tracked.txt"), b"one\nTWO\nthree\n").unwrap();
+    fs::write(root.join("tail.txt"), b"one\ntwo\nLAST").unwrap();
+    let index_before = fs::read(repository.path().join("index")).unwrap();
+
+    let stage = |document: &str| {
+        harkness_with_stdin(
+            &data_dir,
+            &[
+                "--json",
+                "git",
+                "stage",
+                "--line-selection",
+                "-",
+                "--project",
+                &project_id,
+            ],
+            document,
+        )
+    };
+
+    // A well-formed record whose coordinates name no changed line in the hunk
+    // the rest of the record still resolves to.
+    let mut file = diff_file(&data_dir, &project_id, "--unstaged", "tracked.txt");
+    file["hunks"][0]["lines"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|line| line["kind"] == "addition");
+    file["hunks"][0]["lines"][0]["new_line_number"] = json!(4096);
+    let missing = stage(&json!({ "files": [file] }).to_string());
+    assert_eq!(missing.status.code(), Some(3));
+    let body = json_output(&missing);
+    assert_eq!(body["error"]["kind"], "line_not_found");
+    assert_eq!(body["error"]["details"]["path"], "tracked.txt");
+    assert_eq!(body["error"]["details"]["new_line_number"], 4096);
+    assert!(body["error"]["details"]["old_line_number"].is_null());
+
+    // Keeping only the addition would put the retained unterminated line ahead
+    // of it, which no patch can express.
+    let mut tail = diff_file(&data_dir, &project_id, "--unstaged", "tail.txt");
+    tail["hunks"][0]["lines"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|line| line["kind"] != "deletion");
+    let stranded = stage(&json!({ "files": [tail] }).to_string());
+    assert_eq!(stranded.status.code(), Some(3));
+    let body = json_output(&stranded);
+    assert_eq!(body["error"]["kind"], "unrepresentable_line_selection");
+    assert_eq!(body["error"]["details"]["path"], "tail.txt");
+
+    assert_eq!(
+        fs::read(repository.path().join("index")).unwrap(),
+        index_before,
+        "a refused line selection still wrote to the index"
+    );
+
+    // The same file stages cleanly once both sides of the change are named.
+    let tail = diff_file(&data_dir, &project_id, "--unstaged", "tail.txt");
+    assert_success(&stage(&json!({ "files": [tail] }).to_string()));
+    let repository = Repository::open(&root).unwrap();
+    let index = repository.index().unwrap();
+    let entry = index.get_path(Path::new("tail.txt"), 0).unwrap();
+    assert_eq!(
+        repository.find_blob(entry.id).unwrap().content(),
+        b"one\ntwo\nLAST"
+    );
+}
+
 /// A batch can name the same hunk twice, or two hunks that cover the same
 /// lines. The first is deduplicated and must be counted as what landed rather
 /// than as what was asked for; the second cannot be expressed as one patch and
