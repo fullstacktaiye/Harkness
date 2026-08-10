@@ -21,13 +21,6 @@ Kirigami.Page {
 
     title: shell.shellName
 
-    onProjectChanged: {
-        // A refresh can replace the project object; the root itself only
-        // changes in theory, but re-applying it is a no-op then.
-        if (project.available)
-            fileModel.setRoot(project.root);
-    }
-
     function repositoryOperationRunning() {
         for (let index = 0; index < backend.jobs.length; ++index) {
             const candidate = backend.jobs[index];
@@ -196,7 +189,17 @@ Kirigami.Page {
             visible: shell.project.available && shell.project.isGit
         }
 
-        // I will address this some other time. I am working on adding the Diff View to the Project Shell Page, minimize Git's presence as well by hiding it in plain sight with actions.
+        ReviewPanel {
+            objectName: "reviewSidePanel"
+
+            Layout.fillHeight: true
+            Layout.fillWidth: true
+            Layout.minimumWidth: Kirigami.Units.gridUnit * 26
+            backend: shell.backend
+            project: shell.project
+            visible: shell.project.available && shell.project.isGit
+        }
+
         /*
         FileTreeModel {
             id: fileModel

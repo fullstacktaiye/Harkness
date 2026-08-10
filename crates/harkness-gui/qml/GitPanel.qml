@@ -257,22 +257,6 @@ Item {
                 Layout.fillWidth: true
             }
 
-            ReviewSurface {
-                Layout.fillWidth: true
-                Layout.bottomMargin: Kirigami.Units.largeSpacing
-                Layout.leftMargin: Kirigami.Units.largeSpacing
-                Layout.rightMargin: Kirigami.Units.largeSpacing
-                Layout.topMargin: Kirigami.Units.largeSpacing
-                backend: panel.backend
-                gitState: panel.gitState
-                project: panel.project
-                stateReady: panel.stateReady
-            }
-
-            Kirigami.Separator {
-                Layout.fillWidth: true
-            }
-
             ColumnLayout {
                 Layout.fillWidth: true
                 Layout.bottomMargin: Kirigami.Units.largeSpacing
