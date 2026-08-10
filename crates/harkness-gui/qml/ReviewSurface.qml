@@ -1048,6 +1048,7 @@ ColumnLayout {
     }
 
     ColumnLayout {
+        Layout.fillHeight: true
         Layout.fillWidth: true
         spacing: Kirigami.Units.smallSpacing
         visible: reviewSurface.reviewReady
@@ -1104,301 +1105,375 @@ ColumnLayout {
                     || reviewSurface.reviewState.error.length === 0)
         }
 
-        ListView {
-            id: reviewFileList
-
+        Kirigami.Separator {
             Layout.fillWidth: true
-            Layout.preferredHeight: Math.min(
-                Kirigami.Units.gridUnit * 9,
-                Math.max(Kirigami.Units.gridUnit * 2, contentHeight)
-            )
-            activeFocusOnTab: true
-            boundsBehavior: Flickable.StopAtBounds
-            clip: true
-            keyNavigationEnabled: true
-            model: reviewSurface.reviewFiles
-            reuseItems: true
-            spacing: Kirigami.Units.smallSpacing
+            visible: reviewSurface.reviewFiles.length > 0
+        }
+
+        // GitHub Desktop's arrangement: the summary and description of what is
+        // being reviewed sit above, and the changed files run down the left of
+        // the diff they open. The handle between them is what lets a deep path
+        // and a wide line of code each be read without the other giving way.
+        Controls.SplitView {
+            Layout.fillHeight: true
+            Layout.fillWidth: true
+            orientation: Qt.Horizontal
             visible: reviewSurface.reviewFiles.length > 0
 
-            delegate: Controls.ItemDelegate {
-                id: reviewFileDelegate
+            handle: Rectangle {
+                readonly property bool active: Controls.SplitHandle.hovered
+                    || Controls.SplitHandle.pressed
 
-                required property int index
-                required property var modelData
+                color: active ? Kirigami.Theme.highlightColor : "transparent"
+                implicitWidth: Kirigami.Units.smallSpacing
 
-                Accessible.name: qsTr("%1, %2 change")
-                    .arg(modelData.path)
-                    .arg(modelData.change)
-                Controls.ToolTip.text: modelData.path
-                Controls.ToolTip.visible: hovered
-                highlighted: String(reviewSurface.reviewState.selectedFileId || "")
-                    === String(modelData.fileId)
-                enabled: !reviewSurface.repositoryMutationRunning()
-                    && !reviewSurface.reviewReadRunning()
-                width: reviewFileList.width
-                onClicked: {
-                    reviewSurface.pendingHunkNavigation = 0;
-                    reviewFileList.currentIndex = index;
-                    reviewSurface.backend.loadReviewFile(
-                        reviewSurface.project.id,
-                        modelData.fileId
-                    );
+                Kirigami.Separator {
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    height: parent.height
+                    visible: !parent.active
                 }
-
-                contentItem: RowLayout {
-                    Controls.Label {
-                        Layout.fillWidth: true
-                        elide: Text.ElideMiddle
-                        font.family: "monospace"
-                        text: reviewFileDelegate.modelData.path
-                        textFormat: Text.PlainText
-                    }
-
-                    Controls.Label {
-                        color: Kirigami.Theme.disabledTextColor
-                        font: Kirigami.Theme.smallFont
-                        text: reviewFileDelegate.modelData.change
-                        textFormat: Text.PlainText
-                    }
-                }
-            }
-
-            Controls.ScrollBar.vertical: Controls.ScrollBar {}
-        }
-
-        RowLayout {
-            Layout.fillWidth: true
-            visible: reviewSurface.reviewFileTotal > reviewSurface.reviewFiles.length
-
-            Controls.Button {
-                enabled: reviewSurface.reviewFileOffset > 0
-                    && !reviewSurface.repositoryMutationRunning()
-                    && !reviewSurface.reviewReadRunning()
-                icon.name: "go-previous"
-                text: qsTr("Previous files")
-                onClicked: reviewSurface.loadReviewFilePage("previous")
-            }
-
-            Controls.Label {
-                Layout.fillWidth: true
-                horizontalAlignment: Text.AlignHCenter
-                text: qsTr("Files %1–%2 of %3")
-                    .arg(reviewSurface.reviewFileOffset + 1)
-                    .arg(reviewSurface.reviewFileOffset + reviewSurface.reviewFiles.length)
-                    .arg(reviewSurface.reviewFileTotal)
-            }
-
-            Controls.Button {
-                enabled: reviewSurface.reviewFileOffset + reviewSurface.reviewFiles.length
-                    < reviewSurface.reviewFileTotal
-                    && !reviewSurface.repositoryMutationRunning()
-                    && !reviewSurface.reviewReadRunning()
-                icon.name: "go-next"
-                text: qsTr("Next files")
-                onClicked: reviewSurface.loadReviewFilePage("next")
-            }
-        }
-
-        RowLayout {
-            Layout.fillWidth: true
-            visible: reviewSurface.reviewFile.fileId !== undefined
-
-            Controls.ToolButton {
-                Accessible.name: text
-                Controls.ToolTip.text: qsTr("Previous file (Alt+K)")
-                Controls.ToolTip.visible: hovered
-                display: Controls.AbstractButton.IconOnly
-                enabled: reviewSurface.fileNavigationAvailable(-1)
-                    && !reviewSurface.repositoryMutationRunning()
-                    && !reviewSurface.reviewReadRunning()
-                icon.name: "go-up"
-                text: qsTr("Previous file")
-                onClicked: reviewSurface.navigateFile(-1)
-            }
-
-            Controls.ToolButton {
-                Accessible.name: text
-                Controls.ToolTip.text: qsTr("Next file (Alt+J)")
-                Controls.ToolTip.visible: hovered
-                display: Controls.AbstractButton.IconOnly
-                enabled: reviewSurface.fileNavigationAvailable(1)
-                    && !reviewSurface.repositoryMutationRunning()
-                    && !reviewSurface.reviewReadRunning()
-                icon.name: "go-down"
-                text: qsTr("Next file")
-                onClicked: reviewSurface.navigateFile(1)
-            }
-
-            Controls.ToolButton {
-                Accessible.name: text
-                Controls.ToolTip.text: qsTr("Previous hunk (Alt+Shift+K)")
-                Controls.ToolTip.visible: hovered
-                display: Controls.AbstractButton.IconOnly
-                enabled: reviewSurface.hunkNavigationEnabled(-1)
-                icon.name: "go-up"
-                text: qsTr("Previous hunk")
-                onClicked: reviewSurface.navigateHunk(-1)
-            }
-
-            Controls.ToolButton {
-                Accessible.name: text
-                Controls.ToolTip.text: qsTr("Next hunk (Alt+Shift+J)")
-                Controls.ToolTip.visible: hovered
-                display: Controls.AbstractButton.IconOnly
-                enabled: reviewSurface.hunkNavigationEnabled(1)
-                icon.name: "go-down"
-                text: qsTr("Next hunk")
-                onClicked: reviewSurface.navigateHunk(1)
-            }
-
-            Controls.Button {
-                readonly property string lineAction: reviewSurface.selectedReviewLineAction()
-
-                Accessible.name: text
-                enabled: reviewSurface.selectedReviewLineCount > 0
-                    && !reviewSurface.repositoryOperationRunning()
-                icon.name: lineAction === "stage"
-                    ? "list-add"
-                    : "edit-undo"
-                text: lineAction === "stage"
-                    ? qsTr("Stage %1 selected line(s)").arg(
-                        reviewSurface.selectedReviewLineCount
-                    )
-                    : qsTr("Unstage %1 selected line(s)").arg(
-                        reviewSurface.selectedReviewLineCount
-                    )
-                visible: reviewSurface.selectedReviewLineCount > 0
-                    && (lineAction === "stage" || lineAction === "unstage")
-                onClicked: reviewSurface.mutateSelectedLines()
-            }
-
-            Controls.ToolButton {
-                Accessible.name: text
-                Controls.ToolTip.text: text
-                Controls.ToolTip.visible: hovered
-                display: Controls.AbstractButton.IconOnly
-                enabled: reviewSurface.selectedReviewLineCount > 0
-                icon.name: "edit-clear"
-                text: qsTr("Clear selected lines")
-                visible: reviewSurface.selectedReviewLineCount > 0
-                onClicked: reviewSurface.clearReviewLineSelection()
             }
 
             Item {
-                Layout.fillWidth: true
-            }
+                objectName: "reviewFileColumn"
 
-            Controls.ButtonGroup {
-                id: reviewLayoutGroup
-            }
+                Controls.SplitView.fillWidth: false
+                Controls.SplitView.maximumWidth: Kirigami.Units.gridUnit * 30
+                Controls.SplitView.minimumWidth: Kirigami.Units.gridUnit * 8
+                Controls.SplitView.preferredWidth: Kirigami.Units.gridUnit * 16
 
-            Controls.ToolButton {
-                Accessible.name: text
-                Controls.ButtonGroup.group: reviewLayoutGroup
-                Controls.ToolTip.text: qsTr("Unified layout")
-                Controls.ToolTip.visible: hovered
-                checkable: true
-                checked: !reviewSurface.splitLayout
-                display: Controls.AbstractButton.IconOnly
-                icon.name: "view-list-text"
-                text: qsTr("Unified layout")
-                onClicked: reviewSurface.setSplitLayout(false)
-            }
+                ColumnLayout {
+                    anchors.fill: parent
+                    anchors.rightMargin: Kirigami.Units.smallSpacing
+                    spacing: Kirigami.Units.smallSpacing
 
-            Controls.ToolButton {
-                Accessible.name: text
-                Controls.ButtonGroup.group: reviewLayoutGroup
-                Controls.ToolTip.text: qsTr("Side-by-side layout")
-                Controls.ToolTip.visible: hovered
-                checkable: true
-                checked: reviewSurface.splitLayout
-                display: Controls.AbstractButton.IconOnly
-                icon.name: "view-split-left-right"
-                text: qsTr("Side-by-side layout")
-                onClicked: reviewSurface.setSplitLayout(true)
-            }
-        }
+                    ListView {
+                        id: reviewFileList
 
-        Controls.Label {
-            Layout.fillWidth: true
-            elide: Text.ElideMiddle
-            font.bold: true
-            font.family: "monospace"
-            text: reviewSurface.reviewFile.path || ""
-            textFormat: Text.PlainText
-            visible: text.length > 0
-        }
+                        Layout.fillHeight: true
+                        Layout.fillWidth: true
+                        activeFocusOnTab: true
+                        boundsBehavior: Flickable.StopAtBounds
+                        clip: true
+                        keyNavigationEnabled: true
+                        model: reviewSurface.reviewFiles
+                        reuseItems: true
+                        spacing: Kirigami.Units.smallSpacing
 
-        Kirigami.InlineMessage {
-            Layout.fillWidth: true
-            text: reviewSurface.reviewFile.summary || ""
-            type: Kirigami.MessageType.Information
-            visible: text.length > 0
-        }
+                        delegate: Controls.ItemDelegate {
+                            id: reviewFileDelegate
 
-        ListView {
-            id: reviewLineView
+                            required property int index
+                            required property var modelData
 
-            Accessible.name: qsTr("Changed lines for %1").arg(reviewSurface.reviewFile.path || "")
-            Layout.fillWidth: true
-            Layout.preferredHeight: Kirigami.Units.gridUnit * 22
-            activeFocusOnTab: true
-            boundsBehavior: Flickable.StopAtBounds
-            cacheBuffer: height * 2
-            clip: true
-            keyNavigationEnabled: true
-            model: reviewSurface.reviewRows
-            reuseItems: true
-            visible: reviewSurface.reviewRows.length > 0
+                            Accessible.name: qsTr("%1, %2 change")
+                                .arg(modelData.path)
+                                .arg(modelData.change)
+                            Controls.ToolTip.text: modelData.path
+                            Controls.ToolTip.visible: hovered
+                            highlighted: String(reviewSurface.reviewState.selectedFileId || "")
+                                === String(modelData.fileId)
+                            enabled: !reviewSurface.repositoryMutationRunning()
+                                && !reviewSurface.reviewReadRunning()
+                            width: reviewFileList.width
+                            onClicked: {
+                                reviewSurface.pendingHunkNavigation = 0;
+                                reviewFileList.currentIndex = index;
+                                reviewSurface.backend.loadReviewFile(
+                                    reviewSurface.project.id,
+                                    modelData.fileId
+                                );
+                            }
 
-            Keys.onPressed: function(event) {
-                if (event.key === Qt.Key_Space
-                        && reviewSurface.toggleCurrentReviewLine(
-                            (event.modifiers & Qt.ShiftModifier) !== 0
-                        )) {
-                    event.accepted = true;
-                }
-            }
+                            contentItem: RowLayout {
+                                spacing: Kirigami.Units.smallSpacing
 
-            delegate: Loader {
-                id: reviewRowLoader
+                                Controls.Label {
+                                    Layout.fillWidth: true
+                                    elide: Text.ElideMiddle
+                                    font.family: "monospace"
+                                    text: reviewFileDelegate.modelData.path
+                                    textFormat: Text.PlainText
+                                }
 
-                required property int index
-                required property var modelData
-
-                readonly property var row: modelData
-                sourceComponent: row.type === "hunk"
-                    ? reviewHunkComponent
-                    : row.type === "collapsed"
-                        ? reviewCollapsedComponent
-                        : row.type === "page"
-                            ? reviewPageComponent
-                            : reviewLineComponent
-                width: reviewLineView.width
-                onLoaded: {
-                    item.row = row;
-                    item.rowIndex = index;
-                }
-                onIndexChanged: {
-                    if (item)
-                        item.rowIndex = index;
-                }
-                onRowChanged: {
-                    // A reused Loader may switch component types in the same
-                    // turn. Assign after sourceComponent has settled so a
-                    // line delegate never receives a hunk row (or vice versa).
-                    Qt.callLater(function() {
-                        if (item) {
-                            item.row = row;
-                            item.rowIndex = index;
+                                Controls.Label {
+                                    color: Kirigami.Theme.disabledTextColor
+                                    font: Kirigami.Theme.smallFont
+                                    text: reviewFileDelegate.modelData.change
+                                    textFormat: Text.PlainText
+                                }
+                            }
                         }
-                    });
+
+                        Controls.ScrollBar.vertical: Controls.ScrollBar {}
+                    }
+
+                    // The file window is paged, and the column is too narrow for
+                    // worded buttons: the arrows carry the verb in their tooltip
+                    // and the count between them says where the window sits.
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 0
+                        visible: reviewSurface.reviewFileTotal > reviewSurface.reviewFiles.length
+
+                        Controls.ToolButton {
+                            Accessible.name: text
+                            Controls.ToolTip.text: text
+                            Controls.ToolTip.visible: hovered
+                            display: Controls.AbstractButton.IconOnly
+                            enabled: reviewSurface.reviewFileOffset > 0
+                                && !reviewSurface.repositoryMutationRunning()
+                                && !reviewSurface.reviewReadRunning()
+                            icon.name: "go-previous"
+                            text: qsTr("Previous files")
+                            onClicked: reviewSurface.loadReviewFilePage("previous")
+                        }
+
+                        Controls.Label {
+                            Layout.fillWidth: true
+                            elide: Text.ElideRight
+                            font: Kirigami.Theme.smallFont
+                            horizontalAlignment: Text.AlignHCenter
+                            text: qsTr("Files %1–%2 of %3")
+                                .arg(reviewSurface.reviewFileOffset + 1)
+                                .arg(reviewSurface.reviewFileOffset + reviewSurface.reviewFiles.length)
+                                .arg(reviewSurface.reviewFileTotal)
+                        }
+
+                        Controls.ToolButton {
+                            Accessible.name: text
+                            Controls.ToolTip.text: text
+                            Controls.ToolTip.visible: hovered
+                            display: Controls.AbstractButton.IconOnly
+                            enabled: reviewSurface.reviewFileOffset + reviewSurface.reviewFiles.length
+                                < reviewSurface.reviewFileTotal
+                                && !reviewSurface.repositoryMutationRunning()
+                                && !reviewSurface.reviewReadRunning()
+                            icon.name: "go-next"
+                            text: qsTr("Next files")
+                            onClicked: reviewSurface.loadReviewFilePage("next")
+                        }
+                    }
                 }
             }
 
-            Controls.ScrollBar.horizontal: Controls.ScrollBar {}
-            Controls.ScrollBar.vertical: Controls.ScrollBar {}
+            Item {
+                objectName: "reviewDiffColumn"
+
+                Controls.SplitView.fillWidth: true
+                Controls.SplitView.minimumWidth: Kirigami.Units.gridUnit * 18
+
+                ColumnLayout {
+                    anchors.fill: parent
+                    anchors.leftMargin: Kirigami.Units.smallSpacing
+                    spacing: Kirigami.Units.smallSpacing
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        visible: reviewSurface.reviewFile.fileId !== undefined
+
+                        Controls.ToolButton {
+                            Accessible.name: text
+                            Controls.ToolTip.text: qsTr("Previous file (Alt+K)")
+                            Controls.ToolTip.visible: hovered
+                            display: Controls.AbstractButton.IconOnly
+                            enabled: reviewSurface.fileNavigationAvailable(-1)
+                                && !reviewSurface.repositoryMutationRunning()
+                                && !reviewSurface.reviewReadRunning()
+                            icon.name: "go-up"
+                            text: qsTr("Previous file")
+                            onClicked: reviewSurface.navigateFile(-1)
+                        }
+
+                        Controls.ToolButton {
+                            Accessible.name: text
+                            Controls.ToolTip.text: qsTr("Next file (Alt+J)")
+                            Controls.ToolTip.visible: hovered
+                            display: Controls.AbstractButton.IconOnly
+                            enabled: reviewSurface.fileNavigationAvailable(1)
+                                && !reviewSurface.repositoryMutationRunning()
+                                && !reviewSurface.reviewReadRunning()
+                            icon.name: "go-down"
+                            text: qsTr("Next file")
+                            onClicked: reviewSurface.navigateFile(1)
+                        }
+
+                        Controls.ToolButton {
+                            Accessible.name: text
+                            Controls.ToolTip.text: qsTr("Previous hunk (Alt+Shift+K)")
+                            Controls.ToolTip.visible: hovered
+                            display: Controls.AbstractButton.IconOnly
+                            enabled: reviewSurface.hunkNavigationEnabled(-1)
+                            icon.name: "go-up"
+                            text: qsTr("Previous hunk")
+                            onClicked: reviewSurface.navigateHunk(-1)
+                        }
+
+                        Controls.ToolButton {
+                            Accessible.name: text
+                            Controls.ToolTip.text: qsTr("Next hunk (Alt+Shift+J)")
+                            Controls.ToolTip.visible: hovered
+                            display: Controls.AbstractButton.IconOnly
+                            enabled: reviewSurface.hunkNavigationEnabled(1)
+                            icon.name: "go-down"
+                            text: qsTr("Next hunk")
+                            onClicked: reviewSurface.navigateHunk(1)
+                        }
+
+                        Controls.Button {
+                            readonly property string lineAction: reviewSurface.selectedReviewLineAction()
+
+                            Accessible.name: text
+                            enabled: reviewSurface.selectedReviewLineCount > 0
+                                && !reviewSurface.repositoryOperationRunning()
+                            icon.name: lineAction === "stage"
+                                ? "list-add"
+                                : "edit-undo"
+                            text: lineAction === "stage"
+                                ? qsTr("Stage %1 selected line(s)").arg(
+                                    reviewSurface.selectedReviewLineCount
+                                )
+                                : qsTr("Unstage %1 selected line(s)").arg(
+                                    reviewSurface.selectedReviewLineCount
+                                )
+                            visible: reviewSurface.selectedReviewLineCount > 0
+                                && (lineAction === "stage" || lineAction === "unstage")
+                            onClicked: reviewSurface.mutateSelectedLines()
+                        }
+
+                        Controls.ToolButton {
+                            Accessible.name: text
+                            Controls.ToolTip.text: text
+                            Controls.ToolTip.visible: hovered
+                            display: Controls.AbstractButton.IconOnly
+                            enabled: reviewSurface.selectedReviewLineCount > 0
+                            icon.name: "edit-clear"
+                            text: qsTr("Clear selected lines")
+                            visible: reviewSurface.selectedReviewLineCount > 0
+                            onClicked: reviewSurface.clearReviewLineSelection()
+                        }
+
+                        Item {
+                            Layout.fillWidth: true
+                        }
+
+                        Controls.ButtonGroup {
+                            id: reviewLayoutGroup
+                        }
+
+                        Controls.ToolButton {
+                            Accessible.name: text
+                            Controls.ButtonGroup.group: reviewLayoutGroup
+                            Controls.ToolTip.text: qsTr("Unified layout")
+                            Controls.ToolTip.visible: hovered
+                            checkable: true
+                            checked: !reviewSurface.splitLayout
+                            display: Controls.AbstractButton.IconOnly
+                            icon.name: "view-list-text"
+                            text: qsTr("Unified layout")
+                            onClicked: reviewSurface.setSplitLayout(false)
+                        }
+
+                        Controls.ToolButton {
+                            Accessible.name: text
+                            Controls.ButtonGroup.group: reviewLayoutGroup
+                            Controls.ToolTip.text: qsTr("Side-by-side layout")
+                            Controls.ToolTip.visible: hovered
+                            checkable: true
+                            checked: reviewSurface.splitLayout
+                            display: Controls.AbstractButton.IconOnly
+                            icon.name: "view-split-left-right"
+                            text: qsTr("Side-by-side layout")
+                            onClicked: reviewSurface.setSplitLayout(true)
+                        }
+                    }
+
+                    Controls.Label {
+                        Layout.fillWidth: true
+                        elide: Text.ElideMiddle
+                        font.bold: true
+                        font.family: "monospace"
+                        text: reviewSurface.reviewFile.path || ""
+                        textFormat: Text.PlainText
+                        visible: text.length > 0
+                    }
+
+                    Kirigami.InlineMessage {
+                        Layout.fillWidth: true
+                        text: reviewSurface.reviewFile.summary || ""
+                        type: Kirigami.MessageType.Information
+                        visible: text.length > 0
+                    }
+
+                    ListView {
+                        id: reviewLineView
+
+                        Accessible.name: qsTr("Changed lines for %1").arg(reviewSurface.reviewFile.path || "")
+                        // The diff takes every row the chrome above it does not need, and
+                        // scrolls itself rather than riding a scroll view around the whole
+                        // surface — which is what used to cap it at a fixed box.
+                        Layout.fillHeight: true
+                        Layout.fillWidth: true
+                        Layout.minimumHeight: Kirigami.Units.gridUnit * 6
+                        activeFocusOnTab: true
+                        boundsBehavior: Flickable.StopAtBounds
+                        cacheBuffer: height * 2
+                        clip: true
+                        keyNavigationEnabled: true
+                        model: reviewSurface.reviewRows
+                        reuseItems: true
+                        visible: reviewSurface.reviewRows.length > 0
+
+                        Keys.onPressed: function(event) {
+                            if (event.key === Qt.Key_Space
+                                    && reviewSurface.toggleCurrentReviewLine(
+                                        (event.modifiers & Qt.ShiftModifier) !== 0
+                                    )) {
+                                event.accepted = true;
+                            }
+                        }
+
+                        delegate: Loader {
+                            id: reviewRowLoader
+
+                            required property int index
+                            required property var modelData
+
+                            readonly property var row: modelData
+                            sourceComponent: row.type === "hunk"
+                                ? reviewHunkComponent
+                                : row.type === "collapsed"
+                                    ? reviewCollapsedComponent
+                                    : row.type === "page"
+                                        ? reviewPageComponent
+                                        : reviewLineComponent
+                            width: reviewLineView.width
+                            onLoaded: {
+                                item.row = row;
+                                item.rowIndex = index;
+                            }
+                            onIndexChanged: {
+                                if (item)
+                                    item.rowIndex = index;
+                            }
+                            onRowChanged: {
+                                // A reused Loader may switch component types in the same
+                                // turn. Assign after sourceComponent has settled so a
+                                // line delegate never receives a hunk row (or vice versa).
+                                Qt.callLater(function() {
+                                    if (item) {
+                                        item.row = row;
+                                        item.rowIndex = index;
+                                    }
+                                });
+                            }
+                        }
+
+                        Controls.ScrollBar.horizontal: Controls.ScrollBar {}
+                        Controls.ScrollBar.vertical: Controls.ScrollBar {}
+                    }
+                }
+            }
         }
     }
 

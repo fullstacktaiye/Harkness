@@ -176,89 +176,114 @@ Item {
                     }
                 }
 
-                StackLayout {
+                // The file list and the commit box divide the column's height
+                // between them, so a long message and a long list of changes
+                // can each be given the room the other does not need.
+                Controls.SplitView {
                     Layout.fillHeight: true
                     Layout.fillWidth: true
-                    currentIndex: sectionTabs.currentIndex
+                    orientation: Qt.Vertical
 
-                    ChangesPanel {
-                        activity: gitActivity
-                        backend: panel.backend
-                        project: panel.project
-                        onPushOverrideRequested: pushOverrideDialog.open()
+                    handle: Rectangle {
+                        readonly property bool active: Controls.SplitHandle.hovered
+                            || Controls.SplitHandle.pressed
+
+                        color: active ? Kirigami.Theme.highlightColor : "transparent"
+                        implicitHeight: Kirigami.Units.smallSpacing
+
+                        Kirigami.Separator {
+                            anchors.verticalCenter: parent.verticalCenter
+                            visible: !parent.active
+                            width: parent.width
+                        }
                     }
 
-                    HistoryPanel {
-                        activity: gitActivity
-                        backend: panel.backend
-                        project: panel.project
-                    }
-                }
+                    StackLayout {
+                        Controls.SplitView.fillHeight: true
+                        Controls.SplitView.minimumHeight: Kirigami.Units.gridUnit * 6
+                        currentIndex: sectionTabs.currentIndex
 
-                Kirigami.Separator {
-                    Layout.fillWidth: true
-                    visible: commitFooter.visible
-                }
-
-                // The commit box stays pinned under the file list, the way
-                // GitHub Desktop anchors it: what is being committed is the
-                // list directly above, so the box must not scroll away from it.
-                ColumnLayout {
-                    id: commitFooter
-
-                    Layout.fillWidth: true
-                    Layout.bottomMargin: Kirigami.Units.largeSpacing
-                    Layout.leftMargin: Kirigami.Units.largeSpacing
-                    Layout.rightMargin: Kirigami.Units.largeSpacing
-                    Layout.topMargin: Kirigami.Units.smallSpacing
-                    spacing: Kirigami.Units.smallSpacing
-                    visible: sectionTabs.currentIndex === 0
-
-                    Controls.TextField {
-                        id: commitSummary
-
-                        Layout.fillWidth: true
-                        enabled: gitActivity.job("commit") === null
-                            && gitActivity.job("push") === null
-                            && !gitActivity.repositoryOperationRunning()
-                        placeholderText: qsTr("Summary (required)")
-                    }
-
-                    Controls.TextArea {
-                        id: commitDescription
-
-                        Layout.fillWidth: true
-                        Layout.preferredHeight: Kirigami.Units.gridUnit * 4
-                        enabled: commitSummary.enabled
-                        placeholderText: qsTr("Description")
-                        wrapMode: TextEdit.Wrap
-                    }
-
-                    RowLayout {
-                        Layout.fillWidth: true
-
-                        Controls.Button {
-                            enabled: panel.commitAllowed()
-                            text: qsTr("Amend")
-                            onClicked: panel.backend.commit(
-                                panel.project.id,
-                                panel.composedCommitMessage(),
-                                true
-                            )
+                        ChangesPanel {
+                            activity: gitActivity
+                            backend: panel.backend
+                            project: panel.project
+                            onPushOverrideRequested: pushOverrideDialog.open()
                         }
 
-                        Controls.Button {
-                            Layout.fillWidth: true
-                            enabled: panel.commitAllowed()
-                            highlighted: true
-                            text: gitActivity.currentBranch.length > 0
-                                ? qsTr("Commit to %1").arg(gitActivity.currentBranch)
-                                : qsTr("Commit to detached HEAD")
-                            onClicked: panel.backend.commit(
-                                panel.project.id,
-                                panel.composedCommitMessage(),
-                                false
-                            )
+                        HistoryPanel {
+                            activity: gitActivity
+                            backend: panel.backend
+                            project: panel.project
+                        }
+                    }
+
+                    // The commit box stays pinned under the file list, the way
+                    // GitHub Desktop anchors it: what is being committed is the
+                    // list directly above, so the box must not scroll away from it.
+                    Item {
+                        id: commitFooter
+
+                        Controls.SplitView.fillHeight: false
+                        Controls.SplitView.minimumHeight: Kirigami.Units.gridUnit * 8
+                        Controls.SplitView.preferredHeight: Kirigami.Units.gridUnit * 11
+                        visible: sectionTabs.currentIndex === 0
+
+                        ColumnLayout {
+                            anchors.fill: parent
+                            anchors.bottomMargin: Kirigami.Units.largeSpacing
+                            anchors.leftMargin: Kirigami.Units.largeSpacing
+                            anchors.rightMargin: Kirigami.Units.largeSpacing
+                            anchors.topMargin: Kirigami.Units.smallSpacing
+                            spacing: Kirigami.Units.smallSpacing
+
+                            Controls.TextField {
+                                id: commitSummary
+
+                                Layout.fillWidth: true
+                                enabled: gitActivity.job("commit") === null
+                                    && gitActivity.job("push") === null
+                                    && !gitActivity.repositoryOperationRunning()
+                                placeholderText: qsTr("Summary (required)")
+                            }
+
+                            Controls.TextArea {
+                                id: commitDescription
+
+                                Layout.fillHeight: true
+                                Layout.fillWidth: true
+                                Layout.minimumHeight: Kirigami.Units.gridUnit * 3
+                                enabled: commitSummary.enabled
+                                placeholderText: qsTr("Description")
+                                wrapMode: TextEdit.Wrap
+                            }
+
+                            RowLayout {
+                                Layout.fillWidth: true
+
+                                Controls.Button {
+                                    enabled: panel.commitAllowed()
+                                    text: qsTr("Amend")
+                                    onClicked: panel.backend.commit(
+                                        panel.project.id,
+                                        panel.composedCommitMessage(),
+                                        true
+                                    )
+                                }
+
+                                Controls.Button {
+                                    Layout.fillWidth: true
+                                    enabled: panel.commitAllowed()
+                                    highlighted: true
+                                    text: gitActivity.currentBranch.length > 0
+                                        ? qsTr("Commit to %1").arg(gitActivity.currentBranch)
+                                        : qsTr("Commit to detached HEAD")
+                                    onClicked: panel.backend.commit(
+                                        panel.project.id,
+                                        panel.composedCommitMessage(),
+                                        false
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -276,22 +301,16 @@ Item {
                 color: Kirigami.Theme.backgroundColor
             }
 
-            Controls.ScrollView {
-                id: reviewScroll
-
+            // No scroll view around the surface: the diff inside it is the only
+            // part worth scrolling, and wrapping the whole thing is what forced
+            // it into a fixed-height box.
+            ReviewSurface {
                 anchors.fill: parent
-                clip: true
-                contentWidth: availableWidth
-
-                ReviewSurface {
-                    width: reviewScroll.availableWidth
-                        - Kirigami.Units.largeSpacing * 2
-                    x: Kirigami.Units.largeSpacing
-                    backend: panel.backend
-                    gitState: panel.gitState
-                    project: panel.project
-                    stateReady: panel.stateReady
-                }
+                anchors.margins: Kirigami.Units.largeSpacing
+                backend: panel.backend
+                gitState: panel.gitState
+                project: panel.project
+                stateReady: panel.stateReady
             }
         }
     }
