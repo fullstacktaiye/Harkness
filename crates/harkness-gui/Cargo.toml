@@ -15,6 +15,11 @@ name = "qml_smoke"
 path = "tests/qml_smoke.rs"
 harness = false
 
+[[test]]
+name = "default_branch_push_repro"
+path = "tests/default_branch_push_repro.rs"
+harness = false
+
 [dependencies]
 cxx = "1.0"
 cxx-qt = "0.9"

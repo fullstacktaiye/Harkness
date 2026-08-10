@@ -1274,4 +1274,199 @@ Kirigami.ApplicationWindow {
         drop(engine);
         drop(app);
     }
+
+    /// One-off diagnostic: drives a real `HarknessBackend` push against a
+    /// clone whose remote default branch is protected, through the real
+    /// `GitPanel.qml`, and reports whether `gitState.errorKind` comes back
+    /// as `default_branch_push` the way the override button expects.
+    #[allow(dead_code)]
+    pub(crate) fn default_branch_push_repro() {
+        use std::process::Command;
+
+        let fixture = TempDir::new().unwrap();
+        let data_dir = fixture.path().join("data");
+        let remote_root = fixture.path().join("remote");
+        let clone_root = fixture.path().join("clone");
+
+        let git = |dir: &Path, args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed in {dir:?}");
+        };
+
+        fs::create_dir_all(&remote_root).unwrap();
+        git(&remote_root, &["init", "--bare", "-q"]);
+        git(
+            fixture.path(),
+            &[
+                "clone",
+                "-q",
+                remote_root.to_str().unwrap(),
+                clone_root.to_str().unwrap(),
+            ],
+        );
+        git(&clone_root, &["config", "user.email", "tests@example.com"]);
+        git(&clone_root, &["config", "user.name", "Harkness Tests"]);
+        fs::write(clone_root.join("a.txt"), "one\n").unwrap();
+        git(&clone_root, &["add", "a.txt"]);
+        git(&clone_root, &["commit", "-q", "-m", "init"]);
+        git(&clone_root, &["branch", "-M", "main"]);
+        git(&clone_root, &["push", "-q", "-u", "origin", "main"]);
+        git(
+            &clone_root,
+            &["remote", "set-head", "origin", "--auto"],
+        );
+        fs::write(clone_root.join("a.txt"), "two\n").unwrap();
+        git(&clone_root, &["commit", "-q", "-am", "second"]);
+
+        // SAFETY: set before any Qt object is constructed, and this binary
+        // runs single-threaded with respect to Qt/env usage.
+        unsafe {
+            std::env::set_var("QT_QPA_PLATFORM", "offscreen");
+            std::env::set_var("QT_FORCE_STDERR_LOGGING", "1");
+            std::env::set_var("HARKNESS_DATA_DIR", &data_dir);
+        }
+        let real_project = harkness_core::ProjectService::load()
+            .unwrap()
+            .import_local(&clone_root)
+            .unwrap();
+        let real_project_id = real_project.id.to_string();
+
+        cxx_qt::init_qml_module!("io.github.fullstacktaiye.harkness");
+        let mut app = QGuiApplication::new();
+        let mut engine = QQmlApplicationEngine::new();
+
+        static RESULT_ROOT: AtomicPtr<QObject> = AtomicPtr::new(ptr::null_mut());
+        if let Some(mut engine) = engine.as_mut() {
+            let _connection = engine.as_mut().on_object_created(|_engine, object, _url| {
+                RESULT_ROOT.store(object, Ordering::SeqCst);
+            });
+            let qml = String::from_utf8(
+                br#"
+import QtQuick
+import org.kde.kirigami as Kirigami
+import io.github.fullstacktaiye.harkness
+
+Kirigami.ApplicationWindow {
+    id: window
+    visible: false
+    width: 640
+    height: 480
+    objectName: "PushReproPending"
+
+    property int phase: 0
+
+    HarknessBackend { id: backend }
+
+    property var proj: ({
+        "id": "__REAL_PROJECT_ID__",
+        "lockScope": "__REAL_PROJECT_ID__",
+        "displayName": "repro",
+        "root": "__REPO_ROOT__",
+        "remote": "",
+        "branch": "",
+        "managed": false,
+        "worktree": false,
+        "parentId": "",
+        "parentName": "",
+        "createdBranch": "",
+        "available": true,
+        "isGit": true,
+        "dirty": false
+    })
+
+    GitPanel {
+        id: gitPanel
+        backend: backend
+        project: window.proj
+    }
+
+    function overrideButtonWouldShow() {
+        return gitPanel.stateReady
+            && ["default_branch_push", "default_branch_unknown"]
+                .indexOf(gitPanel.gitState.errorKind) !== -1;
+    }
+
+    Timer {
+        interval: 20000
+        running: true
+        onTriggered: {
+            window.objectName = "PushReproTimedOut-phase" + window.phase
+                + "-jobs" + backend.jobs.length
+                + "-gitProjectId" + String(backend.git.projectId || "<none>")
+                + "-jobKinds[" + backend.jobs.map(function(j) { return j.kind; }).join(",") + "]";
+            Qt.quit();
+        }
+    }
+
+    Connections {
+        target: backend
+
+        function onOpenedChanged() {
+            if (window.phase === 0
+                    && String(backend.opened.id || "") === "__REAL_PROJECT_ID__") {
+                window.phase = 1;
+                backend.refreshGit("__REAL_PROJECT_ID__");
+            }
+        }
+
+        function onGitChanged() {
+            if (window.phase === 1 && backend.jobs.length === 0
+                    && String(backend.git.projectId || "") === "__REAL_PROJECT_ID__") {
+                window.phase = 2;
+                backend.push("__REAL_PROJECT_ID__", false);
+            } else if (window.phase === 2 && backend.jobs.length === 0
+                    && String(backend.git.projectId || "") === "__REAL_PROJECT_ID__") {
+                window.phase = 3;
+                Qt.callLater(function() {
+                    const passed = gitPanel.stateReady
+                        && String(gitPanel.gitState.errorKind || "") === "default_branch_push"
+                        && overrideButtonWouldShow();
+                    window.objectName = passed
+                        ? "PushOverrideConditionPassed"
+                        : "PushOverrideConditionFailed:" + JSON.stringify({
+                            error: String(gitPanel.gitState.error || ""),
+                            errorKind: String(gitPanel.gitState.errorKind || ""),
+                            stateReady: gitPanel.stateReady,
+                            overrideButtonWouldShow: overrideButtonWouldShow()
+                        });
+                    Qt.quit();
+                });
+            }
+        }
+    }
+
+    Component.onCompleted: backend.openProject("__REAL_PROJECT_ID__")
+}
+"#
+                .to_vec(),
+            )
+            .unwrap()
+            .replace("__REAL_PROJECT_ID__", &real_project_id)
+            .replace("__REPO_ROOT__", &clone_root.display().to_string());
+            engine.as_mut().load_data(
+                &QByteArray::from(qml.as_bytes()),
+                &QUrl::from("qrc:/PushOverrideRepro.qml"),
+            );
+        }
+
+        if let Some(app) = app.as_mut() {
+            app.exec();
+        }
+
+        let root = RESULT_ROOT.load(Ordering::SeqCst);
+        let name = unsafe { root.as_ref() }
+            .map(|object| object.object_name().to_string())
+            .unwrap_or_default();
+        drop(engine);
+        drop(app);
+        assert_eq!(
+            name, "PushOverrideConditionPassed",
+            "GitPanel must surface a default_branch_push refusal with the \
+             override button's visibility condition true; got: {name}"
+        );
+    }
 }

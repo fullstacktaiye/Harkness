@@ -151,6 +151,18 @@ Item {
             commitMessage.text = "";
     }
 
+    // Surfaces the default-branch override as a dialog the moment a push is
+    // refused, rather than only as a button above the "Changes" section that
+    // a user who clicked Push down in "Remote" would have to scroll up to
+    // notice.
+    property bool pushJobRunning: job("push") !== null
+    onPushJobRunningChanged: {
+        if (!pushJobRunning
+                && stateReady
+                && ["default_branch_push", "default_branch_unknown"].indexOf(gitState.errorKind) !== -1)
+            pushOverrideDialog.open();
+    }
+
     function reviewReadRunning() {
         return job("review") !== null
             || job("review_file") !== null
