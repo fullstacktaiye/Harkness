@@ -1315,10 +1315,7 @@ Kirigami.ApplicationWindow {
         git(&clone_root, &["commit", "-q", "-m", "init"]);
         git(&clone_root, &["branch", "-M", "main"]);
         git(&clone_root, &["push", "-q", "-u", "origin", "main"]);
-        git(
-            &clone_root,
-            &["remote", "set-head", "origin", "--auto"],
-        );
+        git(&clone_root, &["remote", "set-head", "origin", "--auto"]);
         fs::write(clone_root.join("a.txt"), "two\n").unwrap();
         git(&clone_root, &["commit", "-q", "-am", "second"]);
 

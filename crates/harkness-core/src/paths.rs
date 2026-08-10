@@ -15,7 +15,7 @@ pub(crate) const LOCKS_DIRECTORY: &str = "locks";
 pub(crate) const REPOSITORIES_DIRECTORY: &str = "repositories";
 pub(crate) const CHECKOUT_DIRECTORY: &str = "checkout";
 
-/// Resolves the Harkness data directory, honoring [`DATA_DIRECTORY_ENV`].
+/// Resolves the Harkness data directory, honoring `HARKNESS_DATA_DIR`.
 ///
 /// The override exists so an isolated front end or an integration test can run
 /// against its own catalog instead of the real user data directory. An empty
@@ -24,7 +24,7 @@ pub(crate) const CHECKOUT_DIRECTORY: &str = "checkout";
 ///
 /// `None` means the platform exposed no user data directory and no override
 /// was given.
-pub(crate) fn data_directory() -> Option<PathBuf> {
+pub fn data_directory() -> Option<PathBuf> {
     std::env::var_os(DATA_DIRECTORY_ENV)
         .filter(|overridden| !overridden.is_empty())
         .map(PathBuf::from)
