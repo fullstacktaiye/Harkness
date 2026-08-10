@@ -66,6 +66,16 @@ pub use worktree::{AddedWorktree, GitWorktree, WorktreeBase};
 pub(crate) const DEFAULT_REMOTE: &str = "origin";
 pub(crate) const LOCAL_REMOTE: &str = ".";
 
+/// Returns a stable opaque identity for a repository's shared mutation domain.
+///
+/// Main checkouts, linked worktrees, and canonical filesystem aliases of the
+/// same Git repository return the same value because the identity is derived
+/// from Git's common directory. Front ends can use it to reject conflicting
+/// work before a second operation waits on the repository lock.
+pub fn repository_identity(repository: impl AsRef<Path>) -> Result<String, GitError> {
+    lock::repository_identity(repository.as_ref()).map(|identity| identity.to_string())
+}
+
 /// A Git inspection diagnostic without exposing the underlying libgit2 type
 /// across crate boundaries.
 #[derive(Debug)]

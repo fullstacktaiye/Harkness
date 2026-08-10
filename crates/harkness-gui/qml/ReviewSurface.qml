@@ -27,27 +27,63 @@ ColumnLayout {
     readonly property var reviewFiles: reviewReady && reviewState.files !== undefined
         ? reviewState.files
         : []
+    readonly property int reviewFileOffset: reviewReady
+        ? Number(reviewState.fileOffset || 0)
+        : 0
+    readonly property int reviewFileTotal: reviewReady
+        ? Number(reviewState.totalFiles || 0)
+        : 0
     readonly property var reviewFile: reviewReady
         && reviewState.file !== undefined
         && reviewState.file.fileId !== undefined
         ? reviewState.file
         : ({})
     readonly property var reviewRows: reviewFile.rows !== undefined ? reviewFile.rows : []
+    readonly property string repositoryLockScope: String(
+        project.lockScope || project.parentId || project.id
+    )
+    property alias reviewContentY: reviewLineView.contentY
+    property alias reviewCurrentIndex: reviewLineView.currentIndex
+    readonly property bool reviewListHasActiveFocus: reviewLineView.activeFocus
     property string baseBranch: ""
     property bool splitLayout: false
+    property real heldReviewContentY: 0
+    property real heldReviewViewportOffset: 0
+    property string heldReviewPathId: ""
+    property string heldReviewProjectId: ""
+    property int heldReviewRowIndex: -1
+    property int heldReviewOldStart: 0
+    property int heldReviewOldLines: 0
+    property int heldReviewNewStart: 0
+    property int heldReviewNewLines: 0
+    property string heldReviewAction: ""
+    property bool heldReviewHadFocus: false
+    property bool heldRestorationScheduled: false
+    property int heldRestorationAttempts: 0
+    property int heldRestorationStableTicks: 0
+    property real heldRestorationLastDelegateY: Number.NaN
+    property real heldRestorationLastContentHeight: Number.NaN
+    readonly property int heldRestorationMaxAttempts: 80
+    property bool restorePositionAfterMutation: false
+    property int pendingHunkNavigation: 0
 
     spacing: Kirigami.Units.smallSpacing
 
     function job(kind) {
         for (let index = 0; index < backend.jobs.length; ++index) {
             const candidate = backend.jobs[index];
-            if (String(candidate.projectId) === String(project.id) && candidate.kind === kind)
+            if ((String(candidate.projectId) === String(project.id)
+                    || String(candidate.lockScope || candidate.projectId)
+                        === repositoryLockScope)
+                    && candidate.kind === kind)
                 return candidate;
         }
         return null;
     }
 
     function chooseBaseBranch() {
+        if (!backend || backend.branches === undefined)
+            return;
         if (baseBranch.length > 0 && baseBranch !== String(gitState.branch || ""))
             return;
         let fallback = "";
@@ -239,6 +275,416 @@ ColumnLayout {
         });
     }
 
+    function reviewRowDisplayed(row) {
+        return !(splitLayout && row.type === "line" && row.splitHidden === true);
+    }
+
+    function displayedReviewRowCount() {
+        let count = 0;
+        for (let index = 0; index < reviewRows.length; ++index) {
+            if (reviewRowDisplayed(reviewRows[index]))
+                ++count;
+        }
+        return count;
+    }
+
+    function loadReviewRowPage(direction, continueHunkNavigation) {
+        if (continueHunkNavigation !== true)
+            pendingHunkNavigation = 0;
+        const hadFocus = reviewOwnsActiveFocus();
+        if (direction === "previous")
+            backend.loadPreviousReviewRows(project.id);
+        else
+            backend.loadMoreReviewRows(project.id);
+        Qt.callLater(function() {
+            if (continueHunkNavigation === true && pendingHunkNavigation !== 0) {
+                const offset = pendingHunkNavigation;
+                if (repositoryMutationRunning()
+                        || reviewReadRunning()
+                        || restorePositionAfterMutation) {
+                    pendingHunkNavigation = 0;
+                    return;
+                }
+                continueNavigateHunk(
+                    offset,
+                    offset > 0 ? -1 : reviewRows.length
+                );
+                return;
+            }
+            const origin = direction === "previous" ? reviewRows.length - 1 : 0;
+            const focusIndex = nearestHunkIndex(origin);
+            reviewLineView.currentIndex = focusIndex;
+            if (focusIndex >= 0) {
+                reviewLineView.positionViewAtIndex(
+                    focusIndex,
+                    direction === "previous" ? ListView.End : ListView.Beginning
+                );
+            } else {
+                const maximum = Math.max(
+                    0,
+                    reviewLineView.contentHeight - reviewLineView.height
+                );
+                reviewLineView.contentY = direction === "previous" ? maximum : 0;
+            }
+            if (hadFocus)
+                reviewLineView.forceActiveFocus();
+        });
+    }
+
+    function mutateHunk(row) {
+        if (!row || (row.action !== "stage" && row.action !== "unstage"))
+            return;
+        heldReviewContentY = reviewLineView.contentY;
+        heldReviewViewportOffset = 0;
+        heldReviewPathId = String(reviewFile.pathId || "");
+        heldReviewProjectId = String(project.id);
+        heldReviewOldStart = Number(row.oldStart || 0);
+        heldReviewOldLines = Number(row.oldLines || 0);
+        heldReviewNewStart = Number(row.newStart || 0);
+        heldReviewNewLines = Number(row.newLines || 0);
+        heldReviewAction = String(row.action || "");
+        heldReviewHadFocus = reviewOwnsActiveFocus();
+        heldReviewRowIndex = -1;
+        for (let index = 0; index < reviewRows.length; ++index) {
+            if (reviewRows[index].type === "hunk"
+                    && String(reviewRows[index].hunkId || "") === String(row.hunkId || "")) {
+                heldReviewRowIndex = index;
+                const delegate = reviewLineView.itemAtIndex(index);
+                if (delegate)
+                    heldReviewViewportOffset = delegate.y - reviewLineView.contentY;
+                break;
+            }
+        }
+        heldRestorationAttempts = 0;
+        heldRestorationStableTicks = 0;
+        heldRestorationLastDelegateY = Number.NaN;
+        heldRestorationLastContentHeight = Number.NaN;
+        restorePositionAfterMutation = true;
+        if (row.action === "stage") {
+            backend.stageHunk(project.id, row.hunkId);
+        } else {
+            backend.unstageHunk(project.id, row.hunkId);
+        }
+        Qt.callLater(function() {
+            if (restorePositionAfterMutation
+                    && !repositoryMutationRunning()
+                    && !reviewReadRunning())
+                clearHeldPosition();
+        });
+    }
+
+    function repositoryMutationRunning() {
+        return job("stage") !== null
+            || job("unstage") !== null
+            || job("stage_hunk") !== null
+            || job("unstage_hunk") !== null
+            || job("commit") !== null
+            || job("fetch") !== null
+            || job("pull") !== null
+            || job("push") !== null
+            || job("checkout") !== null
+            || job("create_branch") !== null
+            || job("create_worktree") !== null
+            || job("reconcile_worktrees") !== null
+            || job("move_worktree") !== null
+            || job("lock_worktree") !== null
+            || job("unlock_worktree") !== null
+            || job("remove_worktree") !== null
+            || job("remove_managed") !== null;
+    }
+
+    function reviewReadRunning() {
+        return job("review") !== null
+            || job("review_file") !== null
+            || job("review_context") !== null;
+    }
+
+    function historyReadRunning() {
+        return job("history") !== null;
+    }
+
+    function repositoryOperationRunning() {
+        return repositoryMutationRunning()
+            || reviewReadRunning()
+            || historyReadRunning()
+            || job("status") !== null
+            || job("branches") !== null
+            || job("worktrees") !== null;
+    }
+
+    function hunkNavigationAvailable(offset) {
+        const direction = offset < 0 ? -1 : 1;
+        let index = reviewLineView.currentIndex;
+        if (index < 0)
+            index = direction > 0 ? -1 : reviewRows.length;
+        for (let candidate = index + direction;
+             candidate >= 0 && candidate < reviewRows.length;
+             candidate += direction) {
+            const row = reviewRows[candidate];
+            if (row.type === "hunk"
+                    || (row.type === "page"
+                        && row.hunkAvailable === true
+                        && row.direction === (direction > 0 ? "next" : "previous")))
+                return true;
+        }
+        return false;
+    }
+
+    function hunkNavigationEnabled(offset) {
+        return hunkNavigationAvailable(offset === undefined ? 1 : offset)
+            && !repositoryMutationRunning()
+            && !reviewReadRunning()
+            && !restorePositionAfterMutation;
+    }
+
+    function clearHeldPosition() {
+        restorePositionAfterMutation = false;
+        heldReviewPathId = "";
+        heldReviewProjectId = "";
+        heldReviewRowIndex = -1;
+        heldReviewOldStart = 0;
+        heldReviewOldLines = 0;
+        heldReviewNewStart = 0;
+        heldReviewNewLines = 0;
+        heldReviewAction = "";
+        heldReviewHadFocus = false;
+        heldRestorationScheduled = false;
+        heldRestorationAttempts = 0;
+        heldRestorationStableTicks = 0;
+        heldRestorationLastDelegateY = Number.NaN;
+        heldRestorationLastContentHeight = Number.NaN;
+    }
+
+    function nearestHunkIndex(origin) {
+        if (reviewRows.length === 0)
+            return -1;
+        const start = Math.max(0, Math.min(reviewRows.length - 1, origin));
+        for (let distance = 0; distance < reviewRows.length; ++distance) {
+            const after = start + distance;
+            if (after < reviewRows.length && reviewRows[after].type === "hunk")
+                return after;
+            const before = start - distance;
+            if (before >= 0 && reviewRows[before].type === "hunk")
+                return before;
+        }
+        return -1;
+    }
+
+    function coordinateDistance(start, lines, anchorStart, anchorLines) {
+        const firstStart = Number(start || 0);
+        const secondStart = Number(anchorStart || 0);
+        const firstEnd = firstStart + Math.max(1, Number(lines || 0)) - 1;
+        const secondEnd = secondStart + Math.max(1, Number(anchorLines || 0)) - 1;
+        if (firstEnd >= secondStart && secondEnd >= firstStart)
+            return 0;
+        return firstEnd < secondStart
+            ? secondStart - firstEnd
+            : firstStart - secondEnd;
+    }
+
+    function semanticHunkIndex() {
+        if (heldReviewNewStart <= 0 && heldReviewOldStart <= 0)
+            return nearestHunkIndex(heldReviewRowIndex);
+        let bestIndex = -1;
+        let bestCoordinateDistance = Number.MAX_VALUE;
+        let bestSpanDistance = Number.MAX_VALUE;
+        let bestRowDistance = Number.MAX_VALUE;
+        for (let index = 0; index < reviewRows.length; ++index) {
+            const row = reviewRows[index];
+            if (row.type !== "hunk")
+                continue;
+            const destinationStart = heldReviewAction === "stage"
+                ? row.newStart
+                : row.oldStart;
+            const destinationLines = heldReviewAction === "stage"
+                ? row.newLines
+                : row.oldLines;
+            const sourceStart = heldReviewAction === "stage"
+                ? heldReviewOldStart
+                : heldReviewNewStart;
+            const sourceLines = heldReviewAction === "stage"
+                ? heldReviewOldLines
+                : heldReviewNewLines;
+            const distance = coordinateDistance(
+                destinationStart,
+                destinationLines,
+                sourceStart,
+                sourceLines
+            );
+            const spanDistance = Math.abs(
+                Number(destinationLines || 0) - Number(sourceLines || 0)
+            );
+            const rowDistance = Math.abs(index - heldReviewRowIndex);
+            if (distance < bestCoordinateDistance
+                    || (distance === bestCoordinateDistance
+                        && spanDistance < bestSpanDistance)
+                    || (distance === bestCoordinateDistance
+                        && spanDistance === bestSpanDistance
+                        && rowDistance < bestRowDistance)) {
+                bestIndex = index;
+                bestCoordinateDistance = distance;
+                bestSpanDistance = spanDistance;
+                bestRowDistance = rowDistance;
+            }
+        }
+        return bestCoordinateDistance === 0 ? bestIndex : -1;
+    }
+
+    function focusIsInside(item, ancestor) {
+        for (let candidate = item; candidate; candidate = candidate.parent) {
+            if (candidate === ancestor)
+                return true;
+        }
+        return false;
+    }
+
+    function reviewOwnsActiveFocus() {
+        const window = reviewLineView.Window.window;
+        return window && focusIsInside(window.activeFocusItem, reviewLineView);
+    }
+
+    function mayRestoreReviewFocus() {
+        const window = reviewLineView.Window.window;
+        return !window || !window.activeFocusItem
+            || focusIsInside(window.activeFocusItem, reviewLineView);
+    }
+
+    function restoreHeldPosition() {
+        if (!restorePositionAfterMutation
+                || !reviewReady
+                || reviewState.loading === true
+                || reviewState.fileLoading === true
+                || repositoryMutationRunning()
+                || reviewReadRunning()
+                || heldRestorationScheduled)
+            return;
+        if (String(project.id) !== heldReviewProjectId
+                || String(reviewFile.pathId || "") !== heldReviewPathId) {
+            clearHeldPosition();
+            return;
+        }
+        heldRestorationScheduled = true;
+        Qt.callLater(function() {
+            reviewSurface.restoreHeldPositionStep();
+        });
+    }
+
+    function restoreHeldPositionStep() {
+        if (!restorePositionAfterMutation) {
+            heldRestorationScheduled = false;
+            return;
+        }
+        if (String(project.id) !== heldReviewProjectId
+                || String(reviewFile.pathId || "") !== heldReviewPathId) {
+            clearHeldPosition();
+            return;
+        }
+        if (reviewState.loading === true
+                || reviewState.fileLoading === true
+                || repositoryMutationRunning()
+                || reviewReadRunning()) {
+            heldRestorationScheduled = false;
+            heldRestorationStableTicks = 0;
+            return;
+        }
+
+        ++heldRestorationAttempts;
+        const focusIndex = semanticHunkIndex();
+        let delegate = null;
+        if (focusIndex >= 0) {
+            const indexChanged = reviewLineView.currentIndex !== focusIndex;
+            reviewLineView.currentIndex = focusIndex;
+            delegate = reviewLineView.itemAtIndex(focusIndex);
+            if (indexChanged || !delegate) {
+                reviewLineView.positionViewAtIndex(focusIndex, ListView.Contain);
+                reviewLineView.forceLayout();
+                delegate = reviewLineView.itemAtIndex(focusIndex);
+            }
+            if (!delegate) {
+                heldRestorationStableTicks = 0;
+                heldRestorationLastDelegateY = Number.NaN;
+                heldRestorationLastContentHeight = reviewLineView.contentHeight;
+                if (heldRestorationAttempts >= heldRestorationMaxAttempts) {
+                    clearHeldPosition();
+                } else {
+                    Qt.callLater(function() {
+                        reviewSurface.restoreHeldPositionStep();
+                    });
+                }
+                return;
+            }
+        }
+
+        reviewLineView.forceLayout();
+        if (focusIndex >= 0)
+            delegate = reviewLineView.itemAtIndex(focusIndex);
+        if (focusIndex >= 0 && !delegate) {
+            heldRestorationStableTicks = 0;
+            heldRestorationLastDelegateY = Number.NaN;
+            heldRestorationLastContentHeight = reviewLineView.contentHeight;
+            if (heldRestorationAttempts >= heldRestorationMaxAttempts) {
+                clearHeldPosition();
+            } else {
+                Qt.callLater(function() {
+                    reviewSurface.restoreHeldPositionStep();
+                });
+            }
+            return;
+        }
+        const maximum = Math.max(
+            0,
+            reviewLineView.contentHeight - reviewLineView.height
+        );
+        const desiredPosition = Math.max(
+            0,
+            Math.min(
+                delegate
+                    ? delegate.y - heldReviewViewportOffset
+                    : heldReviewContentY,
+                maximum
+            )
+        );
+        const positionStable = Math.abs(
+            reviewLineView.contentY - desiredPosition
+        ) < 1;
+        const heightStable = isFinite(heldRestorationLastContentHeight)
+            && Math.abs(
+                reviewLineView.contentHeight
+                    - heldRestorationLastContentHeight
+            ) < 1;
+        const delegateStable = !delegate
+            || (isFinite(heldRestorationLastDelegateY)
+                && Math.abs(delegate.y - heldRestorationLastDelegateY) < 1);
+        if (!positionStable)
+            reviewLineView.contentY = desiredPosition;
+
+        const viewportStable = positionStable
+            && heightStable
+            && delegateStable
+            && (focusIndex < 0
+                || reviewLineView.currentIndex === focusIndex);
+        const focusMayBeRestored = heldReviewHadFocus
+            && mayRestoreReviewFocus();
+        if (viewportStable && focusMayBeRestored)
+            reviewLineView.forceActiveFocus();
+        const focusStable = !focusMayBeRestored
+            || reviewLineView.activeFocus;
+        heldRestorationStableTicks = viewportStable && focusStable
+            ? heldRestorationStableTicks + 1
+            : 0;
+        heldRestorationLastDelegateY = delegate ? delegate.y : Number.NaN;
+        heldRestorationLastContentHeight = reviewLineView.contentHeight;
+
+        if (heldRestorationStableTicks >= 3
+                || heldRestorationAttempts >= heldRestorationMaxAttempts) {
+            clearHeldPosition();
+            return;
+        }
+        Qt.callLater(function() {
+            reviewSurface.restoreHeldPositionStep();
+        });
+    }
+
     function selectedFileIndex() {
         const selected = reviewReady ? String(reviewState.selectedFileId || "") : "";
         for (let index = 0; index < reviewFiles.length; ++index) {
@@ -248,25 +694,73 @@ ColumnLayout {
         return -1;
     }
 
-    function navigateFile(offset) {
+    function fileNavigationAvailable(offset) {
         if (reviewFiles.length === 0)
-            return;
-        let index = selectedFileIndex();
+            return false;
+        const index = selectedFileIndex();
         if (index < 0)
-            index = offset > 0 ? 0 : reviewFiles.length - 1;
-        else
-            index = Math.max(0, Math.min(reviewFiles.length - 1, index + offset));
+            return false;
+        if (offset < 0)
+            return index > 0 || reviewFileOffset > 0;
+        return index + 1 < reviewFiles.length
+            || reviewFileOffset + reviewFiles.length < reviewFileTotal;
+    }
+
+    function openReviewFileAt(index) {
+        if (index < 0 || index >= reviewFiles.length)
+            return;
         reviewFileList.currentIndex = index;
         reviewFileList.positionViewAtIndex(index, ListView.Contain);
         backend.loadReviewFile(project.id, reviewFiles[index].fileId);
     }
 
-    function navigateHunk(offset) {
-        if (reviewRows.length === 0)
+    function navigateFile(offset) {
+        if (!fileNavigationAvailable(offset))
             return;
-        let index = reviewLineView.currentIndex;
+        pendingHunkNavigation = 0;
+        let index = selectedFileIndex();
         if (index < 0)
-            index = offset > 0 ? -1 : reviewRows.length;
+            return;
+        const destination = index + offset;
+        if (destination >= 0 && destination < reviewFiles.length) {
+            openReviewFileAt(destination);
+            return;
+        }
+        if (offset < 0)
+            backend.loadPreviousReviewFiles(project.id);
+        else
+            backend.loadMoreReviewFiles(project.id);
+        Qt.callLater(function() {
+            openReviewFileAt(offset < 0 ? reviewFiles.length - 1 : 0);
+        });
+    }
+
+    function loadReviewFilePage(direction) {
+        pendingHunkNavigation = 0;
+        if (direction === "previous")
+            backend.loadPreviousReviewFiles(project.id);
+        else
+            backend.loadMoreReviewFiles(project.id);
+        Qt.callLater(function() {
+            reviewFileList.currentIndex = selectedFileIndex();
+            if (reviewFileList.currentIndex < 0 && reviewFiles.length > 0) {
+                // A manually browsed file window must not leave the diff on a
+                // hidden selection: define the new page boundary as the
+                // selection so subsequent Previous/Next remains adjacent.
+                openReviewFileAt(
+                    direction === "previous" ? reviewFiles.length - 1 : 0
+                );
+                return;
+            }
+            if (reviewFileList.currentIndex >= 0)
+                reviewFileList.positionViewAtIndex(
+                    reviewFileList.currentIndex,
+                    ListView.Contain
+                );
+        });
+    }
+
+    function continueNavigateHunk(offset, index) {
         for (let candidate = index + offset;
              candidate >= 0 && candidate < reviewRows.length;
              candidate += offset) {
@@ -274,12 +768,59 @@ ColumnLayout {
                 reviewLineView.currentIndex = candidate;
                 reviewLineView.positionViewAtIndex(candidate, ListView.Beginning);
                 reviewLineView.forceActiveFocus();
+                pendingHunkNavigation = 0;
                 return;
             }
         }
+        const pageDirection = offset > 0 ? "next" : "previous";
+        for (let candidate = 0; candidate < reviewRows.length; ++candidate) {
+            const row = reviewRows[candidate];
+            if (row.type === "page"
+                    && row.hunkAvailable === true
+                    && row.direction === pageDirection) {
+                pendingHunkNavigation = offset;
+                loadReviewRowPage(pageDirection, true);
+                return;
+            }
+        }
+        pendingHunkNavigation = 0;
+    }
+
+    function navigateHunk(offset) {
+        if (!hunkNavigationEnabled(offset))
+            return;
+        pendingHunkNavigation = 0;
+        let index = reviewLineView.currentIndex;
+        if (index < 0)
+            index = offset > 0 ? -1 : reviewRows.length;
+        continueNavigateHunk(offset, index);
+    }
+
+    function activateCurrentHunkAction() {
+        const loader = reviewLineView.itemAtIndex(reviewLineView.currentIndex);
+        const button = loader && loader.item ? loader.item.actionButton : null;
+        if (!button || !button.visible || !button.enabled)
+            return false;
+        button.forceActiveFocus();
+        button.click();
+        return true;
+    }
+
+    function currentReviewViewportOffset() {
+        const delegate = reviewLineView.itemAtIndex(reviewLineView.currentIndex);
+        return delegate ? delegate.y - reviewLineView.contentY : Number.NaN;
     }
 
     onStateReadyChanged: chooseBaseBranch()
+    onProjectChanged: {
+        pendingHunkNavigation = 0;
+        clearHeldPosition();
+    }
+    onReviewStateChanged: {
+        if (String(reviewState.commitId || "").length === 0)
+            historyList.currentIndex = -1;
+        restoreHeldPosition();
+    }
     Component.onCompleted: chooseBaseBranch()
     onBaseBranchChanged: {
         reviewBasePicker.currentIndex = -1;
@@ -293,28 +834,43 @@ ColumnLayout {
         function onBranchesChanged() {
             reviewSurface.chooseBaseBranch();
         }
+
+        function onJobsChanged() {
+            // A mutation job is replaced by a review-refresh job in the same
+            // backend callback. Re-check on the next turn so the transient gap
+            // cannot consume the held scroll position.
+            Qt.callLater(function() {
+                reviewSurface.restoreHeldPosition();
+            });
+        }
     }
 
     Shortcut {
-        enabled: reviewSurface.reviewReady && reviewSurface.reviewFiles.length > 0
+        enabled: reviewSurface.reviewReady
+            && reviewSurface.fileNavigationAvailable(1)
+            && !reviewSurface.repositoryMutationRunning()
+            && !reviewSurface.reviewReadRunning()
         sequence: "Alt+J"
         onActivated: reviewSurface.navigateFile(1)
     }
 
     Shortcut {
-        enabled: reviewSurface.reviewReady && reviewSurface.reviewFiles.length > 0
+        enabled: reviewSurface.reviewReady
+            && reviewSurface.fileNavigationAvailable(-1)
+            && !reviewSurface.repositoryMutationRunning()
+            && !reviewSurface.reviewReadRunning()
         sequence: "Alt+K"
         onActivated: reviewSurface.navigateFile(-1)
     }
 
     Shortcut {
-        enabled: reviewSurface.reviewRows.length > 0
+        enabled: reviewSurface.hunkNavigationEnabled(1)
         sequence: "Alt+Shift+J"
         onActivated: reviewSurface.navigateHunk(1)
     }
 
     Shortcut {
-        enabled: reviewSurface.reviewRows.length > 0
+        enabled: reviewSurface.hunkNavigationEnabled(-1)
         sequence: "Alt+Shift+K"
         onActivated: reviewSurface.navigateHunk(-1)
     }
@@ -337,11 +893,14 @@ ColumnLayout {
         }
 
         Controls.ToolButton {
+            Accessible.name: text
             Controls.ToolTip.text: qsTr("Refresh commit history")
             Controls.ToolTip.visible: hovered
             display: Controls.AbstractButton.IconOnly
             enabled: reviewSurface.job("history") === null
+                && !reviewSurface.repositoryMutationRunning()
             icon.name: "view-refresh"
+            text: qsTr("Refresh commit history")
             onClicked: reviewSurface.backend.refreshHistory(reviewSurface.project.id)
         }
     }
@@ -377,7 +936,8 @@ ColumnLayout {
             Layout.preferredWidth: Kirigami.Units.gridUnit * 7
             editable: true
             enabled: reviewSurface.stateReady && reviewSurface.gitState.branch
-                && reviewSurface.job("review") === null
+                && !reviewSurface.reviewReadRunning()
+                && !reviewSurface.repositoryMutationRunning()
             model: reviewSurface.backend.branches
             textRole: "name"
 
@@ -391,19 +951,25 @@ ColumnLayout {
         }
 
         Controls.ToolButton {
+            Accessible.name: text
             Controls.ToolTip.text: qsTr("Review branch against merge-base")
             Controls.ToolTip.visible: hovered
             display: Controls.AbstractButton.IconOnly
             enabled: reviewSurface.stateReady
                 && reviewSurface.gitState.branch
                 && reviewSurface.baseBranch.length > 0
-                && reviewSurface.job("review") === null
+                && !reviewSurface.reviewReadRunning()
+                && !reviewSurface.repositoryMutationRunning()
             icon.name: "vcs-diff"
-            onClicked: reviewSurface.backend.reviewBranch(
-                reviewSurface.project.id,
-                reviewSurface.gitState.branch,
-                reviewSurface.baseBranch
-            )
+            text: qsTr("Review branch against merge-base")
+            onClicked: {
+                historyList.currentIndex = -1;
+                reviewSurface.backend.reviewBranch(
+                    reviewSurface.project.id,
+                    reviewSurface.gitState.branch,
+                    reviewSurface.baseBranch
+                );
+            }
         }
     }
 
@@ -417,21 +983,31 @@ ColumnLayout {
         }
 
         Controls.Button {
-            enabled: reviewSurface.job("review") === null
+            enabled: !reviewSurface.reviewReadRunning()
+                && !reviewSurface.repositoryMutationRunning()
             text: qsTr("Staged")
-            onClicked: reviewSurface.backend.reviewWorkingChanges(
-                reviewSurface.project.id,
-                true
-            )
+            onClicked: {
+                historyList.currentIndex = -1;
+                reviewSurface.backend.reviewWorkingChanges(
+                    reviewSurface.project.id,
+                    true,
+                    ""
+                );
+            }
         }
 
         Controls.Button {
-            enabled: reviewSurface.job("review") === null
+            enabled: !reviewSurface.reviewReadRunning()
+                && !reviewSurface.repositoryMutationRunning()
             text: qsTr("Unstaged")
-            onClicked: reviewSurface.backend.reviewWorkingChanges(
-                reviewSurface.project.id,
-                false
-            )
+            onClicked: {
+                historyList.currentIndex = -1;
+                reviewSurface.backend.reviewWorkingChanges(
+                    reviewSurface.project.id,
+                    false,
+                    ""
+                );
+            }
         }
     }
 
@@ -463,6 +1039,7 @@ ColumnLayout {
         activeFocusOnTab: true
         boundsBehavior: Flickable.StopAtBounds
         clip: true
+        currentIndex: -1
         keyNavigationEnabled: true
         model: reviewSurface.commits
         reuseItems: true
@@ -472,11 +1049,21 @@ ColumnLayout {
         delegate: Controls.ItemDelegate {
             id: commitDelegate
 
+            required property int index
             required property var modelData
 
+            Accessible.name: qsTr("Commit %1: %2 by %3")
+                .arg(modelData.shortId)
+                .arg(modelData.summary.length > 0
+                    ? modelData.summary
+                    : qsTr("no commit message"))
+                .arg(modelData.author)
             Controls.ToolTip.text: modelData.message
             Controls.ToolTip.visible: hovered && modelData.message.length > 0
-            highlighted: historyList.currentIndex === index
+            highlighted: String(reviewSurface.reviewState.commitId || "")
+                === String(modelData.id)
+            enabled: !reviewSurface.repositoryMutationRunning()
+                && !reviewSurface.reviewReadRunning()
             width: historyList.width
             onClicked: {
                 historyList.currentIndex = index;
@@ -533,6 +1120,7 @@ ColumnLayout {
     Controls.Button {
         Layout.alignment: Qt.AlignHCenter
         enabled: reviewSurface.job("history") === null
+            && !reviewSurface.repositoryMutationRunning()
         icon.name: "go-down"
         text: reviewSurface.job("history") === null
             ? qsTr("Load older commits")
@@ -623,14 +1211,21 @@ ColumnLayout {
             delegate: Controls.ItemDelegate {
                 id: reviewFileDelegate
 
+                required property int index
                 required property var modelData
 
+                Accessible.name: qsTr("%1, %2 change")
+                    .arg(modelData.path)
+                    .arg(modelData.change)
                 Controls.ToolTip.text: modelData.path
                 Controls.ToolTip.visible: hovered
                 highlighted: String(reviewSurface.reviewState.selectedFileId || "")
                     === String(modelData.fileId)
+                enabled: !reviewSurface.repositoryMutationRunning()
+                    && !reviewSurface.reviewReadRunning()
                 width: reviewFileList.width
                 onClicked: {
+                    reviewSurface.pendingHunkNavigation = 0;
                     reviewFileList.currentIndex = index;
                     reviewSurface.backend.loadReviewFile(
                         reviewSurface.project.id,
@@ -661,42 +1256,86 @@ ColumnLayout {
 
         RowLayout {
             Layout.fillWidth: true
+            visible: reviewSurface.reviewFileTotal > reviewSurface.reviewFiles.length
+
+            Controls.Button {
+                enabled: reviewSurface.reviewFileOffset > 0
+                    && !reviewSurface.repositoryMutationRunning()
+                    && !reviewSurface.reviewReadRunning()
+                icon.name: "go-previous"
+                text: qsTr("Previous files")
+                onClicked: reviewSurface.loadReviewFilePage("previous")
+            }
+
+            Controls.Label {
+                Layout.fillWidth: true
+                horizontalAlignment: Text.AlignHCenter
+                text: qsTr("Files %1–%2 of %3")
+                    .arg(reviewSurface.reviewFileOffset + 1)
+                    .arg(reviewSurface.reviewFileOffset + reviewSurface.reviewFiles.length)
+                    .arg(reviewSurface.reviewFileTotal)
+            }
+
+            Controls.Button {
+                enabled: reviewSurface.reviewFileOffset + reviewSurface.reviewFiles.length
+                    < reviewSurface.reviewFileTotal
+                    && !reviewSurface.repositoryMutationRunning()
+                    && !reviewSurface.reviewReadRunning()
+                icon.name: "go-next"
+                text: qsTr("Next files")
+                onClicked: reviewSurface.loadReviewFilePage("next")
+            }
+        }
+
+        RowLayout {
+            Layout.fillWidth: true
             visible: reviewSurface.reviewFile.fileId !== undefined
 
             Controls.ToolButton {
+                Accessible.name: text
                 Controls.ToolTip.text: qsTr("Previous file (Alt+K)")
                 Controls.ToolTip.visible: hovered
                 display: Controls.AbstractButton.IconOnly
-                enabled: reviewSurface.selectedFileIndex() > 0
+                enabled: reviewSurface.fileNavigationAvailable(-1)
+                    && !reviewSurface.repositoryMutationRunning()
+                    && !reviewSurface.reviewReadRunning()
                 icon.name: "go-up"
+                text: qsTr("Previous file")
                 onClicked: reviewSurface.navigateFile(-1)
             }
 
             Controls.ToolButton {
+                Accessible.name: text
                 Controls.ToolTip.text: qsTr("Next file (Alt+J)")
                 Controls.ToolTip.visible: hovered
                 display: Controls.AbstractButton.IconOnly
-                enabled: reviewSurface.selectedFileIndex() >= 0
-                    && reviewSurface.selectedFileIndex() + 1 < reviewSurface.reviewFiles.length
+                enabled: reviewSurface.fileNavigationAvailable(1)
+                    && !reviewSurface.repositoryMutationRunning()
+                    && !reviewSurface.reviewReadRunning()
                 icon.name: "go-down"
+                text: qsTr("Next file")
                 onClicked: reviewSurface.navigateFile(1)
             }
 
             Controls.ToolButton {
+                Accessible.name: text
                 Controls.ToolTip.text: qsTr("Previous hunk (Alt+Shift+K)")
                 Controls.ToolTip.visible: hovered
                 display: Controls.AbstractButton.IconOnly
-                enabled: reviewSurface.reviewRows.length > 0
-                icon.name: "arrow-up-double"
+                enabled: reviewSurface.hunkNavigationEnabled(-1)
+                icon.name: "go-up"
+                text: qsTr("Previous hunk")
                 onClicked: reviewSurface.navigateHunk(-1)
             }
 
             Controls.ToolButton {
+                Accessible.name: text
                 Controls.ToolTip.text: qsTr("Next hunk (Alt+Shift+J)")
                 Controls.ToolTip.visible: hovered
                 display: Controls.AbstractButton.IconOnly
-                enabled: reviewSurface.reviewRows.length > 0
-                icon.name: "arrow-down-double"
+                enabled: reviewSurface.hunkNavigationEnabled(1)
+                icon.name: "go-down"
+                text: qsTr("Next hunk")
                 onClicked: reviewSurface.navigateHunk(1)
             }
 
@@ -709,6 +1348,7 @@ ColumnLayout {
             }
 
             Controls.ToolButton {
+                Accessible.name: text
                 Controls.ButtonGroup.group: reviewLayoutGroup
                 Controls.ToolTip.text: qsTr("Unified layout")
                 Controls.ToolTip.visible: hovered
@@ -716,10 +1356,12 @@ ColumnLayout {
                 checked: !reviewSurface.splitLayout
                 display: Controls.AbstractButton.IconOnly
                 icon.name: "view-list-text"
+                text: qsTr("Unified layout")
                 onClicked: reviewSurface.setSplitLayout(false)
             }
 
             Controls.ToolButton {
+                Accessible.name: text
                 Controls.ButtonGroup.group: reviewLayoutGroup
                 Controls.ToolTip.text: qsTr("Side-by-side layout")
                 Controls.ToolTip.visible: hovered
@@ -727,6 +1369,7 @@ ColumnLayout {
                 checked: reviewSurface.splitLayout
                 display: Controls.AbstractButton.IconOnly
                 icon.name: "view-split-left-right"
+                text: qsTr("Side-by-side layout")
                 onClicked: reviewSurface.setSplitLayout(true)
             }
         }
@@ -751,6 +1394,7 @@ ColumnLayout {
         ListView {
             id: reviewLineView
 
+            Accessible.name: qsTr("Changed lines for %1").arg(reviewSurface.reviewFile.path || "")
             Layout.fillWidth: true
             Layout.preferredHeight: Kirigami.Units.gridUnit * 22
             activeFocusOnTab: true
@@ -765,6 +1409,7 @@ ColumnLayout {
             delegate: Loader {
                 id: reviewRowLoader
 
+                required property int index
                 required property var modelData
 
                 readonly property var row: modelData
@@ -772,12 +1417,28 @@ ColumnLayout {
                     ? reviewHunkComponent
                     : row.type === "collapsed"
                         ? reviewCollapsedComponent
-                        : reviewLineComponent
+                        : row.type === "page"
+                            ? reviewPageComponent
+                            : reviewLineComponent
                 width: reviewLineView.width
-                onLoaded: item.row = row
-                onRowChanged: {
+                onLoaded: {
+                    item.row = row;
+                    item.rowIndex = index;
+                }
+                onIndexChanged: {
                     if (item)
-                        item.row = row;
+                        item.rowIndex = index;
+                }
+                onRowChanged: {
+                    // A reused Loader may switch component types in the same
+                    // turn. Assign after sourceComponent has settled so a
+                    // line delegate never receives a hunk row (or vice versa).
+                    Qt.callLater(function() {
+                        if (item) {
+                            item.row = row;
+                            item.rowIndex = index;
+                        }
+                    });
                 }
             }
 
@@ -793,27 +1454,58 @@ ColumnLayout {
             id: reviewHunk
 
             property var row: ({})
+            property int rowIndex: -1
+            property alias actionButton: reviewHunkAction
 
+            Accessible.name: qsTr("Diff hunk %1").arg(row.header || "")
+            Accessible.role: Accessible.ListItem
+            Accessible.selectable: true
+            Accessible.selected: reviewLineView.currentIndex === reviewHunk.rowIndex
             padding: Kirigami.Units.smallSpacing
             width: ListView.view ? ListView.view.width : implicitWidth
+
+            background: Rectangle {
+                border.color: reviewLineView.currentIndex === reviewHunk.rowIndex
+                    ? Kirigami.Theme.highlightColor
+                    : "transparent"
+                border.width: reviewLineView.currentIndex === reviewHunk.rowIndex ? 2 : 0
+                color: Kirigami.Theme.backgroundColor
+                radius: Kirigami.Units.smallSpacing
+            }
 
             contentItem: ColumnLayout {
                 spacing: Kirigami.Units.smallSpacing
 
-                Controls.Label {
+                RowLayout {
                     Layout.fillWidth: true
-                    color: Kirigami.Theme.highlightColor
-                    font.family: "monospace"
-                    text: reviewHunk.row.header
-                    textFormat: Text.PlainText
-                    wrapMode: Text.WrapAnywhere
+
+                    Controls.Label {
+                        Layout.fillWidth: true
+                        color: Kirigami.Theme.highlightColor
+                        font.family: "monospace"
+                        text: reviewHunk.row.header || ""
+                        textFormat: Text.PlainText
+                        wrapMode: Text.WrapAnywhere
+                    }
+
+                    Controls.Button {
+                        id: reviewHunkAction
+
+                        enabled: !reviewSurface.repositoryOperationRunning()
+                        text: reviewHunk.row.action === "stage"
+                            ? qsTr("Stage hunk")
+                            : qsTr("Unstage hunk")
+                        visible: reviewHunk.row.action === "stage"
+                            || reviewHunk.row.action === "unstage"
+                        onClicked: reviewSurface.mutateHunk(reviewHunk.row)
+                    }
                 }
 
                 Controls.Label {
                     Layout.fillWidth: true
                     color: Kirigami.Theme.neutralTextColor
                     font: Kirigami.Theme.smallFont
-                    text: reviewHunk.row.degradation
+                        text: reviewHunk.row.degradation || ""
                     textFormat: Text.PlainText
                     visible: text.length > 0
                     wrapMode: Text.Wrap
@@ -827,8 +1519,10 @@ ColumnLayout {
 
         Controls.Button {
             property var row: ({})
+            property int rowIndex: -1
 
-            enabled: reviewSurface.job("review_context") === null
+            enabled: !reviewSurface.reviewReadRunning()
+                && !reviewSurface.repositoryMutationRunning()
             flat: true
             icon.name: "view-more-symbolic"
             text: qsTr("Show %1 more unchanged line(s)").arg(Math.min(20, row.count))
@@ -842,14 +1536,43 @@ ColumnLayout {
     }
 
     Component {
+        id: reviewPageComponent
+
+        Controls.Button {
+            property var row: ({})
+            property int rowIndex: -1
+
+            enabled: !reviewSurface.reviewReadRunning()
+                && !reviewSurface.repositoryMutationRunning()
+            flat: true
+            icon.name: row.direction === "previous"
+                ? "go-up-symbolic"
+                : "go-down-symbolic"
+            text: row.direction === "previous"
+                ? qsTr("Show previous changed lines (%1 before)").arg(row.count)
+                : qsTr("Show next changed lines (%1 remaining)").arg(row.count)
+            width: ListView.view ? ListView.view.width : implicitWidth
+            onClicked: reviewSurface.loadReviewRowPage(row.direction)
+        }
+    }
+
+    Component {
         id: reviewLineComponent
 
         Item {
             id: reviewLineDelegate
 
             property var row: ({})
+            property int rowIndex: -1
 
-            readonly property bool hidden: reviewSurface.splitLayout && row.splitHidden === true
+            readonly property var unified: row.unified || ({
+                "oldLine": 0,
+                "newLine": 0,
+                "kind": "context",
+                "marker": "",
+                "segments": []
+            })
+            readonly property bool hidden: !reviewSurface.reviewRowDisplayed(row)
             implicitHeight: hidden
                 ? 0
                 : reviewSurface.splitLayout
@@ -863,7 +1586,7 @@ ColumnLayout {
 
                 anchors.left: parent.left
                 anchors.right: parent.right
-                color: reviewSurface.lineColor(reviewLineDelegate.row.unified.kind)
+                color: reviewSurface.lineColor(reviewLineDelegate.unified.kind)
                 implicitHeight: unifiedLayout.implicitHeight + Kirigami.Units.smallSpacing
                 visible: !reviewSurface.splitLayout
 
@@ -882,30 +1605,30 @@ ColumnLayout {
                         font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                         horizontalAlignment: Text.AlignRight
                         text: "%1│%2"
-                            .arg(reviewLineDelegate.row.unified.oldLine > 0
-                                ? reviewLineDelegate.row.unified.oldLine
+                            .arg(reviewLineDelegate.unified.oldLine > 0
+                                ? reviewLineDelegate.unified.oldLine
                                 : "")
-                            .arg(reviewLineDelegate.row.unified.newLine > 0
-                                ? reviewLineDelegate.row.unified.newLine
+                            .arg(reviewLineDelegate.unified.newLine > 0
+                                ? reviewLineDelegate.unified.newLine
                                 : "")
                     }
 
                     Controls.Label {
                         Layout.preferredWidth: Kirigami.Units.gridUnit
                         color: reviewSurface.markerColor(
-                            reviewLineDelegate.row.unified.kind
+                            reviewLineDelegate.unified.kind
                         )
                         font.bold: true
                         font.family: "monospace"
                         horizontalAlignment: Text.AlignHCenter
-                        text: reviewLineDelegate.row.unified.marker
+                        text: reviewLineDelegate.unified.marker
                     }
 
                     Controls.Label {
                         Layout.fillWidth: true
                         font.family: "monospace"
                         text: reviewSurface.highlightedLine(
-                            reviewLineDelegate.row.unified.segments,
+                            reviewLineDelegate.unified.segments,
                             reviewSurface.reviewFile.path || ""
                         )
                         textFormat: Text.RichText
@@ -923,7 +1646,10 @@ ColumnLayout {
                 visible: reviewSurface.splitLayout
 
                 Repeater {
-                    model: [reviewLineDelegate.row.old, reviewLineDelegate.row.new]
+                    model: [
+                        reviewLineDelegate.row.old || ({}),
+                        reviewLineDelegate.row.new || ({})
+                    ]
 
                     delegate: Rectangle {
                         id: splitSide

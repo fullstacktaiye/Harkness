@@ -143,6 +143,12 @@ impl Drop for RepositoryLock {
 
 /// Resolves the lock file shared by every worktree of one repository.
 fn lock_path(lock_dir: &Path, repository: &Path) -> Result<PathBuf, GitError> {
+    Ok(lock_dir.join(format!("{}.lock", repository_identity(repository)?)))
+}
+
+/// Returns the opaque identity used to share one mutation lock across every
+/// worktree and filesystem alias of a repository.
+pub(crate) fn repository_identity(repository: &Path) -> Result<Uuid, GitError> {
     // `open` rather than `discover`: a path that is not itself a repository
     // must not be silently locked as its parent.
     let opened = match Repository::open(repository) {
@@ -173,7 +179,7 @@ fn lock_path(lock_dir: &Path, repository: &Path) -> Result<PathBuf, GitError> {
         &REPOSITORY_LOCK_NAMESPACE,
         canonical.as_os_str().as_encoded_bytes(),
     );
-    Ok(lock_dir.join(format!("{identifier}.lock")))
+    Ok(identifier)
 }
 
 #[cfg(test)]
