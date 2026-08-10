@@ -142,6 +142,15 @@ Item {
         return "fetch";
     }
 
+    // Clears the commit message once the in-flight commit finishes without
+    // error, rather than leaving a stale message the user has to delete
+    // themselves before writing the next one.
+    property bool commitJobRunning: job("commit") !== null
+    onCommitJobRunningChanged: {
+        if (!commitJobRunning && stateReady && String(gitState.error || "").length === 0)
+            commitMessage.text = "";
+    }
+
     function reviewReadRunning() {
         return job("review") !== null
             || job("review_file") !== null
