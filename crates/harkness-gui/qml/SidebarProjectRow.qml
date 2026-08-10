@@ -94,7 +94,7 @@ Controls.AbstractButton {
                         return Kirigami.Theme.disabledTextColor;
                     }
                     elide: Text.ElideRight
-                    font: Kirigami.Theme.smallFont
+                    font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                     text: row.describe()
                 }
 

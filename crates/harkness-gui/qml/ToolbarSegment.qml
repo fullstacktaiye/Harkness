@@ -29,7 +29,7 @@ Controls.ToolButton {
     // Two stacked labels are taller than the default tool-button content, and
     // the toolbar cells must line up whatever text they hold.
     implicitHeight: Math.max(
-        Kirigami.Units.gridUnit * 2.5,
+        Kirigami.Units.gridUnit * 2.2,
         implicitContentHeight + topPadding + bottomPadding
     )
 

@@ -117,7 +117,7 @@ Controls.AbstractButton {
             Controls.Label {
                 Layout.fillWidth: true
                 color: Kirigami.Theme.disabledTextColor
-                font: Kirigami.Theme.smallFont
+                font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                 text: card.subtitle
                 wrapMode: Text.Wrap
             }

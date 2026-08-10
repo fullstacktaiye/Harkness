@@ -258,7 +258,7 @@ ColumnLayout {
                         Layout.fillWidth: true
                         color: Kirigami.Theme.disabledTextColor
                         elide: Text.ElideRight
-                        font: Kirigami.Theme.smallFont
+                        font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                         text: qsTr("%1 · %2")
                             .arg(commitDelegate.modelData.author)
                             .arg(history.formatCommitTime(

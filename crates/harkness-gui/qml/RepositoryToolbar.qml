@@ -402,7 +402,7 @@ RowLayout {
                                 Layout.fillWidth: true
                                 color: Kirigami.Theme.disabledTextColor
                                 elide: Text.ElideMiddle
-                                font: Kirigami.Theme.smallFont
+                                font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                                 text: qsTr("%1 (%2)")
                                     .arg(worktreeDelegate.row.root)
                                     .arg(worktreeDelegate.row.owned
@@ -417,7 +417,7 @@ RowLayout {
                             Controls.Label {
                                 Layout.fillWidth: true
                                 color: Kirigami.Theme.neutralTextColor
-                                font: Kirigami.Theme.smallFont
+                                font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                                 text: worktreeDelegate.row.lockReason.length > 0
                                     ? qsTr("Locked: %1").arg(worktreeDelegate.row.lockReason)
                                     : qsTr("Locked without a recorded reason")

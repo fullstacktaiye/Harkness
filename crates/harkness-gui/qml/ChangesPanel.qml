@@ -251,7 +251,7 @@ ColumnLayout {
                             ? Kirigami.Theme.negativeTextColor
                             : Kirigami.Theme.disabledTextColor
                         elide: Text.ElideRight
-                        font: Kirigami.Theme.smallFont
+                        font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                         text: changes.changeSummary(entryDelegate.modelData)
                         textFormat: Text.PlainText
                         visible: text.length > 0

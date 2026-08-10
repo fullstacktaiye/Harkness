@@ -141,7 +141,7 @@ Kirigami.Page {
                 id: headerBand
 
                 Layout.fillWidth: true
-                implicitHeight: headerRow.implicitHeight + Kirigami.Units.largeSpacing * 2
+                implicitHeight: headerRow.implicitHeight + Kirigami.Units.largeSpacing
 
                 Kirigami.Theme.colorSet: Kirigami.Theme.Header
                 Kirigami.Theme.inherit: false
@@ -175,8 +175,8 @@ Kirigami.Page {
                     // block has an anchor point instead of an icon floating
                     // in the row.
                     Rectangle {
-                        Layout.preferredHeight: Kirigami.Units.iconSizes.medium + Kirigami.Units.smallSpacing * 3
-                        Layout.preferredWidth: Kirigami.Units.iconSizes.medium + Kirigami.Units.smallSpacing * 3
+                        Layout.preferredHeight: Kirigami.Units.iconSizes.smallMedium + Kirigami.Units.smallSpacing * 2
+                        Layout.preferredWidth: Kirigami.Units.iconSizes.smallMedium + Kirigami.Units.smallSpacing * 2
                         border.color: shell.frameColor
                         border.width: 1
                         color: Kirigami.Theme.alternateBackgroundColor
@@ -184,46 +184,45 @@ Kirigami.Page {
 
                         Kirigami.Icon {
                             anchors.centerIn: parent
-                            height: Kirigami.Units.iconSizes.medium
+                            height: Kirigami.Units.iconSizes.smallMedium
                             source: shell.project.isGit ? "folder-git" : "folder"
-                            width: Kirigami.Units.iconSizes.medium
+                            width: Kirigami.Units.iconSizes.smallMedium
                         }
                     }
 
-                    ColumnLayout {
+                    // Name and path share one baseline-aligned row: the header
+                    // stays a single line tall however long either grows.
+                    RowLayout {
                         Layout.fillWidth: true
-                        spacing: 0
+                        spacing: Kirigami.Units.smallSpacing
 
                         Kirigami.Heading {
-                            Layout.fillWidth: true
+                            Layout.alignment: Qt.AlignBaseline
+                            Layout.maximumWidth: headerRow.width / 2
                             elide: Text.ElideRight
-                            level: 2
+                            level: 3
                             text: shell.shellName
                         }
 
-                        RowLayout {
+                        Controls.Label {
+                            Layout.alignment: Qt.AlignBaseline
                             Layout.fillWidth: true
-                            spacing: Kirigami.Units.smallSpacing
+                            color: Kirigami.Theme.disabledTextColor
+                            elide: Text.ElideMiddle
+                            font.family: "monospace"
+                            font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                            text: shell.project.root
+                        }
 
-                            Controls.Label {
-                                Layout.fillWidth: true
-                                color: Kirigami.Theme.disabledTextColor
-                                elide: Text.ElideMiddle
-                                font.family: "monospace"
-                                font.pixelSize: Kirigami.Theme.smallFont.pixelSize
-                                text: shell.project.root
-                            }
-
-                            Controls.ToolButton {
-                                Controls.ToolTip.text: qsTr("Copy path")
-                                display: Controls.AbstractButton.IconOnly
-                                icon.name: "edit-copy"
-                                onClicked: {
-                                    clipboard.text = shell.project.root;
-                                    clipboard.selectAll();
-                                    clipboard.copy();
-                                    clipboard.deselect();
-                                }
+                        Controls.ToolButton {
+                            Controls.ToolTip.text: qsTr("Copy path")
+                            display: Controls.AbstractButton.IconOnly
+                            icon.name: "edit-copy"
+                            onClicked: {
+                                clipboard.text = shell.project.root;
+                                clipboard.selectAll();
+                                clipboard.copy();
+                                clipboard.deselect();
                             }
                         }
                     }

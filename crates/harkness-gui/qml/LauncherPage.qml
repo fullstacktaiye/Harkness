@@ -183,7 +183,7 @@ Kirigami.Page {
                         Layout.fillWidth: true
                         color: Kirigami.Theme.disabledTextColor
                         elide: Text.ElideRight
-                        font: Kirigami.Theme.smallFont
+                        font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                         text: launcher.backend.status
                         textFormat: Text.PlainText
                         visible: text.length > 0
@@ -409,7 +409,7 @@ Kirigami.Page {
                         Controls.Label {
                             Layout.fillWidth: true
                             color: Kirigami.Theme.negativeTextColor
-                            font: Kirigami.Theme.smallFont
+                            font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                             text: remoteField.error
                             visible: text.length > 0
                             wrapMode: Text.Wrap
@@ -429,7 +429,7 @@ Kirigami.Page {
                             Controls.Label {
                                 Layout.fillWidth: true
                                 elide: Text.ElideRight
-                                font: Kirigami.Theme.smallFont
+                                font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                                 text: launcher.backend.status
                                 textFormat: Text.PlainText
                             }

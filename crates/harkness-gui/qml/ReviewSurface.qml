@@ -540,7 +540,7 @@ ColumnLayout {
                     Layout.fillWidth: true
                     color: Kirigami.Theme.disabledTextColor
                     elide: Text.ElideMiddle
-                    font: Kirigami.Theme.smallFont
+                    font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                     text: reviewSurface.reviewState.detail || ""
                     textFormat: Text.PlainText
                 }
@@ -666,7 +666,7 @@ ColumnLayout {
 
                                 Controls.Label {
                                     color: Kirigami.Theme.disabledTextColor
-                                    font: Kirigami.Theme.smallFont
+                                    font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                                     text: reviewFileDelegate.modelData.change
                                     textFormat: Text.PlainText
                                 }
@@ -700,7 +700,7 @@ ColumnLayout {
                         Controls.Label {
                             Layout.fillWidth: true
                             elide: Text.ElideRight
-                            font: Kirigami.Theme.smallFont
+                            font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                             horizontalAlignment: Text.AlignHCenter
                             text: qsTr("Files %1–%2 of %3")
                                 .arg(reviewSurface.reviewFileOffset + 1)
@@ -943,7 +943,7 @@ ColumnLayout {
                 Controls.Label {
                     Layout.fillWidth: true
                     color: Kirigami.Theme.neutralTextColor
-                    font: Kirigami.Theme.smallFont
+                    font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                         text: reviewHunk.row.degradation || ""
                     textFormat: Text.PlainText
                     visible: text.length > 0

@@ -12,6 +12,10 @@ Kirigami.ApplicationWindow {
     // title itself is still set: it is what the task switcher and the window
     // list show, and nothing inside the window displays it.
     flags: Qt.Window | Qt.FramelessWindowHint
+    // Visual Studio Code's Linux interface font. The window's font propagates
+    // to every control and popup inside it, so this is the one place the
+    // application typeface is chosen.
+    font.family: "Droid Sans"
     height: 900
     minimumHeight: 900
     minimumWidth: 1280
@@ -88,11 +92,21 @@ Kirigami.ApplicationWindow {
             root.confirmRemoveLocal(project.id, project.displayName);
     }
 
+    // The style draws menu entries in a muted grey that is hard to read on the
+    // dark chrome, so every menu spells out full-contrast white for its items.
+    component LegibleMenuItem: Controls.MenuItem {
+        Kirigami.Theme.inherit: false
+        Kirigami.Theme.textColor: "#ffffff"
+        palette.text: "#ffffff"
+        palette.windowText: "#ffffff"
+    }
+
     menuBar: AppTitleBar {
         Controls.Menu {
             // The style sizes a menu to its labels alone, so the widest entry
             // and its shortcut would be printed on top of each other. Reserve
             // the column the shortcuts need.
+            delegate: LegibleMenuItem {}
             implicitWidth: Kirigami.Units.gridUnit * 16
             title: qsTr("&File")
 
@@ -141,6 +155,7 @@ Kirigami.ApplicationWindow {
         }
 
         Controls.Menu {
+            delegate: LegibleMenuItem {}
             title: qsTr("&Help")
 
             Controls.Action {
