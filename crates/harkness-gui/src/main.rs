@@ -156,6 +156,135 @@ Kirigami.ApplicationWindow {
             "ProjectShellPage failed to load; see QML warnings above"
         );
 
+        // Drive the activity bar and the side panel it switches with stub
+        // views. Both are backend-free, so the checks are plain synchronous
+        // property reads; what they cover is the view contract itself, which
+        // the shell fixture above only ever sees in its unavailable state.
+        LOADED.store(false, Ordering::SeqCst);
+        static SIDE_PANEL_ROOT: AtomicPtr<QObject> = AtomicPtr::new(ptr::null_mut());
+        if let Some(mut engine) = engine.as_mut() {
+            let _connection = engine.as_mut().on_object_created(|_engine, object, _url| {
+                LOADED.store(!object.is_null(), Ordering::SeqCst);
+                SIDE_PANEL_ROOT.store(object, Ordering::SeqCst);
+            });
+            engine.as_mut().load_data(
+                &QByteArray::from(
+                    br#"
+import QtQuick
+import org.kde.kirigami as Kirigami
+import io.github.fullstacktaiye.harkness
+
+Kirigami.ApplicationWindow {
+    id: window
+
+    visible: false
+    width: 640
+    height: 480
+
+    component StubPanel: Item {
+        property string viewId: ""
+        property string viewTitle: ""
+        property string viewIcon: "vcs-branch"
+        property string viewShortcut: "Ctrl+Shift+G"
+        property int viewBadge: 0
+        property bool viewAvailable: true
+        property var viewActions: []
+    }
+
+    property string currentViewId: "first"
+    property bool secondAvailable: true
+    property string hidden: "no"
+
+    SidePanel {
+        id: sidePanel
+
+        anchors.fill: parent
+        currentViewId: window.currentViewId
+        onHideRequested: window.hidden = "yes"
+
+        StubPanel {
+            id: firstView
+
+            viewId: "first"
+            viewTitle: "First"
+            viewBadge: 3
+        }
+
+        StubPanel {
+            id: secondView
+
+            viewId: "second"
+            viewTitle: "Second"
+            viewAvailable: window.secondAvailable
+        }
+    }
+
+    ActivityBar {
+        id: activityBar
+
+        anchors.left: parent.left
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        currentViewId: window.currentViewId
+        views: sidePanel.views
+        visible: sidePanel.hasAvailableView
+    }
+
+    Component.onCompleted: {
+        const failures = [];
+        function check(name, passed) {
+            if (!passed)
+                failures.push(name);
+        }
+
+        check("collectsDeclaredViews", sidePanel.views.length === 2);
+        check("keepsDeclarationOrder", sidePanel.firstAvailableViewId() === "first");
+        check("looksUpByViewId", sidePanel.view("second") === secondView);
+        check("ignoresUnknownViewId", sidePanel.view("third") === null);
+        check("showsCurrentView", sidePanel.currentPanel === firstView);
+        check("reportsCurrentViewReady", sidePanel.currentPanelReady);
+        check("titlesFromCurrentView", sidePanel.currentPanel.viewTitle === "First");
+        check("advertisesViewsToTheBar", activityBar.views.length === 2);
+        check("showsTheBarWhileAViewApplies", activityBar.visible);
+
+        window.currentViewId = "second";
+        check("switchesView", sidePanel.currentPanel === secondView);
+
+        // A view that stops applying must not leave the panel on it; the shell
+        // watches `currentPanelReady` to move back to one that does.
+        window.secondAvailable = false;
+        check("dropsUnavailableView", !sidePanel.currentPanelReady);
+        check("fallsBackToAnAvailableView", sidePanel.firstAvailableViewId() === "first");
+
+        firstView.viewAvailable = false;
+        check("hidesTheBarWithoutAnyView", !activityBar.visible);
+        check("reportsNoAvailableView", sidePanel.firstAvailableViewId() === "");
+
+        sidePanel.hideRequested();
+        check("forwardsHideRequests", window.hidden === "yes");
+
+        window.objectName = failures.length === 0
+            ? "SidePanelSmokePassed"
+            : "SidePanelSmokeFailed[" + failures.join(",") + "]";
+    }
+}
+"#,
+                ),
+                &QUrl::from("qrc:/SidePanelSmoke.qml"),
+            );
+        }
+        assert!(
+            LOADED.load(Ordering::SeqCst),
+            "SidePanel.qml failed to load; see QML warnings above"
+        );
+        let side_panel_name = unsafe { SIDE_PANEL_ROOT.load(Ordering::SeqCst).as_ref() }
+            .map(|object| object.object_name().to_string())
+            .unwrap_or_default();
+        assert_eq!(
+            side_panel_name, "SidePanelSmokePassed",
+            "activity bar and side panel view contract check failed"
+        );
+
         // Exercise every GitPanel delegate with hand-written state. Main.qml
         // cannot populate changed paths or running jobs without driving real
         // asynchronous Git operations, so this fixture is what catches typos

@@ -19,7 +19,58 @@ Kirigami.Page {
         project.lockScope || project.parentId || project.id
     )
 
+    /// Identifier of the side-panel view on screen. An empty value means no
+    /// view applies to this project, and the activity bar stays hidden.
+    property string currentViewId: ""
+    /// Whether the side panel is showing beside the review surface.
+    property bool sidePanelExpanded: true
+
     title: shell.shellName
+    // The activity bar and the panels beside it are chrome: they run to the
+    // window edge instead of floating inside the page's content padding.
+    padding: 0
+
+    /// Applies an activity-bar pick the way Visual Studio Code does: another
+    /// view switches the panel, the current one toggles it away and back.
+    function activateView(viewId) {
+        const view = sidePanel.view(viewId);
+        if (!view || !view.viewAvailable)
+            return;
+        if (shell.currentViewId === viewId) {
+            shell.sidePanelExpanded = !shell.sidePanelExpanded;
+            return;
+        }
+        shell.currentViewId = viewId;
+        shell.sidePanelExpanded = true;
+    }
+
+    function toggleSidePanel() {
+        if (!sidePanel.hasAvailableView)
+            return;
+        shell.sidePanelExpanded = !shell.sidePanelExpanded;
+    }
+
+    /// Keeps the panel off views that do not apply to the project on screen.
+    /// The shell is reused across projects, so what applies changes under it.
+    function selectAvailableView() {
+        shell.currentViewId = sidePanel.firstAvailableViewId();
+    }
+
+    Component.onCompleted: selectAvailableView()
+
+    Connections {
+        target: sidePanel
+
+        function onCurrentPanelReadyChanged() {
+            if (!sidePanel.currentPanelReady)
+                shell.selectAvailableView();
+        }
+
+        function onHasAvailableViewChanged() {
+            if (sidePanel.hasAvailableView && shell.currentViewId.length === 0)
+                shell.selectAvailableView();
+        }
+    }
 
     function repositoryOperationRunning() {
         for (let index = 0; index < backend.jobs.length; ++index) {
@@ -66,6 +117,19 @@ Kirigami.Page {
             }
         }
     ]
+
+    // Visual Studio Code's sidebar bindings, which is what users reach for
+    // first. Each view owns the shortcut it advertises in its tooltip.
+    Shortcut {
+        sequences: ["Ctrl+B"]
+        onActivated: shell.toggleSidePanel()
+    }
+
+    Shortcut {
+        enabled: gitPanel.viewAvailable
+        sequences: [gitPanel.viewShortcut]
+        onActivated: shell.activateView(gitPanel.viewId)
+    }
 
     // Clipboard helper: Qt exposes no direct clipboard API to QML.
     TextEdit {
@@ -174,30 +238,67 @@ Kirigami.Page {
         anchors.fill: parent
         spacing: 0
 
-        GitPanel {
+        ActivityBar {
             Layout.fillHeight: true
-            Layout.minimumWidth: Kirigami.Units.gridUnit * 20
-            Layout.preferredWidth: Kirigami.Units.gridUnit * 23
-            Layout.maximumWidth: parent.width * 0.5
-            backend: shell.backend
-            project: shell.project
-            visible: shell.project.available && shell.project.isGit
+            currentViewId: shell.currentViewId
+            panelExpanded: shell.sidePanelExpanded
+            views: sidePanel.views
+            visible: sidePanel.hasAvailableView
+            onViewTriggered: viewId => shell.activateView(viewId)
         }
 
         Kirigami.Separator {
             Layout.fillHeight: true
-            visible: shell.project.available && shell.project.isGit
+            visible: sidePanel.hasAvailableView
         }
 
-        ReviewPanel {
-            objectName: "reviewSidePanel"
-
+        Controls.SplitView {
             Layout.fillHeight: true
             Layout.fillWidth: true
-            Layout.minimumWidth: Kirigami.Units.gridUnit * 26
-            backend: shell.backend
-            project: shell.project
-            visible: shell.project.available && shell.project.isGit
+            orientation: Qt.Horizontal
+
+            handle: Rectangle {
+                readonly property bool active: Controls.SplitHandle.hovered
+                    || Controls.SplitHandle.pressed
+
+                color: active ? Kirigami.Theme.highlightColor : "transparent"
+                implicitWidth: Kirigami.Units.smallSpacing
+
+                Kirigami.Separator {
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    height: parent.height
+                    visible: !parent.active
+                }
+            }
+
+            SidePanel {
+                id: sidePanel
+
+                Controls.SplitView.fillWidth: false
+                Controls.SplitView.maximumWidth: Kirigami.Units.gridUnit * 40
+                Controls.SplitView.minimumWidth: Kirigami.Units.gridUnit * 18
+                Controls.SplitView.preferredWidth: Kirigami.Units.gridUnit * 23
+                currentViewId: shell.currentViewId
+                visible: shell.sidePanelExpanded && sidePanel.currentPanelReady
+                onHideRequested: shell.sidePanelExpanded = false
+
+                GitPanel {
+                    id: gitPanel
+
+                    backend: shell.backend
+                    project: shell.project
+                }
+            }
+
+            ReviewPanel {
+                objectName: "reviewSidePanel"
+
+                Controls.SplitView.fillWidth: true
+                Controls.SplitView.minimumWidth: Kirigami.Units.gridUnit * 26
+                backend: shell.backend
+                project: shell.project
+                visible: shell.project.available && shell.project.isGit
+            }
         }
 
         /*

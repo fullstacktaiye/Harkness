@@ -29,6 +29,25 @@ Item {
         project.lockScope || project.parentId || project.id
     )
 
+    // Side-panel view contract; see SidePanel.qml.
+    readonly property string viewId: "git"
+    readonly property string viewTitle: qsTr("Source Control")
+    readonly property string viewIcon: "vcs-branch"
+    readonly property string viewShortcut: "Ctrl+Shift+G"
+    readonly property int viewBadge: entries.length
+    readonly property bool viewAvailable: project.available && project.isGit
+    property var viewActions: [refreshAction]
+
+    Kirigami.Action {
+        id: refreshAction
+
+        enabled: panel.job("status") === null && !panel.repositoryMutationRunning()
+        icon.name: "view-refresh"
+        text: qsTr("Refresh Git status")
+        tooltip: qsTr("Refresh Git status")
+        onTriggered: panel.backend.refreshGit(panel.project.id)
+    }
+
     Rectangle {
         anchors.fill: parent
         color: Kirigami.Theme.alternateBackgroundColor
@@ -223,34 +242,12 @@ Item {
             spacing: 0
             width: scroll.availableWidth
 
-            RowLayout {
-                Layout.fillWidth: true
-                Layout.leftMargin: Kirigami.Units.largeSpacing
-                Layout.rightMargin: Kirigami.Units.largeSpacing
-                Layout.topMargin: Kirigami.Units.largeSpacing
-                Layout.bottomMargin: Kirigami.Units.smallSpacing
-
-                Kirigami.Heading {
-                    Layout.fillWidth: true
-                    level: 3
-                    text: qsTr("Git")
-                }
-
-                Controls.ToolButton {
-                    Controls.ToolTip.text: qsTr("Refresh Git status")
-                    display: Controls.AbstractButton.IconOnly
-                    enabled: panel.job("status") === null
-                        && !panel.repositoryMutationRunning()
-                    icon.name: "view-refresh"
-                    onClicked: panel.backend.refreshGit(panel.project.id)
-                }
-            }
-
             ColumnLayout {
                 Layout.fillWidth: true
                 Layout.bottomMargin: Kirigami.Units.largeSpacing
                 Layout.leftMargin: Kirigami.Units.largeSpacing
                 Layout.rightMargin: Kirigami.Units.largeSpacing
+                Layout.topMargin: Kirigami.Units.largeSpacing
                 spacing: Kirigami.Units.smallSpacing
 
                 Controls.Label {
