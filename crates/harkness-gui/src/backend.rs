@@ -180,6 +180,16 @@ pub mod ffi {
         #[cxx_name = "unstageHunk"]
         fn unstage_hunk(self: Pin<&mut HarknessBackend>, project_id: &QString, hunk_id: &QString);
 
+        /// Stages newline-delimited backend-owned changed-line row identities.
+        #[qinvokable]
+        #[cxx_name = "stageLines"]
+        fn stage_lines(self: Pin<&mut HarknessBackend>, project_id: &QString, line_ids: &QString);
+
+        /// Unstages newline-delimited backend-owned changed-line row identities.
+        #[qinvokable]
+        #[cxx_name = "unstageLines"]
+        fn unstage_lines(self: Pin<&mut HarknessBackend>, project_id: &QString, line_ids: &QString);
+
         #[qinvokable]
         fn commit(
             self: Pin<&mut HarknessBackend>,
@@ -296,6 +306,7 @@ pub struct HarknessBackendRust {
     path_selection_ids: HashMap<PathSelectionKey, String>,
     review_path_ids: HashMap<PathSelectionKey, String>,
     review_hunk_selections: HashMap<String, ReviewHunkSelectionRecord>,
+    review_line_selections: HashMap<String, ReviewLineSelectionRecord>,
     /// Catalog project ID to the actual Git common-directory scheduling domain.
     repository_lock_scopes: HashMap<String, String>,
     /// Managed worktree ID to the catalog parent's Git mutation domain. Git
@@ -335,6 +346,7 @@ impl Default for HarknessBackendRust {
             path_selection_ids: HashMap::new(),
             review_path_ids: HashMap::new(),
             review_hunk_selections: HashMap::new(),
+            review_line_selections: HashMap::new(),
             repository_lock_scopes: HashMap::new(),
             worktree_lifecycle_lock_scopes: HashMap::new(),
             legacy_job: None,
@@ -1281,6 +1293,20 @@ impl ReviewHunkAnchor {
             source_window_row: selection.row_in_window,
         }
     }
+
+    fn from_line(action: HunkAction, selection: &ReviewLineSelectionRecord) -> Self {
+        let (source_start, source_lines) = match action {
+            HunkAction::Stage => (selection.selection.old_start, selection.selection.old_lines),
+            HunkAction::Unstage => (selection.selection.new_start, selection.selection.new_lines),
+        };
+        Self {
+            action,
+            source_start,
+            source_lines,
+            source_row: selection.row_index,
+            source_window_row: selection.row_in_window,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1288,6 +1314,15 @@ struct ReviewHunkSelectionRecord {
     project_id: String,
     target: harkness_git::DiffTarget,
     selection: harkness_git::HunkSelection,
+    row_index: usize,
+    row_in_window: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ReviewLineSelectionRecord {
+    project_id: String,
+    target: harkness_git::DiffTarget,
+    selection: harkness_git::LineSelection,
     row_index: usize,
     row_in_window: usize,
 }
@@ -1613,10 +1648,11 @@ fn to_text_segments(
 fn empty_review_side() -> QVariant {
     let mut side = QMap::<QMapPair_QString_QVariant>::default();
     side.insert(QString::from("present"), QVariant::from(&false));
+    side.insert(QString::from("lineId"), QVariant::from(&QString::default()));
     QVariant::from(&side)
 }
 
-fn to_review_side(line: &harkness_git::DiffLine, number: Option<u32>) -> QVariant {
+fn to_review_side(line: &harkness_git::DiffLine, number: Option<u32>, line_id: &str) -> QVariant {
     let (kind, marker) = diff_line_name(line.kind);
     let mut side = QMap::<QMapPair_QString_QVariant>::default();
     side.insert(QString::from("present"), QVariant::from(&true));
@@ -1625,6 +1661,10 @@ fn to_review_side(line: &harkness_git::DiffLine, number: Option<u32>) -> QVarian
         QVariant::from(&number.map_or(0, bounded_i32)),
     );
     side.insert(QString::from("kind"), QVariant::from(&QString::from(kind)));
+    side.insert(
+        QString::from("lineId"),
+        QVariant::from(&QString::from(line_id)),
+    );
     side.insert(
         QString::from("marker"),
         QVariant::from(&QString::from(marker)),
@@ -1639,7 +1679,7 @@ fn to_review_side(line: &harkness_git::DiffLine, number: Option<u32>) -> QVarian
     QVariant::from(&side)
 }
 
-fn to_unified_review_line(line: &harkness_git::DiffLine) -> QVariant {
+fn to_unified_review_line(line: &harkness_git::DiffLine, line_id: &str) -> QVariant {
     let (kind, marker) = diff_line_name(line.kind);
     let mut value = QMap::<QMapPair_QString_QVariant>::default();
     value.insert(
@@ -1651,6 +1691,10 @@ fn to_unified_review_line(line: &harkness_git::DiffLine) -> QVariant {
         QVariant::from(&line.new_line_number.map_or(0, bounded_i32)),
     );
     value.insert(QString::from("kind"), QVariant::from(&QString::from(kind)));
+    value.insert(
+        QString::from("lineId"),
+        QVariant::from(&QString::from(line_id)),
+    );
     value.insert(
         QString::from("marker"),
         QVariant::from(&QString::from(marker)),
@@ -1665,8 +1709,35 @@ fn to_unified_review_line(line: &harkness_git::DiffLine) -> QVariant {
     QVariant::from(&value)
 }
 
-fn to_review_line_row(hunk: &harkness_git::Hunk, index: usize) -> QVariant {
+fn review_line_id(
+    hunk_id: &str,
+    line: &harkness_git::DiffLine,
+    target: &harkness_git::DiffTarget,
+) -> String {
+    if review_hunk_action(target).is_empty() {
+        return String::new();
+    }
+    match line.kind {
+        harkness_git::DiffLineKind::Addition => line
+            .new_line_number
+            .map(|line| format!("{hunk_id}:new:{line}"))
+            .unwrap_or_default(),
+        harkness_git::DiffLineKind::Deletion => line
+            .old_line_number
+            .map(|line| format!("{hunk_id}:old:{line}"))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn to_review_line_row(
+    hunk_id: &str,
+    hunk: &harkness_git::Hunk,
+    index: usize,
+    target: &harkness_git::DiffTarget,
+) -> QVariant {
     let line = &hunk.lines[index];
+    let line_id = review_line_id(hunk_id, line, target);
     let partner = line
         .paired_line_index
         .and_then(|partner| hunk.lines.get(partner));
@@ -1675,13 +1746,17 @@ fn to_review_line_row(hunk: &harkness_git::Hunk, index: usize) -> QVariant {
             .is_some_and(|partner| matches!(partner.kind, harkness_git::DiffLineKind::Deletion));
     let (old, new) = match line.kind {
         harkness_git::DiffLineKind::Context => (
-            to_review_side(line, line.old_line_number),
-            to_review_side(line, line.new_line_number),
+            to_review_side(line, line.old_line_number, ""),
+            to_review_side(line, line.new_line_number, ""),
         ),
         harkness_git::DiffLineKind::Deletion => (
-            to_review_side(line, line.old_line_number),
+            to_review_side(line, line.old_line_number, &line_id),
             partner.map_or_else(empty_review_side, |partner| {
-                to_review_side(partner, partner.new_line_number)
+                to_review_side(
+                    partner,
+                    partner.new_line_number,
+                    &review_line_id(hunk_id, partner, target),
+                )
             }),
         ),
         harkness_git::DiffLineKind::Addition => {
@@ -1690,13 +1765,13 @@ fn to_review_line_row(hunk: &harkness_git::Hunk, index: usize) -> QVariant {
             } else {
                 (
                     empty_review_side(),
-                    to_review_side(line, line.new_line_number),
+                    to_review_side(line, line.new_line_number, &line_id),
                 )
             }
         }
         _ => (
-            to_review_side(line, line.old_line_number),
-            to_review_side(line, line.new_line_number),
+            to_review_side(line, line.old_line_number, ""),
+            to_review_side(line, line.new_line_number, ""),
         ),
     };
     let mut row = QMap::<QMapPair_QString_QVariant>::default();
@@ -1704,7 +1779,18 @@ fn to_review_line_row(hunk: &harkness_git::Hunk, index: usize) -> QVariant {
         QString::from("type"),
         QVariant::from(&QString::from("line")),
     );
-    row.insert(QString::from("unified"), to_unified_review_line(line));
+    row.insert(
+        QString::from("hunkId"),
+        QVariant::from(&QString::from(hunk_id)),
+    );
+    row.insert(
+        QString::from("lineAction"),
+        QVariant::from(&QString::from(review_hunk_action(target))),
+    );
+    row.insert(
+        QString::from("unified"),
+        to_unified_review_line(line, &line_id),
+    );
     row.insert(QString::from("old"), old);
     row.insert(QString::from("new"), new);
     row.insert(QString::from("splitHidden"), QVariant::from(&split_hidden));
@@ -2153,7 +2239,7 @@ fn review_rows(loaded: &ReviewLoadedFile) -> QList<QVariant> {
             start,
             end,
             &hunk.lines,
-            |line_index, _| to_review_line_row(hunk, line_index),
+            |line_index, _| to_review_line_row(&state.id, hunk, line_index, &loaded.file.target),
         ) {
             break 'all_rows;
         }
@@ -2361,6 +2447,40 @@ fn review_hunk_selections(row: &ReviewStateRow) -> HashMap<String, ReviewHunkSel
         })
 }
 
+fn review_line_selections(row: &ReviewStateRow) -> HashMap<String, ReviewLineSelectionRecord> {
+    row.loaded_file
+        .as_ref()
+        .map_or_else(HashMap::new, |loaded| {
+            if review_hunk_action(&loaded.file.target).is_empty() {
+                return HashMap::new();
+            }
+            debug_assert_eq!(loaded.hunks.len(), loaded.file.hunks.len());
+            let (start, _, _) = review_row_window(loaded);
+            let mut selections = HashMap::new();
+            visit_review_hunk_rows(loaded, |_, hunk_row, state, hunk| {
+                for (line_index, line) in hunk.lines.iter().enumerate() {
+                    let id = review_line_id(&state.id, line, &loaded.file.target);
+                    if id.is_empty() {
+                        continue;
+                    }
+                    let row_index = hunk_row.saturating_add(1).saturating_add(line_index);
+                    selections.insert(
+                        id,
+                        ReviewLineSelectionRecord {
+                            project_id: row.project_id.clone(),
+                            target: loaded.file.target.clone(),
+                            selection: harkness_git::LineSelection::new(&loaded.file, hunk, line),
+                            row_index,
+                            row_in_window: row_index.saturating_sub(start),
+                        },
+                    );
+                }
+                true
+            });
+            selections
+        })
+}
+
 fn set_review_state(mut backend: Pin<&mut ffi::HarknessBackend>, row: ReviewStateRow) {
     let loaded_path_id = {
         let rust = backend.as_mut().rust_mut().get_mut();
@@ -2369,10 +2489,12 @@ fn set_review_state(mut backend: Pin<&mut ffi::HarknessBackend>, row: ReviewStat
         })
     };
     let value = to_review(&row, &loaded_path_id);
-    let selections = review_hunk_selections(&row);
+    let hunk_selections = review_hunk_selections(&row);
+    let line_selections = review_line_selections(&row);
     let previous = {
         let rust = backend.as_mut().rust_mut().get_mut();
-        rust.review_hunk_selections = selections;
+        rust.review_hunk_selections = hunk_selections;
+        rust.review_line_selections = line_selections;
         rust.review_state.replace(row)
     };
     backend.as_mut().set_review(value);
@@ -2393,14 +2515,20 @@ fn sync_review_state(mut backend: Pin<&mut ffi::HarknessBackend>) {
     let loaded_path_id = identity.map_or_else(String::new, |(project_id, path)| {
         register_review_path_identity(backend.as_mut().rust_mut().get_mut(), &project_id, &path)
     });
-    let (value, selections) = {
+    let (value, hunk_selections, line_selections) = {
         let backend_ref = backend.as_ref();
         let Some(row) = backend_ref.rust().review_state.as_ref() else {
             return;
         };
-        (to_review(row, &loaded_path_id), review_hunk_selections(row))
+        (
+            to_review(row, &loaded_path_id),
+            review_hunk_selections(row),
+            review_line_selections(row),
+        )
     };
-    backend.as_mut().rust_mut().get_mut().review_hunk_selections = selections;
+    let rust = backend.as_mut().rust_mut().get_mut();
+    rust.review_hunk_selections = hunk_selections;
+    rust.review_line_selections = line_selections;
     backend.as_mut().set_review(value);
 }
 
@@ -2411,6 +2539,7 @@ fn clear_review_state(mut backend: Pin<&mut ffi::HarknessBackend>) {
         rust.next_review_file_request += 1;
         rust.review_path_ids.clear();
         rust.review_hunk_selections.clear();
+        rust.review_line_selections.clear();
         rust.review_state.take()
     };
     backend.as_mut().set_review(empty_review());
@@ -3013,6 +3142,23 @@ fn mutate_hunk_with_git(
     }
 }
 
+fn mutate_lines_with_git(
+    git: &harkness_git::GitService,
+    action: HunkAction,
+    selections: &[harkness_git::LineSelection],
+    cancellation: &harkness_git::Cancellation,
+) -> Result<HunkMutationOutcome, GitFailure> {
+    let result = match action {
+        HunkAction::Stage => git.stage_lines(selections, cancellation),
+        HunkAction::Unstage => git.unstage_lines(selections, cancellation),
+    };
+    match result {
+        Ok(outcome) => Ok(HunkMutationOutcome::Applied(outcome.lines)),
+        Err(harkness_git::GitError::StaleHunkSelection { .. }) => Ok(HunkMutationOutcome::Stale),
+        Err(error) => Err(GitFailure::from(error)),
+    }
+}
+
 fn resolve_review_hunk_selection(
     selections: &HashMap<String, ReviewHunkSelectionRecord>,
     project_id: &str,
@@ -3029,6 +3175,36 @@ fn resolve_review_hunk_selection(
         return Err("The selected hunk belongs to the other side of the index");
     }
     Ok(selection.clone())
+}
+
+fn resolve_review_line_selections(
+    selections: &HashMap<String, ReviewLineSelectionRecord>,
+    project_id: &str,
+    line_ids: &str,
+    action: HunkAction,
+) -> Result<Vec<ReviewLineSelectionRecord>, &'static str> {
+    let mut resolved = Vec::new();
+    for line_id in line_ids.lines().filter(|line_id| !line_id.is_empty()) {
+        let selection = selections
+            .get(line_id)
+            .ok_or("A selected line is no longer available; refresh the review")?;
+        if selection.project_id != project_id {
+            return Err("A selected line belongs to a different project");
+        }
+        if !action.matches(&selection.target) {
+            return Err("A selected line belongs to the other side of the index");
+        }
+        if !resolved
+            .iter()
+            .any(|existing: &ReviewLineSelectionRecord| existing.selection == selection.selection)
+        {
+            resolved.push(selection.clone());
+        }
+    }
+    if resolved.is_empty() {
+        return Err("Select at least one changed line first");
+    }
+    Ok(resolved)
 }
 
 fn launch_hunk_operation(
@@ -3074,6 +3250,94 @@ fn launch_hunk_operation(
             match outcome {
                 HunkMutationOutcome::Applied(count) => Ok(format!(
                     "{} {count} hunk{}",
+                    if action == HunkAction::Stage {
+                        "Staged"
+                    } else {
+                        "Unstaged"
+                    },
+                    if count == 1 { "" } else { "s" }
+                )),
+                HunkMutationOutcome::Stale => Ok(
+                    "The file changed; refreshed the review without changing the index".to_owned(),
+                ),
+            }
+        });
+        let _ = qt_thread.queue(move |mut backend| {
+            let refresh_project_id = result.project_id.clone();
+            apply_git_result(backend.as_mut(), &job_id, result, true, false, false, false);
+            if backend.as_ref().rust().next_review_request != review_request
+                || backend.as_ref().rust().next_review_file_request != file_request
+                || opened_project_id(backend.as_ref().opened()).as_deref()
+                    != Some(refresh_project_id.as_str())
+            {
+                return;
+            }
+            let Some(mutation_outcome) = mutation_outcome else {
+                return;
+            };
+            let refresh_staged = refreshed_hunk_target(action, mutation_outcome, source_staged);
+            let refresh_anchor =
+                matches!(mutation_outcome, HunkMutationOutcome::Applied(_)).then_some(anchor);
+            launch_working_review_with_anchor(
+                backend.as_mut(),
+                refresh_project_id,
+                refresh_staged,
+                preferred_path,
+                refresh_anchor,
+            );
+        });
+    });
+}
+
+fn launch_line_operation(
+    mut backend: Pin<&mut ffi::HarknessBackend>,
+    project_id: &QString,
+    line_ids: &QString,
+    action: HunkAction,
+) {
+    let project_id = project_id.to_string();
+    let selections = match resolve_review_line_selections(
+        &backend.as_ref().rust().review_line_selections,
+        &project_id,
+        &line_ids.to_string(),
+        action,
+    ) {
+        Ok(selections) => selections,
+        Err(error) => {
+            backend.as_mut().set_status(error.into());
+            return;
+        }
+    };
+    let Some((job_id, cancellation)) = start_job(
+        backend.as_mut(),
+        action.kind(),
+        &project_id,
+        match action {
+            HunkAction::Stage => "Stage selected lines",
+            HunkAction::Unstage => "Unstage selected lines",
+        },
+        true,
+    ) else {
+        return;
+    };
+    let review_request = backend.as_ref().rust().next_review_request;
+    let file_request = backend.as_ref().rust().next_review_file_request;
+    let source_staged = matches!(selections[0].target, harkness_git::DiffTarget::Staged);
+    let preferred_path = selections[0].selection.path().map(Path::to_path_buf);
+    let anchor = ReviewHunkAnchor::from_line(action, &selections[0]);
+    let line_selections = selections
+        .into_iter()
+        .map(|selection| selection.selection)
+        .collect::<Vec<_>>();
+    let qt_thread = backend.qt_thread();
+    std::thread::spawn(move || {
+        let mut mutation_outcome = None;
+        let result = run_git_operation(project_id, &cancellation, |git, cancellation| {
+            let outcome = mutate_lines_with_git(git, action, &line_selections, cancellation)?;
+            mutation_outcome = Some(outcome);
+            match outcome {
+                HunkMutationOutcome::Applied(count) => Ok(format!(
+                    "{} {count} line{}",
                     if action == HunkAction::Stage {
                         "Staged"
                     } else {
@@ -4659,6 +4923,14 @@ impl ffi::HarknessBackend {
         launch_hunk_operation(self, project_id, hunk_id, HunkAction::Unstage);
     }
 
+    fn stage_lines(self: Pin<&mut Self>, project_id: &QString, line_ids: &QString) {
+        launch_line_operation(self, project_id, line_ids, HunkAction::Stage);
+    }
+
+    fn unstage_lines(self: Pin<&mut Self>, project_id: &QString, line_ids: &QString) {
+        launch_line_operation(self, project_id, line_ids, HunkAction::Unstage);
+    }
+
     fn commit(mut self: Pin<&mut Self>, project_id: &QString, message: &QString, amend: bool) {
         let project_id = project_id.to_string();
         let message = message.to_string();
@@ -5245,17 +5517,18 @@ mod tests {
         empty_opened, end_job, expand_review_context_with_git, hidden_before, jobs_conflict,
         load_history_page_with_git, load_review_file_with_git, load_review_with_git,
         load_review_with_initial_file_with_git, move_worktree_with_service, mutate_hunk_with_git,
-        operation_outcome, path_mutation_refresh_target, path_mutation_review_refresh,
-        project_repository_lock_scopes, project_rows, project_worktree_lifecycle_lock_scopes,
-        refreshed_hunk_target, register_path_selection, register_review_path_identity,
-        remove_worktree_with_service, replace_status_path_selections, resolve_path_selection,
-        resolve_review_hunk_selection, retreat_review_file_window, retreat_review_row_window,
+        mutate_lines_with_git, operation_outcome, path_mutation_refresh_target,
+        path_mutation_review_refresh, project_repository_lock_scopes, project_rows,
+        project_worktree_lifecycle_lock_scopes, refreshed_hunk_target, register_path_selection,
+        register_review_path_identity, remove_worktree_with_service,
+        replace_status_path_selections, resolve_path_selection, resolve_review_hunk_selection,
+        resolve_review_line_selections, retreat_review_file_window, retreat_review_row_window,
         review_content_summary, review_file_window, review_hunk_exists_where,
-        review_hunk_for_anchor, review_hunk_selections, review_path, review_range_distance,
-        review_row_count, review_row_offset_for_anchor, review_row_window, review_rows,
-        run_git_operation_with_git, run_git_status_with_git, selected_review_path, to_branches,
-        to_git, to_jobs, to_map, to_projects, to_review, update_job, worktree_base,
-        worktree_job_lock_scope,
+        review_hunk_for_anchor, review_hunk_selections, review_line_id, review_line_selections,
+        review_path, review_range_distance, review_row_count, review_row_offset_for_anchor,
+        review_row_window, review_rows, run_git_operation_with_git, run_git_status_with_git,
+        selected_review_path, to_branches, to_git, to_jobs, to_map, to_projects, to_review,
+        update_job, worktree_base, worktree_job_lock_scope,
     };
 
     fn project(
@@ -6302,6 +6575,118 @@ mod tests {
         assert!(committed.contains("line 2 changed\n"));
         assert!(committed.contains("line 22\n"));
         assert!(!committed.contains("line 22 changed\n"));
+    }
+
+    #[test]
+    fn review_surface_line_tokens_stage_and_unstage_only_the_selected_line() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("review-line-repository");
+        initialize_repository(&root);
+        let path = Path::new("story.txt");
+        commit_file(&root, path, "one\ntwo\nthree\nfour\n", "add story");
+        fs::write(
+            root.join(path),
+            "one\nselected\ntwo\nthree\nnot selected\nfour\n",
+        )
+        .unwrap();
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
+        let review = load_review_with_initial_file_with_git(
+            &git,
+            "project-1".to_owned(),
+            ReviewSelection::Unstaged,
+            31,
+            32,
+            Some(path),
+        )
+        .unwrap();
+        let loaded = review.loaded_file.as_ref().unwrap();
+        let hunk = &loaded.file.hunks[0];
+        let state = &loaded.hunks[0];
+        let selected = hunk
+            .lines
+            .iter()
+            .find(|line| {
+                line.kind == harkness_git::DiffLineKind::Addition && line.content == b"selected\n"
+            })
+            .unwrap();
+        let selected_id = review_line_id(&state.id, selected, &loaded.file.target);
+        let selections = review_line_selections(&review);
+        assert_eq!(selections.len(), 2);
+        assert!(selections.contains_key(&selected_id));
+        assert!(
+            resolve_review_line_selections(
+                &selections,
+                "other-project",
+                &selected_id,
+                HunkAction::Stage,
+            )
+            .is_err()
+        );
+        let resolved = resolve_review_line_selections(
+            &selections,
+            "project-1",
+            &selected_id,
+            HunkAction::Stage,
+        )
+        .unwrap();
+        let line_selections = resolved
+            .iter()
+            .map(|selection| selection.selection.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mutate_lines_with_git(
+                &git,
+                HunkAction::Stage,
+                &line_selections,
+                &harkness_git::Cancellation::default(),
+            )
+            .unwrap(),
+            HunkMutationOutcome::Applied(1)
+        );
+        let repository = Repository::open(&root).unwrap();
+        let index = repository.index().unwrap();
+        let entry = index.get_path(path, 0).unwrap();
+        assert_eq!(
+            repository.find_blob(entry.id).unwrap().content(),
+            b"one\nselected\ntwo\nthree\nfour\n"
+        );
+
+        let staged_review = load_review_with_initial_file_with_git(
+            &git,
+            "project-1".to_owned(),
+            ReviewSelection::Staged,
+            33,
+            34,
+            Some(path),
+        )
+        .unwrap();
+        let staged_selections = review_line_selections(&staged_review);
+        assert_eq!(staged_selections.len(), 1);
+        let staged_id = staged_selections.keys().next().unwrap();
+        let resolved = resolve_review_line_selections(
+            &staged_selections,
+            "project-1",
+            staged_id,
+            HunkAction::Unstage,
+        )
+        .unwrap();
+        assert_eq!(
+            mutate_lines_with_git(
+                &git,
+                HunkAction::Unstage,
+                &[resolved[0].selection.clone()],
+                &harkness_git::Cancellation::default(),
+            )
+            .unwrap(),
+            HunkMutationOutcome::Applied(1)
+        );
+        let repository = Repository::open(&root).unwrap();
+        let index = repository.index().unwrap();
+        let entry = index.get_path(path, 0).unwrap();
+        assert_eq!(
+            repository.find_blob(entry.id).unwrap().content(),
+            b"one\ntwo\nthree\nfour\n"
+        );
     }
 
     #[test]

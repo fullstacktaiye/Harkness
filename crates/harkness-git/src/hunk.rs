@@ -114,6 +114,99 @@ impl HunkSelection {
     }
 }
 
+/// One selected changed line from a [`Hunk`] in a [`FileDiff`].
+///
+/// The enclosing hunk coordinates locate the line's neighbourhood after the
+/// diff is recomputed under the repository lock. The optional old and new line
+/// numbers then identify the changed line itself without relying on its array
+/// index, which can move when the fresh diff is projected.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct LineSelection {
+    /// The file's path on the old side, absent for an addition.
+    pub old_path: Option<PathBuf>,
+    /// The file's path on the new side, absent for a deletion.
+    pub new_path: Option<PathBuf>,
+    /// The old blob object ID the selection was taken against.
+    pub old_blob_id: String,
+    /// The new blob object ID the selection was taken against.
+    pub new_blob_id: String,
+    /// The context-line count the hunk coordinates are expressed in.
+    pub context_lines: u32,
+    /// First old-side line covered by the selected line's hunk.
+    pub old_start: u32,
+    /// Number of old-side lines covered by the selected line's hunk.
+    pub old_lines: u32,
+    /// First new-side line covered by the selected line's hunk.
+    pub new_start: u32,
+    /// Number of new-side lines covered by the selected line's hunk.
+    pub new_lines: u32,
+    /// Old-side number of the selected line, absent for an addition.
+    pub old_line_number: Option<u32>,
+    /// New-side number of the selected line, absent for a deletion.
+    pub new_line_number: Option<u32>,
+}
+
+impl LineSelection {
+    /// Captures the stable file, hunk, and line identity needed to select
+    /// `line`.
+    #[must_use]
+    pub fn new(file: &FileDiff, hunk: &Hunk, line: &DiffLine) -> Self {
+        Self {
+            old_path: file.old_path.clone(),
+            new_path: file.new_path.clone(),
+            old_blob_id: file.old_blob_id.clone(),
+            new_blob_id: file.new_blob_id.clone(),
+            context_lines: file.context_lines,
+            old_start: hunk.old_start,
+            old_lines: hunk.old_lines,
+            new_start: hunk.new_start,
+            new_lines: hunk.new_lines,
+            old_line_number: line.old_line_number,
+            new_line_number: line.new_line_number,
+        }
+    }
+
+    /// Reconstructs a line selection carried across a serialization boundary.
+    ///
+    /// Every value remains untrusted until line staging recomputes the diff and
+    /// validates the file, hunk, and changed-line coordinates while holding the
+    /// repository lock.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        old_path: Option<PathBuf>,
+        new_path: Option<PathBuf>,
+        old_blob_id: impl Into<String>,
+        new_blob_id: impl Into<String>,
+        context_lines: u32,
+        old_range: (u32, u32),
+        new_range: (u32, u32),
+        old_line_number: Option<u32>,
+        new_line_number: Option<u32>,
+    ) -> Self {
+        Self {
+            old_path,
+            new_path,
+            old_blob_id: old_blob_id.into(),
+            new_blob_id: new_blob_id.into(),
+            context_lines,
+            old_start: old_range.0,
+            old_lines: old_range.1,
+            new_start: new_range.0,
+            new_lines: new_range.1,
+            old_line_number,
+            new_line_number,
+        }
+    }
+
+    /// The path callers should normally show in an error or selection list.
+    #[must_use]
+    pub fn path(&self) -> Option<&Path> {
+        self.new_path.as_deref().or(self.old_path.as_deref())
+    }
+}
+
 /// What a batch of hunk staging or unstaging produced.
 ///
 /// A batch is atomic, so unlike [`super::StageOutcome`] there is no per-item
@@ -134,6 +227,18 @@ pub struct HunkStageOutcome {
     pub status: StatusRefreshOutcome,
 }
 
+/// What one atomic batch of line staging or unstaging produced.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct LineStageOutcome {
+    /// How many distinct changed lines reached the index.
+    pub lines: usize,
+    /// How many distinct hunks contained those lines.
+    pub hunks: usize,
+    /// The optional full-repository status refresh performed after the apply.
+    pub status: StatusRefreshOutcome,
+}
+
 #[derive(Clone, Copy)]
 enum Direction {
     Forward,
@@ -142,7 +247,21 @@ enum Direction {
 
 struct PreparedFile {
     file: FileDiff,
-    hunks: Vec<Hunk>,
+    hunks: Vec<PreparedHunk>,
+}
+
+struct PreparedHunk {
+    hunk: Hunk,
+    /// `None` selects the whole hunk. A non-empty vector selects exactly the
+    /// named changed lines and is merged when several selections name the same
+    /// freshly recomputed hunk.
+    selected_lines: Option<Vec<LineCoordinates>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LineCoordinates {
+    old: Option<u32>,
+    new: Option<u32>,
 }
 
 impl PreparedFile {
@@ -190,6 +309,44 @@ pub(crate) fn unstage(
     )
 }
 
+pub(crate) fn stage_lines(
+    git_executable: &Path,
+    root: &Path,
+    _lock: &RepositoryLock,
+    selections: &[LineSelection],
+    options: &StageOptions,
+    cancellation: &Cancellation,
+) -> Result<LineStageOutcome, GitError> {
+    mutate_lines(
+        git_executable,
+        root,
+        selections,
+        DiffTarget::Unstaged,
+        Direction::Forward,
+        options,
+        cancellation,
+    )
+}
+
+pub(crate) fn unstage_lines(
+    git_executable: &Path,
+    root: &Path,
+    _lock: &RepositoryLock,
+    selections: &[LineSelection],
+    options: &StageOptions,
+    cancellation: &Cancellation,
+) -> Result<LineStageOutcome, GitError> {
+    mutate_lines(
+        git_executable,
+        root,
+        selections,
+        DiffTarget::Staged,
+        Direction::Reverse,
+        options,
+        cancellation,
+    )
+}
+
 fn mutate(
     git_executable: &Path,
     root: &Path,
@@ -218,8 +375,51 @@ fn mutate(
     })
 }
 
+fn mutate_lines(
+    git_executable: &Path,
+    root: &Path,
+    selections: &[LineSelection],
+    target: DiffTarget,
+    direction: Direction,
+    options: &StageOptions,
+    cancellation: &Cancellation,
+) -> Result<LineStageOutcome, GitError> {
+    let paths = line_selection_paths(selections);
+    commit::validate_paths(root, &paths)?;
+    let repository = commit::open(root)?;
+    let (mut lines, mut hunks) = (0, 0);
+    if !selections.is_empty() {
+        refuse_filtered_paths(&repository, root, &paths)?;
+        let prepared = prepare_lines(root, selections, &paths, &target, cancellation)?;
+        lines = prepared
+            .iter()
+            .flat_map(|file| &file.hunks)
+            .map(|hunk| hunk.selected_lines.as_ref().map_or(0, Vec::len))
+            .sum();
+        hunks = prepared.iter().map(|file| file.hunks.len()).sum();
+        apply(&repository, &prepared, &paths, direction)?;
+    }
+    Ok(LineStageOutcome {
+        lines,
+        hunks,
+        status: commit::refresh_status(git_executable, root, options.refresh_status, cancellation),
+    })
+}
+
 /// Every distinct path a batch names, on either side.
 fn selection_paths(selections: &[HunkSelection]) -> Vec<PathBuf> {
+    let mut paths = selections
+        .iter()
+        .flat_map(|selection| [&selection.old_path, &selection.new_path])
+        .filter_map(Option::as_ref)
+        .cloned()
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    paths.dedup();
+    paths
+}
+
+fn line_selection_paths(selections: &[LineSelection]) -> Vec<PathBuf> {
     let mut paths = selections
         .iter()
         .flat_map(|selection| [&selection.old_path, &selection.new_path])
@@ -338,13 +538,139 @@ fn prepare(
                 && prepared.file.old_blob_id == file.old_blob_id
                 && prepared.file.new_blob_id == file.new_blob_id
         }) {
-            if !existing.hunks.iter().any(|existing| existing == hunk) {
-                existing.hunks.push(hunk.clone());
+            if !existing.hunks.iter().any(|existing| existing.hunk == *hunk) {
+                existing.hunks.push(PreparedHunk {
+                    hunk: hunk.clone(),
+                    selected_lines: None,
+                });
             }
         } else {
             prepared.push(PreparedFile {
                 file: file.clone(),
-                hunks: vec![hunk.clone()],
+                hunks: vec![PreparedHunk {
+                    hunk: hunk.clone(),
+                    selected_lines: None,
+                }],
+            });
+        }
+    }
+
+    refuse_overlaps(&prepared)?;
+    Ok(prepared)
+}
+
+/// Revalidates line selections and merges all lines that resolve to one fresh
+/// hunk. Selections from genuinely distinct, overlapping hunks remain separate
+/// so the ordinary overlap refusal can reject them before the index is opened.
+fn prepare_lines(
+    root: &Path,
+    selections: &[LineSelection],
+    paths: &[PathBuf],
+    target: &DiffTarget,
+    cancellation: &Cancellation,
+) -> Result<Vec<PreparedFile>, GitError> {
+    let mut contexts = selections
+        .iter()
+        .map(|selection| selection.context_lines)
+        .collect::<Vec<_>>();
+    contexts.sort_unstable();
+    contexts.dedup();
+
+    let mut current = Vec::new();
+    for context_lines in contexts {
+        if cancellation.is_cancelled() {
+            return Err(GitError::Cancelled);
+        }
+        let options = DiffOptions::unbounded()
+            .with_context_lines(context_lines)
+            .with_paths(paths);
+        current.push((
+            context_lines,
+            diff::compute(root, target.clone(), &options)?,
+        ));
+    }
+
+    let mut prepared = Vec::<PreparedFile>::new();
+    for selection in selections {
+        if cancellation.is_cancelled() {
+            return Err(GitError::Cancelled);
+        }
+        let path = display_path(selection.new_path.as_deref(), selection.old_path.as_deref());
+        let file = current
+            .iter()
+            .find(|(context, _)| *context == selection.context_lines)
+            .and_then(|(_, files)| {
+                files.iter().find(|file| {
+                    file.old_path == selection.old_path && file.new_path == selection.new_path
+                })
+            })
+            .ok_or_else(|| GitError::StaleHunkSelection {
+                path: path.to_path_buf(),
+            })?;
+
+        if file.old_blob_id != selection.old_blob_id || file.new_blob_id != selection.new_blob_id {
+            return Err(GitError::StaleHunkSelection {
+                path: path.to_path_buf(),
+            });
+        }
+        refuse_unsupported(file)?;
+
+        let hunk = file
+            .hunks
+            .iter()
+            .find(|hunk| line_hunk_coordinates_match(selection, hunk))
+            .ok_or_else(|| GitError::HunkNotFound {
+                path: path.to_path_buf(),
+                old_start: selection.old_start,
+                old_lines: selection.old_lines,
+                new_start: selection.new_start,
+                new_lines: selection.new_lines,
+            })?;
+        let line = hunk
+            .lines
+            .iter()
+            .find(|line| line_coordinates_match(selection, line))
+            .ok_or_else(|| GitError::LineNotFound {
+                path: path.to_path_buf(),
+                old_line_number: selection.old_line_number,
+                new_line_number: selection.new_line_number,
+            })?;
+        let coordinates = LineCoordinates {
+            old: line.old_line_number,
+            new: line.new_line_number,
+        };
+
+        if let Some(existing_file) = prepared.iter_mut().find(|prepared| {
+            prepared.file.old_path == file.old_path
+                && prepared.file.new_path == file.new_path
+                && prepared.file.old_blob_id == file.old_blob_id
+                && prepared.file.new_blob_id == file.new_blob_id
+        }) {
+            if let Some(existing_hunk) = existing_file
+                .hunks
+                .iter_mut()
+                .find(|existing| existing.hunk == *hunk)
+            {
+                let selected = existing_hunk
+                    .selected_lines
+                    .as_mut()
+                    .expect("line preparation never creates a whole-hunk selection");
+                if !selected.contains(&coordinates) {
+                    selected.push(coordinates);
+                }
+            } else {
+                existing_file.hunks.push(PreparedHunk {
+                    hunk: hunk.clone(),
+                    selected_lines: Some(vec![coordinates]),
+                });
+            }
+        } else {
+            prepared.push(PreparedFile {
+                file: file.clone(),
+                hunks: vec![PreparedHunk {
+                    hunk: hunk.clone(),
+                    selected_lines: Some(vec![coordinates]),
+                }],
             });
         }
     }
@@ -397,8 +723,10 @@ fn refuse_unsupported(file: &FileDiff) -> Result<(), GitError> {
 /// hand and the index has not been opened for writing.
 fn refuse_overlaps(prepared: &[PreparedFile]) -> Result<(), GitError> {
     for entry in prepared {
-        for (index, hunk) in entry.hunks.iter().enumerate() {
+        for (index, prepared_hunk) in entry.hunks.iter().enumerate() {
+            let hunk = &prepared_hunk.hunk;
             for other in &entry.hunks[index + 1..] {
+                let other = &other.hunk;
                 if ranges_intersect(
                     hunk.old_start,
                     hunk.old_lines,
@@ -465,6 +793,19 @@ fn coordinates_match(selection: &HunkSelection, hunk: &Hunk) -> bool {
         && selection.new_lines == hunk.new_lines
 }
 
+fn line_hunk_coordinates_match(selection: &LineSelection, hunk: &Hunk) -> bool {
+    selection.old_start == hunk.old_start
+        && selection.old_lines == hunk.old_lines
+        && selection.new_start == hunk.new_start
+        && selection.new_lines == hunk.new_lines
+}
+
+fn line_coordinates_match(selection: &LineSelection, line: &DiffLine) -> bool {
+    matches!(line.kind, DiffLineKind::Addition | DiffLineKind::Deletion)
+        && selection.old_line_number == line.old_line_number
+        && selection.new_line_number == line.new_line_number
+}
+
 /// The path to show for a record, preferring the side a caller would name.
 ///
 /// Every [`FileDiff`] has at least one side, so the empty fallback is only
@@ -481,17 +822,22 @@ fn render_patch(files: &[PreparedFile], direction: Direction) -> Vec<u8> {
     let mut patch = Vec::new();
     for prepared in files {
         let mut hunks = prepared.hunks.iter().collect::<Vec<_>>();
-        hunks.sort_by_key(|hunk| match direction {
-            Direction::Forward => (hunk.old_start, hunk.new_start),
-            Direction::Reverse => (hunk.new_start, hunk.old_start),
+        hunks.sort_by_key(|prepared| match direction {
+            Direction::Forward => (prepared.hunk.old_start, prepared.hunk.new_start),
+            Direction::Reverse => (prepared.hunk.new_start, prepared.hunk.old_start),
         });
         render_file(&mut patch, &prepared.file, &hunks, direction);
     }
     patch
 }
 
-fn render_file(patch: &mut Vec<u8>, file: &FileDiff, hunks: &[&Hunk], direction: Direction) {
-    let (old_path, new_path, old_id, new_id, old_mode, new_mode) = match direction {
+fn render_file(
+    patch: &mut Vec<u8>,
+    file: &FileDiff,
+    hunks: &[&PreparedHunk],
+    direction: Direction,
+) {
+    let (old_path, mut new_path, old_id, mut new_id, old_mode, mut new_mode) = match direction {
         Direction::Forward => (
             file.old_path.as_deref(),
             file.new_path.as_deref(),
@@ -509,6 +855,23 @@ fn render_file(patch: &mut Vec<u8>, file: &FileDiff, hunks: &[&Hunk], direction:
             file.old_mode,
         ),
     };
+
+    // A partial deletion leaves a real postimage even when the original diff
+    // compared the file with `/dev/null`. Render that as an ordinary modified
+    // file; otherwise the file header would make libgit2 remove the entire
+    // index entry despite the retained lines in the hunk body.
+    if new_path.is_none()
+        && hunks.iter().any(|hunk| hunk.selected_lines.is_some())
+        && hunks
+            .iter()
+            .map(|hunk| rendered_line_counts(hunk, direction).1)
+            .sum::<u32>()
+            > 0
+    {
+        new_path = old_path;
+        new_id = old_id;
+        new_mode = old_mode;
+    }
     let display_old = display_path(old_path, new_path);
     let display_new = display_path(new_path, old_path);
 
@@ -574,25 +937,26 @@ fn render_file(patch: &mut Vec<u8>, file: &FileDiff, hunks: &[&Hunk], direction:
     }
 }
 
-fn render_hunk(patch: &mut Vec<u8>, hunk: &Hunk, direction: Direction) {
-    let (old_start, old_lines, new_start, new_lines) = match direction {
-        Direction::Forward => (
-            hunk.old_start,
-            hunk.old_lines,
-            hunk.new_start,
-            hunk.new_lines,
-        ),
-        Direction::Reverse => (
-            hunk.new_start,
-            hunk.new_lines,
-            hunk.old_start,
-            hunk.old_lines,
-        ),
+fn render_hunk(patch: &mut Vec<u8>, prepared: &PreparedHunk, direction: Direction) {
+    let hunk = &prepared.hunk;
+    let (old_lines, new_lines) = rendered_line_counts(prepared, direction);
+    let (old_start, new_start) = match direction {
+        Direction::Forward => (hunk.old_start, hunk.new_start),
+        Direction::Reverse => (hunk.new_start, hunk.old_start),
     };
     patch.extend_from_slice(
         format!("@@ -{old_start},{old_lines} +{new_start},{new_lines} @@\n").as_bytes(),
     );
 
+    let Some(selected_lines) = prepared.selected_lines.as_deref() else {
+        render_whole_hunk(patch, hunk, direction);
+        return;
+    };
+    let groups = selected_line_groups(hunk, selected_lines, direction);
+    render_line_groups(patch, &groups, direction);
+}
+
+fn render_whole_hunk(patch: &mut Vec<u8>, hunk: &Hunk, direction: Direction) {
     match direction {
         Direction::Forward => {
             for line in &hunk.lines {
@@ -620,12 +984,43 @@ fn render_hunk(patch: &mut Vec<u8>, hunk: &Hunk, direction: Direction) {
     }
 }
 
+fn rendered_line_counts(prepared: &PreparedHunk, direction: Direction) -> (u32, u32) {
+    let Some(selected_lines) = prepared.selected_lines.as_deref() else {
+        return match direction {
+            Direction::Forward => (prepared.hunk.old_lines, prepared.hunk.new_lines),
+            Direction::Reverse => (prepared.hunk.new_lines, prepared.hunk.old_lines),
+        };
+    };
+    let groups = selected_line_groups(&prepared.hunk, selected_lines, direction);
+    let (old, new) = groups
+        .iter()
+        .fold((0u32, 0u32), |(old, new), group| match group.kind {
+            DiffLineKind::Context => (old.saturating_add(1), new.saturating_add(1)),
+            DiffLineKind::Addition => (old, new.saturating_add(1)),
+            DiffLineKind::Deletion => (old.saturating_add(1), new),
+            _ => (old, new),
+        });
+    match direction {
+        Direction::Forward => (old, new),
+        Direction::Reverse => (new, old),
+    }
+}
+
 /// One diff line together with the end-of-file markers that qualify it.
 ///
 /// Libgit2 emits a `\ No newline at end of file` record immediately after the
 /// line it describes, so reordering must move the two together.
+#[derive(Clone, Copy)]
 struct LineGroup<'lines> {
     /// The kind of the leading line, before any direction flip.
+    kind: DiffLineKind,
+    lines: &'lines [DiffLine],
+}
+
+/// One line group after an unselected change has either disappeared or become
+/// context for the side of the index that must remain unchanged.
+struct RenderLineGroup<'lines> {
+    original_kind: DiffLineKind,
     kind: DiffLineKind,
     lines: &'lines [DiffLine],
 }
@@ -647,6 +1042,126 @@ fn line_groups(lines: &[DiffLine]) -> Vec<LineGroup<'_>> {
     groups
 }
 
+fn selected_line_groups<'lines>(
+    hunk: &'lines Hunk,
+    selected_lines: &[LineCoordinates],
+    direction: Direction,
+) -> Vec<RenderLineGroup<'lines>> {
+    let mut rendered = Vec::new();
+    let mut changed_run = Vec::new();
+    for group in line_groups(&hunk.lines) {
+        if group.kind == DiffLineKind::Context {
+            push_selected_change_run(&mut rendered, &changed_run, selected_lines, direction);
+            changed_run.clear();
+            rendered.push(RenderLineGroup {
+                original_kind: group.kind,
+                kind: group.kind,
+                lines: group.lines,
+            });
+        } else {
+            changed_run.push(group);
+        }
+    }
+    push_selected_change_run(&mut rendered, &changed_run, selected_lines, direction);
+    rendered
+}
+
+fn push_selected_change_run<'lines>(
+    rendered: &mut Vec<RenderLineGroup<'lines>>,
+    run: &[LineGroup<'lines>],
+    selected_lines: &[LineCoordinates],
+    direction: Direction,
+) {
+    let deletions = run
+        .iter()
+        .filter(|group| group.kind == DiffLineKind::Deletion)
+        .collect::<Vec<_>>();
+    let additions = run
+        .iter()
+        .filter(|group| group.kind == DiffLineKind::Addition)
+        .collect::<Vec<_>>();
+    for index in 0..deletions.len().max(additions.len()) {
+        for group in [deletions.get(index), additions.get(index)]
+            .into_iter()
+            .flatten()
+        {
+            let line = &group.lines[0];
+            let selected = selected_lines.contains(&LineCoordinates {
+                old: line.old_line_number,
+                new: line.new_line_number,
+            });
+            let kind = match (direction, group.kind, selected) {
+                (_, DiffLineKind::Addition, true) => Some(DiffLineKind::Addition),
+                (_, DiffLineKind::Deletion, true) => Some(DiffLineKind::Deletion),
+                (Direction::Forward, DiffLineKind::Addition, false)
+                | (Direction::Reverse, DiffLineKind::Deletion, false) => None,
+                (Direction::Forward, DiffLineKind::Deletion, false)
+                | (Direction::Reverse, DiffLineKind::Addition, false) => {
+                    Some(DiffLineKind::Context)
+                }
+                (_, kind, _) => Some(kind),
+            };
+            if let Some(kind) = kind {
+                rendered.push(RenderLineGroup {
+                    original_kind: group.kind,
+                    kind,
+                    lines: group.lines,
+                });
+            }
+        }
+    }
+}
+
+fn render_line_groups(patch: &mut Vec<u8>, groups: &[RenderLineGroup<'_>], direction: Direction) {
+    match direction {
+        Direction::Forward => {
+            for group in groups {
+                push_render_group(patch, group, direction);
+            }
+        }
+        Direction::Reverse => {
+            let mut run = Vec::new();
+            for group in groups {
+                if group.kind == DiffLineKind::Context {
+                    push_reversed_render_run(patch, &mut run);
+                    push_render_group(patch, group, direction);
+                } else {
+                    run.push(group);
+                }
+            }
+            push_reversed_render_run(patch, &mut run);
+        }
+    }
+}
+
+fn push_reversed_render_run(patch: &mut Vec<u8>, run: &mut Vec<&RenderLineGroup<'_>>) {
+    let (deletions, additions): (Vec<_>, Vec<_>) = run
+        .iter()
+        .partition(|group| group.kind == DiffLineKind::Addition);
+    for group in deletions.into_iter().chain(additions) {
+        push_render_group(patch, group, Direction::Reverse);
+    }
+    run.clear();
+}
+
+fn push_render_group(patch: &mut Vec<u8>, group: &RenderLineGroup<'_>, direction: Direction) {
+    for (index, line) in group.lines.iter().enumerate() {
+        let kind = if index == 0 {
+            group.kind
+        } else if group.kind == DiffLineKind::Context
+            && group.original_kind != DiffLineKind::Context
+            && is_eof_marker(line.kind)
+        {
+            // Once an unselected changed line is retained on both sides, its
+            // missing final newline belongs to both sides as well.
+            DiffLineKind::BothEofNoNewline
+        } else {
+            line.kind
+        };
+        push_line_as(patch, line, kind, direction);
+    }
+}
+
 /// Emits one reversed run of changed lines with its deletions leading.
 fn push_reversed_run(patch: &mut Vec<u8>, run: &mut Vec<&LineGroup<'_>>) {
     // Reversal turns an addition into a deletion, so additions lead here.
@@ -666,7 +1181,11 @@ fn push_group(patch: &mut Vec<u8>, group: &LineGroup<'_>, direction: Direction) 
 }
 
 fn push_line(patch: &mut Vec<u8>, line: &DiffLine, direction: Direction) {
-    match reversed_kind(line.kind, direction) {
+    push_line_as(patch, line, line.kind, direction);
+}
+
+fn push_line_as(patch: &mut Vec<u8>, line: &DiffLine, kind: DiffLineKind, direction: Direction) {
+    match reversed_kind(kind, direction) {
         DiffLineKind::Context => patch.push(b' '),
         DiffLineKind::Addition => patch.push(b'+'),
         DiffLineKind::Deletion => patch.push(b'-'),
@@ -744,10 +1263,13 @@ mod tests {
 
     use git2::Repository;
 
-    use super::{HunkSelection, refuse_unsupported};
+    use super::{
+        Direction, HunkSelection, LineSelection, line_selection_paths, prepare_lines,
+        refuse_unsupported, render_patch,
+    };
     use crate::{
-        Cancellation, CommitOptions, DiffOmission, DiffOptions, DiffTarget, FileChange, FileDiff,
-        GitError, GitService, Hunk, StageOptions, StatusRefreshOutcome,
+        Cancellation, CommitOptions, DiffLine, DiffLineKind, DiffOmission, DiffOptions, DiffTarget,
+        FileChange, FileDiff, GitError, GitService, Hunk, StageOptions, StatusRefreshOutcome,
         testing::{Fixture, commit_all, configure_commit_identity, git, initialize_repository},
     };
 
@@ -900,6 +1422,132 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_unterminated_final_line_and_the_change_around_it_stage_independently() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("unterminated-line-selection");
+        let repository = initialize_repository(&root);
+        fs::write(root.join("tail.txt"), b"one\ntwo\nlast").unwrap();
+        commit_all(&repository, "prepare line-selected tail");
+        fs::write(root.join("tail.txt"), b"one\nTWO\nLAST").unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+
+        let unstaged = service
+            .diff(DiffTarget::Unstaged, &DiffOptions::default())
+            .unwrap();
+        let file = named(&unstaged, Path::new("tail.txt"));
+        let hunk = &file.hunks[0];
+        let final_old = changed_line(hunk, DiffLineKind::Deletion, b"last");
+        let final_new = changed_line(hunk, DiffLineKind::Addition, b"LAST");
+        service
+            .stage_lines(
+                &[
+                    LineSelection::new(file, hunk, final_old),
+                    LineSelection::new(file, hunk, final_new),
+                ],
+                &Cancellation::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            index_bytes(&repository, Path::new("tail.txt")).unwrap(),
+            b"one\ntwo\nLAST"
+        );
+
+        let staged = service
+            .diff(DiffTarget::Staged, &DiffOptions::default())
+            .unwrap();
+        let staged_file = named(&staged, Path::new("tail.txt"));
+        let staged_hunk = &staged_file.hunks[0];
+        let final_old = changed_line(staged_hunk, DiffLineKind::Deletion, b"last");
+        let final_new = changed_line(staged_hunk, DiffLineKind::Addition, b"LAST");
+        service
+            .unstage_lines(
+                &[
+                    LineSelection::new(staged_file, staged_hunk, final_old),
+                    LineSelection::new(staged_file, staged_hunk, final_new),
+                ],
+                &Cancellation::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            index_bytes(&repository, Path::new("tail.txt")).unwrap(),
+            b"one\ntwo\nlast"
+        );
+
+        let unstaged = service
+            .diff(DiffTarget::Unstaged, &DiffOptions::default())
+            .unwrap();
+        let file = named(&unstaged, Path::new("tail.txt"));
+        let hunk = &file.hunks[0];
+        let earlier_old = changed_line(hunk, DiffLineKind::Deletion, b"two\n");
+        let earlier_new = changed_line(hunk, DiffLineKind::Addition, b"TWO\n");
+        service
+            .stage_lines(
+                &[
+                    LineSelection::new(file, hunk, earlier_old),
+                    LineSelection::new(file, hunk, earlier_new),
+                ],
+                &Cancellation::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            index_bytes(&repository, Path::new("tail.txt")).unwrap(),
+            b"one\nTWO\nlast"
+        );
+        assert_eq!(fs::read(root.join("tail.txt")).unwrap(), b"one\nTWO\nLAST");
+    }
+
+    #[test]
+    fn partial_hunk_headers_recount_every_emitted_selection_shape() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("recount-line-headers");
+        let repository = initialize_repository(&root);
+        fs::write(
+            root.join("tracked.txt"),
+            b"zero\nold first\nmiddle\nold last\nend\n",
+        )
+        .unwrap();
+        commit_all(&repository, "prepare header recount");
+        fs::write(
+            root.join("tracked.txt"),
+            b"zero\nnew first\nmiddle\nnew last\nextra\nend\n",
+        )
+        .unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+        let files = service
+            .diff(DiffTarget::Unstaged, &DiffOptions::default())
+            .unwrap();
+        let file = named(&files, Path::new("tracked.txt"));
+        let hunk = &file.hunks[0];
+
+        for shape in [
+            vec![(DiffLineKind::Addition, b"new first\n".as_slice())],
+            vec![(DiffLineKind::Deletion, b"old first\n".as_slice())],
+            vec![
+                (DiffLineKind::Deletion, b"old first\n".as_slice()),
+                (DiffLineKind::Addition, b"new first\n".as_slice()),
+            ],
+            vec![(DiffLineKind::Addition, b"extra\n".as_slice())],
+        ] {
+            let selections = shape
+                .into_iter()
+                .map(|(kind, content)| {
+                    LineSelection::new(file, hunk, changed_line(hunk, kind, content))
+                })
+                .collect::<Vec<_>>();
+            let paths = line_selection_paths(&selections);
+            let prepared = prepare_lines(
+                &root,
+                &selections,
+                &paths,
+                &DiffTarget::Unstaged,
+                &Cancellation::default(),
+            )
+            .unwrap();
+            assert_patch_header_matches_body(&render_patch(&prepared, Direction::Forward));
+        }
+    }
+
     /// Libgit2 never runs an external `filter=` driver, so applying raw
     /// working-tree bytes would put unfiltered content where `git add` puts the
     /// driver's output. Under Git LFS that replaces a pointer with its payload.
@@ -952,6 +1600,27 @@ mod tests {
             cleaned,
             "a refused batch still rewrote the index"
         );
+        let line = file.hunks[0]
+            .lines
+            .iter()
+            .find(|line| line.kind == DiffLineKind::Addition)
+            .unwrap();
+        let error = service
+            .stage_lines(
+                &[LineSelection::new(file, &file.hunks[0], line)],
+                &Cancellation::default(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, GitError::FilteredHunkSelection { ref path, ref driver }
+            if path == Path::new("secret.txt") && driver == "redact"),
+            "{error:?}"
+        );
+        assert_eq!(
+            index_bytes(&repository, Path::new("secret.txt")).unwrap(),
+            cleaned,
+            "a refused line selection rewrote the index"
+        );
     }
 
     #[test]
@@ -994,6 +1663,151 @@ mod tests {
             FIRST_ONLY
         );
         assert_eq!(fs::read(root.join("tracked.txt")).unwrap(), NEW);
+    }
+
+    #[test]
+    fn a_commit_after_line_staging_contains_only_the_selected_lines() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("commit-lines");
+        let repository = initialize_repository(&root);
+        fs::write(root.join("tracked.txt"), b"one\ntwo\nthree\nfour\n").unwrap();
+        commit_all(&repository, "prepare line selection");
+        fs::write(
+            root.join("tracked.txt"),
+            b"one\nselected\ntwo\nthree\nnot selected\nfour\n",
+        )
+        .unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+        let files = service
+            .diff(DiffTarget::Unstaged, &DiffOptions::default())
+            .unwrap();
+        let file = named(&files, Path::new("tracked.txt"));
+        assert_eq!(file.hunks.len(), 1);
+        let hunk = &file.hunks[0];
+        let selected = changed_line(hunk, DiffLineKind::Addition, b"selected\n");
+
+        let outcome = service
+            .stage_lines(
+                &[LineSelection::new(file, hunk, selected)],
+                &Cancellation::default(),
+            )
+            .unwrap();
+
+        assert_eq!(outcome.lines, 1);
+        assert_eq!(outcome.hunks, 1);
+        assert_eq!(
+            index_bytes(&repository, Path::new("tracked.txt")).unwrap(),
+            b"one\nselected\ntwo\nthree\nfour\n"
+        );
+        let committed = service
+            .commit(
+                "commit one line",
+                &CommitOptions::default().with_status_refresh(false),
+                &Cancellation::default(),
+            )
+            .unwrap();
+        let commit = repository
+            .find_commit(committed.commit_id.parse().unwrap())
+            .unwrap();
+        let entry = commit
+            .tree()
+            .unwrap()
+            .get_path(Path::new("tracked.txt"))
+            .unwrap();
+        assert_eq!(
+            repository.find_blob(entry.id()).unwrap().content(),
+            b"one\nselected\ntwo\nthree\nfour\n"
+        );
+        assert_eq!(
+            fs::read(root.join("tracked.txt")).unwrap(),
+            b"one\nselected\ntwo\nthree\nnot selected\nfour\n"
+        );
+    }
+
+    #[test]
+    fn unselected_deletions_become_context_and_selected_deletions_remain_independent() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("partial-deletions");
+        let repository = initialize_repository(&root);
+        fs::write(
+            root.join("tracked.txt"),
+            b"one\nkeep deletion\nthree\nremove deletion\nfive\n",
+        )
+        .unwrap();
+        commit_all(&repository, "prepare deletions");
+        fs::write(
+            root.join("tracked.txt"),
+            b"one\nthree\nselected addition\nfive\n",
+        )
+        .unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+        let files = service
+            .diff(DiffTarget::Unstaged, &DiffOptions::default())
+            .unwrap();
+        let file = named(&files, Path::new("tracked.txt"));
+        assert_eq!(file.hunks.len(), 1);
+        let hunk = &file.hunks[0];
+        let addition = changed_line(hunk, DiffLineKind::Addition, b"selected addition\n");
+        let deletion = changed_line(hunk, DiffLineKind::Deletion, b"remove deletion\n");
+
+        let outcome = service
+            .stage_lines(
+                &[
+                    LineSelection::new(file, hunk, addition),
+                    LineSelection::new(file, hunk, deletion),
+                ],
+                &Cancellation::default(),
+            )
+            .unwrap();
+
+        assert_eq!(outcome.lines, 2);
+        assert_eq!(outcome.hunks, 1, "same-hunk lines were not merged");
+        assert_eq!(
+            index_bytes(&repository, Path::new("tracked.txt")).unwrap(),
+            b"one\nkeep deletion\nthree\nselected addition\nfive\n"
+        );
+        assert_eq!(
+            fs::read(root.join("tracked.txt")).unwrap(),
+            b"one\nthree\nselected addition\nfive\n"
+        );
+    }
+
+    #[test]
+    fn line_unstaging_reverses_only_the_selected_lines() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("unstage-lines");
+        let repository = initialize_repository(&root);
+        fs::write(root.join("tracked.txt"), b"one\ntwo\nthree\nfour\n").unwrap();
+        commit_all(&repository, "prepare unstaging lines");
+        fs::write(
+            root.join("tracked.txt"),
+            b"one\nfirst\ntwo\nthree\nsecond\nfour\n",
+        )
+        .unwrap();
+        git(&root, ["add", "--", "tracked.txt"]);
+        let service = GitService::new(&root, &fixture.data_dir);
+        let files = service
+            .diff(DiffTarget::Staged, &DiffOptions::default())
+            .unwrap();
+        let file = named(&files, Path::new("tracked.txt"));
+        let hunk = &file.hunks[0];
+        let first = changed_line(hunk, DiffLineKind::Addition, b"first\n");
+
+        service
+            .unstage_lines(
+                &[LineSelection::new(file, hunk, first)],
+                &Cancellation::default(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            index_bytes(&repository, Path::new("tracked.txt")).unwrap(),
+            b"one\ntwo\nthree\nsecond\nfour\n"
+        );
+        assert_eq!(
+            fs::read(root.join("tracked.txt")).unwrap(),
+            b"one\nfirst\ntwo\nthree\nsecond\nfour\n"
+        );
     }
 
     #[test]
@@ -1061,6 +1875,13 @@ mod tests {
             ),
             Err(GitError::BinaryHunkSelection { .. })
         ));
+        assert!(matches!(
+            binary_service.stage_lines(
+                &[LineSelection::new(binary, &fake, &fake_line())],
+                &Cancellation::default()
+            ),
+            Err(GitError::BinaryHunkSelection { .. })
+        ));
         assert_eq!(
             fs::read(binary_repository.path().join("index")).unwrap(),
             index_before
@@ -1086,6 +1907,13 @@ mod tests {
         assert!(matches!(
             rename_service.stage_hunks(
                 &[HunkSelection::new(rename, &fake)],
+                &Cancellation::default()
+            ),
+            Err(GitError::RenameOnlyHunkSelection { .. })
+        ));
+        assert!(matches!(
+            rename_service.stage_lines(
+                &[LineSelection::new(rename, &fake, &fake_line())],
                 &Cancellation::default()
             ),
             Err(GitError::RenameOnlyHunkSelection { .. })
@@ -1280,6 +2108,79 @@ mod tests {
         assert_eq!(fs::read(root.join("tracked.txt")).unwrap(), worktree_before);
     }
 
+    #[test]
+    fn same_line_from_overlapping_hunks_is_refused_but_same_hunk_lines_are_merged() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("overlapping-lines");
+        let repository = initialize_repository(&root);
+        fs::write(root.join("tracked.txt"), OLD).unwrap();
+        commit_all(&repository, "prepare overlapping lines");
+        fs::write(root.join("tracked.txt"), NEW).unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+        let zero_context = service
+            .diff(
+                DiffTarget::Unstaged,
+                &DiffOptions::default().with_context_lines(0),
+            )
+            .unwrap();
+        let default_context = service
+            .diff(DiffTarget::Unstaged, &DiffOptions::default())
+            .unwrap();
+        let zero = named(&zero_context, Path::new("tracked.txt"));
+        let default = named(&default_context, Path::new("tracked.txt"));
+        let zero_line = changed_line(&zero.hunks[0], DiffLineKind::Addition, b"TWO\n");
+        let default_line = changed_line(&default.hunks[0], DiffLineKind::Addition, b"TWO\n");
+        let index_before = fs::read(repository.path().join("index")).unwrap();
+
+        let error = service
+            .stage_lines(
+                &[
+                    LineSelection::new(zero, &zero.hunks[0], zero_line),
+                    LineSelection::new(default, &default.hunks[0], default_line),
+                ],
+                &Cancellation::default(),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(error, GitError::OverlappingHunkSelection { ref path }
+                if path == Path::new("tracked.txt")),
+            "{error:?}"
+        );
+        assert_eq!(
+            fs::read(repository.path().join("index")).unwrap(),
+            index_before
+        );
+    }
+
+    #[test]
+    fn stale_line_selection_is_refused_with_the_index_untouched() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("stale-line");
+        let repository = initialize_repository(&root);
+        fs::write(root.join("tracked.txt"), b"one\ntwo\nthree\n").unwrap();
+        commit_all(&repository, "prepare stale line");
+        fs::write(root.join("tracked.txt"), b"one\nTWO\nthree\n").unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+        let files = service
+            .diff(DiffTarget::Unstaged, &DiffOptions::default())
+            .unwrap();
+        let file = named(&files, Path::new("tracked.txt"));
+        let line = changed_line(&file.hunks[0], DiffLineKind::Addition, b"TWO\n");
+        let selection = LineSelection::new(file, &file.hunks[0], line);
+        fs::write(root.join("tracked.txt"), b"one\nTWO AGAIN\nthree\n").unwrap();
+        let index_before = fs::read(repository.path().join("index")).unwrap();
+
+        assert!(matches!(
+            service.stage_lines(&[selection], &Cancellation::default()),
+            Err(GitError::StaleHunkSelection { .. })
+        ));
+        assert_eq!(
+            fs::read(repository.path().join("index")).unwrap(),
+            index_before
+        );
+    }
+
     /// One batch is one transaction. The refusal is raised by the third
     /// selection, and the first two must not reach the index either.
     #[test]
@@ -1433,6 +2334,93 @@ mod tests {
         assert!(
             root.join("fresh.txt").exists(),
             "unstaging removed a working-tree file"
+        );
+    }
+
+    #[test]
+    fn whole_file_records_also_support_partial_line_application() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("whole-file-lines");
+        let repository = initialize_repository(&root);
+        fs::write(root.join("gone.txt"), b"one\ntwo\nthree\n").unwrap();
+        commit_all(&repository, "prepare whole-file lines");
+        fs::remove_file(root.join("gone.txt")).unwrap();
+        fs::write(root.join("fresh.txt"), b"alpha\nbeta\ngamma\n").unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+        let files = service
+            .diff(DiffTarget::Unstaged, &DiffOptions::default())
+            .unwrap();
+        let gone = named(&files, Path::new("gone.txt"));
+        let fresh = named(&files, Path::new("fresh.txt"));
+        let gone_line = changed_line(&gone.hunks[0], DiffLineKind::Deletion, b"two\n");
+        let fresh_line = changed_line(&fresh.hunks[0], DiffLineKind::Addition, b"beta\n");
+
+        service
+            .stage_lines(
+                &[
+                    LineSelection::new(gone, &gone.hunks[0], gone_line),
+                    LineSelection::new(fresh, &fresh.hunks[0], fresh_line),
+                ],
+                &Cancellation::default(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            index_bytes(&repository, Path::new("gone.txt")).unwrap(),
+            b"one\nthree\n"
+        );
+        assert_eq!(
+            index_bytes(&repository, Path::new("fresh.txt")).unwrap(),
+            b"beta\n"
+        );
+        assert!(!root.join("gone.txt").exists());
+        assert_eq!(
+            fs::read(root.join("fresh.txt")).unwrap(),
+            b"alpha\nbeta\ngamma\n"
+        );
+    }
+
+    #[test]
+    fn whole_file_records_also_support_partial_line_unstaging() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("whole-file-line-unstaging");
+        let repository = initialize_repository(&root);
+        fs::write(root.join("gone.txt"), b"one\ntwo\nthree\n").unwrap();
+        commit_all(&repository, "prepare whole-file line unstaging");
+        fs::remove_file(root.join("gone.txt")).unwrap();
+        fs::write(root.join("fresh.txt"), b"alpha\nbeta\ngamma\n").unwrap();
+        git(&root, ["add", "--all"]);
+        let service = GitService::new(&root, &fixture.data_dir);
+        let files = service
+            .diff(DiffTarget::Staged, &DiffOptions::default())
+            .unwrap();
+        let gone = named(&files, Path::new("gone.txt"));
+        let fresh = named(&files, Path::new("fresh.txt"));
+        let gone_line = changed_line(&gone.hunks[0], DiffLineKind::Deletion, b"two\n");
+        let fresh_line = changed_line(&fresh.hunks[0], DiffLineKind::Addition, b"beta\n");
+
+        service
+            .unstage_lines(
+                &[
+                    LineSelection::new(gone, &gone.hunks[0], gone_line),
+                    LineSelection::new(fresh, &fresh.hunks[0], fresh_line),
+                ],
+                &Cancellation::default(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            index_bytes(&repository, Path::new("gone.txt")).unwrap(),
+            b"two\n"
+        );
+        assert_eq!(
+            index_bytes(&repository, Path::new("fresh.txt")).unwrap(),
+            b"alpha\ngamma\n"
+        );
+        assert!(!root.join("gone.txt").exists());
+        assert_eq!(
+            fs::read(root.join("fresh.txt")).unwrap(),
+            b"alpha\nbeta\ngamma\n"
         );
     }
 
@@ -1700,6 +2688,45 @@ mod tests {
             .unwrap_or_else(|| panic!("no diff for '{}' in {files:#?}", path.display()))
     }
 
+    fn changed_line<'a>(hunk: &'a Hunk, kind: DiffLineKind, content: &[u8]) -> &'a DiffLine {
+        hunk.lines
+            .iter()
+            .find(|line| line.kind == kind && line.content == content)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no {kind:?} line {:?} in {hunk:#?}",
+                    String::from_utf8_lossy(content)
+                )
+            })
+    }
+
+    fn assert_patch_header_matches_body(patch: &[u8]) {
+        let patch = String::from_utf8(patch.to_vec()).unwrap();
+        let mut lines = patch.lines();
+        let header = lines
+            .find(|line| line.starts_with("@@ "))
+            .unwrap_or_else(|| panic!("patch has no hunk header:\n{patch}"));
+        let mut fields = header.split_whitespace();
+        assert_eq!(fields.next(), Some("@@"));
+        let old = fields.next().unwrap();
+        let new = fields.next().unwrap();
+        let declared_old = old.split_once(',').unwrap().1.parse::<usize>().unwrap();
+        let declared_new = new.split_once(',').unwrap().1.parse::<usize>().unwrap();
+        let body = lines
+            .take_while(|line| !line.starts_with("@@ ") && !line.starts_with("diff --git "))
+            .collect::<Vec<_>>();
+        let actual_old = body
+            .iter()
+            .filter(|line| line.starts_with(' ') || line.starts_with('-'))
+            .count();
+        let actual_new = body
+            .iter()
+            .filter(|line| line.starts_with(' ') || line.starts_with('+'))
+            .count();
+        assert_eq!(declared_old, actual_old, "old count in patch:\n{patch}");
+        assert_eq!(declared_new, actual_new, "new count in patch:\n{patch}");
+    }
+
     fn index_bytes(repository: &Repository, path: &Path) -> Option<Vec<u8>> {
         let repository = Repository::open(repository.workdir().unwrap()).unwrap();
         let index = repository.index().unwrap();
@@ -1722,6 +2749,17 @@ mod tests {
             header: b"@@ -1 +1 @@\n".to_vec(),
             intra_line_degradation: None,
             lines: Vec::new(),
+        }
+    }
+
+    fn fake_line() -> DiffLine {
+        DiffLine {
+            kind: DiffLineKind::Addition,
+            old_line_number: None,
+            new_line_number: Some(1),
+            content: b"fake\n".to_vec(),
+            paired_line_index: None,
+            intra_line_ranges: None,
         }
     }
 

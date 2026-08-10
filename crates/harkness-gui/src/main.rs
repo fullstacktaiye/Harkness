@@ -181,10 +181,13 @@ Kirigami.ApplicationWindow {
         && fixtureBackend.lastReviewPath === "fixture-path"
         && fixtureBackend.stageHunkCalls === 3
         && fixtureBackend.unstageHunkCalls === 1
+        && fixtureBackend.stageLineCalls === 1
+        && fixtureBackend.lastLineIds === "review-line-old\nreview-line-new"
         && fixtureBackend.lastHunkProject === String(projectFixture.id)
         && fixtureBackend.lastHunkId === "review-hunk-fixture"
         && reviewFixture.splitLayout === true
         && pairedRowsDetected === true
+        && lineSelectionDetected === true
         && reviewFixture.restorePositionAfterMutation === false
         && reviewFixture.heldReviewPathId === ""
         && reviewFixture.heldReviewRowIndex === -1
@@ -207,6 +210,8 @@ Kirigami.ApplicationWindow {
         : "GitPanelSmokeFailed-" + fixtureBackend.stageHunkCalls
             + "-" + fixtureBackend.unstageHunkCalls
             + "-" + pairedRowsDetected
+            + "-" + lineSelectionDetected
+            + "-" + fixtureBackend.stageLineCalls
             + "-" + reviewBusyDetected
             + "-" + mutationBusyDetected
             + "-" + operationBusyDetected
@@ -234,6 +239,7 @@ Kirigami.ApplicationWindow {
 
     property bool reviewBusyDetected: false
     property bool pairedRowsDetected: false
+    property bool lineSelectionDetected: false
     property bool mutationBusyDetected: false
     property bool operationBusyDetected: false
     property bool fileBoundaryDetected: false
@@ -623,6 +629,8 @@ Kirigami.ApplicationWindow {
         property string lastReviewPath: ""
         property int stageHunkCalls: 0
         property int unstageHunkCalls: 0
+        property int stageLineCalls: 0
+        property int unstageLineCalls: 0
         property int nextPageCalls: 0
         property int previousPageCalls: 0
         property int loadReviewFileCalls: 0
@@ -634,6 +642,7 @@ Kirigami.ApplicationWindow {
         property int crossPagePhase: 0
         property string lastHunkProject: ""
         property string lastHunkId: ""
+        property string lastLineIds: ""
 
         property var branches: [{
             "name": "topic",
@@ -748,8 +757,11 @@ Kirigami.ApplicationWindow {
                     "newLines": 1
                 }, {
                     "type": "line",
+                    "hunkId": "review-hunk-fixture",
+                    "lineAction": "stage",
                     "splitHidden": false,
                     "unified": {
+                        "lineId": "review-line-old",
                         "oldLine": 1,
                         "newLine": 0,
                         "kind": "deletion",
@@ -760,6 +772,7 @@ Kirigami.ApplicationWindow {
                         }]
                     },
                     "old": {
+                        "lineId": "review-line-old",
                         "present": true,
                         "line": 1,
                         "kind": "deletion",
@@ -770,6 +783,7 @@ Kirigami.ApplicationWindow {
                         }]
                     },
                     "new": {
+                        "lineId": "review-line-new",
                         "present": true,
                         "line": 1,
                         "kind": "addition",
@@ -781,8 +795,11 @@ Kirigami.ApplicationWindow {
                     }
                 }, {
                     "type": "line",
+                    "hunkId": "review-hunk-fixture",
+                    "lineAction": "stage",
                     "splitHidden": true,
                     "unified": {
+                        "lineId": "review-line-new",
                         "oldLine": 0,
                         "newLine": 1,
                         "kind": "addition",
@@ -873,6 +890,14 @@ Kirigami.ApplicationWindow {
             ++unstageHunkCalls;
             lastHunkProject = String(projectId);
             lastHunkId = String(hunkId);
+        }
+        function stageLines(projectId, lineIds) {
+            ++stageLineCalls;
+            lastLineIds = String(lineIds);
+        }
+        function unstageLines(projectId, lineIds) {
+            ++unstageLineCalls;
+            lastLineIds = String(lineIds);
         }
         function commit(projectId, message, amend) {}
         function fetch(projectId) {}
@@ -1027,9 +1052,13 @@ Kirigami.ApplicationWindow {
         interval: 250
         repeat: false
         onTriggered: {
-            gitPanel.grabToImage(function(result) {
-                screenshotSaved = result.saveToFile(screenshotPath);
-                Qt.quit();
+            reviewFixture.toggleReviewLine("review-line-old", false);
+            reviewFixture.toggleReviewLine("review-line-new", true);
+            Qt.callLater(function() {
+                reviewFixture.grabToImage(function(result) {
+                    screenshotSaved = result.saveToFile(screenshotPath);
+                    Qt.quit();
+                });
             });
         }
     }
@@ -1043,6 +1072,13 @@ Kirigami.ApplicationWindow {
         }
         realBackend.openProject(realProjectId);
         gitPanel.selectPath("fixture-path", "added", "modified");
+        fixtureBackend.jobs = [];
+        reviewFixture.toggleReviewLine("review-line-old", false);
+        reviewFixture.toggleReviewLine("review-line-new", true);
+        lineSelectionDetected = reviewFixture.selectedReviewLineCount === 2
+            && reviewFixture.isReviewLineSelected("review-line-old")
+            && reviewFixture.isReviewLineSelected("review-line-new");
+        reviewFixture.mutateSelectedLines();
         reviewFixture.mutateHunk(fixtureBackend.review.file.rows[1]);
         const unifiedFixtureRowCount = reviewFixture.displayedReviewRowCount();
         reviewFixture.setSplitLayout(true);

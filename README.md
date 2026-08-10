@@ -77,8 +77,8 @@ harkness --json git branch list [--all] [--project <selector>]
 harkness --json git branch create <name> [--from <ref>] [--checkout] [--project <selector>]
 harkness --json git branch checkout <name> [--project <selector>]
 harkness --json git branch delete <name> [--force] [--project <selector>]
-harkness --json git stage (<path>... | --all | --hunk <selection-flags> | --hunk-selection <path|->) [--project <selector>]
-harkness --json git unstage (<path>... | --hunk <selection-flags> | --hunk-selection <path|->) [--project <selector>]
+harkness --json git stage (<path>... | --all | --hunk <selection-flags> | --hunk-selection <path|-> | --line-selection <path|->) [--project <selector>]
+harkness --json git unstage (<path>... | --hunk <selection-flags> | --hunk-selection <path|-> | --line-selection <path|->) [--project <selector>]
 harkness --json git commit --message <message> [--amend] [--allow-empty] [--project <selector>]
 
 harkness --json worktree list [--project <parent-selector>]
@@ -173,7 +173,7 @@ paired deletion/addition indexes and half-open byte ranges. Those keys are
 absent without the flag; pathological lines or pairings retain ordinary line
 marks and name `line_too_long` or `pairing_too_large` on the hunk.
 
-There are two ways to stage or unstage below path granularity, and both are
+There are three ways to stage or unstage below path granularity, and all are
 refused before any mutation if an identity or coordinate has gone stale: the
 diff is recomputed under the repository lock, and a mismatch exits 3 with the
 index untouched.
@@ -200,6 +200,26 @@ coordinates themselves. Prefer a document over repeated single-hunk calls:
 the whole batch is one atomic index write, whereas staging one hunk rewrites
 the index and shifts the blob IDs of every other selection taken from the same
 diff, so a second single-hunk call would be correctly refused as stale.
+
+For individual changed lines, pass `--line-selection` the same document shape
+and narrow each retained hunk's `lines` array to the additions and deletions to
+apply. Context and no-newline marker records may remain; they are ignored as
+selection entries but are recomputed into the synthesized patch as needed. For
+example, this stages the first added line in the first hunk:
+
+```sh
+harkness --json git diff --unstaged --project <selector> \
+  | jq '{files: [.data.files[] | select(.new_path == "src/main.rs")
+                               | .hunks |= [.[0]
+                                   | .lines |= ([.[] | select(.kind != "addition")]
+                                       + ([.[] | select(.kind == "addition")][0:1]))]]}' \
+  | harkness --json git stage --line-selection - --project <selector>
+```
+
+The flat form uses the same file and hunk identity fields plus
+`old_line_number` and `new_line_number`; exactly one line-number side is
+present for an addition or deletion. Several lines from one fresh hunk are
+merged and applied as one recounted patch hunk.
 
 `git stage` consumes unstaged records and `git unstage` consumes staged ones, so
 narrow the diff before piping it; a record carrying the other side's `target` is
@@ -250,7 +270,9 @@ The GUI opens a Kirigami window on the project launcher backed by the Rust
 same creation modes, live linked-worktree inventory, selective reconciliation,
 and a second confirmation before dirty files can be discarded. Selecting a
 changed path loads only that path's staged and unstaged content, marks added
-and removed lines, and stages or unstages one stale-safe hunk at a time. Binary,
+and removed lines, and stages or unstages stale-safe hunks or selected lines.
+Click selects one changed line, Shift-click extends a range, and Space provides
+the keyboard equivalent while the diff list is focused. Binary,
 byte-bounded, and line-bounded content stays visible as a named summary instead
 of eagerly creating an unbounded number of QML delegates. The review surface
 pages commit history through Git cursors, compares commits or a branch against
@@ -262,7 +284,7 @@ lock, and unlock while showing the stored lock reason inline.
 
 ### Git review UI
 
-![Commit history and a lazily loaded unified review diff](docs/screenshots/review-surface.png)
+![Selected changed lines in the lazily loaded unified review diff](docs/screenshots/review-surface.png)
 
 ![Git panel showing a selected hunk diff](docs/screenshots/git-panel.png)
 

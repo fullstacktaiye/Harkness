@@ -51,7 +51,7 @@ pub use diff::{
     MAX_INTRA_LINE_COMPARISONS,
 };
 pub use history::{CommitInfo, CommitSignature, LogCursor, LogOptions, LogPage, LogRange};
-pub use hunk::{HunkSelection, HunkStageOutcome};
+pub use hunk::{HunkSelection, HunkStageOutcome, LineSelection, LineStageOutcome};
 use lock::RepositoryLock;
 pub use runner::{Cancellation, CloneCancellation};
 pub use status::{
@@ -519,6 +519,17 @@ pub enum GitError {
         new_lines: u32,
     },
 
+    /// The selected changed-line coordinates are not present in the named hunk.
+    #[error(
+        "the diff for '{}' does not contain changed line old={:?} new={:?}",
+        path.display(), old_line_number, new_line_number
+    )]
+    LineNotFound {
+        path: PathBuf,
+        old_line_number: Option<u32>,
+        new_line_number: Option<u32>,
+    },
+
     /// Libgit2 could not parse or atomically apply a rebuilt hunk patch.
     ///
     /// The batch is atomic, so the failure names every path it covered rather
@@ -596,6 +607,7 @@ impl GitError {
         "filtered_hunk_selection",
         "overlapping_hunk_selection",
         "hunk_not_found",
+        "line_not_found",
         "hunk_application",
         "malformed_status",
     ];
@@ -664,6 +676,7 @@ impl GitError {
             Self::FilteredHunkSelection { .. } => "filtered_hunk_selection",
             Self::OverlappingHunkSelection { .. } => "overlapping_hunk_selection",
             Self::HunkNotFound { .. } => "hunk_not_found",
+            Self::LineNotFound { .. } => "line_not_found",
             Self::HunkApplication { .. } => "hunk_application",
             Self::MalformedStatus { .. } => "malformed_status",
         }
@@ -938,6 +951,65 @@ impl GitService {
     ) -> Result<HunkStageOutcome, GitError> {
         let lock = self.acquire_lock(cancellation)?;
         hunk::unstage(
+            &self.git_executable,
+            &self.root,
+            &lock,
+            selections,
+            options,
+            cancellation,
+        )
+    }
+
+    /// Stages selected changed lines without writing the working tree.
+    ///
+    /// Each selection retains its enclosing hunk identity so the diff can be
+    /// recomputed and checked under the repository lock. Lines from the same
+    /// fresh hunk are merged into one internally recounted patch hunk before
+    /// the batch is applied atomically.
+    pub fn stage_lines(
+        &self,
+        selections: &[LineSelection],
+        cancellation: &Cancellation,
+    ) -> Result<LineStageOutcome, GitError> {
+        self.stage_lines_with_options(selections, &StageOptions::default(), cancellation)
+    }
+
+    /// Stages selected lines with control over the final status refresh.
+    pub fn stage_lines_with_options(
+        &self,
+        selections: &[LineSelection],
+        options: &StageOptions,
+        cancellation: &Cancellation,
+    ) -> Result<LineStageOutcome, GitError> {
+        let lock = self.acquire_lock(cancellation)?;
+        hunk::stage_lines(
+            &self.git_executable,
+            &self.root,
+            &lock,
+            selections,
+            options,
+            cancellation,
+        )
+    }
+
+    /// Unstages selected changed lines without writing the working tree.
+    pub fn unstage_lines(
+        &self,
+        selections: &[LineSelection],
+        cancellation: &Cancellation,
+    ) -> Result<LineStageOutcome, GitError> {
+        self.unstage_lines_with_options(selections, &StageOptions::default(), cancellation)
+    }
+
+    /// Unstages selected lines with control over the final status refresh.
+    pub fn unstage_lines_with_options(
+        &self,
+        selections: &[LineSelection],
+        options: &StageOptions,
+        cancellation: &Cancellation,
+    ) -> Result<LineStageOutcome, GitError> {
+        let lock = self.acquire_lock(cancellation)?;
+        hunk::unstage_lines(
             &self.git_executable,
             &self.root,
             &lock,
@@ -2004,6 +2076,14 @@ mod tests {
                     new_lines: 4,
                 },
                 "hunk_not_found",
+            ),
+            (
+                GitError::LineNotFound {
+                    path: path.clone(),
+                    old_line_number: Some(1),
+                    new_line_number: None,
+                },
+                "line_not_found",
             ),
             (
                 GitError::HunkApplication {

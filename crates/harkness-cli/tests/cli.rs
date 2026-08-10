@@ -2145,6 +2145,97 @@ fn a_selection_document_stages_several_hunks_atomically() {
     );
 }
 
+#[test]
+fn a_line_selection_document_stages_and_unstages_only_retained_changed_lines() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("line-selection-project");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    fs::write(root.join("tracked.txt"), b"one\ntwo\nthree\nfour\n").unwrap();
+    commit_all(&repository, "prepare line selection");
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+    fs::write(
+        root.join("tracked.txt"),
+        b"one\nselected\ntwo\nthree\nnot selected\nfour\n",
+    )
+    .unwrap();
+
+    let mut file = diff_file(&data_dir, &project_id, "--unstaged", "tracked.txt");
+    assert_eq!(file["hunks"].as_array().unwrap().len(), 1);
+    file["hunks"][0]["lines"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|line| line["kind"] != "addition" || line["content"] == "selected\n");
+    let document = json!({ "files": [file] }).to_string();
+    let staged = harkness_with_stdin(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "stage",
+            "--line-selection",
+            "-",
+            "--project",
+            &project_id,
+        ],
+        &document,
+    );
+
+    assert_success(&staged);
+    assert_eq!(json_output(&staged)["data"]["lines"], 1);
+    assert_eq!(json_output(&staged)["data"]["hunks"], 1);
+    let repository = Repository::open(&root).unwrap();
+    let index = repository.index().unwrap();
+    let entry = index.get_path(Path::new("tracked.txt"), 0).unwrap();
+    assert_eq!(
+        repository.find_blob(entry.id).unwrap().content(),
+        b"one\nselected\ntwo\nthree\nfour\n"
+    );
+    assert_eq!(
+        fs::read(root.join("tracked.txt")).unwrap(),
+        b"one\nselected\ntwo\nthree\nnot selected\nfour\n"
+    );
+
+    let response = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--staged",
+            "--project",
+            &project_id,
+        ],
+    );
+    let unstaged = harkness_with_stdin(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "unstage",
+            "--line-selection",
+            "-",
+            "--project",
+            &project_id,
+        ],
+        &String::from_utf8(response.stdout).unwrap(),
+    );
+    assert_success(&unstaged);
+    assert_eq!(json_output(&unstaged)["data"]["lines"], 1);
+    let repository = Repository::open(&root).unwrap();
+    let index = repository.index().unwrap();
+    let entry = index.get_path(Path::new("tracked.txt"), 0).unwrap();
+    assert_eq!(
+        repository.find_blob(entry.id).unwrap().content(),
+        b"one\ntwo\nthree\nfour\n"
+    );
+}
+
 /// A batch can name the same hunk twice, or two hunks that cover the same
 /// lines. The first is deduplicated and must be counted as what landed rather
 /// than as what was asked for; the second cannot be expressed as one patch and
