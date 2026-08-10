@@ -6,7 +6,7 @@
 //! lock order.
 
 use std::{
-    fs,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -21,6 +21,10 @@ use crate::{
 };
 
 /// What a newly created worktree should check out.
+///
+/// The variants make branch creation, reuse, and detached checkout mutually
+/// exclusive, so callers cannot accidentally ask Git to invent a suffixed
+/// branch or attach a commit-only workspace to a made-up branch name.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorktreeBase {
     /// Create `name` from `start_point`, or from the repository HEAD when absent.
@@ -75,29 +79,45 @@ impl GitWorktree {
     }
 
     /// Whether `path` identifies this checkout, including through aliases.
+    ///
+    /// This canonicalizes both paths and therefore performs blocking
+    /// filesystem I/O. When a path does not exist, its nearest existing
+    /// ancestor is canonicalized and the missing suffix is restored.
     #[must_use]
     pub fn matches_path(&self, path: &Path) -> bool {
         same_path(&self.root, path)
     }
 
     /// Whether this checkout's `.git` file names `administrative_name`.
+    ///
+    /// This reads the checkout's `.git` file and returns `false` on any I/O or
+    /// decoding failure.
     #[must_use]
     pub fn matches_administrative_name(&self, administrative_name: &str) -> bool {
         administrative_name_at(&self.root).as_deref() == Some(administrative_name)
     }
-
-    /// Compares two checkout paths with the same missing-tail handling used by
-    /// worktree records.
-    #[must_use]
-    pub fn paths_match(left: &Path, right: &Path) -> bool {
-        same_path(left, right)
-    }
 }
 
 /// The revision and branch identity Git actually created.
+#[derive(Debug)]
 pub struct AddedWorktree {
     branch: Option<String>,
     commit: Oid,
+}
+
+/// Refuses to let worktree creation reuse anything already present at its
+/// destination, including a dangling symlink that `Path::exists` misses.
+pub(crate) fn require_missing_destination(destination: &Path) -> Result<(), GitError> {
+    match fs::symlink_metadata(destination) {
+        Ok(_) => Err(GitError::WorktreeAddDestinationExists {
+            path: destination.to_path_buf(),
+        }),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(GitError::WorktreeAddDestinationUnavailable {
+            path: destination.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 impl AddedWorktree {
@@ -321,7 +341,7 @@ pub(crate) fn remove_known_unlocked(
     Ok(())
 }
 
-/// Runs the mandatory best-effort cleanup sequence after `worktree add` was
+/// Runs and verifies the mandatory cleanup sequence after `worktree add` was
 /// attempted: Git removal, filesystem removal, then a targeted retry for any
 /// administrative record whose checkout disappeared during cleanup.
 pub(crate) fn cleanup_failed_add(
@@ -329,25 +349,60 @@ pub(crate) fn cleanup_failed_add(
     parent: &Path,
     lock: &RepositoryLock,
     destination: &Path,
-) {
+) -> Result<(), GitError> {
     let cancellation = Cancellation::default();
-    let _ = remove_known_unlocked(
+    let mut failures = Vec::new();
+    if let Err(error) = remove_known_unlocked(
         git_executable,
         parent,
         lock,
         destination,
         true,
         &cancellation,
-    );
-    let _ = fs::remove_dir_all(destination);
-    let _ = remove_known_unlocked(
+    ) {
+        failures.push(error.to_string());
+    }
+    if let Err(source) = fs::remove_dir_all(destination)
+        && source.kind() != io::ErrorKind::NotFound
+    {
+        failures.push(format!("filesystem removal failed: {source}"));
+    }
+    if let Err(error) = remove_known_unlocked(
         git_executable,
         parent,
         lock,
         destination,
         true,
         &cancellation,
-    );
+    ) {
+        failures.push(error.to_string());
+    }
+
+    let row_remains = match list(git_executable, parent, &cancellation) {
+        Ok(rows) => rows.iter().any(|row| row.matches_path(destination)),
+        Err(error) => {
+            failures.push(format!("could not verify administrative cleanup: {error}"));
+            true
+        }
+    };
+    let checkout_remains = match fs::symlink_metadata(destination) {
+        Ok(_) => true,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => false,
+        Err(source) => {
+            failures.push(format!("could not verify checkout cleanup: {source}"));
+            true
+        }
+    };
+    if !row_remains && !checkout_remains {
+        return Ok(());
+    }
+    if failures.is_empty() {
+        failures.push("the checkout or its Git administrative record remains".to_owned());
+    }
+    Err(GitError::WorktreeAddCleanup {
+        path: destination.to_path_buf(),
+        detail: failures.join("; "),
+    })
 }
 
 /// Lists the main and linked worktrees in Git's stable porcelain format.
@@ -501,7 +556,9 @@ mod tests {
 
     #[cfg(unix)]
     use super::same_path;
-    use super::{administrative_name_at, parse_porcelain};
+    use super::{
+        AddedWorktree, administrative_name_at, parse_porcelain, require_missing_destination,
+    };
 
     #[test]
     fn parses_branch_detached_locked_and_unseparated_porcelain_rows() {
@@ -532,7 +589,46 @@ mod tests {
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].locked.as_deref(), Some(""));
+        assert!(rows[0].is_locked());
+        assert_eq!(rows[0].lock_reason(), None);
         assert_eq!(rows[1].locked.as_deref(), Some("first\nsecond"));
+        assert_eq!(rows[1].lock_reason(), Some("first\nsecond"));
+    }
+
+    #[test]
+    fn public_worktree_accessors_report_the_parsed_identity() {
+        let rows = parse_porcelain(
+            b"worktree /tmp/main\0HEAD aaaa\0branch refs/heads/main\0prunable stale\0\0",
+        )
+        .unwrap();
+        let row = &rows[0];
+
+        assert_eq!(row.root(), std::path::Path::new("/tmp/main"));
+        assert_eq!(row.branch(), Some("main"));
+        assert!(!row.is_locked());
+        assert_eq!(row.lock_reason(), None);
+        assert!(row.is_prunable());
+
+        let added = AddedWorktree {
+            branch: Some("topic".to_owned()),
+            commit: git2::Oid::ZERO_SHA1,
+        };
+        assert_eq!(added.branch(), Some("topic"));
+        assert_eq!(added.commit_id(), git2::Oid::ZERO_SHA1.to_string());
+        assert!(format!("{added:?}").contains("topic"));
+    }
+
+    #[test]
+    fn worktree_add_destinations_must_be_absent() {
+        let fixture = tempfile::tempdir().unwrap();
+        let existing = fixture.path().join("existing");
+        fs::create_dir(&existing).unwrap();
+
+        assert!(matches!(
+            require_missing_destination(&existing),
+            Err(crate::GitError::WorktreeAddDestinationExists { path }) if path == existing
+        ));
+        require_missing_destination(&fixture.path().join("missing")).unwrap();
     }
 
     #[test]

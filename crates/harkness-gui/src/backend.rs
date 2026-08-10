@@ -136,7 +136,7 @@ pub mod ffi {
             file_id: &QString,
         );
 
-        /// Expands one collapsed region through core's stable context API.
+        /// Expands one collapsed region through the Git service's stable context API.
         #[qinvokable]
         #[cxx_name = "expandReviewContext"]
         fn expand_review_context(
@@ -234,7 +234,7 @@ pub mod ffi {
             destination: &QString,
         );
 
-        /// Protects a Harkness-owned worktree with a mandatory core-validated reason.
+        /// Protects a Harkness-owned worktree with a mandatory Git-validated reason.
         #[qinvokable]
         #[cxx_name = "lockWorktree"]
         fn lock_worktree(self: Pin<&mut HarknessBackend>, project_id: &QString, reason: &QString);
@@ -1379,7 +1379,7 @@ fn load_review_with_git(
     generation: u64,
 ) -> Result<ReviewStateRow, GitFailure> {
     let target = prepare_review_target(git, selection)?;
-    // A zero content budget asks core for the complete identity list while
+    // A zero content budget asks the Git service for the complete identity list while
     // intentionally omitting every hunk. Opening a path makes the second,
     // path-restricted request below, so a thousand-file review never eagerly
     // builds a thousand line models.
@@ -1529,7 +1529,7 @@ fn hunk_degradation_summary(hunk: &harkness_git::Hunk) -> String {
         Some(harkness_git::IntraLineDegradation::PairingTooLarge { limit }) => {
             format!("Word emphasis unavailable — pairing exceeds the {limit}-comparison limit.")
         }
-        Some(_) => "Word emphasis unavailable for a named core limit.".to_owned(),
+        Some(_) => "Word emphasis unavailable for a named Git limit.".to_owned(),
         None => String::new(),
     }
 }
@@ -1950,7 +1950,7 @@ fn context_omission_summary(omission: &harkness_git::FileContextOmission) -> Str
         harkness_git::FileContextOmission::ContentBudgetExhausted { limit } => {
             format!("Context budget exhausted — the range exceeds {limit} bytes.")
         }
-        _ => "Context omitted for a named core limit.".to_owned(),
+        _ => "Context omitted for a named Git limit.".to_owned(),
     }
 }
 
@@ -4481,7 +4481,7 @@ mod tests {
         let root = fixture.path().join("byte-path-repository");
         initialize_repository(&root);
         fs::write(root.join(&first), b"byte-exact content\n").unwrap();
-        let git = harkness_git::GitService::new(&root, fixture.path().join("byte-path-locks"));
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
         let state =
             load_diff_with_git(&git, "project-1".to_owned(), first_id, first.clone()).unwrap();
         assert_eq!(state.path_id, "path-1");
@@ -4505,7 +4505,7 @@ mod tests {
             .replace("line 2\n", "line 2 changed\n")
             .replace("line 22\n", "line 22 changed\n");
         fs::write(root.join(path), &modified).unwrap();
-        let git = harkness_git::GitService::new(&root, fixture.path().join("diff-locks"));
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
 
         let state = load_diff_with_git(
             &git,
@@ -4634,7 +4634,7 @@ mod tests {
         let path = Path::new("stale.txt");
         commit_file(&root, path, "one\ntwo\nthree\n", "add stale fixture");
         fs::write(root.join(path), "one\ntwo changed\nthree\n").unwrap();
-        let git = harkness_git::GitService::new(&root, fixture.path().join("stale-locks"));
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
         let state = load_diff_with_git(
             &git,
             "project-1".to_owned(),
@@ -4684,7 +4684,7 @@ mod tests {
         let fixture = TempDir::new().unwrap();
         let root = fixture.path().join("summary-repository");
         initialize_repository(&root);
-        let git = harkness_git::GitService::new(&root, fixture.path().join("summary-locks"));
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
 
         fs::write(root.join("binary.dat"), [0_u8, 1, 2, 0, 3]).unwrap();
         let binary = load_diff_with_git(
@@ -4727,7 +4727,7 @@ mod tests {
             .map(|line| format!("line {line}\n"))
             .collect::<String>();
         fs::write(root.join("many-lines.txt"), content).unwrap();
-        let git = harkness_git::GitService::new(&root, fixture.path().join("line-limit-locks"));
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
         let state = load_diff_with_git(
             &git,
             "project-1".to_owned(),
@@ -4760,7 +4760,7 @@ mod tests {
     }
 
     #[test]
-    fn review_history_uses_exactly_one_core_cursor_page_at_a_time() {
+    fn review_history_uses_exactly_one_git_cursor_page_at_a_time() {
         let fixture = TempDir::new().unwrap();
         let root = fixture.path().join("history-repository");
         initialize_repository(&root);
@@ -4772,7 +4772,7 @@ mod tests {
                 format!("revision {revision}").as_str(),
             );
         }
-        let git = harkness_git::GitService::new(&root, fixture.path().join("history-locks"));
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
         let cancellation = harkness_git::Cancellation::default();
 
         let (first, cursor) = load_history_page_with_git(&git, None, &cancellation).unwrap();
@@ -4834,7 +4834,7 @@ mod tests {
             "change topic",
         );
 
-        let git = harkness_git::GitService::new(&root, fixture.path().join("branch-locks"));
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
         let review = load_review_with_git(
             &git,
             "project-1".to_owned(),
@@ -4857,7 +4857,7 @@ mod tests {
     }
 
     #[test]
-    fn review_file_loads_core_intra_line_ranges_only_on_demand() {
+    fn review_file_loads_git_intra_line_ranges_only_on_demand() {
         let fixture = TempDir::new().unwrap();
         let root = fixture.path().join("word-review-repository");
         initialize_repository(&root);
@@ -4876,7 +4876,7 @@ mod tests {
         );
         let repository = Repository::open(&root).unwrap();
         let revision = repository.head().unwrap().target().unwrap().to_string();
-        let git = harkness_git::GitService::new(&root, fixture.path().join("word-locks"));
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
         let review = load_review_with_git(
             &git,
             "project-1".to_owned(),
@@ -4943,7 +4943,7 @@ mod tests {
         drop(repository);
         let revision = commit_index(&root, "change both review files").to_string();
 
-        let git = harkness_git::GitService::new(&root, fixture.path().join("default-locks"));
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
         let review = load_review_with_initial_file_with_git(
             &git,
             "project-1".to_owned(),
@@ -4996,7 +4996,7 @@ mod tests {
         drop(parent);
         drop(repository);
 
-        let git = harkness_git::GitService::new(&root, fixture.path().join("large-locks"));
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
         let review = load_review_with_git(
             &git,
             "project-1".to_owned(),
@@ -5023,7 +5023,7 @@ mod tests {
         commit_file(&root, path, &changed, "change middle line");
         let repository = Repository::open(&root).unwrap();
         let revision = repository.head().unwrap().target().unwrap().to_string();
-        let git = harkness_git::GitService::new(&root, fixture.path().join("context-locks"));
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
         let review = load_review_with_git(
             &git,
             "project-1".to_owned(),
@@ -5071,7 +5071,7 @@ mod tests {
         drop(index);
         drop(repository);
 
-        let git = harkness_git::GitService::new(&root, fixture.path().join("working-locks"));
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
         let staged =
             load_review_with_git(&git, "project-1".to_owned(), ReviewSelection::Staged, 10)
                 .unwrap();
@@ -5299,7 +5299,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_worktree_lock_requires_and_surfaces_the_core_reason() {
+    fn backend_worktree_lock_requires_and_surfaces_the_git_reason() {
         let fixture = TempDir::new().unwrap();
         let parent_root = fixture.path().join("lock-parent");
         initialize_repository(&parent_root);

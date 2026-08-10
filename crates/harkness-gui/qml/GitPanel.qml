@@ -907,7 +907,7 @@ Item {
                                 }
                             }
 
-                            // A lock is lifecycle policy owned by core. Show
+                            // A lock is lifecycle policy owned by the catalog. Show
                             // Git's reason in the row so protection is visible
                             // before a move or removal is attempted.
                             Controls.Label {

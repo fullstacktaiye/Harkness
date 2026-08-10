@@ -253,9 +253,9 @@ changed path loads only that path's staged and unstaged content, marks added
 and removed lines, and stages or unstages one stale-safe hunk at a time. Binary,
 byte-bounded, and line-bounded content stays visible as a named summary instead
 of eagerly creating an unbounded number of QML delegates. The review surface
-pages commit history through core cursors, compares commits or a branch against
+pages commit history through Git cursors, compares commits or a branch against
 its pinned merge-base, and loads one selected file at a time. Its virtualized
-unified and side-by-side layouts render core's intra-line ranges, apply
+unified and side-by-side layouts render the Git layer's intra-line ranges, apply
 presentation-only syntax color, expand stable blob-addressed context, and expose
 keyboard navigation between files and hunks. Managed worktree rows expose move,
 lock, and unlock while showing the stored lock reason inline.

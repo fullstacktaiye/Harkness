@@ -2,10 +2,11 @@
 
 ## Project Structure & Module Organization
 
-Harkness is a Rust 2024 workspace split into four crates under `crates/`:
+Harkness is a Rust 2024 workspace split into five crates under `crates/`:
 
 - `harkness-core`: project catalog, storage layout, cross-domain project workflows, and directory-listing logic shared by front ends.
-- `harkness-git`: production Git inspection, process execution, repository locking, and worktree mechanics.
+- `harkness-git`: all production Git behavior: inspection, diffs and history, file context and hunk staging, branch and worktree mutation, commits, clone and synchronization, hermetic process execution, and repository locking.
+- `harkness-test-fixtures`: hermetic repository, filesystem, and process fixtures shared only by crate tests.
 - `harkness-cli`: the `harkness` command and its integration tests in `tests/`.
 - `harkness-gui`: the Qt 6/KDE Kirigami application. Rust/CXX-Qt bindings live in `src/` and `cxx/`; UI components live in `qml/`.
 

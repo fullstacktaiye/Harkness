@@ -416,7 +416,7 @@ fn merge_base_in(
     merge_base_ids(repository, root, one_id, two_id, one, two)
 }
 
-pub(super) fn merge_base_ids(
+pub(crate) fn merge_base_ids(
     repository: &Repository,
     root: &Path,
     one_id: Oid,
@@ -435,7 +435,7 @@ pub(super) fn merge_base_ids(
         })
 }
 
-pub(super) fn require_commit(
+pub(crate) fn require_commit(
     repository: &Repository,
     root: &Path,
     revision: &str,

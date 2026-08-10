@@ -628,7 +628,8 @@ mod tests {
     use git2::{Repository, WorktreeAddOptions};
 
     use super::{
-        DetailedStatus, FileChange, HeadState, StatusEntry, UpstreamStatus, parse_porcelain_v2,
+        DetailedStatus, FileChange, GitStatus, HeadState, StatusEntry, UpstreamStatus,
+        parse_porcelain_v2,
     };
     use crate::{
         Cancellation, GitError, GitService,
@@ -645,6 +646,38 @@ mod tests {
         1 M. N... 100644 100644 100644 aaa bbb staged.txt\0\
         1 .M N... 100644 100644 100644 ccc ddd unstaged.txt\0\
         ? untracked.txt\0";
+
+    #[test]
+    fn cheap_status_json_contract_is_exact() {
+        let status = GitStatus {
+            branch: Some("main".to_owned()),
+            dirty: true,
+            upstream: Some(UpstreamStatus {
+                name: "origin/main".to_owned(),
+                ahead: 2,
+                behind: 3,
+            }),
+            staged: 4,
+            unstaged: 5,
+        };
+        let expected = serde_json::json!({
+            "branch": "main",
+            "dirty": true,
+            "upstream": {
+                "name": "origin/main",
+                "ahead": 2,
+                "behind": 3
+            },
+            "staged": 4,
+            "unstaged": 5
+        });
+
+        assert_eq!(serde_json::to_value(&status).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_value::<GitStatus>(expected).unwrap(),
+            status
+        );
+    }
 
     #[test]
     fn a_branch_with_an_upstream_parses_into_head_divergence_and_entries() {

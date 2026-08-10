@@ -71,6 +71,10 @@ jobs:
             ${{ runner.os }}-cargo-
       - name: Test core
         run: cargo test --locked -p harkness-core
+      - name: Test Git
+        run: cargo test --locked -p harkness-git
+      - name: Test shared fixtures
+        run: cargo test --locked -p harkness-test-fixtures
       - name: Test CLI
         run: cargo test --locked -p harkness-cli
 
@@ -84,22 +88,22 @@ jobs:
           clean: true
       - name: Test GitHub remote import deduplication
         run: >-
-          cargo test --locked -p harkness-core
+          sh .github/scripts/run-ignored-exact-test.sh
+          harkness-core
           project::tests::github_remote_forms_deduplicate_through_import
-          -- --ignored --exact
       # Every other synchronizing test uses a local remote, which exercises no
       # credential helper at all. This is the only coverage proving a real
       # remote is still reached through the generalized runner.
       - name: Test GitHub fetch and pull round trip
         run: >-
-          cargo test --locked -p harkness-core
-          git::sync::tests::github_fetch_and_pull_round_trip
-          -- --ignored --exact
+          sh .github/scripts/run-ignored-exact-test.sh
+          harkness-git
+          sync::tests::github_fetch_and_pull_round_trip
       # The default-branch guardrail asks the remote which branch it currently
       # calls its default, so it needs one real hosting service to have answered
       # at least once. It writes nothing: the push it refuses never runs.
       - name: Test GitHub default branch refusal
         run: >-
-          cargo test --locked -p harkness-core
-          git::sync::tests::github_default_branch_refusal_asks_the_remote
-          -- --ignored --exact
+          sh .github/scripts/run-ignored-exact-test.sh
+          harkness-git
+          sync::tests::github_default_branch_refusal_asks_the_remote

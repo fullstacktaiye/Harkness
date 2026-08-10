@@ -14,6 +14,9 @@ use crate::{
 ///
 /// `remote` and `destination` reach Git exactly as the caller supplied them.
 /// The `--` boundary prevents either from being interpreted as an option.
+/// Callers are responsible for validating the remote before invoking this
+/// primitive. Relative destinations resolve against `working_directory`; an
+/// absolute destination is used as written.
 ///
 /// No timeout: a first clone of a large repository is legitimately slow, and
 /// `cancellation` already stops it on the only terms a user cares about.
@@ -61,5 +64,26 @@ mod tests {
 
         assert!(working_directory.join(destination).join(".git").is_dir());
         assert!(!working_directory.join("checkout").exists());
+    }
+
+    #[test]
+    fn clone_accepts_an_absolute_checkout_destination() {
+        let fixture = Fixture::new();
+        let source = fixture.directory("absolute-clone-source");
+        initialize_repository(&source);
+        let working_directory = fixture.directory("absolute-clone-working-directory");
+        let destination = fixture.root.path().join("absolute-chosen-checkout");
+
+        GitService::new(&working_directory, &fixture.data_dir)
+            .clone_to(
+                source.to_str().unwrap(),
+                &destination,
+                &Cancellation::default(),
+                |_| {},
+            )
+            .unwrap();
+
+        assert!(destination.join(".git").is_dir());
+        assert!(!working_directory.join("absolute-chosen-checkout").exists());
     }
 }

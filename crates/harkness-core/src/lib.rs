@@ -1,4 +1,9 @@
-//! Shared application behavior for Harkness front ends.
+//! Shared catalog and cross-domain application behavior for Harkness front ends.
+//!
+//! Public project workflows use types from the lower-level [`harkness_git`]
+//! crate. It is re-exported here so an application that wants the core facade
+//! can name those types without declaring and version-aligning a second direct
+//! dependency.
 
 mod catalog;
 mod listing;
@@ -9,6 +14,10 @@ mod remote;
 mod testing;
 
 pub use catalog::entry::{Project, ProjectId, ProjectSource};
+pub use harkness_git;
+pub use harkness_git::{
+    Cancellation, GitError, GitService, GitStatus, InspectionSource, WorktreeBase,
+};
 pub use listing::{DirEntry, list_directory};
 pub use project::{
     ProjectError, ProjectSelector, ProjectService, Worktree, WorktreeReconciliation,

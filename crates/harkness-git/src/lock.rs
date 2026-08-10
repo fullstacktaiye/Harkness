@@ -17,6 +17,11 @@ use crate::{GitError, runner::Cancellation};
 /// the name would stop excluding each other.
 const REPOSITORY_LOCK_NAMESPACE: Uuid = Uuid::from_u128(0x7f3a_9c1e_5b2d_4e6a_9c17_2f8b_41d0_a6e3);
 
+/// Stable repository-lock namespace beneath the embedding application's data
+/// directory. Moving it would let old and new Harkness builds mutate one
+/// repository concurrently.
+const LOCKS_DIRECTORY: &str = "locks";
+
 /// How long a caller waits before the repository is reported busy.
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -36,8 +41,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 ///
 /// # Location
 ///
-/// The lock file lives in the caller-provided lock directory, never inside the
-/// user's `.git`, so acquiring a lock does not write repository metadata.
+/// The lock file lives below `locks/` in the caller-provided application data
+/// directory, never inside the user's `.git`, so acquiring a lock does not
+/// write repository metadata.
 ///
 /// # Scope
 ///
@@ -73,13 +79,14 @@ impl RepositoryLock {
     /// throughout, so a caller that gives up first is not made to wait out the
     /// timeout.
     pub(crate) fn acquire(
-        lock_dir: &Path,
+        data_dir: &Path,
         repository: &Path,
         cancellation: &Cancellation,
     ) -> Result<Self, GitError> {
-        let path = lock_path(lock_dir, repository)?;
-        fs::create_dir_all(lock_dir).map_err(|source| GitError::Lock {
-            path: lock_dir.to_path_buf(),
+        let lock_dir = data_dir.join(LOCKS_DIRECTORY);
+        let path = lock_path(&lock_dir, repository)?;
+        fs::create_dir_all(&lock_dir).map_err(|source| GitError::Lock {
+            path: lock_dir.clone(),
             source,
         })?;
         let file = File::options()
@@ -199,16 +206,20 @@ mod tests {
     }
 
     #[test]
-    fn the_lock_lives_in_the_injected_directory_and_not_in_the_repository() {
+    fn the_service_derives_the_stable_lock_directory_from_its_data_directory() {
         let fixture = Fixture::new();
         let repository = fixture.directory("locked-repository");
         initialize_repository(&repository);
 
-        let lock =
-            RepositoryLock::acquire(&fixture.data_dir, &repository, &Cancellation::default())
-                .unwrap();
+        let session = GitService::new(&repository, &fixture.data_dir)
+            .lock(&Cancellation::default())
+            .unwrap();
+        let lock = &session.lock;
 
-        assert_eq!(lock.path().parent(), Some(fixture.data_dir.as_path()));
+        assert_eq!(
+            lock.path().parent(),
+            Some(fixture.data_dir.join("locks").as_path())
+        );
         assert!(!lock.path().starts_with(&repository));
         assert!(
             !std::fs::read_dir(repository.join(".git"))

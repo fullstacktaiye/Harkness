@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/harkness-test-fixtures",
     "crates/harkness-git",
     "crates/harkness-core",
     "crates/harkness-cli",
@@ -20,6 +21,7 @@ dirs = "6.0"
 git2 = { version = "0.21", default-features = false }
 harkness-core = { path = "crates/harkness-core" }
 harkness-git = { path = "crates/harkness-git" }
+harkness-test-fixtures = { path = "crates/harkness-test-fixtures" }
 libc = "0.2"
 libgit2-sys = { version = "0.18", default-features = false }
 serde = { version = "1.0", features = ["derive"] }

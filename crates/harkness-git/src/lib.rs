@@ -1,6 +1,6 @@
 //! System Git integration for Harkness front ends.
 //!
-//! Everything Harkness does with Git goes through this module: one command
+//! Everything Harkness does with Git goes through this crate: one command
 //! runner, one per-repository lock, and the two status tiers. [`GitService`] is
 //! the front door, addressed by filesystem path so that nothing here needs the
 //! project catalog — and therefore nothing here can take the catalog lock out
@@ -30,6 +30,10 @@ use std::{
 
 use git2::{ErrorCode, Repository};
 use thiserror::Error;
+
+/// The libgit2 identity and classification types used by this crate's public
+/// API. Re-exporting the exact dependency keeps downstream versions aligned.
+pub use git2;
 
 pub use branch::{Branch, BranchCheckout, BranchKind, BranchListOptions, CreateBranchOptions};
 pub use commit::{
@@ -72,6 +76,19 @@ impl InspectionSource {
     #[must_use]
     pub fn from_message(message: &str) -> Self {
         Self(git2::Error::from_str(message))
+    }
+
+    /// The libgit2 error code, for callers that need more than the stable
+    /// Harkness error kind.
+    #[must_use]
+    pub fn code(&self) -> git2::ErrorCode {
+        self.0.code()
+    }
+
+    /// The libgit2 subsystem that raised the diagnostic.
+    #[must_use]
+    pub fn class(&self) -> git2::ErrorClass {
+        self.0.class()
     }
 }
 
@@ -209,6 +226,27 @@ pub enum GitError {
         worktree.display()
     )]
     BranchCheckedOutInWorktree { branch: String, worktree: PathBuf },
+
+    /// Worktree creation never reuses a filesystem entry, including a
+    /// dangling symlink that [`Path::exists`] would overlook.
+    #[error("worktree destination '{}' already exists", path.display())]
+    WorktreeAddDestinationExists { path: PathBuf },
+
+    /// The worktree destination could not be inspected safely before Git ran.
+    #[error(
+        "worktree destination '{}' cannot be inspected: {source}",
+        path.display()
+    )]
+    WorktreeAddDestinationUnavailable {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    /// A failed worktree add left either its checkout or its administrative
+    /// record behind after the complete targeted cleanup sequence.
+    #[error("failed to clean worktree destination '{}': {detail}", path.display())]
+    WorktreeAddCleanup { path: PathBuf, detail: String },
 
     /// A worktree was explicitly locked by Git against every lifecycle change.
     ///
@@ -515,6 +553,9 @@ impl GitError {
         "current_branch_deletion",
         "default_branch_deletion",
         "branch_checked_out_in_worktree",
+        "worktree_add_destination_exists",
+        "worktree_add_destination_unavailable",
+        "worktree_add_cleanup",
         "worktree_locked",
         "empty_worktree_lock_reason",
         "worktree_already_locked",
@@ -578,6 +619,11 @@ impl GitError {
             Self::CurrentBranchDeletion { .. } => "current_branch_deletion",
             Self::DefaultBranchDeletion { .. } => "default_branch_deletion",
             Self::BranchCheckedOutInWorktree { .. } => "branch_checked_out_in_worktree",
+            Self::WorktreeAddDestinationExists { .. } => "worktree_add_destination_exists",
+            Self::WorktreeAddDestinationUnavailable { .. } => {
+                "worktree_add_destination_unavailable"
+            }
+            Self::WorktreeAddCleanup { .. } => "worktree_add_cleanup",
             Self::WorktreeLocked { .. } => "worktree_locked",
             Self::EmptyWorktreeLockReason => "empty_worktree_lock_reason",
             Self::WorktreeAlreadyLocked { .. } => "worktree_already_locked",
@@ -664,20 +710,22 @@ fn describe_paths(paths: &[PathBuf]) -> String {
 #[derive(Clone, Debug)]
 pub struct GitService {
     root: PathBuf,
-    lock_dir: PathBuf,
+    data_dir: PathBuf,
     git_executable: PathBuf,
 }
 
 impl GitService {
     /// Addresses the repository whose working directory is `root`.
     ///
-    /// `lock_dir` is supplied explicitly by the embedding application; nothing
-    /// is created there until a lock is taken.
+    /// `data_dir` is the embedding application's data directory. Repository
+    /// locks always live below its stable `locks/` child; callers cannot choose
+    /// a second lock namespace accidentally. Nothing is created there until a
+    /// mutation lock is taken.
     #[must_use]
-    pub fn new(root: impl Into<PathBuf>, lock_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(root: impl Into<PathBuf>, data_dir: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            lock_dir: lock_dir.into(),
+            data_dir: data_dir.into(),
             git_executable: PathBuf::from("git"),
         }
     }
@@ -714,6 +762,11 @@ impl GitService {
     /// Clones `remote` to an explicit destination using this service's working
     /// directory and Git executable.
     ///
+    /// The caller must validate `remote` before passing it here; every Git URL
+    /// form, local path, and transport helper reaches Git unchanged. A relative
+    /// destination resolves beneath [`GitService::root`], while an absolute
+    /// destination is used as written.
+    ///
     /// Clone creates a repository, so there is no repository lock to take yet.
     pub fn clone_to(
         &self,
@@ -733,7 +786,8 @@ impl GitService {
     }
 
     /// Lists the repository's main and linked worktrees without taking its
-    /// mutation lock.
+    /// mutation lock. Use [`LockedRepository::worktrees_while_locked`] when a
+    /// later lifecycle mutation must retain the same mutation capability.
     pub fn worktrees(&self, cancellation: &Cancellation) -> Result<Vec<GitWorktree>, GitError> {
         worktree::list(&self.git_executable, &self.root, cancellation)
     }
@@ -1222,6 +1276,11 @@ impl GitService {
     ///
     /// Every Git mutation holds it; no read takes it at all. The caller must
     /// acquire it before any catalog lock.
+    ///
+    /// While the returned session is alive, do not call a mutating method on
+    /// this or another [`GitService`] for the same repository. Repository
+    /// locks are deliberately non-reentrant, so that call waits for this
+    /// session and then returns [`GitError::RepositoryBusy`].
     pub fn lock(&self, cancellation: &Cancellation) -> Result<LockedRepository, GitError> {
         Ok(LockedRepository {
             root: self.root.clone(),
@@ -1231,14 +1290,17 @@ impl GitService {
     }
 
     fn acquire_lock(&self, cancellation: &Cancellation) -> Result<RepositoryLock, GitError> {
-        RepositoryLock::acquire(&self.lock_dir, &self.root, cancellation)
+        RepositoryLock::acquire(&self.data_dir, &self.root, cancellation)
     }
 }
 
 /// A repository session that proves the repository mutation lock is held.
 ///
 /// Its public surface is intentionally limited to the worktree lifecycle used
-/// by the catalog layer. Dropping the session releases the lock.
+/// by an embedding catalog layer. Dropping the session releases the lock.
+/// Callers must keep their catalog row in sync with every successful lifecycle
+/// mutation. Do not invoke another `GitService` mutation for this repository
+/// while the session is alive; the lock is not re-entrant.
 #[derive(Debug)]
 pub struct LockedRepository {
     root: PathBuf,
@@ -1247,40 +1309,72 @@ pub struct LockedRepository {
 }
 
 impl LockedRepository {
-    /// Lists worktrees while retaining the repository mutation capability.
-    pub fn worktrees(&self, cancellation: &Cancellation) -> Result<Vec<GitWorktree>, GitError> {
+    /// Lists worktrees while retaining the repository mutation capability for
+    /// a later catalog-coordinated lifecycle change.
+    pub fn worktrees_while_locked(
+        &self,
+        cancellation: &Cancellation,
+    ) -> Result<Vec<GitWorktree>, GitError> {
         worktree::list(&self.git_executable, &self.root, cancellation)
     }
 
-    /// Adds a linked worktree while retaining the repository lock.
-    pub fn add_worktree(
+    /// Adds a linked worktree and completes its catalog transaction while the
+    /// repository lock remains held.
+    ///
+    /// The destination must not exist. If Git fails, or `complete` returns an
+    /// error, the exact attempted checkout and its administrative record are
+    /// cleaned before this returns. Cleanup is verified rather than silently
+    /// discarding command or filesystem failures. The nested result keeps a
+    /// catalog error `E` distinct from a Git or cleanup failure.
+    pub fn add_worktree<T, E>(
         &self,
         destination: impl AsRef<Path>,
         base: &WorktreeBase,
         cancellation: &Cancellation,
-    ) -> Result<AddedWorktree, GitError> {
-        worktree::add(
+        complete: impl FnOnce(&AddedWorktree) -> Result<T, E>,
+    ) -> Result<Result<T, E>, GitError> {
+        let destination = destination.as_ref();
+        worktree::require_missing_destination(destination)?;
+        let added = match worktree::add(
             &self.git_executable,
             &self.root,
             &self.lock,
-            destination.as_ref(),
+            destination,
             base,
             cancellation,
-        )
+        ) {
+            Ok(added) => added,
+            Err(error) => {
+                if matches!(
+                    &error,
+                    GitError::Failed { .. } | GitError::Cancelled | GitError::TimedOut { .. }
+                ) {
+                    worktree::cleanup_failed_add(
+                        &self.git_executable,
+                        &self.root,
+                        &self.lock,
+                        destination,
+                    )?;
+                }
+                return Err(error);
+            }
+        };
+        let completed = complete(&added);
+        if completed.is_err() {
+            worktree::cleanup_failed_add(
+                &self.git_executable,
+                &self.root,
+                &self.lock,
+                destination,
+            )?;
+        }
+        Ok(completed)
     }
 
-    /// Performs the mandatory best-effort cleanup after a failed add.
-    pub fn cleanup_failed_worktree_add(&self, destination: impl AsRef<Path>) {
-        worktree::cleanup_failed_add(
-            &self.git_executable,
-            &self.root,
-            &self.lock,
-            destination.as_ref(),
-        );
-    }
-
-    /// Moves a known unlocked worktree.
-    pub fn move_worktree(
+    /// Moves a registered, unlocked worktree. The embedding layer is
+    /// responsible for validating and updating its catalog row while this
+    /// session keeps concurrent Harkness mutations excluded.
+    pub fn move_registered_worktree(
         &self,
         source: impl AsRef<Path>,
         destination: impl AsRef<Path>,
@@ -1296,8 +1390,10 @@ impl LockedRepository {
         )
     }
 
-    /// Removes a known unlocked worktree through Git.
-    pub fn remove_worktree(
+    /// Removes a registered, unlocked worktree through Git. The embedding
+    /// layer is responsible for dropping its matching catalog row before the
+    /// session is released.
+    pub fn remove_registered_worktree(
         &self,
         destination: impl AsRef<Path>,
         force: bool,
@@ -1313,8 +1409,9 @@ impl LockedRepository {
         )
     }
 
-    /// Locks a worktree whose current state the caller already verified.
-    pub fn lock_worktree(
+    /// Locks a registered worktree whose current state the embedding layer
+    /// already verified.
+    pub fn lock_registered_worktree(
         &self,
         destination: impl AsRef<Path>,
         reason: &str,
@@ -1330,8 +1427,9 @@ impl LockedRepository {
         )
     }
 
-    /// Unlocks a worktree whose current state the caller already verified.
-    pub fn unlock_worktree(
+    /// Unlocks a registered worktree whose current state the embedding layer
+    /// already verified.
+    pub fn unlock_registered_worktree(
         &self,
         destination: impl AsRef<Path>,
         cancellation: &Cancellation,
@@ -1459,7 +1557,7 @@ fn inspection(path: &Path, source: git2::Error) -> GitError {
 mod tests {
     use std::{io, path::PathBuf, time::Duration};
 
-    use super::{Cancellation, FileChange, GitError, GitService, PendingOperation};
+    use super::{Cancellation, FileChange, GitError, GitService, PendingOperation, WorktreeBase};
     use crate::testing::{Fixture, initialize_repository};
 
     #[test]
@@ -1476,6 +1574,84 @@ mod tests {
 
         drop(session);
         service.lock(&Cancellation::default()).unwrap();
+    }
+
+    #[test]
+    fn worktree_transactions_never_reuse_or_clean_an_existing_destination() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("transaction-root");
+        initialize_repository(&root);
+        let destination = fixture.directory("existing-destination");
+        let sentinel = destination.join("keep.txt");
+        std::fs::write(&sentinel, "keep\n").unwrap();
+        let session = GitService::new(&root, &fixture.data_dir)
+            .with_git_executable(fixture.root.path().join("must-not-run"))
+            .lock(&Cancellation::default())
+            .unwrap();
+
+        let error = session
+            .add_worktree(
+                &destination,
+                &WorktreeBase::Detached {
+                    commit: "HEAD".to_owned(),
+                },
+                &Cancellation::default(),
+                |_| Ok::<(), ()>(()),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            GitError::WorktreeAddDestinationExists { path } if path == destination
+        ));
+        assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "keep\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_transactions_surface_cleanup_that_cannot_be_verified() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("unverifiable-cleanup-root");
+        initialize_repository(&root);
+        let destination = fixture.root.path().join("partial-worktree");
+        let shim = fixture.shim(
+            "unverifiable-cleanup-git",
+            "#!/bin/sh\n\
+             previous=\n\
+             operation=other\n\
+             destination=\n\
+             for argument in \"$@\"; do\n\
+               destination=$argument\n\
+               if [ \"$previous\" = worktree ]; then operation=$argument; fi\n\
+               previous=$argument\n\
+             done\n\
+             if [ \"$operation\" = add ]; then mkdir -p \"$destination\"; exit 42; fi\n\
+             if [ \"$operation\" = remove ]; then exit 43; fi\n\
+             if [ \"$operation\" = list ]; then exit 44; fi\n\
+             exit 45\n",
+        );
+        let session = GitService::new(&root, &fixture.data_dir)
+            .with_git_executable(shim)
+            .lock(&Cancellation::default())
+            .unwrap();
+
+        let error = session
+            .add_worktree(
+                &destination,
+                &WorktreeBase::NewBranch {
+                    name: "cleanup-failure".to_owned(),
+                    start_point: None,
+                },
+                &Cancellation::default(),
+                |_| Ok::<(), ()>(()),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            GitError::WorktreeAddCleanup { path, .. } if path == destination
+        ));
+        assert!(!destination.exists());
     }
 
     #[test]
@@ -1607,6 +1783,24 @@ mod tests {
                     worktree: path.clone(),
                 },
                 "branch_checked_out_in_worktree",
+            ),
+            (
+                GitError::WorktreeAddDestinationExists { path: path.clone() },
+                "worktree_add_destination_exists",
+            ),
+            (
+                GitError::WorktreeAddDestinationUnavailable {
+                    path: path.clone(),
+                    source: io_error(),
+                },
+                "worktree_add_destination_unavailable",
+            ),
+            (
+                GitError::WorktreeAddCleanup {
+                    path: path.clone(),
+                    detail: "fixture".to_owned(),
+                },
+                "worktree_add_cleanup",
             ),
             (
                 GitError::WorktreeLocked {

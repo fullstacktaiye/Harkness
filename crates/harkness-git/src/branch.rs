@@ -46,7 +46,7 @@ pub struct Branch {
     /// Whether this is a local branch or a remote-tracking ref.
     pub kind: BranchKind,
     /// The commit at the tip as a typed object ID. Front-end boundaries can
-    /// render it without making core callers parse it back from a string.
+    /// render it without making later callers parse it back from a string.
     pub tip: Oid,
     /// The configured upstream and locally known divergence from it.
     ///
@@ -427,7 +427,7 @@ pub(crate) fn rename(
     Ok(())
 }
 
-pub(super) fn require_local_branch<'repo>(
+pub(crate) fn require_local_branch<'repo>(
     repository: &'repo Repository,
     name: &str,
 ) -> Result<git2::Branch<'repo>, GitError> {
@@ -443,7 +443,7 @@ pub(super) fn require_local_branch<'repo>(
     }
 }
 
-pub(super) fn require_missing_branch(repository: &Repository, name: &str) -> Result<(), GitError> {
+pub(crate) fn require_missing_branch(repository: &Repository, name: &str) -> Result<(), GitError> {
     match repository.find_branch(name, BranchType::Local) {
         Ok(_) => Err(GitError::BranchAlreadyExists {
             branch: name.to_owned(),
@@ -485,7 +485,7 @@ fn require_upstream_branch(repository: &Repository, name: &str) -> Result<(), Gi
     }
 }
 
-pub(super) fn head_names(repository: &Repository, full_name: &str) -> Result<bool, GitError> {
+pub(crate) fn head_names(repository: &Repository, full_name: &str) -> Result<bool, GitError> {
     match repository.head() {
         // Repository::head resolves symbolic HEAD to the branch reference, so
         // its own full name is the checked-out branch name.
@@ -538,7 +538,7 @@ fn local_default_branch(
     recorded_default_branch(repository, root, &remote)
 }
 
-pub(super) fn other_worktree(
+pub(crate) fn other_worktree(
     repository: &Repository,
     root: &Path,
     full_name: &str,
@@ -662,7 +662,7 @@ fn has_unmerged_commits(
         .map_err(|source| inspection(root, source))
 }
 
-pub(super) fn open(root: &Path) -> Result<Repository, GitError> {
+pub(crate) fn open(root: &Path) -> Result<Repository, GitError> {
     match Repository::open(root) {
         Ok(repository) if repository.workdir().is_some() => Ok(repository),
         Ok(_) => Err(GitError::NotARepository {

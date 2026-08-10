@@ -469,6 +469,7 @@ dependencies = [
  "dirs",
  "git2",
  "harkness-git",
+ "harkness-test-fixtures",
  "serde",
  "serde_json",
  "tempfile",
@@ -482,6 +483,7 @@ name = "harkness-git"
 version = "0.1.0"
 dependencies = [
  "git2",
+ "harkness-test-fixtures",
  "libc",
  "libgit2-sys",
  "serde",
@@ -504,6 +506,15 @@ dependencies = [
  "harkness-git",
  "tempfile",
  "time",
+]
+
+[[package]]
+name = "harkness-test-fixtures"
+version = "0.1.0"
+dependencies = [
+ "git2",
+ "libc",
+ "tempfile",
 ]
 
 [[package]]

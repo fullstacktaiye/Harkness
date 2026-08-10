@@ -1022,62 +1022,51 @@ impl ProjectService {
         let repository = self
             .git_service(&preliminary_parent.root)
             .lock(cancellation)?;
-        let added = match repository.add_worktree(&destination, base, cancellation) {
-            Ok(added) => added,
-            Err(error) => {
-                repository.cleanup_failed_worktree_add(&destination);
-                return Err(error.into());
-            }
-        };
+        repository
+            .add_worktree(&destination, base, cancellation, |added| {
+                let canonical_root = validate_local_directory(&destination)?;
+                // Canonicalization and the status walk both touch the checkout
+                // and therefore finish before the global catalog lock is taken.
+                let git = inspect_git(&canonical_root)?;
+                let _catalog_lock = self.lock_exclusive()?;
+                let mut candidate = self.read_catalog()?;
+                let parent = candidate
+                    .projects
+                    .iter()
+                    .find(|project| project.id == parent_id)
+                    .ok_or(ProjectError::ProjectNotFound(parent_id))?;
+                validate_worktree_parent(parent)?;
+                if parent.root != preliminary_parent.root {
+                    return Err(ProjectError::ProjectUnavailable {
+                        id: parent_id,
+                        path: preliminary_parent.root.clone(),
+                    });
+                }
 
-        let created = (|| {
-            let canonical_root = validate_local_directory(&destination)?;
-            // Canonicalization and the status walk both touch the checkout and
-            // therefore finish before the global catalog lock is taken.
-            let git = inspect_git(&canonical_root)?;
-            let _catalog_lock = self.lock_exclusive()?;
-            let mut candidate = self.read_catalog()?;
-            let parent = candidate
-                .projects
-                .iter()
-                .find(|project| project.id == parent_id)
-                .ok_or(ProjectError::ProjectNotFound(parent_id))?;
-            validate_worktree_parent(parent)?;
-            if parent.root != preliminary_parent.root {
-                return Err(ProjectError::ProjectUnavailable {
-                    id: parent_id,
-                    path: preliminary_parent.root.clone(),
+                let worktree_branch = added.branch().map(str::to_owned);
+                let display_name = worktree_branch.clone().unwrap_or_else(|| {
+                    let oid = added.commit_id();
+                    format!("Detached at {}", &oid[..12])
                 });
-            }
-
-            let worktree_branch = added.branch().map(str::to_owned);
-            let display_name = worktree_branch.clone().unwrap_or_else(|| {
-                let oid = added.commit_id();
-                format!("Detached at {}", &oid[..12])
-            });
-            let project = Project {
-                id,
-                display_name,
-                root: canonical_root,
-                source: ProjectSource::Worktree {
-                    parent: parent_id,
-                    worktree_branch,
-                },
-                last_opened: OffsetDateTime::now_utc(),
-                available: true,
-                git,
-            };
-            candidate.projects.push(project.clone());
-            sort_recents(&mut candidate.projects);
-            self.persist(&candidate)?;
-            self.catalog = candidate;
-            Ok(project)
-        })();
-
-        if created.is_err() {
-            repository.cleanup_failed_worktree_add(&destination);
-        }
-        created
+                let project = Project {
+                    id,
+                    display_name,
+                    root: canonical_root,
+                    source: ProjectSource::Worktree {
+                        parent: parent_id,
+                        worktree_branch,
+                    },
+                    last_opened: OffsetDateTime::now_utc(),
+                    available: true,
+                    git,
+                };
+                candidate.projects.push(project.clone());
+                sort_recents(&mut candidate.projects);
+                self.persist(&candidate)?;
+                self.catalog = candidate;
+                Ok(project)
+            })
+            .map_err(ProjectError::from)?
     }
 
     /// Relocates a Harkness-managed worktree through Git and records its
@@ -1125,7 +1114,7 @@ impl ProjectService {
         let repository = self
             .git_service(&preliminary_parent.root)
             .lock(cancellation)?;
-        let listed = repository.worktrees(cancellation)?;
+        let listed = repository.worktrees_while_locked(cancellation)?;
         match registered_worktree(&listed, &id.to_string()) {
             Some(registered) if registered.matches_path(&preliminary.root) => {}
             Some(registered) => {
@@ -1172,7 +1161,11 @@ impl ProjectService {
             }
         }
 
-        repository.move_worktree(&preliminary.root, &canonical_destination, cancellation)?;
+        repository.move_registered_worktree(
+            &preliminary.root,
+            &canonical_destination,
+            cancellation,
+        )?;
 
         // Every failure after Git succeeds is terminally distinct: callers can
         // tell that retrying the move is wrong and reconciliation is required.
@@ -1181,7 +1174,7 @@ impl ProjectService {
         // row it cannot identify instead of guessing or deleting files.
         let post_move = (|| -> Result<(Catalog, Project), String> {
             let listed = repository
-                .worktrees(cancellation)
+                .worktrees_while_locked(cancellation)
                 .map_err(|error| error.to_string())?;
             let registered = registered_worktree(&listed, &id.to_string()).ok_or_else(|| {
                 "Git has no matching administrative record after the move".to_owned()
@@ -1359,7 +1352,7 @@ impl ProjectService {
             )?;
         }
 
-        let listed = repository.worktrees(cancellation)?;
+        let listed = repository.worktrees_while_locked(cancellation)?;
 
         // Matching the catalogued path alone would let a stranger that has
         // taken over that path inherit this operation. Prove the checkout is
@@ -1411,9 +1404,9 @@ impl ProjectService {
                     // Git cannot replace a reason in place. Unlocking here
                     // still holds the repository lock, so the unprotected
                     // window is closed to every other Harkness operation.
-                    repository.unlock_worktree(&preliminary.root, cancellation)?;
+                    repository.unlock_registered_worktree(&preliminary.root, cancellation)?;
                 }
-                repository.lock_worktree(&preliminary.root, reason, cancellation)?;
+                repository.lock_registered_worktree(&preliminary.root, reason, cancellation)?;
             }
             WorktreeLockChange::Unlock => {
                 if !row.is_locked() {
@@ -1422,7 +1415,7 @@ impl ProjectService {
                     }
                     .into());
                 }
-                repository.unlock_worktree(&preliminary.root, cancellation)?;
+                repository.unlock_registered_worktree(&preliminary.root, cancellation)?;
             }
         }
         Ok(())
@@ -1480,7 +1473,7 @@ impl ProjectService {
         };
         let checkout_state = recorded_worktree_state(&preliminary, unsafe_worktree_removal)?;
         let listed = if let Some(repository) = &repository {
-            let listed = repository.worktrees(cancellation)?;
+            let listed = repository.worktrees_while_locked(cancellation)?;
             match registered_worktree(&listed, &preliminary.id.to_string()) {
                 Some(registered) if registered.matches_path(&preliminary.root) => {}
                 Some(registered) => {
@@ -1548,7 +1541,7 @@ impl ProjectService {
                     .any(|worktree| worktree.matches_path(&preliminary.root))
             });
             if has_administrative_row || preliminary.root.exists() {
-                repository.remove_worktree(
+                repository.remove_registered_worktree(
                     &preliminary.root,
                     force || checkout_state == WorktreeCheckoutState::Missing,
                     cancellation,
@@ -1655,7 +1648,7 @@ impl ProjectService {
         let mut repairs = Vec::new();
         let mut terminal_error = None;
         if let Some(repository) = &repository {
-            let live = repository.worktrees(cancellation)?;
+            let live = repository.worktrees_while_locked(cancellation)?;
             for (project, state) in &worktree_states {
                 let registered = registered_worktree(&live, &project.id.to_string());
                 if *state == WorktreeCheckoutState::Available {
@@ -1722,7 +1715,7 @@ impl ProjectService {
             }
 
             for project in git_removals {
-                match repository.remove_worktree(&project.root, true, cancellation) {
+                match repository.remove_registered_worktree(&project.root, true, cancellation) {
                     Ok(()) => removable.push((project.id, project.root.clone())),
                     Err(GitError::Cancelled) => {
                         terminal_error = Some(ProjectError::Git(GitError::Cancelled));
@@ -1951,8 +1944,7 @@ impl ProjectService {
 
     /// Addresses one repository with this service's Git executable.
     fn git_service(&self, root: &Path) -> GitService {
-        GitService::new(root, self.data_dir.join(LOCKS_DIRECTORY))
-            .with_git_executable(&self.git_executable)
+        GitService::new(root, &self.data_dir).with_git_executable(&self.git_executable)
     }
 
     fn persist(&self, catalog: &Catalog) -> Result<(), ProjectError> {
@@ -2795,14 +2787,13 @@ mod tests {
             REPOSITORIES_DIRECTORY, WORKTREES_DIRECTORY,
         },
         testing::{
-            Fixture, PROCESS_BRANCH_ENV, PROCESS_GIT_EXECUTABLE_ENV, PROCESS_PROJECT_ID_ENV,
-            PROCESS_PROJECT_ROOT_ENV, PROCESS_READY_FILE_ENV, SCRUBBED_ENVIRONMENT, commit_all,
-            git, initialize_repository, spawn_child, wait_for_child_signal,
+            Fixture, PROCESS_BRANCH_ENV, PROCESS_PROJECT_ID_ENV, PROCESS_PROJECT_ROOT_ENV,
+            PROCESS_READY_FILE_ENV, commit_all, git, initialize_repository, spawn_child,
+            wait_for_child_signal,
         },
     };
     use harkness_git::{
-        Cancellation, CloneCancellation, CommitOptions, GitError, GitWorktree, InspectionSource,
-        WorktreeBase,
+        Cancellation, CloneCancellation, CommitOptions, GitError, InspectionSource, WorktreeBase,
     };
 
     /// Coarse enough for the ~15ms system clock granularity on Windows.
@@ -3347,6 +3338,16 @@ mod tests {
         assert!(matches!(
             failed,
             ProjectError::CloneFailed { stderr } if stderr == "fixture process failure"
+        ));
+
+        let other = super::clone_failure(GitError::NotARepository {
+            path: PathBuf::from("not-a-repository"),
+        });
+        assert_eq!(other.kind(), "clone_failed");
+        assert!(matches!(
+            other,
+            ProjectError::CloneFailed { stderr }
+                if stderr.contains("not-a-repository") && stderr.contains("not a Git repository")
         ));
     }
 
@@ -4300,7 +4301,7 @@ mod tests {
             error,
             ProjectError::Git(GitError::BranchCheckedOutInWorktree { branch, worktree })
                 if branch == "held-elsewhere"
-                    && GitWorktree::paths_match(&worktree, &external)
+                    && fs::canonicalize(&worktree).unwrap() == as_catalogued(&external)
         ));
 
         let managed = create_branch_worktree(&mut service, parent.id, "agent/not-a-parent");
@@ -4342,7 +4343,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(worktrees.len(), 1);
-        assert!(GitWorktree::paths_match(&worktrees[0].root, &external));
+        assert_eq!(
+            fs::canonicalize(&worktrees[0].root).unwrap(),
+            as_catalogued(&external)
+        );
         assert_eq!(worktrees[0].branch.as_deref(), Some("external-branch"));
         assert!(worktrees[0].project.is_none());
         assert_eq!(service.list_catalog_only().unwrap().len(), 1);
@@ -4617,7 +4621,7 @@ mod tests {
             .unwrap();
         let foreign = listed
             .iter()
-            .find(|row| GitWorktree::paths_match(&row.root, &outside))
+            .find(|row| fs::canonicalize(&row.root).unwrap() == as_catalogued(&outside))
             .expect("the foreign worktree is listed");
         assert!(foreign.locked);
         assert_eq!(
@@ -4868,7 +4872,7 @@ mod tests {
                 &Cancellation::default(),
             ),
             Err(ProjectError::WorktreeDestinationInsideDataDirectory { path, .. })
-                if GitWorktree::paths_match(&path, &data_destination)
+                if path == data_destination
         ));
 
         let missing_parent = fixture
@@ -4998,8 +5002,7 @@ mod tests {
                 worktree: source,
                 destination: refused,
                 ..
-            }) if GitWorktree::paths_match(&source, &worktree.root)
-                && GitWorktree::paths_match(&refused, &destination)
+            }) if source == worktree.root && refused == destination
         ));
         assert!(worktree.root.exists());
         assert!(!destination.exists());
@@ -5815,7 +5818,7 @@ mod tests {
                 .unwrap()
                 .lines()
                 .collect::<Vec<_>>(),
-            ["add", "remove", "remove"]
+            ["add", "remove", "remove", "list"]
         );
         let catalog = service.list_catalog_only().unwrap();
         assert_eq!(catalog.len(), 1);
@@ -6928,45 +6931,6 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert!(listed[0].git.is_some(), "the listing reported Git state");
         assert!(!sentinel.exists(), "the listing spawned the Git executable");
-    }
-
-    /// Set through `Command::env` on a re-executed child rather than
-    /// `std::env::set_var`, which is unsound in a multithreaded test binary
-    /// under Rust 2024.
-    #[cfg(unix)]
-    #[test]
-    fn a_redirected_parent_environment_does_not_reach_git() {
-        let fixture = Fixture::new();
-        let working_directory = fixture.directory("scrubbed");
-        let elsewhere = fixture.directory("elsewhere");
-        let scrubbed = SCRUBBED_ENVIRONMENT.join(" ");
-        let reporting_git = fixture.shim(
-            "reporting-git",
-            &format!(
-                "#!/bin/sh\n\
-                 for name in {scrubbed}; do\n\
-                 \x20 eval \"value=\\${{$name-unset}}\"\n\
-                 \x20 test \"$value\" = unset || exit 41\n\
-                 done\n\
-                 test \"$GIT_TERMINAL_PROMPT\" = 0 || exit 42\n\
-                 test \"$GIT_OPTIONAL_LOCKS\" = 0 || exit 43\n\
-                 test \"$LC_ALL\" = C || exit 44\n\
-                 test \"$GIT_EDITOR\" = harkness-has-no-editor || exit 45\n"
-            ),
-        );
-
-        let mut child = spawn_child(&fixture.data_dir, "scrubbed-environment");
-        child
-            .env(PROCESS_PROJECT_ROOT_ENV, &working_directory)
-            .env(PROCESS_GIT_EXECUTABLE_ENV, &reporting_git);
-        // Every scrubbed name is exported with a value that would visibly
-        // change what Git did, so the child asserting `unset` asserts something.
-        for name in SCRUBBED_ENVIRONMENT {
-            child.env(name, elsewhere.join(name.to_ascii_lowercase()));
-        }
-        let mut child = child.spawn().unwrap();
-
-        assert!(child.wait().unwrap().success());
     }
 
     /// The repository lock is taken before the catalog lock, so a removal

@@ -32,7 +32,7 @@ struct Token {
 ///
 /// The ordinary hunk bytes are never touched. Every bound is preflighted
 /// before metadata is applied, so a degraded hunk contains no partial answer.
-pub(super) fn annotate(hunk: &mut Hunk) {
+pub(crate) fn annotate(hunk: &mut Hunk) {
     hunk.intra_line_degradation = None;
     for line in &mut hunk.lines {
         line.paired_line_index = None;

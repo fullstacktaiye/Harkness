@@ -137,7 +137,7 @@ ColumnLayout {
     }
 
     // This lexer is deliberately presentation-only. Pairing and byte ranges
-    // arrive from core; this function only colors familiar source tokens.
+    // arrive from the Git service; this function only colors familiar source tokens.
     function syntaxHtml(value, path) {
         const text = String(value);
         const extension = String(path).toLowerCase().split(".").pop();
