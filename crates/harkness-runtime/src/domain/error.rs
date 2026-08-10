@@ -2,7 +2,7 @@ use std::fmt;
 
 use thiserror::Error;
 
-use super::{RunState, ToolCallState};
+use super::{ExecutionState, ToolCallState};
 
 /// A requested lifecycle edge that is absent from its transition table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15,30 +15,59 @@ pub struct InvalidTransition<S> {
 
 impl<S> fmt::Display for InvalidTransition<S>
 where
-    S: fmt::Debug,
+    S: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "state {:?} cannot become {:?}",
-            self.from, self.to
-        )
+        write!(formatter, "state {} cannot become {}", self.from, self.to)
     }
 }
 
-impl<S> std::error::Error for InvalidTransition<S> where S: fmt::Debug {}
+impl<S> std::error::Error for InvalidTransition<S> where S: fmt::Debug + fmt::Display {}
 
-/// Invalid state changes or persisted record combinations in the run domain.
+/// Invalid state changes or persisted record combinations in the runtime domain.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[non_exhaustive]
 pub enum RunDomainError {
-    /// A run or step requested an edge absent from [`super::RUN_TRANSITIONS`].
+    /// A run or step requested an edge absent from [`super::EXECUTION_TRANSITIONS`].
     #[error(transparent)]
-    InvalidRunTransition(#[from] InvalidTransition<RunState>),
+    InvalidExecutionTransition(#[from] InvalidTransition<ExecutionState>),
 
     /// A tool call requested an edge absent from [`super::TOOL_CALL_TRANSITIONS`].
     #[error(transparent)]
     InvalidToolCallTransition(#[from] InvalidTransition<ToolCallState>),
+
+    /// A lifecycle revision has no representable successor.
+    #[error("{record} revision is exhausted")]
+    RevisionExhausted {
+        /// Kind of record being transitioned.
+        record: &'static str,
+    },
+
+    /// A persisted record predates the oldest schema this build supports.
+    #[error(
+        "{record} schema version {found} is older than the minimum supported version {minimum}"
+    )]
+    SchemaVersionTooOld {
+        /// Kind of record being decoded.
+        record: &'static str,
+        /// Version found in the record.
+        found: u32,
+        /// Oldest version understood by this build.
+        minimum: u32,
+    },
+
+    /// A persisted record requires a newer build of Harkness.
+    #[error(
+        "{record} schema version {found} is newer than the maximum supported version {maximum}; upgrade Harkness to read it"
+    )]
+    SchemaVersionTooNew {
+        /// Kind of record being decoded.
+        record: &'static str,
+        /// Version found in the record.
+        found: u32,
+        /// Newest version understood by this build.
+        maximum: u32,
+    },
 
     /// A wire timestamp is not a valid UTC lifecycle timestamp.
     #[error("{record}.{field} is invalid: {reason}")]
@@ -64,8 +93,11 @@ pub enum RunDomainError {
 impl RunDomainError {
     /// Every stable discriminant this error namespace can emit.
     pub const KINDS: &'static [&'static str] = &[
-        "invalid_run_transition",
+        "invalid_execution_transition",
         "invalid_tool_call_transition",
+        "revision_exhausted",
+        "schema_version_too_old",
+        "schema_version_too_new",
         "invalid_timestamp",
         "invalid_lifecycle",
     ];
@@ -74,8 +106,11 @@ impl RunDomainError {
     #[must_use]
     pub const fn kind(&self) -> &'static str {
         match self {
-            Self::InvalidRunTransition(_) => "invalid_run_transition",
+            Self::InvalidExecutionTransition(_) => "invalid_execution_transition",
             Self::InvalidToolCallTransition(_) => "invalid_tool_call_transition",
+            Self::RevisionExhausted { .. } => "revision_exhausted",
+            Self::SchemaVersionTooOld { .. } => "schema_version_too_old",
+            Self::SchemaVersionTooNew { .. } => "schema_version_too_new",
             Self::InvalidTimestamp { .. } => "invalid_timestamp",
             Self::InvalidLifecycle { .. } => "invalid_lifecycle",
         }
@@ -85,17 +120,29 @@ impl RunDomainError {
 #[cfg(test)]
 mod tests {
     use super::{InvalidTransition, RunDomainError};
-    use crate::domain::{RunState, ToolCallState};
+    use crate::domain::{ExecutionState, ToolCallState};
+
+    #[test]
+    fn transition_errors_use_stable_state_spellings() {
+        let error = InvalidTransition {
+            from: ExecutionState::WaitingForApproval,
+            to: ExecutionState::Succeeded,
+        };
+        assert_eq!(
+            error.to_string(),
+            "state waiting_for_approval cannot become succeeded"
+        );
+    }
 
     #[test]
     fn domain_error_kinds_round_trip_through_the_kinds_table() {
         let cases = [
             (
-                RunDomainError::InvalidRunTransition(InvalidTransition {
-                    from: RunState::Queued,
-                    to: RunState::Succeeded,
+                RunDomainError::InvalidExecutionTransition(InvalidTransition {
+                    from: ExecutionState::Queued,
+                    to: ExecutionState::Succeeded,
                 }),
-                "invalid_run_transition",
+                "invalid_execution_transition",
             ),
             (
                 RunDomainError::InvalidToolCallTransition(InvalidTransition {
@@ -103,6 +150,26 @@ mod tests {
                     to: ToolCallState::Running,
                 }),
                 "invalid_tool_call_transition",
+            ),
+            (
+                RunDomainError::RevisionExhausted { record: "run" },
+                "revision_exhausted",
+            ),
+            (
+                RunDomainError::SchemaVersionTooOld {
+                    record: "task",
+                    found: 0,
+                    minimum: 1,
+                },
+                "schema_version_too_old",
+            ),
+            (
+                RunDomainError::SchemaVersionTooNew {
+                    record: "task",
+                    found: 2,
+                    maximum: 1,
+                },
+                "schema_version_too_new",
             ),
             (
                 RunDomainError::InvalidTimestamp {

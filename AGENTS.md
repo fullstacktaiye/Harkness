@@ -45,6 +45,18 @@ older build cannot preserve requires a catalog version bump and a frozen JSON
 fixture. Same-version unknown fields are rejected instead of being silently
 dropped on the next write.
 
+New durable JSON formats use explicit schema versions and RFC 3339 UTC
+timestamps. The project catalog's human-readable `time` encoding is a legacy
+exception that remains frozen until a future catalog v3 migration; do not copy
+it into new formats. JSON-backed path fields currently require UTF-8, so
+persisting a runtime task with a non-UTF-8 workspace path is a known Unix
+limitation and must surface as a serialization error rather than lossy data.
+
+Each durable runtime record probes `schema_version` before parsing its strict
+body. Adding a field or persisted state spelling requires a version bump and an
+updated frozen fixture; current-version unknown fields remain errors. Keep the
+owned deserialization type and borrowing serialization type byte-compatible.
+
 Every worktree must name an existing parent; self-parenting, dangling parents,
 and parent cycles are invalid. Parent removal and worktree insertion both need
 the exclusive catalog lock. Worktree creation acquires the repository lock

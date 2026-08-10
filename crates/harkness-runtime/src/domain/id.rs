@@ -19,6 +19,7 @@ macro_rules! define_id {
         }
 
         impl Default for $name {
+            /// Generates a fresh random identifier; there is no empty ID value.
             fn default() -> Self {
                 Self::new()
             }
@@ -33,6 +34,8 @@ macro_rules! define_id {
         impl std::str::FromStr for $name {
             type Err = uuid::Error;
 
+            /// Accepts every UUID spelling supported by [`Uuid::parse_str`].
+            /// Display and serialization always return canonical hyphenated form.
             fn from_str(value: &str) -> Result<Self, Self::Err> {
                 Uuid::parse_str(value).map(Self)
             }
@@ -42,18 +45,26 @@ macro_rules! define_id {
 
 define_id!(
     /// A stable identifier for one user task.
+    ///
+    /// [`Default`] generates a fresh random identity rather than an empty value.
     TaskId
 );
 define_id!(
     /// A stable identifier for one attempt to execute a task.
+    ///
+    /// [`Default`] generates a fresh random identity rather than an empty value.
     RunId
 );
 define_id!(
     /// A stable identifier for one ordered step in a run.
+    ///
+    /// [`Default`] generates a fresh random identity rather than an empty value.
     StepId
 );
 define_id!(
     /// A stable identifier for one requested tool invocation.
+    ///
+    /// [`Default`] generates a fresh random identity rather than an empty value.
     ToolCallId
 );
 
@@ -90,5 +101,21 @@ mod tests {
         assert_id_contract::<RunId>();
         assert_id_contract::<StepId>();
         assert_id_contract::<ToolCallId>();
+    }
+
+    #[test]
+    fn default_generates_a_fresh_random_identity() {
+        assert_ne!(RunId::default(), RunId::default());
+    }
+
+    #[test]
+    fn accepted_uuid_spellings_canonicalize_on_display() {
+        for spelling in [
+            "123e4567e89b42d3a456426614174000",
+            "{123e4567-e89b-42d3-a456-426614174000}",
+            "urn:uuid:123e4567-e89b-42d3-a456-426614174000",
+        ] {
+            assert_eq!(RunId::from_str(spelling).unwrap().to_string(), FIXTURE_ID);
+        }
     }
 }
