@@ -3710,7 +3710,8 @@ fn git_exit_code(error: &GitError) -> u8 {
         | GitError::FilteredHunkSelection { .. }
         | GitError::OverlappingHunkSelection { .. }
         | GitError::HunkNotFound { .. }
-        | GitError::LineNotFound { .. } => EXIT_REFUSED,
+        | GitError::LineNotFound { .. }
+        | GitError::UnrepresentableLineSelection { .. } => EXIT_REFUSED,
         // Enumerated rather than left to the wildcard so the classification of
         // every kind in `GitError::KINDS` is stated here, and a reader adding a
         // variant sees that the published exit-code contract needs a decision.
@@ -3813,6 +3814,7 @@ const GIT_KIND_EXIT_CODES: &[(&str, u8)] = &[
     ("overlapping_hunk_selection", EXIT_REFUSED),
     ("hunk_not_found", EXIT_REFUSED),
     ("line_not_found", EXIT_REFUSED),
+    ("unrepresentable_line_selection", EXIT_REFUSED),
     ("hunk_application", EXIT_OPERATION_FAILED),
     ("malformed_status", EXIT_OPERATION_FAILED),
 ];
@@ -4030,6 +4032,7 @@ fn git_error_details(error: &GitError) -> Value {
         | GitError::StaleHunkSelection { path }
         | GitError::BinaryHunkSelection { path }
         | GitError::OverlappingHunkSelection { path }
+        | GitError::UnrepresentableLineSelection { path }
         | GitError::RepositoryBusy { path }
         | GitError::NotARepository { path }
         | GitError::DiffContent { path, .. } => {

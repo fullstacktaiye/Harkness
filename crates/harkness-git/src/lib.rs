@@ -530,6 +530,17 @@ pub enum GitError {
         new_line_number: Option<u32>,
     },
 
+    /// The selected lines cannot stand alone as a patch.
+    ///
+    /// Retaining an unselected change puts a line that ends the file without a
+    /// final newline ahead of a line that must follow it. No patch can express
+    /// that, so the selection is refused rather than applied approximately.
+    #[error(
+        "the selected lines for '{}' cannot be applied on their own: a line with no final newline would not be last; select the rest of the change too",
+        path.display()
+    )]
+    UnrepresentableLineSelection { path: PathBuf },
+
     /// Libgit2 could not parse or atomically apply a rebuilt hunk patch.
     ///
     /// The batch is atomic, so the failure names every path it covered rather
@@ -608,6 +619,7 @@ impl GitError {
         "overlapping_hunk_selection",
         "hunk_not_found",
         "line_not_found",
+        "unrepresentable_line_selection",
         "hunk_application",
         "malformed_status",
     ];
@@ -677,6 +689,7 @@ impl GitError {
             Self::OverlappingHunkSelection { .. } => "overlapping_hunk_selection",
             Self::HunkNotFound { .. } => "hunk_not_found",
             Self::LineNotFound { .. } => "line_not_found",
+            Self::UnrepresentableLineSelection { .. } => "unrepresentable_line_selection",
             Self::HunkApplication { .. } => "hunk_application",
             Self::MalformedStatus { .. } => "malformed_status",
         }
@@ -2084,6 +2097,10 @@ mod tests {
                     new_line_number: None,
                 },
                 "line_not_found",
+            ),
+            (
+                GitError::UnrepresentableLineSelection { path: path.clone() },
+                "unrepresentable_line_selection",
             ),
             (
                 GitError::HunkApplication {

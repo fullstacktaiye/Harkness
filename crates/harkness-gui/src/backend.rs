@@ -181,11 +181,18 @@ pub mod ffi {
         fn unstage_hunk(self: Pin<&mut HarknessBackend>, project_id: &QString, hunk_id: &QString);
 
         /// Stages newline-delimited backend-owned changed-line row identities.
+        ///
+        /// A newline is safe as the separator because the identities are minted
+        /// here, never parsed from user content: `review_line_id` builds each
+        /// one from a generated hunk ID and a line number, so none can contain
+        /// one. Unknown or empty entries are refused rather than skipped.
         #[qinvokable]
         #[cxx_name = "stageLines"]
         fn stage_lines(self: Pin<&mut HarknessBackend>, project_id: &QString, line_ids: &QString);
 
         /// Unstages newline-delimited backend-owned changed-line row identities.
+        ///
+        /// The separator holds for the same reason as [`Self::stage_lines`].
         #[qinvokable]
         #[cxx_name = "unstageLines"]
         fn unstage_lines(self: Pin<&mut HarknessBackend>, project_id: &QString, line_ids: &QString);
@@ -2396,6 +2403,14 @@ fn to_review(row: &ReviewStateRow, loaded_path_id: &str) -> QVariant {
                 )),
             );
             value.insert(QString::from("binary"), QVariant::from(&loaded.file.binary));
+            // The whole loaded file sits on one side of the index, so the verb
+            // for a line selection is a property of the file rather than of any
+            // row. Deriving it from the rows would lose it as soon as the
+            // selected line paged out of the row window.
+            value.insert(
+                QString::from("lineAction"),
+                QVariant::from(&QString::from(review_hunk_action(&loaded.file.target))),
+            );
             value.insert(
                 QString::from("hunkCount"),
                 QVariant::from(&i32::try_from(loaded.file.hunks.len()).unwrap_or(i32::MAX)),
@@ -2464,6 +2479,11 @@ fn review_line_selections(row: &ReviewStateRow) -> HashMap<String, ReviewLineSel
                         continue;
                     }
                     let row_index = hunk_row.saturating_add(1).saturating_add(line_index);
+                    // Unlike hunk records, every line of the file is registered
+                    // so a selection survives paging. A line above the current
+                    // window has no offset within it, and clamping to zero is
+                    // the right answer for the one thing the offset drives:
+                    // scrolling the acted-on row back into view afterwards.
                     selections.insert(
                         id,
                         ReviewLineSelectionRecord {
@@ -3137,8 +3157,8 @@ fn mutate_hunk_with_git(
     };
     match result {
         Ok(outcome) => Ok(HunkMutationOutcome::Applied(outcome.hunks)),
-        Err(harkness_git::GitError::StaleHunkSelection { .. }) => Ok(HunkMutationOutcome::Stale),
-        Err(error) => Err(GitFailure::from(error)),
+        Err(error) if is_stale_selection(&error) => Ok(HunkMutationOutcome::Stale),
+        Err(error) => Err(selection_failure(error)),
     }
 }
 
@@ -3154,8 +3174,41 @@ fn mutate_lines_with_git(
     };
     match result {
         Ok(outcome) => Ok(HunkMutationOutcome::Applied(outcome.lines)),
-        Err(harkness_git::GitError::StaleHunkSelection { .. }) => Ok(HunkMutationOutcome::Stale),
-        Err(error) => Err(GitFailure::from(error)),
+        Err(error) if is_stale_selection(&error) => Ok(HunkMutationOutcome::Stale),
+        Err(error) => Err(selection_failure(error)),
+    }
+}
+
+/// Whether a refusal means the diff moved under the selection rather than that
+/// the caller asked for something wrong.
+///
+/// All three say the same thing to someone looking at the review surface: the
+/// coordinates were revalidated against a freshly computed diff and no longer
+/// name what they were taken from. Reporting a missing hunk or line as a
+/// failure would put Git-internal coordinates in front of a user whose view had
+/// merely gone out of date, so they join the blob-identity check in triggering
+/// the same silent refresh.
+fn is_stale_selection(error: &harkness_git::GitError) -> bool {
+    matches!(
+        error,
+        harkness_git::GitError::StaleHunkSelection { .. }
+            | harkness_git::GitError::HunkNotFound { .. }
+            | harkness_git::GitError::LineNotFound { .. }
+    )
+}
+
+/// Turns an apply failure into something a reviewer can act on.
+///
+/// Libgit2 reports these as a line number inside the patch this module
+/// synthesized, which corresponds to nothing the user can see. The apply is
+/// all-or-nothing, so the one fact worth stating is that nothing changed.
+fn selection_failure(error: harkness_git::GitError) -> GitFailure {
+    if !matches!(error, harkness_git::GitError::HunkApplication { .. }) {
+        return GitFailure::from(error);
+    }
+    GitFailure {
+        kind: error.kind().to_owned(),
+        message: "Could not apply the selection; the index was left unchanged. Refresh the review and try again".to_owned(),
     }
 }
 

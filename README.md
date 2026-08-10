@@ -219,7 +219,16 @@ harkness --json git diff --unstaged --project <selector> \
 The flat form uses the same file and hunk identity fields plus
 `old_line_number` and `new_line_number`; exactly one line-number side is
 present for an addition or deletion. Several lines from one fresh hunk are
-merged and applied as one recounted patch hunk.
+merged and applied as one recounted patch hunk, and lines from several hunks of
+one file are applied together with each later hunk shifted by what the earlier
+ones actually contributed rather than by what the whole diff would have.
+
+An unselected deletion is retained where the line that replaced it stood, so a
+partial stage never reorders a file: staging only `two -> TWO` out of
+`one/two/last -> one/TWO/LAST` leaves `one/TWO/last`. Where that retained line
+is the last in a file with no final newline and a selected line would have to
+follow it, no patch can express the result and the batch is refused with
+`unrepresentable_line_selection`; select the rest of the change as well.
 
 `git stage` consumes unstaged records and `git unstage` consumes staged ones, so
 narrow the diff before piping it; a record carrying the other side's `target` is

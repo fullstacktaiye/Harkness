@@ -69,6 +69,14 @@ ColumnLayout {
     property var selectedReviewLineIds: []
     property string reviewLineSelectionAnchor: ""
     readonly property int selectedReviewLineCount: selectedReviewLineIds.length
+    // Every changed-line delegate tests membership on every rebind, so the
+    // selection is kept as a lookup as well as an ordered list.
+    readonly property var selectedReviewLineIndex: {
+        const index = {};
+        for (let position = 0; position < selectedReviewLineIds.length; ++position)
+            index[selectedReviewLineIds[position]] = true;
+        return index;
+    }
     readonly property string reviewLineSelectionScope: String(project.id)
         + "|" + String(reviewState.title || "")
         + "|" + String(reviewState.detail || "")
@@ -134,8 +142,8 @@ ColumnLayout {
     }
 
     function isReviewLineSelected(lineId) {
-        return String(lineId || "").length > 0
-            && selectedReviewLineIds.indexOf(String(lineId)) !== -1;
+        const id = String(lineId || "");
+        return id.length > 0 && selectedReviewLineIndex[id] === true;
     }
 
     function reviewLineIds(row) {
@@ -157,6 +165,9 @@ ColumnLayout {
         return ids;
     }
 
+    // Range order is always the unified one: it lists every changed line of the
+    // window exactly once and in file order, which is what a split row's two
+    // sides collapse back to.
     function orderedReviewLineIds() {
         const ids = [];
         for (let index = 0; index < reviewRows.length; ++index) {
@@ -170,16 +181,44 @@ ColumnLayout {
         return ids;
     }
 
+    function setReviewLinesSelected(ids, select) {
+        if (repositoryOperationRunning())
+            return false;
+        let selected = selectedReviewLineIds.slice();
+        let changed = false;
+        let anchor = "";
+        for (let index = 0; index < ids.length; ++index) {
+            const id = String(ids[index] || "");
+            if (id.length === 0)
+                continue;
+            if (anchor.length === 0)
+                anchor = id;
+            const existing = selected.indexOf(id);
+            if (select && existing === -1) {
+                selected.push(id);
+                changed = true;
+            } else if (!select && existing !== -1) {
+                selected.splice(existing, 1);
+                changed = true;
+            }
+        }
+        if (!changed)
+            return false;
+        selectedReviewLineIds = selected;
+        reviewLineSelectionAnchor = anchor;
+        return true;
+    }
+
     function toggleReviewLine(lineId, extendRange) {
         const id = String(lineId || "");
         if (id.length === 0 || repositoryOperationRunning())
             return false;
-        let selected = selectedReviewLineIds.slice();
         if (extendRange === true && reviewLineSelectionAnchor.length > 0) {
             const ordered = orderedReviewLineIds();
             const anchorIndex = ordered.indexOf(reviewLineSelectionAnchor);
             const selectedIndex = ordered.indexOf(id);
             if (anchorIndex >= 0 && selectedIndex >= 0) {
+                let selected = selectedReviewLineIds.slice();
                 const first = Math.min(anchorIndex, selectedIndex);
                 const last = Math.max(anchorIndex, selectedIndex);
                 for (let index = first; index <= last; ++index) {
@@ -190,14 +229,7 @@ ColumnLayout {
                 return true;
             }
         }
-        const existing = selected.indexOf(id);
-        if (existing === -1)
-            selected.push(id);
-        else
-            selected.splice(existing, 1);
-        selectedReviewLineIds = selected;
-        reviewLineSelectionAnchor = id;
-        return true;
+        return setReviewLinesSelected([id], !isReviewLineSelected(id));
     }
 
     function toggleCurrentReviewLine(extendRange) {
@@ -205,10 +237,21 @@ ColumnLayout {
                 || reviewLineView.currentIndex >= reviewRows.length)
             return false;
         const ids = reviewLineIds(reviewRows[reviewLineView.currentIndex]);
-        let toggled = false;
-        for (let index = 0; index < ids.length; ++index)
-            toggled = toggleReviewLine(ids[index], extendRange) || toggled;
-        return toggled;
+        if (ids.length === 0)
+            return false;
+        if (extendRange === true && reviewLineSelectionAnchor.length > 0) {
+            let extended = false;
+            for (let index = 0; index < ids.length; ++index)
+                extended = toggleReviewLine(ids[index], true) || extended;
+            return extended;
+        }
+        // A split row carries both sides of a replacement. Toggling each side in
+        // turn would invert the pair whenever only one of them was selected, so
+        // the row acts as a single control: it selects unless already whole.
+        let whole = true;
+        for (let index = 0; index < ids.length && whole; ++index)
+            whole = isReviewLineSelected(ids[index]);
+        return setReviewLinesSelected(ids, !whole);
     }
 
     function clearReviewLineSelection() {
@@ -216,16 +259,28 @@ ColumnLayout {
         reviewLineSelectionAnchor = "";
     }
 
+    // The verb belongs to the loaded file, not to any row: a selection outlives
+    // the row window, and scanning the visible rows for it used to hide the
+    // action button as soon as the selected line paged out of view.
     function selectedReviewLineAction() {
+        return String(reviewFile.lineAction || "");
+    }
+
+    function selectedReviewLineAnchorRow() {
         for (let index = 0; index < reviewRows.length; ++index) {
             const row = reviewRows[index];
             const ids = reviewLineIds(row);
             for (let idIndex = 0; idIndex < ids.length; ++idIndex) {
-                if (isReviewLineSelected(ids[idIndex]))
-                    return String(row.lineAction || "");
+                if (isReviewLineSelected(ids[idIndex])) {
+                    // The hunk header carries the coordinates the refresh
+                    // anchors on, but a hunk taller than one row page can leave
+                    // it outside the window. The selected row is then the
+                    // closest anchor there is, and it is visible by definition.
+                    return reviewHunkRow(row.hunkId) || row;
+                }
             }
         }
-        return "";
+        return null;
     }
 
     function markerColor(kind) {
@@ -396,6 +451,14 @@ ColumnLayout {
         return count;
     }
 
+    // Moves the keyboard cursor, which is what the Space binding acts on.
+    function setCurrentReviewRow(index) {
+        if (index < 0 || index >= reviewRows.length)
+            return false;
+        reviewLineView.currentIndex = index;
+        return true;
+    }
+
     function loadReviewRowPage(direction, continueHunkNavigation) {
         if (continueHunkNavigation !== true)
             pendingHunkNavigation = 0;
@@ -500,20 +563,12 @@ ColumnLayout {
         if (selectedReviewLineIds.length === 0
                 || (action !== "stage" && action !== "unstage"))
             return;
-        let anchorRow = null;
-        for (let index = 0; index < reviewRows.length && !anchorRow; ++index) {
-            const row = reviewRows[index];
-            const ids = reviewLineIds(row);
-            for (let idIndex = 0; idIndex < ids.length; ++idIndex) {
-                if (isReviewLineSelected(ids[idIndex])) {
-                    anchorRow = reviewHunkRow(row.hunkId);
-                    break;
-                }
-            }
-        }
-        if (!anchorRow)
-            return;
-        holdReviewMutationPosition(anchorRow);
+        // A selection can outlive the rows that produced it, leaving nothing on
+        // screen to anchor on. Only the scroll restoration depends on that; the
+        // mutation itself must still happen.
+        const anchorRow = selectedReviewLineAnchorRow();
+        if (anchorRow)
+            holdReviewMutationPosition(anchorRow);
         const lineIds = selectedReviewLineIds.join("\n");
         clearReviewLineSelection();
         if (action === "stage")
@@ -1512,7 +1567,8 @@ ColumnLayout {
                     : qsTr("Unstage %1 selected line(s)").arg(
                         reviewSurface.selectedReviewLineCount
                     )
-                visible: lineAction === "stage" || lineAction === "unstage"
+                visible: reviewSurface.selectedReviewLineCount > 0
+                    && (lineAction === "stage" || lineAction === "unstage")
                 onClicked: reviewSurface.mutateSelectedLines()
             }
 
@@ -1842,11 +1898,13 @@ ColumnLayout {
                     Accessible.checked: reviewSurface.isReviewLineSelected(
                         reviewLineDelegate.unified.lineId
                     )
-                    Accessible.name: qsTr("Select changed line %1").arg(
-                        reviewLineDelegate.unified.oldLine > 0
-                            ? reviewLineDelegate.unified.oldLine
-                            : reviewLineDelegate.unified.newLine
-                    )
+                    Accessible.name: reviewLineDelegate.unified.kind === "deletion"
+                        ? qsTr("Select removed line %1").arg(
+                            reviewLineDelegate.unified.oldLine
+                        )
+                        : qsTr("Select added line %1").arg(
+                            reviewLineDelegate.unified.newLine
+                        )
                     Accessible.role: Accessible.CheckBox
                     cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
                     enabled: String(reviewLineDelegate.unified.lineId || "").length > 0
@@ -1942,9 +2000,13 @@ ColumnLayout {
                             Accessible.checked: reviewSurface.isReviewLineSelected(
                                 splitSide.lineId
                             )
-                            Accessible.name: qsTr("Select changed line %1").arg(
-                                splitSide.modelData.line || ""
-                            )
+                            Accessible.name: splitSide.modelData.kind === "deletion"
+                                ? qsTr("Select removed line %1").arg(
+                                    splitSide.modelData.line || ""
+                                )
+                                : qsTr("Select added line %1").arg(
+                                    splitSide.modelData.line || ""
+                                )
                             Accessible.role: Accessible.CheckBox
                             cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
                             enabled: splitSide.lineId.length > 0
