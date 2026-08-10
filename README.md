@@ -47,6 +47,18 @@ cargo fmt --check
 cargo clippy --workspace --all-targets
 ```
 
+### Live QML reloading
+
+`cargo run -p harkness-gui` from the working copy reads its QML from `crates/harkness-gui/qml`
+instead of from the resources compiled into the binary, and rebuilds the window whenever a file
+there is saved. The project that was open is reopened after the reload, and a file saved
+half-written leaves the running window up with the parse error on stderr. An installed build has
+no working copy beside it, so it is unaffected; `HARKNESS_QML_HOT_RELOAD=0` turns it off, and
+`HARKNESS_QML_SOURCE_DIR` points it at a different directory.
+
+Rust edits still need a rebuild. `sh scripts/dev-gui.sh` runs the GUI under a file watcher that
+restarts it when they change, leaving QML edits to reload in place.
+
 The CLI exposes the project catalog with a versioned machine-readable contract
 and stable exit codes suitable for agents. Commands that act on one project
 accept `--project <SELECTOR>` after the command name. A selector may be a full

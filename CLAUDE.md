@@ -138,6 +138,14 @@ files must be added to `build.rs`'s file list.
   `next_review_request`) and on the still-open project, so a stale reply is dropped rather than
   applied. Follow that pattern for new async work.
 - `tests/qml_smoke.rs` includes `src/main.rs` directly and loads `Main.qml` to catch QML errors.
+- **QML hot reload** (`cxx/qmlhotreload.h`, `src/hotreload.rs`) makes a working-copy build read
+  `qml/` from disk rather than from the compiled resource, and rebuild the window on save. It is an
+  URL interceptor rather than an extra import path because the module's `qmldir` maps every type to
+  a `qrc:` URL; only files under the module's `qml/` prefix are redirected, so the type registry
+  stays the one the build produced. It installs itself only when that directory exists beside the
+  binary, which an installed build's does not. Reload loads the replacement before dropping the old
+  root, so a QML parse error leaves the running window up instead of closing the last window and
+  ending the process. `Main.qml`'s `restoreProjectId` is the reload's one piece of carried state.
 
 ### Runtime domain
 

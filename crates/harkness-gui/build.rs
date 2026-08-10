@@ -26,6 +26,10 @@ fn main() {
     )
     .qt_module("Network")
     .include_dir("cxx")
-    .files(["src/backend.rs", "src/file_tree_model.rs"])
+    .files([
+        "src/backend.rs",
+        "src/file_tree_model.rs",
+        "src/hotreload.rs",
+    ])
     .build();
 }

@@ -31,6 +31,11 @@ Kirigami.ApplicationWindow {
         Component.onCompleted: refresh()
     }
 
+    /// Project to reopen as the window comes up. Only the development QML hot
+    /// reload sets it, so a reload returns to the project that was on screen
+    /// instead of dropping back to the launcher; it is empty in every other run.
+    property string restoreProjectId: ""
+
     // Navigation is driven entirely by `opened`: any operation that sets a
     // project pushes the shell, and clearing it (back, removal) returns to
     // the launcher.
@@ -155,7 +160,11 @@ Kirigami.ApplicationWindow {
         WindowResizeBorders {}
     }
 
-    Component.onCompleted: resizeBordersComponent.createObject(root.overlay)
+    Component.onCompleted: {
+        resizeBordersComponent.createObject(root.overlay);
+        if (root.restoreProjectId.length > 0)
+            appBackend.openProject(root.restoreProjectId);
+    }
 
     // The global toolbar's built-in Back button navigates PageRow history
     // directly, so it bypasses ProjectShellPage's explicit Back action. Keep

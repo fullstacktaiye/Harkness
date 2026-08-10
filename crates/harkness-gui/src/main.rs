@@ -1,7 +1,11 @@
 mod backend;
 mod file_tree_model;
+pub(crate) mod hotreload;
 
 use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QString, QUrl};
+
+/// Root of the statically compiled QML module.
+const MAIN_QML_URL: &str = "qrc:/qt/qml/io/github/fullstacktaiye/harkness/qml/Main.qml";
 
 fn main() {
     // Force-links the statically compiled QML module so its types register.
@@ -18,10 +22,12 @@ fn main() {
             .set_application_display_name(&QString::from("Harkness"));
     }
 
-    if let Some(engine) = engine.as_mut() {
-        engine.load(&QUrl::from(
-            "qrc:/qt/qml/io/github/fullstacktaiye/harkness/qml/Main.qml",
-        ));
+    if let Some(mut engine) = engine.as_mut() {
+        // Only applies to a binary still sitting beside the QML it was built
+        // from; it has to be installed before the first load, because the
+        // interceptor it adds is what redirects that load to disk.
+        hotreload::install(engine.as_mut(), MAIN_QML_URL);
+        engine.as_mut().load(&QUrl::from(MAIN_QML_URL));
     }
 
     if let Some(app) = app.as_mut() {
