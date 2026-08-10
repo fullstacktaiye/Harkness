@@ -188,19 +188,16 @@ Kirigami.ApplicationWindow {
         property string viewShortcut: "Ctrl+Shift+G"
         property int viewBadge: 0
         property bool viewAvailable: true
-        property var viewActions: []
     }
 
     property string currentViewId: "first"
     property bool secondAvailable: true
-    property string hidden: "no"
 
     SidePanel {
         id: sidePanel
 
         anchors.fill: parent
         currentViewId: window.currentViewId
-        onHideRequested: window.hidden = "yes"
 
         StubPanel {
             id: firstView
@@ -259,9 +256,6 @@ Kirigami.ApplicationWindow {
         firstView.viewAvailable = false;
         check("hidesTheBarWithoutAnyView", !activityBar.visible);
         check("reportsNoAvailableView", sidePanel.firstAvailableViewId() === "");
-
-        sidePanel.hideRequested();
-        check("forwardsHideRequests", window.hidden === "yes");
 
         window.objectName = failures.length === 0
             ? "SidePanelSmokePassed"

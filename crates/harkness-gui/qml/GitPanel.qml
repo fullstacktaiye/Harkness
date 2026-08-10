@@ -24,10 +24,15 @@ Item {
     property string lockingWorktreeId: ""
     property string lockingWorktreeName: ""
 
-    implicitWidth: Kirigami.Units.gridUnit * 22
+    implicitWidth: Kirigami.Units.gridUnit * 56
     readonly property string repositoryLockScope: String(
         project.lockScope || project.parentId || project.id
     )
+
+    /// Emitted when the user dismisses this view from its header. The whole
+    /// surface goes, review side included: source control and the diff it
+    /// drives are one view, not a panel with a detached companion.
+    signal hideRequested()
 
     // Side-panel view contract; see SidePanel.qml.
     readonly property string viewId: "git"
@@ -36,7 +41,6 @@ Item {
     readonly property string viewShortcut: "Ctrl+Shift+G"
     readonly property int viewBadge: entries.length
     readonly property bool viewAvailable: project.available && project.isGit
-    property var viewActions: [refreshAction]
 
     Kirigami.Action {
         id: refreshAction
@@ -46,11 +50,6 @@ Item {
         text: qsTr("Refresh Git status")
         tooltip: qsTr("Refresh Git status")
         onTriggered: panel.backend.refreshGit(panel.project.id)
-    }
-
-    Rectangle {
-        anchors.fill: parent
-        color: Kirigami.Theme.alternateBackgroundColor
     }
 
     function job(kind, targetProjectId) {
@@ -231,693 +230,776 @@ Item {
     onProjectChanged: handleProjectChange()
     Component.onCompleted: handleProjectChange()
 
-    Controls.ScrollView {
-        id: scroll
-
+    // The view is the source-control column plus the review surface it drives.
+    // They are split here rather than in the shell so that collapsing the view
+    // takes both away together.
+    Controls.SplitView {
         anchors.fill: parent
-        clip: true
-        contentWidth: availableWidth
+        orientation: Qt.Horizontal
 
-        ColumnLayout {
-            spacing: 0
-            width: scroll.availableWidth
+        handle: Rectangle {
+            readonly property bool active: Controls.SplitHandle.hovered
+                || Controls.SplitHandle.pressed
 
-            ColumnLayout {
-                Layout.fillWidth: true
-                Layout.bottomMargin: Kirigami.Units.largeSpacing
-                Layout.leftMargin: Kirigami.Units.largeSpacing
-                Layout.rightMargin: Kirigami.Units.largeSpacing
-                Layout.topMargin: Kirigami.Units.largeSpacing
-                spacing: Kirigami.Units.smallSpacing
-
-                Controls.Label {
-                    Layout.fillWidth: true
-                    elide: Text.ElideRight
-                    font.bold: true
-                    text: panel.stateReady ? panel.gitState.head : qsTr("Loading repository status…")
-                    textFormat: Text.PlainText
-                }
-
-                Controls.Label {
-                    Layout.fillWidth: true
-                    color: Kirigami.Theme.disabledTextColor
-                    text: {
-                        if (!panel.stateReady || !panel.gitState.upstream)
-                            return qsTr("No upstream configured");
-                        return qsTr("%1 · %2 ahead · %3 behind")
-                            .arg(panel.gitState.upstream)
-                            .arg(panel.gitState.ahead)
-                            .arg(panel.gitState.behind);
-                    }
-                    textFormat: Text.PlainText
-                }
-
-                Kirigami.InlineMessage {
-                    Layout.fillWidth: true
-                    text: panel.escapedRichText(
-                        qsTr("A %1 is waiting to be resolved or aborted.")
-                            .arg(panel.gitState.pending || "")
-                    )
-                    type: Kirigami.MessageType.Warning
-                    visible: panel.stateReady && panel.gitState.pending && panel.gitState.pending.length > 0
-                }
-
-                Kirigami.InlineMessage {
-                    Layout.fillWidth: true
-                    text: panel.escapedRichText(panel.gitState.error || "")
-                    type: Kirigami.MessageType.Error
-                    visible: panel.stateReady && panel.gitState.error && panel.gitState.error.length > 0
-                }
-
-                Controls.Button {
-                    Layout.alignment: Qt.AlignRight
-                    enabled: !panel.repositoryOperationRunning()
-                    icon.name: "dialog-warning"
-                    text: qsTr("Push to default branch anyway…")
-                    visible: panel.stateReady
-                        && ["default_branch_push", "default_branch_unknown"].indexOf(panel.gitState.errorKind) !== -1
-                    onClicked: pushOverrideDialog.open()
-                }
-            }
+            color: active ? Kirigami.Theme.highlightColor : "transparent"
+            implicitWidth: Kirigami.Units.smallSpacing
 
             Kirigami.Separator {
-                Layout.fillWidth: true
+                anchors.horizontalCenter: parent.horizontalCenter
+                height: parent.height
+                visible: !parent.active
+            }
+        }
+
+        Item {
+            objectName: "sourceControlColumn"
+
+            Controls.SplitView.fillWidth: false
+            Controls.SplitView.maximumWidth: Kirigami.Units.gridUnit * 40
+            Controls.SplitView.minimumWidth: Kirigami.Units.gridUnit * 18
+            Controls.SplitView.preferredWidth: Kirigami.Units.gridUnit * 23
+
+            Rectangle {
+                anchors.fill: parent
+                color: Kirigami.Theme.alternateBackgroundColor
             }
 
             ColumnLayout {
-                Layout.fillWidth: true
-                Layout.bottomMargin: Kirigami.Units.largeSpacing
-                Layout.leftMargin: Kirigami.Units.largeSpacing
-                Layout.rightMargin: Kirigami.Units.largeSpacing
-                Layout.topMargin: Kirigami.Units.largeSpacing
-                spacing: Kirigami.Units.smallSpacing
+                anchors.fill: parent
+                spacing: 0
 
-                RowLayout {
+                PanelHeader {
                     Layout.fillWidth: true
-
-                    Kirigami.Heading {
-                        Layout.fillWidth: true
-                        level: 4
-                        text: qsTr("Changes")
-                    }
-
-                    Controls.Label {
-                        color: Kirigami.Theme.disabledTextColor
-                        text: panel.entries.length
-                    }
+                    actions: [refreshAction]
+                    title: panel.viewTitle
+                    onHideRequested: panel.hideRequested()
                 }
 
-                Controls.Label {
+                Kirigami.Separator {
                     Layout.fillWidth: true
-                    color: Kirigami.Theme.positiveTextColor
-                    text: qsTr("Working tree clean")
-                    visible: panel.stateReady && panel.entries.length === 0
                 }
 
-                Repeater {
-                    model: panel.entries
+                Controls.ScrollView {
+                    id: scroll
 
-                    delegate: Controls.Frame {
-                        required property var modelData
-
-                        Layout.fillWidth: true
-                        padding: Kirigami.Units.smallSpacing
-
-                        contentItem: ColumnLayout {
-                            spacing: Kirigami.Units.smallSpacing
-
-                            RowLayout {
-                                Layout.fillWidth: true
-
-                                Controls.Label {
-                                    Layout.fillWidth: true
-                                    elide: Text.ElideMiddle
-                                    font.family: "monospace"
-                                    text: modelData.path
-                                    textFormat: Text.PlainText
-                                }
-
-                                Controls.ToolButton {
-                                    Controls.ToolTip.text: qsTr("View staged and unstaged diff")
-                                    Controls.ToolTip.visible: hovered
-                                    display: Controls.AbstractButton.TextOnly
-                                    enabled: !panel.repositoryMutationRunning()
-                                        && !panel.reviewReadRunning()
-                                    text: qsTr("View diff")
-                                    onClicked: panel.selectPath(
-                                        modelData.pathId,
-                                        modelData.staged,
-                                        modelData.unstaged
-                                    )
-                                }
-                            }
-
-                            RowLayout {
-                                Layout.fillWidth: true
-
-                                Controls.Label {
-                                    Layout.fillWidth: true
-                                    color: modelData.conflicted
-                                        ? Kirigami.Theme.negativeTextColor
-                                        : Kirigami.Theme.disabledTextColor
-                                    font: Kirigami.Theme.smallFont
-                                    text: {
-                                        const states = [];
-                                        if (modelData.staged)
-                                            states.push(qsTr("staged: %1").arg(modelData.staged));
-                                        if (modelData.unstaged)
-                                            states.push(qsTr("working tree: %1").arg(modelData.unstaged));
-                                        if (modelData.conflicted)
-                                            states.push(qsTr("conflict"));
-                                        return states.join(" · ");
-                                    }
-                                    textFormat: Text.PlainText
-                                }
-
-                                Controls.Button {
-                                    enabled: !panel.repositoryOperationRunning()
-                                    text: qsTr("Unstage")
-                                    visible: modelData.staged.length > 0
-                                    onClicked: panel.backend.unstagePath(panel.project.id, modelData.pathId)
-                                }
-
-                                Controls.Button {
-                                    enabled: !panel.repositoryOperationRunning()
-                                    text: qsTr("Stage")
-                                    visible: modelData.unstaged.length > 0
-                                    onClicked: panel.backend.stagePath(panel.project.id, modelData.pathId)
-                                }
-                            }
-                        }
-                    }
-                }
-
-            }
-
-            Kirigami.Separator {
-                Layout.fillWidth: true
-            }
-
-            ColumnLayout {
-                Layout.fillWidth: true
-                Layout.bottomMargin: Kirigami.Units.largeSpacing
-                Layout.leftMargin: Kirigami.Units.largeSpacing
-                Layout.rightMargin: Kirigami.Units.largeSpacing
-                Layout.topMargin: Kirigami.Units.largeSpacing
-                spacing: Kirigami.Units.smallSpacing
-
-                Kirigami.Heading {
-                    level: 4
-                    text: qsTr("Commit")
-                }
-
-                Controls.TextField {
-                    id: commitMessage
-
+                    Layout.fillHeight: true
                     Layout.fillWidth: true
-                    enabled: panel.job("commit") === null
-                        && panel.job("push") === null
-                        && !panel.repositoryOperationRunning()
-                    placeholderText: qsTr("Commit message")
-                }
+                    clip: true
+                    contentWidth: availableWidth
 
-                RowLayout {
-                    Layout.fillWidth: true
+                    ColumnLayout {
+                        spacing: 0
+                        width: scroll.availableWidth
 
-                    Controls.Button {
-                        Layout.fillWidth: true
-                        enabled: panel.job("commit") === null
-                            && panel.job("push") === null
-                            && !panel.repositoryOperationRunning()
-                            && commitMessage.text.trim().length > 0
-                        text: qsTr("Amend")
-                        onClicked: panel.backend.commit(panel.project.id, commitMessage.text, true)
-                    }
-
-                    Controls.Button {
-                        Layout.fillWidth: true
-                        enabled: panel.job("commit") === null
-                            && panel.job("push") === null
-                            && !panel.repositoryOperationRunning()
-                            && commitMessage.text.trim().length > 0
-                        highlighted: true
-                        text: qsTr("Commit")
-                        onClicked: panel.backend.commit(panel.project.id, commitMessage.text, false)
-                    }
-                }
-            }
-
-            Kirigami.Separator {
-                Layout.fillWidth: true
-            }
-
-            ColumnLayout {
-                Layout.fillWidth: true
-                Layout.bottomMargin: Kirigami.Units.largeSpacing
-                Layout.leftMargin: Kirigami.Units.largeSpacing
-                Layout.rightMargin: Kirigami.Units.largeSpacing
-                Layout.topMargin: Kirigami.Units.largeSpacing
-                spacing: Kirigami.Units.smallSpacing
-
-                Kirigami.Heading {
-                    level: 4
-                    text: qsTr("Remote")
-                }
-
-                Controls.Button {
-                    Layout.fillWidth: true
-                    enabled: !panel.repositoryOperationRunning()
-                    icon.name: {
-                        switch (panel.syncAction()) {
-                        case "pull": return "go-down";
-                        case "push": return "go-up";
-                        default: return "download";
-                        }
-                    }
-                    text: {
-                        switch (panel.syncAction()) {
-                        case "pull": return qsTr("Pull (%1)").arg(panel.gitState.behind || 0);
-                        case "push": return qsTr("Push (%1)").arg(panel.gitState.ahead || 0);
-                        default: return qsTr("Fetch");
-                        }
-                    }
-                    onClicked: {
-                        switch (panel.syncAction()) {
-                        case "pull":
-                            panel.backend.pull(panel.project.id);
-                            break;
-                        case "push":
-                            panel.backend.push(panel.project.id, false);
-                            break;
-                        default:
-                            panel.backend.fetch(panel.project.id);
-                            break;
-                        }
-                    }
-                }
-
-                Repeater {
-                    model: panel.networkJobs()
-
-                    delegate: RowLayout {
-                        required property var modelData
-
-                        Layout.fillWidth: true
-
-                        Controls.BusyIndicator {
-                            Layout.preferredHeight: Kirigami.Units.iconSizes.small
-                            Layout.preferredWidth: Kirigami.Units.iconSizes.small
-                            running: true
-                        }
-
-                        Controls.Label {
+                        ColumnLayout {
                             Layout.fillWidth: true
-                            elide: Text.ElideRight
-                            text: qsTr("%1: %2").arg(modelData.label).arg(modelData.progress)
-                            textFormat: Text.PlainText
-                        }
-
-                        Controls.Button {
-                            enabled: modelData.cancellable
-                            text: qsTr("Cancel")
-                            onClicked: panel.backend.cancelJob(modelData.id)
-                        }
-                    }
-                }
-            }
-
-            Kirigami.Separator {
-                Layout.fillWidth: true
-            }
-
-            ColumnLayout {
-                Layout.fillWidth: true
-                Layout.bottomMargin: Kirigami.Units.largeSpacing
-                Layout.leftMargin: Kirigami.Units.largeSpacing
-                Layout.rightMargin: Kirigami.Units.largeSpacing
-                Layout.topMargin: Kirigami.Units.largeSpacing
-                spacing: Kirigami.Units.smallSpacing
-
-                Kirigami.Heading {
-                    level: 4
-                    text: qsTr("Branches")
-                }
-
-                Controls.ComboBox {
-                    id: branchPicker
-
-                    Layout.fillWidth: true
-                    enabled: panel.job("checkout") === null
-                        && panel.job("push") === null
-                        && !panel.repositoryOperationRunning()
-                    model: panel.backend.branches
-                    textRole: "name"
-                    valueRole: "name"
-
-                    currentIndex: panel.currentBranchIndex()
-
-                    delegate: Controls.ItemDelegate {
-                        required property var modelData
-
-                        Controls.ToolTip.text: panel.escapedRichText(modelData.detail)
-                        Controls.ToolTip.visible: hovered && modelData.detail.length > 0
-                        enabled: modelData.selectable
-                        text: modelData.name
-                        width: branchPicker.width
-                    }
-
-                    onActivated: {
-                        const selected = String(currentValue);
-                        if (selected.length > 0 && selected !== panel.project.branch)
-                            panel.backend.checkoutBranch(panel.project.id, selected);
-                    }
-                }
-
-                RowLayout {
-                    Layout.fillWidth: true
-
-                    Controls.TextField {
-                        id: newBranch
-
-                        Layout.fillWidth: true
-                        enabled: panel.job("create_branch") === null
-                            && panel.job("push") === null
-                            && !panel.repositoryOperationRunning()
-                        placeholderText: qsTr("New branch name")
-                    }
-
-                    Controls.TextField {
-                        id: branchStart
-
-                        Layout.fillWidth: true
-                        enabled: panel.job("create_branch") === null
-                            && panel.job("push") === null
-                            && !panel.repositoryOperationRunning()
-                        placeholderText: qsTr("Start point")
-                        text: "HEAD"
-                    }
-                }
-
-                Controls.Button {
-                    Layout.fillWidth: true
-                    enabled: panel.job("create_branch") === null
-                        && panel.job("push") === null
-                        && !panel.repositoryOperationRunning()
-                        && newBranch.text.trim().length > 0
-                    icon.name: "list-add"
-                    text: qsTr("Create and switch")
-                    onClicked: panel.backend.createBranch(
-                        panel.project.id,
-                        newBranch.text,
-                        branchStart.text
-                    )
-                }
-            }
-
-            Kirigami.Separator {
-                Layout.fillWidth: true
-            }
-
-            ColumnLayout {
-                Layout.fillWidth: true
-                Layout.bottomMargin: Kirigami.Units.largeSpacing
-                Layout.leftMargin: Kirigami.Units.largeSpacing
-                Layout.rightMargin: Kirigami.Units.largeSpacing
-                Layout.topMargin: Kirigami.Units.largeSpacing
-                spacing: Kirigami.Units.smallSpacing
-
-                Kirigami.Heading {
-                    level: 4
-                    text: qsTr("Worktrees")
-                }
-
-                Controls.Label {
-                    Layout.fillWidth: true
-                    color: Kirigami.Theme.disabledTextColor
-                    text: qsTr("This workspace comes from %1.").arg(panel.project.parentName)
-                    textFormat: Text.PlainText
-                    visible: panel.project.worktree
-                }
-
-                RowLayout {
-                    Layout.fillWidth: true
-                    visible: !panel.project.worktree
-
-                    Controls.Button {
-                        Layout.fillWidth: true
-                        enabled: !panel.repositoryOperationRunning()
-                        icon.name: "vcs-branch"
-                        text: qsTr("New Worktree…")
-                        onClicked: worktreeForm.visible = !worktreeForm.visible
-                    }
-
-                    Controls.Button {
-                        Layout.fillWidth: true
-                        enabled: !panel.repositoryOperationRunning()
-                        icon.name: "view-refresh"
-                        text: qsTr("Reconcile")
-                        onClicked: panel.backend.reconcileWorktrees(panel.project.id)
-                    }
-                }
-
-                ColumnLayout {
-                    id: worktreeForm
-
-                    Layout.fillWidth: true
-                    spacing: Kirigami.Units.smallSpacing
-                    visible: false
-
-                    Controls.ComboBox {
-                        id: worktreeMode
-
-                        readonly property string mode: ["new", "existing", "detached"][currentIndex]
-
-                        Layout.fillWidth: true
-                        model: [qsTr("New branch"), qsTr("Existing branch"), qsTr("Detached HEAD")]
-                    }
-
-                    Controls.TextField {
-                        id: worktreeBranch
-
-                        Layout.fillWidth: true
-                        placeholderText: worktreeMode.mode === "existing"
-                            ? qsTr("Existing branch")
-                            : qsTr("New branch name")
-                        visible: worktreeMode.mode !== "detached"
-                    }
-
-                    Controls.TextField {
-                        id: worktreeStart
-
-                        Layout.fillWidth: true
-                        placeholderText: worktreeMode.mode === "detached"
-                            ? qsTr("Commit or revision")
-                            : qsTr("Start point")
-                        text: worktreeMode.mode === "new" ? "HEAD" : ""
-                        visible: worktreeMode.mode !== "existing"
-                    }
-
-                    Controls.Button {
-                        Layout.fillWidth: true
-                        enabled: !panel.repositoryOperationRunning()
-                            && (worktreeMode.mode === "detached"
-                                ? worktreeStart.text.trim().length > 0
-                                : worktreeBranch.text.trim().length > 0)
-                        icon.name: "list-add"
-                        text: qsTr("Review and create…")
-                        onClicked: createWorktreeDialog.open()
-                    }
-                }
-
-                Repeater {
-                    model: panel.project.worktree ? [] : panel.backend.worktrees
-
-                    delegate: Controls.Frame {
-                        id: worktreeRow
-
-                        required property var modelData
-                        readonly property var row: modelData
-
-                        Layout.fillWidth: true
-                        padding: Kirigami.Units.smallSpacing
-
-                        contentItem: ColumnLayout {
+                            Layout.bottomMargin: Kirigami.Units.largeSpacing
+                            Layout.leftMargin: Kirigami.Units.largeSpacing
+                            Layout.rightMargin: Kirigami.Units.largeSpacing
+                            Layout.topMargin: Kirigami.Units.largeSpacing
                             spacing: Kirigami.Units.smallSpacing
 
-                            RowLayout {
-                                Layout.fillWidth: true
-
-                                Controls.Label {
-                                    Layout.fillWidth: true
-                                    color: Kirigami.Theme.disabledTextColor
-                                    elide: Text.ElideMiddle
-                                    font: Kirigami.Theme.smallFont
-                                    text: qsTr("%1 — %2 (%3)")
-                                        .arg(worktreeRow.row.branch.length > 0
-                                            ? worktreeRow.row.branch
-                                            : qsTr("detached HEAD"))
-                                        .arg(worktreeRow.row.root)
-                                        .arg(worktreeRow.row.owned ? qsTr("Harkness") : qsTr("external"))
-                                    textFormat: Text.PlainText
-                                }
-
-                                Kirigami.Icon {
-                                    Layout.preferredHeight: Kirigami.Units.iconSizes.small
-                                    Layout.preferredWidth: Kirigami.Units.iconSizes.small
-                                    source: "object-locked"
-                                    visible: worktreeRow.row.locked
-                                }
-                            }
-
-                            // A lock is lifecycle policy owned by the catalog. Show
-                            // Git's reason in the row so protection is visible
-                            // before a move or removal is attempted.
                             Controls.Label {
                                 Layout.fillWidth: true
-                                color: Kirigami.Theme.neutralTextColor
-                                text: worktreeRow.row.lockReason.length > 0
-                                    ? qsTr("Locked: %1").arg(worktreeRow.row.lockReason)
-                                    : qsTr("Locked without a recorded reason")
+                                elide: Text.ElideRight
+                                font.bold: true
+                                text: panel.stateReady ? panel.gitState.head : qsTr("Loading repository status…")
                                 textFormat: Text.PlainText
-                                visible: worktreeRow.row.locked
-                                wrapMode: Text.Wrap
                             }
+
+                            Controls.Label {
+                                Layout.fillWidth: true
+                                color: Kirigami.Theme.disabledTextColor
+                                text: {
+                                    if (!panel.stateReady || !panel.gitState.upstream)
+                                        return qsTr("No upstream configured");
+                                    return qsTr("%1 · %2 ahead · %3 behind")
+                                        .arg(panel.gitState.upstream)
+                                        .arg(panel.gitState.ahead)
+                                        .arg(panel.gitState.behind);
+                                }
+                                textFormat: Text.PlainText
+                            }
+
+                            Kirigami.InlineMessage {
+                                Layout.fillWidth: true
+                                text: panel.escapedRichText(
+                                    qsTr("A %1 is waiting to be resolved or aborted.")
+                                        .arg(panel.gitState.pending || "")
+                                )
+                                type: Kirigami.MessageType.Warning
+                                visible: panel.stateReady && panel.gitState.pending && panel.gitState.pending.length > 0
+                            }
+
+                            Kirigami.InlineMessage {
+                                Layout.fillWidth: true
+                                text: panel.escapedRichText(panel.gitState.error || "")
+                                type: Kirigami.MessageType.Error
+                                visible: panel.stateReady && panel.gitState.error && panel.gitState.error.length > 0
+                            }
+
+                            Controls.Button {
+                                Layout.alignment: Qt.AlignRight
+                                enabled: !panel.repositoryOperationRunning()
+                                icon.name: "dialog-warning"
+                                text: qsTr("Push to default branch anyway…")
+                                visible: panel.stateReady
+                                    && ["default_branch_push", "default_branch_unknown"].indexOf(panel.gitState.errorKind) !== -1
+                                onClicked: pushOverrideDialog.open()
+                            }
+                        }
+
+                        Kirigami.Separator {
+                            Layout.fillWidth: true
+                        }
+
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            Layout.bottomMargin: Kirigami.Units.largeSpacing
+                            Layout.leftMargin: Kirigami.Units.largeSpacing
+                            Layout.rightMargin: Kirigami.Units.largeSpacing
+                            Layout.topMargin: Kirigami.Units.largeSpacing
+                            spacing: Kirigami.Units.smallSpacing
 
                             RowLayout {
                                 Layout.fillWidth: true
-                                visible: worktreeRow.row.owned
 
-                                Controls.Button {
+                                Kirigami.Heading {
                                     Layout.fillWidth: true
-                                    enabled: !panel.repositoryOperationRunning()
-                                        && panel.job(
-                                        worktreeRow.row.locked
-                                            ? "unlock_worktree"
-                                            : "lock_worktree",
-                                        worktreeRow.row.id
-                                    ) === null
-                                    icon.name: worktreeRow.row.locked
-                                        ? "object-unlocked"
-                                        : "object-locked"
-                                    text: worktreeRow.row.locked ? qsTr("Unlock") : qsTr("Lock…")
-                                    onClicked: {
-                                        if (worktreeRow.row.locked) {
-                                            panel.backend.unlockWorktree(worktreeRow.row.id);
-                                        } else {
-                                            panel.lockingWorktreeId = String(worktreeRow.row.id);
-                                            panel.lockingWorktreeName = worktreeRow.row.branch.length > 0
-                                                ? String(worktreeRow.row.branch)
-                                                : qsTr("detached HEAD");
-                                            lockReason.text = "";
-                                            lockWorktreeForm.visible = true;
-                                            moveWorktreeForm.visible = false;
-                                            lockReason.forceActiveFocus();
+                                    level: 4
+                                    text: qsTr("Changes")
+                                }
+
+                                Controls.Label {
+                                    color: Kirigami.Theme.disabledTextColor
+                                    text: panel.entries.length
+                                }
+                            }
+
+                            Controls.Label {
+                                Layout.fillWidth: true
+                                color: Kirigami.Theme.positiveTextColor
+                                text: qsTr("Working tree clean")
+                                visible: panel.stateReady && panel.entries.length === 0
+                            }
+
+                            Repeater {
+                                model: panel.entries
+
+                                delegate: Controls.Frame {
+                                    required property var modelData
+
+                                    Layout.fillWidth: true
+                                    padding: Kirigami.Units.smallSpacing
+
+                                    contentItem: ColumnLayout {
+                                        spacing: Kirigami.Units.smallSpacing
+
+                                        RowLayout {
+                                            Layout.fillWidth: true
+
+                                            Controls.Label {
+                                                Layout.fillWidth: true
+                                                elide: Text.ElideMiddle
+                                                font.family: "monospace"
+                                                text: modelData.path
+                                                textFormat: Text.PlainText
+                                            }
+
+                                            Controls.ToolButton {
+                                                Controls.ToolTip.text: qsTr("View staged and unstaged diff")
+                                                Controls.ToolTip.visible: hovered
+                                                display: Controls.AbstractButton.TextOnly
+                                                enabled: !panel.repositoryMutationRunning()
+                                                    && !panel.reviewReadRunning()
+                                                text: qsTr("View diff")
+                                                onClicked: panel.selectPath(
+                                                    modelData.pathId,
+                                                    modelData.staged,
+                                                    modelData.unstaged
+                                                )
+                                            }
+                                        }
+
+                                        RowLayout {
+                                            Layout.fillWidth: true
+
+                                            Controls.Label {
+                                                Layout.fillWidth: true
+                                                color: modelData.conflicted
+                                                    ? Kirigami.Theme.negativeTextColor
+                                                    : Kirigami.Theme.disabledTextColor
+                                                font: Kirigami.Theme.smallFont
+                                                text: {
+                                                    const states = [];
+                                                    if (modelData.staged)
+                                                        states.push(qsTr("staged: %1").arg(modelData.staged));
+                                                    if (modelData.unstaged)
+                                                        states.push(qsTr("working tree: %1").arg(modelData.unstaged));
+                                                    if (modelData.conflicted)
+                                                        states.push(qsTr("conflict"));
+                                                    return states.join(" · ");
+                                                }
+                                                textFormat: Text.PlainText
+                                            }
+
+                                            Controls.Button {
+                                                enabled: !panel.repositoryOperationRunning()
+                                                text: qsTr("Unstage")
+                                                visible: modelData.staged.length > 0
+                                                onClicked: panel.backend.unstagePath(panel.project.id, modelData.pathId)
+                                            }
+
+                                            Controls.Button {
+                                                enabled: !panel.repositoryOperationRunning()
+                                                text: qsTr("Stage")
+                                                visible: modelData.unstaged.length > 0
+                                                onClicked: panel.backend.stagePath(panel.project.id, modelData.pathId)
+                                            }
                                         }
                                     }
                                 }
+                            }
+
+                        }
+
+                        Kirigami.Separator {
+                            Layout.fillWidth: true
+                        }
+
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            Layout.bottomMargin: Kirigami.Units.largeSpacing
+                            Layout.leftMargin: Kirigami.Units.largeSpacing
+                            Layout.rightMargin: Kirigami.Units.largeSpacing
+                            Layout.topMargin: Kirigami.Units.largeSpacing
+                            spacing: Kirigami.Units.smallSpacing
+
+                            Kirigami.Heading {
+                                level: 4
+                                text: qsTr("Commit")
+                            }
+
+                            Controls.TextField {
+                                id: commitMessage
+
+                                Layout.fillWidth: true
+                                enabled: panel.job("commit") === null
+                                    && panel.job("push") === null
+                                    && !panel.repositoryOperationRunning()
+                                placeholderText: qsTr("Commit message")
+                            }
+
+                            RowLayout {
+                                Layout.fillWidth: true
+
+                                Controls.Button {
+                                    Layout.fillWidth: true
+                                    enabled: panel.job("commit") === null
+                                        && panel.job("push") === null
+                                        && !panel.repositoryOperationRunning()
+                                        && commitMessage.text.trim().length > 0
+                                    text: qsTr("Amend")
+                                    onClicked: panel.backend.commit(panel.project.id, commitMessage.text, true)
+                                }
+
+                                Controls.Button {
+                                    Layout.fillWidth: true
+                                    enabled: panel.job("commit") === null
+                                        && panel.job("push") === null
+                                        && !panel.repositoryOperationRunning()
+                                        && commitMessage.text.trim().length > 0
+                                    highlighted: true
+                                    text: qsTr("Commit")
+                                    onClicked: panel.backend.commit(panel.project.id, commitMessage.text, false)
+                                }
+                            }
+                        }
+
+                        Kirigami.Separator {
+                            Layout.fillWidth: true
+                        }
+
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            Layout.bottomMargin: Kirigami.Units.largeSpacing
+                            Layout.leftMargin: Kirigami.Units.largeSpacing
+                            Layout.rightMargin: Kirigami.Units.largeSpacing
+                            Layout.topMargin: Kirigami.Units.largeSpacing
+                            spacing: Kirigami.Units.smallSpacing
+
+                            Kirigami.Heading {
+                                level: 4
+                                text: qsTr("Remote")
+                            }
+
+                            Controls.Button {
+                                Layout.fillWidth: true
+                                enabled: !panel.repositoryOperationRunning()
+                                icon.name: {
+                                    switch (panel.syncAction()) {
+                                    case "pull": return "go-down";
+                                    case "push": return "go-up";
+                                    default: return "download";
+                                    }
+                                }
+                                text: {
+                                    switch (panel.syncAction()) {
+                                    case "pull": return qsTr("Pull (%1)").arg(panel.gitState.behind || 0);
+                                    case "push": return qsTr("Push (%1)").arg(panel.gitState.ahead || 0);
+                                    default: return qsTr("Fetch");
+                                    }
+                                }
+                                onClicked: {
+                                    switch (panel.syncAction()) {
+                                    case "pull":
+                                        panel.backend.pull(panel.project.id);
+                                        break;
+                                    case "push":
+                                        panel.backend.push(panel.project.id, false);
+                                        break;
+                                    default:
+                                        panel.backend.fetch(panel.project.id);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            Repeater {
+                                model: panel.networkJobs()
+
+                                delegate: RowLayout {
+                                    required property var modelData
+
+                                    Layout.fillWidth: true
+
+                                    Controls.BusyIndicator {
+                                        Layout.preferredHeight: Kirigami.Units.iconSizes.small
+                                        Layout.preferredWidth: Kirigami.Units.iconSizes.small
+                                        running: true
+                                    }
+
+                                    Controls.Label {
+                                        Layout.fillWidth: true
+                                        elide: Text.ElideRight
+                                        text: qsTr("%1: %2").arg(modelData.label).arg(modelData.progress)
+                                        textFormat: Text.PlainText
+                                    }
+
+                                    Controls.Button {
+                                        enabled: modelData.cancellable
+                                        text: qsTr("Cancel")
+                                        onClicked: panel.backend.cancelJob(modelData.id)
+                                    }
+                                }
+                            }
+                        }
+
+                        Kirigami.Separator {
+                            Layout.fillWidth: true
+                        }
+
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            Layout.bottomMargin: Kirigami.Units.largeSpacing
+                            Layout.leftMargin: Kirigami.Units.largeSpacing
+                            Layout.rightMargin: Kirigami.Units.largeSpacing
+                            Layout.topMargin: Kirigami.Units.largeSpacing
+                            spacing: Kirigami.Units.smallSpacing
+
+                            Kirigami.Heading {
+                                level: 4
+                                text: qsTr("Branches")
+                            }
+
+                            Controls.ComboBox {
+                                id: branchPicker
+
+                                Layout.fillWidth: true
+                                enabled: panel.job("checkout") === null
+                                    && panel.job("push") === null
+                                    && !panel.repositoryOperationRunning()
+                                model: panel.backend.branches
+                                textRole: "name"
+                                valueRole: "name"
+
+                                currentIndex: panel.currentBranchIndex()
+
+                                delegate: Controls.ItemDelegate {
+                                    required property var modelData
+
+                                    Controls.ToolTip.text: panel.escapedRichText(modelData.detail)
+                                    Controls.ToolTip.visible: hovered && modelData.detail.length > 0
+                                    enabled: modelData.selectable
+                                    text: modelData.name
+                                    width: branchPicker.width
+                                }
+
+                                onActivated: {
+                                    const selected = String(currentValue);
+                                    if (selected.length > 0 && selected !== panel.project.branch)
+                                        panel.backend.checkoutBranch(panel.project.id, selected);
+                                }
+                            }
+
+                            RowLayout {
+                                Layout.fillWidth: true
+
+                                Controls.TextField {
+                                    id: newBranch
+
+                                    Layout.fillWidth: true
+                                    enabled: panel.job("create_branch") === null
+                                        && panel.job("push") === null
+                                        && !panel.repositoryOperationRunning()
+                                    placeholderText: qsTr("New branch name")
+                                }
+
+                                Controls.TextField {
+                                    id: branchStart
+
+                                    Layout.fillWidth: true
+                                    enabled: panel.job("create_branch") === null
+                                        && panel.job("push") === null
+                                        && !panel.repositoryOperationRunning()
+                                    placeholderText: qsTr("Start point")
+                                    text: "HEAD"
+                                }
+                            }
+
+                            Controls.Button {
+                                Layout.fillWidth: true
+                                enabled: panel.job("create_branch") === null
+                                    && panel.job("push") === null
+                                    && !panel.repositoryOperationRunning()
+                                    && newBranch.text.trim().length > 0
+                                icon.name: "list-add"
+                                text: qsTr("Create and switch")
+                                onClicked: panel.backend.createBranch(
+                                    panel.project.id,
+                                    newBranch.text,
+                                    branchStart.text
+                                )
+                            }
+                        }
+
+                        Kirigami.Separator {
+                            Layout.fillWidth: true
+                        }
+
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            Layout.bottomMargin: Kirigami.Units.largeSpacing
+                            Layout.leftMargin: Kirigami.Units.largeSpacing
+                            Layout.rightMargin: Kirigami.Units.largeSpacing
+                            Layout.topMargin: Kirigami.Units.largeSpacing
+                            spacing: Kirigami.Units.smallSpacing
+
+                            Kirigami.Heading {
+                                level: 4
+                                text: qsTr("Worktrees")
+                            }
+
+                            Controls.Label {
+                                Layout.fillWidth: true
+                                color: Kirigami.Theme.disabledTextColor
+                                text: qsTr("This workspace comes from %1.").arg(panel.project.parentName)
+                                textFormat: Text.PlainText
+                                visible: panel.project.worktree
+                            }
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                visible: !panel.project.worktree
 
                                 Controls.Button {
                                     Layout.fillWidth: true
                                     enabled: !panel.repositoryOperationRunning()
-                                        && !worktreeRow.row.locked
-                                        && panel.job("move_worktree", worktreeRow.row.id) === null
-                                    icon.name: "folder-move"
-                                    text: worktreeRow.row.locked
-                                        ? qsTr("Unlock before moving")
-                                        : qsTr("Move…")
-                                    onClicked: {
-                                        panel.movingWorktreeId = String(worktreeRow.row.id);
-                                        panel.movingWorktreeName = worktreeRow.row.branch.length > 0
-                                            ? String(worktreeRow.row.branch)
-                                            : qsTr("detached HEAD");
-                                        panel.movingWorktreeRoot = String(worktreeRow.row.root);
-                                        moveDestination.text = "";
-                                        moveWorktreeForm.visible = true;
-                                        lockWorktreeForm.visible = false;
-                                        moveDestination.forceActiveFocus();
+                                    icon.name: "vcs-branch"
+                                    text: qsTr("New Worktree…")
+                                    onClicked: worktreeForm.visible = !worktreeForm.visible
+                                }
+
+                                Controls.Button {
+                                    Layout.fillWidth: true
+                                    enabled: !panel.repositoryOperationRunning()
+                                    icon.name: "view-refresh"
+                                    text: qsTr("Reconcile")
+                                    onClicked: panel.backend.reconcileWorktrees(panel.project.id)
+                                }
+                            }
+
+                            ColumnLayout {
+                                id: worktreeForm
+
+                                Layout.fillWidth: true
+                                spacing: Kirigami.Units.smallSpacing
+                                visible: false
+
+                                Controls.ComboBox {
+                                    id: worktreeMode
+
+                                    readonly property string mode: ["new", "existing", "detached"][currentIndex]
+
+                                    Layout.fillWidth: true
+                                    model: [qsTr("New branch"), qsTr("Existing branch"), qsTr("Detached HEAD")]
+                                }
+
+                                Controls.TextField {
+                                    id: worktreeBranch
+
+                                    Layout.fillWidth: true
+                                    placeholderText: worktreeMode.mode === "existing"
+                                        ? qsTr("Existing branch")
+                                        : qsTr("New branch name")
+                                    visible: worktreeMode.mode !== "detached"
+                                }
+
+                                Controls.TextField {
+                                    id: worktreeStart
+
+                                    Layout.fillWidth: true
+                                    placeholderText: worktreeMode.mode === "detached"
+                                        ? qsTr("Commit or revision")
+                                        : qsTr("Start point")
+                                    text: worktreeMode.mode === "new" ? "HEAD" : ""
+                                    visible: worktreeMode.mode !== "existing"
+                                }
+
+                                Controls.Button {
+                                    Layout.fillWidth: true
+                                    enabled: !panel.repositoryOperationRunning()
+                                        && (worktreeMode.mode === "detached"
+                                            ? worktreeStart.text.trim().length > 0
+                                            : worktreeBranch.text.trim().length > 0)
+                                    icon.name: "list-add"
+                                    text: qsTr("Review and create…")
+                                    onClicked: createWorktreeDialog.open()
+                                }
+                            }
+
+                            Repeater {
+                                model: panel.project.worktree ? [] : panel.backend.worktrees
+
+                                delegate: Controls.Frame {
+                                    id: worktreeRow
+
+                                    required property var modelData
+                                    readonly property var row: modelData
+
+                                    Layout.fillWidth: true
+                                    padding: Kirigami.Units.smallSpacing
+
+                                    contentItem: ColumnLayout {
+                                        spacing: Kirigami.Units.smallSpacing
+
+                                        RowLayout {
+                                            Layout.fillWidth: true
+
+                                            Controls.Label {
+                                                Layout.fillWidth: true
+                                                color: Kirigami.Theme.disabledTextColor
+                                                elide: Text.ElideMiddle
+                                                font: Kirigami.Theme.smallFont
+                                                text: qsTr("%1 — %2 (%3)")
+                                                    .arg(worktreeRow.row.branch.length > 0
+                                                        ? worktreeRow.row.branch
+                                                        : qsTr("detached HEAD"))
+                                                    .arg(worktreeRow.row.root)
+                                                    .arg(worktreeRow.row.owned ? qsTr("Harkness") : qsTr("external"))
+                                                textFormat: Text.PlainText
+                                            }
+
+                                            Kirigami.Icon {
+                                                Layout.preferredHeight: Kirigami.Units.iconSizes.small
+                                                Layout.preferredWidth: Kirigami.Units.iconSizes.small
+                                                source: "object-locked"
+                                                visible: worktreeRow.row.locked
+                                            }
+                                        }
+
+                                        // A lock is lifecycle policy owned by the catalog. Show
+                                        // Git's reason in the row so protection is visible
+                                        // before a move or removal is attempted.
+                                        Controls.Label {
+                                            Layout.fillWidth: true
+                                            color: Kirigami.Theme.neutralTextColor
+                                            text: worktreeRow.row.lockReason.length > 0
+                                                ? qsTr("Locked: %1").arg(worktreeRow.row.lockReason)
+                                                : qsTr("Locked without a recorded reason")
+                                            textFormat: Text.PlainText
+                                            visible: worktreeRow.row.locked
+                                            wrapMode: Text.Wrap
+                                        }
+
+                                        RowLayout {
+                                            Layout.fillWidth: true
+                                            visible: worktreeRow.row.owned
+
+                                            Controls.Button {
+                                                Layout.fillWidth: true
+                                                enabled: !panel.repositoryOperationRunning()
+                                                    && panel.job(
+                                                    worktreeRow.row.locked
+                                                        ? "unlock_worktree"
+                                                        : "lock_worktree",
+                                                    worktreeRow.row.id
+                                                ) === null
+                                                icon.name: worktreeRow.row.locked
+                                                    ? "object-unlocked"
+                                                    : "object-locked"
+                                                text: worktreeRow.row.locked ? qsTr("Unlock") : qsTr("Lock…")
+                                                onClicked: {
+                                                    if (worktreeRow.row.locked) {
+                                                        panel.backend.unlockWorktree(worktreeRow.row.id);
+                                                    } else {
+                                                        panel.lockingWorktreeId = String(worktreeRow.row.id);
+                                                        panel.lockingWorktreeName = worktreeRow.row.branch.length > 0
+                                                            ? String(worktreeRow.row.branch)
+                                                            : qsTr("detached HEAD");
+                                                        lockReason.text = "";
+                                                        lockWorktreeForm.visible = true;
+                                                        moveWorktreeForm.visible = false;
+                                                        lockReason.forceActiveFocus();
+                                                    }
+                                                }
+                                            }
+
+                                            Controls.Button {
+                                                Layout.fillWidth: true
+                                                enabled: !panel.repositoryOperationRunning()
+                                                    && !worktreeRow.row.locked
+                                                    && panel.job("move_worktree", worktreeRow.row.id) === null
+                                                icon.name: "folder-move"
+                                                text: worktreeRow.row.locked
+                                                    ? qsTr("Unlock before moving")
+                                                    : qsTr("Move…")
+                                                onClicked: {
+                                                    panel.movingWorktreeId = String(worktreeRow.row.id);
+                                                    panel.movingWorktreeName = worktreeRow.row.branch.length > 0
+                                                        ? String(worktreeRow.row.branch)
+                                                        : qsTr("detached HEAD");
+                                                    panel.movingWorktreeRoot = String(worktreeRow.row.root);
+                                                    moveDestination.text = "";
+                                                    moveWorktreeForm.visible = true;
+                                                    lockWorktreeForm.visible = false;
+                                                    moveDestination.forceActiveFocus();
+                                                }
+                                            }
+                                        }
                                     }
+                                }
+                            }
+
+                            ColumnLayout {
+                                id: lockWorktreeForm
+
+                                Layout.fillWidth: true
+                                spacing: Kirigami.Units.smallSpacing
+                                visible: false
+
+                                Controls.Label {
+                                    Layout.fillWidth: true
+                                    text: qsTr("Lock %1").arg(panel.lockingWorktreeName)
+                                    textFormat: Text.PlainText
+                                }
+
+                                Controls.TextField {
+                                    id: lockReason
+
+                                    Layout.fillWidth: true
+                                    placeholderText: qsTr("Required reason for protecting this worktree")
+                                }
+
+                                Controls.Button {
+                                    Layout.fillWidth: true
+                                    enabled: !panel.repositoryOperationRunning()
+                                        && lockReason.text.trim().length > 0
+                                        && panel.job("lock_worktree", panel.lockingWorktreeId) === null
+                                    icon.name: "object-locked"
+                                    text: qsTr("Lock worktree")
+                                    onClicked: {
+                                        panel.backend.lockWorktree(panel.lockingWorktreeId, lockReason.text);
+                                        lockWorktreeForm.visible = false;
+                                    }
+                                }
+                            }
+
+                            ColumnLayout {
+                                id: moveWorktreeForm
+
+                                Layout.fillWidth: true
+                                spacing: Kirigami.Units.smallSpacing
+                                visible: false
+
+                                Controls.Label {
+                                    Layout.fillWidth: true
+                                    text: qsTr("Move %1").arg(panel.movingWorktreeName)
+                                    textFormat: Text.PlainText
+                                }
+
+                                RowLayout {
+                                    Layout.fillWidth: true
+
+                                    Controls.TextField {
+                                        id: moveDestination
+
+                                        Layout.fillWidth: true
+                                        placeholderText: qsTr("Absolute destination path")
+                                    }
+
+                                    Controls.ToolButton {
+                                        Controls.ToolTip.text: qsTr("Choose destination parent folder")
+                                        Controls.ToolTip.visible: hovered
+                                        display: Controls.AbstractButton.IconOnly
+                                        icon.name: "document-open-folder"
+                                        text: qsTr("Choose destination")
+                                        onClicked: moveParentDialog.open()
+                                    }
+                                }
+
+                                Controls.Button {
+                                    Layout.fillWidth: true
+                                    enabled: !panel.repositoryOperationRunning()
+                                        && moveDestination.text.trim().length > 0
+                                        && panel.job("move_worktree", panel.movingWorktreeId) === null
+                                    icon.name: "folder-move"
+                                    text: qsTr("Review and move…")
+                                    onClicked: moveWorktreeDialog.open()
                                 }
                             }
                         }
                     }
                 }
+            }
+        }
 
-                ColumnLayout {
-                    id: lockWorktreeForm
+        Item {
+            objectName: "reviewSidePanel"
 
-                    Layout.fillWidth: true
-                    spacing: Kirigami.Units.smallSpacing
-                    visible: false
+            Controls.SplitView.fillWidth: true
+            Controls.SplitView.minimumWidth: Kirigami.Units.gridUnit * 26
 
-                    Controls.Label {
-                        Layout.fillWidth: true
-                        text: qsTr("Lock %1").arg(panel.lockingWorktreeName)
-                        textFormat: Text.PlainText
-                    }
+            Rectangle {
+                anchors.fill: parent
+                color: Kirigami.Theme.backgroundColor
+            }
 
-                    Controls.TextField {
-                        id: lockReason
+            Controls.ScrollView {
+                id: reviewScroll
 
-                        Layout.fillWidth: true
-                        placeholderText: qsTr("Required reason for protecting this worktree")
-                    }
+                anchors.fill: parent
+                clip: true
+                contentWidth: availableWidth
 
-                    Controls.Button {
-                        Layout.fillWidth: true
-                        enabled: !panel.repositoryOperationRunning()
-                            && lockReason.text.trim().length > 0
-                            && panel.job("lock_worktree", panel.lockingWorktreeId) === null
-                        icon.name: "object-locked"
-                        text: qsTr("Lock worktree")
-                        onClicked: {
-                            panel.backend.lockWorktree(panel.lockingWorktreeId, lockReason.text);
-                            lockWorktreeForm.visible = false;
-                        }
-                    }
-                }
-
-                ColumnLayout {
-                    id: moveWorktreeForm
-
-                    Layout.fillWidth: true
-                    spacing: Kirigami.Units.smallSpacing
-                    visible: false
-
-                    Controls.Label {
-                        Layout.fillWidth: true
-                        text: qsTr("Move %1").arg(panel.movingWorktreeName)
-                        textFormat: Text.PlainText
-                    }
-
-                    RowLayout {
-                        Layout.fillWidth: true
-
-                        Controls.TextField {
-                            id: moveDestination
-
-                            Layout.fillWidth: true
-                            placeholderText: qsTr("Absolute destination path")
-                        }
-
-                        Controls.ToolButton {
-                            Controls.ToolTip.text: qsTr("Choose destination parent folder")
-                            Controls.ToolTip.visible: hovered
-                            display: Controls.AbstractButton.IconOnly
-                            icon.name: "document-open-folder"
-                            text: qsTr("Choose destination")
-                            onClicked: moveParentDialog.open()
-                        }
-                    }
-
-                    Controls.Button {
-                        Layout.fillWidth: true
-                        enabled: !panel.repositoryOperationRunning()
-                            && moveDestination.text.trim().length > 0
-                            && panel.job("move_worktree", panel.movingWorktreeId) === null
-                        icon.name: "folder-move"
-                        text: qsTr("Review and move…")
-                        onClicked: moveWorktreeDialog.open()
-                    }
+                ReviewSurface {
+                    width: reviewScroll.availableWidth
+                        - Kirigami.Units.largeSpacing * 2
+                    x: Kirigami.Units.largeSpacing
+                    backend: panel.backend
+                    gitState: panel.gitState
+                    project: panel.project
+                    stateReady: panel.stateReady
                 }
             }
         }

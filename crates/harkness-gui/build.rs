@@ -11,8 +11,8 @@ fn main() {
             "qml/ActivityBar.qml",
             "qml/ActivityBarItem.qml",
             "qml/SidePanel.qml",
+            "qml/PanelHeader.qml",
             "qml/GitPanel.qml",
-            "qml/ReviewPanel.qml",
             "qml/ReviewSurface.qml",
         ]),
     )

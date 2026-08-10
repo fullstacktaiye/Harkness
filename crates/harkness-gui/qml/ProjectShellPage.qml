@@ -252,52 +252,23 @@ Kirigami.Page {
             visible: sidePanel.hasAvailableView
         }
 
-        Controls.SplitView {
+        // The current view owns everything right of the activity bar, so
+        // collapsing it takes the whole surface rather than baring a companion
+        // pane the activity bar never advertised.
+        SidePanel {
+            id: sidePanel
+
             Layout.fillHeight: true
             Layout.fillWidth: true
-            orientation: Qt.Horizontal
+            currentViewId: shell.currentViewId
+            visible: shell.sidePanelExpanded && sidePanel.currentPanelReady
 
-            handle: Rectangle {
-                readonly property bool active: Controls.SplitHandle.hovered
-                    || Controls.SplitHandle.pressed
+            GitPanel {
+                id: gitPanel
 
-                color: active ? Kirigami.Theme.highlightColor : "transparent"
-                implicitWidth: Kirigami.Units.smallSpacing
-
-                Kirigami.Separator {
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    height: parent.height
-                    visible: !parent.active
-                }
-            }
-
-            SidePanel {
-                id: sidePanel
-
-                Controls.SplitView.fillWidth: false
-                Controls.SplitView.maximumWidth: Kirigami.Units.gridUnit * 40
-                Controls.SplitView.minimumWidth: Kirigami.Units.gridUnit * 18
-                Controls.SplitView.preferredWidth: Kirigami.Units.gridUnit * 23
-                currentViewId: shell.currentViewId
-                visible: shell.sidePanelExpanded && sidePanel.currentPanelReady
-                onHideRequested: shell.sidePanelExpanded = false
-
-                GitPanel {
-                    id: gitPanel
-
-                    backend: shell.backend
-                    project: shell.project
-                }
-            }
-
-            ReviewPanel {
-                objectName: "reviewSidePanel"
-
-                Controls.SplitView.fillWidth: true
-                Controls.SplitView.minimumWidth: Kirigami.Units.gridUnit * 26
                 backend: shell.backend
                 project: shell.project
-                visible: shell.project.available && shell.project.isGit
+                onHideRequested: shell.sidePanelExpanded = false
             }
         }
 

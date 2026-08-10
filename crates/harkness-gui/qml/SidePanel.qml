@@ -3,10 +3,12 @@ import QtQuick.Controls as Controls
 import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
 
-/// Host for the collapsible views the activity bar switches between: a title
-/// row carrying the current view's own actions, above the view itself. Every
-/// view stays instantiated while another is on screen, so switching back keeps
-/// its scroll position and in-progress input.
+/// Host for the collapsible views the activity bar switches between. Every view
+/// stays instantiated while another is on screen, so switching back keeps its
+/// scroll position and in-progress input.
+///
+/// The host only decides *which* view is on screen; a view draws its own title
+/// row with `PanelHeader`, because how far a view spans is the view's business.
 ///
 /// Every child panel declares the view contract:
 ///   viewId         unique identifier, the handle the host switches on
@@ -15,7 +17,6 @@ import org.kde.kirigami as Kirigami
 ///   viewShortcut   shortcut advertised in the tooltip; may be empty
 ///   viewBadge      count drawn on the activity-bar icon; 0 hides it
 ///   viewAvailable  whether the view applies to the current project
-///   viewActions    array of Kirigami.Action shown in the header
 Item {
     id: sidePanel
 
@@ -47,9 +48,6 @@ Item {
         }
         return -1;
     }
-
-    /// Emitted when the user dismisses the panel from its header.
-    signal hideRequested()
 
     implicitWidth: Kirigami.Units.gridUnit * 23
 
@@ -93,68 +91,16 @@ Item {
     data: [
         Rectangle {
             anchors.fill: parent
-            // Matches the panels themselves, so the header reads as part of
-            // the sidebar rather than as a strip of window chrome.
+            // The backdrop a view that does not paint its whole surface falls
+            // back to, so the sidebar never shows through to the window.
             color: Kirigami.Theme.alternateBackgroundColor
         },
 
-        ColumnLayout {
+        StackLayout {
+            id: stack
+
             anchors.fill: parent
-            spacing: 0
-
-            RowLayout {
-                Layout.bottomMargin: Kirigami.Units.smallSpacing
-                Layout.fillWidth: true
-                Layout.leftMargin: Kirigami.Units.largeSpacing
-                Layout.rightMargin: Kirigami.Units.smallSpacing
-                Layout.topMargin: Kirigami.Units.smallSpacing
-                spacing: Kirigami.Units.smallSpacing
-
-                Controls.Label {
-                    Layout.fillWidth: true
-                    color: Kirigami.Theme.disabledTextColor
-                    elide: Text.ElideRight
-                    font.capitalization: Font.AllUppercase
-                    font.pixelSize: Kirigami.Theme.smallFont.pixelSize
-                    text: sidePanel.currentPanel ? sidePanel.currentPanel.viewTitle : ""
-                }
-
-                Repeater {
-                    model: sidePanel.currentPanel ? sidePanel.currentPanel.viewActions : []
-
-                    Controls.ToolButton {
-                        required property var modelData
-
-                        Controls.ToolTip.text: String(modelData.tooltip).length > 0
-                            ? modelData.tooltip
-                            : modelData.text
-                        Controls.ToolTip.visible: hovered
-                        action: modelData
-                        display: Controls.AbstractButton.IconOnly
-                    }
-                }
-
-                Controls.ToolButton {
-                    Controls.ToolTip.text: qsTr("Hide the side panel (Ctrl+B)")
-                    Controls.ToolTip.visible: hovered
-                    display: Controls.AbstractButton.IconOnly
-                    icon.name: "window-close-symbolic"
-                    text: qsTr("Hide")
-                    onClicked: sidePanel.hideRequested()
-                }
-            }
-
-            Kirigami.Separator {
-                Layout.fillWidth: true
-            }
-
-            StackLayout {
-                id: stack
-
-                Layout.fillHeight: true
-                Layout.fillWidth: true
-                currentIndex: sidePanel.currentIndex
-            }
+            currentIndex: sidePanel.currentIndex
         }
     ]
 }
