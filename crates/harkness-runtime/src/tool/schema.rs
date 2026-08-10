@@ -376,11 +376,20 @@ mod tests {
         let schema_path = directory.path().join("referenced.json");
         std::fs::write(&schema_path, br#"{"type": "string"}"#).unwrap();
 
+        // A `file:` URI needs forward slashes and, on Windows, a slash before the
+        // drive letter. Interpolating a native path directly would produce
+        // `file://C:\...` there, which fails to parse as a URI — and the assertion
+        // below would then pass for the wrong reason on one CI platform while
+        // testing what it claims to on the other two.
+        let native = schema_path.display().to_string();
+        let file_uri = if cfg!(windows) {
+            format!("file:///{}", native.replace('\\', "/"))
+        } else {
+            format!("file://{native}")
+        };
+
         let cases = [
-            (
-                json!({"$ref": format!("file://{}", schema_path.display())}),
-                "`resolve-file` feature",
-            ),
+            (json!({"$ref": file_uri}), "`resolve-file` feature"),
             (
                 json!({"$ref": "https://example.com/schema.json"}),
                 "`resolve-http` feature",

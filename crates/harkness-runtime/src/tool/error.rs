@@ -41,7 +41,14 @@ pub const MAX_VIOLATION_FIELD_BYTES: usize = 512;
 /// separately and hope the next one remembers, the projection to a [`Failure`]
 /// clamps whatever it is handed. This is the invariant the run store depends on,
 /// so it is enforced where the record is actually made.
-pub const MAX_FAILURE_MESSAGE_BYTES: usize = 8 * 1024;
+///
+/// The value is chosen so the two bounds *compose*: a full report of
+/// [`MAX_REPORTED_VIOLATIONS`] violations, each field at
+/// [`MAX_VIOLATION_FIELD_BYTES`], comes to roughly 10.5 KB and so passes through
+/// this clamp untouched. A backstop that routinely truncated legitimate reports
+/// would be doing the per-field bound's job badly instead of its own.
+/// `the_two_bounds_compose_so_a_full_report_survives_intact` holds that.
+pub const MAX_FAILURE_MESSAGE_BYTES: usize = 16 * 1024;
 
 /// Appended to text that was cut short.
 const TRUNCATION_MARKER: &str = "… (truncated)";
@@ -91,7 +98,7 @@ impl fmt::Display for SchemaDirection {
 /// marker, which also means a truncated pointer is visibly not a resolvable
 /// pointer rather than one that silently addresses the wrong place.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, from = "SchemaViolationWire")]
+#[serde(from = "SchemaViolationWire")]
 pub struct SchemaViolation {
     pointer: String,
     schema_pointer: String,
@@ -100,6 +107,10 @@ pub struct SchemaViolation {
 
 /// Deserialization target for [`SchemaViolation`], so a violation read from JSON
 /// is bounded exactly as one built in process is.
+///
+/// `deny_unknown_fields` belongs here rather than on `SchemaViolation`: `from`
+/// makes this type the whole of that one's `Deserialize`, so an attribute left on
+/// the outer struct would look like a check while doing nothing.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SchemaViolationWire {
@@ -935,6 +946,38 @@ mod tests {
     }
 
     #[test]
+    fn the_two_bounds_compose_so_a_full_report_survives_intact() {
+        // The outer clamp is a backstop for unbounded sources, not a second
+        // trimmer of schema reports. A worst-case full report — every violation at
+        // the field bound in both pointer and message — has to pass through it
+        // untouched, or the per-field bound is not the thing deciding how much
+        // detail an agent gets back.
+        let long_pointer = format!("/{}", "p".repeat(MAX_VIOLATION_FIELD_BYTES));
+        let long_message = "m".repeat(MAX_VIOLATION_FIELD_BYTES);
+        let violation = SchemaViolation::new(long_pointer, "s".repeat(64), long_message);
+        let report = ToolError::InvalidInput {
+            tool: identity(),
+            violations: vec![violation; MAX_REPORTED_VIOLATIONS],
+            omitted: 40,
+        };
+
+        let rendered = report.to_string();
+        let recorded = report.as_failure();
+        assert_eq!(
+            recorded.message().len(),
+            rendered.len(),
+            "the clamp trimmed a full report of {} bytes",
+            rendered.len()
+        );
+        assert!(!recorded.message().ends_with(TRUNCATION_MARKER));
+        assert!(
+            recorded.message().contains("(and 40 more)"),
+            "the omission count must survive to the end of the message"
+        );
+        assert!(recorded.message().len() < crate::store::MAX_INLINE_PAYLOAD_BYTES);
+    }
+
+    #[test]
     fn a_pointer_is_bounded_because_a_map_key_is_caller_chosen() {
         // The explanation is the obvious unbounded field; the pointer is the one
         // that is easy to miss. A JSON Pointer names the keys it traverses, so an
@@ -990,6 +1033,29 @@ mod tests {
             );
             assert!(field.ends_with(TRUNCATION_MARKER));
         }
+
+        // Routing through a wire type must not have cost the strictness the outer
+        // struct used to declare.
+        let extra = serde_json::json!({
+            "pointer": "/a",
+            "schema_pointer": "/type",
+            "message": "wrong",
+            "surprise": true,
+        });
+        let error = serde_json::from_value::<SchemaViolation>(extra).unwrap_err();
+        assert!(
+            error.to_string().contains("unknown field"),
+            "an unknown field should still be refused: {error}"
+        );
+
+        // And the round trip is stable, so the serialized form still matches what
+        // deserialization accepts.
+        let original = SchemaViolation::new("/a", "/type", "wrong");
+        let json = serde_json::to_string(&original).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SchemaViolation>(&json).unwrap(),
+            original
+        );
     }
 
     #[test]

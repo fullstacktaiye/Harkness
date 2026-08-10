@@ -192,24 +192,26 @@ impl RecordedProgress {
 
     /// Returns a snapshot of the events recorded so far, in arrival order.
     ///
-    /// # Panics
-    ///
-    /// Panics if a previous recording panicked while holding the lock, which
-    /// cannot happen through [`ProgressSink::emit`].
+    /// Recovers from a poisoned lock rather than panicking. Nothing this type does
+    /// while holding the lock can panic, so poisoning would have to come from a
+    /// panic elsewhere in the same call — and losing a progress log is not a reason
+    /// to turn that into a second failure.
     #[must_use]
     pub fn events(&self) -> Vec<ProgressEvent> {
+        self.locked().clone()
+    }
+
+    /// Borrows the recorded events, recovering from poisoning.
+    fn locked(&self) -> std::sync::MutexGuard<'_, Vec<ProgressEvent>> {
         self.events
             .lock()
-            .expect("progress recorder poisoned")
-            .clone()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
 impl ProgressSink for RecordedProgress {
     fn emit(&mut self, event: ProgressEvent) {
-        if let Ok(mut events) = self.events.lock() {
-            events.push(event);
-        }
+        self.locked().push(event);
     }
 }
 

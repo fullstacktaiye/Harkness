@@ -5,6 +5,14 @@
 //! schema cannot be compiled at all. None of them touches the filesystem, Git,
 //! the network, or the run store, which is the point — the contract has to be
 //! exercisable with nothing else wired up.
+//!
+//! The panic-containment tests print `thread ... panicked at ... a static panic
+//! payload` and similar. That output is expected: the panics are deliberate and
+//! the tests assert on the error they were converted into. Silencing it would mean
+//! installing a panic hook, and a hook is process-global — tests run in parallel,
+//! so a suppressing hook installed by one test masks a genuine panic in another,
+//! and two tests swapping it can leave the suppressing one in place for the rest of
+//! the run. Noisy output is a better trade than a debugging hazard.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -873,12 +881,6 @@ fn a_panicking_tool_becomes_a_structured_error_and_the_registry_survives() {
     registry.register(Echo::new("1.0.0")).unwrap();
     let mut context = context();
 
-    // The default hook would print the panic for every case below; the tests
-    // assert on the contained error instead, so the noise is suppressed for the
-    // duration and the previous hook is restored.
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-
     let error = invoke(
         &registry,
         &id("fixture.panics"),
@@ -887,8 +889,6 @@ fn a_panicking_tool_becomes_a_structured_error_and_the_registry_survives() {
         &mut context,
     )
     .unwrap_err();
-
-    std::panic::set_hook(previous);
 
     assert_eq!(error.kind(), "tool_panicked");
     let Some(ToolError::ToolPanicked { tool, payload }) = error.tool_error() else {
@@ -910,8 +910,6 @@ fn a_panicking_tool_becomes_a_structured_error_and_the_registry_survives() {
     assert_eq!(outcome.output().get(), r#"{"echoed":"still here"}"#);
 
     // A second panic on the same registry is contained the same way.
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let again = invoke(
         &registry,
         &id("fixture.panics"),
@@ -920,7 +918,6 @@ fn a_panicking_tool_becomes_a_structured_error_and_the_registry_survives() {
         &mut context,
     )
     .unwrap_err();
-    std::panic::set_hook(previous);
     assert_eq!(again.kind(), "tool_panicked");
 }
 
@@ -939,10 +936,7 @@ fn a_panic_payload_is_recovered_when_it_is_a_string_and_omitted_otherwise() {
         let tool = erase(Panics { payload }).unwrap();
         let mut context = context();
 
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
         let error = tool.execute_json(&raw("{}"), &mut context).unwrap_err();
-        std::panic::set_hook(previous);
 
         let ToolError::ToolPanicked {
             payload: recovered, ..
