@@ -2815,6 +2815,36 @@ mod tests {
         fs::canonicalize(root).expect("a fixture root is always canonicalizable")
     }
 
+    /// Compares fixture paths after resolving every existing ancestor.
+    ///
+    /// Worktree errors can name a not-yet-created destination, so ordinary
+    /// canonicalization is insufficient. This keeps the platform-aware path
+    /// spelling needed by these assertions out of the production Git API.
+    fn fixture_paths_match(left: &Path, right: &Path) -> bool {
+        fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
+            let mut ancestor = path;
+            let mut missing = Vec::new();
+            loop {
+                if let Ok(mut canonical) = ancestor.canonicalize() {
+                    for component in missing.iter().rev() {
+                        canonical.push(component);
+                    }
+                    return Some(canonical);
+                }
+                missing.push(ancestor.file_name()?.to_os_string());
+                ancestor = ancestor.parent()?;
+            }
+        }
+
+        match (
+            canonicalize_with_missing_tail(left),
+            canonicalize_with_missing_tail(right),
+        ) {
+            (Some(left), Some(right)) => left == right,
+            _ => left == right,
+        }
+    }
+
     fn catalog_fixture(template: &str, replacements: &[(&str, &Path)]) -> Vec<u8> {
         let mut resolved = template.to_owned();
         for (placeholder, path) in replacements {
@@ -4301,7 +4331,7 @@ mod tests {
             error,
             ProjectError::Git(GitError::BranchCheckedOutInWorktree { branch, worktree })
                 if branch == "held-elsewhere"
-                    && fs::canonicalize(&worktree).unwrap() == as_catalogued(&external)
+                    && fixture_paths_match(&worktree, &external)
         ));
 
         let managed = create_branch_worktree(&mut service, parent.id, "agent/not-a-parent");
@@ -4343,10 +4373,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(worktrees.len(), 1);
-        assert_eq!(
-            fs::canonicalize(&worktrees[0].root).unwrap(),
-            as_catalogued(&external)
-        );
+        assert!(fixture_paths_match(&worktrees[0].root, &external));
         assert_eq!(worktrees[0].branch.as_deref(), Some("external-branch"));
         assert!(worktrees[0].project.is_none());
         assert_eq!(service.list_catalog_only().unwrap().len(), 1);
@@ -4621,7 +4648,7 @@ mod tests {
             .unwrap();
         let foreign = listed
             .iter()
-            .find(|row| fs::canonicalize(&row.root).unwrap() == as_catalogued(&outside))
+            .find(|row| fixture_paths_match(&row.root, &outside))
             .expect("the foreign worktree is listed");
         assert!(foreign.locked);
         assert_eq!(
@@ -4872,7 +4899,7 @@ mod tests {
                 &Cancellation::default(),
             ),
             Err(ProjectError::WorktreeDestinationInsideDataDirectory { path, .. })
-                if path == data_destination
+                if fixture_paths_match(&path, &data_destination)
         ));
 
         let missing_parent = fixture
@@ -5002,7 +5029,8 @@ mod tests {
                 worktree: source,
                 destination: refused,
                 ..
-            }) if source == worktree.root && refused == destination
+            }) if fixture_paths_match(&source, &worktree.root)
+                && fixture_paths_match(&refused, &destination)
         ));
         assert!(worktree.root.exists());
         assert!(!destination.exists());
