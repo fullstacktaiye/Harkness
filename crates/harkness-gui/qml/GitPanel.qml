@@ -72,6 +72,21 @@ Item {
             backend.refreshWorktrees(project.id);
     }
 
+    // `ComboBox.valueAt()` does not reliably resolve roles from the QVariant
+    // maps produced by the Rust backend while its model is being populated.
+    // Read the map directly, as ReviewSurface does, so the picker always
+    // reflects the branch Git reports as checked out rather than its first
+    // alphabetical entry.
+    function currentBranchIndex() {
+        const currentBranch = String(gitState.branch || project.branch || "");
+        for (let index = 0; index < backend.branches.length; ++index) {
+            const branch = backend.branches[index];
+            if (String(branch.name || "") === currentBranch)
+                return index;
+        }
+        return -1;
+    }
+
     function handleProjectChange() {
         const nextId = project && project.id !== undefined ? String(project.id) : "";
         if (selectedProjectId !== nextId) {
@@ -111,6 +126,41 @@ Item {
             || job("unlock_worktree") !== null
             || job("remove_worktree") !== null
             || job("remove_managed") !== null;
+    }
+
+    // Mirrors the ahead/behind summary in the header: pulling takes
+    // priority when behind (a push would be rejected anyway), otherwise
+    // push if there's anything to push, otherwise just fetch to refresh
+    // the remote-tracking state.
+    function syncAction() {
+        const behind = stateReady ? Number(gitState.behind || 0) : 0;
+        const ahead = stateReady ? Number(gitState.ahead || 0) : 0;
+        if (behind > 0)
+            return "pull";
+        if (ahead > 0)
+            return "push";
+        return "fetch";
+    }
+
+    // Clears the commit message once the in-flight commit finishes without
+    // error, rather than leaving a stale message the user has to delete
+    // themselves before writing the next one.
+    property bool commitJobRunning: job("commit") !== null
+    onCommitJobRunningChanged: {
+        if (!commitJobRunning && stateReady && String(gitState.error || "").length === 0)
+            commitMessage.text = "";
+    }
+
+    // Surfaces the default-branch override as a dialog the moment a push is
+    // refused, rather than only as a button above the "Changes" section that
+    // a user who clicked Push down in "Remote" would have to scroll up to
+    // notice.
+    property bool pushJobRunning: job("push") !== null
+    onPushJobRunningChanged: {
+        if (!pushJobRunning
+                && stateReady
+                && ["default_branch_push", "default_branch_unknown"].indexOf(gitState.errorKind) !== -1)
+            pushOverrideDialog.open();
     }
 
     function reviewReadRunning() {
@@ -251,22 +301,6 @@ Item {
                         && ["default_branch_push", "default_branch_unknown"].indexOf(panel.gitState.errorKind) !== -1
                     onClicked: pushOverrideDialog.open()
                 }
-            }
-
-            Kirigami.Separator {
-                Layout.fillWidth: true
-            }
-
-            ReviewSurface {
-                Layout.fillWidth: true
-                Layout.bottomMargin: Kirigami.Units.largeSpacing
-                Layout.leftMargin: Kirigami.Units.largeSpacing
-                Layout.rightMargin: Kirigami.Units.largeSpacing
-                Layout.topMargin: Kirigami.Units.largeSpacing
-                backend: panel.backend
-                gitState: panel.gitState
-                project: panel.project
-                stateReady: panel.stateReady
             }
 
             Kirigami.Separator {
@@ -453,33 +487,35 @@ Item {
                     text: qsTr("Remote")
                 }
 
-                RowLayout {
+                Controls.Button {
                     Layout.fillWidth: true
-
-                    Controls.Button {
-                        Layout.fillWidth: true
-                        enabled: !panel.repositoryOperationRunning()
-                        icon.name: "download"
-                        text: qsTr("Fetch")
-                        onClicked: panel.backend.fetch(panel.project.id)
+                    enabled: !panel.repositoryOperationRunning()
+                    icon.name: {
+                        switch (panel.syncAction()) {
+                        case "pull": return "go-down";
+                        case "push": return "go-up";
+                        default: return "download";
+                        }
                     }
-
-                    Controls.Button {
-                        Layout.fillWidth: true
-                        enabled: panel.job("pull") === null
-                            && panel.job("push") === null
-                            && !panel.repositoryOperationRunning()
-                        icon.name: "go-down"
-                        text: qsTr("Pull")
-                        onClicked: panel.backend.pull(panel.project.id)
+                    text: {
+                        switch (panel.syncAction()) {
+                        case "pull": return qsTr("Pull (%1)").arg(panel.gitState.behind || 0);
+                        case "push": return qsTr("Push (%1)").arg(panel.gitState.ahead || 0);
+                        default: return qsTr("Fetch");
+                        }
                     }
-
-                    Controls.Button {
-                        Layout.fillWidth: true
-                        enabled: !panel.repositoryOperationRunning()
-                        icon.name: "go-up"
-                        text: qsTr("Push")
-                        onClicked: panel.backend.push(panel.project.id, false)
+                    onClicked: {
+                        switch (panel.syncAction()) {
+                        case "pull":
+                            panel.backend.pull(panel.project.id);
+                            break;
+                        case "push":
+                            panel.backend.push(panel.project.id, false);
+                            break;
+                        default:
+                            panel.backend.fetch(panel.project.id);
+                            break;
+                        }
                     }
                 }
 
@@ -541,13 +577,7 @@ Item {
                     textRole: "name"
                     valueRole: "name"
 
-                    currentIndex: {
-                        for (let index = 0; index < count; ++index) {
-                            if (valueAt(index) === panel.project.branch)
-                                return index;
-                        }
-                        return -1;
-                    }
+                    currentIndex: panel.currentBranchIndex()
 
                     delegate: Controls.ItemDelegate {
                         required property var modelData

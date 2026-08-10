@@ -9,6 +9,7 @@ fn main() {
             "qml/SidebarProjectRow.qml",
             "qml/ProjectShellPage.qml",
             "qml/GitPanel.qml",
+            "qml/ReviewPanel.qml",
             "qml/ReviewSurface.qml",
         ]),
     )

@@ -21,13 +21,6 @@ Kirigami.Page {
 
     title: shell.shellName
 
-    onProjectChanged: {
-        // A refresh can replace the project object; the root itself only
-        // changes in theory, but re-applying it is a no-op then.
-        if (project.available)
-            fileModel.setRoot(project.root);
-    }
-
     function repositoryOperationRunning() {
         for (let index = 0; index < backend.jobs.length; ++index) {
             const candidate = backend.jobs[index];
@@ -177,10 +170,6 @@ Kirigami.Page {
         }
     }
 
-    FileTreeModel {
-        id: fileModel
-    }
-
     RowLayout {
         anchors.fill: parent
         spacing: 0
@@ -198,6 +187,22 @@ Kirigami.Page {
         Kirigami.Separator {
             Layout.fillHeight: true
             visible: shell.project.available && shell.project.isGit
+        }
+
+        ReviewPanel {
+            objectName: "reviewSidePanel"
+
+            Layout.fillHeight: true
+            Layout.fillWidth: true
+            Layout.minimumWidth: Kirigami.Units.gridUnit * 26
+            backend: shell.backend
+            project: shell.project
+            visible: shell.project.available && shell.project.isGit
+        }
+
+        /*
+        FileTreeModel {
+            id: fileModel
         }
 
         TreeView {
@@ -243,6 +248,7 @@ Kirigami.Page {
 
             Component.onCompleted: fileModel.setRoot(shell.project.root)
         }
+        */
     }
 
     Kirigami.PlaceholderMessage {
