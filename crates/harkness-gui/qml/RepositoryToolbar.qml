@@ -250,11 +250,15 @@ RowLayout {
         caption: qsTr("Current worktree")
         enabled: !toolbar.activity.repositoryOperationRunning()
         icon.name: toolbar.project.worktree ? "folder-open" : "folder-git"
+        // The primary checkout is named after the project it belongs to; a
+        // linked worktree is told apart from its siblings by its branch.
         value: toolbar.project.worktree
             ? (toolbar.project.branch.length > 0
                 ? toolbar.project.branch
                 : qsTr("detached HEAD"))
-            : qsTr("Primary checkout")
+            : (toolbar.project.displayName.length > 0
+                ? toolbar.project.displayName
+                : qsTr("Primary checkout"))
         onClicked: worktreePopup.visible ? worktreePopup.close() : worktreePopup.open()
 
         Controls.Popup {
