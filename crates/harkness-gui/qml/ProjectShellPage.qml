@@ -34,9 +34,9 @@ Kirigami.Page {
     // window edge instead of floating inside the page's content padding.
     padding: 0
 
-    // The page itself is the window-coloured band the framed surface floats
-    // on, so the gutter around the frame matches the title bar above it.
-    // Inheritance is off here, so the window's black ground is restated.
+    // The page itself is the window-coloured ground the framed surface sits
+    // on, so what shows through the frame's rounded corners matches the title
+    // bar above it. Inheritance is off here, so the black ground is restated.
     Kirigami.Theme.colorSet: Kirigami.Theme.Window
     Kirigami.Theme.inherit: false
     Kirigami.Theme.backgroundColor: "#000000"
@@ -139,13 +139,12 @@ Kirigami.Page {
     }
 
     // The whole shell — header band, activity bar and the current view — sits
-    // on this one framed surface, floated inside a gutter so the border wraps
-    // the entire look rather than each strip drawing its own edge.
+    // on this one framed surface, run to the page edge so the border wraps the
+    // entire look rather than each strip drawing its own edge.
     Rectangle {
         id: frame
 
         anchors.fill: parent
-        anchors.margins: Kirigami.Units.largeSpacing
         border.color: shell.frameColor
         border.width: 1
         color: Kirigami.Theme.backgroundColor
