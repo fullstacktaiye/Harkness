@@ -67,6 +67,16 @@ define_id!(
     /// [`Default`] generates a fresh random identity rather than an empty value.
     ToolCallId
 );
+define_id!(
+    /// A stable identifier for one stored artifact.
+    ///
+    /// An artifact is content too large to live in a row: a build log, a diff,
+    /// an overflowed event payload. The identity names both the metadata row and
+    /// the file holding the bytes, so the two can never drift apart.
+    ///
+    /// [`Default`] generates a fresh random identity rather than an empty value.
+    ArtifactId
+);
 
 #[cfg(test)]
 mod tests {
@@ -74,7 +84,7 @@ mod tests {
 
     use serde::{Serialize, de::DeserializeOwned};
 
-    use super::{RunId, StepId, TaskId, ToolCallId};
+    use super::{ArtifactId, RunId, StepId, TaskId, ToolCallId};
 
     const FIXTURE_ID: &str = "123e4567-e89b-42d3-a456-426614174000";
 
@@ -101,6 +111,7 @@ mod tests {
         assert_id_contract::<RunId>();
         assert_id_contract::<StepId>();
         assert_id_contract::<ToolCallId>();
+        assert_id_contract::<ArtifactId>();
     }
 
     #[test]

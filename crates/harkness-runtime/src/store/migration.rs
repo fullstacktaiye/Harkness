@@ -31,10 +31,16 @@ pub(super) struct Migration {
 }
 
 /// Every migration this build can apply, in ascending version order.
-pub(super) const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    statements: include_str!("migrations/001_initial_schema.sql"),
-}];
+pub(super) const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        statements: include_str!("migrations/001_initial_schema.sql"),
+    },
+    Migration {
+        version: 2,
+        statements: include_str!("migrations/002_events_and_artifacts.sql"),
+    },
+];
 
 /// Newest schema version this build understands.
 pub const SCHEMA_VERSION: i64 = MIGRATIONS[MIGRATIONS.len() - 1].version;
@@ -153,7 +159,17 @@ mod tests {
         assert_eq!(recorded_version(&connection).unwrap(), SCHEMA_VERSION);
 
         let tables = table_names(&connection);
-        assert_eq!(tables, ["runs", "steps", "tasks", "tool_calls"]);
+        assert_eq!(
+            tables,
+            [
+                "artifacts",
+                "run_events",
+                "runs",
+                "steps",
+                "tasks",
+                "tool_calls"
+            ]
+        );
 
         // Re-applying is a no-op rather than a duplicate-table failure.
         apply(&mut connection, MIGRATIONS).unwrap();

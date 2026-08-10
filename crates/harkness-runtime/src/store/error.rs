@@ -129,6 +129,39 @@ pub enum StoreError {
         bytes: usize,
     },
 
+    /// An artifact's content could not be written, synced, renamed, or read.
+    ///
+    /// The metadata row and the file are recorded in that order — file first —
+    /// so this failure means no row was written and nothing refers to whatever
+    /// bytes reached the disk.
+    #[error("the run store failed while {operation} at {}: {source}", .path.display())]
+    ArtifactIo {
+        /// What the store was doing to the file.
+        operation: &'static str,
+        /// File the operation was performed on.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A stored artifact row named a location outside its reserved place.
+    ///
+    /// An artifact's path is derivable from its run and its own identity, so a
+    /// row disagreeing with that derivation was edited outside Harkness.
+    /// Refusing it is what stops a tampered row from making the store read or
+    /// overwrite an arbitrary file; the rest of the run stays readable, because
+    /// nothing else in it resolves an artifact path.
+    #[error(
+        "artifact {id} is recorded at {path}, which is not the location reserved for it; refusing to resolve it"
+    )]
+    ForbiddenArtifactPath {
+        /// Artifact whose row names the wrong place.
+        id: String,
+        /// Path the row named.
+        path: String,
+    },
+
     /// A stored path is not valid UTF-8 on this platform.
     #[error("{record}.{field} is not valid UTF-8 and cannot be stored")]
     NonUtf8Path {
@@ -217,6 +250,8 @@ impl StoreError {
         "missing_parent",
         "duplicate_step_ordinal",
         "payload_too_large",
+        "artifact_io",
+        "forbidden_artifact_path",
         "non_utf8_path",
         "invalid_transition",
         "invalid_record",
@@ -240,6 +275,8 @@ impl StoreError {
             Self::MissingParent { .. } => "missing_parent",
             Self::DuplicateStepOrdinal { .. } => "duplicate_step_ordinal",
             Self::PayloadTooLarge { .. } => "payload_too_large",
+            Self::ArtifactIo { .. } => "artifact_io",
+            Self::ForbiddenArtifactPath { .. } => "forbidden_artifact_path",
             Self::NonUtf8Path { .. } => "non_utf8_path",
             Self::InvalidTransition(_) => "invalid_transition",
             Self::InvalidRecord { .. } => "invalid_record",
@@ -406,6 +443,21 @@ mod tests {
                     bytes: 65_537,
                 },
                 "payload_too_large",
+            ),
+            (
+                StoreError::ArtifactIo {
+                    operation: "renaming an artifact",
+                    path: PathBuf::from("artifacts/run/artifact"),
+                    source: std::io::Error::other("disk full"),
+                },
+                "artifact_io",
+            ),
+            (
+                StoreError::ForbiddenArtifactPath {
+                    id: "artifact".to_owned(),
+                    path: "../../.ssh/id_rsa".to_owned(),
+                },
+                "forbidden_artifact_path",
             ),
             (
                 StoreError::NonUtf8Path {

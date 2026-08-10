@@ -562,7 +562,7 @@ fn tool_call_wire(row: &Row<'_>) -> Result<ToolCallWire, StoreError> {
 // -- shared column plumbing -------------------------------------------------
 
 /// Reads and validates a row's schema version before anything else is decoded.
-fn schema_version(row: &Row<'_>, record: &'static str) -> Result<u32, StoreError> {
+pub(super) fn schema_version(row: &Row<'_>, record: &'static str) -> Result<u32, StoreError> {
     let stored = integer(row, record, "schema_version")?;
     let found = u32::try_from(stored).map_err(|_| StoreError::ColumnEncoding {
         record,
@@ -580,7 +580,11 @@ fn schema_version(row: &Row<'_>, record: &'static str) -> Result<u32, StoreError
 /// arrived from outside Harkness. Reading it back would import exactly the
 /// memory and query cost the threshold exists to prevent, so the row is refused
 /// on the way in as well as on the way out.
-fn text(row: &Row<'_>, record: &'static str, field: &'static str) -> Result<String, StoreError> {
+pub(super) fn text(
+    row: &Row<'_>,
+    record: &'static str,
+    field: &'static str,
+) -> Result<String, StoreError> {
     let stored: String = row
         .get(field)
         .map_err(|error| column(record, field, error))?;
@@ -588,7 +592,7 @@ fn text(row: &Row<'_>, record: &'static str, field: &'static str) -> Result<Stri
     Ok(stored)
 }
 
-fn optional_text(
+pub(super) fn optional_text(
     row: &Row<'_>,
     record: &'static str,
     field: &'static str,
