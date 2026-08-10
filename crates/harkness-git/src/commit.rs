@@ -20,6 +20,34 @@ use crate::{
     status,
 };
 
+/// Which changes one commit records.
+///
+/// The two staging variants exist so a front end that presents committing as a
+/// single action does not have to stage and commit as two operations. Two
+/// operations would release the repository lock between them, and a sibling
+/// worktree's mutation landing in that window would be swept into the commit.
+/// Staging here happens under the lock the commit already holds, so what the
+/// caller saw in the status it selected from is what the commit records.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum CommitScope {
+    /// Record exactly what is already staged, and stage nothing.
+    #[default]
+    Index,
+    /// Record every change in the working tree.
+    WorkingTree,
+    /// Record exactly these paths, whatever else the index holds.
+    ///
+    /// A path that is staged but absent from this list is left staged and out
+    /// of the commit, which is what lets a caller offer a per-file choice
+    /// without making the index the thing the user operates.
+    ///
+    /// Prefer [`Self::WorkingTree`] when the selection covers every changed
+    /// path: the two record the same tree, but this variant names every path
+    /// on one command line, and a large enough working tree would overrun it.
+    Paths(Vec<PathBuf>),
+}
+
 /// What one commit should do.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -28,15 +56,8 @@ pub struct CommitOptions {
     pub amend: bool,
     /// Permit a commit whose tree is identical to its parent.
     pub allow_empty: bool,
-    /// Stage every working-tree change before committing.
-    ///
-    /// This exists so a front end that presents committing as one action does
-    /// not have to stage and commit as two operations. Two operations would
-    /// release the repository lock between them, and a sibling worktree's
-    /// mutation landing in that window would be swept into the commit. Staging
-    /// here happens under the lock the commit already holds, so what the caller
-    /// saw in the status it staged from is what the commit records.
-    pub stage_all: bool,
+    /// Which changes the commit records, and what it stages to record them.
+    pub scope: CommitScope,
     /// Refresh the full repository status after the commit.
     ///
     /// Disable this when the caller will refresh separately. The default is
@@ -49,7 +70,7 @@ impl Default for CommitOptions {
         Self {
             amend: false,
             allow_empty: false,
-            stage_all: false,
+            scope: CommitScope::Index,
             refresh_status: true,
         }
     }
@@ -70,10 +91,10 @@ impl CommitOptions {
         self
     }
 
-    /// Sets whether every working-tree change is staged before committing.
+    /// Sets which changes the commit records.
     #[must_use]
-    pub fn with_stage_all(mut self, stage_all: bool) -> Self {
-        self.stage_all = stage_all;
+    pub fn with_scope(mut self, scope: CommitScope) -> Self {
+        self.scope = scope;
         self
     }
 
@@ -249,6 +270,26 @@ fn add_all(
         .map(|_| ())
 }
 
+/// Stages exactly these paths, one command each.
+///
+/// Unlike [`stage`], a failure anywhere aborts: these paths are about to be
+/// committed together, and committing a subset of a selection the caller made
+/// as a whole would record something the user never chose.
+fn add_paths(
+    git_executable: &Path,
+    root: &Path,
+    paths: &[PathBuf],
+    cancellation: &Cancellation,
+) -> Result<(), GitError> {
+    for path in paths {
+        GitCommand::new(git_executable, root, GitAccess::LocalWrite)
+            .args(["--literal-pathspecs", "add", "--all", "--"])
+            .arg(path.as_os_str())
+            .run(cancellation)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn unstage(
     git_executable: &Path,
     root: &Path,
@@ -303,28 +344,67 @@ pub(crate) fn commit(
     if options.amend && unborn {
         return Err(GitError::AmendUnbornBranch);
     }
+    let scoped_paths = match &options.scope {
+        CommitScope::Paths(paths) => {
+            // A selection of nothing is reported as nothing staged rather than
+            // as its own refusal: it is the same outcome the caller would get
+            // by selecting only unchanged paths, and it costs the error
+            // namespace nothing to say so.
+            if paths.is_empty() {
+                return Err(GitError::NothingStaged);
+            }
+            validate_paths(root, paths)?;
+            Some(paths.as_slice())
+        }
+        CommitScope::Index | CommitScope::WorkingTree => None,
+    };
+
     // Staging happens after the refusals above so a commit this function was
     // never going to make cannot leave the index rewritten behind it.
-    let repository = if options.stage_all {
-        add_all(git_executable, root, cancellation)?;
-        // `git add` rewrote the index on disk, and the handle opened above still
-        // describes the index as it was before that write.
-        open(root)?
-    } else {
-        repository
+    let repository = match &options.scope {
+        CommitScope::Index => repository,
+        CommitScope::WorkingTree => {
+            add_all(git_executable, root, cancellation)?;
+            // `git add` rewrote the index on disk, and the handle opened above
+            // still describes the index as it was before that write.
+            open(root)?
+        }
+        CommitScope::Paths(paths) => {
+            add_paths(git_executable, root, paths, cancellation)?;
+            open(root)?
+        }
     };
-    if !options.allow_empty && !has_staged_changes(&repository, root)? {
+    // An amend rewrites a commit that already exists, so an unchanged tree is
+    // a message edit rather than an empty commit, and refusing it would leave
+    // no way to correct a commit message.
+    if !options.allow_empty
+        && !options.amend
+        && !has_staged_changes(&repository, root, scoped_paths)?
+    {
         return Err(GitError::NothingStaged);
     }
 
-    let mut command = GitCommand::new(git_executable, root, GitAccess::LocalWrite).arg("commit");
+    let mut command = GitCommand::new(git_executable, root, GitAccess::LocalWrite)
+        // The selected paths are literal filesystem names, not pathspec
+        // patterns, for the same reason they are in `stage`.
+        .arg("--literal-pathspecs")
+        .arg("commit");
     if options.amend {
         command = command.arg("--amend");
     }
     if options.allow_empty {
         command = command.arg("--allow-empty");
     }
-    command.args(["--message", message]).run(cancellation)?;
+    command = command.args(["--message", message]);
+    if let Some(paths) = scoped_paths {
+        // `--only` is what confines the commit to the selection: it records
+        // these paths against HEAD and leaves every other staged path staged.
+        command = command.args(["--only", "--"]);
+        for path in paths {
+            command = command.arg(path.as_os_str());
+        }
+    }
+    command.run(cancellation)?;
 
     let repository = open(root)?;
     let commit_id = repository
@@ -439,12 +519,29 @@ fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
     }
 }
 
-fn has_staged_changes(repository: &Repository, root: &Path) -> Result<bool, GitError> {
+/// Whether the index differs from `HEAD`, optionally only for `paths`.
+///
+/// Scoping matters for a path-selected commit: another path being staged says
+/// nothing about whether the selected ones would record anything, and treating
+/// it as if it did would hand Git a commit it refuses.
+fn has_staged_changes(
+    repository: &Repository,
+    root: &Path,
+    paths: Option<&[PathBuf]>,
+) -> Result<bool, GitError> {
     let mut options = StatusOptions::new();
     options
         .include_untracked(false)
         .recurse_untracked_dirs(false)
         .include_ignored(false);
+    if let Some(paths) = paths {
+        // Exact names, never glob matches, so a path containing pathspec
+        // metacharacters selects itself and nothing else.
+        options.disable_pathspec_match(true);
+        for path in paths {
+            options.pathspec(path);
+        }
+    }
     let statuses = repository
         .statuses(Some(&mut options))
         .map_err(|source| inspection(root, source))?;
@@ -496,8 +593,9 @@ mod tests {
     use git2::Repository;
 
     use crate::{
-        Cancellation, CommitOptions, DetailedStatus, FileChange, GitError, GitService, HeadState,
-        PendingOperation, StageOptions, StagePathResult, StatusEntry, StatusRefreshOutcome,
+        Cancellation, CommitOptions, CommitScope, DetailedStatus, FileChange, GitError, GitService,
+        HeadState, PendingOperation, StageOptions, StagePathResult, StatusEntry,
+        StatusRefreshOutcome,
         testing::{
             Fixture, PROCESS_PROJECT_ROOT_ENV, commit_all, configure_commit_identity,
             initialize_repository, spawn_child,
@@ -1024,7 +1122,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stage_all_commit_records_the_whole_working_tree_without_staging_first() {
+    fn a_working_tree_commit_records_everything_without_staging_first() {
         let fixture = Fixture::new();
         let root = fixture.directory("stage-all-commit");
         let repository = initialize_repository(&root);
@@ -1041,7 +1139,7 @@ mod tests {
         let outcome = service
             .commit(
                 "commit everything in one action",
-                &CommitOptions::default().with_stage_all(true),
+                &CommitOptions::default().with_scope(CommitScope::WorkingTree),
                 &cancellation,
             )
             .unwrap();
@@ -1063,7 +1161,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stage_all_commit_with_a_clean_tree_leaves_no_staged_changes_behind() {
+    fn a_working_tree_commit_with_nothing_changed_is_refused() {
         let fixture = Fixture::new();
         let root = fixture.directory("stage-all-clean");
         initialize_repository(&root);
@@ -1072,7 +1170,7 @@ mod tests {
         let error = service
             .commit(
                 "nothing to record",
-                &CommitOptions::default().with_stage_all(true),
+                &CommitOptions::default().with_scope(CommitScope::WorkingTree),
                 &Cancellation::default(),
             )
             .unwrap_err();
@@ -1081,7 +1179,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stage_all_commit_refuses_a_pending_operation_before_touching_the_index() {
+    fn a_working_tree_commit_refuses_a_pending_operation_before_touching_the_index() {
         let fixture = Fixture::new();
         let root = fixture.directory("stage-all-pending");
         let repository = initialize_repository(&root);
@@ -1093,7 +1191,7 @@ mod tests {
         let error = service
             .commit(
                 "must not finish an unknown merge",
-                &CommitOptions::default().with_stage_all(true),
+                &CommitOptions::default().with_scope(CommitScope::WorkingTree),
                 &Cancellation::default(),
             )
             .unwrap_err();
@@ -1111,6 +1209,220 @@ mod tests {
             None,
             "the refused commit staged the working tree anyway"
         );
+    }
+
+    #[test]
+    fn a_path_scoped_commit_records_only_the_selected_paths() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("path-scoped-commit");
+        let repository = initialize_repository(&root);
+        fs::write(root.join("dropped.txt"), "delete me\n").unwrap();
+        commit_all(&repository, "add deletion fixture");
+        drop(repository);
+        let service = GitService::new(&root, &fixture.data_dir);
+        let cancellation = Cancellation::default();
+
+        fs::write(root.join("tracked.txt"), "selected change\n").unwrap();
+        fs::write(root.join("added.txt"), "selected addition\n").unwrap();
+        fs::remove_file(root.join("dropped.txt")).unwrap();
+        fs::write(root.join("excluded.txt"), "left behind\n").unwrap();
+
+        let outcome = service
+            .commit(
+                "record only the selection",
+                &CommitOptions::default().with_scope(CommitScope::Paths(vec![
+                    "tracked.txt".into(),
+                    "added.txt".into(),
+                    "dropped.txt".into(),
+                ])),
+                &cancellation,
+            )
+            .unwrap();
+
+        let repository = Repository::open(&root).unwrap();
+        let tree = repository
+            .find_commit(outcome.commit_id.parse().unwrap())
+            .unwrap()
+            .tree()
+            .unwrap();
+        assert!(tree.get_name("added.txt").is_some());
+        assert!(tree.get_name("dropped.txt").is_none());
+        assert!(
+            tree.get_name("excluded.txt").is_none(),
+            "an unselected path must stay out of the commit"
+        );
+        assert_eq!(
+            tree.get_name("tracked.txt")
+                .unwrap()
+                .to_object(&repository)
+                .unwrap()
+                .as_blob()
+                .unwrap()
+                .content(),
+            b"selected change\n"
+        );
+
+        // The unselected path is still there to be committed next time, and
+        // still on the working-tree side of the index.
+        let status = refreshed(&outcome.status);
+        let excluded = entry(&status.entries, Path::new("excluded.txt"));
+        assert_eq!(excluded.unstaged, Some(FileChange::Untracked));
+        assert_eq!(excluded.staged, None);
+        assert_eq!(status.entries.len(), 1);
+    }
+
+    #[test]
+    fn a_path_scoped_commit_leaves_an_unselected_staged_path_staged() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("path-scoped-leaves-index");
+        initialize_repository(&root);
+        let service = GitService::new(&root, &fixture.data_dir);
+        let cancellation = Cancellation::default();
+
+        fs::write(root.join("tracked.txt"), "selected\n").unwrap();
+        fs::write(root.join("staged-elsewhere.txt"), "staged by hand\n").unwrap();
+        service
+            .stage(["staged-elsewhere.txt"], &cancellation)
+            .unwrap();
+
+        let outcome = service
+            .commit(
+                "ignore what is already staged",
+                &CommitOptions::default()
+                    .with_scope(CommitScope::Paths(vec!["tracked.txt".into()])),
+                &cancellation,
+            )
+            .unwrap();
+
+        let repository = Repository::open(&root).unwrap();
+        let tree = repository
+            .find_commit(outcome.commit_id.parse().unwrap())
+            .unwrap()
+            .tree()
+            .unwrap();
+        assert!(
+            tree.get_name("staged-elsewhere.txt").is_none(),
+            "a staged path outside the selection must not be swept into the commit"
+        );
+        let staged = entry(
+            &refreshed(&outcome.status).entries,
+            Path::new("staged-elsewhere.txt"),
+        );
+        assert_eq!(
+            staged.staged,
+            Some(FileChange::Added),
+            "the untouched path must be left exactly as staged"
+        );
+    }
+
+    #[test]
+    fn a_selection_that_records_nothing_is_refused_whatever_else_is_staged() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("path-scoped-refusals");
+        initialize_repository(&root);
+        let service = GitService::new(&root, &fixture.data_dir);
+        let cancellation = Cancellation::default();
+
+        assert!(matches!(
+            service.commit(
+                "nothing selected",
+                &CommitOptions::default().with_scope(CommitScope::Paths(Vec::new())),
+                &cancellation,
+            ),
+            Err(GitError::NothingStaged)
+        ));
+
+        // An unrelated staged path must not make an unchanged selection look
+        // committable: the whole-index check would have said yes here.
+        fs::write(root.join("staged-elsewhere.txt"), "staged by hand\n").unwrap();
+        service
+            .stage(["staged-elsewhere.txt"], &cancellation)
+            .unwrap();
+        assert!(matches!(
+            service.commit(
+                "unchanged selection",
+                &CommitOptions::default()
+                    .with_scope(CommitScope::Paths(vec!["tracked.txt".into()])),
+                &cancellation,
+            ),
+            Err(GitError::NothingStaged)
+        ));
+    }
+
+    #[test]
+    fn a_path_outside_the_repository_is_refused_before_the_commit_stages_anything() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("path-scoped-escape");
+        initialize_repository(&root);
+        fs::write(fixture.root.path().join("outside.txt"), "outside\n").unwrap();
+        fs::write(root.join("tracked.txt"), "must not be staged\n").unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+
+        let error = service
+            .commit(
+                "escape attempt",
+                &CommitOptions::default().with_scope(CommitScope::Paths(vec![
+                    "tracked.txt".into(),
+                    "../outside.txt".into(),
+                ])),
+                &Cancellation::default(),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(error, GitError::PathOutsideRepository { ref path, .. }
+                if path == Path::new("../outside.txt")),
+            "{error:?}"
+        );
+        assert_eq!(
+            entry(
+                &service
+                    .detailed_status(&Cancellation::default())
+                    .unwrap()
+                    .entries,
+                Path::new("tracked.txt")
+            )
+            .staged,
+            None,
+            "the refused commit staged a companion path anyway"
+        );
+    }
+
+    #[test]
+    fn amending_an_unchanged_tree_rewrites_only_the_message() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("message-only-amend");
+        let repository = initialize_repository(&root);
+        let original = repository.head().unwrap().target().unwrap();
+        let original_tree = repository
+            .find_commit(original)
+            .unwrap()
+            .tree()
+            .unwrap()
+            .id();
+        drop(repository);
+        let service = GitService::new(&root, &fixture.data_dir);
+
+        let amended = service
+            .commit(
+                "corrected subject",
+                &CommitOptions::default().with_amend(true),
+                &Cancellation::default(),
+            )
+            .unwrap();
+
+        assert!(amended.amended);
+        let repository = Repository::open(&root).unwrap();
+        let commit = repository
+            .find_commit(amended.commit_id.parse().unwrap())
+            .unwrap();
+        assert_eq!(commit.message().unwrap(), "corrected subject\n");
+        assert_eq!(
+            commit.tree().unwrap().id(),
+            original_tree,
+            "a message-only amend must not change the tree"
+        );
+        assert_ne!(amended.commit_id, original.to_string());
     }
 
     #[test]

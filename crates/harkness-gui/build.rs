@@ -15,6 +15,7 @@ fn main() {
             "qml/SidePanel.qml",
             "qml/PanelHeader.qml",
             "qml/GitActivity.qml",
+            "qml/CommitSelection.qml",
             "qml/ToolbarSegment.qml",
             "qml/RepositoryToolbar.qml",
             "qml/GitPanel.qml",

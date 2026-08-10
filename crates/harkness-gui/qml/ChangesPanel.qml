@@ -6,10 +6,11 @@ import org.kde.kirigami as Kirigami
 /// The "Changes" tab of the source-control view: what the working tree holds
 /// right now, and the diff each entry opens beside it.
 ///
-/// The list is a statement of what the commit footer below will record, not a
-/// set of controls. There is no staging step to perform here: committing takes
-/// the whole working tree, so a row has nothing to toggle. Anything that
-/// reaches the remote or switches what is checked out lives in the header
+/// A row's checkbox is the only control it carries, and it means one thing:
+/// whether the next commit records this file. There is no staging step behind
+/// it — the commit stages what is checked, as part of committing — so a checked
+/// box is a statement about the commit rather than about the index. Anything
+/// that reaches the remote or switches what is checked out lives in the header
 /// toolbar.
 ColumnLayout {
     id: changes
@@ -18,6 +19,8 @@ ColumnLayout {
     required property var project
     /// Shared job and Git-state projection; see GitActivity.qml.
     required property var activity
+    /// Which files the commit footer will record; see CommitSelection.qml.
+    required property var selection
 
     /// Asked for when a push has been refused because the branch is the
     /// remote's default; the view hosting this tab owns the confirmation.
@@ -65,6 +68,10 @@ ColumnLayout {
             states.push(qsTr("conflict"));
         return states.join(" · ");
     }
+
+    // A file that is gone from the working tree must not stay excluded in
+    // secret if it ever comes back.
+    onEntriesChanged: selection.prune(entries)
 
     ColumnLayout {
         Layout.fillWidth: true
@@ -128,13 +135,40 @@ ColumnLayout {
         Layout.rightMargin: Kirigami.Units.smallSpacing
         Layout.topMargin: Kirigami.Units.smallSpacing
 
-        Controls.Label {
-            Layout.fillWidth: true
-            elide: Text.ElideRight
+        // GitHub Desktop's header control: one box that reads the state of
+        // every row and, when pressed, gives them all the same answer.
+        Controls.CheckBox {
+            id: selectAll
+
+            readonly property int includedCount: changes.selection.countIncluded(changes.entries)
+
+            Accessible.name: text
+            Controls.ToolTip.text: qsTr("Include every changed file in the commit")
+            Controls.ToolTip.visible: hovered
+            checkState: includedCount === 0
+                ? Qt.Unchecked
+                : includedCount === changes.entries.length
+                    ? Qt.Checked
+                    : Qt.PartiallyChecked
+            enabled: changes.entries.length > 0
+                && !changes.activity.repositoryMutationRunning()
             text: changes.entries.length === 1
                 ? qsTr("1 changed file")
-                : qsTr("%1 changed files").arg(changes.entries.length)
-            textFormat: Text.PlainText
+                : qsTr("%1 of %2 changed files")
+                    .arg(includedCount)
+                    .arg(changes.entries.length)
+            // A partial state resolves to "all", never back to "none": the
+            // useful move from a half-made selection is to take everything.
+            tristate: true
+            nextCheckState: function() {
+                return includedCount === changes.entries.length
+                    ? Qt.Unchecked
+                    : Qt.Checked;
+            }
+            onToggled: changes.selection.setAll(
+                changes.entries,
+                checkState === Qt.Checked
+            )
         }
 
         // The whole-diff entry point: everything the next commit would record,
@@ -185,27 +219,43 @@ ColumnLayout {
                 modelData.unstaged
             )
 
-            contentItem: ColumnLayout {
-                spacing: 0
+            contentItem: RowLayout {
+                spacing: Kirigami.Units.smallSpacing
 
-                Controls.Label {
-                    Layout.fillWidth: true
-                    elide: Text.ElideMiddle
-                    font.family: "monospace"
-                    text: entryDelegate.modelData.path
-                    textFormat: Text.PlainText
+                Controls.CheckBox {
+                    Accessible.name: qsTr("Include %1 in the commit")
+                        .arg(entryDelegate.modelData.path)
+                    checked: changes.selection.included(entryDelegate.modelData.path)
+                    enabled: !changes.activity.repositoryMutationRunning()
+                    onToggled: changes.selection.setIncluded(
+                        entryDelegate.modelData.path,
+                        checked
+                    )
                 }
 
-                Controls.Label {
+                ColumnLayout {
                     Layout.fillWidth: true
-                    color: entryDelegate.modelData.conflicted
-                        ? Kirigami.Theme.negativeTextColor
-                        : Kirigami.Theme.disabledTextColor
-                    elide: Text.ElideRight
-                    font: Kirigami.Theme.smallFont
-                    text: changes.changeSummary(entryDelegate.modelData)
-                    textFormat: Text.PlainText
-                    visible: text.length > 0
+                    spacing: 0
+
+                    Controls.Label {
+                        Layout.fillWidth: true
+                        elide: Text.ElideMiddle
+                        font.family: "monospace"
+                        text: entryDelegate.modelData.path
+                        textFormat: Text.PlainText
+                    }
+
+                    Controls.Label {
+                        Layout.fillWidth: true
+                        color: entryDelegate.modelData.conflicted
+                            ? Kirigami.Theme.negativeTextColor
+                            : Kirigami.Theme.disabledTextColor
+                        elide: Text.ElideRight
+                        font: Kirigami.Theme.smallFont
+                        text: changes.changeSummary(entryDelegate.modelData)
+                        textFormat: Text.PlainText
+                        visible: text.length > 0
+                    }
                 }
             }
         }

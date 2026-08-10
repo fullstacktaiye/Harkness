@@ -37,8 +37,8 @@ pub use git2;
 
 pub use branch::{Branch, BranchCheckout, BranchKind, BranchListOptions, CreateBranchOptions};
 pub use commit::{
-    CommitOptions, CommitOutcome, StageOptions, StageOutcome, StagePathOutcome, StagePathResult,
-    StatusRefreshOutcome,
+    CommitOptions, CommitOutcome, CommitScope, StageOptions, StageOutcome, StagePathOutcome,
+    StagePathResult, StatusRefreshOutcome,
 };
 pub use context::{
     FileContextOmission, FileContextRange, FileContextRequest, FileContextResponse,
@@ -1159,14 +1159,18 @@ impl GitService {
         )
     }
 
-    /// Creates a commit from the staged snapshot.
+    /// Creates a commit.
     ///
-    /// Empty messages, an unchanged index, and amending an unborn branch are
-    /// refused in process before Git is spawned. [`CommitOptions`] provides
-    /// the explicit overrides for amending, intentionally empty commits, and
-    /// skipping the final full-repository status refresh. A successful commit
-    /// remains an `Ok` [`CommitOutcome`] if only that follow-up refresh fails;
-    /// inspect [`CommitOutcome::status`] for the refresh result.
+    /// What the commit records is [`CommitOptions::scope`]: the staged
+    /// snapshot by default, or a working tree or path selection that this call
+    /// stages itself, under the one repository lock it already holds.
+    ///
+    /// Empty messages, a selection that would record nothing, and amending an
+    /// unborn branch are refused in process before Git is spawned. Amending is
+    /// exempt from the second of those, because rewriting an existing commit
+    /// with an unchanged tree is a message edit rather than an empty commit. A
+    /// successful commit remains an `Ok` [`CommitOutcome`] if only the
+    /// follow-up refresh fails; inspect [`CommitOutcome::status`] for it.
     pub fn commit(
         &self,
         message: &str,

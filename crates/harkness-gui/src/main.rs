@@ -79,6 +79,10 @@ pub(crate) mod tests {
         drop(index);
         drop(repository);
         fs::write(repository_root.join(path), "after\n").unwrap();
+        // A second change the bridge leaves unchecked, so the commit it drives
+        // has something to exclude and the exclusion can be proved.
+        let excluded_path = Path::new("excluded.txt");
+        fs::write(repository_root.join(excluded_path), "not this one\n").unwrap();
 
         // SAFETY: set before any Qt object is constructed, and tests in this
         // binary run single-threaded with respect to Qt usage.
@@ -311,6 +315,9 @@ Kirigami.ApplicationWindow {
         && fixtureBackend.lastReviewStaged === false
         && fixtureBackend.lastReviewPath === "fixture-path"
         && reviewFixture.splitLayout === true
+        && selectionDetected === true
+        && commitScopeDetected === true
+        && amendGatingDetected === true
         && pairedRowsDetected === true
         && reviewBusyDetected === true
         && mutationBusyDetected === true
@@ -325,7 +332,10 @@ Kirigami.ApplicationWindow {
         && deepScrollDetected === true
         && realBridgePassed === true
         ? "GitPanelSmokePassed"
-        : "GitPanelSmokeFailed-" + pairedRowsDetected
+        : "GitPanelSmokeFailed-" + selectionDetected
+            + "-" + commitScopeDetected
+            + "-" + amendGatingDetected
+            + "-" + pairedRowsDetected
             + "-" + reviewBusyDetected
             + "-" + mutationBusyDetected
             + "-" + operationBusyDetected
@@ -348,6 +358,9 @@ Kirigami.ApplicationWindow {
     height: screenshotPath.length > 0 ? 1140 : 720
 
     property bool reviewBusyDetected: false
+    property bool selectionDetected: false
+    property bool commitScopeDetected: false
+    property bool amendGatingDetected: false
     property bool pairedRowsDetected: false
     property bool mutationBusyDetected: false
     property bool operationBusyDetected: false
@@ -647,19 +660,23 @@ Kirigami.ApplicationWindow {
                 ? []
                 : realBackend.git.entries;
             if (realBridgePhase === 1) {
-                if (entries.length === 0)
+                if (entries.length < 2)
                     return;
-                realPathId = String(entries[0].pathId || "");
+                for (let index = 0; index < entries.length; ++index) {
+                    if (String(entries[index].path) === "bridge.txt")
+                        realPathId = String(entries[index].pathId || "");
+                }
                 if (realPathId.length === 0)
                     return;
                 realBridgePhase = 2;
                 realBackend.reviewWorkingChanges(realProjectId, false, realPathId);
             } else if (realBridgePhase === 3) {
-                // The commit stages as it goes, so a clean working tree
-                // afterwards is the whole assertion: nothing was left behind
-                // for a second step to pick up.
-                if (entries.length !== 0
-                        || String(realBackend.git.error || "").length > 0)
+                // The commit stages as it goes, so what survives is the whole
+                // assertion: the checked path is gone from the list and the
+                // unchecked one is still sitting there, untouched.
+                if (String(realBackend.git.error || "").length > 0
+                        || entries.length !== 1
+                        || String(entries[0].path) !== "excluded.txt")
                     return;
                 realBridgePhase = 4;
                 realBridgePassed = true;
@@ -673,7 +690,7 @@ Kirigami.ApplicationWindow {
                     || !realReviewHasHunk())
                 return;
             realBridgePhase = 3;
-            realBackend.commit(realProjectId, "bridge commit", false);
+            realBackend.commit(realProjectId, "bridge commit", false, realPathId);
         }
     }
 
@@ -684,6 +701,8 @@ Kirigami.ApplicationWindow {
         property bool lastReviewStaged: true
         property string lastReviewPath: ""
         property int commitCalls: 0
+        property bool lastCommitAmend: false
+        property string lastCommitPathIds: ""
         property int nextPageCalls: 0
         property int previousPageCalls: 0
         property int loadReviewFileCalls: 0
@@ -742,6 +761,13 @@ Kirigami.ApplicationWindow {
                 "pathId": "fixture-path",
                 "path": "src/main.rs",
                 "staged": "added",
+                "unstaged": "modified",
+                "renameSource": "",
+                "conflicted": false
+            }, {
+                "pathId": "fixture-path-2",
+                "path": "src/lib.rs",
+                "staged": "",
                 "unstaged": "modified",
                 "renameSource": "",
                 "conflicted": false
@@ -918,8 +944,10 @@ Kirigami.ApplicationWindow {
         function clearReview() {}
         function refreshBranches(projectId) {}
         function refreshWorktrees(projectId) {}
-        function commit(projectId, message, amend) {
+        function commit(projectId, message, amend, pathIds) {
             ++commitCalls;
+            lastCommitAmend = amend;
+            lastCommitPathIds = String(pathIds);
         }
         function fetch(projectId) {}
         function pull(projectId) {}
@@ -952,12 +980,19 @@ Kirigami.ApplicationWindow {
 
     // The tab and the header toolbar are what GitPanel hosts; instantiating
     // them here as well is what makes their functions callable by name below.
+    CommitSelection {
+        id: selectionFixture
+
+        project: projectFixture
+    }
+
     ChangesPanel {
         id: changesFixture
 
         activity: activityFixture
         backend: fixtureBackend
         project: projectFixture
+        selection: selectionFixture
         visible: false
     }
 
@@ -1017,6 +1052,68 @@ Kirigami.ApplicationWindow {
         realBackend.openProject(realProjectId);
         changesFixture.selectPath("fixture-path", "added", "modified");
         fixtureBackend.jobs = [];
+
+        // Everything starts included, and a file is dropped from the commit by
+        // unchecking it rather than by moving it across the index.
+        const allEntries = fixtureBackend.git.entries;
+        selectionDetected = selectionFixture.all(allEntries)
+            && selectionFixture.countIncluded(allEntries) === 2
+            && selectionFixture.includedPathIds(allEntries)
+                === "fixture-path\nfixture-path-2";
+        selectionFixture.setIncluded("src/main.rs", false);
+        selectionDetected = selectionDetected
+            && !selectionFixture.all(allEntries)
+            && !selectionFixture.none(allEntries)
+            && selectionFixture.countIncluded(allEntries) === 1
+            && selectionFixture.includedPathIds(allEntries) === "fixture-path-2";
+        // An exclusion for a path that is no longer changed must not survive to
+        // silently hold that path back if it changes again.
+        selectionFixture.setIncluded("src/gone.rs", false);
+        selectionFixture.prune(allEntries);
+        selectionDetected = selectionDetected
+            && selectionFixture.included("src/gone.rs")
+            && !selectionFixture.included("src/main.rs");
+        selectionFixture.setAll(allEntries, false);
+        selectionDetected = selectionDetected
+            && selectionFixture.none(allEntries)
+            && selectionFixture.includedPathIds(allEntries) === "";
+        selectionFixture.setAll(allEntries, true);
+        selectionDetected = selectionDetected && selectionFixture.all(allEntries);
+
+        // The footer commits the panel's own selection, not the whole list.
+        gitPanel.selection.setIncluded("src/main.rs", false);
+        commitScopeDetected = gitPanel.includedCount === 1;
+        const commitsBefore = fixtureBackend.commitCalls;
+        gitPanel.backend.commit(
+            gitPanel.project.id,
+            "fixture commit",
+            false,
+            gitPanel.selection.includedPathIds(gitPanel.entries)
+        );
+        commitScopeDetected = commitScopeDetected
+            && fixtureBackend.commitCalls === commitsBefore + 1
+            && fixtureBackend.lastCommitAmend === false
+            && fixtureBackend.lastCommitPathIds === "fixture-path-2";
+
+        // Amending stays available with nothing checked, because rewriting the
+        // previous commit's message is a real thing to want; committing does
+        // not, because it would record nothing.
+        gitPanel.draftSummary = "drafted subject";
+        gitPanel.selection.setAll(gitPanel.entries, false);
+        amendGatingDetected = gitPanel.includedCount === 0
+            && !gitPanel.commitAllowed()
+            && gitPanel.amendAllowed();
+        gitPanel.selection.setAll(gitPanel.entries, true);
+        amendGatingDetected = amendGatingDetected
+            && gitPanel.commitAllowed()
+            && gitPanel.amendAllowed();
+        // There is no previous commit to rewrite on an unborn branch.
+        fixtureBackend.git = Object.assign({}, fixtureBackend.git, { "unborn": true });
+        amendGatingDetected = amendGatingDetected
+            && !gitPanel.amendAllowed()
+            && gitPanel.commitAllowed();
+        fixtureBackend.git = Object.assign({}, fixtureBackend.git, { "unborn": false });
+        gitPanel.draftSummary = "";
 
         // Side-by-side collapses a replacement's two unified rows into one, so
         // the split view must display exactly one row fewer than the unified
@@ -1146,19 +1243,21 @@ Kirigami.ApplicationWindow {
             "GitPanel and ReviewSurface interaction check failed"
         );
         if screenshot_path.is_none() {
-            // The commit bridge was handed no staged content and no separate
-            // staging call: proving the working-tree bytes reached HEAD is
-            // what shows the commit staged them itself.
+            // The bridge checked one of two changed files and was handed no
+            // staged content and no separate staging call. What reached HEAD,
+            // and what did not, is the whole proof: the commit staged its own
+            // selection and left the rest alone.
             let repository = Repository::open(&repository_root).unwrap();
-            let committed = repository
+            let tree = repository
                 .head()
                 .unwrap()
                 .peel_to_commit()
                 .unwrap()
                 .tree()
-                .unwrap()
+                .unwrap();
+            let committed = tree
                 .get_path(path)
-                .expect("the commit bridge must record the changed path")
+                .expect("the commit bridge must record the checked path")
                 .to_object(&repository)
                 .unwrap();
             assert_eq!(
@@ -1167,12 +1266,23 @@ Kirigami.ApplicationWindow {
                 "the public commit bridge must record the working-tree bytes exactly"
             );
             assert!(
-                repository
-                    .statuses(None)
-                    .unwrap()
-                    .iter()
-                    .all(|entry| entry.status().is_empty()),
-                "the commit must leave nothing behind for a second staging step"
+                tree.get_path(excluded_path).is_err(),
+                "the unchecked path must stay out of the commit"
+            );
+            let statuses = repository.statuses(None).unwrap();
+            let left = statuses
+                .iter()
+                .map(|entry| (entry.path().unwrap_or_default().to_owned(), entry.status()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                left.len(),
+                1,
+                "only the unchecked path may survive the commit: {left:?}"
+            );
+            assert_eq!(left[0].0, "excluded.txt");
+            assert!(
+                left[0].1.contains(git2::Status::WT_NEW),
+                "the unchecked path must be left in the working tree, unstaged: {left:?}"
             );
         }
         // The engine must be released before the application; dropping locals

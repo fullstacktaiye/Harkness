@@ -162,18 +162,26 @@ pub mod ffi {
         #[cxx_name = "clearReview"]
         fn clear_review(self: Pin<&mut HarknessBackend>);
 
-        /// Records every working-tree change as one commit.
+        /// Records the changes named by `path_ids` as one commit.
+        ///
+        /// `path_ids` is newline-delimited, which is safe because the values
+        /// are backend-minted `path-N` tokens rather than paths or any other
+        /// user content. Unknown entries are refused rather than skipped, so a
+        /// stale token cannot silently shrink the commit.
         ///
         /// There is no separate staging step to invoke first: the index is not
         /// a surface this front end asks the user to operate. Staging happens
         /// inside the commit, under the repository lock the commit already
         /// holds, so what the Changes list showed is what the commit records.
+        /// An empty selection is only valid when amending, where it means
+        /// rewriting the previous commit's message and nothing else.
         #[qinvokable]
         fn commit(
             self: Pin<&mut HarknessBackend>,
             project_id: &QString,
             message: &QString,
             amend: bool,
+            path_ids: &QString,
         );
 
         #[qinvokable]
@@ -602,6 +610,26 @@ struct PathSelectionKey {
     unstaged_rename_source: Option<PathBuf>,
 }
 
+impl PathSelectionKey {
+    /// Every native path a commit of this one row has to name.
+    ///
+    /// A rename is one row but two paths. Naming only the destination would
+    /// record it as a new file and leave the original standing, so the source
+    /// travels with it and the commit records the rename it displayed.
+    fn commit_paths(&self) -> Vec<PathBuf> {
+        let mut paths = vec![self.path.clone()];
+        for source in [&self.staged_rename_source, &self.unstaged_rename_source]
+            .into_iter()
+            .flatten()
+        {
+            if !paths.contains(source) {
+                paths.push(source.clone());
+            }
+        }
+        paths
+    }
+}
+
 #[derive(Debug)]
 struct StatusEntryRow {
     path: PathBuf,
@@ -787,6 +815,47 @@ fn resolve_path_selection(
         return Err("The selected path belongs to a different project".to_owned());
     }
     Ok(selection.clone())
+}
+
+/// Turns the tokens QML checked into the scope one commit should record.
+///
+/// A selection covering every currently registered path becomes
+/// [`harkness_git::CommitScope::WorkingTree`] rather than a path list. The two
+/// record the same tree, but the path list has to name every path on one
+/// command line, and a working tree large enough would overrun it.
+fn resolve_commit_scope(
+    backend: &HarknessBackendRust,
+    project_id: &str,
+    path_ids: &str,
+    amend: bool,
+) -> Result<harkness_git::CommitScope, String> {
+    let mut selected = Vec::new();
+    let mut paths = Vec::new();
+    for path_id in path_ids.lines().filter(|line| !line.is_empty()) {
+        let selection = resolve_path_selection(backend, project_id, path_id)?;
+        if !selected.contains(&path_id.to_owned()) {
+            selected.push(path_id.to_owned());
+            for path in selection.commit_paths() {
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+
+    if selected.is_empty() {
+        // Amending with nothing selected rewrites the previous commit's
+        // message against its own tree, so there is nothing to stage.
+        return if amend {
+            Ok(harkness_git::CommitScope::Index)
+        } else {
+            Err("Select at least one file to commit".to_owned())
+        };
+    }
+    if selected.len() == backend.path_selections.len() {
+        return Ok(harkness_git::CommitScope::WorkingTree);
+    }
+    Ok(harkness_git::CommitScope::Paths(paths))
 }
 
 fn to_git(row: &GitStateRow, path_selection_ids: &[String]) -> QVariant {
@@ -4038,9 +4107,27 @@ impl ffi::HarknessBackend {
         clear_review_state(self);
     }
 
-    fn commit(mut self: Pin<&mut Self>, project_id: &QString, message: &QString, amend: bool) {
+    fn commit(
+        mut self: Pin<&mut Self>,
+        project_id: &QString,
+        message: &QString,
+        amend: bool,
+        path_ids: &QString,
+    ) {
         let project_id = project_id.to_string();
         let message = message.to_string();
+        let scope = match resolve_commit_scope(
+            self.as_ref().rust(),
+            &project_id,
+            &path_ids.to_string(),
+            amend,
+        ) {
+            Ok(scope) => scope,
+            Err(error) => {
+                self.as_mut().set_status(error.into());
+                return;
+            }
+        };
         let Some((job_id, cancellation)) =
             start_job(self.as_mut(), "commit", &project_id, "Commit", true)
         else {
@@ -4054,7 +4141,7 @@ impl ffi::HarknessBackend {
                         &message,
                         &harkness_git::CommitOptions::default()
                             .with_amend(amend)
-                            .with_stage_all(true),
+                            .with_scope(scope),
                         cancellation,
                     )
                     .map_err(GitFailure::from)?;
@@ -4627,9 +4714,9 @@ mod tests {
         load_review_with_initial_file_with_git, move_worktree_with_service, operation_outcome,
         project_repository_lock_scopes, project_rows, project_worktree_lifecycle_lock_scopes,
         register_path_selection, register_review_path_identity, remove_worktree_with_service,
-        replace_status_path_selections, resolve_path_selection, retreat_review_file_window,
-        retreat_review_row_window, review_content_summary, review_file_window,
-        review_hunk_exists_where, review_path, review_row_count, review_rows,
+        replace_status_path_selections, resolve_commit_scope, resolve_path_selection,
+        retreat_review_file_window, retreat_review_row_window, review_content_summary,
+        review_file_window, review_hunk_exists_where, review_path, review_row_count, review_rows,
         run_git_operation_with_git, run_git_status_with_git, selected_review_path, to_branches,
         to_git, to_jobs, to_map, to_projects, to_review, update_job, worktree_base,
         worktree_job_lock_scope,
@@ -5310,6 +5397,152 @@ mod tests {
         assert_eq!(review.loaded_file.unwrap().file.new_path, Some(first));
     }
 
+    /// A status projection with one entry per `(path, rename source)` pair.
+    fn status_row(entries: &[(&str, Option<&str>, bool)]) -> GitStateRow {
+        GitStateRow::from_status(
+            "project-1".to_owned(),
+            harkness_git::DetailedStatus {
+                head: harkness_git::HeadState::Branch {
+                    name: "topic".to_owned(),
+                },
+                upstream: None,
+                pending: None,
+                entries: entries
+                    .iter()
+                    .map(|(path, rename_source, staged)| harkness_git::StatusEntry {
+                        path: PathBuf::from(path),
+                        staged: rename_source
+                            .filter(|_| *staged)
+                            .map(|_| harkness_git::FileChange::Renamed),
+                        unstaged: if *staged {
+                            None
+                        } else {
+                            Some(
+                                rename_source.map_or(harkness_git::FileChange::Modified, |_| {
+                                    harkness_git::FileChange::Renamed
+                                }),
+                            )
+                        },
+                        rename_source: rename_source.map(PathBuf::from),
+                        conflicted: false,
+                    })
+                    .collect(),
+            },
+        )
+    }
+
+    #[test]
+    fn a_complete_selection_commits_the_working_tree_instead_of_naming_every_path() {
+        let mut backend = HarknessBackendRust::default();
+        let tokens = replace_status_path_selections(
+            &mut backend,
+            &status_row(&[("first.txt", None, false), ("second.txt", None, false)]),
+        );
+
+        assert_eq!(
+            resolve_commit_scope(&backend, "project-1", &tokens.join("\n"), false).unwrap(),
+            harkness_git::CommitScope::WorkingTree
+        );
+        // Repeats must not be counted as coverage, or a selection of one path
+        // named twice would commit the whole working tree.
+        assert_eq!(
+            resolve_commit_scope(
+                &backend,
+                "project-1",
+                &format!("{}\n{}", tokens[0], tokens[0]),
+                false,
+            )
+            .unwrap(),
+            harkness_git::CommitScope::Paths(vec![PathBuf::from("first.txt")])
+        );
+    }
+
+    #[test]
+    fn a_partial_selection_commits_exactly_the_selected_paths() {
+        let mut backend = HarknessBackendRust::default();
+        let tokens = replace_status_path_selections(
+            &mut backend,
+            &status_row(&[
+                ("first.txt", None, false),
+                ("second.txt", None, false),
+                ("third.txt", None, false),
+            ]),
+        );
+
+        assert_eq!(
+            resolve_commit_scope(
+                &backend,
+                "project-1",
+                &format!("{}\n{}", tokens[0], tokens[2]),
+                false,
+            )
+            .unwrap(),
+            harkness_git::CommitScope::Paths(vec![
+                PathBuf::from("first.txt"),
+                PathBuf::from("third.txt"),
+            ])
+        );
+    }
+
+    #[test]
+    fn committing_a_rename_names_both_of_its_native_paths() {
+        let mut backend = HarknessBackendRust::default();
+        let tokens = replace_status_path_selections(
+            &mut backend,
+            &status_row(&[
+                ("new-name.txt", Some("old-name.txt"), false),
+                ("other.txt", None, false),
+            ]),
+        );
+
+        let scope = resolve_commit_scope(&backend, "project-1", &tokens[0], false).unwrap();
+
+        assert_eq!(
+            scope,
+            harkness_git::CommitScope::Paths(vec![
+                PathBuf::from("new-name.txt"),
+                PathBuf::from("old-name.txt"),
+            ]),
+            "a rename committed by its destination alone would leave the source standing"
+        );
+    }
+
+    #[test]
+    fn an_empty_selection_is_a_message_amend_and_otherwise_a_refusal() {
+        let mut backend = HarknessBackendRust::default();
+        replace_status_path_selections(&mut backend, &status_row(&[("first.txt", None, false)]));
+
+        assert_eq!(
+            resolve_commit_scope(&backend, "project-1", "", true).unwrap(),
+            harkness_git::CommitScope::Index,
+            "amending nothing rewrites the previous message against its own tree"
+        );
+        assert!(resolve_commit_scope(&backend, "project-1", "", false).is_err());
+        assert!(resolve_commit_scope(&backend, "project-1", "\n\n", false).is_err());
+    }
+
+    #[test]
+    fn a_stale_or_foreign_token_refuses_the_whole_commit() {
+        let mut backend = HarknessBackendRust::default();
+        let tokens = replace_status_path_selections(
+            &mut backend,
+            &status_row(&[("first.txt", None, false), ("second.txt", None, false)]),
+        );
+
+        // Silently dropping the unknown entry would commit a strict subset of
+        // what the user ticked, which is the one outcome worse than refusing.
+        assert!(
+            resolve_commit_scope(
+                &backend,
+                "project-1",
+                &format!("{}\npath-does-not-exist", tokens[0]),
+                false,
+            )
+            .is_err()
+        );
+        assert!(resolve_commit_scope(&backend, "project-2", &tokens[0], false).is_err());
+    }
+
     #[test]
     fn a_path_capability_only_ever_names_the_path_it_was_minted_for() {
         let source = Path::new("source.txt");
@@ -5501,7 +5734,8 @@ mod tests {
                 |git, cancellation| {
                     git.commit(
                         "cancelled commit",
-                        &harkness_git::CommitOptions::default().with_stage_all(true),
+                        &harkness_git::CommitOptions::default()
+                            .with_scope(harkness_git::CommitScope::WorkingTree),
                         cancellation,
                     )
                     .map_err(GitFailure::from)?;

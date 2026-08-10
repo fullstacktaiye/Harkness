@@ -38,6 +38,22 @@ Item {
         project: panel.project
     }
 
+    CommitSelection {
+        id: commitSelection
+
+        project: panel.project
+    }
+
+    /// Which changed files the next commit records.
+    ///
+    /// The checkboxes in the Changes tab and the buttons in the footer are two
+    /// views of this one answer, so it is named here rather than owned by
+    /// either of them.
+    property alias selection: commitSelection
+
+    /// The commit subject being drafted, which gates both footer buttons.
+    property alias draftSummary: commitSummary.text
+
     Kirigami.Action {
         id: refreshAction
 
@@ -64,9 +80,13 @@ Item {
         if (selectedProjectId !== nextId) {
             selectedProjectId = nextId;
             backend.clearReview();
+            commitSelection.clear();
         }
         refresh();
     }
+
+    /// How many changed files the next commit would record.
+    readonly property int includedCount: commitSelection.countIncluded(entries)
 
     /// The message the backend commits: GitHub Desktop's split summary and
     /// description, joined the way Git stores them.
@@ -76,15 +96,27 @@ Item {
         return description.length > 0 ? summary + "\n\n" + description : summary;
     }
 
-    /// A commit records the whole working tree, so there is nothing to commit
-    /// when nothing has changed — the backend would refuse it, and offering the
-    /// button anyway would make the refusal the only way to find that out.
-    function commitAllowed() {
+    function commitReady() {
         return gitActivity.job("commit") === null
             && gitActivity.job("push") === null
             && !gitActivity.repositoryOperationRunning()
-            && entries.length > 0
             && commitSummary.text.trim().length > 0;
+    }
+
+    /// A commit records the checked files, so an empty selection has nothing to
+    /// record. The backend would refuse it, and offering the button anyway
+    /// would make that refusal the only way to find out.
+    function commitAllowed() {
+        return commitReady() && includedCount > 0;
+    }
+
+    /// Amending is allowed with nothing checked, where it rewrites the previous
+    /// commit's message and leaves its tree alone. It needs a commit to rewrite,
+    /// which an unborn branch does not have.
+    function amendAllowed() {
+        return commitReady()
+            && gitActivity.stateReady
+            && gitActivity.gitState.unborn !== true;
     }
 
     // Clears the commit message once the in-flight commit finishes without
@@ -97,6 +129,10 @@ Item {
                 && String(gitActivity.gitState.error || "").length === 0) {
             commitSummary.text = "";
             commitDescription.text = "";
+            // Whatever survived the commit starts checked again, so a partial
+            // commit is followed by "the rest" rather than by an empty list of
+            // boxes the user has to remember to tick.
+            commitSelection.clear();
         }
     }
 
@@ -211,6 +247,7 @@ Item {
                             activity: gitActivity
                             backend: panel.backend
                             project: panel.project
+                            selection: commitSelection
                             onPushOverrideRequested: pushOverrideDialog.open()
                         }
 
@@ -265,19 +302,24 @@ Item {
                                 Layout.fillWidth: true
 
                                 Controls.Button {
-                                    enabled: panel.commitAllowed()
+                                    Controls.ToolTip.text: panel.includedCount === 0
+                                        ? qsTr("Rewrite the previous commit's message")
+                                        : qsTr("Add the checked files to the previous commit")
+                                    Controls.ToolTip.visible: hovered
+                                    enabled: panel.amendAllowed()
                                     text: qsTr("Amend")
                                     onClicked: panel.backend.commit(
                                         panel.project.id,
                                         panel.composedCommitMessage(),
-                                        true
+                                        true,
+                                        commitSelection.includedPathIds(panel.entries)
                                     )
                                 }
 
-                                // The count is on the button because the button
-                                // is what decides it: every changed file goes
-                                // in, so the number says exactly what pressing
-                                // this will record.
+                                // The count is on the button because the boxes
+                                // above decide it: it says exactly what pressing
+                                // this will record, without having to count the
+                                // ticks to find out.
                                 Controls.Button {
                                     readonly property string destination: gitActivity.currentBranch.length > 0
                                         ? gitActivity.currentBranch
@@ -286,15 +328,16 @@ Item {
                                     Layout.fillWidth: true
                                     enabled: panel.commitAllowed()
                                     highlighted: true
-                                    text: panel.entries.length === 1
+                                    text: panel.includedCount === 1
                                         ? qsTr("Commit 1 file to %1").arg(destination)
                                         : qsTr("Commit %1 files to %2")
-                                            .arg(panel.entries.length)
+                                            .arg(panel.includedCount)
                                             .arg(destination)
                                     onClicked: panel.backend.commit(
                                         panel.project.id,
                                         panel.composedCommitMessage(),
-                                        false
+                                        false,
+                                        commitSelection.includedPathIds(panel.entries)
                                     )
                                 }
                             }
