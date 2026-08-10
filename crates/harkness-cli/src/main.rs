@@ -19,6 +19,9 @@ use clap::{
     error::{Error as ClapError, ErrorKind},
 };
 use harkness_core::{
+    Project, ProjectError, ProjectSelector, ProjectService, ProjectSource, Worktree,
+};
+use harkness_git::{
     Branch, BranchCheckout, BranchKind, BranchListOptions, Cancellation, CommitInfo, CommitOptions,
     CommitOutcome, CommitSignature, CreateBranchOptions, DEFAULT_DIFF_CONTEXT_LINES,
     DEFAULT_MAX_DIFF_FILE_SIZE, DEFAULT_MAX_DIFF_FILES, DEFAULT_MAX_DIFF_TOTAL_BYTES,
@@ -26,9 +29,8 @@ use harkness_core::{
     FetchOutcome, FileChange, FileContextOmission, FileContextRange, FileContextRequest,
     FileContextResponse, FileDiff, FileSide, GitError, GitService, GitStatus, HeadState, Hunk,
     HunkSelection, IntraLineDegradation, LogCursor, LogOptions, LogRange, PendingOperation,
-    Project, ProjectError, ProjectSelector, ProjectService, ProjectSource, PullOptions,
-    PullOutcome, PullStrategy, PushOptions, PushOutcome, RefUpdate, StageOutcome, StagePathResult,
-    StatusRefreshOutcome, UpstreamStatus, Worktree, WorktreeBase,
+    PullOptions, PullOutcome, PullStrategy, PushOptions, PushOutcome, RefUpdate, StageOutcome,
+    StagePathResult, StatusEntry, StatusRefreshOutcome, UpstreamStatus, WorktreeBase,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -85,7 +87,7 @@ enum Command {
         #[command(subcommand)]
         command: ProjectCommand,
     },
-    /// Inspect and change Git repositories through the shared core service.
+    /// Inspect and change Git repositories through the dedicated Git service.
     Git {
         #[command(subcommand)]
         command: GitCommand,
@@ -2011,7 +2013,7 @@ fn resolve_project(service: &ProjectService, selector: Option<&str>) -> Result<P
 fn selected_git(
     service: &ProjectService,
     selection: ProjectSelection,
-) -> Result<harkness_core::GitService, CliError> {
+) -> Result<GitService, CliError> {
     let project = resolve_project(service, selection.project.as_deref())?;
     service.git(project.id).map_err(Into::into)
 }
@@ -2772,7 +2774,7 @@ fn head_value(head: &HeadState) -> Value {
     }
 }
 
-fn status_entry_value(entry: &harkness_core::StatusEntry) -> Value {
+fn status_entry_value(entry: &StatusEntry) -> Value {
     let (path, path_is_lossy) = wire_path(&entry.path);
     let (rename_source, rename_source_is_lossy) =
         optional_wire_path(entry.rename_source.as_deref());
@@ -3421,6 +3423,7 @@ fn git_exit_code(error: &GitError) -> u8 {
         | GitError::NoMergeBase { .. }
         | GitError::BranchAlreadyExists { .. }
         | GitError::BranchCheckedOutInWorktree { .. }
+        | GitError::WorktreeAddDestinationExists { .. }
         | GitError::WorktreeAlreadyLocked { .. }
         | GitError::WorktreeNotLocked { .. } => EXIT_CONFLICT,
         GitError::PathOutsideRepository { .. }
@@ -3463,6 +3466,8 @@ fn git_exit_code(error: &GitError) -> u8 {
         | GitError::Failed { .. }
         | GitError::TimedOut { .. }
         | GitError::Lock { .. }
+        | GitError::WorktreeAddDestinationUnavailable { .. }
+        | GitError::WorktreeAddCleanup { .. }
         | GitError::InvalidBranchName { .. }
         | GitError::InvalidStartPoint { .. }
         | GitError::NonFastForward { .. }
@@ -3516,6 +3521,12 @@ const GIT_KIND_EXIT_CODES: &[(&str, u8)] = &[
     ("current_branch_deletion", EXIT_REFUSED),
     ("default_branch_deletion", EXIT_REFUSED),
     ("branch_checked_out_in_worktree", EXIT_CONFLICT),
+    ("worktree_add_destination_exists", EXIT_CONFLICT),
+    (
+        "worktree_add_destination_unavailable",
+        EXIT_OPERATION_FAILED,
+    ),
+    ("worktree_add_cleanup", EXIT_OPERATION_FAILED),
     ("worktree_locked", EXIT_REFUSED),
     ("empty_worktree_lock_reason", EXIT_REFUSED),
     ("worktree_already_locked", EXIT_CONFLICT),
@@ -3758,6 +3769,8 @@ fn git_error_details(error: &GitError) -> Value {
             })
         }
         GitError::WorktreeNotLocked { path }
+        | GitError::WorktreeAddDestinationExists { path }
+        | GitError::WorktreeAddDestinationUnavailable { path, .. }
         | GitError::StaleHunkSelection { path }
         | GitError::BinaryHunkSelection { path }
         | GitError::OverlappingHunkSelection { path }
@@ -3766,6 +3779,14 @@ fn git_error_details(error: &GitError) -> Value {
         | GitError::DiffContent { path, .. } => {
             let (path, path_is_lossy) = wire_path(path);
             json!({ "path": path, "path_is_lossy": path_is_lossy })
+        }
+        GitError::WorktreeAddCleanup { path, detail } => {
+            let (path, path_is_lossy) = wire_path(path);
+            json!({
+                "path": path,
+                "path_is_lossy": path_is_lossy,
+                "detail": detail,
+            })
         }
         // Every hunk refusal below names an alternative in its message, and the
         // path that alternative applies to has to reach the caller as data. A
@@ -4287,6 +4308,40 @@ mod tests {
                 .find(|(kind, _)| *kind == error.kind())
                 .map(|(_, code)| *code);
             assert_eq!(declared, Some(expected), "table disagrees for {error:?}");
+        }
+    }
+
+    #[test]
+    fn worktree_transaction_errors_keep_their_exit_codes_and_paths() {
+        let path = PathBuf::from("/tmp/worktree");
+        let cases = [
+            (
+                GitError::WorktreeAddDestinationExists { path: path.clone() },
+                EXIT_CONFLICT,
+            ),
+            (
+                GitError::WorktreeAddDestinationUnavailable {
+                    path: path.clone(),
+                    source: io::Error::other("fixture"),
+                },
+                EXIT_OPERATION_FAILED,
+            ),
+            (
+                GitError::WorktreeAddCleanup {
+                    path: path.clone(),
+                    detail: "cleanup could not be verified".to_owned(),
+                },
+                EXIT_OPERATION_FAILED,
+            ),
+        ];
+        let expected_path = path.to_string_lossy();
+
+        for (error, expected) in cases {
+            assert_eq!(git_exit_code(&error), expected, "for {error:?}");
+            assert_eq!(
+                git_error_details(&error)["path"].as_str(),
+                Some(expected_path.as_ref())
+            );
         }
     }
 

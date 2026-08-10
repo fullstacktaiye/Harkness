@@ -18,7 +18,7 @@ use git2::{
     ErrorCode, FileMode, ObjectType, Oid, Patch, Repository,
 };
 
-use crate::git::{FileChange, GitError, commit, history, intra_line};
+use crate::{FileChange, GitError, commit, history, intra_line};
 
 /// The default largest file whose content Harkness will put in a diff model.
 pub const DEFAULT_MAX_DIFF_FILE_SIZE: u64 = 1024 * 1024;
@@ -123,7 +123,7 @@ impl Default for DiffOptions {
 impl DiffOptions {
     /// Removes every size and count bound.
     ///
-    /// Revalidation in [`super::hunk`] must see a superset of whatever a caller
+    /// Hunk revalidation must see a superset of whatever a caller
     /// diffed, so a file the caller could legitimately select from is never
     /// omitted merely for exceeding that caller's own display budget.
     #[must_use]
@@ -1054,7 +1054,7 @@ fn os_str_bytes(value: &OsStr) -> &[u8] {
 fn inspection(path: &Path, source: git2::Error) -> GitError {
     GitError::Inspection {
         path: path.to_path_buf(),
-        source,
+        source: source.into(),
     }
 }
 
@@ -1075,7 +1075,7 @@ mod tests {
         IntraLineRange, MAX_INTRA_LINE_BYTES,
     };
     use crate::{
-        git::{FileChange, GitError, GitService},
+        FileChange, GitError, GitService,
         testing::{Fixture, commit_all, configure_commit_identity, git, initialize_repository},
     };
 

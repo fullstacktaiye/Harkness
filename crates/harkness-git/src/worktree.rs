@@ -1,12 +1,12 @@
 //! Git worktree lifecycle primitives.
 //!
-//! Catalog ownership stays in `project`; this module knows only how to
+//! Catalog ownership stays in the embedding layer; this module knows only how to
 //! validate and mutate one repository while its caller holds the repository
 //! lock. Keeping those layers separate preserves the repository-before-catalog
 //! lock order.
 
 use std::{
-    fs,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -16,26 +16,122 @@ use std::ffi::OsString;
 use git2::{ErrorCode, Oid, Repository};
 
 use crate::{
-    git::{
-        GitError, RepositoryLock, branch, head_branch,
-        runner::{Cancellation, GitAccess, GitCommand},
-    },
-    project::WorktreeBase,
+    GitError, RepositoryLock, branch, head_branch,
+    runner::{Cancellation, GitAccess, GitCommand},
 };
+
+/// What a newly created worktree should check out.
+///
+/// The variants make branch creation, reuse, and detached checkout mutually
+/// exclusive, so callers cannot accidentally ask Git to invent a suffixed
+/// branch or attach a commit-only workspace to a made-up branch name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorktreeBase {
+    /// Create `name` from `start_point`, or from the repository HEAD when absent.
+    NewBranch {
+        name: String,
+        start_point: Option<String>,
+    },
+    /// Check out an existing local branch without creating or renaming it.
+    ExistingBranch { name: String },
+    /// Check out one commit with a detached HEAD.
+    Detached { commit: String },
+}
 
 /// One row from `git worktree list --porcelain`.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GitWorktree {
-    pub(crate) root: PathBuf,
-    pub(crate) branch: Option<String>,
-    pub(crate) locked: Option<String>,
-    pub(crate) prunable: bool,
+pub struct GitWorktree {
+    root: PathBuf,
+    branch: Option<String>,
+    locked: Option<String>,
+    prunable: bool,
+}
+
+impl GitWorktree {
+    /// The checkout path reported by Git.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The checked-out branch, or `None` for a detached worktree.
+    #[must_use]
+    pub fn branch(&self) -> Option<&str> {
+        self.branch.as_deref()
+    }
+
+    /// Whether Git has locked this worktree.
+    #[must_use]
+    pub fn is_locked(&self) -> bool {
+        self.locked.is_some()
+    }
+
+    /// Git's non-empty lock reason, when one was recorded.
+    #[must_use]
+    pub fn lock_reason(&self) -> Option<&str> {
+        self.locked.as_deref().filter(|reason| !reason.is_empty())
+    }
+
+    /// Whether Git considers this administrative record prunable.
+    #[must_use]
+    pub fn is_prunable(&self) -> bool {
+        self.prunable
+    }
+
+    /// Whether `path` identifies this checkout, including through aliases.
+    ///
+    /// This canonicalizes both paths and therefore performs blocking
+    /// filesystem I/O. When a path does not exist, its nearest existing
+    /// ancestor is canonicalized and the missing suffix is restored.
+    #[must_use]
+    pub fn matches_path(&self, path: &Path) -> bool {
+        same_path(&self.root, path)
+    }
+
+    /// Whether this checkout's `.git` file names `administrative_name`.
+    ///
+    /// This reads the checkout's `.git` file and returns `false` on any I/O or
+    /// decoding failure.
+    #[must_use]
+    pub fn matches_administrative_name(&self, administrative_name: &str) -> bool {
+        administrative_name_at(&self.root).as_deref() == Some(administrative_name)
+    }
 }
 
 /// The revision and branch identity Git actually created.
-pub(crate) struct AddedWorktree {
-    pub(crate) branch: Option<String>,
-    pub(crate) commit: Oid,
+#[derive(Debug)]
+pub struct AddedWorktree {
+    branch: Option<String>,
+    commit: Oid,
+}
+
+/// Refuses to let worktree creation reuse anything already present at its
+/// destination, including a dangling symlink that `Path::exists` misses.
+pub(crate) fn require_missing_destination(destination: &Path) -> Result<(), GitError> {
+    match fs::symlink_metadata(destination) {
+        Ok(_) => Err(GitError::WorktreeAddDestinationExists {
+            path: destination.to_path_buf(),
+        }),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(GitError::WorktreeAddDestinationUnavailable {
+            path: destination.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+impl AddedWorktree {
+    /// The branch Git checked out, or `None` for a detached worktree.
+    #[must_use]
+    pub fn branch(&self) -> Option<&str> {
+        self.branch.as_deref()
+    }
+
+    /// The full hexadecimal object ID Git resolved for the new worktree.
+    #[must_use]
+    pub fn commit_id(&self) -> String {
+        self.commit.to_string()
+    }
 }
 
 /// Adds a worktree after resolving every caller-controlled revision to a
@@ -135,22 +231,6 @@ fn refuse_checked_out(
     }
 }
 
-/// Refuses a Git-locked row using the shared typed diagnostic.
-pub(crate) fn refuse_if_locked(listed: &[GitWorktree], path: &Path) -> Result<(), GitError> {
-    let reason = listed
-        .iter()
-        .find(|worktree| same_path(&worktree.root, path))
-        .and_then(|worktree| worktree.locked.clone());
-    if let Some(reason) = reason {
-        Err(GitError::WorktreeLocked {
-            path: path.to_path_buf(),
-            reason: (!reason.is_empty()).then_some(reason),
-        })
-    } else {
-        Ok(())
-    }
-}
-
 /// Rejects lock requests that would leave later refusals without a reason and
 /// returns the exact text Git will store.
 ///
@@ -173,9 +253,9 @@ pub(crate) fn validate_lock_reason(reason: &str) -> Result<&str, GitError> {
 /// Locks a worktree after its caller has proved the row is currently unlocked.
 ///
 /// The reason is re-validated here rather than trusted from the caller so the
-/// primitive stays safe for any future caller outside `ProjectService`;
-/// `ProjectService` deliberately validates earlier as well so an invalid
-/// request never reaches a porcelain listing.
+/// primitive stays safe for any future caller. The catalog workflow
+/// deliberately validates earlier as well so an invalid request never reaches
+/// a porcelain listing.
 pub(crate) fn lock_known_unlocked(
     git_executable: &Path,
     parent: &Path,
@@ -261,7 +341,7 @@ pub(crate) fn remove_known_unlocked(
     Ok(())
 }
 
-/// Runs the mandatory best-effort cleanup sequence after `worktree add` was
+/// Runs and verifies the mandatory cleanup sequence after `worktree add` was
 /// attempted: Git removal, filesystem removal, then a targeted retry for any
 /// administrative record whose checkout disappeared during cleanup.
 pub(crate) fn cleanup_failed_add(
@@ -269,25 +349,60 @@ pub(crate) fn cleanup_failed_add(
     parent: &Path,
     lock: &RepositoryLock,
     destination: &Path,
-) {
+) -> Result<(), GitError> {
     let cancellation = Cancellation::default();
-    let _ = remove_known_unlocked(
+    let mut failures = Vec::new();
+    if let Err(error) = remove_known_unlocked(
         git_executable,
         parent,
         lock,
         destination,
         true,
         &cancellation,
-    );
-    let _ = fs::remove_dir_all(destination);
-    let _ = remove_known_unlocked(
+    ) {
+        failures.push(error.to_string());
+    }
+    if let Err(source) = fs::remove_dir_all(destination)
+        && source.kind() != io::ErrorKind::NotFound
+    {
+        failures.push(format!("filesystem removal failed: {source}"));
+    }
+    if let Err(error) = remove_known_unlocked(
         git_executable,
         parent,
         lock,
         destination,
         true,
         &cancellation,
-    );
+    ) {
+        failures.push(error.to_string());
+    }
+
+    let row_remains = match list(git_executable, parent, &cancellation) {
+        Ok(rows) => rows.iter().any(|row| row.matches_path(destination)),
+        Err(error) => {
+            failures.push(format!("could not verify administrative cleanup: {error}"));
+            true
+        }
+    };
+    let checkout_remains = match fs::symlink_metadata(destination) {
+        Ok(_) => true,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => false,
+        Err(source) => {
+            failures.push(format!("could not verify checkout cleanup: {source}"));
+            true
+        }
+    };
+    if !row_remains && !checkout_remains {
+        return Ok(());
+    }
+    if failures.is_empty() {
+        failures.push("the checkout or its Git administrative record remains".to_owned());
+    }
+    Err(GitError::WorktreeAddCleanup {
+        path: destination.to_path_buf(),
+        detail: failures.join("; "),
+    })
 }
 
 /// Lists the main and linked worktrees in Git's stable porcelain format.
@@ -392,25 +507,6 @@ pub(crate) fn same_path(left: &Path, right: &Path) -> bool {
     }
 }
 
-/// Finds a live worktree by the stable name of its Git administrative record.
-///
-/// Harkness initially creates each checkout at `worktrees/<project-id>`, so
-/// Git gives its administrative directory that UUID as well. `git worktree
-/// move` deliberately keeps that directory name, and the moved checkout's
-/// `.git` file continues to name it. That makes the UUID the identity needed to
-/// repair a catalog write interrupted after Git has already moved the checkout.
-pub(crate) fn registered_root<'a>(
-    listed: &'a [GitWorktree],
-    administrative_name: &str,
-) -> Option<&'a Path> {
-    listed
-        .iter()
-        .find(|worktree| {
-            administrative_name_at(&worktree.root).as_deref() == Some(administrative_name)
-        })
-        .map(|worktree| worktree.root.as_path())
-}
-
 fn administrative_name_at(root: &Path) -> Option<String> {
     let contents = fs::read(root.join(".git")).ok()?;
     let mut git_dir = contents.strip_prefix(b"gitdir: ")?;
@@ -450,7 +546,7 @@ fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
 fn inspection(path: &Path, source: git2::Error) -> GitError {
     GitError::Inspection {
         path: path.to_path_buf(),
-        source,
+        source: source.into(),
     }
 }
 
@@ -460,7 +556,9 @@ mod tests {
 
     #[cfg(unix)]
     use super::same_path;
-    use super::{administrative_name_at, parse_porcelain};
+    use super::{
+        AddedWorktree, administrative_name_at, parse_porcelain, require_missing_destination,
+    };
 
     #[test]
     fn parses_branch_detached_locked_and_unseparated_porcelain_rows() {
@@ -491,7 +589,46 @@ mod tests {
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].locked.as_deref(), Some(""));
+        assert!(rows[0].is_locked());
+        assert_eq!(rows[0].lock_reason(), None);
         assert_eq!(rows[1].locked.as_deref(), Some("first\nsecond"));
+        assert_eq!(rows[1].lock_reason(), Some("first\nsecond"));
+    }
+
+    #[test]
+    fn public_worktree_accessors_report_the_parsed_identity() {
+        let rows = parse_porcelain(
+            b"worktree /tmp/main\0HEAD aaaa\0branch refs/heads/main\0prunable stale\0\0",
+        )
+        .unwrap();
+        let row = &rows[0];
+
+        assert_eq!(row.root(), std::path::Path::new("/tmp/main"));
+        assert_eq!(row.branch(), Some("main"));
+        assert!(!row.is_locked());
+        assert_eq!(row.lock_reason(), None);
+        assert!(row.is_prunable());
+
+        let added = AddedWorktree {
+            branch: Some("topic".to_owned()),
+            commit: git2::Oid::ZERO_SHA1,
+        };
+        assert_eq!(added.branch(), Some("topic"));
+        assert_eq!(added.commit_id(), git2::Oid::ZERO_SHA1.to_string());
+        assert!(format!("{added:?}").contains("topic"));
+    }
+
+    #[test]
+    fn worktree_add_destinations_must_be_absent() {
+        let fixture = tempfile::tempdir().unwrap();
+        let existing = fixture.path().join("existing");
+        fs::create_dir(&existing).unwrap();
+
+        assert!(matches!(
+            require_missing_destination(&existing),
+            Err(crate::GitError::WorktreeAddDestinationExists { path }) if path == existing
+        ));
+        require_missing_destination(&fixture.path().join("missing")).unwrap();
     }
 
     #[test]

@@ -14,7 +14,7 @@ use std::{
 
 use git2::{ErrorCode, Repository, Status, StatusOptions};
 
-use crate::git::{
+use crate::{
     DetailedStatus, GitError, RepositoryLock,
     runner::{Cancellation, GitAccess, GitCommand},
     status,
@@ -74,7 +74,7 @@ pub struct StageOptions {
     /// Refresh the full repository status after all requested paths have run.
     ///
     /// Disable this when a caller is applying several user actions before one
-    /// explicit [`crate::git::GitService::detailed_status`] call.
+    /// explicit [`crate::GitService::detailed_status`] call.
     pub refresh_status: bool,
 }
 
@@ -448,7 +448,7 @@ pub(crate) fn open(root: &Path) -> Result<Repository, GitError> {
 fn inspection(root: &Path, source: git2::Error) -> GitError {
     GitError::Inspection {
         path: root.to_path_buf(),
-        source,
+        source: source.into(),
     }
 }
 
@@ -459,11 +459,8 @@ mod tests {
     use git2::Repository;
 
     use crate::{
-        git::{
-            Cancellation, CommitOptions, DetailedStatus, FileChange, GitError, GitService,
-            HeadState, PendingOperation, StageOptions, StagePathResult, StatusEntry,
-            StatusRefreshOutcome,
-        },
+        Cancellation, CommitOptions, DetailedStatus, FileChange, GitError, GitService, HeadState,
+        PendingOperation, StageOptions, StagePathResult, StatusEntry, StatusRefreshOutcome,
         testing::{
             Fixture, PROCESS_PROJECT_ROOT_ENV, commit_all, configure_commit_identity,
             initialize_repository, spawn_child,

@@ -8,7 +8,8 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use git2::{ObjectType, Repository, Signature};
-use harkness_core::{DiffOptions, DiffTarget, GitService, Project, ProjectService};
+use harkness_core::{Project, ProjectService};
+use harkness_git::{DiffOptions, DiffTarget, GitService};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -1455,7 +1456,7 @@ fn git_log_pages_statelessly_and_preserves_commit_bytes() {
 }
 
 #[test]
-fn log_ranges_and_every_revision_diff_target_use_the_shared_core_model() {
+fn log_ranges_and_every_revision_diff_target_use_the_shared_git_model() {
     let fixture = TempDir::new().unwrap();
     let data_dir = fixture.path().join("data");
     let root = fixture.path().join("revision-project");
@@ -1509,7 +1510,7 @@ fn log_ranges_and_every_revision_diff_target_use_the_shared_core_model() {
     assert_eq!(commit[0]["target"], "commit");
     assert_eq!(commit[0]["target_details"]["revision"], "feature");
     assert_eq!(commit[0]["new_path"], "feature-only.txt");
-    let core_commit = GitService::new(&root, &data_dir)
+    let git_commit = GitService::new(&root, &data_dir)
         .diff(
             DiffTarget::Commit {
                 revision: "feature".to_owned(),
@@ -1518,16 +1519,16 @@ fn log_ranges_and_every_revision_diff_target_use_the_shared_core_model() {
             &DiffOptions::default(),
         )
         .unwrap();
-    assert_eq!(core_commit.len(), commit.len());
-    assert_eq!(commit[0]["old_blob_id"], core_commit[0].old_blob_id);
-    assert_eq!(commit[0]["new_blob_id"], core_commit[0].new_blob_id);
+    assert_eq!(git_commit.len(), commit.len());
+    assert_eq!(commit[0]["old_blob_id"], git_commit[0].old_blob_id);
+    assert_eq!(commit[0]["new_blob_id"], git_commit[0].new_blob_id);
     assert_eq!(
         commit[0]["hunks"].as_array().unwrap().len(),
-        core_commit[0].hunks.len()
+        git_commit[0].hunks.len()
     );
     assert_eq!(
         commit[0]["hunks"][0]["new_start"],
-        core_commit[0].hunks[0].new_start
+        git_commit[0].hunks[0].new_start
     );
 
     let pair = diff(&["--revisions", &format!("{common}..main")]);
@@ -1965,7 +1966,7 @@ fn a_merge_conflict_is_named_without_failing_the_whole_diff() {
     assert!(!clean["hunks"].as_array().unwrap().is_empty());
 }
 
-/// Each diff bound has to reach core and be reported when it bites, or the
+/// Each diff bound has to reach the Git service and be reported when it bites, or the
 /// flags are decoration and a wiring mistake ships green.
 #[test]
 fn diff_bounds_narrow_the_response_and_name_what_they_withheld() {

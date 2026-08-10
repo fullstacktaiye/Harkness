@@ -11,14 +11,41 @@ use std::{
 };
 
 use git2::{Branch, ErrorCode, Repository, RepositoryState, Status, StatusOptions};
+use serde::{Deserialize, Serialize};
 
 use crate::{
-    catalog::entry::{GitStatus, UpstreamStatus},
-    git::{
-        GitError,
-        runner::{Cancellation, GitAccess, GitCommand},
-    },
+    GitError,
+    runner::{Cancellation, GitAccess, GitCommand},
 };
+
+/// Where a branch stands relative to the branch it tracks.
+///
+/// Resolved from local refs only. The counts answer how far apart the two refs
+/// already known to this machine are; producing one never contacts a remote.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UpstreamStatus {
+    /// The tracked branch, as `origin/main` rather than as a full ref name.
+    pub name: String,
+    /// Commits on the local branch that the upstream does not have.
+    pub ahead: usize,
+    /// Commits on the upstream that the local branch does not have.
+    pub behind: usize,
+}
+
+/// Cheap Git information collected from a repository working directory.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitStatus {
+    /// The checked-out branch, or `None` for a detached head.
+    pub branch: Option<String>,
+    /// Whether the worktree contains tracked or untracked changes.
+    pub dirty: bool,
+    /// The tracked branch and locally known divergence, when configured.
+    pub upstream: Option<UpstreamStatus>,
+    /// How many paths differ between the index and HEAD.
+    pub staged: usize,
+    /// How many tracked paths differ between the working tree and index.
+    pub unstaged: usize,
+}
 
 /// Where the checked-out commit sits relative to the branch namespace.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -337,7 +364,7 @@ fn divergence(
 fn inspection(path: &Path, source: git2::Error) -> GitError {
     GitError::Inspection {
         path: path.to_path_buf(),
-        source,
+        source: source.into(),
     }
 }
 
@@ -600,11 +627,14 @@ mod tests {
 
     use git2::{Repository, WorktreeAddOptions};
 
-    use super::{DetailedStatus, FileChange, HeadState, StatusEntry, parse_porcelain_v2};
+    use super::{
+        DetailedStatus, FileChange, GitStatus, HeadState, StatusEntry, UpstreamStatus,
+        parse_porcelain_v2,
+    };
     use crate::{
-        catalog::entry::UpstreamStatus,
-        git::{Cancellation, GitAccess, GitCommand, GitError, GitService},
-        testing::{Fixture, commit_all, initialize_repository},
+        Cancellation, GitError, GitService,
+        runner::{GitAccess, GitCommand},
+        testing::{Fixture, commit_all, git, initialize_repository},
     };
 
     /// A branch checked out with one staged and one unstaged change, as real
@@ -616,6 +646,38 @@ mod tests {
         1 M. N... 100644 100644 100644 aaa bbb staged.txt\0\
         1 .M N... 100644 100644 100644 ccc ddd unstaged.txt\0\
         ? untracked.txt\0";
+
+    #[test]
+    fn cheap_status_json_contract_is_exact() {
+        let status = GitStatus {
+            branch: Some("main".to_owned()),
+            dirty: true,
+            upstream: Some(UpstreamStatus {
+                name: "origin/main".to_owned(),
+                ahead: 2,
+                behind: 3,
+            }),
+            staged: 4,
+            unstaged: 5,
+        };
+        let expected = serde_json::json!({
+            "branch": "main",
+            "dirty": true,
+            "upstream": {
+                "name": "origin/main",
+                "ahead": 2,
+                "behind": 3
+            },
+            "staged": 4,
+            "unstaged": 5
+        });
+
+        assert_eq!(serde_json::to_value(&status).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_value::<GitStatus>(expected).unwrap(),
+            status
+        );
+    }
 
     #[test]
     fn a_branch_with_an_upstream_parses_into_head_divergence_and_entries() {
@@ -909,13 +971,19 @@ mod tests {
         let fixture = Fixture::new();
         let origin = fixture.directory("divergence-origin");
         let origin_repository = initialize_repository(&origin);
-        let mut service = fixture.service();
-        let clone = service
-            .import_repository(origin.to_str().unwrap(), &Cancellation::default(), |_| {})
-            .unwrap();
-        let cloned = Repository::open(&clone.root).unwrap();
+        let clone = fixture.root.path().join("divergence-clone");
+        git(
+            fixture.root.path(),
+            [
+                "clone",
+                "--",
+                origin.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        let cloned = Repository::open(&clone).unwrap();
 
-        let upstream = super::inspect(&clone.root).unwrap().unwrap().upstream;
+        let upstream = super::inspect(&clone).unwrap().unwrap().upstream;
         assert_eq!(
             upstream,
             Some(UpstreamStatus {
@@ -925,24 +993,24 @@ mod tests {
             })
         );
 
-        std::fs::write(clone.root.join("local.txt"), "local\n").unwrap();
+        std::fs::write(clone.join("local.txt"), "local\n").unwrap();
         commit_all(&cloned, "local commit");
         std::fs::write(origin.join("remote.txt"), "remote\n").unwrap();
         commit_all(&origin_repository, "remote commit");
 
-        let before_fetch = super::inspect(&clone.root).unwrap().unwrap().upstream;
+        let before_fetch = super::inspect(&clone).unwrap().unwrap().upstream;
         assert_eq!(
             before_fetch.map(|upstream| (upstream.ahead, upstream.behind)),
             Some((1, 0)),
             "the origin's commit was seen without a fetch"
         );
 
-        GitCommand::new("git", &clone.root, GitAccess::Network)
+        GitCommand::new("git", &clone, GitAccess::Network)
             .arg("fetch")
             .run(&Cancellation::default())
             .unwrap();
 
-        let after_fetch = super::inspect(&clone.root).unwrap().unwrap().upstream;
+        let after_fetch = super::inspect(&clone).unwrap().unwrap().upstream;
         assert_eq!(
             after_fetch.map(|upstream| (upstream.ahead, upstream.behind)),
             Some((1, 1))

@@ -1,6 +1,6 @@
 //! A lazy, read-only filesystem model for the project shell's native tree.
 //!
-//! The model is a [`QAbstractItemModel`] implemented in Rust through cxx-qt
+//! The model is a `QAbstractItemModel` implemented in Rust through cxx-qt
 //! inheritance. It lists exactly one directory level per `fetchMore` call, so
 //! expanding a node never walks more of the tree than becomes visible.
 //! [`harkness_core::list_directory`] supplies the entries, which means `.git`

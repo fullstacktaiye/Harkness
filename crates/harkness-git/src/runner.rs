@@ -30,7 +30,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::git::GitError;
+use crate::GitError;
 
 /// Git repeats a progress phase on every update, so retaining the whole stream
 /// would put megabytes of overwritten counters into a failure message. The tail
@@ -151,7 +151,7 @@ pub type CloneCancellation = Cancellation;
 
 /// What a Git invocation touches, which fixes its locking and its timeout.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GitAccess {
+pub(crate) enum GitAccess {
     /// Reads local state. Runs with `GIT_OPTIONAL_LOCKS=0`, so a status refresh
     /// never takes `index.lock` to write back a refreshed index, and is bounded
     /// by a 30 second timeout.
@@ -176,14 +176,13 @@ impl GitAccess {
 
 /// What one finished Git invocation produced.
 #[derive(Clone, Debug)]
-pub struct GitOutput {
+pub(crate) struct GitOutput {
     /// The exit code Git reported, or `None` when a signal ended it.
-    pub code: Option<i32>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) code: Option<i32>,
     /// Everything Git wrote to standard output, as raw bytes: paths in Git's
     /// output are byte strings and need not be UTF-8.
-    pub stdout: Vec<u8>,
-    /// The retained tail of Git's diagnostic output.
-    pub stderr: String,
+    pub(crate) stdout: Vec<u8>,
 }
 
 /// One invocation of the system Git executable.
@@ -207,7 +206,7 @@ pub struct GitOutput {
 /// the credential helpers configured on the machine are left exactly as the
 /// user set them, because delegating to them is how Harkness reaches a real
 /// remote without ever handling a secret itself.
-pub struct GitCommand {
+pub(crate) struct GitCommand {
     executable: PathBuf,
     working_directory: PathBuf,
     access: GitAccess,
@@ -217,7 +216,7 @@ pub struct GitCommand {
     timeout: Option<Duration>,
     // A mutation command obtained through `GitService` owns the repository
     // lock for its whole lifetime, including while it runs.
-    _repository_lock: Option<crate::git::RepositoryLock>,
+    _repository_lock: Option<crate::RepositoryLock>,
 }
 
 impl GitCommand {
@@ -245,7 +244,7 @@ impl GitCommand {
     }
 
     /// Keeps `lock` held until this command finishes or is discarded.
-    pub(crate) fn with_repository_lock(mut self, lock: crate::git::RepositoryLock) -> Self {
+    pub(crate) fn with_repository_lock(mut self, lock: crate::RepositoryLock) -> Self {
         self._repository_lock = Some(lock);
         self
     }
@@ -278,12 +277,12 @@ impl GitCommand {
 
     /// Treats `code` as success rather than failure.
     ///
-    /// Several Git verbs answer a question through their exit status:
-    /// `git diff --quiet` exits 1 for "there are differences" and
-    /// `git merge-base --is-ancestor` exits 1 for false. Without this they
-    /// would be unusable, because every non-zero status is otherwise a failure.
+    /// Some Git verbs answer a question through their exit status. For
+    /// example, `git diff --quiet` exits 1 for "there are differences".
+    /// Without this test hook, every non-zero status is a failure.
     #[must_use]
-    pub fn accept_exit_code(mut self, code: i32) -> Self {
+    #[cfg(test)]
+    pub(crate) fn accept_exit_code(mut self, code: i32) -> Self {
         self.accepted_exit_codes.push(code);
         self
     }
@@ -307,7 +306,8 @@ impl GitCommand {
     /// Setting one on a [`GitAccess::Network`] command opts that command out of
     /// the deliberate no-timeout rule; nothing in Harkness does.
     #[must_use]
-    pub fn timeout(mut self, timeout: Duration) -> Self {
+    #[cfg(test)]
+    pub(crate) fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
     }
@@ -413,11 +413,7 @@ impl GitCommand {
                 let accepted = status.success()
                     || code.is_some_and(|code| self.accepted_exit_codes.contains(&code));
                 return if accepted {
-                    Ok(GitOutput {
-                        code,
-                        stdout,
-                        stderr,
-                    })
+                    Ok(GitOutput { code, stdout })
                 } else {
                     Err(GitError::Failed {
                         command: described,
@@ -565,7 +561,7 @@ fn read_git_output(stderr: impl Read, sender: &mpsc::Sender<String>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{io, sync::mpsc};
+    use std::{fs, io, sync::mpsc};
 
     #[cfg(unix)]
     use std::time::{Duration, Instant};
@@ -573,7 +569,13 @@ mod tests {
     #[cfg(unix)]
     use super::{Cancellation, GitAccess, GitCommand};
     #[cfg(unix)]
-    use crate::{git::GitError, testing::Fixture};
+    use crate::{
+        GitError,
+        testing::{
+            Fixture, PROCESS_GIT_EXECUTABLE_ENV, PROCESS_PROJECT_ROOT_ENV, SCRUBBED_ENVIRONMENT,
+            spawn_child,
+        },
+    };
 
     /// Git overwrites a progress phase with carriage returns and only emits a
     /// newline when the phase ends, so line-oriented reads report nothing for
@@ -643,12 +645,48 @@ mod tests {
 
         assert_eq!(output.code, Some(0));
         assert_eq!(output.stdout.len(), FLOOD);
-        assert!(
-            output
-                .stderr
-                .lines()
-                .all(|line| line.contains("harkness-stderr"))
+    }
+
+    /// Set through `Command::env` on a re-executed child rather than
+    /// `std::env::set_var`, which is unsound in a multithreaded test binary
+    /// under Rust 2024. The invocation file proves the configured shim ran;
+    /// empty porcelain output alone would not.
+    #[cfg(unix)]
+    #[test]
+    fn a_redirected_parent_environment_does_not_reach_git() {
+        let fixture = Fixture::new();
+        let working_directory = fixture.directory("scrubbed");
+        let elsewhere = fixture.directory("elsewhere");
+        let invoked = fixture.root.path().join("scrubbed-invocation");
+        let scrubbed = SCRUBBED_ENVIRONMENT.join(" ");
+        let reporting_git = fixture.shim(
+            "reporting-git",
+            &format!(
+                "#!/bin/sh\n\
+                 for name in {scrubbed}; do\n\
+                 \x20 eval \"value=\\${{$name-unset}}\"\n\
+                 \x20 test \"$value\" = unset || exit 41\n\
+                 done\n\
+                 test \"$GIT_TERMINAL_PROMPT\" = 0 || exit 42\n\
+                 test \"$GIT_OPTIONAL_LOCKS\" = 0 || exit 43\n\
+                 test \"$LC_ALL\" = C || exit 44\n\
+                 test \"$GIT_EDITOR\" = harkness-has-no-editor || exit 45\n\
+                 printf '%s\\n' \"$*\" > '{}'\n",
+                invoked.display()
+            ),
         );
+
+        let mut child = spawn_child(&fixture.data_dir, "scrubbed-environment");
+        child
+            .env(PROCESS_PROJECT_ROOT_ENV, &working_directory)
+            .env(PROCESS_GIT_EXECUTABLE_ENV, &reporting_git);
+        for name in SCRUBBED_ENVIRONMENT {
+            child.env(name, elsewhere.join(name.to_ascii_lowercase()));
+        }
+
+        assert!(child.spawn().unwrap().wait().unwrap().success());
+        let invocation = fs::read_to_string(invoked).expect("the configured Git shim ran");
+        assert!(invocation.contains("worktree list --porcelain -z"));
     }
 
     #[cfg(unix)]

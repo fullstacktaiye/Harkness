@@ -2,7 +2,7 @@
 //!
 //! The three operations that reach a remote, and with them the one operation
 //! that can destroy work belonging to someone who is not the caller. The
-//! guardrails are therefore here, in the core, as typed refusals: nothing that
+//! guardrails are therefore here, in the Git layer, as typed refusals: nothing that
 //! calls Harkness gets to decide for itself whether a force push is allowed,
 //! because the window and the agent share this code and only this code.
 //!
@@ -39,13 +39,10 @@ use std::{collections::BTreeMap, path::Path};
 use git2::{ErrorCode, Oid, Repository};
 
 use crate::{
-    catalog::entry::GitStatus,
-    git::{
-        GitError, LOCAL_REMOTE, RepositoryLock, head_branch, recorded_default_branch,
-        resolve_remote,
-        runner::{Cancellation, GitAccess, GitCommand, GitOutput},
-        status,
-    },
+    GitError, GitStatus, LOCAL_REMOTE, RepositoryLock, head_branch, recorded_default_branch,
+    resolve_remote,
+    runner::{Cancellation, GitAccess, GitCommand, GitOutput},
+    status,
 };
 
 /// What one fetch should do.
@@ -819,7 +816,7 @@ fn open(root: &Path) -> Result<Repository, GitError> {
 fn inspection(root: &Path, source: git2::Error) -> GitError {
     GitError::Inspection {
         path: root.to_path_buf(),
-        source,
+        source: source.into(),
     }
 }
 
@@ -838,8 +835,7 @@ mod tests {
         fetch_arguments, pull_arguments, push_arguments, push_report,
     };
     use crate::{
-        catalog::entry::UpstreamStatus,
-        git::{Cancellation, GitError, GitService, PendingOperation},
+        Cancellation, GitError, GitService, PendingOperation, UpstreamStatus,
         testing::{
             Fixture, PROCESS_PROJECT_ROOT_ENV, PROCESS_READY_FILE_ENV, commit_all, git,
             initialize_repository, remote_with_clone, spawn_child, wait_for_child_signal,

@@ -1,9 +1,10 @@
 # Harkness
 
-Harkness is an early native AI-harness scaffold. Its Rust core maintains a local
-project catalog and can safely clone GitHub repositories through the system Git
-executable, preserving the user's existing SSH and HTTPS credential setup. Its
-core also provides cancellable branch listing and locked, typed create,
+Harkness is an early native AI-harness scaffold. Its Rust catalog core and
+dedicated Git integration crate maintain a local project catalog and safely
+clone GitHub repositories through the system Git executable, preserving the
+user's existing SSH and HTTPS credential setup. The Git layer also provides
+cancellable branch listing and locked, typed create,
 checkout, rename, delete, and upstream-management operations. The same locked
 service stages explicit paths, stages a whole working tree, unstages safely
 before or after the first commit, and creates guarded commits and amendments.
@@ -252,9 +253,9 @@ changed path loads only that path's staged and unstaged content, marks added
 and removed lines, and stages or unstages one stale-safe hunk at a time. Binary,
 byte-bounded, and line-bounded content stays visible as a named summary instead
 of eagerly creating an unbounded number of QML delegates. The review surface
-pages commit history through core cursors, compares commits or a branch against
+pages commit history through Git cursors, compares commits or a branch against
 its pinned merge-base, and loads one selected file at a time. Its virtualized
-unified and side-by-side layouts render core's intra-line ranges, apply
+unified and side-by-side layouts render the Git layer's intra-line ranges, apply
 presentation-only syntax color, expand stable blob-addressed context, and expose
 keyboard navigation between files and hunks. Managed worktree rows expose move,
 lock, and unlock while showing the stored lock reason inline.

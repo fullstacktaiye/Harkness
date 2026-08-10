@@ -454,6 +454,7 @@ dependencies = [
  "clap",
  "git2",
  "harkness-core",
+ "harkness-git",
  "libc",
  "serde",
  "serde_json",
@@ -467,13 +468,28 @@ version = "0.1.0"
 dependencies = [
  "dirs",
  "git2",
+ "harkness-git",
+ "harkness-test-fixtures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "time",
+ "uuid",
+]
+
+[[package]]
+name = "harkness-git"
+version = "0.1.0"
+dependencies = [
+ "git2",
+ "harkness-test-fixtures",
  "libc",
  "libgit2-sys",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",
- "time",
  "uuid",
 ]
 
@@ -487,8 +503,18 @@ dependencies = [
  "cxx-qt-lib",
  "git2",
  "harkness-core",
+ "harkness-git",
  "tempfile",
  "time",
+]
+
+[[package]]
+name = "harkness-test-fixtures"
+version = "0.1.0"
+dependencies = [
+ "git2",
+ "libc",
+ "tempfile",
 ]
 
 [[package]]

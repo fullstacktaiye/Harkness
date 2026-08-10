@@ -10,15 +10,17 @@ use std::{
 use git2::{ErrorCode, Repository};
 use uuid::Uuid;
 
-use crate::{
-    git::{GitError, runner::Cancellation},
-    paths::LOCKS_DIRECTORY,
-};
+use crate::{GitError, runner::Cancellation};
 
 /// Namespace for the version 5 lock identifiers, fixed forever: changing it
 /// would rename every lock file, and two Harkness builds that disagreed about
 /// the name would stop excluding each other.
 const REPOSITORY_LOCK_NAMESPACE: Uuid = Uuid::from_u128(0x7f3a_9c1e_5b2d_4e6a_9c17_2f8b_41d0_a6e3);
+
+/// Stable repository-lock namespace beneath the embedding application's data
+/// directory. Moving it would let old and new Harkness builds mutate one
+/// repository concurrently.
+const LOCKS_DIRECTORY: &str = "locks";
 
 /// How long a caller waits before the repository is reported busy.
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -39,9 +41,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 ///
 /// # Location
 ///
-/// The lock file lives in the Harkness data directory, never inside the user's
-/// `.git`. A [`Local`] project's repository is therefore never written to by
-/// the act of locking it, and a read-only repository can still be locked.
+/// The lock file lives below `locks/` in the caller-provided application data
+/// directory, never inside the user's `.git`, so acquiring a lock does not
+/// write repository metadata.
 ///
 /// # Scope
 ///
@@ -59,12 +61,12 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// it releases, takes this lock, and only then takes the exclusive catalog
 /// lock and re-verifies what it read.
 ///
-/// [`Local`]: crate::ProjectSource::Local
 #[derive(Debug)]
-pub struct RepositoryLock {
+pub(crate) struct RepositoryLock {
     /// The kernel releases the lock when this handle closes, including if the
     /// process dies holding it.
     file: File,
+    #[cfg(test)]
     path: PathBuf,
 }
 
@@ -81,10 +83,10 @@ impl RepositoryLock {
         repository: &Path,
         cancellation: &Cancellation,
     ) -> Result<Self, GitError> {
-        let path = lock_path(data_dir, repository)?;
-        let locks_directory = path.parent().unwrap_or(data_dir);
-        fs::create_dir_all(locks_directory).map_err(|source| GitError::Lock {
-            path: locks_directory.to_path_buf(),
+        let lock_dir = data_dir.join(LOCKS_DIRECTORY);
+        let path = lock_path(&lock_dir, repository)?;
+        fs::create_dir_all(&lock_dir).map_err(|source| GitError::Lock {
+            path: lock_dir.clone(),
             source,
         })?;
         let file = File::options()
@@ -101,7 +103,13 @@ impl RepositoryLock {
         let deadline = Instant::now() + ACQUIRE_TIMEOUT;
         loop {
             match file.try_lock() {
-                Ok(()) => return Ok(Self { file, path }),
+                Ok(()) => {
+                    return Ok(Self {
+                        file,
+                        #[cfg(test)]
+                        path,
+                    });
+                }
                 Err(TryLockError::WouldBlock) => {}
                 Err(TryLockError::Error(source)) => return Err(GitError::Lock { path, source }),
             }
@@ -117,9 +125,10 @@ impl RepositoryLock {
         }
     }
 
-    /// The lock file this guard holds, inside the Harkness data directory.
+    /// The lock file this guard holds, inside the configured lock directory.
+    #[cfg(test)]
     #[must_use]
-    pub fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 }
@@ -133,7 +142,7 @@ impl Drop for RepositoryLock {
 }
 
 /// Resolves the lock file shared by every worktree of one repository.
-fn lock_path(data_dir: &Path, repository: &Path) -> Result<PathBuf, GitError> {
+fn lock_path(lock_dir: &Path, repository: &Path) -> Result<PathBuf, GitError> {
     // `open` rather than `discover`: a path that is not itself a repository
     // must not be silently locked as its parent.
     let opened = match Repository::open(repository) {
@@ -146,7 +155,7 @@ fn lock_path(data_dir: &Path, repository: &Path) -> Result<PathBuf, GitError> {
         Err(source) => {
             return Err(GitError::Inspection {
                 path: repository.to_path_buf(),
-                source,
+                source: source.into(),
             });
         }
     };
@@ -164,9 +173,7 @@ fn lock_path(data_dir: &Path, repository: &Path) -> Result<PathBuf, GitError> {
         &REPOSITORY_LOCK_NAMESPACE,
         canonical.as_os_str().as_encoded_bytes(),
     );
-    Ok(data_dir
-        .join(LOCKS_DIRECTORY)
-        .join(format!("{identifier}.lock")))
+    Ok(lock_dir.join(format!("{identifier}.lock")))
 }
 
 #[cfg(test)]
@@ -180,7 +187,7 @@ mod tests {
 
     use super::RepositoryLock;
     use crate::{
-        git::{Cancellation, GitError, GitService},
+        Cancellation, GitError, GitService,
         testing::{
             Fixture, PROCESS_PROJECT_ROOT_ENV, PROCESS_READY_FILE_ENV, initialize_repository,
             spawn_child, wait_for_child_signal,
@@ -199,16 +206,20 @@ mod tests {
     }
 
     #[test]
-    fn the_lock_lives_in_the_data_directory_and_not_in_the_repository() {
+    fn the_service_derives_the_stable_lock_directory_from_its_data_directory() {
         let fixture = Fixture::new();
         let repository = fixture.directory("locked-repository");
         initialize_repository(&repository);
 
-        let lock =
-            RepositoryLock::acquire(&fixture.data_dir, &repository, &Cancellation::default())
-                .unwrap();
+        let session = GitService::new(&repository, &fixture.data_dir)
+            .lock(&Cancellation::default())
+            .unwrap();
+        let lock = &session.lock;
 
-        assert!(lock.path().starts_with(&fixture.data_dir));
+        assert_eq!(
+            lock.path().parent(),
+            Some(fixture.data_dir.join("locks").as_path())
+        );
         assert!(!lock.path().starts_with(&repository));
         assert!(
             !std::fs::read_dir(repository.join(".git"))

@@ -30,7 +30,7 @@ use std::{
 
 use git2::{ApplyLocation, ApplyOptions, AttrCheckFlags, AttrValue, Diff, Repository};
 
-use crate::git::{
+use crate::{
     Cancellation, DiffLine, DiffLineKind, DiffOptions, DiffTarget, FileChange, FileDiff, GitError,
     Hunk, RepositoryLock, StageOptions, StatusRefreshOutcome, commit, diff,
 };
@@ -731,7 +731,7 @@ fn path_bytes(path: &Path) -> Cow<'_, [u8]> {
 fn inspection(root: &Path, source: git2::Error) -> GitError {
     GitError::Inspection {
         path: root.to_path_buf(),
-        source,
+        source: source.into(),
     }
 }
 
@@ -746,10 +746,8 @@ mod tests {
 
     use super::{HunkSelection, refuse_unsupported};
     use crate::{
-        git::{
-            Cancellation, CommitOptions, DiffOmission, DiffOptions, DiffTarget, FileChange,
-            FileDiff, GitError, GitService, Hunk, StageOptions, StatusRefreshOutcome,
-        },
+        Cancellation, CommitOptions, DiffOmission, DiffOptions, DiffTarget, FileChange, FileDiff,
+        GitError, GitService, Hunk, StageOptions, StatusRefreshOutcome,
         testing::{Fixture, commit_all, configure_commit_identity, git, initialize_repository},
     };
 

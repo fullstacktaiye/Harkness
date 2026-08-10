@@ -1,7 +1,11 @@
-//! Shared application behavior for Harkness front ends.
+//! Shared catalog and cross-domain application behavior for Harkness front ends.
+//!
+//! Public project workflows use types from the lower-level [`harkness_git`]
+//! crate. It is re-exported here so an application that wants the core facade
+//! can name those types without declaring and version-aligning a second direct
+//! dependency.
 
 mod catalog;
-mod git;
 mod listing;
 mod paths;
 mod project;
@@ -9,23 +13,14 @@ mod remote;
 #[cfg(test)]
 mod testing;
 
-pub use catalog::entry::{GitStatus, Project, ProjectId, ProjectSource, UpstreamStatus};
-pub use git::{
-    Branch, BranchCheckout, BranchKind, BranchListOptions, Cancellation, CloneCancellation,
-    CommitInfo, CommitOptions, CommitOutcome, CommitSignature, CreateBranchOptions,
-    DEFAULT_DIFF_CONTEXT_LINES, DEFAULT_MAX_DIFF_FILE_SIZE, DEFAULT_MAX_DIFF_FILES,
-    DEFAULT_MAX_DIFF_TOTAL_BYTES, DetailedStatus, DiffLine, DiffLineKind, DiffOmission,
-    DiffOptions, DiffTarget, FetchOptions, FetchOutcome, FileChange, FileContextOmission,
-    FileContextRange, FileContextRequest, FileContextResponse, FileContextSource, FileDiff,
-    FileSide, GitAccess, GitCommand, GitError, GitOutput, GitService, HeadState, Hunk,
-    HunkSelection, IntraLineDegradation, IntraLineRange, LogCursor, LogOptions, LogPage, LogRange,
-    MAX_INTRA_LINE_BYTES, MAX_INTRA_LINE_COMPARISONS, PendingOperation, PullOptions, PullOutcome,
-    PullStrategy, PushOptions, PushOutcome, RefUpdate, RepositoryLock, StageOptions, StageOutcome,
-    StagePathOutcome, StagePathResult, StatusEntry, StatusRefreshOutcome,
+pub use catalog::entry::{Project, ProjectId, ProjectSource};
+pub use harkness_git;
+pub use harkness_git::{
+    Cancellation, GitError, GitService, GitStatus, InspectionSource, WorktreeBase,
 };
 pub use listing::{DirEntry, list_directory};
 pub use project::{
-    ProjectError, ProjectSelector, ProjectService, Worktree, WorktreeBase, WorktreeReconciliation,
+    ProjectError, ProjectSelector, ProjectService, Worktree, WorktreeReconciliation,
     WorktreeReconciliationSkip,
 };
 pub use remote::normalize_remote;
