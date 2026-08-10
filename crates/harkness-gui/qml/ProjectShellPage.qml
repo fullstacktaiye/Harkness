@@ -177,10 +177,6 @@ Kirigami.Page {
         }
     }
 
-    FileTreeModel {
-        id: fileModel
-    }
-
     RowLayout {
         anchors.fill: parent
         spacing: 0
@@ -198,6 +194,12 @@ Kirigami.Page {
         Kirigami.Separator {
             Layout.fillHeight: true
             visible: shell.project.available && shell.project.isGit
+        }
+
+        // I will address this some other time. I am working on adding the Diff View to the Project Shell Page, minimize Git's presence as well by hiding it in plain sight with actions.
+        /*
+        FileTreeModel {
+            id: fileModel
         }
 
         TreeView {
@@ -243,6 +245,7 @@ Kirigami.Page {
 
             Component.onCompleted: fileModel.setRoot(shell.project.root)
         }
+        */
     }
 
     Kirigami.PlaceholderMessage {
