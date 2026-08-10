@@ -17,18 +17,7 @@ Item {
     readonly property var entries: stateReady && gitState.entries !== undefined
         ? gitState.entries
         : []
-    readonly property bool diffReady: backend.diff !== undefined
-        && backend.diff
-        && backend.diff.projectId !== undefined
-        && String(backend.diff.projectId) === String(project.id)
-        && String(backend.diff.pathId) === selectedPathId
-    readonly property var diffState: diffReady ? backend.diff : ({})
-    readonly property var diffFiles: diffReady && diffState.files !== undefined
-        ? diffState.files
-        : []
-    property string diffProjectId: ""
-    property string selectedPathId: ""
-    property string selectedPath: ""
+    property string selectedProjectId: ""
     property string movingWorktreeId: ""
     property string movingWorktreeName: ""
     property string movingWorktreeRoot: ""
@@ -36,6 +25,9 @@ Item {
     property string lockingWorktreeName: ""
 
     implicitWidth: Kirigami.Units.gridUnit * 22
+    readonly property string repositoryLockScope: String(
+        project.lockScope || project.parentId || project.id
+    )
 
     Rectangle {
         anchors.fill: parent
@@ -46,7 +38,12 @@ Item {
         const target = targetProjectId === undefined ? project.id : targetProjectId;
         for (let index = 0; index < backend.jobs.length; ++index) {
             const candidate = backend.jobs[index];
-            if (String(candidate.projectId) === String(target) && candidate.kind === kind)
+            const matchesTarget = targetProjectId === undefined
+                ? String(candidate.projectId) === String(target)
+                    || String(candidate.lockScope || candidate.projectId)
+                        === repositoryLockScope
+                : String(candidate.projectId) === String(target);
+            if (matchesTarget && candidate.kind === kind)
                 return candidate;
         }
         return null;
@@ -56,7 +53,9 @@ Item {
         const running = [];
         for (let index = 0; index < backend.jobs.length; ++index) {
             const candidate = backend.jobs[index];
-            if (String(candidate.projectId) === String(project.id)
+            if ((String(candidate.projectId) === String(project.id)
+                    || String(candidate.lockScope || candidate.projectId)
+                        === repositoryLockScope)
                     && ["fetch", "pull", "push"].indexOf(candidate.kind) !== -1)
                 running.push(candidate);
         }
@@ -75,24 +74,62 @@ Item {
 
     function handleProjectChange() {
         const nextId = project && project.id !== undefined ? String(project.id) : "";
-        if (diffProjectId !== nextId) {
-            diffProjectId = nextId;
-            selectedPathId = "";
-            selectedPath = "";
-            backend.clearDiff();
+        if (selectedProjectId !== nextId) {
+            selectedProjectId = nextId;
             backend.clearReview();
         }
         refresh();
     }
 
-    function selectPath(pathId, path) {
-        selectedPathId = String(pathId);
-        selectedPath = String(path);
-        backend.refreshDiff(project.id, selectedPathId);
+    function selectPath(pathId, staged, unstaged) {
+        const selectedPathId = String(pathId);
+        // Prefer the working-tree side when both exist. The staged side stays
+        // one click away in the same review surface.
+        backend.reviewWorkingChanges(
+            project.id,
+            String(unstaged || "").length === 0
+                && String(staged || "").length > 0,
+            selectedPathId
+        );
     }
 
-    function diffTint(color) {
-        return Qt.rgba(color.r, color.g, color.b, 0.14);
+    function repositoryMutationRunning() {
+        return job("stage") !== null
+            || job("unstage") !== null
+            || job("stage_hunk") !== null
+            || job("unstage_hunk") !== null
+            || job("commit") !== null
+            || job("fetch") !== null
+            || job("pull") !== null
+            || job("push") !== null
+            || job("checkout") !== null
+            || job("create_branch") !== null
+            || job("create_worktree") !== null
+            || job("reconcile_worktrees") !== null
+            || job("move_worktree") !== null
+            || job("lock_worktree") !== null
+            || job("unlock_worktree") !== null
+            || job("remove_worktree") !== null
+            || job("remove_managed") !== null;
+    }
+
+    function reviewReadRunning() {
+        return job("review") !== null
+            || job("review_file") !== null
+            || job("review_context") !== null;
+    }
+
+    function historyReadRunning() {
+        return job("history") !== null;
+    }
+
+    function repositoryOperationRunning() {
+        return repositoryMutationRunning()
+            || reviewReadRunning()
+            || historyReadRunning()
+            || job("status") !== null
+            || job("branches") !== null
+            || job("worktrees") !== null;
     }
 
     // InlineMessage does not expose its internal label's textFormat. Wrap an
@@ -153,6 +190,7 @@ Item {
                     Controls.ToolTip.text: qsTr("Refresh Git status")
                     display: Controls.AbstractButton.IconOnly
                     enabled: panel.job("status") === null
+                        && !panel.repositoryMutationRunning()
                     icon.name: "view-refresh"
                     onClicked: panel.backend.refreshGit(panel.project.id)
                 }
@@ -206,7 +244,7 @@ Item {
 
                 Controls.Button {
                     Layout.alignment: Qt.AlignRight
-                    enabled: panel.job("push") === null
+                    enabled: !panel.repositoryOperationRunning()
                     icon.name: "dialog-warning"
                     text: qsTr("Push to default branch anyway…")
                     visible: panel.stateReady
@@ -289,15 +327,17 @@ Item {
                                 }
 
                                 Controls.ToolButton {
-                                    Controls.ToolTip.text: checked
-                                        ? qsTr("Refresh selected diff")
-                                        : qsTr("View staged and unstaged diff")
+                                    Controls.ToolTip.text: qsTr("View staged and unstaged diff")
                                     Controls.ToolTip.visible: hovered
-                                    checkable: true
-                                    checked: panel.selectedPathId === String(modelData.pathId)
                                     display: Controls.AbstractButton.TextOnly
-                                    text: checked ? qsTr("Refresh diff") : qsTr("View diff")
-                                    onClicked: panel.selectPath(modelData.pathId, modelData.path)
+                                    enabled: !panel.repositoryMutationRunning()
+                                        && !panel.reviewReadRunning()
+                                    text: qsTr("View diff")
+                                    onClicked: panel.selectPath(
+                                        modelData.pathId,
+                                        modelData.staged,
+                                        modelData.unstaged
+                                    )
                                 }
                             }
 
@@ -324,14 +364,14 @@ Item {
                                 }
 
                                 Controls.Button {
-                                    enabled: panel.job("unstage") === null
+                                    enabled: !panel.repositoryOperationRunning()
                                     text: qsTr("Unstage")
                                     visible: modelData.staged.length > 0
                                     onClicked: panel.backend.unstagePath(panel.project.id, modelData.pathId)
                                 }
 
                                 Controls.Button {
-                                    enabled: panel.job("stage") === null
+                                    enabled: !panel.repositoryOperationRunning()
                                     text: qsTr("Stage")
                                     visible: modelData.unstaged.length > 0
                                     onClicked: panel.backend.stagePath(panel.project.id, modelData.pathId)
@@ -341,230 +381,6 @@ Item {
                     }
                 }
 
-                ColumnLayout {
-                    Layout.fillWidth: true
-                    Layout.topMargin: Kirigami.Units.smallSpacing
-                    spacing: Kirigami.Units.smallSpacing
-                    visible: panel.selectedPath.length > 0
-
-                    RowLayout {
-                        Layout.fillWidth: true
-
-                        Kirigami.Heading {
-                            Layout.fillWidth: true
-                            elide: Text.ElideMiddle
-                            level: 5
-                            text: qsTr("Diff · %1").arg(panel.selectedPath)
-                            textFormat: Text.PlainText
-                        }
-
-                        Controls.BusyIndicator {
-                            Layout.preferredHeight: Kirigami.Units.iconSizes.small
-                            Layout.preferredWidth: Kirigami.Units.iconSizes.small
-                            running: panel.diffReady && panel.diffState.loading === true
-                            visible: running
-                        }
-
-                        Controls.ToolButton {
-                            Controls.ToolTip.text: qsTr("Refresh selected diff")
-                            Controls.ToolTip.visible: hovered
-                            display: Controls.AbstractButton.IconOnly
-                            enabled: !(panel.diffReady && panel.diffState.loading === true)
-                            icon.name: "view-refresh"
-                            text: qsTr("Refresh diff")
-                            onClicked: panel.backend.refreshDiff(panel.project.id, panel.selectedPathId)
-                        }
-                    }
-
-                    Kirigami.InlineMessage {
-                        Layout.fillWidth: true
-                        text: panel.escapedRichText(
-                            panel.diffReady ? panel.diffState.error || "" : ""
-                        )
-                        type: Kirigami.MessageType.Error
-                        visible: panel.diffReady
-                            && panel.diffState.error
-                            && panel.diffState.error.length > 0
-                    }
-
-                    Controls.Label {
-                        Layout.fillWidth: true
-                        color: Kirigami.Theme.disabledTextColor
-                        text: qsTr("No staged or unstaged content remains for this path.")
-                        visible: panel.diffReady
-                            && panel.diffState.loading !== true
-                            && (!panel.diffState.error || panel.diffState.error.length === 0)
-                            && panel.diffFiles.length === 0
-                        wrapMode: Text.Wrap
-                    }
-
-                    Repeater {
-                        model: panel.diffFiles
-
-                        delegate: Controls.Frame {
-                            id: fileDiffFrame
-
-                            required property var modelData
-                            readonly property var file: modelData
-
-                            Layout.fillWidth: true
-                            padding: Kirigami.Units.smallSpacing
-
-                            contentItem: ColumnLayout {
-                                spacing: Kirigami.Units.smallSpacing
-
-                                Controls.Label {
-                                    Layout.fillWidth: true
-                                    color: fileDiffFrame.file.target === "staged"
-                                        ? Kirigami.Theme.positiveTextColor
-                                        : Kirigami.Theme.textColor
-                                    font.bold: true
-                                    text: fileDiffFrame.file.target === "staged"
-                                        ? qsTr("Staged · %1").arg(fileDiffFrame.file.change)
-                                        : qsTr("Working tree · %1").arg(fileDiffFrame.file.change)
-                                    textFormat: Text.PlainText
-                                }
-
-                                Controls.Label {
-                                    Layout.fillWidth: true
-                                    color: Kirigami.Theme.disabledTextColor
-                                    elide: Text.ElideMiddle
-                                    font.family: "monospace"
-                                    text: fileDiffFrame.file.path
-                                    textFormat: Text.PlainText
-                                }
-
-                                Kirigami.InlineMessage {
-                                    Layout.fillWidth: true
-                                    text: panel.escapedRichText(fileDiffFrame.file.summary)
-                                    type: Kirigami.MessageType.Information
-                                    visible: fileDiffFrame.file.summary.length > 0
-                                }
-
-                                Repeater {
-                                    model: fileDiffFrame.file.hunks
-
-                                    delegate: Controls.Frame {
-                                        id: hunkFrame
-
-                                        required property var modelData
-                                        readonly property var hunk: modelData
-
-                                        Layout.fillWidth: true
-                                        padding: Kirigami.Units.smallSpacing
-
-                                        contentItem: ColumnLayout {
-                                            spacing: 0
-
-                                            RowLayout {
-                                                Layout.fillWidth: true
-                                                Layout.bottomMargin: Kirigami.Units.smallSpacing
-
-                                                Controls.Label {
-                                                    Layout.fillWidth: true
-                                                    color: Kirigami.Theme.highlightColor
-                                                    font.family: "monospace"
-                                                    text: hunkFrame.hunk.header
-                                                    textFormat: Text.PlainText
-                                                    wrapMode: Text.WrapAnywhere
-                                                }
-
-                                                Controls.Button {
-                                                    enabled: panel.job(
-                                                        fileDiffFrame.file.target === "staged"
-                                                            ? "unstage_hunk"
-                                                            : "stage_hunk"
-                                                    ) === null
-                                                    text: fileDiffFrame.file.target === "staged"
-                                                        ? qsTr("Unstage hunk")
-                                                        : qsTr("Stage hunk")
-                                                    onClicked: {
-                                                        if (fileDiffFrame.file.target === "staged") {
-                                                            panel.backend.unstageHunk(
-                                                                panel.project.id,
-                                                                hunkFrame.hunk.selectionId
-                                                            );
-                                                        } else {
-                                                            panel.backend.stageHunk(
-                                                                panel.project.id,
-                                                                hunkFrame.hunk.selectionId
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                            }
-
-                                            Repeater {
-                                                model: hunkFrame.hunk.lines
-
-                                                delegate: Rectangle {
-                                                    id: diffLine
-
-                                                    required property var modelData
-                                                    readonly property var line: modelData
-
-                                                    Layout.fillWidth: true
-                                                    color: line.kind === "addition"
-                                                        ? panel.diffTint(Kirigami.Theme.positiveTextColor)
-                                                        : line.kind === "deletion"
-                                                            ? panel.diffTint(Kirigami.Theme.negativeTextColor)
-                                                            : "transparent"
-                                                    implicitHeight: diffLineLayout.implicitHeight
-                                                        + Kirigami.Units.smallSpacing
-
-                                                    RowLayout {
-                                                        id: diffLineLayout
-
-                                                        anchors.fill: parent
-                                                        anchors.leftMargin: Kirigami.Units.smallSpacing
-                                                        anchors.rightMargin: Kirigami.Units.smallSpacing
-                                                        spacing: Kirigami.Units.smallSpacing
-
-                                                        Controls.Label {
-                                                            Layout.preferredWidth: Kirigami.Units.gridUnit * 3
-                                                            color: Kirigami.Theme.disabledTextColor
-                                                            font.family: "monospace"
-                                                            font.pixelSize: Kirigami.Theme.smallFont.pixelSize
-                                                            horizontalAlignment: Text.AlignRight
-                                                            text: "%1│%2"
-                                                                .arg(diffLine.line.oldLine > 0
-                                                                    ? diffLine.line.oldLine
-                                                                    : "")
-                                                                .arg(diffLine.line.newLine > 0
-                                                                    ? diffLine.line.newLine
-                                                                    : "")
-                                                        }
-
-                                                        Controls.Label {
-                                                            Layout.preferredWidth: Kirigami.Units.gridUnit
-                                                            color: diffLine.line.kind === "addition"
-                                                                ? Kirigami.Theme.positiveTextColor
-                                                                : diffLine.line.kind === "deletion"
-                                                                    ? Kirigami.Theme.negativeTextColor
-                                                                    : Kirigami.Theme.disabledTextColor
-                                                            font.bold: true
-                                                            font.family: "monospace"
-                                                            horizontalAlignment: Text.AlignHCenter
-                                                            text: diffLine.line.marker
-                                                        }
-
-                                                        Controls.Label {
-                                                            Layout.fillWidth: true
-                                                            font.family: "monospace"
-                                                            text: diffLine.line.content
-                                                            textFormat: Text.PlainText
-                                                            wrapMode: Text.WrapAnywhere
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
             }
 
             Kirigami.Separator {
@@ -589,6 +405,8 @@ Item {
 
                     Layout.fillWidth: true
                     enabled: panel.job("commit") === null
+                        && panel.job("push") === null
+                        && !panel.repositoryOperationRunning()
                     placeholderText: qsTr("Commit message")
                 }
 
@@ -597,14 +415,20 @@ Item {
 
                     Controls.Button {
                         Layout.fillWidth: true
-                        enabled: panel.job("commit") === null && commitMessage.text.trim().length > 0
+                        enabled: panel.job("commit") === null
+                            && panel.job("push") === null
+                            && !panel.repositoryOperationRunning()
+                            && commitMessage.text.trim().length > 0
                         text: qsTr("Amend")
                         onClicked: panel.backend.commit(panel.project.id, commitMessage.text, true)
                     }
 
                     Controls.Button {
                         Layout.fillWidth: true
-                        enabled: panel.job("commit") === null && commitMessage.text.trim().length > 0
+                        enabled: panel.job("commit") === null
+                            && panel.job("push") === null
+                            && !panel.repositoryOperationRunning()
+                            && commitMessage.text.trim().length > 0
                         highlighted: true
                         text: qsTr("Commit")
                         onClicked: panel.backend.commit(panel.project.id, commitMessage.text, false)
@@ -634,7 +458,7 @@ Item {
 
                     Controls.Button {
                         Layout.fillWidth: true
-                        enabled: panel.job("fetch") === null
+                        enabled: !panel.repositoryOperationRunning()
                         icon.name: "download"
                         text: qsTr("Fetch")
                         onClicked: panel.backend.fetch(panel.project.id)
@@ -643,6 +467,8 @@ Item {
                     Controls.Button {
                         Layout.fillWidth: true
                         enabled: panel.job("pull") === null
+                            && panel.job("push") === null
+                            && !panel.repositoryOperationRunning()
                         icon.name: "go-down"
                         text: qsTr("Pull")
                         onClicked: panel.backend.pull(panel.project.id)
@@ -650,7 +476,7 @@ Item {
 
                     Controls.Button {
                         Layout.fillWidth: true
-                        enabled: panel.job("push") === null
+                        enabled: !panel.repositoryOperationRunning()
                         icon.name: "go-up"
                         text: qsTr("Push")
                         onClicked: panel.backend.push(panel.project.id, false)
@@ -709,6 +535,8 @@ Item {
 
                     Layout.fillWidth: true
                     enabled: panel.job("checkout") === null
+                        && panel.job("push") === null
+                        && !panel.repositoryOperationRunning()
                     model: panel.backend.branches
                     textRole: "name"
                     valueRole: "name"
@@ -746,6 +574,8 @@ Item {
 
                         Layout.fillWidth: true
                         enabled: panel.job("create_branch") === null
+                            && panel.job("push") === null
+                            && !panel.repositoryOperationRunning()
                         placeholderText: qsTr("New branch name")
                     }
 
@@ -754,6 +584,8 @@ Item {
 
                         Layout.fillWidth: true
                         enabled: panel.job("create_branch") === null
+                            && panel.job("push") === null
+                            && !panel.repositoryOperationRunning()
                         placeholderText: qsTr("Start point")
                         text: "HEAD"
                     }
@@ -761,7 +593,10 @@ Item {
 
                 Controls.Button {
                     Layout.fillWidth: true
-                    enabled: panel.job("create_branch") === null && newBranch.text.trim().length > 0
+                    enabled: panel.job("create_branch") === null
+                        && panel.job("push") === null
+                        && !panel.repositoryOperationRunning()
+                        && newBranch.text.trim().length > 0
                     icon.name: "list-add"
                     text: qsTr("Create and switch")
                     onClicked: panel.backend.createBranch(
@@ -803,7 +638,7 @@ Item {
 
                     Controls.Button {
                         Layout.fillWidth: true
-                        enabled: panel.job("create_worktree") === null
+                        enabled: !panel.repositoryOperationRunning()
                         icon.name: "vcs-branch"
                         text: qsTr("New Worktree…")
                         onClicked: worktreeForm.visible = !worktreeForm.visible
@@ -811,7 +646,7 @@ Item {
 
                     Controls.Button {
                         Layout.fillWidth: true
-                        enabled: panel.job("reconcile_worktrees") === null
+                        enabled: !panel.repositoryOperationRunning()
                         icon.name: "view-refresh"
                         text: qsTr("Reconcile")
                         onClicked: panel.backend.reconcileWorktrees(panel.project.id)
@@ -857,7 +692,7 @@ Item {
 
                     Controls.Button {
                         Layout.fillWidth: true
-                        enabled: panel.job("create_worktree") === null
+                        enabled: !panel.repositoryOperationRunning()
                             && (worktreeMode.mode === "detached"
                                 ? worktreeStart.text.trim().length > 0
                                 : worktreeBranch.text.trim().length > 0)
@@ -927,7 +762,8 @@ Item {
 
                                 Controls.Button {
                                     Layout.fillWidth: true
-                                    enabled: panel.job(
+                                    enabled: !panel.repositoryOperationRunning()
+                                        && panel.job(
                                         worktreeRow.row.locked
                                             ? "unlock_worktree"
                                             : "lock_worktree",
@@ -955,7 +791,8 @@ Item {
 
                                 Controls.Button {
                                     Layout.fillWidth: true
-                                    enabled: !worktreeRow.row.locked
+                                    enabled: !panel.repositoryOperationRunning()
+                                        && !worktreeRow.row.locked
                                         && panel.job("move_worktree", worktreeRow.row.id) === null
                                     icon.name: "folder-move"
                                     text: worktreeRow.row.locked
@@ -1000,7 +837,8 @@ Item {
 
                     Controls.Button {
                         Layout.fillWidth: true
-                        enabled: lockReason.text.trim().length > 0
+                        enabled: !panel.repositoryOperationRunning()
+                            && lockReason.text.trim().length > 0
                             && panel.job("lock_worktree", panel.lockingWorktreeId) === null
                         icon.name: "object-locked"
                         text: qsTr("Lock worktree")
@@ -1046,7 +884,8 @@ Item {
 
                     Controls.Button {
                         Layout.fillWidth: true
-                        enabled: moveDestination.text.trim().length > 0
+                        enabled: !panel.repositoryOperationRunning()
+                            && moveDestination.text.trim().length > 0
                             && panel.job("move_worktree", panel.movingWorktreeId) === null
                         icon.name: "folder-move"
                         text: qsTr("Review and move…")

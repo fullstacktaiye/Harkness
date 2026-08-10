@@ -10,6 +10,11 @@ build = "build.rs"
 name = "harkness-gui"
 path = "src/main.rs"
 
+[[test]]
+name = "qml_smoke"
+path = "tests/qml_smoke.rs"
+harness = false
+
 [dependencies]
 cxx = "1.0"
 cxx-qt = "0.9"

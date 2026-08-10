@@ -15,6 +15,9 @@ Kirigami.Page {
     readonly property string shellName: project.worktree && project.parentName.length > 0
         ? qsTr("%1 — from %2").arg(project.displayName).arg(project.parentName)
         : project.displayName
+    readonly property string repositoryLockScope: String(
+        project.lockScope || project.parentId || project.id
+    )
 
     title: shell.shellName
 
@@ -23,6 +26,17 @@ Kirigami.Page {
         // changes in theory, but re-applying it is a no-op then.
         if (project.available)
             fileModel.setRoot(project.root);
+    }
+
+    function repositoryOperationRunning() {
+        for (let index = 0; index < backend.jobs.length; ++index) {
+            const candidate = backend.jobs[index];
+            if (String(candidate.projectId) === String(project.id)
+                    || String(candidate.lockScope || candidate.projectId)
+                        === repositoryLockScope)
+                return true;
+        }
+        return false;
     }
 
     actions: [
@@ -34,12 +48,14 @@ Kirigami.Page {
             onTriggered: shell.backend.closeProject()
         },
         Kirigami.Action {
+            enabled: !shell.repositoryOperationRunning()
             icon.name: "view-refresh"
             text: qsTr("Refresh")
             tooltip: qsTr("Re-read availability and Git state")
             onTriggered: shell.backend.openProject(shell.project.id)
         },
         Kirigami.Action {
+            enabled: !shell.repositoryOperationRunning()
             icon.name: "delete"
             text: qsTr("Remove from Harkness…")
             tooltip: shell.project.worktree
