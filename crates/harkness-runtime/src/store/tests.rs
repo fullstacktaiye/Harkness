@@ -660,6 +660,58 @@ fn an_oversized_approval_audit_record_is_refused_and_keeps_the_run_waiting() {
 }
 
 #[test]
+fn an_accumulated_approval_history_is_bounded_without_stranding_the_run() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    fixture
+        .store
+        .transition_run(run.id(), ExecutionState::Running, at(10))
+        .unwrap();
+
+    // Every approval on its own fits; the history they build up does not. This
+    // is the only column a caller can overflow without ever handing the store
+    // an oversized value, so the refusal has to arrive at the append rather
+    // than at some later transition that merely rewrites the same column.
+    let decided_by = "a".repeat(MAX_INLINE_PAYLOAD_BYTES / 8);
+    let mut approvals = 0;
+    let refusal = loop {
+        let clock = at(11 + approvals * 2);
+        fixture
+            .store
+            .transition_run(run.id(), ExecutionState::WaitingForApproval, clock)
+            .unwrap();
+        match fixture
+            .store
+            .approve_run(run.id(), &decided_by, clock + Duration::from_secs(1))
+        {
+            Ok(_) => approvals += 1,
+            Err(error) => break error,
+        }
+        assert!(approvals < 100, "the approval history never hit its bound");
+    };
+
+    assert_eq!(refusal.kind(), "payload_too_large");
+    assert!(
+        approvals > 1,
+        "the bound should be reached by accumulation, not by one oversized value"
+    );
+
+    // The run is still where the refused approval left it, and the states that
+    // do not append to the history are still reachable, so a record whose
+    // history filled up can always be ended rather than being stranded awaiting
+    // an approval it can never record.
+    let waiting = fixture.store.load_run(run.id()).unwrap();
+    assert_eq!(waiting.state(), ExecutionState::WaitingForApproval);
+    assert_eq!(waiting.approvals().len(), approvals as usize);
+    let cancelled = fixture
+        .store
+        .transition_run(run.id(), ExecutionState::Cancelled, at(500))
+        .unwrap();
+    assert_eq!(cancelled.state(), ExecutionState::Cancelled);
+}
+
+#[test]
 fn a_row_holding_more_than_a_column_may_hold_fails_to_load() {
     let fixture = Fixture::new();
     let task = stored_task(&fixture.store);

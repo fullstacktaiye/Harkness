@@ -112,7 +112,11 @@ approval history are each held to it in both directions, so a row that arrived
 from outside Harkness oversized also fails to load. A caller whose failure
 message exceeds the threshold is refused with the record left in its previous
 state and must summarize and retry; truncating silently would store something
-the caller never wrote. Every stored row is rebuilt into its wire record and
+the caller never wrote. The approval history is the one column a caller can
+overflow without ever supplying an oversized value, so its refusal has to land
+on the append rather than on some later transition that merely rewrites the
+column: a record whose history has filled up can still be cancelled, failed, or
+interrupted, and is never stranded awaiting a decision it cannot record. Every stored row is rebuilt into its wire record and
 re-validated by the domain on load, so a hand-edited row fails to load instead
 of entering the process as an impossible record, and its `schema_version` is
 probed before any other column is decoded so a future row reads as an upgrade

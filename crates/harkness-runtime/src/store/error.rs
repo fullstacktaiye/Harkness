@@ -112,9 +112,13 @@ pub enum StoreError {
         ordinal: u32,
     },
 
-    /// An inline payload exceeded [`MAX_INLINE_PAYLOAD_BYTES`].
+    /// Caller data for one column exceeded [`MAX_INLINE_PAYLOAD_BYTES`].
+    ///
+    /// The remedy depends on the column, so the message names both: a tool
+    /// payload belongs in the artifact store, while a title, a failure message,
+    /// or an approval identity is simply too long and should be shortened.
     #[error(
-        "{record}.{field} is {bytes} bytes, above the {MAX_INLINE_PAYLOAD_BYTES} byte inline limit; store the payload as an artifact instead"
+        "{record}.{field} is {bytes} bytes, above the {MAX_INLINE_PAYLOAD_BYTES} byte inline limit; shorten it, or store large content as an artifact instead"
     )]
     PayloadTooLarge {
         /// Kind of record being persisted.
@@ -470,7 +474,7 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "tool_call.input is 70000 bytes, above the 65536 byte inline limit; \
-             store the payload as an artifact instead"
+             shorten it, or store large content as an artifact instead"
         );
     }
 }
