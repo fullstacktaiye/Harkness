@@ -509,6 +509,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "harkness-runtime"
+version = "0.1.0"
+dependencies = [
+ "harkness-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "time",
+ "uuid",
+]
+
+[[package]]
 name = "harkness-test-fixtures"
 version = "0.1.0"
 dependencies = [

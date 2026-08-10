@@ -2,11 +2,12 @@
 
 ## Project Structure & Module Organization
 
-Harkness is a Rust 2024 workspace split into five crates under `crates/`:
+Harkness is a Rust 2024 workspace split into six crates under `crates/`:
 
 - `harkness-core`: project catalog, storage layout, cross-domain project workflows, and directory-listing logic shared by front ends.
 - `harkness-git`: all production Git behavior: inspection, diffs and history, file context and hunk staging, branch and worktree mutation, commits, clone and synchronization, hermetic process execution, and repository locking.
 - `harkness-test-fixtures`: hermetic repository, filesystem, and process fixtures shared only by crate tests.
+- `harkness-runtime`: typed task, run, step, and tool-call records plus the execution contracts shared by front ends.
 - `harkness-cli`: the `harkness` command and its integration tests in `tests/`.
 - `harkness-gui`: the Qt 6/KDE Kirigami application. Rust/CXX-Qt bindings live in `src/` and `cxx/`; UI components live in `qml/`.
 
@@ -43,6 +44,18 @@ must be omitted when absent. Any new `ProjectSource` variant or other data an
 older build cannot preserve requires a catalog version bump and a frozen JSON
 fixture. Same-version unknown fields are rejected instead of being silently
 dropped on the next write.
+
+New durable JSON formats use explicit schema versions and RFC 3339 UTC
+timestamps. The project catalog's human-readable `time` encoding is a legacy
+exception that remains frozen until a future catalog v3 migration; do not copy
+it into new formats. JSON-backed path fields currently require UTF-8, so
+persisting a runtime task with a non-UTF-8 workspace path is a known Unix
+limitation and must surface as a serialization error rather than lossy data.
+
+Each durable runtime record probes `schema_version` before parsing its strict
+body. Adding a field or persisted state spelling requires a version bump and an
+updated frozen fixture; current-version unknown fields remain errors. Keep the
+owned deserialization type and borrowing serialization type byte-compatible.
 
 Every worktree must name an existing parent; self-parenting, dangling parents,
 and parent cycles are invalid. Parent removal and worktree insertion both need
