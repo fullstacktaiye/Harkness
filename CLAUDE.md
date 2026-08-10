@@ -42,14 +42,16 @@ build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing lin
   fails loudly if the named test no longer exists — so renaming one requires updating
   `.github/workflows/network-integration.yml`.
 - **Fixture regeneration**: `cargo test -p harkness-runtime regenerate_the_frozen_v1_fixture --
-  --ignored` rewrites `crates/harkness-runtime/src/store/fixtures/runtime-v1.db`. Run only when
-  migration 1 itself changes; a released migration is otherwise never edited.
+  --ignored` rewrites `crates/harkness-runtime/src/store/fixtures/runtime-v1.db`, and
+  `regenerate_the_frozen_v2_fixture` rewrites `runtime-v2.db`. Run only when that migration itself
+  changes; a released migration is otherwise never edited. The v1 regenerator applies a truncated
+  ladder rather than opening a `Store`, because opening one now climbs to the newest schema.
 - **Latency targets** (`store/tests.rs`, `tool/tests.rs`): meaningful only under `--release`.
 
 ### Frozen fixtures
 
 `crates/harkness-core/src/catalog/fixtures/*.json`, `crates/harkness-runtime/src/domain/fixtures/*.json`,
-and `crates/harkness-runtime/src/store/fixtures/runtime-v1.db` pin released on-disk formats. A new
+and `crates/harkness-runtime/src/store/fixtures/runtime-v{1,2}.db` pin released on-disk formats. A new
 persisted field, state spelling, or table means a version bump plus a *new* fixture, not an edit to
 an existing one.
 
@@ -78,7 +80,8 @@ translating between two cancellation mechanisms.
   directory layout, and cross-domain workflows (import, clone, worktree lifecycle, reconcile).
   `project.rs` is ~7k lines and holds `ProjectService`, the composition point for catalog + Git.
 - **`harkness-runtime`** is split into `domain` (pure records and lifecycle state machines, no I/O),
-  `store` (SQLite persistence), and `tool` (the typed tool contract and registry). Every row is
+  `store` (SQLite persistence, including the append-only run event log and the artifact store), and
+  `tool` (the typed tool contract and registry). Every row is
   rebuilt into its wire record and re-validated by `domain` on load, so an impossible record cannot
   enter the process. `domain::ToolCall` records *that* a tool ran; `tool` is what defines and
   executes one. `store` and `tool` both build on `domain` but not on each other, so persistence and
@@ -184,4 +187,6 @@ would silently drop the identity, so constructing the variant requires naming th
 `HARKNESS_DATA_DIR` replaces the platform data directory outright; the CLI's `--data-dir` takes
 precedence over it. Tests and isolated front ends rely on this — use it rather than touching real
 user data. The directory holds `projects.json`, `projects.lock`, `runtime.db` (+ `-wal`/`-shm`),
-`locks/`, `repositories/`, and `worktrees/`.
+`artifacts/`, `locks/`, `repositories/`, and `worktrees/`. Artifact content lives at
+`artifacts/<run_id>/<artifact_id>`; the `artifacts` table records the metadata and re-derives that
+path rather than trusting the one it stored.

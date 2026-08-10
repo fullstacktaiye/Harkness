@@ -3,6 +3,7 @@
 //! Every test opens its own database under a temporary directory, so nothing
 //! here can read or write the real Harkness data directory.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use std::str::FromStr;
@@ -12,17 +13,25 @@ use std::time::Duration;
 
 use rusqlite::{Connection, TransactionBehavior};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
 
 use crate::domain::{
-    ExecutionState, Failure, Run, RunId, Step, StepId, Task, TaskId, ToolCall, ToolCallId,
-    ToolCallState, ToolCallWire,
+    ArtifactId, ExecutionState, Failure, Run, RunId, Step, StepId, Task, TaskId, ToolCall,
+    ToolCallId, ToolCallState, ToolCallWire,
 };
+use crate::tool::ArtifactWriter;
 
+use super::artifact::artifact_path;
 use super::migration::{MIGRATIONS, Migration, SCHEMA_VERSION, apply, recorded_version};
-use super::{DATABASE_FILE, MAX_INLINE_PAYLOAD_BYTES, RunCursor, RunPage, Store, guard};
+use super::redaction::tests::{MASK, Masking, SECRET, Shouting};
+use super::{
+    ARTIFACTS_DIRECTORY, Artifact, Availability, DATABASE_FILE, EventKind, EventSeq,
+    MAX_EVENT_PAGE_LIMIT, MAX_INLINE_PAYLOAD_BYTES, Redactor, RunCursor, RunEvent, RunPage, Store,
+    StoreArtifacts, guard,
+};
 
 /// Text one byte past the largest value any column will hold.
 fn oversized_text() -> String {
@@ -54,9 +63,32 @@ impl Fixture {
         Self { data_dir, store }
     }
 
+    /// A store whose every recorded byte passes through `redactor`.
+    fn redacting(redactor: Arc<dyn Redactor>) -> Self {
+        let data_dir = TempDir::new().unwrap();
+        let store = Store::open(data_dir.path()).unwrap().redacting(redactor);
+        Self { data_dir, store }
+    }
+
     fn reopen(&self) -> Store {
         Store::open(self.data_dir.path()).unwrap()
     }
+}
+
+/// The digest an artifact of `content` should carry.
+fn sha256_hex(content: &[u8]) -> String {
+    Sha256::digest(content)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn stored_artifact(store: &Store, run_id: RunId, name: &str, content: &[u8]) -> Artifact {
+    let mut sink = store
+        .create_artifact(run_id, name, "text/plain", at(20))
+        .unwrap();
+    sink.write_all(content).unwrap();
+    sink.finish().unwrap()
 }
 
 /// A deterministic instant, `offset` seconds after a fixed epoch.
@@ -1277,6 +1309,1045 @@ fn a_reader_sees_a_write_committed_by_the_writer_connection() {
     );
 }
 
+// -- events -----------------------------------------------------------------
+
+#[test]
+fn an_event_round_trips_with_its_associations() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = stored_step(&fixture.store, &run);
+    let call = stored_tool_call(&fixture.store, &step);
+    let event = RunEvent::new(EventKind::ToolProgress, at(20))
+        .for_step(step.id())
+        .for_tool_call(call.id())
+        .with_payload(json!({"completed": 3, "total": 4}));
+
+    let seq = fixture.store.append_event(run.id(), event.clone()).unwrap();
+
+    assert_eq!(seq, EventSeq::FIRST);
+    let stored = fixture.reopen().events(run.id(), None, 10).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].run_id, run.id());
+    assert_eq!(stored[0].seq, seq);
+    assert_eq!(stored[0].event, event);
+}
+
+#[test]
+fn event_sequences_are_monotonic_per_run_under_concurrent_appends() {
+    const PER_THREAD: u64 = 25;
+
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let other = queued_run(&fixture.store, &task, 5);
+    let store = Arc::new(fixture.reopen());
+
+    let appenders = (0..2)
+        .map(|appender| {
+            let store = Arc::clone(&store);
+            let run_id = run.id();
+            let other_id = other.id();
+            thread::spawn(move || {
+                let mut taken = Vec::new();
+                for index in 0..PER_THREAD {
+                    taken.push(
+                        store
+                            .append_event(
+                                run_id,
+                                RunEvent::new(EventKind::Diagnostic, at(30))
+                                    .with_payload(json!({"appender": appender, "index": index})),
+                            )
+                            .unwrap(),
+                    );
+                    // A second run appending at the same time proves the counter
+                    // is per run rather than global.
+                    store
+                        .append_event(other_id, RunEvent::new(EventKind::Diagnostic, at(30)))
+                        .unwrap();
+                }
+                taken
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut allocated = appenders
+        .into_iter()
+        .flat_map(|appender| appender.join().unwrap())
+        .map(EventSeq::get)
+        .collect::<Vec<_>>();
+    allocated.sort_unstable();
+
+    assert_eq!(
+        allocated,
+        (1..=PER_THREAD * 2).collect::<Vec<_>>(),
+        "two appenders must never be handed the same number"
+    );
+    let stored = store.events(run.id(), None, MAX_EVENT_PAGE_LIMIT).unwrap();
+    assert_eq!(
+        stored
+            .iter()
+            .map(|event| event.seq.get())
+            .collect::<Vec<_>>(),
+        (1..=PER_THREAD * 2).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        store
+            .events(other.id(), None, MAX_EVENT_PAGE_LIMIT)
+            .unwrap()[0]
+            .seq,
+        EventSeq::FIRST,
+        "each run counts from one"
+    );
+}
+
+#[test]
+fn a_state_change_and_its_event_commit_atomically_or_not_at_all() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+
+    // An event naming a step that was never stored cannot be inserted, so the
+    // transition sharing its transaction must not survive either.
+    let error = fixture
+        .store
+        .transition_run_with_event(
+            run.id(),
+            ExecutionState::Running,
+            at(10),
+            RunEvent::new(EventKind::RunStateChanged, at(10)).for_step(StepId::new()),
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "missing_parent");
+    assert_eq!(fixture.store.load_run(run.id()).unwrap(), run);
+    assert_eq!(fixture.reopen().load_run(run.id()).unwrap(), run);
+    assert!(
+        fixture.store.events(run.id(), None, 10).unwrap().is_empty(),
+        "a rolled-back transition must leave no event behind"
+    );
+
+    // And the successful pairing writes both.
+    let (running, seq) = fixture
+        .store
+        .transition_run_with_event(
+            run.id(),
+            ExecutionState::Running,
+            at(10),
+            RunEvent::new(EventKind::RunStateChanged, at(10))
+                .with_payload(json!({"from": "queued", "to": "running"})),
+        )
+        .unwrap();
+    assert_eq!(running.state(), ExecutionState::Running);
+    assert_eq!(seq, EventSeq::FIRST);
+    let reopened = fixture.reopen();
+    assert_eq!(reopened.load_run(run.id()).unwrap(), running);
+    assert_eq!(reopened.events(run.id(), None, 10).unwrap().len(), 1);
+}
+
+#[test]
+fn an_invalid_transition_writes_no_event() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+
+    let error = fixture
+        .store
+        .transition_run_with_event(
+            run.id(),
+            ExecutionState::Succeeded,
+            at(10),
+            RunEvent::new(EventKind::RunStateChanged, at(10)),
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "invalid_transition");
+    assert_eq!(fixture.store.load_run(run.id()).unwrap(), run);
+    assert!(fixture.store.events(run.id(), None, 10).unwrap().is_empty());
+}
+
+#[test]
+fn a_tool_call_transition_and_its_event_commit_together() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = stored_step(&fixture.store, &run);
+    let call = stored_tool_call(&fixture.store, &step);
+
+    let (running, seq) = fixture
+        .store
+        .transition_tool_call_with_event(
+            call.id(),
+            ToolCallState::Running,
+            at(10),
+            RunEvent::new(EventKind::ToolCallStateChanged, at(10))
+                .for_step(step.id())
+                .for_tool_call(call.id())
+                .with_payload(json!({"to": "running"})),
+        )
+        .unwrap();
+
+    assert_eq!(running.state(), ToolCallState::Running);
+    let stored = fixture.reopen().events(run.id(), None, 10).unwrap();
+    assert_eq!(stored[0].seq, seq);
+    assert_eq!(stored[0].event.tool_call_id(), Some(call.id()));
+}
+
+#[test]
+fn oversized_event_payloads_become_artifacts_with_a_reference() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = stored_step(&fixture.store, &run);
+    let full = json!({"stderr": "a".repeat(MAX_INLINE_PAYLOAD_BYTES)});
+
+    fixture
+        .store
+        .append_event(
+            run.id(),
+            RunEvent::new(EventKind::Diagnostic, at(20))
+                .for_step(step.id())
+                .with_payload(full.clone()),
+        )
+        .unwrap();
+
+    let stored = fixture.reopen().events(run.id(), None, 10).unwrap();
+    let event = &stored[0].event;
+    let reference = event
+        .overflowed_payload()
+        .expect("an oversized payload should have been spilled");
+    assert_eq!(
+        event.artifact_id(),
+        Some(reference.id),
+        "the column should point at the spilled artifact when the caller named none"
+    );
+    assert_eq!(reference.media_type, "application/json");
+    assert!(
+        serde_json::to_string(event.payload()).unwrap().len() < MAX_INLINE_PAYLOAD_BYTES,
+        "the inline payload must be under the threshold"
+    );
+
+    // The full bytes round-trip through the artifact, which is the whole point
+    // of spilling rather than refusing.
+    let bytes = fixture.store.read_artifact(reference.id).unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), full);
+    let artifact = fixture.store.artifact(reference.id).unwrap();
+    assert_eq!(artifact.byte_size(), reference.byte_size);
+    assert_eq!(artifact.step_id(), Some(step.id()));
+}
+
+#[test]
+fn an_overflow_does_not_overwrite_an_artifact_the_caller_named() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let mut sink = fixture
+        .store
+        .create_artifact(run.id(), "build.log", "text/plain", at(19))
+        .unwrap();
+    sink.write_all(b"the log the caller cared about").unwrap();
+    let named = sink.finish().unwrap();
+
+    fixture
+        .store
+        .append_event(
+            run.id(),
+            RunEvent::new(EventKind::ArtifactCreated, at(20))
+                .for_artifact(named.id())
+                .with_payload(json!({"stderr": "a".repeat(MAX_INLINE_PAYLOAD_BYTES)})),
+        )
+        .unwrap();
+
+    let stored = fixture.store.events(run.id(), None, 10).unwrap();
+    let event = &stored[0].event;
+    assert_eq!(
+        event.artifact_id(),
+        Some(named.id()),
+        "the caller's reference must survive the spill"
+    );
+    assert_ne!(
+        event.overflowed_payload().unwrap().id,
+        named.id(),
+        "the payload should have gone to its own artifact"
+    );
+}
+
+#[test]
+fn an_unknown_event_kind_loads_as_opaque() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    fixture
+        .store
+        .append_event(run.id(), RunEvent::new(EventKind::Diagnostic, at(20)))
+        .unwrap();
+    // A kind a later build defines. An older binary must render it, not refuse
+    // the run it belongs to.
+    guard(&fixture.store.writer)
+        .execute(
+            "UPDATE run_events SET kind = 'sandbox_escaped' WHERE run_id = ?1",
+            [run.id().to_string()],
+        )
+        .unwrap();
+
+    let stored = fixture.store.events(run.id(), None, 10).unwrap();
+
+    assert_eq!(
+        stored[0].event.kind(),
+        &EventKind::Unrecognized("sandbox_escaped".to_owned())
+    );
+    assert!(!stored[0].event.kind().is_recognized());
+    assert_eq!(stored[0].event.kind().to_string(), "sandbox_escaped");
+}
+
+#[test]
+fn event_pages_by_sequence_survive_concurrent_appends() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    for index in 0..5 {
+        fixture
+            .store
+            .append_event(
+                run.id(),
+                RunEvent::new(EventKind::Diagnostic, at(20 + index))
+                    .with_payload(json!({"index": index})),
+            )
+            .unwrap();
+    }
+
+    let mut seen = Vec::new();
+    let mut after = None;
+    let mut appended = 0;
+    loop {
+        let page = fixture.store.events(run.id(), after, 2).unwrap();
+        if page.is_empty() {
+            break;
+        }
+        after = Some(page[page.len() - 1].seq);
+        seen.extend(page.iter().map(|stored| stored.seq.get()));
+
+        // An event arriving mid-paging is newer than everything the cursor
+        // addresses, so it must appear once at the end and never displace a row
+        // of a page already returned. The appends stop so the loop can drain;
+        // a log that never stops growing is #100's problem, not paging's.
+        if appended < 3 {
+            fixture
+                .store
+                .append_event(run.id(), RunEvent::new(EventKind::Diagnostic, at(40)))
+                .unwrap();
+            appended += 1;
+        }
+    }
+
+    let mut unique = seen.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique, seen, "a page repeated an event");
+    assert_eq!(seen, (1..=5 + appended).collect::<Vec<_>>());
+}
+
+#[test]
+fn an_event_page_outside_the_supported_range_is_refused() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+
+    for limit in [0, MAX_EVENT_PAGE_LIMIT + 1] {
+        let error = fixture.store.events(run.id(), None, limit).unwrap_err();
+        assert_eq!(error.kind(), "invalid_page_limit");
+    }
+}
+
+#[test]
+fn an_event_against_an_unstored_run_is_refused() {
+    let fixture = Fixture::new();
+
+    let error = fixture
+        .store
+        .append_event(RunId::new(), RunEvent::new(EventKind::Diagnostic, at(20)))
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "missing_parent");
+}
+
+// -- artifacts ---------------------------------------------------------------
+
+#[test]
+fn artifact_hashes_and_sizes_match_streamed_content() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let content = b"diff --git a/one b/one\n@@ -1 +1 @@\n";
+
+    let mut sink = fixture
+        .store
+        .create_artifact(run.id(), "change.patch", "text/x-diff", at(20))
+        .unwrap();
+    let id = sink.id();
+    for chunk in content.chunks(7) {
+        sink.write_all(chunk).unwrap();
+    }
+    let artifact = sink.finish().unwrap();
+
+    assert_eq!(artifact.id(), id, "the identity is known before the bytes");
+    assert_eq!(artifact.byte_size(), content.len() as u64);
+    assert_eq!(artifact.sha256(), sha256_hex(content));
+    assert_eq!(artifact.availability(), Availability::Available);
+    assert_eq!(artifact.media_type(), "text/x-diff");
+    assert_eq!(fixture.reopen().read_artifact(id).unwrap(), content);
+    assert_eq!(fixture.store.artifact(id).unwrap(), artifact);
+    assert_eq!(fixture.store.run_artifacts(run.id()).unwrap(), [artifact]);
+}
+
+#[test]
+fn an_artifact_streams_without_accumulating_its_content() {
+    // The structural guarantee is that `ArtifactSink` is a `Write` and nothing
+    // else: there is no method taking a whole artifact, so no amount of content
+    // can be held anywhere but the fixed buffer between the sink and the file.
+    // This exercises that path with more content than any buffer in it.
+    const CHUNK: usize = 64 * 1024;
+    const CHUNKS: usize = 128;
+
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let chunk = vec![b'x'; CHUNK];
+
+    let mut sink = fixture
+        .store
+        .create_artifact(run.id(), "build.log", "text/plain", at(20))
+        .unwrap();
+    for _ in 0..CHUNKS {
+        sink.write_all(&chunk).unwrap();
+    }
+    let artifact = sink.finish().unwrap();
+
+    assert_eq!(artifact.byte_size(), (CHUNK * CHUNKS) as u64);
+    assert_eq!(
+        artifact.sha256(),
+        sha256_hex(&vec![b'x'; CHUNK * CHUNKS]),
+        "the recorded digest must describe the whole stream"
+    );
+    assert_eq!(artifact.availability(), Availability::Available);
+}
+
+#[test]
+fn artifact_finalize_is_write_sync_rename_then_row() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+
+    let mut sink = fixture
+        .store
+        .create_artifact(run.id(), "notes.txt", "text/plain", at(20))
+        .unwrap();
+    let id = sink.id();
+    sink.write_all(b"durable before it is recorded").unwrap();
+
+    // Stand exactly where a crash between the two phases would.
+    let sealed = sink.seal().unwrap();
+
+    let path = artifact_path(fixture.data_dir.path(), run.id(), id);
+    assert!(path.is_file(), "the bytes should already be durable");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"durable before it is recorded"
+    );
+    assert!(
+        !path.with_file_name(format!(".tmp-{id}")).exists(),
+        "the temporary name should be gone"
+    );
+    assert_eq!(
+        fixture.store.artifact(id).unwrap_err().kind(),
+        "not_found",
+        "an orphan file must leave no dangling row"
+    );
+    // The store is entirely readable across that crash point.
+    assert_eq!(fixture.reopen().load_run(run.id()).unwrap(), run);
+    assert!(fixture.store.run_artifacts(run.id()).unwrap().is_empty());
+
+    // Completing the second phase is all that is left.
+    let artifact = fixture
+        .store
+        .in_write_transaction("recording an artifact", |connection| {
+            super::artifact::insert_artifact(connection, &sealed)
+        })
+        .unwrap();
+    assert_eq!(fixture.store.artifact(id).unwrap(), artifact);
+}
+
+#[test]
+fn an_abandoned_artifact_leaves_no_row_and_no_file() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+
+    let id = {
+        let mut sink = fixture
+            .store
+            .create_artifact(run.id(), "abandoned.log", "text/plain", at(20))
+            .unwrap();
+        sink.write_all(b"never finished").unwrap();
+        sink.id()
+    };
+
+    assert!(fixture.store.run_artifacts(run.id()).unwrap().is_empty());
+    let directory = fixture
+        .data_dir
+        .path()
+        .join(ARTIFACTS_DIRECTORY)
+        .join(run.id().to_string());
+    assert_eq!(
+        std::fs::read_dir(&directory).unwrap().count(),
+        0,
+        "an abandoned write should leave nothing behind"
+    );
+    assert!(!artifact_path(fixture.data_dir.path(), run.id(), id).exists());
+}
+
+#[test]
+fn a_seal_that_fails_partway_still_removes_its_temporary_file() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+
+    let mut sink = fixture
+        .store
+        .create_artifact(run.id(), "notes.txt", "text/plain", at(20))
+        .unwrap();
+    let id = sink.id();
+    sink.write_all(b"never reaches its final name").unwrap();
+    let staged = sink.temporary().to_path_buf();
+    // A directory where the artifact wants to land, so the rename inside `seal`
+    // fails after the stream has already been taken.
+    std::fs::create_dir(artifact_path(fixture.data_dir.path(), run.id(), id)).unwrap();
+
+    let error = sink.finish().unwrap_err();
+
+    assert_eq!(error.kind(), "artifact_io");
+    assert!(
+        !staged.exists(),
+        "a seal that gave up must not strand its temporary file at {}",
+        staged.display()
+    );
+    assert_eq!(fixture.store.artifact(id).unwrap_err().kind(), "not_found");
+}
+
+#[test]
+fn a_missing_artifact_file_degrades_to_availability_missing() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let kept = stored_artifact(&fixture.store, run.id(), "kept.txt", b"still here");
+    let removed = stored_artifact(&fixture.store, run.id(), "gone.txt", b"deleted later");
+
+    std::fs::remove_file(artifact_path(
+        fixture.data_dir.path(),
+        run.id(),
+        removed.id(),
+    ))
+    .unwrap();
+
+    let store = fixture.reopen();
+    assert_eq!(
+        store.artifact(removed.id()).unwrap().availability(),
+        Availability::Missing
+    );
+    assert_eq!(
+        store.artifact(kept.id()).unwrap().availability(),
+        Availability::Available,
+        "one artifact's absence must not change another's"
+    );
+    // Everything that does not need the bytes still works.
+    assert_eq!(store.load_run(run.id()).unwrap(), run);
+    assert!(store.events(run.id(), None, 10).unwrap().is_empty());
+    assert_eq!(store.run_artifacts(run.id()).unwrap().len(), 2);
+    assert_eq!(
+        store.read_artifact(removed.id()).unwrap_err().kind(),
+        "artifact_io"
+    );
+}
+
+#[test]
+fn an_artifact_whose_bytes_changed_is_reported_as_a_size_mismatch() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let artifact = stored_artifact(&fixture.store, run.id(), "notes.txt", b"original");
+
+    std::fs::write(
+        artifact_path(fixture.data_dir.path(), run.id(), artifact.id()),
+        b"rewritten from outside",
+    )
+    .unwrap();
+
+    assert_eq!(
+        fixture
+            .store
+            .artifact(artifact.id())
+            .unwrap()
+            .availability(),
+        Availability::SizeMismatch
+    );
+}
+
+#[test]
+fn a_storage_path_outside_the_artifacts_directory_is_refused_on_read() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let tampered = stored_artifact(&fixture.store, run.id(), "notes.txt", b"content");
+    let intact = stored_artifact(&fixture.store, run.id(), "other.txt", b"content");
+    guard(&fixture.store.writer)
+        .execute(
+            "UPDATE artifacts SET storage_path = '../../.ssh/id_rsa' WHERE id = ?1",
+            [tampered.id().to_string()],
+        )
+        .unwrap();
+
+    let store = fixture.reopen();
+    for error in [
+        store.artifact(tampered.id()).unwrap_err(),
+        store.read_artifact(tampered.id()).unwrap_err(),
+        store.open_artifact(tampered.id()).unwrap_err(),
+    ] {
+        assert_eq!(error.kind(), "forbidden_artifact_path");
+        assert!(
+            error.to_string().contains("../../.ssh/id_rsa"),
+            "the refusal should name the path it declined: {error}"
+        );
+    }
+
+    // The run itself is untouched by one tampered row, and every other artifact
+    // still reads on its own.
+    assert_eq!(store.load_run(run.id()).unwrap(), run);
+    assert!(store.events(run.id(), None, 10).unwrap().is_empty());
+    assert_eq!(store.artifact(intact.id()).unwrap(), intact);
+
+    // A *listing* does fail, deliberately: dropping the bad row would hand back
+    // a list the caller reads as complete when it is not.
+    assert_eq!(
+        store.run_artifacts(run.id()).unwrap_err().kind(),
+        "forbidden_artifact_path"
+    );
+}
+
+#[test]
+fn an_artifact_against_an_unstored_run_is_refused_before_a_file_exists() {
+    let fixture = Fixture::new();
+    let unstored = RunId::new();
+
+    let error = fixture
+        .store
+        .create_artifact(unstored, "notes.txt", "text/plain", at(20))
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "missing_parent");
+    assert!(
+        !fixture
+            .data_dir
+            .path()
+            .join(ARTIFACTS_DIRECTORY)
+            .join(unstored.to_string())
+            .exists(),
+        "a refused artifact must not create its directory"
+    );
+}
+
+#[test]
+fn oversized_artifact_metadata_is_refused_before_anything_is_streamed() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+
+    for (name, media_type) in [
+        (oversized_text(), "text/plain".to_owned()),
+        ("notes.txt".to_owned(), oversized_text()),
+    ] {
+        let error = fixture
+            .store
+            .create_artifact(run.id(), &name, &media_type, at(20))
+            .unwrap_err();
+        assert_eq!(error.kind(), "payload_too_large");
+    }
+    assert!(fixture.store.run_artifacts(run.id()).unwrap().is_empty());
+}
+
+#[test]
+fn a_tool_artifact_writer_records_against_its_call() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = stored_step(&fixture.store, &run);
+    let call = stored_tool_call(&fixture.store, &step);
+    let store = Arc::new(fixture.reopen());
+    let mut artifacts = StoreArtifacts::new(Arc::clone(&store), run.id(), step.id(), call.id());
+
+    let reference = artifacts
+        .write("build.log", "text/plain", b"compiling harkness")
+        .unwrap();
+
+    let id = ArtifactId::from_str(&reference.id).unwrap();
+    let artifact = store.artifact(id).unwrap();
+    assert_eq!(artifact.name(), "build.log");
+    assert_eq!(artifact.step_id(), Some(step.id()));
+    assert_eq!(artifact.tool_call_id(), Some(call.id()));
+    assert_eq!(reference.byte_len, 18);
+    assert_eq!(store.read_artifact(id).unwrap(), b"compiling harkness");
+}
+
+#[test]
+fn a_tool_artifact_failure_is_reported_rather_than_half_stored() {
+    let fixture = Fixture::new();
+    let store = Arc::new(fixture.reopen());
+    // A run nobody stored: the writer must refuse rather than hand the tool a
+    // reference to something that was never recorded.
+    let mut artifacts = StoreArtifacts::new(store, RunId::new(), StepId::new(), ToolCallId::new());
+
+    let error = artifacts
+        .write("build.log", "text/plain", b"output")
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "execution_failed");
+    assert!(error.to_string().contains("build.log"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn artifact_files_are_readable_only_by_their_owner() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let artifact = stored_artifact(&fixture.store, run.id(), "secret.log", b"a token, probably");
+
+    let path = artifact_path(fixture.data_dir.path(), run.id(), artifact.id());
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "process output may contain anything; the umask is not a strong enough claim"
+    );
+    assert_eq!(
+        std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+}
+
+// -- redaction ---------------------------------------------------------------
+
+#[test]
+fn every_event_payload_and_artifact_byte_passes_through_the_redactor() {
+    let fixture = Fixture::redacting(Arc::new(Shouting));
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = stored_step(&fixture.store, &run);
+
+    fixture
+        .store
+        .append_event(
+            run.id(),
+            RunEvent::new(EventKind::Diagnostic, at(20)).with_payload(json!({"note": "quiet"})),
+        )
+        .unwrap();
+    fixture
+        .store
+        .transition_run_with_event(
+            run.id(),
+            ExecutionState::Running,
+            at(21),
+            RunEvent::new(EventKind::RunStateChanged, at(21))
+                .with_payload(json!({"reason": "started"})),
+        )
+        .unwrap();
+    fixture
+        .store
+        .append_event(
+            run.id(),
+            RunEvent::new(EventKind::Diagnostic, at(22))
+                .for_step(step.id())
+                .with_payload(json!({"stderr": "b".repeat(MAX_INLINE_PAYLOAD_BYTES)})),
+        )
+        .unwrap();
+    let mut sink = fixture
+        .store
+        .create_artifact(run.id(), "build.log", "text/plain", at(23))
+        .unwrap();
+    sink.write_all(b"linking harkness").unwrap();
+    let artifact = sink.finish().unwrap();
+
+    let stored = fixture.reopen().events(run.id(), None, 10).unwrap();
+    assert_eq!(stored[0].event.payload(), &json!({"note": "QUIET"}));
+    assert_eq!(stored[1].event.payload(), &json!({"reason": "STARTED"}));
+
+    // A spilled payload holds exactly what the row would have held had it fit:
+    // values scrubbed, keys intact. Redacting it through the stream wrapper
+    // instead would scrub it twice and rewrite its keys, so the same content
+    // would come back differently depending only on its size.
+    let spilled = stored[2].event.overflowed_payload().unwrap();
+    let bytes = fixture.store.read_artifact(spilled.id).unwrap();
+    assert_eq!(
+        bytes,
+        format!(r#"{{"stderr":"{}"}}"#, "B".repeat(MAX_INLINE_PAYLOAD_BYTES)).into_bytes()
+    );
+    assert_eq!(spilled.byte_size, bytes.len() as u64);
+    assert_eq!(spilled.sha256, sha256_hex(&bytes));
+
+    // And the size and digest describe what actually landed, not what arrived.
+    let content = fixture.store.read_artifact(artifact.id()).unwrap();
+    assert_eq!(content, b"LINKING HARKNESS");
+    assert_eq!(artifact.byte_size(), content.len() as u64);
+    assert_eq!(artifact.sha256(), sha256_hex(&content));
+    assert_eq!(
+        fixture
+            .store
+            .artifact(artifact.id())
+            .unwrap()
+            .availability(),
+        Availability::Available,
+        "the recorded size must match the redacted file, or every probe would disagree"
+    );
+}
+
+#[test]
+fn a_redactor_that_only_scrubs_values_still_scrubs_an_oversized_payload() {
+    let fixture = Fixture::redacting(Arc::new(Masking));
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    // Still oversized after the rule has run, so it takes the spill path.
+    let noisy = format!("{}{SECRET}", "-".repeat(MAX_INLINE_PAYLOAD_BYTES));
+
+    fixture
+        .store
+        .append_event(
+            run.id(),
+            RunEvent::new(EventKind::Diagnostic, at(20)).with_payload(json!({"stderr": noisy})),
+        )
+        .unwrap();
+
+    // `Masking` leaves `wrap_stream` as the identity, which the trait permits.
+    // If a spilled payload relied on the stream wrapper to scrub it, the secret
+    // would be durable here purely because the payload was over the threshold.
+    let stored = fixture.store.events(run.id(), None, 10).unwrap();
+    let spilled = stored[0].event.overflowed_payload().unwrap();
+    let bytes = fixture.store.read_artifact(spilled.id).unwrap();
+    let content = String::from_utf8(bytes).unwrap();
+    assert!(
+        !content.contains(SECRET),
+        "a value scrubbed under the threshold must stay scrubbed above it"
+    );
+    assert!(content.contains(MASK), "the rule should have run once");
+    assert!(
+        content.starts_with(r#"{"stderr":"#),
+        "the spilled payload should keep its published field names: {}",
+        &content[..40.min(content.len())]
+    );
+}
+
+#[test]
+fn a_rejected_write_leaves_no_spilled_artifact_behind() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let oversized = json!({"stderr": "a".repeat(MAX_INLINE_PAYLOAD_BYTES)});
+
+    // An invalid transition is an ordinary refusal, not a crash, so the spill
+    // written on the way in has to be cleaned up: an agent retrying would
+    // otherwise leave one file per attempt in a store with no collector.
+    for attempt in 0..3 {
+        let error = fixture
+            .store
+            .transition_run_with_event(
+                run.id(),
+                ExecutionState::Succeeded,
+                at(10 + attempt),
+                RunEvent::new(EventKind::RunStateChanged, at(10 + attempt))
+                    .with_payload(oversized.clone()),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), "invalid_transition");
+    }
+
+    assert!(fixture.store.run_artifacts(run.id()).unwrap().is_empty());
+    assert!(fixture.store.events(run.id(), None, 10).unwrap().is_empty());
+    let directory = fixture
+        .data_dir
+        .path()
+        .join(ARTIFACTS_DIRECTORY)
+        .join(run.id().to_string());
+    assert_eq!(
+        std::fs::read_dir(&directory).unwrap().count(),
+        0,
+        "a retried rejection must not accumulate spilled payloads"
+    );
+}
+
+#[test]
+fn an_event_cannot_associate_a_step_or_call_from_another_run() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let elsewhere = queued_run(&fixture.store, &task, 5);
+    let step = stored_step(&fixture.store, &run);
+    let call = stored_tool_call(&fixture.store, &step);
+
+    // Both records exist; neither belongs to `elsewhere`. A timeline that could
+    // name another run's step is worse than a refused write, because nothing
+    // downstream re-checks it — the wrong step is simply rendered.
+    for event in [
+        RunEvent::new(EventKind::StepStarted, at(20)).for_step(step.id()),
+        RunEvent::new(EventKind::ToolProgress, at(20)).for_tool_call(call.id()),
+    ] {
+        let error = fixture
+            .store
+            .append_event(elsewhere.id(), event)
+            .unwrap_err();
+        assert_eq!(error.kind(), "missing_parent");
+    }
+    assert!(
+        fixture
+            .store
+            .events(elsewhere.id(), None, 10)
+            .unwrap()
+            .is_empty()
+    );
+
+    // The same association against its own run is accepted.
+    fixture
+        .store
+        .append_event(
+            run.id(),
+            RunEvent::new(EventKind::StepStarted, at(20)).for_step(step.id()),
+        )
+        .unwrap();
+}
+
+#[test]
+fn an_artifact_cannot_be_attributed_to_a_step_from_another_run() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let elsewhere = queued_run(&fixture.store, &task, 5);
+    let step = stored_step(&fixture.store, &run);
+
+    let mut sink = fixture
+        .store
+        .create_artifact(elsewhere.id(), "notes.txt", "text/plain", at(20))
+        .unwrap()
+        .for_step(step.id());
+    sink.write_all(b"attributed to the wrong run").unwrap();
+    let id = sink.id();
+    let error = sink.finish().unwrap_err();
+
+    assert_eq!(error.kind(), "missing_parent");
+    assert!(
+        fixture
+            .store
+            .run_artifacts(elsewhere.id())
+            .unwrap()
+            .is_empty()
+    );
+    // A refused insert is an ordinary rejection, not the crash the orphan-file
+    // trade-off is about: a tool retrying a failing artifact write must not
+    // leave a full copy of its content behind each time.
+    assert!(
+        !artifact_path(fixture.data_dir.path(), elsewhere.id(), id).exists(),
+        "a refused artifact must not leave its content behind"
+    );
+}
+
+#[test]
+fn a_retried_tool_artifact_write_does_not_accumulate_content() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = stored_step(&fixture.store, &run);
+    let call = stored_tool_call(&fixture.store, &step);
+    let elsewhere = queued_run(&fixture.store, &task, 5);
+    let store = Arc::new(fixture.reopen());
+    // The run exists, so the content is streamed and sealed in full; the step
+    // belongs to a different run, so the insert is refused afterwards. That is
+    // the window where a whole build log can be left behind once per attempt.
+    let mut artifacts =
+        StoreArtifacts::new(Arc::clone(&store), elsewhere.id(), step.id(), call.id());
+
+    for _ in 0..3 {
+        assert_eq!(
+            artifacts
+                .write("build.log", "text/plain", b"compiling harkness")
+                .unwrap_err()
+                .kind(),
+            "execution_failed"
+        );
+    }
+
+    let directory = fixture
+        .data_dir
+        .path()
+        .join(ARTIFACTS_DIRECTORY)
+        .join(elsewhere.id().to_string());
+    assert_eq!(
+        std::fs::read_dir(&directory).unwrap().count(),
+        0,
+        "a retried tool artifact write accumulated content"
+    );
+    assert!(store.run_artifacts(elsewhere.id()).unwrap().is_empty());
+}
+
+#[test]
+fn artifact_metadata_passes_through_the_redactor_like_its_content() {
+    let fixture = Fixture::redacting(Arc::new(Masking));
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+
+    // A label is caller text that becomes durable in a column, so a tool naming
+    // its artifact after the credential it just leaked must not persist it in
+    // the one place redaction does not look.
+    let mut sink = fixture
+        .store
+        .create_artifact(
+            run.id(),
+            &format!("token-{SECRET}.log"),
+            "text/plain",
+            at(20),
+        )
+        .unwrap();
+    sink.write_all(b"content").unwrap();
+    let artifact = sink.finish().unwrap();
+
+    assert_eq!(artifact.name(), format!("token-{MASK}.log"));
+    assert!(!artifact.name().contains(SECRET));
+    assert_eq!(
+        fixture.store.artifact(artifact.id()).unwrap().name(),
+        artifact.name()
+    );
+
+    // A store-generated value is left exactly as this module wrote it, so the
+    // spilled-payload media type still reads back as its published constant.
+    fixture
+        .store
+        .append_event(
+            run.id(),
+            RunEvent::new(EventKind::Diagnostic, at(21))
+                .with_payload(json!({"stderr": "-".repeat(MAX_INLINE_PAYLOAD_BYTES)})),
+        )
+        .unwrap();
+    let spilled = fixture.store.events(run.id(), None, 10).unwrap()[0]
+        .event
+        .overflowed_payload()
+        .unwrap();
+    assert_eq!(spilled.media_type, super::OVERFLOW_PAYLOAD_MEDIA_TYPE);
+    assert_eq!(
+        fixture.store.artifact(spilled.id).unwrap().name(),
+        super::OVERFLOW_PAYLOAD_NAME
+    );
+}
+
 // -- the default data directory ---------------------------------------------
 
 const OPEN_DEFAULT_CHILD: &str = "store::tests::the_default_store_lands_in_the_overridden_data_dir";
@@ -1319,7 +2390,14 @@ fn the_data_directory_override_redirects_the_default_store() {
 
 // -- migration from a frozen database ---------------------------------------
 
-/// A later migration, standing in for the ones #88 and #92 will add.
+/// The frozen v2 database committed beside this module.
+///
+/// Written by `regenerate_the_frozen_v2_fixture`. Its artifact file is
+/// deliberately *not* committed beside it: an artifact whose bytes are gone is
+/// exactly the case a restored database has to survive.
+const FROZEN_V2_DATABASE: &[u8] = include_bytes!("fixtures/runtime-v2.db");
+
+/// A later migration, standing in for the one #92 will add.
 const LATER_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -1327,26 +2405,30 @@ const LATER_MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 2,
+        statements: include_str!("migrations/002_events_and_artifacts.sql"),
+    },
+    Migration {
+        version: 3,
         statements: "ALTER TABLE runs ADD COLUMN cancelled_by TEXT;",
     },
 ];
 
-fn restore_frozen_database() -> TempDir {
+fn restore_frozen_database(bytes: &[u8]) -> TempDir {
     let data_dir = TempDir::new().unwrap();
-    std::fs::write(data_dir.path().join(DATABASE_FILE), FROZEN_V1_DATABASE).unwrap();
+    std::fs::write(data_dir.path().join(DATABASE_FILE), bytes).unwrap();
     data_dir
 }
 
 #[test]
-fn a_frozen_v1_database_opens_and_reads_back() {
-    let data_dir = restore_frozen_database();
+fn a_v1_database_migrates_to_v2_and_still_reads_its_existing_runs() {
+    let data_dir = restore_frozen_database(FROZEN_V1_DATABASE);
 
     let store = Store::open(data_dir.path()).unwrap();
 
     assert_eq!(
         recorded_version(&guard(&store.writer)).unwrap(),
-        1,
-        "opening must not invent a migration"
+        SCHEMA_VERSION,
+        "opening a v1 database should climb the ladder"
     );
     let run = store
         .load_run(RunId::from_str(FIXTURE_RUN_ID).unwrap())
@@ -1366,11 +2448,58 @@ fn a_frozen_v1_database_opens_and_reads_back() {
             .tool_id(),
         "fs.read"
     );
+
+    // A run that predates the event log has an empty one rather than none: the
+    // new tables must be usable against inherited rows, not only against rows
+    // this build created.
+    assert!(store.events(run.id(), None, 10).unwrap().is_empty());
+    assert!(store.run_artifacts(run.id()).unwrap().is_empty());
+    let seq = store
+        .append_event(
+            run.id(),
+            RunEvent::new(EventKind::Diagnostic, at(20)).with_payload(json!({"note": "migrated"})),
+        )
+        .unwrap();
+    assert_eq!(seq, EventSeq::FIRST);
 }
 
 #[test]
-fn a_frozen_v1_database_opens_after_future_migrations() {
-    let data_dir = restore_frozen_database();
+fn a_frozen_v2_database_opens_and_reads_its_log_and_artifacts() {
+    let data_dir = restore_frozen_database(FROZEN_V2_DATABASE);
+
+    let store = Store::open(data_dir.path()).unwrap();
+
+    assert_eq!(
+        recorded_version(&guard(&store.writer)).unwrap(),
+        2,
+        "opening must not invent a migration"
+    );
+    let run_id = RunId::from_str(FIXTURE_RUN_ID).unwrap();
+    let events = store.events(run_id, None, 10).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .map(|stored| stored.event.kind().as_str())
+            .collect::<Vec<_>>(),
+        ["run_state_changed", "artifact_created"]
+    );
+    assert_eq!(events[0].seq, EventSeq::FIRST);
+
+    // The fixture ships without its artifact file, which is the shape a restored
+    // backup has: the metadata reads, the content does not, and nothing fails.
+    let artifacts = store.run_artifacts(run_id).unwrap();
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(artifacts[0].availability(), Availability::Missing);
+    assert_eq!(artifacts[0].name(), "notes.txt");
+    assert_eq!(
+        store.read_artifact(artifacts[0].id()).unwrap_err().kind(),
+        "artifact_io"
+    );
+}
+
+#[test]
+fn a_frozen_v2_database_opens_after_future_migrations() {
+    let data_dir = restore_frozen_database(FROZEN_V2_DATABASE);
     let path = data_dir.path().join(DATABASE_FILE);
     let mut connection = Connection::open(&path).unwrap();
     connection
@@ -1379,7 +2508,7 @@ fn a_frozen_v1_database_opens_after_future_migrations() {
 
     apply(&mut connection, LATER_MIGRATIONS).unwrap();
 
-    assert_eq!(recorded_version(&connection).unwrap(), 2);
+    assert_eq!(recorded_version(&connection).unwrap(), 3);
     let run =
         super::repository::load_run(&connection, RunId::from_str(FIXTURE_RUN_ID).unwrap()).unwrap();
     assert_eq!(run.state(), ExecutionState::Running);
@@ -1390,6 +2519,13 @@ fn a_frozen_v1_database_opens_after_future_migrations() {
         1,
         "a forward migration must preserve the rows it inherits"
     );
+    assert_eq!(
+        super::event::events(&connection, run.id(), None, 10)
+            .unwrap()
+            .len(),
+        2,
+        "a forward migration must preserve the event log it inherits"
+    );
 }
 
 /// Rewrites the frozen v1 fixture from the current migration 1.
@@ -1398,9 +2534,65 @@ fn a_frozen_v1_database_opens_after_future_migrations() {
 /// `cargo test -p harkness-runtime regenerate_the_frozen_v1_fixture -- --ignored`.
 /// `VACUUM INTO` writes a compact rollback-journal database, so the committed
 /// file needs no write-ahead log beside it.
+///
+/// It cannot use [`Store`], which now climbs to the newest schema on open: the
+/// point of this fixture is a database that stopped at version 1, so the ladder
+/// is truncated and the rows are written through the repository directly.
 #[test]
 #[ignore = "rewrites a committed fixture; run only when migration 1 changes"]
 fn regenerate_the_frozen_v1_fixture() {
+    let data_dir = TempDir::new().unwrap();
+    let mut connection = Connection::open(data_dir.path().join(DATABASE_FILE)).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .unwrap();
+    apply(&mut connection, &MIGRATIONS[..1]).unwrap();
+
+    let task = Task::with_id(
+        TaskId::from_str(FIXTURE_TASK_ID).unwrap(),
+        "Add the run store",
+        "/workspace/harkness",
+        None,
+        at(0),
+    );
+    super::repository::insert_task(&connection, &task).unwrap();
+    let mut run = Run::with_id(RunId::from_str(FIXTURE_RUN_ID).unwrap(), task.id(), at(1));
+    super::repository::insert_run(&connection, &run).unwrap();
+    let mut step = Step::with_id(
+        StepId::from_str(FIXTURE_STEP_ID).unwrap(),
+        run.id(),
+        0,
+        "Read the schema",
+        at(2),
+    );
+    super::repository::insert_step(&connection, &step).unwrap();
+    let mut call = ToolCall::with_id(
+        ToolCallId::from_str(FIXTURE_TOOL_CALL_ID).unwrap(),
+        &step,
+        "fs.read",
+        "1.0.0",
+        json!({"path": "crates/harkness-runtime/src/store/mod.rs"}),
+        at(3),
+    );
+    super::repository::insert_tool_call(&connection, &call).unwrap();
+
+    run.transition(ExecutionState::Running, at(10)).unwrap();
+    super::repository::update_run(&connection, &run).unwrap();
+    step.transition(ExecutionState::Running, at(11)).unwrap();
+    super::repository::update_step(&connection, &step).unwrap();
+    call.transition(ToolCallState::Running, at(12)).unwrap();
+    super::repository::update_tool_call(&connection, &call).unwrap();
+
+    freeze(&connection, "runtime-v1.db");
+}
+
+/// Rewrites the frozen v2 fixture from the current migration ladder.
+///
+/// Run deliberately, and only when migration 2 itself changes:
+/// `cargo test -p harkness-runtime regenerate_the_frozen_v2_fixture -- --ignored`.
+#[test]
+#[ignore = "rewrites a committed fixture; run only when migration 2 changes"]
+fn regenerate_the_frozen_v2_fixture() {
     let data_dir = TempDir::new().unwrap();
     let store = Store::open(data_dir.path()).unwrap();
     let task = stored_task(&store);
@@ -1408,28 +2600,56 @@ fn regenerate_the_frozen_v1_fixture() {
     let step = stored_step(&store, &run);
     let call = stored_tool_call(&store, &step);
     store
-        .transition_run(run.id(), ExecutionState::Running, at(10))
-        .unwrap();
-    store
         .transition_step(step.id(), ExecutionState::Running, at(11))
         .unwrap();
     store
         .transition_tool_call(call.id(), ToolCallState::Running, at(12))
         .unwrap();
+    store
+        .transition_run_with_event(
+            run.id(),
+            ExecutionState::Running,
+            at(10),
+            RunEvent::new(EventKind::RunStateChanged, at(10))
+                .with_payload(json!({"from": "queued", "to": "running"})),
+        )
+        .unwrap();
 
-    let destination =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/store/fixtures/runtime-v1.db");
+    let mut sink = store
+        .create_artifact(run.id(), "notes.txt", "text/plain", at(13))
+        .unwrap()
+        .for_step(step.id());
+    sink.write_all(b"frozen fixture content\n").unwrap();
+    let artifact = sink.finish().unwrap();
+    store
+        .append_event(
+            run.id(),
+            RunEvent::new(EventKind::ArtifactCreated, at(13))
+                .for_step(step.id())
+                .for_artifact(artifact.id())
+                .with_payload(json!({"name": artifact.name()})),
+        )
+        .unwrap();
+
+    freeze(&guard(&store.writer), "runtime-v2.db");
+}
+
+/// Writes a compact rollback-journal copy of `connection` into the fixtures.
+fn freeze(connection: &Connection, name: &str) {
+    let destination = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/store/fixtures")
+        .join(name);
     std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
     let _ = std::fs::remove_file(&destination);
-    guard(&store.writer)
+    connection
         .execute("VACUUM INTO ?1", [destination.to_str().unwrap()])
         .unwrap();
 }
 
 #[test]
 fn every_migration_in_this_build_is_recorded_in_order() {
-    assert_eq!(MIGRATIONS.len(), 1, "add coverage for a new migration");
-    assert_eq!(SCHEMA_VERSION, 1);
+    assert_eq!(MIGRATIONS.len(), 2, "add coverage for a new migration");
+    assert_eq!(SCHEMA_VERSION, 2);
 }
 
 // -- performance -------------------------------------------------------------
@@ -1468,6 +2688,97 @@ fn persisting_a_state_change_batch_meets_the_latency_target() {
     assert!(
         elapsed < std::time::Duration::from_millis(10),
         "persisting a state-change batch took {elapsed:?}"
+    );
+}
+
+#[test]
+#[ignore = "latency target; meaningful only in a release build"]
+fn persisting_a_state_change_batch_with_its_events_meets_the_latency_target() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = stored_step(&fixture.store, &run);
+    let call = stored_tool_call(&fixture.store, &step);
+
+    // An event rides the same transaction as the state change it describes, so
+    // the pairing has to stay inside the budget the state change alone had.
+    let started = std::time::Instant::now();
+    fixture
+        .store
+        .transition_run_with_event(
+            run.id(),
+            ExecutionState::Running,
+            at(10),
+            RunEvent::new(EventKind::RunStateChanged, at(10))
+                .with_payload(json!({"to": "running"})),
+        )
+        .unwrap();
+    fixture
+        .store
+        .transition_step(step.id(), ExecutionState::Running, at(11))
+        .unwrap();
+    fixture
+        .store
+        .append_event(
+            run.id(),
+            RunEvent::new(EventKind::StepStarted, at(11)).for_step(step.id()),
+        )
+        .unwrap();
+    fixture
+        .store
+        .transition_tool_call_with_event(
+            call.id(),
+            ToolCallState::Running,
+            at(12),
+            RunEvent::new(EventKind::ToolCallStateChanged, at(12)).for_tool_call(call.id()),
+        )
+        .unwrap();
+    fixture
+        .store
+        .succeed_tool_call(call.id(), json!({"bytes": 4096}), at(13))
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    println!("persisting a state-change batch with its events took {elapsed:?}");
+    assert!(
+        elapsed < std::time::Duration::from_millis(10),
+        "persisting a state-change batch with its events took {elapsed:?}"
+    );
+}
+
+#[test]
+#[ignore = "latency target; meaningful only in a release build"]
+fn loading_a_thousand_event_run_meets_the_latency_target() {
+    const EVENTS: usize = 1_000;
+
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = stored_step(&fixture.store, &run);
+    for index in 0..EVENTS {
+        fixture
+            .store
+            .append_event(
+                run.id(),
+                RunEvent::new(EventKind::ToolProgress, at(20 + index as i64))
+                    .for_step(step.id())
+                    .with_payload(json!({"completed": index, "total": EVENTS})),
+            )
+            .unwrap();
+    }
+    // A fresh store, so the measurement is of loading the log rather than of
+    // reading a warm page cache in the process that wrote it.
+    let store = fixture.reopen();
+
+    let started = std::time::Instant::now();
+    let events = store.events(run.id(), None, MAX_EVENT_PAGE_LIMIT).unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(events.len(), EVENTS);
+    println!("loading a {EVENTS}-event run took {elapsed:?}");
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "loading a {EVENTS}-event run took {elapsed:?}"
     );
 }
 

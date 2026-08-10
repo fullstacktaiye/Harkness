@@ -65,6 +65,29 @@
 //! would store something the caller never wrote, and storing it whole would
 //! break the bound every other column keeps.
 //!
+//! The one caller-supplied value that is *not* refused for being too large is an
+//! event payload, because an event describes something that already happened
+//! and refusing to record it loses history rather than protecting it. It is
+//! spilled into the artifact store and replaced by a reference instead; see
+//! [`RunEvent::overflowed_payload`] for the reference it leaves behind.
+//!
+//! # Events and artifacts
+//!
+//! The records above say what a run *is*. [`RunEvent`] says how it got there,
+//! in an append-only per-run log whose sequence numbers are allocated inside the
+//! transaction that writes them, and which commits together with the state
+//! change it describes. [`Artifact`] is where content too large for any row
+//! lives: files under `<data_dir>/artifacts/`, written before their metadata row
+//! so no row can point at bytes that were never made durable, hashed so a
+//! consumer can prove they have not changed, and probed on read so deleting one
+//! degrades an artifact rather than breaking a run.
+//!
+//! Every caller value either of them persists passes through a [`Redactor`]
+//! first — payload values and an artifact's label and media type by value,
+//! artifact content by stream. The v0.3 default changes nothing; the point of
+//! the hook is that supplying real rules is a change in one place rather than an
+//! audit of every caller.
+//!
 //! # Backups
 //!
 //! A WAL database is three files: `runtime.db`, `runtime.db-wal`, and
@@ -75,15 +98,18 @@
 //! behind, which is reported as [`StoreError::IncompleteCheckpoint`] rather
 //! than by failing the statement.
 
+mod artifact;
 mod column;
 mod error;
+mod event;
 mod listing;
 mod migration;
+mod redaction;
 mod repository;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -92,12 +118,19 @@ use serde_json::Value;
 use time::OffsetDateTime;
 
 use crate::domain::{
-    Failure, Run, RunDomainError, RunId, Step, StepId, Task, TaskId, ToolCall, ToolCallId,
+    ArtifactId, Failure, Run, RunDomainError, RunId, Step, StepId, Task, TaskId, ToolCall,
+    ToolCallId,
 };
 
+pub use artifact::{ARTIFACTS_DIRECTORY, Artifact, ArtifactSink, Availability, StoreArtifacts};
 pub use error::{OpenFailure, StoreError};
+pub use event::{
+    DEFAULT_EVENT_PAGE_LIMIT, EventKind, EventSeq, MAX_EVENT_PAGE_LIMIT, OVERFLOW_PAYLOAD_FIELD,
+    OVERFLOW_PAYLOAD_MEDIA_TYPE, OVERFLOW_PAYLOAD_NAME, OverflowedPayload, RunEvent, StoredEvent,
+};
 pub use listing::{DEFAULT_RUN_PAGE_LIMIT, MAX_RUN_PAGE_LIMIT, RunCursor, RunListing, RunPage};
 pub use migration::SCHEMA_VERSION;
+pub use redaction::{PassThrough, Redactor};
 
 /// Name of the run database inside the Harkness data directory.
 pub const DATABASE_FILE: &str = "runtime.db";
@@ -123,9 +156,11 @@ const POOLED_READERS: usize = 4;
 /// connection; reads borrow their own.
 #[derive(Debug)]
 pub struct Store {
+    data_dir: PathBuf,
     path: PathBuf,
     writer: Mutex<Connection>,
     readers: Mutex<Vec<Connection>>,
+    redactor: Arc<dyn Redactor>,
 }
 
 impl Store {
@@ -148,10 +183,24 @@ impl Store {
         migration::apply(&mut connection, migration::MIGRATIONS)?;
 
         Ok(Self {
+            data_dir: data_dir.to_path_buf(),
             path,
             writer: Mutex::new(connection),
             readers: Mutex::new(Vec::new()),
+            redactor: Arc::new(PassThrough),
         })
+    }
+
+    /// Routes every event payload and artifact stream through `redactor`.
+    ///
+    /// Consuming rather than mutating is deliberate: a store is shared across
+    /// threads, and a redactor that could be swapped underneath a running write
+    /// would make "this content was scrubbed" a claim about timing rather than
+    /// about the store.
+    #[must_use]
+    pub fn redacting(mut self, redactor: Arc<dyn Redactor>) -> Self {
+        self.redactor = redactor;
+        self
     }
 
     /// Opens the run store in the platform data directory.
@@ -561,7 +610,318 @@ impl Store {
         self.mutate_tool_call(id, |call| call.reject_approval(decided_by, failure, at))
     }
 
+    // -- events ---------------------------------------------------------------
+
+    /// Appends one event to a run's log and returns the position it took.
+    ///
+    /// The sequence number is allocated inside the same transaction as the
+    /// insert, so two threads appending to one run cannot be handed the same
+    /// number. A payload above [`MAX_INLINE_PAYLOAD_BYTES`] is written to an
+    /// artifact and replaced by a reference to it rather than refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::MissingParent`] when the run, or a step, tool call
+    /// or artifact the event names, is not stored, and
+    /// [`StoreError::ArtifactIo`] when an oversized payload cannot be spilled.
+    pub fn append_event(&self, run_id: RunId, event: RunEvent) -> Result<EventSeq, StoreError> {
+        let prepared = self.prepare_event(run_id, event)?;
+        self.commit_event("appending a run event", prepared, |connection, prepared| {
+            prepared.append(connection, run_id)
+        })
+    }
+
+    /// Applies a run transition and appends its event in one transaction.
+    ///
+    /// This is the pairing the whole log depends on: a run whose state moved
+    /// without its history saying so, or a history claiming a move that was
+    /// rolled back, are both worse than a failed transition. Either both rows
+    /// are visible or neither is.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::transition_run`] and [`Store::append_event`]; a failure of
+    /// either half leaves the run exactly as it was.
+    pub fn transition_run_with_event(
+        &self,
+        id: RunId,
+        to: crate::domain::ExecutionState,
+        at: OffsetDateTime,
+        event: RunEvent,
+    ) -> Result<(Run, EventSeq), StoreError> {
+        let prepared = self.prepare_event(id, event)?;
+        self.commit_event(
+            "transitioning a run with its event",
+            prepared,
+            |connection, prepared| {
+                let mut run = repository::load_run(connection, id)?;
+                run.transition(to, at)
+                    .map_err(StoreError::InvalidTransition)?;
+                repository::update_run(connection, &run)?;
+                let seq = prepared.append(connection, id)?;
+                Ok((run, seq))
+            },
+        )
+    }
+
+    /// Applies a tool-call transition and appends its event in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::transition_run_with_event`], for tool calls.
+    pub fn transition_tool_call_with_event(
+        &self,
+        id: ToolCallId,
+        to: crate::domain::ToolCallState,
+        at: OffsetDateTime,
+        event: RunEvent,
+    ) -> Result<(ToolCall, EventSeq), StoreError> {
+        // The run is read before the transaction so the payload can be spilled
+        // and redacted outside it: no transaction is held across work that
+        // touches the filesystem.
+        let run_id = self.load_tool_call(id)?.run_id();
+        let prepared = self.prepare_event(run_id, event)?;
+        self.commit_event(
+            "transitioning a tool call with its event",
+            prepared,
+            |connection, prepared| {
+                let mut call = repository::load_tool_call(connection, id)?;
+                call.transition(to, at)
+                    .map_err(StoreError::InvalidTransition)?;
+                repository::update_tool_call(connection, &call)?;
+                let seq = prepared.append(connection, call.run_id())?;
+                Ok((call, seq))
+            },
+        )
+    }
+
+    /// Returns one page of a run's event log, oldest first.
+    ///
+    /// `after` is exclusive, so paging is `after = the last sequence seen`. A
+    /// page never repeats or skips an event however many arrive at the tip
+    /// between requests, because it addresses a position in the log rather than
+    /// a position in a result set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidPageLimit`] when the page size is zero or
+    /// above [`MAX_EVENT_PAGE_LIMIT`].
+    pub fn events(
+        &self,
+        run_id: RunId,
+        after: Option<EventSeq>,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>, StoreError> {
+        self.with_reader(|connection| event::events(connection, run_id, after, limit))
+    }
+
+    // -- artifacts ------------------------------------------------------------
+
+    /// Opens a streaming write into the artifact store.
+    ///
+    /// The returned sink is an [`std::io::Write`] and offers no whole-content
+    /// method, so a caller cannot accidentally buffer an artifact in order to
+    /// store it. Nothing is recorded until
+    /// [`ArtifactSink::finish`] is called; an abandoned sink leaves neither a
+    /// row nor a file a reader would resolve.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::MissingParent`] when the run is not stored,
+    /// [`StoreError::PayloadTooLarge`] when the name or media type would not fit
+    /// its column, and [`StoreError::ArtifactIo`] when the file cannot be
+    /// created.
+    pub fn create_artifact(
+        &self,
+        run_id: RunId,
+        name: &str,
+        media_type: &str,
+        at: OffsetDateTime,
+    ) -> Result<ArtifactSink<'_>, StoreError> {
+        ArtifactSink::create(
+            self,
+            run_id,
+            name,
+            media_type,
+            at,
+            artifact::Redaction::Pending,
+        )
+    }
+
+    /// Loads one artifact's metadata, probing whether its bytes are still there.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NotFound`] when no artifact has that identity and
+    /// [`StoreError::ForbiddenArtifactPath`] when the row names a location
+    /// outside the artifacts directory. A *missing file* is not an error: it is
+    /// reported as [`Availability::Missing`].
+    pub fn artifact(&self, id: ArtifactId) -> Result<Artifact, StoreError> {
+        self.with_reader(|connection| artifact::load_artifact(connection, &self.data_dir, id))
+    }
+
+    /// Loads every artifact recorded against a run, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::artifact`], for any row of the run.
+    pub fn run_artifacts(&self, run_id: RunId) -> Result<Vec<Artifact>, StoreError> {
+        self.with_reader(|connection| {
+            artifact::load_run_artifacts(connection, &self.data_dir, run_id)
+        })
+    }
+
+    /// Opens an artifact's content for reading.
+    ///
+    /// Returned as a handle rather than as bytes because an artifact is the
+    /// thing that did not fit in memory; a caller that wants it whole says so
+    /// with [`Store::read_artifact`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::artifact`], plus [`StoreError::ArtifactIo`] when the content
+    /// cannot be opened — which includes the file having been deleted.
+    pub fn open_artifact(&self, id: ArtifactId) -> Result<fs::File, StoreError> {
+        let artifact = self.artifact(id)?;
+        let path = artifact::artifact_path(&self.data_dir, artifact.run_id(), artifact.id());
+        fs::File::open(&path).map_err(|source| StoreError::ArtifactIo {
+            operation: "opening an artifact",
+            path,
+            source,
+        })
+    }
+
+    /// Reads an artifact's content into memory.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::open_artifact`].
+    pub fn read_artifact(&self, id: ArtifactId) -> Result<Vec<u8>, StoreError> {
+        let artifact = self.artifact(id)?;
+        let path = artifact::artifact_path(&self.data_dir, artifact.run_id(), artifact.id());
+        fs::read(&path).map_err(|source| StoreError::ArtifactIo {
+            operation: "reading an artifact",
+            path,
+            source,
+        })
+    }
+
     // -- internals ----------------------------------------------------------
+
+    /// The data directory this store's artifacts live under.
+    pub(super) fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// The redactor every recorded byte passes through.
+    pub(super) fn redactor(&self) -> &Arc<dyn Redactor> {
+        &self.redactor
+    }
+
+    /// Runs a prepared event's write, cleaning up its spill if the write fails.
+    ///
+    /// The crash matrix in [`artifact`](self::artifact) accounts for the orphan
+    /// file a *crash* between the rename and the insert leaves behind. An
+    /// ordinary rejection is not a crash: an invalid transition or an event
+    /// naming an unstored step returns `Err` on a perfectly healthy store, and a
+    /// caller retrying one must not accumulate a file per attempt in a store
+    /// with no collector. Removal is best effort — the write's own failure is
+    /// what the caller needs to hear about.
+    fn commit_event<T, F>(
+        &self,
+        operation: &'static str,
+        prepared: PreparedEvent,
+        change: F,
+    ) -> Result<T, StoreError>
+    where
+        F: FnOnce(&Connection, &PreparedEvent) -> Result<T, StoreError>,
+    {
+        let result =
+            self.in_write_transaction(operation, |connection| change(connection, &prepared));
+        if result.is_err() {
+            prepared.discard_spill(self);
+        }
+        result
+    }
+
+    /// Redacts an event's payload and spills it to an artifact when oversized.
+    ///
+    /// Everything expensive happens here, before any transaction opens: the
+    /// redaction, the encoding, and — for an overflowing payload — writing and
+    /// syncing a whole file. What is left for the transaction is two inserts.
+    fn prepare_event(&self, run_id: RunId, event: RunEvent) -> Result<PreparedEvent, StoreError> {
+        let redacted = redaction::redact_payload(&*self.redactor, event.payload());
+        let encoded =
+            serde_json::to_string(&redacted).map_err(|error| StoreError::ColumnEncoding {
+                record: "run_event",
+                field: "payload",
+                reason: error.to_string(),
+            })?;
+        if !event::overflows_inline(&encoded) {
+            return Ok(PreparedEvent {
+                event: event.with_payload(redacted),
+                payload_json: encoded,
+                sealed: None,
+            });
+        }
+
+        // The artifact carries the *redacted* encoding — the exact bytes the row
+        // would have held had they fit — so it is created in `Redaction::Applied`
+        // mode and the stream wrapper does not scrub them a second time.
+        //
+        // Spilling the caller's original and leaving the wrapper to do the work
+        // would make redaction depend on payload size: a rule implemented in
+        // `redact_text` alone, which the trait allows, would scrub a payload
+        // under the threshold and persist the same secret in the clear above it.
+        // It would also rewrite object keys, so the recovered payload would not
+        // be the one the inline path produces.
+        let spilled = encoded.into_bytes();
+        let mut sink = artifact::ArtifactSink::create(
+            self,
+            run_id,
+            event::OVERFLOW_PAYLOAD_NAME,
+            event::OVERFLOW_PAYLOAD_MEDIA_TYPE,
+            event.at(),
+            artifact::Redaction::Applied,
+        )?;
+        if let Some(step_id) = event.step_id() {
+            sink = sink.for_step(step_id);
+        }
+        if let Some(tool_call_id) = event.tool_call_id() {
+            sink = sink.for_tool_call(tool_call_id);
+        }
+        let staged = sink.temporary().to_path_buf();
+        std::io::Write::write_all(&mut sink, &spilled).map_err(|source| {
+            StoreError::ArtifactIo {
+                operation: "spilling an oversized event payload",
+                path: staged,
+                source,
+            }
+        })?;
+        let sealed = sink.seal()?;
+
+        let marker = event::overflow_payload(event::OverflowedPayload {
+            id: sealed.id(),
+            media_type: sealed.media_type().to_owned(),
+            byte_size: sealed.byte_size(),
+            sha256: sealed.sha256().to_owned(),
+        });
+        let payload_json =
+            serde_json::to_string(&marker).expect("an overflow marker is representable as JSON");
+        // The reference is always in the payload. The column additionally points
+        // at it when the caller named no artifact of their own, so the common
+        // case is queryable without parsing JSON and the uncommon one does not
+        // silently lose what the caller meant.
+        let event = match event.artifact_id() {
+            Some(_) => event.with_payload(marker),
+            None => event.with_payload(marker).for_artifact(sealed.id()),
+        };
+        Ok(PreparedEvent {
+            event,
+            payload_json,
+            sealed: Some(sealed),
+        })
+    }
 
     fn mutate_run<F>(&self, id: RunId, change: F) -> Result<Run, StoreError>
     where
@@ -644,6 +1004,47 @@ impl Store {
             readers.push(connection);
         }
         result
+    }
+}
+
+/// An event with everything slow already done to it.
+///
+/// Redaction, encoding and — when the payload overflowed — writing and syncing
+/// a whole artifact file happen before the transaction opens. What is left is
+/// one or two inserts, which is what keeps an event ride-along inside the
+/// state-change latency budget.
+struct PreparedEvent {
+    event: RunEvent,
+    payload_json: String,
+    sealed: Option<artifact::SealedArtifact>,
+}
+
+impl PreparedEvent {
+    /// Records the spilled artifact, if there was one, and then the event.
+    ///
+    /// The order is forced: the event's `artifact_id` foreign key can only
+    /// resolve once the artifact row exists. Both are in the caller's
+    /// transaction, so an event referring to an artifact row that never
+    /// committed is not a state the store can be found in.
+    fn append(&self, connection: &Connection, run_id: RunId) -> Result<EventSeq, StoreError> {
+        if let Some(sealed) = &self.sealed {
+            artifact::insert_artifact(connection, sealed)?;
+        }
+        event::append_event(connection, run_id, &self.event, &self.payload_json)
+    }
+
+    /// Removes the spilled artifact's bytes after a rejected write.
+    ///
+    /// Best effort: the caller is about to be told why the write failed, and a
+    /// file that outlives its row is the harmless half of the crash matrix.
+    fn discard_spill(&self, store: &Store) {
+        if let Some(sealed) = &self.sealed {
+            let _ = fs::remove_file(artifact::artifact_path(
+                store.data_dir(),
+                sealed.run_id(),
+                sealed.id(),
+            ));
+        }
     }
 }
 
