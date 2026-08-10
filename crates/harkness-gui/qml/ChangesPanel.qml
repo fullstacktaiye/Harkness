@@ -173,6 +173,7 @@ ColumnLayout {
 
         // The whole-diff entry point: everything the next commit would record,
         // without having to pick a path first.
+        /*
         Controls.ToolButton {
             Controls.ToolTip.text: qsTr("Review every change in the working tree")
             Controls.ToolTip.visible: hovered
@@ -182,8 +183,10 @@ ColumnLayout {
             text: qsTr("Review all")
             onClicked: changes.backend.reviewWorkingChanges(changes.project.id, false, "")
         }
+        */
     }
 
+    /*
     Controls.Label {
         Layout.fillWidth: true
         Layout.leftMargin: Kirigami.Units.largeSpacing
@@ -192,6 +195,7 @@ ColumnLayout {
         text: qsTr("Working tree clean")
         visible: changes.activity.stateReady && changes.entries.length === 0
     }
+    */
 
     ListView {
         id: entryList
