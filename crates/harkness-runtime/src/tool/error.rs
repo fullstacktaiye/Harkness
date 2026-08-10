@@ -53,6 +53,16 @@ pub const MAX_FAILURE_MESSAGE_BYTES: usize = 16 * 1024;
 /// Appended to text that was cut short.
 const TRUNCATION_MARKER: &str = "… (truncated)";
 
+/// Most further violations counted past the ones retained.
+///
+/// Counting the remainder exactly means walking the validator's whole lazy error
+/// iterator, which constructs one error per violation. The input is
+/// caller-supplied and unbounded, so an instance engineered to violate its schema
+/// everywhere would do that work on the thread that is meant to be returning a
+/// refusal. Past this many, the report says "at least" rather than paying to find
+/// out — an exact count of ten thousand tells a caller nothing a bound does not.
+pub const MAX_COUNTED_VIOLATIONS: usize = 1_000;
+
 /// Which side of an invocation a schema describes.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -639,8 +649,14 @@ fn render_violations(violations: &[SchemaViolation], omitted: usize) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("; ");
-    if omitted > 0 {
-        rendered.push_str(&format!(" (and {omitted} more)"));
+    match omitted {
+        0 => {}
+        // The count stops at the cap, so at the cap it is a lower bound and must
+        // not be reported as if it were the total.
+        counted if counted >= MAX_COUNTED_VIOLATIONS => {
+            rendered.push_str(&format!(" (and at least {counted} more)"));
+        }
+        counted => rendered.push_str(&format!(" (and {counted} more)")),
     }
     rendered
 }

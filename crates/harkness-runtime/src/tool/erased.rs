@@ -130,14 +130,24 @@ pub trait Tool: Send + Sync {
 /// A registered tool addressed through JSON rather than through its own types.
 ///
 /// This is what the registry stores, because a `HashMap` cannot hold values of
-/// differing associated types. Every implementation is produced by
-/// [`erase`] — the trait is public so a registry can be enumerated and passed
-/// around, not so it can be implemented by hand.
+/// differing associated types. It is public so a registry can be enumerated and
+/// passed around, and **sealed** so it cannot be implemented outside this module:
+/// [`erase`] is the only way to produce one.
+///
+/// The seal is what makes this module's guarantees guarantees. A hand-written
+/// implementation could publish a descriptor whose `input_schema` bears no
+/// relation to what its `execute_json` deserializes, skip the cancellation gate,
+/// skip the [`catch_unwind`] boundary, and skip both validation gates — while
+/// `harkness contract` still advertised it as a validated contract and
+/// [`ToolError::happened_before_execution`] still promised callers a safe retry.
+/// Since [`ToolRegistry::register_erased`](super::ToolRegistry::register_erased)
+/// accepts any `Arc<dyn ErasedTool>`, documenting "please do not implement this"
+/// would have left every one of those properties on the honour system.
 ///
 /// [`Debug`](std::fmt::Debug) is a supertrait so that an `Arc<dyn ErasedTool>`
 /// can appear in an assertion or a log line at all; it renders the tool's
 /// identity, never its state.
-pub trait ErasedTool: std::fmt::Debug + Send + Sync {
+pub trait ErasedTool: sealed::Sealed + std::fmt::Debug + Send + Sync {
     /// The frozen published contract of this tool.
     fn descriptor(&self) -> &ToolDescriptor;
 
@@ -189,6 +199,14 @@ where
         output,
     }))
 }
+
+/// Seals [`ErasedTool`]. Private, so no downstream crate can name — and therefore
+/// cannot satisfy — the supertrait it requires.
+mod sealed {
+    pub trait Sealed {}
+}
+
+impl<T> sealed::Sealed for TypedTool<T> {}
 
 /// The erasure boundary for one typed tool.
 struct TypedTool<T> {

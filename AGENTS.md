@@ -146,6 +146,15 @@ Publishing a change means registering a new version beside the old one.
 Descriptor enumeration is ordered by identifier and then by version precedence,
 so any projection built from it is diff-stable regardless of registration order.
 
+Build metadata is refused outright rather than accepted and ignored. The
+specification requires precedence to disregard it, but `semver::Version` derives
+`Eq` and `Ord` over it, so `1.0.0` and `1.0.0+hotfix` would be two registry keys
+that compare unequal while denoting one version: the duplicate guard would not
+fire, neither would look like a pre-release, and unversioned resolution would
+silently move onto the build-tagged one while an approval bound to the plain
+spelling still resolved to the original. An identity component the ordering must
+ignore has no coherent meaning here; publishing a fix means bumping the patch.
+
 Resolving without a version selects the highest *stable* version, falling back to
 a pre-release only when nothing stable is registered. Raw semver precedence puts
 `2.0.0-rc.1` above `1.10.0`, so an unfiltered "highest version" would mean that
@@ -196,9 +205,22 @@ restored retrieval because some other workspace member depended on `jsonschema`
 with default features. Note that the draft meta-schemas ship inside the crate and
 resolve from its built-in registry; that is local resolution, not retrieval.
 
+`ErasedTool` is sealed: `erase` is the only way to produce one. Without the seal a
+hand-written implementation reachable through the public `register_erased` could
+publish a descriptor unrelated to what it deserializes and skip the cancellation
+gate, the panic boundary, and both validation gates, while `harkness contract`
+still advertised it as validated — every guarantee in this section would be on the
+honour system.
+
+Tool output is re-serialized through `serde_json::Value`, whose object map is a
+`BTreeMap`, so a delivered result has canonical key order whatever order the tool
+declares its fields in. Approval and provenance hashing depends on that stability.
+
 Schemas are generated from the `Input` and `Output` associated types and never
 declared by hand, so a published contract cannot disagree with the type the tool
-body deserializes. They are compiled at registration: a schema that cannot be
+body deserializes. Any type appearing in an `Input` or `Output` therefore needs
+`JsonSchema` — including `ArtifactRef`, whose whole purpose is to be returned
+inside an output. They are compiled at registration: a schema that cannot be
 compiled is a refusal to declare the tool, not a surprise on the first call.
 `schemars` closes an object schema only for a type carrying
 `#[serde(deny_unknown_fields)]`, so every tool `Input` type must carry it —
@@ -211,10 +233,6 @@ classifies what will actually execute rather than an unparsed blob. Output is
 validated before delivery, so a consumer that trusted the published schema never
 receives a shape it cannot handle. Both gates locate findings with RFC 6901 JSON
 Pointers.
-
-`jsonschema` is built with `default-features = false`, which drops
-`resolve-http` and `resolve-file`. A `$ref` to a URL or a local file therefore
-cannot be followed: schema compilation reaches nothing outside the process.
 
 Declared risk and capabilities are frozen in the descriptor. A tool cannot lower
 its declared risk for one call; whether a specific invocation is more dangerous

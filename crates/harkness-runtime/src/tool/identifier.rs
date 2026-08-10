@@ -25,6 +25,10 @@ const MINIMUM_CAPABILITY_SEGMENTS: usize = 1;
 /// allocating; `the_length_reason_states_the_actual_bound` keeps it honest.
 const TOO_LONG: &str = "it is longer than 64 characters";
 
+/// Reason reported for a version carrying build metadata.
+const BUILD_METADATA: &str = "build metadata is ignored for semantic-version precedence, so it cannot \
+     distinguish one tool version from another; bump the patch version instead";
+
 /// A stable dotted tool identifier such as `fs.read`.
 ///
 /// The grammar is deliberately narrow: lowercase ASCII letters, digits, and
@@ -78,6 +82,25 @@ impl ToolId {
 /// Resolving "the latest version of an id" therefore cannot be fooled by
 /// lexicographic ordering, which is the whole reason the version is parsed
 /// instead of stored as text.
+///
+/// # Build metadata is refused
+///
+/// `1.0.0+hotfix` is rejected, not accepted and ignored. The semantic-version
+/// specification says build metadata MUST be disregarded when determining
+/// precedence, but `semver::Version` derives `Eq` and `Ord` over it — so
+/// `1.0.0` and `1.0.0+hotfix` are two distinct registry keys that compare
+/// unequal while denoting the same version.
+///
+/// Every consequence of that is bad. The duplicate-registration guard does not
+/// fire, so both register. [`ToolVersion::is_prerelease`] is false for both, so
+/// the pre-release filter cannot see the difference either, and unversioned
+/// resolution silently moves onto the build-tagged one. An approval bound to
+/// `fs.read@1.0.0` and a fresh unversioned call then execute different code under
+/// two `tool_calls.tool_version` strings that semver considers equal.
+///
+/// A tool version is an identity that gets persisted and matched against, so an
+/// identity component the ordering is required to ignore has no coherent meaning
+/// here. Publishing a fix means bumping the patch.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(into = "String", try_from = "String")]
 pub struct ToolVersion(semver::Version);
@@ -88,14 +111,15 @@ impl ToolVersion {
     /// # Errors
     ///
     /// Returns [`RegistryError::InvalidToolVersion`] when the value is not a
-    /// complete `major.minor.patch` semantic version.
+    /// complete `major.minor.patch` semantic version, when it carries build
+    /// metadata, or when it is longer than [`MAX_IDENTIFIER_LENGTH`].
     pub fn new(value: impl Into<String>) -> Result<Self, RegistryError> {
         let value = value.into();
         // Bounded for the same reason a tool id is: this string is persisted in
         // `tool_calls.tool_version` beside the id and rendered everywhere the id
-        // is. Semver places no limit on pre-release or build identifiers, so
-        // without this a version could register cleanly and then make every
-        // record of its own calls unpersistable.
+        // is. Semver places no limit on pre-release identifiers, so without this
+        // a version could register cleanly and then make every record of its own
+        // calls unpersistable.
         if value.chars().count() > MAX_IDENTIFIER_LENGTH {
             return Err(RegistryError::InvalidToolVersion {
                 value,
@@ -103,6 +127,10 @@ impl ToolVersion {
             });
         }
         match semver::Version::parse(&value) {
+            Ok(version) if !version.build.is_empty() => Err(RegistryError::InvalidToolVersion {
+                value,
+                reason: BUILD_METADATA.to_owned(),
+            }),
             Ok(version) => Ok(Self(version)),
             Err(error) => Err(RegistryError::InvalidToolVersion {
                 value,
@@ -403,16 +431,45 @@ mod tests {
         assert_eq!(error.kind(), "invalid_tool_version");
         assert!(error.to_string().contains(super::TOO_LONG), "{error}");
 
-        assert!(ToolVersion::new("1.0.0-rc.1+build.5").is_ok());
+        assert!(ToolVersion::new("1.0.0-rc.1").is_ok());
+    }
+
+    #[test]
+    fn build_metadata_is_refused_because_precedence_must_ignore_it() {
+        // `semver::Version` derives `Eq`/`Ord` over `build`, while the
+        // specification requires precedence to disregard it. Accepting it would
+        // make `1.0.0` and `1.0.0+hotfix` two registry keys that compare unequal
+        // yet denote the same version — so both would register, neither would look
+        // like a pre-release, and unversioned resolution would silently move onto
+        // the build-tagged one.
+        for rejected in ["1.0.0+hotfix", "1.0.0-rc.1+build.5", "2.3.4+20260810"] {
+            let error = ToolVersion::new(rejected).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                "invalid_tool_version",
+                "accepted {rejected:?}"
+            );
+            assert!(
+                error.to_string().contains("build metadata is ignored"),
+                "{error}"
+            );
+        }
+
+        // The property that made it dangerous, recorded so the reason this is
+        // refused stays visible if anyone revisits it.
+        let plain = semver::Version::parse("1.0.0").unwrap();
+        let tagged = semver::Version::parse("1.0.0+hotfix").unwrap();
+        assert_ne!(plain, tagged, "semver treats build metadata as identity");
+        assert!(plain < tagged, "semver orders build metadata last");
     }
 
     #[test]
     fn a_pre_release_version_identifies_itself() {
         for (spelling, expected) in [
             ("1.0.0", false),
-            ("1.0.0+build.5", false),
             ("1.0.0-rc.1", true),
             ("2.0.0-alpha", true),
+            ("2.0.0-alpha.1", true),
         ] {
             assert_eq!(
                 ToolVersion::new(spelling).unwrap().is_prerelease(),

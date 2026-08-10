@@ -1026,6 +1026,172 @@ fn a_failed_unpinned_call_still_reports_the_version_that_ran() {
 }
 
 #[test]
+fn a_tool_can_return_an_artifact_reference_in_its_output() {
+    // `ArtifactRef` exists to be returned inside a tool's `Output`, and an
+    // `Output` must implement `JsonSchema`. This test is the guard on that: without
+    // the derive on `ArtifactRef` the tool below does not compile, which would make
+    // the module's only documented route for returning stored content unusable.
+    #[derive(Serialize, JsonSchema)]
+    struct Stored {
+        log: super::ArtifactRef,
+    }
+
+    struct WritesAnArtifact;
+
+    impl Tool for WritesAnArtifact {
+        type Input = Empty;
+        type Output = Stored;
+
+        fn metadata(&self) -> ToolMetadata {
+            ToolMetadata::new(
+                ToolIdentity::parse("fixture.stores", "1.0.0").unwrap(),
+                "Stores",
+                "Writes an artifact and returns a reference to it.",
+                RiskLevel::WorkspaceWrite,
+            )
+        }
+
+        fn execute(
+            &self,
+            _input: Empty,
+            context: &mut ExecutionContext,
+        ) -> Result<Stored, ToolError> {
+            let log = context.write_artifact("build.log", "text/plain", b"output")?;
+            Ok(Stored { log })
+        }
+    }
+
+    struct Storing;
+
+    impl super::ArtifactWriter for Storing {
+        fn write(
+            &mut self,
+            _name: &str,
+            media_type: &str,
+            bytes: &[u8],
+        ) -> Result<super::ArtifactRef, ToolError> {
+            Ok(super::ArtifactRef {
+                id: "artifact-1".to_owned(),
+                media_type: media_type.to_owned(),
+                byte_len: bytes.len() as u64,
+            })
+        }
+    }
+
+    let mut registry = ToolRegistry::new();
+    registry.register(WritesAnArtifact).unwrap();
+
+    // The generated output schema describes the reference, so a consumer of the
+    // published contract knows what it is receiving.
+    let schema = registry
+        .get(&id("fixture.stores"), None)
+        .unwrap()
+        .descriptor()
+        .output_schema();
+    assert_eq!(
+        schema["properties"]["log"]["$ref"],
+        json!("#/$defs/ArtifactRef"),
+        "the reference should be published as a definition: {schema}"
+    );
+    assert_eq!(
+        schema["$defs"]["ArtifactRef"]["required"],
+        json!(["id", "media_type", "byte_len"])
+    );
+
+    let mut context = ExecutionContext::new(
+        RunId::new(),
+        StepId::new(),
+        ToolCallId::new(),
+        WORKSPACE,
+        Cancellation::default(),
+        Box::new(DiscardedProgress),
+        Box::new(Storing),
+    )
+    .unwrap();
+
+    // And the round trip passes the output validation gate, which is what would
+    // fail if the schema and the type disagreed.
+    //
+    // Note the key order: the delivered JSON is sorted, not in field-declaration
+    // order, because the output gate re-serializes through `serde_json::Value` and
+    // its object map is a `BTreeMap`. That canonicalization is a property worth
+    // relying on rather than an accident — it is what lets a hash taken over a
+    // tool's result be stable across builds and across tools that declare the same
+    // fields in a different order.
+    let outcome = invoke(
+        &registry,
+        &id("fixture.stores"),
+        None,
+        &raw("{}"),
+        &mut context,
+    )
+    .unwrap();
+    assert_eq!(
+        outcome.output().get(),
+        r#"{"log":{"byte_len":6,"id":"artifact-1","media_type":"text/plain"}}"#
+    );
+}
+
+#[test]
+fn delivered_output_has_canonical_key_order() {
+    // The property the artifact test observes, stated on its own so it is a
+    // contract rather than an incidental detail of one assertion. #92 will hash
+    // over recorded input and output, and a hash is only stable if the bytes are.
+    #[derive(Serialize, JsonSchema)]
+    struct Unsorted {
+        zebra: u8,
+        apple: u8,
+        mango: u8,
+    }
+
+    struct Declares;
+
+    impl Tool for Declares {
+        type Input = Empty;
+        type Output = Unsorted;
+
+        fn metadata(&self) -> ToolMetadata {
+            ToolMetadata::new(
+                ToolIdentity::parse("fixture.unsorted", "1.0.0").unwrap(),
+                "Unsorted",
+                "Declares its output fields out of alphabetical order.",
+                RiskLevel::Observe,
+            )
+        }
+
+        fn execute(
+            &self,
+            _input: Empty,
+            _context: &mut ExecutionContext,
+        ) -> Result<Unsorted, ToolError> {
+            Ok(Unsorted {
+                zebra: 1,
+                apple: 2,
+                mango: 3,
+            })
+        }
+    }
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Declares).unwrap();
+    let mut context = context();
+
+    let outcome = invoke(
+        &registry,
+        &id("fixture.unsorted"),
+        None,
+        &raw("{}"),
+        &mut context,
+    )
+    .unwrap();
+    assert_eq!(
+        outcome.output().get(),
+        r#"{"apple":2,"mango":3,"zebra":1}"#,
+        "the pipeline should deliver canonical key order"
+    );
+}
+
+#[test]
 fn a_body_raised_schema_error_cannot_claim_the_body_never_ran() {
     // `ToolError` is `#[non_exhaustive]` at the enum level, which does not seal its
     // variants, so a tool can construct `InvalidInput` itself and return it after

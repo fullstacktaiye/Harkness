@@ -3,6 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use harkness_git::Cancellation;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{RunId, StepId, ToolCallId};
@@ -220,7 +221,14 @@ impl ProgressSink for RecordedProgress {
 /// Output travels through schema validation and is persisted inline under a size
 /// bound, so anything large — a full diff, a build log, a downloaded file —
 /// belongs in the artifact store with only this reference in the result.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+///
+/// It derives [`JsonSchema`](schemars::JsonSchema) because that is the whole point
+/// of it: a tool returns this *inside* its `Output`, and an `Output` must have a
+/// generated schema. Without the derive the only documented route for returning
+/// stored content would force a tool author to hand-write a schema or mirror the
+/// struct — reintroducing exactly the type/schema divergence this module exists to
+/// make impossible.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactRef {
     /// Identifier the artifact store assigned.

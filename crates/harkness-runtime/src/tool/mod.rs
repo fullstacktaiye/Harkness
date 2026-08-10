@@ -41,6 +41,13 @@
 //! in flight still needs the tool to check
 //! [`ExecutionContext::check_cancelled`].
 //!
+//! Because step 4 goes through `serde_json::Value`, whose object map is a
+//! `BTreeMap`, the delivered result has **canonical key order** regardless of the
+//! order a tool declares its output fields in. That is worth relying on rather
+//! than rediscovering: a hash taken over a recorded result is stable across
+//! builds, and two tools declaring the same fields in different orders produce
+//! byte-identical output.
+//!
 //! Both gates locate their findings. A [`SchemaViolation`] carries an RFC 6901
 //! JSON Pointer into the offending value and another into the schema rule it
 //! broke, which is what makes a refusal actionable for an agent retrying on its
@@ -157,8 +164,8 @@ pub use descriptor::{
 };
 pub use erased::{ErasedTool, Tool, erase};
 pub use error::{
-    InvocationError, MAX_FAILURE_MESSAGE_BYTES, MAX_REPORTED_VIOLATIONS, MAX_VIOLATION_FIELD_BYTES,
-    RegistryError, SchemaDirection, SchemaViolation, ToolError,
+    InvocationError, MAX_COUNTED_VIOLATIONS, MAX_FAILURE_MESSAGE_BYTES, MAX_REPORTED_VIOLATIONS,
+    MAX_VIOLATION_FIELD_BYTES, RegistryError, SchemaDirection, SchemaViolation, ToolError,
 };
 pub use identifier::{Capability, MAX_IDENTIFIER_LENGTH, ToolId, ToolIdentity, ToolVersion};
 pub use registry::{ToolOutcome, ToolRegistry, invoke, invoke_resolved};

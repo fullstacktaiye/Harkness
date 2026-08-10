@@ -19,8 +19,8 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use super::{
-    MAX_REPORTED_VIOLATIONS, RegistryError, SchemaDirection, SchemaViolation, ToolError,
-    ToolIdentity,
+    MAX_COUNTED_VIOLATIONS, MAX_REPORTED_VIOLATIONS, RegistryError, SchemaDirection,
+    SchemaViolation, ToolError, ToolIdentity,
 };
 
 /// Generates the JSON Schema published for one side of an invocation.
@@ -85,9 +85,14 @@ pub(super) fn validate(
     }
 
     // The iterator is lazy and taken by reference, so counting the remainder
-    // finishes the same single pass rather than validating a second time. This
-    // only ever runs on the failure path.
-    let omitted = errors.count();
+    // finishes the same single pass rather than validating a second time — but
+    // "the remainder" is unbounded. `iter_errors` constructs one error per
+    // violation, each cloning a fragment of the instance, and the pipeline accepts
+    // a `RawValue` of any length: a multi-megabyte array whose every element
+    // violates its item schema would allocate one error per element on the thread
+    // that is supposed to be returning a quick refusal. The count is therefore
+    // capped, and the message says "at least" when the cap is reached.
+    let omitted = errors.take(MAX_COUNTED_VIOLATIONS).count();
     Err(refusal(tool, direction, violations, omitted))
 }
 
