@@ -258,13 +258,31 @@ impl SnapshotFiles {
     }
 }
 
-/// Sorts by path, keeps the first entry for a repeated path.
+/// Sorts by path and keeps one entry per path, preferring a real reading over
+/// the [`ContentDigest::Absent`] marker.
 ///
-/// Git can report one path twice — a rename's source and destination, an
-/// unmerged path — and a set that counted it twice would digest differently
-/// depending on the order Git happened to emit.
+/// A capture does not currently produce a repeated path: a rename's source is
+/// deleted by definition, so Git reports no rename at all once that path exists
+/// again — `git mv a b` followed by staging a new `a` comes back as an add
+/// beside a modify. Loading refuses a duplicate outright. What remains is
+/// [`SnapshotFiles::new`], which is public and takes whatever it is handed, so
+/// the set it produces has to be defined rather than merely observed.
+///
+/// The preference is stated rather than inherited. `ContentDigest`'s derived
+/// `Ord` happens to give the same answer, purely because `StagedBlob` is
+/// declared above `Absent`; reordering the variants is an edit nothing would
+/// flag, and it would silently invert which reading survived.
 fn canonicalize_entries(mut entries: Vec<FileDigestEntry>) -> Vec<FileDigestEntry> {
-    entries.sort();
+    fn absent_last(digest: &ContentDigest) -> u8 {
+        u8::from(matches!(digest, ContentDigest::Absent))
+    }
+
+    entries.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| absent_last(&left.digest).cmp(&absent_last(&right.digest)))
+            .then_with(|| left.digest.cmp(&right.digest))
+    });
     entries.dedup_by(|left, right| left.path == right.path);
     entries
 }
@@ -571,10 +589,12 @@ impl WorkspaceSnapshot {
 
     /// Reads the current state of `git`'s worktree.
     ///
-    /// Blocking. `cancellation` is polled before every file is hashed, so a
-    /// cancelled capture returns promptly whatever the size of the workspace,
-    /// and returns [`ContextDomainError::SnapshotCancelled`] rather than a
-    /// partial identity.
+    /// Blocking. `cancellation` is polled between status entries, while an
+    /// untracked directory is walked, and between the blocks of one file's
+    /// content, so a cancelled capture returns promptly whatever the size of the
+    /// workspace — including a workspace that is one very large file. It returns
+    /// [`ContextDomainError::SnapshotCancelled`] rather than a partial
+    /// identity.
     ///
     /// One unreadable file does not fail a capture: it contributes
     /// [`ContentDigest::Unreadable`] and a line in the diagnostics reachable
@@ -1548,6 +1568,31 @@ mod tests {
             .unwrap(),
             r#"{"state":"unverifiable","reason":"cancelled"}"#
         );
+    }
+
+    #[test]
+    fn deduplication_prefers_a_reading_over_the_absent_marker_either_way_round() {
+        let blob = ContentDigest::StagedBlob("0123456789abcdef".to_owned());
+        for order in [
+            vec![
+                FileDigestEntry::new(
+                    RepoPath::from_bytes(b"a.txt".to_vec()),
+                    ContentDigest::Absent,
+                ),
+                FileDigestEntry::new(RepoPath::from_bytes(b"a.txt".to_vec()), blob.clone()),
+            ],
+            vec![
+                FileDigestEntry::new(RepoPath::from_bytes(b"a.txt".to_vec()), blob.clone()),
+                FileDigestEntry::new(
+                    RepoPath::from_bytes(b"a.txt".to_vec()),
+                    ContentDigest::Absent,
+                ),
+            ],
+        ] {
+            let canonical = super::canonicalize_entries(order);
+            assert_eq!(canonical.len(), 1);
+            assert_eq!(canonical[0].digest, blob);
+        }
     }
 
     #[test]

@@ -54,8 +54,18 @@ Capture reads Git for *what* changed and a `WorkspaceProbe` for *what those path
 now contain*. The split is what keeps the identity model testable without a
 filesystem and leaves eligibility — ignore rules, size limits, classification —
 to the inventory stage without the digest definition moving. `FilesystemProbe` is
-the default: it hashes in 64 KiB blocks, hashes a symlink's target *path* rather
-than following it, and expands an untracked directory Git reported as one entry.
+the default: it hashes regular files in 64 KiB blocks, hashes a symlink's target
+*path* rather than following it, refuses to open anything else, resolves every
+path through a check that it stays inside the worktree, and expands an untracked
+directory Git reported as one entry.
+
+Two rules in that expansion carry more weight than they look like they do. A
+failure *inside* a tree is recorded per sub-path rather than collapsing the tree:
+one sentinel for a whole subtree would freeze its digest, and a frozen digest
+means every later edit beneath it verifies as `Fresh`. And a probe caching
+anything about the workspace invalidates it in `begin_read`, because a probe is
+naturally held for a worktree while a snapshot describes a moment — a cached Git
+index served to a later verification answers from the past.
 
 The two operations differ in what they owe the caller, which is why they fail
 differently. `capture` must not hand back a half-built identity, so cancellation
