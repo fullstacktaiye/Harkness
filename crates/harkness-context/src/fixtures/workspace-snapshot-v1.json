@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "id": "22222222-2222-4222-8222-222222222222",
+  "project_id": "11111111-1111-4111-8111-111111111111",
+  "repository_identity": "9c2f4c8a-0d3a-5a4e-9c1c-6f9b7c1d2e3f",
+  "worktree_root": "/workspaces/harkness",
+  "head": "0123456789abcdef0123456789abcdef01234567",
+  "branch": "main",
+  "staged": [
+    {
+      "path": "staged.txt",
+      "digest": "staged_blob:abcdef0123456789"
+    }
+  ],
+  "tracked_dirty": [
+    {
+      "path": "src/main.rs",
+      "digest": "content:ef32637cb9c3ec2e3968c9cbdf26a5e9c172be94f88af533e14bd43f892d5297"
+    }
+  ],
+  "untracked": [
+    {
+      "path": "notes/scratch.md",
+      "digest": "unreadable"
+    }
+  ],
+  "index_digest": "4787547ecc8ba21b9a3a1396f88a9485b63ca8fbfcb39b6a5ea0cef94611b574",
+  "tracked_dirty_digest": "83cea1941b77a905b0f233b8151de46031c3937a53accaea3374bf9c8e46c8a4",
+  "untracked_digest": "1eb065ee3185083937f16cff604f21cacb66681e43992c45f6c4e0cd9ea22347",
+  "instructions_digest": "53135562dd3555b8c98ff7fe1ec802cc9ef414db7bc25d3dc8f46204d04f3f4c",
+  "config_generation": 0,
+  "index_generation": 3,
+  "captured_at": "1970-01-01T00:00:01Z",
+  "digest": "43284d000b34c6d5e46c8352396e5d049752ed0d815dc3a6a7682adea1b9b04c"
+}

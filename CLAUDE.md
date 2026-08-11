@@ -46,12 +46,16 @@ build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing lin
   `regenerate_the_frozen_v2_fixture` rewrites `runtime-v2.db`. Run only when that migration itself
   changes; a released migration is otherwise never edited. The v1 regenerator applies a truncated
   ladder rather than opening a `Store`, because opening one now climbs to the newest schema.
+  `cargo test -p harkness-context -- --ignored regenerate_the_frozen_v1_fixtures` rewrites
+  `crates/harkness-context/src/fixtures/*.json` the same way, and carries the same warning: a
+  released wire form is replaced by a new versioned fixture, never edited in place.
 - **Latency targets** (`store/tests.rs`, `tool/tests.rs`): meaningful only under `--release`.
 
 ### Frozen fixtures
 
 `crates/harkness-core/src/catalog/fixtures/*.json`, `crates/harkness-runtime/src/domain/fixtures/*.json`,
-and `crates/harkness-runtime/src/store/fixtures/runtime-v{1,2}.db` pin released on-disk formats. A new
+`crates/harkness-context/src/fixtures/*.json`, and
+`crates/harkness-runtime/src/store/fixtures/runtime-v{1,2}.db` pin released on-disk formats. A new
 persisted field, state spelling, or table means a version bump plus a *new* fixture, not an edit to
 an existing one.
 
@@ -64,8 +68,10 @@ Dependencies flow strictly downward; nothing lower reaches back up.
 ```
 harkness-cli ──┐                              ┌─> harkness-git
 harkness-gui ──┴─> harkness-core ─────────────┤
-                   harkness-runtime ──────────┘
-                   (domain | store | tool)
+                   harkness-runtime ──────────┤
+                   (domain | store | tool)    │
+                   harkness-context ──────────┘
+                   (also depends on harkness-core, for ProjectId)
 ```
 
 `harkness-runtime` depends on `harkness-git` for one thing: `Cancellation`, which `tool`'s
@@ -86,6 +92,13 @@ translating between two cancellation mechanisms.
   enter the process. `domain::ToolCall` records *that* a tool ran; `tool` is what defines and
   executes one. `store` and `tool` both build on `domain` but not on each other, so persistence and
   execution can be reasoned about — and tested — separately.
+- **`harkness-context`** owns the context engine's vocabulary and nothing that
+  uses it: identifiers, `WorkspaceSnapshot` identity, `Provenance`, and
+  `FileClass`. It deliberately does *not* depend on `harkness-runtime` — the
+  runtime will depend on it — so a snapshot can be captured and verified with no
+  database of runs in the process. Read `snapshot.rs`'s module doc before
+  changing anything a digest absorbs; the wire forms are frozen by fixtures under
+  `src/fixtures/` because #110 turns them into `runtime.db` columns.
 - **`harkness-test-fixtures`** is dev-only: hermetic temp repos, process fixtures, and the
   child-re-execution helpers. `COMMIT_EPOCH_SECONDS` is fixed so fixture repos hash identically.
 

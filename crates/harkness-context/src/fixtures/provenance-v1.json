@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "source": "lexical_search",
+  "path": "src/main.rs",
+  "range": {
+    "start": 0,
+    "end": 12,
+    "first_line": 1,
+    "last_line": 1
+  },
+  "symbol": {
+    "id": "sha256:86b33b9defc31403b3ea0700be943f70a5a5dc34f859dc08a5ad0fdd63cb2b32",
+    "qualified_name": "main",
+    "kind": "function",
+    "language": "rust"
+  },
+  "content_sha256": "ef32637cb9c3ec2e3968c9cbdf26a5e9c172be94f88af533e14bd43f892d5297",
+  "snapshot_id": "22222222-2222-4222-8222-222222222222",
+  "reason": {
+    "kind": "query_match",
+    "detail": "matched 'main'"
+  },
+  "rank": {
+    "score": 0.75,
+    "position": 0,
+    "candidates": 4,
+    "signals": [
+      {
+        "name": "lexical",
+        "value": 0.9,
+        "weight": 0.5
+      }
+    ]
+  },
+  "truncated": true,
+  "sensitivity": {
+    "kind": "suspicious",
+    "marker": "«untrusted-content»"
+  }
+}
