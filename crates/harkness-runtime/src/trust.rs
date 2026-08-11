@@ -296,6 +296,12 @@ impl PathBoundary {
         let mut reached = PathBuf::new();
         for component in candidate.components() {
             reached.push(component.as_os_str());
+            if matches!(
+                component,
+                std::path::Component::Prefix(_) | std::path::Component::RootDir
+            ) {
+                continue;
+            }
             let metadata = match fs::symlink_metadata(&reached) {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -702,6 +708,7 @@ pub fn classify_request(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::ffi::OsString;
     use std::fs;
 
@@ -711,10 +718,11 @@ mod tests {
     use time::macros::datetime;
 
     use super::*;
+    #[cfg(unix)]
     use crate::domain::{RunId, StepId, ToolCallId};
-    use crate::tool::{
-        Capture, ExecutionContext, Tool, ToolError, ToolIdentity, ToolMetadata, ToolProcess, erase,
-    };
+    #[cfg(unix)]
+    use crate::tool::{Capture, ToolProcess};
+    use crate::tool::{ExecutionContext, Tool, ToolError, ToolIdentity, ToolMetadata, erase};
 
     fn boundary() -> (TempDir, PathBoundary) {
         let directory = TempDir::new().unwrap();
@@ -998,8 +1006,10 @@ mod tests {
 
     struct FixtureTool(RiskLevel);
 
+    #[cfg(unix)]
     struct FixtureEnvTool(EnvironmentName);
 
+    #[cfg(unix)]
     impl Tool for FixtureEnvTool {
         type Input = Input;
         type Output = Output;
