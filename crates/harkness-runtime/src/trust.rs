@@ -777,7 +777,10 @@ mod tests {
                 link: named,
                 target,
             } => {
-                assert_eq!(named, link);
+                assert_eq!(
+                    named,
+                    fs::canonicalize(directory.path()).unwrap().join("escape")
+                );
                 assert_eq!(target, fs::canonicalize(outside.path()).unwrap());
             }
             other => panic!("unexpected refusal: {other}"),
@@ -800,7 +803,7 @@ mod tests {
         assert!(matches!(
             error,
             BoundaryError::SymlinkEscapes { link: named, target }
-                if named == link
+                if named == fs::canonicalize(directory.path()).unwrap().join("escape")
                     && target
                         == fs::canonicalize(outside.path()).unwrap().join("not-created")
         ));
