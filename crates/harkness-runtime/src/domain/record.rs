@@ -851,6 +851,87 @@ impl ToolCall {
         self.lifecycle.transition("tool_call", to, at)
     }
 
+    /// Enters `running`, pinning the tool version that was actually resolved.
+    ///
+    /// A call may be recorded without naming a version — "the latest `fs.read`"
+    /// — and which version that turned out to be has to be written down at the
+    /// moment it is chosen. Resolving again later is a second lookup, and a
+    /// second lookup can disagree with the first: a version registered in
+    /// between would make the record name something other than what ran, while
+    /// an approval bound to the recorded version would no longer describe the
+    /// work it authorized. Pinning is therefore part of this transition rather
+    /// than a separate write that could be skipped, reordered, or lost.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunDomainError`] when the call is not `pending`, and when the
+    /// record already names a *different* version — a resolution disagreeing
+    /// with a recorded request is a caller bug, not a version to overwrite.
+    pub fn dispatch(
+        &mut self,
+        tool_version: impl Into<String>,
+        at: OffsetDateTime,
+    ) -> Result<(), RunDomainError> {
+        let resolved = tool_version.into();
+        require_state(
+            "tool_call",
+            self.state() == ToolCallState::Pending,
+            "ToolCall::dispatch begins execution and requires pending",
+        )?;
+        require_state(
+            "tool_call",
+            self.tool_version.is_empty() || self.tool_version == resolved,
+            "a recorded tool version may not be replaced by a different one",
+        )?;
+        self.lifecycle
+            .transition("tool_call", ToolCallState::Running, at)?;
+        self.tool_version = resolved;
+        Ok(())
+    }
+
+    /// Records an approval, pins the resolved version, and enters `running`.
+    ///
+    /// [`Self::approve`] already resumes approval-gated work, so this adds one
+    /// thing: the version. An approval is a decision about `(id, version)` —
+    /// that pair is what an audit reads back and what a policy scope is matched
+    /// against — so recording the decision and recording what it authorized have
+    /// to be the same step. Doing them separately would leave a window in which
+    /// the call is approved and running while the row still says which version
+    /// was *asked for* rather than which one is executing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunDomainError`] when the call is not `awaiting_approval`, when
+    /// the identity is blank, and when the record already names a *different*
+    /// version. Nothing is mutated unless all three hold.
+    pub fn dispatch_approved(
+        &mut self,
+        decided_by: impl Into<String>,
+        tool_version: impl Into<String>,
+        at: OffsetDateTime,
+    ) -> Result<(), RunDomainError> {
+        let resolved = tool_version.into();
+        require_state(
+            "tool_call",
+            self.state() == ToolCallState::AwaitingApproval,
+            "approval decisions require awaiting_approval",
+        )?;
+        require_state(
+            "tool_call",
+            self.tool_version.is_empty() || self.tool_version == resolved,
+            "a recorded tool version may not be replaced by a different one",
+        )?;
+        // Validated before the transition, like every other refusal here: a
+        // rejected dispatch leaves the record exactly as it was.
+        let decided_by = approval_identity("tool_call", decided_by)?;
+        self.lifecycle
+            .transition("tool_call", ToolCallState::Running, at)?;
+        self.tool_version = resolved;
+        self.approvals
+            .push(Approval::approved(decided_by, self.updated_at()));
+        Ok(())
+    }
+
     /// Enters `succeeded` atomically with the tool output.
     pub fn succeed(&mut self, output: Value, at: OffsetDateTime) -> Result<(), RunDomainError> {
         self.lifecycle
@@ -1214,6 +1295,121 @@ mod tests {
         assert_eq!(call.state(), ToolCallState::Failed);
         assert_eq!(call.started_at(), None);
         assert_eq!(call.failure().unwrap().kind(), "invalid_input");
+    }
+
+    #[test]
+    fn dispatch_pins_the_resolved_version_as_part_of_starting() {
+        // A call may be recorded without naming a version, and which one won has
+        // to be written at the moment execution starts: resolving again later is
+        // a second lookup that can disagree with the first.
+        let step = fresh_step();
+        let mut unpinned = ToolCall::new(&step, "fixture.tool", "", json!({}), at(0));
+        assert_eq!(unpinned.tool_version(), "");
+
+        unpinned.dispatch("1.10.0", at(1)).unwrap();
+
+        assert_eq!(unpinned.state(), ToolCallState::Running);
+        assert_eq!(unpinned.tool_version(), "1.10.0");
+        assert_eq!(unpinned.started_at(), Some(at(1)));
+
+        // Restating what a caller already asked for is fine; contradicting it is
+        // a caller bug, and the record is left exactly as it was.
+        let mut pinned = fresh_call();
+        pinned.dispatch("1.0.0", at(1)).unwrap();
+        assert_eq!(pinned.state(), ToolCallState::Running);
+
+        let mut conflicting = fresh_call();
+        let error = conflicting.dispatch("2.0.0", at(1)).unwrap_err();
+        assert!(error.to_string().contains("may not be replaced"), "{error}");
+        assert_eq!(conflicting.state(), ToolCallState::Pending);
+        assert_eq!(conflicting.tool_version(), "1.0.0");
+    }
+
+    #[test]
+    fn an_approved_dispatch_records_the_decision_and_the_version_together() {
+        // An approval is a decision about `(id, version)`. Recording the two in
+        // separate steps would leave a window in which the call is approved and
+        // running while the row still names the version that was *asked for*.
+        let mut call = call_in(ToolCallState::AwaitingApproval);
+        assert_eq!(call.tool_version(), "1.0.0");
+
+        call.dispatch_approved("reviewer", "1.0.0", at(5)).unwrap();
+
+        assert_eq!(call.state(), ToolCallState::Running);
+        assert_eq!(call.tool_version(), "1.0.0");
+        assert_eq!(call.approvals().len(), 1);
+        assert_eq!(call.approvals()[0].decided_by(), "reviewer");
+        assert_eq!(
+            call.approvals()[0].decision(),
+            crate::domain::ApprovalDecision::Approved
+        );
+
+        // An unpinned call is pinned by the approval, which is the case the
+        // pairing exists for.
+        let step = fresh_step();
+        let mut unpinned = ToolCall::new(&step, "fixture.tool", "", json!({}), at(0));
+        unpinned
+            .transition(ToolCallState::AwaitingApproval, at(1))
+            .unwrap();
+        unpinned
+            .dispatch_approved("reviewer", "2.3.0", at(2))
+            .unwrap();
+        assert_eq!(unpinned.tool_version(), "2.3.0");
+    }
+
+    #[test]
+    fn a_refused_approved_dispatch_leaves_the_record_untouched() {
+        // Every refusal is checked before the transition, so a rejected dispatch
+        // cannot leave a call running with no approval, or approved with the
+        // wrong version.
+        for (decided_by, version) in [("", "1.0.0"), ("   ", "1.0.0"), ("reviewer", "2.0.0")] {
+            let mut call = call_in(ToolCallState::AwaitingApproval);
+            assert!(
+                call.dispatch_approved(decided_by, version, at(5)).is_err(),
+                "accepted {decided_by:?} at {version}"
+            );
+            assert_eq!(call.state(), ToolCallState::AwaitingApproval);
+            assert_eq!(call.tool_version(), "1.0.0");
+            assert!(call.approvals().is_empty());
+        }
+
+        // And it is reserved for a call that is actually waiting on a decision.
+        for state in [
+            ToolCallState::Pending,
+            ToolCallState::Running,
+            ToolCallState::Succeeded,
+            ToolCallState::Failed,
+            ToolCallState::Denied,
+            ToolCallState::Cancelled,
+            ToolCallState::Interrupted,
+        ] {
+            let mut call = call_in(state);
+            assert!(
+                call.dispatch_approved("reviewer", "1.0.0", at(9)).is_err(),
+                "a {state} call was approved into running"
+            );
+            assert_eq!(call.state(), state);
+        }
+    }
+
+    #[test]
+    fn only_a_pending_call_can_be_dispatched() {
+        for state in [
+            ToolCallState::AwaitingApproval,
+            ToolCallState::Running,
+            ToolCallState::Succeeded,
+            ToolCallState::Failed,
+            ToolCallState::Denied,
+            ToolCallState::Cancelled,
+            ToolCallState::Interrupted,
+        ] {
+            let mut call = call_in(state);
+            assert!(
+                call.dispatch("1.0.0", at(9)).is_err(),
+                "a {state} call was dispatched"
+            );
+            assert_eq!(call.state(), state);
+        }
     }
 
     #[test]

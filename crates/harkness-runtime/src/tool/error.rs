@@ -255,6 +255,25 @@ pub enum ToolError {
         message: String,
     },
 
+    /// A child process the tool supervised ended unsuccessfully.
+    ///
+    /// Distinguished from [`Self::ExecutionFailed`] because the two call for
+    /// different handling: a tool's own failure is a statement about the work,
+    /// while an exit status is a statement about a program whose whole
+    /// diagnostic lives on a stream this process captured. Keeping the status
+    /// typed means a caller can branch on it without parsing prose.
+    #[error("{}", render_exit(*.code, .stderr_tail))]
+    ProcessFailed {
+        /// Status the child reported, or `None` when a signal ended it.
+        code: Option<i32>,
+        /// End of what the child wrote to standard error.
+        ///
+        /// The tail rather than the whole, because a program's diagnosis comes
+        /// last and its progress reporting comes in unbounded quantity. The full
+        /// stream is in the artifact the call recorded.
+        stderr_tail: String,
+    },
+
     /// The tool exceeded the time it was allowed.
     ///
     /// Rendered with `Duration`'s own formatting rather than in whole seconds,
@@ -305,6 +324,7 @@ impl ToolError {
         "invalid_input",
         "invalid_output",
         "execution_failed",
+        "process_failed",
         "timed_out",
         "cancelled",
         "denied",
@@ -320,6 +340,7 @@ impl ToolError {
             Self::InvalidInput { .. } => "invalid_input",
             Self::InvalidOutput { .. } => "invalid_output",
             Self::ExecutionFailed { .. } => "execution_failed",
+            Self::ProcessFailed { .. } => "process_failed",
             Self::TimedOut { .. } => "timed_out",
             Self::Cancelled => "cancelled",
             Self::Denied { .. } => "denied",
@@ -661,6 +682,22 @@ fn render_violations(violations: &[SchemaViolation], omitted: usize) -> String {
     rendered
 }
 
+/// Renders a child's exit status and whatever it said on the way out.
+///
+/// A signalled child reports no code at all, and saying "exited with status
+/// None" would read as a bug in Harkness rather than as what it is — which
+/// matters here, because the executor kills a timed-out child itself.
+fn render_exit(code: Option<i32>, stderr_tail: &str) -> String {
+    let status = match code {
+        Some(code) => format!("a child process exited with status {code}"),
+        None => "a child process was ended by a signal".to_owned(),
+    };
+    match stderr_tail.trim() {
+        "" => status,
+        reported => format!("{status}: {reported}"),
+    }
+}
+
 /// Renders a recovered panic payload, or nothing when the payload was not a
 /// string this build could read.
 fn render_payload(payload: &Option<String>) -> String {
@@ -718,6 +755,13 @@ mod tests {
                     message: "fixture".to_owned(),
                 },
                 "execution_failed",
+            ),
+            (
+                ToolError::ProcessFailed {
+                    code: Some(1),
+                    stderr_tail: "fixture".to_owned(),
+                },
+                "process_failed",
             ),
             (
                 ToolError::TimedOut {
@@ -1092,6 +1136,10 @@ mod tests {
             ToolError::Denied {
                 reason: verbose.clone(),
             },
+            ToolError::ProcessFailed {
+                code: Some(1),
+                stderr_tail: verbose.clone(),
+            },
         ];
 
         for error in cases {
@@ -1142,6 +1190,10 @@ mod tests {
         // write.
         for ran in [
             ToolError::denied("policy"),
+            ToolError::ProcessFailed {
+                code: Some(2),
+                stderr_tail: "boom".to_owned(),
+            },
             ToolError::ForbiddenPath {
                 path: PathBuf::from(".."),
                 reason: "fixture",
@@ -1177,6 +1229,29 @@ mod tests {
         };
         assert_eq!(error.to_string(), "fixture.tool@1.0.0 panicked");
         assert_eq!(error.as_failure().kind(), "tool_panicked");
+    }
+
+    #[test]
+    fn a_signalled_child_does_not_report_itself_as_status_none() {
+        // The executor kills a timed-out child itself, so this rendering is the
+        // common case rather than an exotic one; "status None" would read as a
+        // bug in Harkness.
+        assert_eq!(
+            ToolError::ProcessFailed {
+                code: None,
+                stderr_tail: String::new(),
+            }
+            .to_string(),
+            "a child process was ended by a signal"
+        );
+        assert_eq!(
+            ToolError::ProcessFailed {
+                code: Some(128),
+                stderr_tail: "  fatal: not a repository\n".to_owned(),
+            }
+            .to_string(),
+            "a child process exited with status 128: fatal: not a repository"
+        );
     }
 
     #[test]

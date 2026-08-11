@@ -15,6 +15,13 @@ use super::{
     ToolDescriptor, ToolError, ToolIdentity, ToolMetadata,
 };
 
+/// Name the artifact store holds a schema-refused result under.
+///
+/// Published because it is how a consumer finds the evidence: an
+/// [`ToolError::InvalidOutput`] says *where* the value broke its schema, and
+/// this names the artifact holding the value itself.
+pub const REJECTED_OUTPUT_ARTIFACT: &str = "rejected-output.json";
+
 /// One typed operation the runtime can execute.
 ///
 /// A tool states its input and output as Rust types and its metadata as data;
@@ -290,7 +297,12 @@ where
                 0,
             )
         })?;
-        schema::validate(&self.output, identity, SchemaDirection::Output, &produced)?;
+        if let Err(rejection) =
+            schema::validate(&self.output, identity, SchemaDirection::Output, &produced)
+        {
+            preserve_rejected_output(context, &produced);
+            return Err(rejection);
+        }
 
         serde_json::value::to_raw_value(&produced).map_err(|error| {
             schema::refusal(
@@ -301,6 +313,26 @@ where
             )
         })
     }
+}
+
+/// Stores a result the output schema refused, so the evidence is not discarded.
+///
+/// The refusal itself locates the violations, but only the value says what the
+/// tool actually produced — and that is what an author debugging a contract
+/// mismatch, or a reviewer auditing what a run tried to return, needs to read.
+/// It cannot be the call's *result*: a consumer that trusted the published
+/// schema must never receive a shape it cannot handle, which is the whole point
+/// of the gate. So it goes where every other oversized, untrusted, non-result
+/// byte goes.
+///
+/// Best effort by design. A context with no artifact store attached — a test, a
+/// one-shot invocation — refuses the write, and losing the evidence must not
+/// change the failure a caller is told about.
+fn preserve_rejected_output(context: &mut ExecutionContext, produced: &Value) {
+    let Ok(encoded) = serde_json::to_vec(produced) else {
+        return;
+    };
+    let _ = context.write_artifact(REJECTED_OUTPUT_ARTIFACT, "application/json", &encoded);
 }
 
 /// Re-labels a failure a tool body raised but is not entitled to claim.

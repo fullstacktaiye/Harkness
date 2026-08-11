@@ -466,6 +466,32 @@ pub(super) fn update_tool_call(connection: &Connection, call: &ToolCall) -> Resu
     missing_row(TOOL_CALL, &call.id(), updated)
 }
 
+/// Writes the tool version a dispatch resolved.
+///
+/// The recorded *request* — `tool_id`, `tool_version`, `input_json` — is
+/// otherwise immutable, which is why [`update_tool_call`] does not name those
+/// columns at all: a lifecycle change must not be able to rewrite what was
+/// asked for. `tool_version` has exactly one exception, and this statement is
+/// it. A call may be recorded without naming a version, and the version that
+/// won has to be written at the moment execution starts; the domain refuses to
+/// replace one version with a different one, so what reaches here is only ever
+/// filling in a blank or restating what was already there.
+pub(super) fn pin_tool_call_version(
+    connection: &Connection,
+    call: &ToolCall,
+) -> Result<(), StoreError> {
+    let updated = connection
+        .execute(
+            "UPDATE tool_calls SET tool_version = :tool_version WHERE id = :id",
+            named_params! {
+                ":id": call.id().to_string(),
+                ":tool_version": encode_text(TOOL_CALL, "tool_version", call.tool_version())?,
+            },
+        )
+        .map_err(|error| query_failed("pinning a tool call version", error))?;
+    missing_row(TOOL_CALL, &call.id(), updated)
+}
+
 pub(super) fn load_tool_call(
     connection: &Connection,
     id: ToolCallId,

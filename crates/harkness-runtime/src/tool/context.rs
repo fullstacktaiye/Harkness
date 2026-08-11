@@ -1,6 +1,8 @@
 use std::fmt;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use harkness_git::Cancellation;
 use schemars::JsonSchema;
@@ -9,6 +11,23 @@ use serde::{Deserialize, Serialize};
 use crate::domain::{RunId, StepId, ToolCallId};
 
 use super::ToolError;
+
+/// How often a waiting supervisor re-checks for a reason to stop.
+///
+/// The cadence `harkness-git`'s runner already uses, named once here so a
+/// cancelled call, a cancelled child, and a deadline all take effect on the same
+/// terms. Short enough that a stopped child dies while the user is still looking
+/// at the button they pressed; long enough that waiting costs no busy spin.
+pub const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Bytes of each captured output stream a call retains in memory by default.
+///
+/// A tool that shells out cannot know in advance how much its child will write,
+/// and a failure message needs the end of that output rather than all of it —
+/// the same reasoning that keeps only the last few segments of Git's stderr.
+/// The full stream still reaches an artifact; this bounds only what is held to
+/// explain a failure.
+pub const DEFAULT_STREAM_TAIL_BYTES: usize = 64 * 1024;
 
 /// A unit a countable progress event is measured in.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -216,6 +235,66 @@ impl ProgressSink for RecordedProgress {
     }
 }
 
+/// Progress events a bounded channel holds before the consumer falls behind.
+///
+/// Small on purpose. The queue is not a buffer to be filled: it exists so a tool
+/// reporting a burst of events does not block on every one of them, and a
+/// consumer polling on a short interval empties it long before it fills. Sizing
+/// it generously would only convert a slow consumer from a visible stall into
+/// invisible memory growth.
+pub const DEFAULT_PROGRESS_CAPACITY: usize = 64;
+
+/// Creates a bounded channel a running tool reports progress through.
+///
+/// # Backpressure, not buffering
+///
+/// The channel is a [`SyncSender`](std::sync::mpsc::SyncSender), so a tool that
+/// outruns its consumer *blocks* rather than queueing. That is the intended
+/// behaviour and not a limitation to work around: progress describes work in
+/// flight, so a queue that grows without bound is one that reports the past
+/// while consuming memory in the present. A tool held up by its own reporting is
+/// a tool that has been told to slow down.
+///
+/// Dropping the receiver is not an error. A consumer that has given up — because
+/// the call timed out, or its run ended — leaves the tool free to run to its own
+/// conclusion instead of blocking forever on a sink nobody reads.
+#[must_use]
+pub fn progress_channel(capacity: usize) -> (ProgressChannel, ProgressReceiver) {
+    let (sender, receiver) = mpsc::sync_channel(capacity);
+    (ProgressChannel { sender }, ProgressReceiver { receiver })
+}
+
+/// The sending half of a bounded progress channel.
+#[derive(Clone, Debug)]
+pub struct ProgressChannel {
+    sender: mpsc::SyncSender<ProgressEvent>,
+}
+
+impl ProgressSink for ProgressChannel {
+    /// Blocks while the channel is full, and discards once nobody is receiving.
+    fn emit(&mut self, event: ProgressEvent) {
+        let _ = self.sender.send(event);
+    }
+}
+
+/// The receiving half of a bounded progress channel.
+#[derive(Debug)]
+pub struct ProgressReceiver {
+    receiver: mpsc::Receiver<ProgressEvent>,
+}
+
+impl ProgressReceiver {
+    /// Takes every event that has arrived, without waiting for more.
+    ///
+    /// Returns an empty vector when nothing is queued, including after every
+    /// sender has been dropped — a consumer draining one last time as a call
+    /// ends is asking what is left, not whether the tool is still running.
+    #[must_use]
+    pub fn drain(&self) -> Vec<ProgressEvent> {
+        self.receiver.try_iter().collect()
+    }
+}
+
 /// A handle to content a tool stored outside its own output.
 ///
 /// Output travels through schema validation and is persisted inline under a size
@@ -239,21 +318,58 @@ pub struct ArtifactRef {
     pub byte_len: u64,
 }
 
-/// Where a running tool puts content too large for its result.
-pub trait ArtifactWriter: Send {
-    /// Stores `bytes` and returns a reference the tool can put in its output.
+/// Content on its way into artifact storage, one chunk at a time.
+///
+/// This is the shape a tool that supervises a child process needs, and the
+/// reason [`ArtifactWriter`] is not a single buffer-shaped method: the output of
+/// a build or a clone is exactly the thing that must never be assembled in
+/// memory in order to be stored. Bytes written here are durable only once
+/// [`finish`](Self::finish) returns; an abandoned stream records nothing.
+pub trait ArtifactStream: Write + Send {
+    /// Makes the bytes durable and returns the reference naming them.
+    ///
+    /// Consuming a `Box<Self>` rather than `self` keeps the trait
+    /// object-safe, which is what lets a stream be opened here and handed to
+    /// the reader thread that fills it.
     ///
     /// # Errors
     ///
-    /// Returns a [`ToolError`] when the content cannot be stored. A tool that
+    /// Returns a [`ToolError`] when the content cannot be finalized.
+    fn finish(self: Box<Self>) -> Result<ArtifactRef, ToolError>;
+}
+
+/// Where a running tool puts content too large for its result.
+pub trait ArtifactWriter: Send {
+    /// Opens a stream that stores content under `name` as `media_type`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ToolError`] when storage cannot be opened. A tool that
     /// cannot store its artifact has not completed its work and should report
     /// the failure rather than return a partial result.
+    fn open(&mut self, name: &str, media_type: &str) -> Result<Box<dyn ArtifactStream>, ToolError>;
+
+    /// Stores `bytes` and returns a reference the tool can put in its output.
+    ///
+    /// The convenience shape for content a tool already holds. It is a provided
+    /// method rather than a second thing to implement, so a writer cannot store
+    /// buffered content one way and streamed content another.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`](Self::open), plus a failure to write or finalize the content.
     fn write(
         &mut self,
         name: &str,
         media_type: &str,
         bytes: &[u8],
-    ) -> Result<ArtifactRef, ToolError>;
+    ) -> Result<ArtifactRef, ToolError> {
+        let mut stream = self.open(name, media_type)?;
+        stream.write_all(bytes).map_err(|error| {
+            ToolError::execution_failed(format!("{name:?} could not be written: {error}"))
+        })?;
+        stream.finish()
+    }
 }
 
 /// An artifact writer for contexts with no artifact store attached.
@@ -265,17 +381,64 @@ pub trait ArtifactWriter: Send {
 pub struct UnsupportedArtifacts;
 
 impl ArtifactWriter for UnsupportedArtifacts {
-    fn write(
+    fn open(
         &mut self,
         name: &str,
         _media_type: &str,
-        _bytes: &[u8],
-    ) -> Result<ArtifactRef, ToolError> {
+    ) -> Result<Box<dyn ArtifactStream>, ToolError> {
         Err(ToolError::ExecutionFailed {
             message: format!(
                 "no artifact store is attached to this execution context, so {name:?} cannot be stored"
             ),
         })
+    }
+}
+
+/// The wall-clock bound on one tool call.
+///
+/// Both halves are carried because both are needed and neither derives the
+/// other after the fact: the instant answers "is it over", and the limit is what
+/// [`ToolError::TimedOut`] has to report. Recomputing the limit from the instant
+/// once it has passed would report how *late* the call is rather than what it
+/// was allowed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Deadline {
+    limit: Duration,
+    at: Instant,
+}
+
+impl Deadline {
+    /// Bounds a call that starts now to `limit`.
+    ///
+    /// Returns `None` when the limit lands further into the future than an
+    /// [`Instant`] can represent — a call that would outlive the machine, and so
+    /// one bounded by cancellation alone. An `Option` rather than a panic
+    /// because the caller is an executor that has already moved a record to
+    /// `running`: unwinding there would strand the call in the one state the
+    /// execution layer promises is impossible, over a limit nobody could reach.
+    #[must_use]
+    pub fn starting_now(limit: Duration) -> Option<Self> {
+        Instant::now()
+            .checked_add(limit)
+            .map(|at| Self { limit, at })
+    }
+
+    /// The limit the call was given.
+    #[must_use]
+    pub const fn limit(self) -> Duration {
+        self.limit
+    }
+
+    /// The instant after which the call is over its limit.
+    #[must_use]
+    pub const fn at(self) -> Instant {
+        self.at
+    }
+
+    /// Whether the limit has already elapsed.
+    #[must_use]
+    pub fn has_passed(self) -> bool {
+        Instant::now() >= self.at
     }
 }
 
@@ -290,6 +453,12 @@ impl ArtifactWriter for UnsupportedArtifacts {
 /// The cancellation token is `harkness_git`'s, not a second mechanism. A tool
 /// that shells out to Git hands the very same token down, so one cancel request
 /// reaches the whole tree instead of stopping at a translation layer.
+///
+/// The deadline and the retained-output bound live here for the same reason the
+/// token does: a tool that supervises a child has to enforce them on that child,
+/// and it can only do that if the limits reached it. An executor sets both when
+/// it dispatches the call; a context built by hand has no deadline and the
+/// default bound.
 pub struct ExecutionContext {
     run: RunId,
     step: StepId,
@@ -298,6 +467,8 @@ pub struct ExecutionContext {
     cancellation: Cancellation,
     progress: Box<dyn ProgressSink>,
     artifacts: Box<dyn ArtifactWriter>,
+    deadline: Option<Deadline>,
+    stream_tail_bytes: usize,
 }
 
 impl ExecutionContext {
@@ -356,7 +527,26 @@ impl ExecutionContext {
             cancellation,
             progress,
             artifacts,
+            deadline: None,
+            stream_tail_bytes: DEFAULT_STREAM_TAIL_BYTES,
         })
+    }
+
+    /// Bounds this call's running time.
+    #[must_use]
+    pub const fn with_deadline(mut self, deadline: Deadline) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
+    /// Bounds how much of each captured output stream is retained in memory.
+    ///
+    /// Zero is accepted and means no tail is kept at all, which is what a call
+    /// whose output only ever belongs in an artifact wants.
+    #[must_use]
+    pub const fn with_stream_tail_bytes(mut self, bytes: usize) -> Self {
+        self.stream_tail_bytes = bytes;
+        self
     }
 
     /// Builds a context with no progress reporting and no artifact storage.
@@ -429,6 +619,41 @@ impl ExecutionContext {
         Ok(())
     }
 
+    /// The wall-clock bound on this call, when it has one.
+    #[must_use]
+    pub const fn deadline(&self) -> Option<Deadline> {
+        self.deadline
+    }
+
+    /// Bytes of each captured output stream to retain in memory.
+    #[must_use]
+    pub const fn stream_tail_bytes(&self) -> usize {
+        self.stream_tail_bytes
+    }
+
+    /// Returns an error if cancellation was requested or the deadline passed.
+    ///
+    /// The check a tool between units of work actually wants: an executor
+    /// enforces the deadline from outside, but a body that notices first stops
+    /// sooner and gets to unwind its own work rather than being abandoned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Cancelled`] or [`ToolError::TimedOut`]. Cancellation
+    /// is reported first, because a cancelled call that also ran out of time was
+    /// stopped by its caller and saying otherwise would misattribute it.
+    pub fn check_still_permitted(&self) -> Result<(), ToolError> {
+        self.check_cancelled()?;
+        if let Some(deadline) = self.deadline
+            && deadline.has_passed()
+        {
+            return Err(ToolError::TimedOut {
+                limit: deadline.limit(),
+            });
+        }
+        Ok(())
+    }
+
     /// Reports one progress event.
     pub fn report(&mut self, event: ProgressEvent) {
         self.progress.emit(event);
@@ -448,6 +673,22 @@ impl ExecutionContext {
         bytes: &[u8],
     ) -> Result<ArtifactRef, ToolError> {
         self.artifacts.write(name, media_type, bytes)
+    }
+
+    /// Opens a stream storing content outside the tool's result.
+    ///
+    /// What a tool uses when the content is a stream rather than a value it
+    /// already holds — the output of a child process, most of all.
+    ///
+    /// # Errors
+    ///
+    /// As [`ArtifactWriter::open`].
+    pub fn open_artifact(
+        &mut self,
+        name: &str,
+        media_type: &str,
+    ) -> Result<Box<dyn ArtifactStream>, ToolError> {
+        self.artifacts.open(name, media_type)
     }
 
     /// Resolves a workspace-relative path against the workspace root.
@@ -515,19 +756,24 @@ impl fmt::Debug for ExecutionContext {
             .field("call", &self.call)
             .field("workspace_root", &self.workspace_root)
             .field("cancelled", &self.cancellation.is_cancelled())
+            .field("timeout", &self.deadline.map(Deadline::limit))
             .finish_non_exhaustive()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use harkness_git::Cancellation;
 
     use super::{
-        ArtifactRef, ArtifactWriter, DiscardedProgress, ExecutionContext, ProgressEvent,
-        ProgressSink, ProgressUnit, RecordedProgress, UnsupportedArtifacts,
+        ArtifactRef, ArtifactStream, ArtifactWriter, DEFAULT_STREAM_TAIL_BYTES, Deadline,
+        DiscardedProgress, ExecutionContext, ProgressEvent, ProgressSink, ProgressUnit,
+        RecordedProgress, UnsupportedArtifacts,
     };
     use crate::domain::{RunId, StepId, ToolCallId};
     use crate::tool::ToolError;
@@ -757,28 +1003,67 @@ mod tests {
         assert!(error.to_string().contains("build.log"), "{error}");
     }
 
-    #[test]
-    fn an_attached_artifact_store_receives_the_content() {
-        #[derive(Default)]
-        struct Recording(Vec<(String, String, usize)>);
+    /// One artifact an in-memory writer was handed.
+    type Stored = (String, String, Vec<u8>);
 
-        impl ArtifactWriter for Recording {
-            fn write(
-                &mut self,
-                name: &str,
-                media_type: &str,
-                bytes: &[u8],
-            ) -> Result<ArtifactRef, ToolError> {
-                self.0
-                    .push((name.to_owned(), media_type.to_owned(), bytes.len()));
-                Ok(ArtifactRef {
-                    id: format!("artifact-{}", self.0.len()),
-                    media_type: media_type.to_owned(),
-                    byte_len: bytes.len() as u64,
-                })
-            }
+    /// An in-memory artifact writer that records what it was handed.
+    #[derive(Clone, Debug, Default)]
+    struct Recording(Arc<Mutex<Vec<Stored>>>);
+
+    impl Recording {
+        fn stored(&self) -> Vec<Stored> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    struct RecordingStream {
+        recording: Recording,
+        name: String,
+        media_type: String,
+        bytes: Vec<u8>,
+    }
+
+    impl std::io::Write for RecordingStream {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
         }
 
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ArtifactStream for RecordingStream {
+        fn finish(self: Box<Self>) -> Result<ArtifactRef, ToolError> {
+            let mut stored = self.recording.0.lock().unwrap();
+            stored.push((self.name, self.media_type.clone(), self.bytes.clone()));
+            Ok(ArtifactRef {
+                id: format!("artifact-{}", stored.len()),
+                media_type: self.media_type,
+                byte_len: self.bytes.len() as u64,
+            })
+        }
+    }
+
+    impl ArtifactWriter for Recording {
+        fn open(
+            &mut self,
+            name: &str,
+            media_type: &str,
+        ) -> Result<Box<dyn ArtifactStream>, ToolError> {
+            Ok(Box::new(RecordingStream {
+                recording: self.clone(),
+                name: name.to_owned(),
+                media_type: media_type.to_owned(),
+                bytes: Vec::new(),
+            }))
+        }
+    }
+
+    #[test]
+    fn an_attached_artifact_store_receives_the_content() {
+        let recording = Recording::default();
         let mut context = ExecutionContext::new(
             RunId::new(),
             StepId::new(),
@@ -786,7 +1071,7 @@ mod tests {
             ROOT,
             Cancellation::default(),
             Box::new(DiscardedProgress),
-            Box::new(Recording::default()),
+            Box::new(recording.clone()),
         )
         .unwrap();
 
@@ -800,6 +1085,105 @@ mod tests {
                 media_type: "text/x-diff".to_owned(),
                 byte_len: 2,
             }
+        );
+        assert_eq!(
+            recording.stored(),
+            [(
+                "diff.patch".to_owned(),
+                "text/x-diff".to_owned(),
+                b"@@".to_vec()
+            )]
+        );
+    }
+
+    #[test]
+    fn buffered_and_streamed_artifacts_take_the_same_route() {
+        // `write` is a provided method built on `open`, so a writer cannot store
+        // buffered content one way and streamed content another — which is what
+        // would let redaction, hashing, or naming disagree between them.
+        let recording = Recording::default();
+        let mut context = ExecutionContext::new(
+            RunId::new(),
+            StepId::new(),
+            ToolCallId::new(),
+            ROOT,
+            Cancellation::default(),
+            Box::new(DiscardedProgress),
+            Box::new(recording.clone()),
+        )
+        .unwrap();
+
+        let mut stream = context.open_artifact("build.log", "text/plain").unwrap();
+        stream.write_all(b"first ").unwrap();
+        stream.write_all(b"second").unwrap();
+        let streamed = stream.finish().unwrap();
+
+        assert_eq!(streamed.byte_len, 12);
+        assert_eq!(
+            recording.stored()[0],
+            (
+                "build.log".to_owned(),
+                "text/plain".to_owned(),
+                b"first second".to_vec()
+            )
+        );
+    }
+
+    #[test]
+    fn a_deadline_reports_its_limit_and_a_context_without_one_never_times_out() {
+        let context = context();
+        assert_eq!(context.deadline(), None);
+        assert_eq!(context.stream_tail_bytes(), DEFAULT_STREAM_TAIL_BYTES);
+        assert!(context.check_still_permitted().is_ok());
+
+        let deadline = Deadline::starting_now(Duration::from_millis(0)).unwrap();
+        assert_eq!(deadline.limit(), Duration::from_millis(0));
+        assert!(deadline.has_passed());
+
+        // A limit further away than an `Instant` can express is reported rather
+        // than panicked over: the executor asking for one has already moved a
+        // record to `running`, and unwinding there would strand the call in the
+        // one state the execution layer promises is impossible.
+        assert_eq!(Deadline::starting_now(Duration::MAX), None);
+
+        let bounded =
+            ExecutionContext::detached(RunId::new(), StepId::new(), ToolCallId::new(), ROOT)
+                .unwrap()
+                .with_deadline(deadline)
+                .with_stream_tail_bytes(16);
+        assert_eq!(bounded.stream_tail_bytes(), 16);
+        assert_eq!(
+            bounded.check_still_permitted().unwrap_err(),
+            ToolError::TimedOut {
+                limit: Duration::from_millis(0)
+            }
+        );
+        assert!(format!("{bounded:?}").contains("timeout"));
+    }
+
+    #[test]
+    fn a_cancelled_call_that_also_ran_out_of_time_reports_the_cancellation() {
+        // Both are true, and only one of them is why the call stopped. Reporting
+        // the deadline would tell a user their work was too slow when in fact
+        // they asked for it to stop.
+        let cancellation = Cancellation::default();
+        let context = ExecutionContext::new(
+            RunId::new(),
+            StepId::new(),
+            ToolCallId::new(),
+            ROOT,
+            cancellation.clone(),
+            Box::new(DiscardedProgress),
+            Box::new(UnsupportedArtifacts),
+        )
+        .unwrap()
+        .with_deadline(Deadline::starting_now(Duration::ZERO).unwrap());
+
+        cancellation.cancel();
+
+        assert_eq!(
+            context.check_still_permitted().unwrap_err(),
+            ToolError::Cancelled
         );
     }
 
