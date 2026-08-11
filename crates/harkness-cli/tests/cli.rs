@@ -232,6 +232,48 @@ fn editor_configuration_and_cli_open_use_literal_argv() {
     assert_eq!(response["data"]["kind"], "editor_open");
     assert_eq!(response["data"]["line"], 14);
 
+    fs::remove_file(&log).unwrap();
+    let dotted = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "editor",
+            "open",
+            "--project",
+            &project.id.to_string(),
+            "./src/./main.rs",
+        ],
+    );
+    assert!(dotted.status.success());
+    let dotted_response = json_output(&dotted);
+    assert_eq!(
+        dotted_response["data"]["file"],
+        project.root.join("src/main.rs").to_string_lossy().as_ref()
+    );
+
+    let zero_line = harkness(
+        &data_dir,
+        &[
+            "editor",
+            "open",
+            "--project",
+            &project.id.to_string(),
+            "src/main.rs",
+            "--line",
+            "0",
+        ],
+    );
+    assert_eq!(zero_line.status.code(), Some(2));
+
+    let invalid_template = harkness(
+        &data_dir,
+        &["--json", "editor", "set", "--", "code", "--wait"],
+    );
+    assert_eq!(invalid_template.status.code(), Some(3));
+    let invalid_template = json_output(&invalid_template);
+    assert_eq!(invalid_template["error"]["kind"], "invalid_editor_template");
+    assert_eq!(invalid_template["error"]["details"]["command"], "code");
+
     let missing = "harkness-editor-that-does-not-exist";
     assert!(
         harkness(&data_dir, &["editor", "set", "--", missing, "{file}"])
@@ -299,6 +341,97 @@ fn editor_configuration_and_cli_open_use_literal_argv() {
             .as_os_str()
             .as_encoded_bytes()
     );
+
+    let editor_fallback_log = fixture.path().join("editor-fallback-argv");
+    let editor_fallback = Command::new(env!("CARGO_BIN_EXE_harkness"))
+        .env("HARKNESS_DATA_DIR", &data_dir)
+        .env_remove("VISUAL")
+        .env(
+            "EDITOR",
+            format!("{} {}", editor.display(), editor_fallback_log.display()),
+        )
+        .args([
+            "editor",
+            "open",
+            "--project",
+            &project.id.to_string(),
+            "src/main.rs",
+        ])
+        .output()
+        .unwrap();
+    assert!(editor_fallback.status.success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !editor_fallback_log.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "$EDITOR shim did not record argv"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        fs::read(editor_fallback_log).unwrap(),
+        project
+            .root
+            .join("src/main.rs")
+            .as_os_str()
+            .as_encoded_bytes()
+    );
+
+    let terminal_editor = fixture.path().join("terminal-editor");
+    fs::write(
+        &terminal_editor,
+        "#!/bin/sh\nIFS= read -r value\nprintf '%s' \"$value\" > \"$1\"\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&terminal_editor).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&terminal_editor, permissions).unwrap();
+    let terminal_log = fixture.path().join("terminal-input");
+    assert!(
+        harkness(
+            &data_dir,
+            &[
+                "editor",
+                "set",
+                "--",
+                terminal_editor.to_str().unwrap(),
+                terminal_log.to_str().unwrap(),
+                "{file}",
+            ],
+        )
+        .status
+        .success()
+    );
+    let mut terminal_launch = Command::new(env!("CARGO_BIN_EXE_harkness"))
+        .env("HARKNESS_DATA_DIR", &data_dir)
+        .args([
+            "editor",
+            "open",
+            "--project",
+            &project.id.to_string(),
+            "src/main.rs",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    terminal_launch
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"terminal input\n")
+        .unwrap();
+    assert!(terminal_launch.wait().unwrap().success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !terminal_log.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "configured editor did not inherit CLI stdin"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(fs::read(terminal_log).unwrap(), b"terminal input");
 }
 
 #[test]
@@ -2896,6 +3029,7 @@ fn the_contract_publishes_an_exit_code_for_every_error_kind() {
     assert_eq!(map["git"]["worktree_already_locked"], 5);
     assert_eq!(map["project"]["worktree_destination_exists"], 5);
     assert_eq!(map["editor"]["editor_path_outside_project"], 3);
+    assert_eq!(map["editor"]["editor_file_unavailable"], 4);
     assert_eq!(map["editor"]["editor_launch"], 1);
     assert_eq!(map["cli"]["usage_error"], 2);
 }

@@ -1335,6 +1335,13 @@ fn review_path(file: &harkness_git::FileDiff) -> PathBuf {
         .unwrap_or_default()
 }
 
+/// Only an unstaged diff reads its new side from the same working-tree file
+/// that an editor will open. Every other target is pinned to the index or a
+/// commit and may therefore disagree with the checkout by the time it opens.
+fn working_tree_may_differ(target: &harkness_git::DiffTarget) -> bool {
+    !matches!(target, harkness_git::DiffTarget::Unstaged)
+}
+
 fn prepare_review_target(
     git: &harkness_git::GitService,
     selection: ReviewSelection,
@@ -3894,18 +3901,15 @@ impl ffi::HarknessBackend {
             .and_then(|state| {
                 state.loaded_file.as_ref().and_then(|loaded| {
                     (loaded.id == file_id).then(|| {
-                        let historical = state.target.as_ref().is_some_and(|target| {
-                            matches!(
-                                target.target,
-                                harkness_git::DiffTarget::Commit { .. }
-                                    | harkness_git::DiffTarget::Revisions { .. }
-                            )
-                        });
-                        (review_path(&loaded.file), historical)
+                        let may_differ = state
+                            .target
+                            .as_ref()
+                            .is_some_and(|target| working_tree_may_differ(&target.target));
+                        (review_path(&loaded.file), may_differ)
                     })
                 })
             });
-        let Some((path, historical)) = selection else {
+        let Some((path, may_differ)) = selection else {
             self.as_mut()
                 .set_status("The selected review file is no longer available".into());
             return;
@@ -3915,13 +3919,16 @@ impl ffi::HarknessBackend {
                 .set_status("The project identifier is invalid".into());
             return;
         };
-        let line = u32::try_from(line).unwrap_or(1).max(1);
+        let line = u32::try_from(line)
+            .ok()
+            .and_then(std::num::NonZeroU32::new)
+            .unwrap_or(std::num::NonZeroU32::MIN);
         let result = harkness_core::ProjectService::load().and_then(|service| {
             service.open_in_editor(
                 project_id,
                 &path,
-                harkness_core::EditorPosition::new(line, 1),
-                harkness_core::EditorFallback::Desktop,
+                harkness_core::EditorPosition::new(line, std::num::NonZeroU32::MIN),
+                harkness_core::EditorLaunchContext::Graphical,
             )
         });
         match result {
@@ -3929,12 +3936,11 @@ impl ffi::HarknessBackend {
                 let mut message = format!(
                     "Opened {} at line {} with {}",
                     path.display(),
-                    launch.position.line,
+                    launch.position.line(),
                     launch.command
                 );
-                if historical {
-                    message
-                        .push_str(" (working-tree content may differ from this historical diff)");
+                if may_differ {
+                    message.push_str(" (working-tree content may differ from this diff)");
                 }
                 self.as_mut().set_status(message.into());
             }
@@ -4847,8 +4853,8 @@ mod tests {
         retreat_review_file_window, retreat_review_row_window, review_content_summary,
         review_file_window, review_hunk_exists_where, review_path, review_row_count, review_rows,
         run_git_operation_with_git, run_git_status_with_git, selected_review_path, to_branches,
-        to_git, to_jobs, to_map, to_projects, to_review, update_job, worktree_base,
-        worktree_job_lock_scope,
+        to_git, to_jobs, to_map, to_projects, to_review, update_job, working_tree_may_differ,
+        worktree_base, worktree_job_lock_scope,
     };
 
     fn project(
@@ -4879,6 +4885,24 @@ mod tests {
         repository
             .commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
             .unwrap();
+    }
+
+    #[test]
+    fn only_unstaged_reviews_share_the_editor_working_tree() {
+        assert!(!working_tree_may_differ(
+            &harkness_git::DiffTarget::Unstaged
+        ));
+        assert!(working_tree_may_differ(&harkness_git::DiffTarget::Staged));
+        assert!(working_tree_may_differ(&harkness_git::DiffTarget::Commit {
+            revision: "a".repeat(40),
+            parent: None,
+        }));
+        assert!(working_tree_may_differ(
+            &harkness_git::DiffTarget::Revisions {
+                old_revision: "a".repeat(40),
+                new_revision: "b".repeat(40),
+            }
+        ));
     }
 
     fn commit_file(root: &Path, path: &Path, contents: &str, message: &str) {
@@ -6345,6 +6369,52 @@ mod tests {
             best_working_tree_line(hunk, addition_index),
             addition.new_line_number.unwrap()
         );
+    }
+
+    #[test]
+    fn review_line_navigation_uses_existing_coordinates_around_unpaired_deletions() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("review-line-navigation-repository");
+        initialize_repository(&root);
+        let path = Path::new("lines.txt");
+        commit_file(&root, path, "first\nremoved\nlast\n", "add lines");
+        fs::write(root.join(path), "first\nlast\n").unwrap();
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
+        let files = git
+            .diff(
+                harkness_git::DiffTarget::Unstaged,
+                &harkness_git::DiffOptions::default(),
+            )
+            .unwrap();
+        let hunk = &files[0].hunks[0];
+        let deletion_index = hunk
+            .lines
+            .iter()
+            .position(|line| matches!(line.kind, harkness_git::DiffLineKind::Deletion))
+            .unwrap();
+        let following_context = hunk.lines[deletion_index + 1..]
+            .iter()
+            .find_map(|line| line.new_line_number)
+            .unwrap();
+        assert_eq!(
+            best_working_tree_line(hunk, deletion_index),
+            following_context
+        );
+
+        fs::write(root.join(path), "first\n").unwrap();
+        let files = git
+            .diff(
+                harkness_git::DiffTarget::Unstaged,
+                &harkness_git::DiffOptions::default(),
+            )
+            .unwrap();
+        let hunk = &files[0].hunks[0];
+        let final_deletion_index = hunk
+            .lines
+            .iter()
+            .rposition(|line| matches!(line.kind, harkness_git::DiffLineKind::Deletion))
+            .unwrap();
+        assert_eq!(best_working_tree_line(hunk, final_deletion_index), 1);
     }
 
     #[test]

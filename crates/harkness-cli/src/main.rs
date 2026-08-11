@@ -3,6 +3,7 @@ use std::{
     ffi::OsString,
     fs,
     io::{self, Read, Write},
+    num::NonZeroU32,
     path::{Path, PathBuf},
     process::ExitCode,
     sync::atomic::{AtomicBool, Ordering},
@@ -19,7 +20,7 @@ use clap::{
     error::{Error as ClapError, ErrorKind},
 };
 use harkness_core::{
-    EditorConfiguration, EditorError, EditorFallback, EditorPosition, EditorPreset, Project,
+    EditorConfiguration, EditorError, EditorLaunchContext, EditorPosition, EditorPreset, Project,
     ProjectError, ProjectSelector, ProjectService, ProjectSource, Worktree,
 };
 use harkness_git::{
@@ -166,11 +167,11 @@ struct EditorOpenArguments {
     #[arg(value_name = "PATH", allow_hyphen_values = true)]
     path: PathBuf,
     /// One-based line number.
-    #[arg(long, default_value_t = 1)]
-    line: u32,
+    #[arg(long, default_value = "1")]
+    line: NonZeroU32,
     /// One-based column number.
-    #[arg(long, default_value_t = 1)]
-    column: u32,
+    #[arg(long, default_value = "1")]
+    column: NonZeroU32,
 }
 
 #[derive(Debug, Args)]
@@ -1636,7 +1637,7 @@ fn run_editor(
                 || {
                     configuration.as_ref().map_or_else(
                         || "automatic ($VISUAL, $EDITOR, desktop default)".to_owned(),
-                        |configuration| configuration.command().join(" "),
+                        display_editor_command,
                     )
                 },
                 || Ok(json!({ "editor": configuration.as_ref().map(editor_configuration_value) })),
@@ -1652,7 +1653,7 @@ fn run_editor(
                             "{}\t{}\t{}",
                             preset.id(),
                             preset.name(),
-                            preset.configuration().command().join(" ")
+                            display_editor_command(&preset.configuration())
                         )
                     })
                     .collect::<Vec<_>>()
@@ -1676,7 +1677,7 @@ fn run_editor(
             service.set_editor_configuration(Some(configuration.clone()))?;
             command_result(
                 json_output,
-                || format!("editor set to {}", configuration.command().join(" ")),
+                || format!("editor set to {}", display_editor_command(&configuration)),
                 || Ok(json!({ "editor": editor_configuration_value(&configuration) })),
             )
         }
@@ -1694,7 +1695,7 @@ fn run_editor(
                 project.id,
                 &arguments.path,
                 EditorPosition::new(arguments.line, arguments.column),
-                EditorFallback::Environment,
+                EditorLaunchContext::CommandLine,
             )?;
             command_result(
                 json_output,
@@ -1702,8 +1703,8 @@ fn run_editor(
                     format!(
                         "opened {} at {}:{} with {}",
                         arguments.path.display(),
-                        launch.position.line,
-                        launch.position.column,
+                        launch.position.line(),
+                        launch.position.column(),
                         launch.command
                     )
                 },
@@ -1714,8 +1715,8 @@ fn run_editor(
                         "command": launch.command,
                         "file": file,
                         "path_is_lossy": path_is_lossy,
-                        "line": launch.position.line,
-                        "column": launch.position.column,
+                        "line": launch.position.line(),
+                        "column": launch.position.column(),
                     }))
                 },
             )
@@ -1725,6 +1726,18 @@ fn run_editor(
 
 fn editor_configuration_value(configuration: &EditorConfiguration) -> Value {
     json!({ "command": configuration.command() })
+}
+
+fn display_editor_command(configuration: &EditorConfiguration) -> String {
+    Value::Array(
+        configuration
+            .command()
+            .iter()
+            .cloned()
+            .map(Value::String)
+            .collect(),
+    )
+    .to_string()
 }
 
 fn run_git(
@@ -3851,6 +3864,7 @@ fn editor_exit_code(error: &EditorError) -> u8 {
         EditorError::PathOutsideProject { .. } | EditorError::InvalidTemplate { .. } => {
             EXIT_REFUSED
         }
+        EditorError::FileUnavailable { .. } => EXIT_NOT_FOUND,
         EditorError::Launch { .. } => EXIT_OPERATION_FAILED,
     }
 }
@@ -4061,6 +4075,7 @@ const PROJECT_KIND_EXIT_CODES: &[(&str, u8)] = &[
 const EDITOR_KIND_EXIT_CODES: &[(&str, u8)] = &[
     ("invalid_editor_template", EXIT_REFUSED),
     ("editor_path_outside_project", EXIT_REFUSED),
+    ("editor_file_unavailable", EXIT_NOT_FOUND),
     ("editor_launch", EXIT_OPERATION_FAILED),
 ];
 
@@ -4170,12 +4185,12 @@ fn project_error_details(error: &ProjectError) -> Value {
 
 fn editor_error_details(error: &EditorError) -> Value {
     match error {
-        EditorError::PathOutsideProject { path } => {
+        EditorError::PathOutsideProject { path } | EditorError::FileUnavailable { path } => {
             let (path, path_is_lossy) = wire_path(path);
             json!({ "path": path, "path_is_lossy": path_is_lossy })
         }
         EditorError::Launch { command, .. } => json!({ "command": command }),
-        EditorError::InvalidTemplate { .. } => json!({}),
+        EditorError::InvalidTemplate { command, .. } => json!({ "command": command }),
     }
 }
 
@@ -4439,6 +4454,7 @@ mod tests {
         assert_eq!(declared, EditorError::KINDS);
         assert_eq!(
             editor_exit_code(&EditorError::InvalidTemplate {
+                command: "fixture-editor".to_owned(),
                 reason: "fixture".to_owned(),
             }),
             EXIT_REFUSED

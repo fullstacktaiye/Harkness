@@ -16,7 +16,8 @@ mod testing;
 
 pub use catalog::entry::{Project, ProjectId, ProjectSource};
 pub use editor::{
-    EditorConfiguration, EditorError, EditorFallback, EditorLaunch, EditorPosition, EditorPreset,
+    EditorConfiguration, EditorError, EditorLaunch, EditorLaunchContext, EditorPosition,
+    EditorPreset,
 };
 pub use harkness_git;
 pub use harkness_git::{

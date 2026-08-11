@@ -686,6 +686,7 @@ dependencies = [
  "git2",
  "harkness-git",
  "harkness-test-fixtures",
+ "libc",
  "serde",
  "serde_json",
  "shlex",

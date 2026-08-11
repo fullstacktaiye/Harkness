@@ -1,0 +1,19 @@
+{
+  "version": 3,
+  "projects": [
+    {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "display_name": "version-three-local",
+      "root": "__LOCAL_ROOT__",
+      "source": "local",
+      "last_opened": "2026-08-06 18:52:03.000000000 +00:00:00"
+    }
+  ],
+  "editor": {
+    "command": [
+      "code",
+      "--goto",
+      "{file}:{line}:{column}"
+    ]
+  }
+}

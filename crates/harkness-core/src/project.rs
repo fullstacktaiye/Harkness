@@ -20,7 +20,7 @@ use crate::{
         lock,
     },
     editor::{
-        self, EditorConfiguration, EditorError, EditorFallback, EditorLaunch, EditorPosition,
+        self, EditorConfiguration, EditorError, EditorLaunch, EditorLaunchContext, EditorPosition,
     },
     paths::{
         self, CATALOG_FILE, CHECKOUT_DIRECTORY, LOCKS_DIRECTORY, REPOSITORIES_DIRECTORY,
@@ -615,7 +615,7 @@ impl ProjectService {
         id: ProjectId,
         path: &Path,
         position: EditorPosition,
-        fallback: EditorFallback,
+        context: EditorLaunchContext,
     ) -> Result<EditorLaunch, ProjectError> {
         let catalog = self.read_catalog_shared()?;
         let project = catalog
@@ -626,7 +626,7 @@ impl ProjectService {
         let root = project.root.clone();
         let configured = catalog.editor.clone();
         drop(catalog);
-        editor::open(&root, path, position, configured.as_ref(), fallback).map_err(Into::into)
+        editor::open(&root, path, position, configured.as_ref(), context).map_err(Into::into)
     }
 
     /// Resolves one catalog entry without mutating the catalog or Recents.
@@ -2834,7 +2834,7 @@ mod tests {
     };
     use crate::{
         catalog::{
-            CATALOG_VERSION, MINIMUM_SUPPORTED_CATALOG_VERSION,
+            CATALOG_VERSION, MINIMUM_SUPPORTED_CATALOG_VERSION, WORKTREE_CATALOG_VERSION,
             entry::{Project, ProjectId, ProjectSource},
         },
         list_directory,
@@ -2857,6 +2857,7 @@ mod tests {
 
     const VERSION_ONE_CATALOG: &str = include_str!("catalog/fixtures/v1.json");
     const VERSION_TWO_CATALOG: &str = include_str!("catalog/fixtures/v2.json");
+    const VERSION_THREE_CATALOG: &str = include_str!("catalog/fixtures/v3.json");
 
     /// A path in the form the catalog records it.
     ///
@@ -3628,6 +3629,28 @@ mod tests {
         assert_eq!(projects[1]["worktree_branch"], "agent/catalog-v2");
     }
 
+    #[test]
+    fn frozen_version_three_editor_configuration_loads_without_rewrite() {
+        let fixture = Fixture::new();
+        let local_root = fixture.directory("version-three-local");
+        fs::create_dir_all(&fixture.data_dir).unwrap();
+        let catalog_path = fixture.data_dir.join(CATALOG_FILE);
+        let fixture_bytes = catalog_fixture(
+            VERSION_THREE_CATALOG,
+            &[("__LOCAL_ROOT__", &as_catalogued(&local_root))],
+        );
+        fs::write(&catalog_path, &fixture_bytes).unwrap();
+
+        let service = ProjectService::load_from_data_dir(&fixture.data_dir).unwrap();
+
+        assert_eq!(service.list_catalog_only().unwrap().len(), 1);
+        assert_eq!(
+            service.editor_configuration().unwrap().unwrap().command(),
+            ["code", "--goto", "{file}:{line}:{column}"]
+        );
+        assert_eq!(fs::read(catalog_path).unwrap(), fixture_bytes);
+    }
+
     /// Set through `Command::env` on a re-executed child rather than
     /// `std::env::set_var`, which is unsound in a multithreaded test binary
     /// under Rust 2024.
@@ -3818,7 +3841,7 @@ mod tests {
                 project.get("available").is_none() && project.get("git").is_none()
             })
         );
-        assert_eq!(stored["version"], CATALOG_VERSION);
+        assert_eq!(stored["version"], WORKTREE_CATALOG_VERSION);
         let local = projects
             .iter()
             .find(|project| project["source"] == "local")
@@ -6211,6 +6234,25 @@ mod tests {
             Err(ProjectError::CatalogVersionTooNew { found, maximum })
                 if found == future_version && maximum == CATALOG_VERSION
         ));
+
+        // An editor field is v3 data. Accepting it under an older version
+        // would let a v1/v2 writer silently discard the user's configuration.
+        for legacy_version in [1, WORKTREE_CATALOG_VERSION] {
+            fs::write(
+                &catalog_path,
+                serde_json::to_vec(&serde_json::json!({
+                    "version": legacy_version,
+                    "projects": [],
+                    "editor": { "command": ["code", "{file}"] }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(matches!(
+                ProjectService::load_from_data_dir(&fixture.data_dir),
+                Err(ProjectError::MalformedCatalog { .. })
+            ));
+        }
     }
 
     #[test]

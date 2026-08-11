@@ -325,6 +325,7 @@ Kirigami.ApplicationWindow {
         && commitScopeDetected === true
         && amendGatingDetected === true
         && pairedRowsDetected === true
+        && editorOpenDetected === true
         && reviewBusyDetected === true
         && mutationBusyDetected === true
         && operationBusyDetected === true
@@ -342,6 +343,7 @@ Kirigami.ApplicationWindow {
             + "-" + commitScopeDetected
             + "-" + amendGatingDetected
             + "-" + pairedRowsDetected
+            + "-" + editorOpenDetected
             + "-" + reviewBusyDetected
             + "-" + mutationBusyDetected
             + "-" + operationBusyDetected
@@ -368,6 +370,7 @@ Kirigami.ApplicationWindow {
     property bool commitScopeDetected: false
     property bool amendGatingDetected: false
     property bool pairedRowsDetected: false
+    property bool editorOpenDetected: false
     property bool mutationBusyDetected: false
     property bool operationBusyDetected: false
     property bool fileBoundaryDetected: false
@@ -423,6 +426,7 @@ Kirigami.ApplicationWindow {
     function contextRow(line) {
         return {
             "type": "line",
+            "openLine": line,
             "splitHidden": false,
             "unified": {
                 "oldLine": line,
@@ -714,6 +718,9 @@ Kirigami.ApplicationWindow {
         property int loadReviewFileCalls: 0
         property int nextFilePageCalls: 0
         property int previousFilePageCalls: 0
+        property int openLineCalls: 0
+        property int lastOpenLine: 0
+        property string lastOpenFileId: ""
         property string lastReviewFileId: ""
         property bool crossPageNavigationActive: false
         property int crossPagePage: 0
@@ -835,6 +842,7 @@ Kirigami.ApplicationWindow {
                 }, {
                     "type": "line",
                     "hunkId": "review-hunk-fixture",
+                    "openLine": 1,
                     "splitHidden": false,
                     "unified": {
                         "oldLine": 1,
@@ -869,6 +877,7 @@ Kirigami.ApplicationWindow {
                 }, {
                     "type": "line",
                     "hunkId": "review-hunk-fixture",
+                    "openLine": 1,
                     "splitHidden": true,
                     "unified": {
                         "oldLine": 0,
@@ -895,6 +904,11 @@ Kirigami.ApplicationWindow {
             ++workingReviewCalls;
             lastReviewStaged = staged;
             lastReviewPath = String(pathId);
+        }
+        function openReviewLine(projectId, fileId, line) {
+            ++openLineCalls;
+            lastOpenFileId = String(fileId);
+            lastOpenLine = Number(line);
         }
         function loadReviewFile(projectId, fileId) {
             ++loadReviewFileCalls;
@@ -1125,7 +1139,16 @@ Kirigami.ApplicationWindow {
         // the split view must display exactly one row fewer than the unified
         // view of the same model.
         const unifiedFixtureRowCount = reviewFixture.displayedReviewRowCount();
+        const lineOpensBeforeKeyboardActivation = fixtureBackend.openLineCalls;
+        reviewFixture.reviewCurrentIndex = 2;
+        reviewFixture.openCurrentReviewLine();
         reviewFixture.setSplitLayout(true);
+        reviewFixture.reviewCurrentIndex = 2;
+        reviewFixture.openCurrentReviewLine();
+        editorOpenDetected = fixtureBackend.openLineCalls
+                === lineOpensBeforeKeyboardActivation + 2
+            && fixtureBackend.lastOpenFileId === "review-file-fixture"
+            && fixtureBackend.lastOpenLine === 1;
         pairedRowsDetected = unifiedFixtureRowCount
                 === fixtureBackend.review.file.rows.length
             && reviewFixture.displayedReviewRowCount()
