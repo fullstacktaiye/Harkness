@@ -1539,6 +1539,72 @@ fn dispatching_a_tool_call_pins_the_version_that_ran_with_its_event() {
 }
 
 #[test]
+fn an_approved_dispatch_commits_the_decision_the_version_and_the_event_together() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = stored_step(&fixture.store, &run);
+    let call = ToolCall::new(&step, "fs.read", "", json!({"path": "a.rs"}), at(3));
+    fixture.store.insert_tool_call(&call).unwrap();
+    fixture
+        .store
+        .transition_tool_call(call.id(), ToolCallState::AwaitingApproval, at(4))
+        .unwrap();
+
+    let (running, seq) = fixture
+        .store
+        .dispatch_approved_tool_call_with_event(
+            call.id(),
+            "reviewer",
+            "1.4.0",
+            at(10),
+            RunEvent::new(EventKind::ApprovalDecided, at(10)).for_tool_call(call.id()),
+        )
+        .unwrap();
+
+    assert_eq!(running.state(), ToolCallState::Running);
+    assert_eq!(running.tool_version(), "1.4.0");
+    assert_eq!(running.approvals().len(), 1);
+
+    // The version survives the next write, as it must for the approval beside it
+    // to keep describing the work that was authorized.
+    let reloaded = fixture.reopen().load_tool_call(call.id()).unwrap();
+    assert_eq!(reloaded.tool_version(), "1.4.0");
+    assert_eq!(reloaded.approvals()[0].decided_by(), "reviewer");
+    assert_eq!(
+        fixture.store.events(run.id(), None, 10).unwrap()[0].seq,
+        seq
+    );
+}
+
+#[test]
+fn a_refused_approved_dispatch_writes_neither_the_decision_nor_its_event() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = stored_step(&fixture.store, &run);
+    // Still `pending`, so there is no decision to record.
+    let call = stored_tool_call(&fixture.store, &step);
+
+    let error = fixture
+        .store
+        .dispatch_approved_tool_call_with_event(
+            call.id(),
+            "reviewer",
+            "1.0.0",
+            at(10),
+            RunEvent::new(EventKind::ApprovalDecided, at(10)).for_tool_call(call.id()),
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "invalid_transition");
+    let unchanged = fixture.store.load_tool_call(call.id()).unwrap();
+    assert_eq!(unchanged.state(), ToolCallState::Pending);
+    assert!(unchanged.approvals().is_empty());
+    assert!(fixture.store.events(run.id(), None, 10).unwrap().is_empty());
+}
+
+#[test]
 fn dispatching_may_not_replace_a_version_a_caller_already_named() {
     let fixture = Fixture::new();
     let task = stored_task(&fixture.store);

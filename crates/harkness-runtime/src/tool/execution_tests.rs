@@ -501,6 +501,132 @@ fn tool_output_that_violates_its_schema_is_stored_as_evidence_and_never_as_a_res
 }
 
 #[test]
+fn an_approved_call_runs_and_records_the_decision_beside_the_version_it_authorized() {
+    // Approval-gated work never passes through `pending` on its way to running:
+    // the domain resumes a held call *by* its decision. So the decision, the
+    // version it authorized, and the start are one step — an audit that could
+    // read an approval beside a version the approver never saw would not be an
+    // audit of anything.
+    let fixture = Fixture::new();
+    let executor = fixture.executor(registry_of(vec![
+        erase(Echo("1.0.0")),
+        erase(Echo("1.10.0")),
+    ]));
+    // Recorded without a version, so the approval is what pins it.
+    let call = fixture.pending("fixture.echo", json!({"message": "approved"}));
+    fixture
+        .store
+        .transition_tool_call(call, ToolCallState::AwaitingApproval, at(4))
+        .unwrap();
+
+    let completed = executor
+        .execute_approved(
+            call,
+            "taiye@example.com",
+            fixture.workspace.path(),
+            &Cancellation::default(),
+        )
+        .unwrap();
+
+    assert!(completed.outcome().succeeded(), "{completed:?}");
+    assert_eq!(completed.record().tool_version(), "1.10.0");
+
+    let approvals = completed.record().approvals();
+    assert_eq!(approvals.len(), 1);
+    assert_eq!(approvals[0].decided_by(), "taiye@example.com");
+    assert_eq!(
+        approvals[0].decision(),
+        crate::domain::ApprovalDecision::Approved
+    );
+
+    // Both halves survive the reload, so the audit trail is durable and not a
+    // projection assembled in memory.
+    let stored = fixture.store.load_tool_call(call).unwrap();
+    assert_eq!(stored.tool_version(), "1.10.0");
+    assert_eq!(stored.approvals().len(), 1);
+
+    // And the timeline says why a call that was waiting is suddenly running.
+    let dispatched = &fixture.events_of(&EventKind::ToolCallStateChanged)[0];
+    assert_eq!(
+        dispatched.event.payload()["approved_by"],
+        json!("taiye@example.com")
+    );
+    assert_eq!(dispatched.event.payload()["tool_version"], json!("1.10.0"));
+}
+
+#[test]
+fn each_entry_point_admits_exactly_one_state() {
+    let fixture = Fixture::new();
+    let executor = fixture.executor(registry_of(vec![erase(Echo("1.0.0"))]));
+
+    // A call waiting on a decision is not one the ungated path may start: doing
+    // so would run work a human was asked about and never answered.
+    let waiting = fixture.pending("fixture.echo", json!({"message": "waiting"}));
+    fixture
+        .store
+        .transition_tool_call(waiting, ToolCallState::AwaitingApproval, at(4))
+        .unwrap();
+    let error = executor
+        .execute(waiting, fixture.workspace.path(), &Cancellation::default())
+        .unwrap_err();
+    assert_eq!(error.kind(), "not_dispatchable");
+    assert!(error.to_string().contains("requires pending"), "{error}");
+
+    // And a decision cannot be recorded against a call nobody asked about.
+    let ungated = fixture.pending("fixture.echo", json!({"message": "ungated"}));
+    let error = executor
+        .execute_approved(
+            ungated,
+            "taiye@example.com",
+            fixture.workspace.path(),
+            &Cancellation::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), "not_dispatchable");
+    assert!(
+        error.to_string().contains("requires awaiting_approval"),
+        "{error}"
+    );
+
+    // Neither leaves a mark: both calls are exactly where they were.
+    assert_eq!(
+        fixture.store.load_tool_call(waiting).unwrap().state(),
+        ToolCallState::AwaitingApproval
+    );
+    let untouched = fixture.store.load_tool_call(ungated).unwrap();
+    assert_eq!(untouched.state(), ToolCallState::Pending);
+    assert!(untouched.approvals().is_empty());
+}
+
+#[test]
+fn a_blank_approver_is_refused_without_starting_the_work() {
+    // An approval history whose decider cannot be identified is not an audit
+    // trail, and refusing after the body ran would be worse than useless.
+    let fixture = Fixture::new();
+    let executor = fixture.executor(registry_of(vec![erase(Echo("1.0.0"))]));
+    let call = fixture.pending("fixture.echo", json!({"message": "anonymous"}));
+    fixture
+        .store
+        .transition_tool_call(call, ToolCallState::AwaitingApproval, at(4))
+        .unwrap();
+
+    let error = executor
+        .execute_approved(
+            call,
+            "  ",
+            fixture.workspace.path(),
+            &Cancellation::default(),
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "store_failed");
+    let untouched = fixture.store.load_tool_call(call).unwrap();
+    assert_eq!(untouched.state(), ToolCallState::AwaitingApproval);
+    assert!(untouched.approvals().is_empty());
+    assert!(fixture.events().is_empty(), "a refused start wrote history");
+}
+
+#[test]
 fn a_worker_that_dies_without_reporting_is_recorded_interrupted() {
     // `ToolCallState::Interrupted` exists for "the owning process stopped before
     // the invocation completed", and this is the only path that reaches it —

@@ -81,18 +81,30 @@
 //!
 //! # What is not here
 //!
-//! Scheduling, queueing, and concurrency limits (#93); policy evaluation and
-//! approvals (#91, #92) — the executor assumes the call it is handed is already
-//! authorized; and any concrete tool (#94, #95).
+//! Scheduling, queueing, and concurrency limits (#93); deciding *whether* a call
+//! may run (#91, #92); and any concrete tool (#94, #95).
 //!
-//! One consequence is worth stating rather than leaving to be discovered. Only a
-//! `pending` call can be dispatched, and
-//! [`ToolCall::approve`](crate::domain::ToolCall::approve) moves an approved
-//! call to `running` on its own — so an approval-gated call cannot be run
-//! through [`ToolExecutor::execute`] at all, and never has its version pinned.
-//! Resuming approved work needs a dispatch of its own, and defining it belongs
-//! with the approval layer that knows who decided and what the decision covered.
-//! See [`ExecutionError::NotDispatchable`].
+//! # Two ways in, because a decision resumes the work it decided
+//!
+//! [`ToolExecutor::execute`] runs a `pending` call. Approval-gated work does not
+//! pass through `pending`: the domain resumes a held record *by* its decision —
+//! [`ToolCall::approve`](crate::domain::ToolCall::approve) transitions
+//! `awaiting_approval` straight to `running` — so there is no moment at which an
+//! approved call is waiting to be dispatched separately.
+//! [`ToolExecutor::execute_approved`] is therefore the second entry point: it
+//! records the decision, pins the version, starts the call, and supervises it
+//! exactly as the first does.
+//!
+//! The executor still decides nothing. It is *told* who approved, in the same
+//! way it is told a pending call is already authorized; which party decides and
+//! on what grounds is #91/#92's. What this layer owns is that the decision and
+//! the version it authorized are written in one transaction, so an audit cannot
+//! read an approval beside a version the approver never saw.
+//!
+//! Neither entry point accepts a `running` call. That is what stops one being
+//! executed twice and its side effects applied twice; telling a call abandoned
+//! by a dead process from one still executing is a question about run ownership,
+//! and answering it is not this module's job.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -342,23 +354,24 @@ pub enum ExecutionError {
     #[error(transparent)]
     Store(#[from] StoreError),
 
-    /// The call is not in a state execution can begin from.
+    /// The call is not in a state the chosen entry point can begin from.
     ///
-    /// `pending` is the only such state today, and that is a real gap for
-    /// approval-gated work rather than a complete rule.
-    /// [`ToolCall::approve`](crate::domain::ToolCall::approve) moves a call from
-    /// `awaiting_approval` straight to `running` itself, so an approved call
-    /// arrives here already `running` and is refused — and its version is never
-    /// pinned, which is precisely what an approval bound to a version needs.
-    /// Resuming approved work is #91/#92's to define, because only the approval
-    /// layer knows who decided and what the decision covers; this executor
-    /// refuses rather than guessing at it.
-    #[error("tool call {call} is {state} and only a pending call can be dispatched")]
+    /// Each entry point admits exactly one state:
+    /// [`execute`](ToolExecutor::execute) a `pending` call, and
+    /// [`execute_approved`](ToolExecutor::execute_approved) one held at
+    /// `awaiting_approval`. A `running` call is refused by both, which is what
+    /// stops a call being executed twice and its side effects applied twice —
+    /// telling one abandoned by a dead process from one still executing is a
+    /// question about run ownership, not about this call, and deliberately not
+    /// answered here.
+    #[error("tool call {call} is {state}, and this dispatch requires {expected}")]
     NotDispatchable {
         /// Call that was handed to the executor.
         call: ToolCallId,
         /// State it was found in.
         state: ToolCallState,
+        /// State the entry point that was used requires.
+        expected: ToolCallState,
     },
 
     /// The execution context could not be built for this call.
@@ -401,6 +414,32 @@ impl ExecutionError {
             Self::NotDispatchable { .. } => "not_dispatchable",
             Self::Context { .. } => "context_unavailable",
             Self::UnboundedNotDeclared { .. } => "unbounded_not_declared",
+        }
+    }
+}
+
+/// How a call comes to be running.
+///
+/// The two entry points differ in exactly this and nothing else, which is why it
+/// is a value rather than a duplicated body: a difference in *how a call starts*
+/// must not become a difference in how it is supervised, recorded, bounded, or
+/// stopped.
+enum Start<'a> {
+    /// An authorized call nobody had to decide on.
+    Pending,
+    /// A call held for a decision, resumed by the decision itself.
+    Approved {
+        /// Stable identity of whoever decided, recorded in the audit history.
+        decided_by: &'a str,
+    },
+}
+
+impl Start<'_> {
+    /// The state a call must be in for this start to be legitimate.
+    const fn required_state(&self) -> ToolCallState {
+        match self {
+            Self::Pending => ToolCallState::Pending,
+            Self::Approved { .. } => ToolCallState::AwaitingApproval,
         }
     }
 }
@@ -483,11 +522,60 @@ impl ToolExecutor {
         workspace_root: impl Into<PathBuf>,
         cancellation: &Cancellation,
     ) -> Result<CompletedCall, ExecutionError> {
+        self.run(call, &Start::Pending, workspace_root, cancellation)
+    }
+
+    /// Runs one call that a human or a policy has decided may proceed.
+    ///
+    /// The approval-gated entry point. A call held at `awaiting_approval` is
+    /// resumed *by* its decision — [`ToolCall::approve`] is defined that way, and
+    /// so are runs and steps — so recording the decision and starting the work
+    /// are one step rather than two, and this is where they meet.
+    ///
+    /// `decided_by` is the stable identity of whoever decided, and it is
+    /// recorded in the call's approval history. The executor does not evaluate
+    /// policy or collect decisions: it is *told* one, exactly as it is told a
+    /// pending call is already authorized. Which party decides, and on what
+    /// grounds, belongs to #91/#92.
+    ///
+    /// The version that ran is pinned by the same transaction that records the
+    /// approval, so an audit can never read a decision beside a version the
+    /// approver did not see.
+    ///
+    /// # Errors
+    ///
+    /// As [`execute`](Self::execute), except that the call must be
+    /// `awaiting_approval` rather than `pending`, and the identity must not be
+    /// blank.
+    pub fn execute_approved(
+        &self,
+        call: ToolCallId,
+        decided_by: &str,
+        workspace_root: impl Into<PathBuf>,
+        cancellation: &Cancellation,
+    ) -> Result<CompletedCall, ExecutionError> {
+        self.run(
+            call,
+            &Start::Approved { decided_by },
+            workspace_root,
+            cancellation,
+        )
+    }
+
+    /// The body both entry points share, differing only in how the call starts.
+    fn run(
+        &self,
+        call: ToolCallId,
+        start: &Start<'_>,
+        workspace_root: impl Into<PathBuf>,
+        cancellation: &Cancellation,
+    ) -> Result<CompletedCall, ExecutionError> {
         let record = self.store.load_tool_call(call)?;
-        if record.state() != ToolCallState::Pending {
+        if record.state() != start.required_state() {
             return Err(ExecutionError::NotDispatchable {
                 call,
                 state: record.state(),
+                expected: start.required_state(),
             });
         }
 
@@ -547,19 +635,29 @@ impl ToolExecutor {
         // before the body is allowed to start.
         let at = OffsetDateTime::now_utc();
         let version = identity.version.to_string();
-        let (dispatched, _) = self.store.dispatch_tool_call_with_event(
-            call,
-            &version,
-            at,
-            RunEvent::new(EventKind::ToolCallStateChanged, at)
-                .for_step(record.step_id())
-                .for_tool_call(call)
-                .with_payload(json!({
-                    "state": ToolCallState::Running.as_str(),
-                    "tool_id": identity.id.as_str(),
-                    "tool_version": version,
-                })),
-        )?;
+        let mut payload = json!({
+            "state": ToolCallState::Running.as_str(),
+            "tool_id": identity.id.as_str(),
+            "tool_version": version,
+        });
+        if let Start::Approved { decided_by } = start {
+            // The decision belongs on the timeline as well as in the approval
+            // history: a reader of the log should see *why* a call that was
+            // waiting is suddenly running.
+            payload["approved_by"] = json!(decided_by);
+        }
+        let event = RunEvent::new(EventKind::ToolCallStateChanged, at)
+            .for_step(record.step_id())
+            .for_tool_call(call)
+            .with_payload(payload);
+        let (dispatched, _) = match start {
+            Start::Pending => self
+                .store
+                .dispatch_tool_call_with_event(call, &version, at, event)?,
+            Start::Approved { decided_by } => self
+                .store
+                .dispatch_approved_tool_call_with_event(call, decided_by, &version, at, event)?,
+        };
         let run_id = dispatched.run_id();
 
         let deadline = timeout.limit().and_then(Deadline::starting_now);
@@ -912,6 +1010,7 @@ mod tests {
                 ExecutionError::NotDispatchable {
                     call: crate::domain::ToolCallId::new(),
                     state: crate::domain::ToolCallState::Running,
+                    expected: crate::domain::ToolCallState::Pending,
                 },
                 "not_dispatchable",
             ),

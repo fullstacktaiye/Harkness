@@ -406,12 +406,22 @@ invariant is not "the tool's number wins" but "the call has a way to end", and
 token, which nothing can verify and a caller therefore cannot assert on the
 author's behalf.
 
-Only a `pending` call can be dispatched, and `ToolCall::approve` moves an approved
-call to `running` by itself — so an approval-gated call cannot currently be run
-through `ToolExecutor::execute` and never has its version pinned. That is a known
-gap, not a rule: resuming approved work needs a dispatch of its own, and defining
-it belongs with the approval layer that knows who decided and what the decision
-covered. Do not widen `execute` to accept `running` to work around it.
+There are two dispatches because a decision resumes the work it decided.
+Approval-gated work never passes through `pending`: the domain moves a held
+record from `awaiting_approval` straight to `running` *by* approving it, so there
+is no moment at which an approved call waits to be dispatched separately.
+`ToolExecutor::execute` therefore admits `pending` and `execute_approved` admits
+`awaiting_approval`; each admits exactly one state. `ToolCall::dispatch_approved`
+records the decision, pins the resolved version, and transitions in one step,
+because an approval is a decision about `(id, version)` and a window in which the
+call is approved and running while the row still names the version that was
+*asked for* would make the audit describe work nobody authorized.
+
+Neither entry point accepts a `running` call, and neither should be widened to.
+That refusal is what stops a call being executed twice and its side effects
+applied twice; telling a call abandoned by a dead process from one still
+executing is a question about run ownership — the `owner_pid` column exists for
+it — and is not the executor's to answer.
 
 A process group is the unit of execution, so it is the unit that ends. When the
 direct child exits, the group is signalled before its output is collected: a pipe

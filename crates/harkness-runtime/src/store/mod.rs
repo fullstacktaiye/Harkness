@@ -761,25 +761,64 @@ impl Store {
         at: OffsetDateTime,
         event: RunEvent,
     ) -> Result<(ToolCall, EventSeq), StoreError> {
+        self.begin_tool_call(id, event, "dispatching a tool call", |call| {
+            call.dispatch(tool_version, at)
+        })
+    }
+
+    /// Applies one start-of-execution change, which also pins the version.
+    ///
+    /// Separate from [`change_tool_call_with_event`](Self::change_tool_call_with_event)
+    /// for one reason: these are the only transitions that rewrite part of the
+    /// recorded *request*. See
+    /// [`repository::pin_tool_call_version`] for why that column is the single
+    /// exception and why `update_tool_call` still names none of them.
+    fn begin_tool_call<F>(
+        &self,
+        id: ToolCallId,
+        event: RunEvent,
+        operation: &'static str,
+        start: F,
+    ) -> Result<(ToolCall, EventSeq), StoreError>
+    where
+        F: FnOnce(&mut ToolCall) -> Result<(), RunDomainError>,
+    {
         let run_id = self.load_tool_call(id)?.run_id();
         let prepared = self.prepare_event(run_id, event)?;
-        self.commit_event(
-            "dispatching a tool call with its event",
-            prepared,
-            |connection, prepared| {
-                let mut call = repository::load_tool_call(connection, id)?;
-                call.dispatch(tool_version, at)
-                    .map_err(StoreError::InvalidTransition)?;
-                repository::update_tool_call(connection, &call)?;
-                // The one statement that rewrites part of the recorded request,
-                // and the reason this transition does not go through
-                // `change_tool_call_with_event`: see
-                // [`repository::pin_tool_call_version`].
-                repository::pin_tool_call_version(connection, &call)?;
-                let seq = prepared.append(connection, call.run_id())?;
-                Ok((call, seq))
-            },
-        )
+        self.commit_event(operation, prepared, |connection, prepared| {
+            let mut call = repository::load_tool_call(connection, id)?;
+            start(&mut call).map_err(StoreError::InvalidTransition)?;
+            repository::update_tool_call(connection, &call)?;
+            repository::pin_tool_call_version(connection, &call)?;
+            let seq = prepared.append(connection, call.run_id())?;
+            Ok((call, seq))
+        })
+    }
+
+    /// Records an approval, pins the resolved version, and appends its event.
+    ///
+    /// The approval-gated sibling of
+    /// [`dispatch_tool_call_with_event`](Self::dispatch_tool_call_with_event).
+    /// The decision, the version it authorized, the transition, and the event
+    /// share one transaction, so an audit can never read an approval whose call
+    /// names a version the approver did not see.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::dispatch_tool_call_with_event`], and
+    /// [`StoreError::InvalidTransition`] when the call is not
+    /// `awaiting_approval` or the identity is blank.
+    pub fn dispatch_approved_tool_call_with_event(
+        &self,
+        id: ToolCallId,
+        decided_by: &str,
+        tool_version: &str,
+        at: OffsetDateTime,
+        event: RunEvent,
+    ) -> Result<(ToolCall, EventSeq), StoreError> {
+        self.begin_tool_call(id, event, "dispatching an approved tool call", |call| {
+            call.dispatch_approved(decided_by, tool_version, at)
+        })
     }
 
     /// Succeeds a tool call with its output and appends its event.

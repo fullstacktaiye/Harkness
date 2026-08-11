@@ -136,12 +136,16 @@
 //! # Executing a recorded call
 //!
 //! [`invoke`] runs a tool. [`ToolExecutor`] runs a *recorded call*, which is a
-//! different job: it takes one `pending` [`ToolCall`](crate::domain::ToolCall)
-//! from the run store and guarantees the call reaches a terminal state, however
-//! the tool behaves — panicking, hanging, ignoring its cancellation token,
-//! emitting gigabytes, or returning a shape its own schema refuses. What the
-//! pipeline above guarantees about one invocation, the executor guarantees about
-//! one *record*:
+//! different job: it takes one [`ToolCall`](crate::domain::ToolCall) from the
+//! run store and guarantees the call reaches a terminal state, however the tool
+//! behaves — panicking, hanging, ignoring its cancellation token, emitting
+//! gigabytes, or returning a shape its own schema refuses. There are two ways
+//! in, because a decision resumes the work it decided:
+//! [`ToolExecutor::execute`] starts a `pending` call, and
+//! [`ToolExecutor::execute_approved`] records a decision against one held at
+//! `awaiting_approval` and starts it in the same transaction. What the pipeline
+//! above guarantees about one invocation, the executor guarantees about one
+//! *record*:
 //!
 //! - The body runs on its own thread, so a hang becomes a
 //!   [`CallOutcome::TimedOut`] rather than a wait with no end. Rust cannot kill
@@ -165,9 +169,10 @@
 //!
 //! It supplies metadata and execution; it does not decide *whether* to execute.
 //! There is no policy evaluation and no approval flow here — the executor
-//! assumes the call it is handed is already authorized — and no scheduling,
-//! queueing, or concurrency limiting. No concrete production tool is registered
-//! here either; this module only defines the shape they take.
+//! records a decision it is handed and assumes an unheld call is already
+//! authorized, but which party decides and on what grounds is #91/#92's — and no
+//! scheduling, queueing, or concurrency limiting. No concrete production tool is
+//! registered here either; this module only defines the shape they take.
 
 mod context;
 mod descriptor;
