@@ -3,6 +3,7 @@ members = [
     "crates/harkness-test-fixtures",
     "crates/harkness-git",
     "crates/harkness-core",
+    "crates/harkness-context",
     "crates/harkness-runtime",
     "crates/harkness-cli",
     "crates/harkness-gui",
@@ -20,6 +21,7 @@ base64 = "0.22"
 clap = { version = "4.6.5", features = ["derive"] }
 dirs = "6.0"
 git2 = { version = "0.21", default-features = false }
+harkness-context = { path = "crates/harkness-context" }
 harkness-core = { path = "crates/harkness-core" }
 harkness-git = { path = "crates/harkness-git" }
 harkness-runtime = { path = "crates/harkness-runtime" }

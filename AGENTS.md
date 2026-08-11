@@ -2,10 +2,11 @@
 
 ## Project Structure & Module Organization
 
-Harkness is a Rust 2024 workspace split into six crates under `crates/`:
+Harkness is a Rust 2024 workspace split into seven crates under `crates/`:
 
 - `harkness-core`: project catalog, storage layout, cross-domain project workflows, and directory-listing logic shared by front ends.
 - `harkness-git`: all production Git behavior: inspection, diffs and history, file context and hunk staging, branch and worktree mutation, commits, clone and synchronization, hermetic process execution, and repository locking.
+- `harkness-context`: the context engine's typed vocabulary — workspace snapshot identity, stable identifiers, provenance, and file classification.
 - `harkness-test-fixtures`: hermetic repository, filesystem, and process fixtures shared only by crate tests.
 - `harkness-runtime`: typed task, run, step, and tool-call records, the typed tool contract and registry every executable operation implements, the execution contracts shared by front ends, and the SQLite run store that makes those records durable.
 - `harkness-cli`: the `harkness` command and its integration tests in `tests/`.
@@ -225,6 +226,44 @@ payload under the threshold and persist the same secret in the clear above it,
 and a rule that did run would rewrite the object keys, so recovering a payload
 would yield different field names depending only on its size. There is no public
 route to `Redaction::Applied`; do not add one.
+
+## Workspace Snapshot Identity Invariants
+
+`HEAD` is never a workspace identity, anywhere. Identity is the composite digest
+over the ten components ADR-0008 fixes, and it excludes exactly two things: the
+snapshot's own id and its capture timestamp. Capturing one unchanged workspace
+twice must yield two ids and one digest — the id names the capture, the digest
+names the workspace, and the two are never used for each other's job.
+
+Digests are domain-separated and length-framed. Every derivation absorbs a
+constant naming what is being hashed and its version, and every component is
+absorbed as its length followed by its bytes, so concatenation is injective and
+a file-version hash cannot collide with a chunk hash over the same input. Path
+sets are sorted by the exact path bytes and hold one entry per path, which is
+what makes them order-independent; nothing may digest a path through its lossy
+display form, because two names a lossy conversion folds together are two files.
+
+A snapshot's three content digests are derived from its entry lists and never
+stored independently of them. Loading a persisted snapshot re-derives all three
+and the composite, and refuses the row by name when either disagrees, so a
+hand-edited row cannot enter the process claiming an identity its own contents
+do not support.
+
+Capture and verification fail differently on purpose. Capture must never yield a
+half-built identity, so cancellation is an error; verification always owes a
+verdict, so a gone repository, a missing root, an unreadable status, and a
+cancelled check all return `Unverifiable` with a reason. `Unverifiable` is not a
+soft `Fresh` and must stop a mutation exactly as `Stale` does. An unreadable file
+is neither: it contributes a stable sentinel and a capture diagnostic, because
+one permission bit must not cost a whole snapshot.
+
+Symlinks are hashed as their target *path string* and never followed, so a link
+pointing outside the worktree changes identity without anything outside the
+worktree being read. Snapshots hold hashes and paths only, never file contents.
+
+The wire forms in `harkness-context` are frozen by committed fixtures because
+they become persisted columns; changing a field, a variant spelling, or a
+timestamp format after that is a `runtime.db` migration plus a new fixture.
 
 ## Tool Contract & Registry Invariants
 

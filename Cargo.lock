@@ -663,6 +663,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "harkness-context"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "harkness-core",
+ "harkness-git",
+ "harkness-test-fixtures",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.19",
+ "time",
+ "uuid",
+]
+
+[[package]]
 name = "harkness-core"
 version = "0.1.0"
 dependencies = [

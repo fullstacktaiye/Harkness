@@ -37,6 +37,43 @@ graph LR
 - **`harkness-runtime`** — gains context tools, the native agent, prompt
   construction, and AI configuration. Front ends reach AI features only here.
 
+## Snapshot identity
+
+`WorkspaceSnapshot` is the type every later stage is relative to. Its shape is
+worth stating precisely, because two things that look like one are deliberately
+separate:
+
+- **`SnapshotId`** names a *capture*. It is a random v4 UUID minted each time the
+  workspace is read, and it is what provenance records and what events correlate
+  by, so a run inspected later can be traced to the exact read it was built from.
+- **`SnapshotDigest`** names a *workspace*. It is the composite digest over the
+  ten identity components, and it is what a staleness check compares. Capturing
+  one unchanged workspace twice yields two ids and one digest.
+
+Capture reads Git for *what* changed and a `WorkspaceProbe` for *what those paths
+now contain*. The split is what keeps the identity model testable without a
+filesystem and leaves eligibility — ignore rules, size limits, classification —
+to the inventory stage without the digest definition moving. `FilesystemProbe` is
+the default: it hashes in 64 KiB blocks, hashes a symlink's target *path* rather
+than following it, and expands an untracked directory Git reported as one entry.
+
+The two operations differ in what they owe the caller, which is why they fail
+differently. `capture` must not hand back a half-built identity, so cancellation
+is an error. `verify` always owes a verdict, so a repository that vanished, a
+missing root, an unreadable status, or a cancelled check all return
+`Unverifiable` with a reason — never a soft `Fresh`. A `Stale` verdict names each
+diverged path and which component it belongs to, which is what lets a refused
+mutation say *why*.
+
+Capture is tolerant of a workspace that moves underneath it. A file that changes
+mid-hash contributes the bytes that were read; a file that cannot be read
+contributes a sentinel and a diagnostic rather than failing the capture. A
+snapshot is an honest record of what was read, and verification is what turns
+that honesty into safety before a write.
+
+Snapshots hold hashes and paths, never file contents, so they are safe to persist
+and to display. The only absolute path is the worktree root.
+
 ## The context pipeline
 
 Retrieval is deterministic-first: structure, lexical search, symbols, Git state,

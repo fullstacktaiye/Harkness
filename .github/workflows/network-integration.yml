@@ -50,6 +50,12 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked -p harkness-runtime --no-deps
+      # harkness-context denies undocumented public items, so a missing rustdoc
+      # comment has to fail here rather than at the next crate that reads it.
+      - name: Check context documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked -p harkness-context --no-deps
 
   core:
     name: Core (${{ matrix.os }})

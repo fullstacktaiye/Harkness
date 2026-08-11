@@ -1,0 +1,25 @@
+[package]
+name = "harkness-context"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+base64.workspace = true
+harkness-core.workspace = true
+harkness-git.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+time.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+harkness-test-fixtures.workspace = true
+tempfile.workspace = true
