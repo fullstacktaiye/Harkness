@@ -245,6 +245,42 @@ enum Direction {
     Reverse,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApplyTarget {
+    Index,
+    Worktree,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MutationMode {
+    Stage,
+    Unstage,
+    Discard,
+}
+
+impl MutationMode {
+    fn diff_target(self) -> DiffTarget {
+        match self {
+            Self::Stage | Self::Discard => DiffTarget::Unstaged,
+            Self::Unstage => DiffTarget::Staged,
+        }
+    }
+
+    fn direction(self) -> Direction {
+        match self {
+            Self::Stage => Direction::Forward,
+            Self::Unstage | Self::Discard => Direction::Reverse,
+        }
+    }
+
+    fn apply_target(self) -> ApplyTarget {
+        match self {
+            Self::Stage | Self::Unstage => ApplyTarget::Index,
+            Self::Discard => ApplyTarget::Worktree,
+        }
+    }
+}
+
 struct PreparedFile {
     file: FileDiff,
     hunks: Vec<PreparedHunk>,
@@ -283,8 +319,7 @@ pub(crate) fn stage(
         git_executable,
         root,
         selections,
-        DiffTarget::Unstaged,
-        Direction::Forward,
+        MutationMode::Stage,
         options,
         cancellation,
     )
@@ -302,8 +337,7 @@ pub(crate) fn unstage(
         git_executable,
         root,
         selections,
-        DiffTarget::Staged,
-        Direction::Reverse,
+        MutationMode::Unstage,
         options,
         cancellation,
     )
@@ -321,8 +355,7 @@ pub(crate) fn stage_lines(
         git_executable,
         root,
         selections,
-        DiffTarget::Unstaged,
-        Direction::Forward,
+        MutationMode::Stage,
         options,
         cancellation,
     )
@@ -340,9 +373,40 @@ pub(crate) fn unstage_lines(
         git_executable,
         root,
         selections,
-        DiffTarget::Staged,
-        Direction::Reverse,
+        MutationMode::Unstage,
         options,
+        cancellation,
+    )
+}
+
+pub(crate) fn discard(
+    git_executable: &Path,
+    root: &Path,
+    selections: &[HunkSelection],
+    cancellation: &Cancellation,
+) -> Result<HunkStageOutcome, GitError> {
+    mutate(
+        git_executable,
+        root,
+        selections,
+        MutationMode::Discard,
+        &StageOptions::default(),
+        cancellation,
+    )
+}
+
+pub(crate) fn discard_lines(
+    git_executable: &Path,
+    root: &Path,
+    selections: &[LineSelection],
+    cancellation: &Cancellation,
+) -> Result<LineStageOutcome, GitError> {
+    mutate_lines(
+        git_executable,
+        root,
+        selections,
+        MutationMode::Discard,
+        &StageOptions::default(),
         cancellation,
     )
 }
@@ -351,8 +415,7 @@ fn mutate(
     git_executable: &Path,
     root: &Path,
     selections: &[HunkSelection],
-    target: DiffTarget,
-    direction: Direction,
+    mode: MutationMode,
     options: &StageOptions,
     cancellation: &Cancellation,
 ) -> Result<HunkStageOutcome, GitError> {
@@ -365,9 +428,23 @@ fn mutate(
     let mut hunks = 0;
     if !selections.is_empty() {
         refuse_filtered_paths(&repository, root, &paths)?;
-        let prepared = prepare(root, selections, &paths, &target, cancellation)?;
+        let target = mode.diff_target();
+        let prepared = prepare(
+            root,
+            selections,
+            &paths,
+            &target,
+            mode.apply_target(),
+            cancellation,
+        )?;
         hunks = prepared.iter().map(|file| file.hunks.len()).sum();
-        apply(&repository, &prepared, &paths, direction)?;
+        apply(
+            &repository,
+            &prepared,
+            &paths,
+            mode.direction(),
+            mode.apply_target(),
+        )?;
     }
     Ok(HunkStageOutcome {
         hunks,
@@ -379,8 +456,7 @@ fn mutate_lines(
     git_executable: &Path,
     root: &Path,
     selections: &[LineSelection],
-    target: DiffTarget,
-    direction: Direction,
+    mode: MutationMode,
     options: &StageOptions,
     cancellation: &Cancellation,
 ) -> Result<LineStageOutcome, GitError> {
@@ -390,14 +466,28 @@ fn mutate_lines(
     let (mut lines, mut hunks) = (0, 0);
     if !selections.is_empty() {
         refuse_filtered_paths(&repository, root, &paths)?;
-        let prepared = prepare_lines(root, selections, &paths, &target, cancellation)?;
+        let target = mode.diff_target();
+        let prepared = prepare_lines(
+            root,
+            selections,
+            &paths,
+            &target,
+            mode.apply_target(),
+            cancellation,
+        )?;
         lines = prepared
             .iter()
             .flat_map(|file| &file.hunks)
             .map(|hunk| hunk.selected_lines.as_ref().map_or(0, Vec::len))
             .sum();
         hunks = prepared.iter().map(|file| file.hunks.len()).sum();
-        apply(&repository, &prepared, &paths, direction)?;
+        apply(
+            &repository,
+            &prepared,
+            &paths,
+            mode.direction(),
+            mode.apply_target(),
+        )?;
     }
     Ok(LineStageOutcome {
         lines,
@@ -500,6 +590,7 @@ fn prepare(
     selections: &[HunkSelection],
     paths: &[PathBuf],
     target: &DiffTarget,
+    apply_target: ApplyTarget,
     cancellation: &Cancellation,
 ) -> Result<Vec<PreparedFile>, GitError> {
     let mut contexts = selections
@@ -549,7 +640,7 @@ fn prepare(
                 path: path.to_path_buf(),
             });
         }
-        refuse_unsupported(file)?;
+        refuse_unsupported(file, apply_target)?;
 
         let hunk = file
             .hunks
@@ -598,6 +689,7 @@ fn prepare_lines(
     selections: &[LineSelection],
     paths: &[PathBuf],
     target: &DiffTarget,
+    apply_target: ApplyTarget,
     cancellation: &Cancellation,
 ) -> Result<Vec<PreparedFile>, GitError> {
     let mut contexts = selections
@@ -644,7 +736,7 @@ fn prepare_lines(
                 path: path.to_path_buf(),
             });
         }
-        refuse_unsupported(file)?;
+        refuse_unsupported(file, apply_target)?;
 
         let hunk = file
             .hunks
@@ -716,8 +808,14 @@ fn prepare_lines(
 /// delete the source from the index. Records that are real but carry no
 /// content, such as a bare `chmod` or a file becoming a symlink, are named for
 /// what they are instead of being reported as a missing hunk.
-fn refuse_unsupported(file: &FileDiff) -> Result<(), GitError> {
+fn refuse_unsupported(file: &FileDiff, apply_target: ApplyTarget) -> Result<(), GitError> {
     let path = display_path(file.new_path.as_deref(), file.old_path.as_deref()).to_path_buf();
+    if apply_target == ApplyTarget::Worktree && file.change == FileChange::Unmerged {
+        return Err(GitError::UnmergedDiscard { path });
+    }
+    if apply_target == ApplyTarget::Worktree && file.change == FileChange::Untracked {
+        return Err(GitError::UntrackedDiscardRequiresDelete { path });
+    }
     match file.change {
         FileChange::Added
         | FileChange::Modified
@@ -798,6 +896,7 @@ fn apply(
     prepared: &[PreparedFile],
     paths: &[PathBuf],
     direction: Direction,
+    target: ApplyTarget,
 ) -> Result<(), GitError> {
     let patch = render_patch(prepared, direction)?;
     let failure = |source| GitError::HunkApplication {
@@ -813,12 +912,14 @@ fn apply(
     // only to roll back. It is cheap: the patch is a few hunks at most.
     let mut check = ApplyOptions::new();
     check.check(true);
+    let location = match target {
+        ApplyTarget::Index => ApplyLocation::Index,
+        ApplyTarget::Worktree => ApplyLocation::WorkDir,
+    };
     repository
-        .apply(&parsed, ApplyLocation::Index, Some(&mut check))
+        .apply(&parsed, location, Some(&mut check))
         .map_err(failure)?;
-    repository
-        .apply(&parsed, ApplyLocation::Index, None)
-        .map_err(failure)
+    repository.apply(&parsed, location, None).map_err(failure)
 }
 
 /// Whether a selection names `hunk` in the freshly recomputed diff.
@@ -1387,8 +1488,8 @@ mod tests {
     use git2::Repository;
 
     use super::{
-        Direction, HunkSelection, LineSelection, prepare_lines, refuse_unsupported, render_patch,
-        selection_paths,
+        ApplyTarget, Direction, HunkSelection, LineSelection, prepare_lines, refuse_unsupported,
+        render_patch, selection_paths,
     };
     use crate::{
         Cancellation, CommitOptions, DiffLine, DiffLineKind, DiffOmission, DiffOptions, DiffTarget,
@@ -1664,6 +1765,7 @@ mod tests {
                 &selections,
                 &paths,
                 &DiffTarget::Unstaged,
+                ApplyTarget::Index,
                 &Cancellation::default(),
             )
             .unwrap();
@@ -2179,6 +2281,7 @@ mod tests {
             &selections,
             &paths,
             &DiffTarget::Unstaged,
+            ApplyTarget::Index,
             &Cancellation::default(),
         )
         .unwrap();
@@ -2373,7 +2476,7 @@ mod tests {
             FileChange::TypeChanged,
             FileChange::Unmerged,
         ] {
-            let error = refuse_unsupported(&record(change)).unwrap_err();
+            let error = refuse_unsupported(&record(change), ApplyTarget::Index).unwrap_err();
             assert!(
                 matches!(error, GitError::UnsupportedHunkChange { change: refused, .. }
                 if refused == change),
@@ -2387,7 +2490,7 @@ mod tests {
             FileChange::Untracked,
         ] {
             assert!(
-                refuse_unsupported(&record(change)).is_ok(),
+                refuse_unsupported(&record(change), ApplyTarget::Index).is_ok(),
                 "{change} was refused"
             );
         }

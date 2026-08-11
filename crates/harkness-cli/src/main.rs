@@ -32,7 +32,8 @@ use harkness_git::{
     FileContextResponse, FileDiff, FileSide, GitError, GitService, GitStatus, HeadState, Hunk,
     HunkSelection, IntraLineDegradation, LineSelection, LogCursor, LogOptions, LogRange,
     PendingOperation, PullOptions, PullOutcome, PullStrategy, PushOptions, PushOutcome, RefUpdate,
-    StageOutcome, StagePathResult, StatusEntry, StatusRefreshOutcome, UpstreamStatus, WorktreeBase,
+    StageOutcome, StagePathResult, StatusEntry, StatusRefreshOutcome, TrackedRestoreSource,
+    UpstreamStatus, WorktreeBase,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -311,6 +312,8 @@ enum GitCommand {
     Stage(StageArguments),
     /// Remove paths from the index without changing the working tree.
     Unstage(UnstageArguments),
+    /// Discard working-tree content through an explicit, confirmed boundary.
+    Discard(DiscardArguments),
     /// Create a commit from the index.
     Commit {
         #[command(flatten)]
@@ -417,6 +420,55 @@ struct UnstageArguments {
         value_name = "PATH"
     )]
     paths: Vec<PathBuf>,
+    #[command(flatten)]
+    hunk: HunkArguments,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DiscardSourceArgument {
+    /// Restore the working tree from the index and preserve staged changes.
+    Index,
+    /// Restore both the index and working tree from HEAD.
+    Head,
+}
+
+impl From<DiscardSourceArgument> for TrackedRestoreSource {
+    fn from(value: DiscardSourceArgument) -> Self {
+        match value {
+            DiscardSourceArgument::Index => Self::Index,
+            DiscardSourceArgument::Head => Self::Head,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("discard_kind")
+        .required(true)
+        .multiple(false)
+        .args(["from", "delete_untracked"])
+))]
+struct DiscardArguments {
+    #[command(flatten)]
+    selection: ProjectSelection,
+    /// Repository-relative or absolute paths to discard.
+    #[arg(
+        required_unless_present_any = ["hunk", "hunk_selection", "line_selection"],
+        value_name = "PATH"
+    )]
+    paths: Vec<PathBuf>,
+    /// Restore tracked content from this explicit Git boundary.
+    #[arg(long, value_enum, value_name = "BOUNDARY")]
+    from: Option<DiscardSourceArgument>,
+    /// Permanently delete explicitly named untracked files.
+    #[arg(
+        long,
+        conflicts_with_all = ["hunk", "hunk_selection", "line_selection"]
+    )]
+    delete_untracked: bool,
+    /// Confirm the destructive operation after reviewing its description.
+    #[arg(long)]
+    yes: bool,
     #[command(flatten)]
     hunk: HunkArguments,
 }
@@ -2044,6 +2096,83 @@ fn run_git(
                 )
             }
         }
+        GitCommand::Discard(arguments) => {
+            let selections = arguments.hunk.into_selections("unstaged")?;
+            let git = selected_git(&service, arguments.selection)?;
+            let source = arguments.from.map(TrackedRestoreSource::from);
+            let description = match (&selections, source, arguments.delete_untracked) {
+                (
+                    Some(GranularSelections::Hunks(selections)),
+                    Some(TrackedRestoreSource::Index),
+                    false,
+                ) => harkness_git::DiscardDescription::restore_hunks(
+                    selections.iter().filter_map(HunkSelection::path),
+                    selections.len(),
+                ),
+                (
+                    Some(GranularSelections::Lines(selections)),
+                    Some(TrackedRestoreSource::Index),
+                    false,
+                ) => harkness_git::DiscardDescription::restore_lines(
+                    selections.iter().filter_map(LineSelection::path),
+                    selections.len(),
+                    selections.len(),
+                ),
+                (Some(_), Some(TrackedRestoreSource::Head), false) => {
+                    return Err(CliError::Usage(
+                        "hunk and line discard restore from the index; use --from index".to_owned(),
+                    ));
+                }
+                (None, Some(source), false) => {
+                    harkness_git::DiscardDescription::restore_tracked(&arguments.paths, source)
+                }
+                (None, None, true) => {
+                    harkness_git::DiscardDescription::delete_untracked(&arguments.paths)
+                }
+                _ => {
+                    return Err(CliError::Usage(
+                        "choose exactly one tracked restore boundary or --delete-untracked"
+                            .to_owned(),
+                    ));
+                }
+            };
+            if !arguments.yes {
+                return Err(refusal(
+                    RefusalKind::ConfirmationRequired,
+                    discard_confirmation_message(&description),
+                    json!({
+                        "override_flag": "--yes",
+                        "discard": discard_description_value(&description),
+                    }),
+                ));
+            }
+            let outcome = match selections {
+                Some(GranularSelections::Hunks(selections)) => {
+                    git.discard_hunks(&selections, cancellation)?
+                }
+                Some(GranularSelections::Lines(selections)) => {
+                    git.discard_lines(&selections, cancellation)?
+                }
+                None if arguments.delete_untracked => {
+                    git.delete_untracked(arguments.paths, cancellation)?
+                }
+                None => git.restore_tracked(
+                    arguments.paths,
+                    source.expect("discard kind group requires --from"),
+                    cancellation,
+                )?,
+            };
+            command_result(
+                json_output,
+                || discard_outcome_line(&outcome.description),
+                || {
+                    Ok(json!({
+                        "discard": discard_description_value(&outcome.description),
+                        "status": status_refresh_value(&outcome.status),
+                    }))
+                },
+            )
+        }
         GitCommand::Commit {
             selection,
             message,
@@ -3458,6 +3587,111 @@ fn hunk_outcome_line(verb: &str, count: usize) -> String {
     format!("{verb} {count} hunk{}", if count == 1 { "" } else { "s" })
 }
 
+fn discard_description_value(description: &harkness_git::DiscardDescription) -> Value {
+    let (operation, source, hunks, lines) = match description.operation() {
+        harkness_git::DiscardOperation::RestoreTracked { source } => (
+            "restore_tracked",
+            match source {
+                TrackedRestoreSource::Index => "index",
+                TrackedRestoreSource::Head => "head",
+                _ => "unknown",
+            },
+            Value::Null,
+            Value::Null,
+        ),
+        harkness_git::DiscardOperation::RestoreTrackedHunks { hunks } => {
+            ("restore_tracked_hunks", "index", json!(hunks), Value::Null)
+        }
+        harkness_git::DiscardOperation::RestoreTrackedLines { lines, hunks } => {
+            ("restore_tracked_lines", "index", json!(hunks), json!(lines))
+        }
+        harkness_git::DiscardOperation::DeleteUntracked => {
+            ("delete_untracked", "none", Value::Null, Value::Null)
+        }
+        _ => ("unknown", "unknown", Value::Null, Value::Null),
+    };
+    let paths = description
+        .paths()
+        .iter()
+        .map(|path| wire_path(path).0)
+        .collect::<Vec<_>>();
+    json!({
+        "operation": operation,
+        "source": source,
+        "tracked_files": description.tracked_files(),
+        "untracked_files": description.untracked_files(),
+        "hunks": hunks,
+        "lines": lines,
+        "paths": paths,
+        "paths_are_lossy": description.paths().iter().any(|path| wire_path(path).1),
+        "recoverability": match description.recoverability() {
+            harkness_git::DiscardRecoverability::GitRecordedBaseline => "git_recorded_baseline",
+            harkness_git::DiscardRecoverability::Unrecoverable => "unrecoverable",
+            _ => "unknown",
+        },
+    })
+}
+
+fn discard_confirmation_message(description: &harkness_git::DiscardDescription) -> String {
+    let paths = description
+        .paths()
+        .iter()
+        .map(|path| format!("'{}'", path.display()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let action = match description.operation() {
+        harkness_git::DiscardOperation::RestoreTracked {
+            source: TrackedRestoreSource::Index,
+        } => format!(
+            "restore {} tracked file(s) from the index: {paths}; the discarded unstaged edits cannot be recovered, while the staged baseline remains in Git",
+            description.tracked_files()
+        ),
+        harkness_git::DiscardOperation::RestoreTracked {
+            source: TrackedRestoreSource::Head,
+        } => format!(
+            "restore {} tracked file(s) from HEAD: {paths}; staged and unstaged edits will be lost, while HEAD remains in Git",
+            description.tracked_files()
+        ),
+        harkness_git::DiscardOperation::RestoreTrackedHunks { hunks } => format!(
+            "discard {hunks} tracked hunk(s) in {paths}; those uncommitted edits cannot be recovered, while the index baseline remains in Git"
+        ),
+        harkness_git::DiscardOperation::RestoreTrackedLines { lines, .. } => format!(
+            "discard {lines} tracked line(s) in {paths}; those uncommitted edits cannot be recovered, while the index baseline remains in Git"
+        ),
+        harkness_git::DiscardOperation::DeleteUntracked => format!(
+            "permanently delete {} untracked file(s): {paths}; Git has no copy and this cannot be undone",
+            description.untracked_files()
+        ),
+        _ => format!("discard changes in {paths}"),
+    };
+    format!("refusing to {action}; pass --yes to confirm")
+}
+
+fn discard_outcome_line(description: &harkness_git::DiscardDescription) -> String {
+    match description.operation() {
+        harkness_git::DiscardOperation::RestoreTracked { source } => format!(
+            "restored {} tracked file(s) from {}",
+            description.tracked_files(),
+            match source {
+                TrackedRestoreSource::Index => "the index",
+                TrackedRestoreSource::Head => "HEAD",
+                _ => "the selected boundary",
+            }
+        ),
+        harkness_git::DiscardOperation::RestoreTrackedHunks { hunks } => {
+            format!("discarded {hunks} tracked hunk(s)")
+        }
+        harkness_git::DiscardOperation::RestoreTrackedLines { lines, .. } => {
+            format!("discarded {lines} tracked line(s)")
+        }
+        harkness_git::DiscardOperation::DeleteUntracked => format!(
+            "deleted {} untracked file(s) permanently",
+            description.untracked_files()
+        ),
+        _ => "discarded changes".to_owned(),
+    }
+}
+
 fn line_outcome_line(verb: &str, count: usize) -> String {
     format!("{verb} {count} line{}", if count == 1 { "" } else { "s" })
 }
@@ -3906,6 +4140,11 @@ fn git_exit_code(error: &GitError) -> u8 {
         | GitError::DetachedHead { .. }
         | GitError::WorktreeLocked { .. }
         | GitError::WorktreeMoveAcrossDevices { .. }
+        | GitError::UntrackedDiscardRequiresDelete { .. }
+        | GitError::TrackedDiscardRequiresRestore { .. }
+        | GitError::UnmergedDiscard { .. }
+        | GitError::NothingToDiscard { .. }
+        | GitError::UntrackedDiscardNotFile { .. }
         | GitError::StaleHunkSelection { .. }
         | GitError::BinaryHunkSelection { .. }
         | GitError::RenameOnlyHunkSelection { .. }
@@ -3936,6 +4175,7 @@ fn git_exit_code(error: &GitError) -> u8 {
         | GitError::NoRemote { .. }
         | GitError::Inspection { .. }
         | GitError::DiffContent { .. }
+        | GitError::UntrackedDiscardIo { .. }
         | GitError::MalformedDiff { .. }
         | GitError::HunkApplication { .. }
         | GitError::MalformedStatus { .. } => EXIT_OPERATION_FAILED,
@@ -4006,6 +4246,12 @@ const GIT_KIND_EXIT_CODES: &[(&str, u8)] = &[
     ("detached_head", EXIT_REFUSED),
     ("inspection", EXIT_OPERATION_FAILED),
     ("diff_content", EXIT_OPERATION_FAILED),
+    ("untracked_discard_requires_delete", EXIT_REFUSED),
+    ("tracked_discard_requires_restore", EXIT_REFUSED),
+    ("unmerged_discard", EXIT_REFUSED),
+    ("nothing_to_discard", EXIT_REFUSED),
+    ("untracked_discard_not_file", EXIT_REFUSED),
+    ("untracked_discard_io", EXIT_OPERATION_FAILED),
     ("invalid_blob_id", EXIT_REFUSED),
     ("blob_not_found", EXIT_NOT_FOUND),
     ("malformed_diff", EXIT_OPERATION_FAILED),
@@ -4252,6 +4498,12 @@ fn git_error_details(error: &GitError) -> Value {
         GitError::WorktreeNotLocked { path }
         | GitError::WorktreeAddDestinationExists { path }
         | GitError::WorktreeAddDestinationUnavailable { path, .. }
+        | GitError::UntrackedDiscardRequiresDelete { path }
+        | GitError::TrackedDiscardRequiresRestore { path }
+        | GitError::UnmergedDiscard { path }
+        | GitError::NothingToDiscard { path }
+        | GitError::UntrackedDiscardNotFile { path }
+        | GitError::UntrackedDiscardIo { path, .. }
         | GitError::StaleHunkSelection { path }
         | GitError::BinaryHunkSelection { path }
         | GitError::OverlappingHunkSelection { path }

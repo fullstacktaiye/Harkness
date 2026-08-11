@@ -1,0 +1,799 @@
+//! Explicit, lock-aware working-tree discard operations.
+//!
+//! Tracked restoration and untracked deletion are separate entry points. A
+//! caller cannot turn a tracked restore into a filesystem deletion merely by
+//! naming a path that Git does not know. Hunk discard shares the staging
+//! renderer, but applies its trusted reverse patch to the working tree instead
+//! of the index.
+
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+use git2::{ErrorCode, Repository, Status};
+
+use crate::{
+    Cancellation, GitError, HunkSelection, RepositoryLock, StatusRefreshOutcome, commit, hunk,
+    runner::{GitAccess, GitCommand},
+    status, worktree,
+};
+
+/// The Git snapshot from which tracked content is restored.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum TrackedRestoreSource {
+    /// Restore the working tree from the index and preserve staged changes.
+    Index,
+    /// Restore both the index and working tree from `HEAD`.
+    Head,
+}
+
+/// The destructive operation a confirmation describes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum DiscardOperation {
+    /// Restore whole tracked paths from the named boundary.
+    RestoreTracked { source: TrackedRestoreSource },
+    /// Restore selected tracked hunks from the index.
+    RestoreTrackedHunks { hunks: usize },
+    /// Restore selected tracked lines from the index.
+    RestoreTrackedLines { lines: usize, hunks: usize },
+    /// Permanently delete untracked files.
+    DeleteUntracked,
+}
+
+/// What Git can still supply after the operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum DiscardRecoverability {
+    /// The restored baseline remains recorded in the index or a commit.
+    ///
+    /// This does not claim that the discarded edits themselves are recoverable.
+    GitRecordedBaseline,
+    /// The deleted bytes were never recorded by Git.
+    Unrecoverable,
+}
+
+/// Front-end-neutral facts used to render a destructive confirmation.
+///
+/// Both front ends receive the same operation, count, path set, and
+/// recoverability classification. Presentation and translation remain their
+/// responsibility; the safety claim does not.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct DiscardDescription {
+    operation: DiscardOperation,
+    paths: Vec<PathBuf>,
+    recoverability: DiscardRecoverability,
+}
+
+impl DiscardDescription {
+    /// Describes a whole-path tracked restore.
+    #[must_use]
+    pub fn restore_tracked<I, P>(paths: I, source: TrackedRestoreSource) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        Self::new(
+            DiscardOperation::RestoreTracked { source },
+            paths,
+            DiscardRecoverability::GitRecordedBaseline,
+        )
+    }
+
+    /// Describes selected tracked hunks restored from the index.
+    #[must_use]
+    pub fn restore_hunks<I, P>(paths: I, hunks: usize) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        Self::new(
+            DiscardOperation::RestoreTrackedHunks { hunks },
+            paths,
+            DiscardRecoverability::GitRecordedBaseline,
+        )
+    }
+
+    /// Describes selected tracked lines restored from the index.
+    #[must_use]
+    pub fn restore_lines<I, P>(paths: I, lines: usize, hunks: usize) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        Self::new(
+            DiscardOperation::RestoreTrackedLines { lines, hunks },
+            paths,
+            DiscardRecoverability::GitRecordedBaseline,
+        )
+    }
+
+    /// Describes explicit untracked-file deletion.
+    #[must_use]
+    pub fn delete_untracked<I, P>(paths: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        Self::new(
+            DiscardOperation::DeleteUntracked,
+            paths,
+            DiscardRecoverability::Unrecoverable,
+        )
+    }
+
+    fn new<I, P>(
+        operation: DiscardOperation,
+        paths: I,
+        recoverability: DiscardRecoverability,
+    ) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let mut paths = paths
+            .into_iter()
+            .map(|path| path.as_ref().to_path_buf())
+            .collect::<Vec<_>>();
+        paths.sort_unstable();
+        paths.dedup();
+        Self {
+            operation,
+            paths,
+            recoverability,
+        }
+    }
+
+    /// The exact operation being confirmed.
+    #[must_use]
+    pub fn operation(&self) -> DiscardOperation {
+        self.operation
+    }
+
+    /// Distinct paths affected by the operation, in stable order.
+    #[must_use]
+    pub fn paths(&self) -> &[PathBuf] {
+        &self.paths
+    }
+
+    /// Number of distinct tracked files whose content is restored.
+    #[must_use]
+    pub fn tracked_files(&self) -> usize {
+        match self.operation {
+            DiscardOperation::RestoreTracked { .. }
+            | DiscardOperation::RestoreTrackedHunks { .. }
+            | DiscardOperation::RestoreTrackedLines { .. } => self.paths.len(),
+            DiscardOperation::DeleteUntracked => 0,
+        }
+    }
+
+    /// Number of distinct untracked files that will be deleted.
+    #[must_use]
+    pub fn untracked_files(&self) -> usize {
+        usize::from(matches!(self.operation, DiscardOperation::DeleteUntracked)) * self.paths.len()
+    }
+
+    /// Whether Git retains a baseline after this operation.
+    #[must_use]
+    pub fn recoverability(&self) -> DiscardRecoverability {
+        self.recoverability
+    }
+}
+
+/// The confirmed operation and the repository state observed after it.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct DiscardOutcome {
+    pub description: DiscardDescription,
+    pub status: StatusRefreshOutcome,
+}
+
+pub(crate) fn restore_tracked(
+    git_executable: &Path,
+    root: &Path,
+    _lock: &RepositoryLock,
+    paths: &[PathBuf],
+    source: TrackedRestoreSource,
+    cancellation: &Cancellation,
+) -> Result<DiscardOutcome, GitError> {
+    commit::validate_paths(root, paths)?;
+    let repository = commit::open(root)?;
+    refuse_locked_worktree(git_executable, root, cancellation)?;
+    if cancellation.is_cancelled() {
+        return Err(GitError::Cancelled);
+    }
+    for path in paths {
+        require_tracked_change(&repository, root, path, source)?;
+    }
+    refuse_pending(&repository, root)?;
+
+    if !paths.is_empty() {
+        let mut command = GitCommand::new(git_executable, root, GitAccess::LocalWrite)
+            .args(["--literal-pathspecs", "restore"]);
+        command = match source {
+            TrackedRestoreSource::Index => command.arg("--worktree"),
+            TrackedRestoreSource::Head => {
+                let source = head_or_empty_tree(&repository, root)?;
+                command
+                    .arg(format!("--source={source}"))
+                    .args(["--staged", "--worktree"])
+            }
+        };
+        command = command.arg("--");
+        for path in paths {
+            command = command.arg(path.as_os_str());
+        }
+        command.run(cancellation)?;
+    }
+
+    Ok(DiscardOutcome {
+        description: DiscardDescription::restore_tracked(paths, source),
+        status: commit::refresh_status(git_executable, root, true, cancellation),
+    })
+}
+
+pub(crate) fn delete_untracked(
+    git_executable: &Path,
+    root: &Path,
+    _lock: &RepositoryLock,
+    paths: &[PathBuf],
+    cancellation: &Cancellation,
+) -> Result<DiscardOutcome, GitError> {
+    commit::validate_paths(root, paths)?;
+    let repository = commit::open(root)?;
+    refuse_locked_worktree(git_executable, root, cancellation)?;
+    if cancellation.is_cancelled() {
+        return Err(GitError::Cancelled);
+    }
+
+    let mut resolved = Vec::with_capacity(paths.len());
+    for path in paths {
+        require_untracked_file(&repository, root, path)?;
+        resolved.push(if path.is_absolute() {
+            path.clone()
+        } else {
+            root.join(path)
+        });
+    }
+    refuse_pending(&repository, root)?;
+    // Once every refusal has passed, deletion is deliberately not cancelled
+    // between files: a late token must not turn one confirmed batch into an
+    // arbitrary prefix of itself.
+    for (path, resolved) in paths.iter().zip(resolved) {
+        fs::remove_file(resolved).map_err(|source| GitError::UntrackedDiscardIo {
+            path: path.clone(),
+            source,
+        })?;
+    }
+
+    Ok(DiscardOutcome {
+        description: DiscardDescription::delete_untracked(paths),
+        status: commit::refresh_status(git_executable, root, true, cancellation),
+    })
+}
+
+pub(crate) fn discard_hunks(
+    git_executable: &Path,
+    root: &Path,
+    _lock: &RepositoryLock,
+    selections: &[HunkSelection],
+    cancellation: &Cancellation,
+) -> Result<DiscardOutcome, GitError> {
+    refuse_locked_worktree(git_executable, root, cancellation)?;
+    let outcome = hunk::discard(git_executable, root, selections, cancellation)?;
+    let paths = selections.iter().filter_map(HunkSelection::path);
+    Ok(DiscardOutcome {
+        description: DiscardDescription::restore_hunks(paths, outcome.hunks),
+        status: outcome.status,
+    })
+}
+
+pub(crate) fn discard_lines(
+    git_executable: &Path,
+    root: &Path,
+    _lock: &RepositoryLock,
+    selections: &[crate::LineSelection],
+    cancellation: &Cancellation,
+) -> Result<DiscardOutcome, GitError> {
+    refuse_locked_worktree(git_executable, root, cancellation)?;
+    let outcome = hunk::discard_lines(git_executable, root, selections, cancellation)?;
+    let paths = selections.iter().filter_map(crate::LineSelection::path);
+    Ok(DiscardOutcome {
+        description: DiscardDescription::restore_lines(paths, outcome.lines, outcome.hunks),
+        status: outcome.status,
+    })
+}
+
+fn refuse_pending(repository: &Repository, root: &Path) -> Result<(), GitError> {
+    match status::pending(repository) {
+        Some(pending) => Err(GitError::OperationInProgress {
+            path: root.to_path_buf(),
+            pending,
+        }),
+        None => Ok(()),
+    }
+}
+
+fn refuse_locked_worktree(
+    git_executable: &Path,
+    root: &Path,
+    cancellation: &Cancellation,
+) -> Result<(), GitError> {
+    if let Some(row) = worktree::list(git_executable, root, cancellation)?
+        .into_iter()
+        .find(|row| row.matches_path(root))
+        .filter(|row| row.is_locked())
+    {
+        return Err(GitError::WorktreeLocked {
+            path: row.root().to_path_buf(),
+            reason: row.lock_reason().map(str::to_owned),
+        });
+    }
+    Ok(())
+}
+
+fn repository_path<'path>(root: &Path, path: &'path Path) -> &'path Path {
+    if path.is_absolute() {
+        path.strip_prefix(root).unwrap_or(path)
+    } else {
+        path
+    }
+}
+
+fn status_for(repository: &Repository, root: &Path, path: &Path) -> Result<Status, GitError> {
+    match repository.status_file(repository_path(root, path)) {
+        Ok(status) => Ok(status),
+        Err(error) if error.code() == ErrorCode::NotFound => Ok(Status::CURRENT),
+        Err(source) => Err(GitError::Inspection {
+            path: root.to_path_buf(),
+            source: source.into(),
+        }),
+    }
+}
+
+fn require_tracked_change(
+    repository: &Repository,
+    root: &Path,
+    path: &Path,
+    source: TrackedRestoreSource,
+) -> Result<(), GitError> {
+    let status = status_for(repository, root, path)?;
+    if status.contains(Status::CONFLICTED) {
+        return Err(GitError::UnmergedDiscard {
+            path: path.to_path_buf(),
+        });
+    }
+    if status.contains(Status::WT_NEW) {
+        return Err(GitError::UntrackedDiscardRequiresDelete {
+            path: path.to_path_buf(),
+        });
+    }
+    let relevant = match source {
+        TrackedRestoreSource::Index => status.intersects(
+            Status::WT_MODIFIED | Status::WT_DELETED | Status::WT_RENAMED | Status::WT_TYPECHANGE,
+        ),
+        TrackedRestoreSource::Head => status.intersects(
+            Status::INDEX_NEW
+                | Status::INDEX_MODIFIED
+                | Status::INDEX_DELETED
+                | Status::INDEX_RENAMED
+                | Status::INDEX_TYPECHANGE
+                | Status::WT_MODIFIED
+                | Status::WT_DELETED
+                | Status::WT_RENAMED
+                | Status::WT_TYPECHANGE,
+        ),
+    };
+    if !relevant {
+        return Err(GitError::NothingToDiscard {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+fn require_untracked_file(
+    repository: &Repository,
+    root: &Path,
+    path: &Path,
+) -> Result<(), GitError> {
+    let status = status_for(repository, root, path)?;
+    if status.contains(Status::CONFLICTED) {
+        return Err(GitError::UnmergedDiscard {
+            path: path.to_path_buf(),
+        });
+    }
+    if !status.contains(Status::WT_NEW) {
+        return Err(GitError::TrackedDiscardRequiresRestore {
+            path: path.to_path_buf(),
+        });
+    }
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let metadata = fs::symlink_metadata(&resolved).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            GitError::NothingToDiscard {
+                path: path.to_path_buf(),
+            }
+        } else {
+            GitError::UntrackedDiscardIo {
+                path: path.to_path_buf(),
+                source,
+            }
+        }
+    })?;
+    if metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        Ok(())
+    } else {
+        Err(GitError::UntrackedDiscardNotFile {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+fn head_or_empty_tree(repository: &Repository, root: &Path) -> Result<git2::Oid, GitError> {
+    match repository.head().and_then(|head| head.peel_to_commit()) {
+        Ok(commit) => Ok(commit.tree_id()),
+        Err(error) if matches!(error.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => {
+            let builder = repository
+                .treebuilder(None)
+                .map_err(|source| GitError::Inspection {
+                    path: root.to_path_buf(),
+                    source: source.into(),
+                })?;
+            builder.write().map_err(|source| GitError::Inspection {
+                path: root.to_path_buf(),
+                source: source.into(),
+            })
+        }
+        Err(source) => Err(GitError::Inspection {
+            path: root.to_path_buf(),
+            source: source.into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::Path};
+
+    use crate::{
+        Cancellation, DiffLineKind, DiffOptions, DiffTarget, DiscardOperation,
+        DiscardRecoverability, GitError, GitService, HunkSelection, LineSelection,
+        TrackedRestoreSource,
+        runner::{GitAccess, GitCommand},
+        testing::{Fixture, commit_all, git, initialize_repository},
+    };
+
+    fn worktree_text(path: &Path) -> String {
+        fs::read_to_string(path).unwrap().replace("\r\n", "\n")
+    }
+
+    #[test]
+    fn restoring_from_the_index_preserves_staged_content() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("discard-index");
+        initialize_repository(&root);
+        let service = GitService::new(&root, &fixture.data_dir);
+        let cancellation = Cancellation::default();
+
+        fs::write(root.join("tracked.txt"), "staged\n").unwrap();
+        service.stage(["tracked.txt"], &cancellation).unwrap();
+        fs::write(root.join("tracked.txt"), "working\n").unwrap();
+
+        let outcome = service
+            .restore_tracked(["tracked.txt"], TrackedRestoreSource::Index, &cancellation)
+            .unwrap();
+
+        assert_eq!(worktree_text(&root.join("tracked.txt")), "staged\n");
+        let staged = service
+            .diff(DiffTarget::Staged, &DiffOptions::default())
+            .unwrap();
+        let unstaged = service
+            .diff(DiffTarget::Unstaged, &DiffOptions::default())
+            .unwrap();
+        assert_eq!(staged.len(), 1);
+        assert!(unstaged.is_empty());
+        assert_eq!(
+            outcome.description.operation(),
+            DiscardOperation::RestoreTracked {
+                source: TrackedRestoreSource::Index
+            }
+        );
+        assert_eq!(outcome.description.tracked_files(), 1);
+        assert_eq!(
+            outcome.description.recoverability(),
+            DiscardRecoverability::GitRecordedBaseline
+        );
+    }
+
+    #[test]
+    fn restoring_from_head_discards_both_index_and_worktree_changes() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("discard-head");
+        initialize_repository(&root);
+        let service = GitService::new(&root, &fixture.data_dir);
+        let cancellation = Cancellation::default();
+
+        fs::write(root.join("tracked.txt"), "staged\n").unwrap();
+        service.stage(["tracked.txt"], &cancellation).unwrap();
+        fs::write(root.join("tracked.txt"), "working\n").unwrap();
+
+        service
+            .restore_tracked(["tracked.txt"], TrackedRestoreSource::Head, &cancellation)
+            .unwrap();
+
+        assert_eq!(worktree_text(&root.join("tracked.txt")), "initial\n");
+        assert!(
+            service
+                .detailed_status(&cancellation)
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn tracked_restore_and_untracked_deletion_cannot_be_conflated() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("discard-kinds");
+        initialize_repository(&root);
+        let service = GitService::new(&root, &fixture.data_dir);
+        let cancellation = Cancellation::default();
+        fs::write(root.join("untracked.txt"), "not in Git\n").unwrap();
+
+        assert!(matches!(
+            service.restore_tracked(
+                ["untracked.txt"],
+                TrackedRestoreSource::Index,
+                &cancellation
+            ),
+            Err(GitError::UntrackedDiscardRequiresDelete { .. })
+        ));
+        assert!(root.join("untracked.txt").exists());
+        assert!(matches!(
+            service.delete_untracked(["tracked.txt"], &cancellation),
+            Err(GitError::TrackedDiscardRequiresRestore { .. })
+        ));
+        assert_eq!(
+            fs::read_to_string(root.join("tracked.txt")).unwrap(),
+            "initial\n"
+        );
+
+        let outcome = service
+            .delete_untracked(["untracked.txt"], &cancellation)
+            .unwrap();
+        assert!(!root.join("untracked.txt").exists());
+        assert_eq!(outcome.description.untracked_files(), 1);
+        assert_eq!(
+            outcome.description.recoverability(),
+            DiscardRecoverability::Unrecoverable
+        );
+    }
+
+    #[test]
+    fn discarding_one_hunk_leaves_the_other_hunk_and_the_index_untouched() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("discard-one-hunk");
+        let repository = initialize_repository(&root);
+        let original = (1..=20)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        fs::write(root.join("tracked.txt"), &original).unwrap();
+        commit_all(&repository, "expand fixture");
+        let changed = original
+            .replace("line 2\n", "line two\n")
+            .replace("line 18\n", "line eighteen\n");
+        fs::write(root.join("tracked.txt"), changed).unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+        let files = service
+            .diff(DiffTarget::Unstaged, &DiffOptions::default())
+            .unwrap();
+        assert_eq!(files[0].hunks.len(), 2);
+        let selection = HunkSelection::new(&files[0], &files[0].hunks[0]);
+
+        let outcome = service
+            .discard_hunks(&[selection], &Cancellation::default())
+            .unwrap();
+        let content = worktree_text(&root.join("tracked.txt"));
+        assert!(content.contains("line 2\n"));
+        assert!(content.contains("line eighteen\n"));
+        assert!(
+            service
+                .diff(DiffTarget::Staged, &DiffOptions::default())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            outcome.description.operation(),
+            DiscardOperation::RestoreTrackedHunks { hunks: 1 }
+        );
+    }
+
+    #[test]
+    fn discarding_one_line_leaves_other_lines_and_the_index_untouched() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("discard-one-line");
+        let repository = initialize_repository(&root);
+        fs::write(root.join("tracked.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        commit_all(&repository, "expand line fixture");
+        fs::write(
+            root.join("tracked.txt"),
+            "one\nfirst\ntwo\nthree\nsecond\nfour\n",
+        )
+        .unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+        let files = service
+            .diff(DiffTarget::Unstaged, &DiffOptions::default())
+            .unwrap();
+        let hunk = &files[0].hunks[0];
+        let first = hunk
+            .lines
+            .iter()
+            .find(|line| line.kind == DiffLineKind::Addition && line.content == b"first\n")
+            .unwrap();
+        let selection = LineSelection::new(&files[0], hunk, first);
+
+        let outcome = service
+            .discard_lines(&[selection], &Cancellation::default())
+            .unwrap();
+
+        assert_eq!(
+            worktree_text(&root.join("tracked.txt")),
+            "one\ntwo\nthree\nsecond\nfour\n"
+        );
+        assert!(
+            service
+                .diff(DiffTarget::Staged, &DiffOptions::default())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            outcome.description.operation(),
+            DiscardOperation::RestoreTrackedLines { lines: 1, hunks: 1 }
+        );
+    }
+
+    #[test]
+    fn a_stale_hunk_and_an_unmerged_path_are_refused_without_moving_content() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("discard-refusals");
+        initialize_repository(&root);
+        let service = GitService::new(&root, &fixture.data_dir);
+        fs::write(root.join("tracked.txt"), "first edit\n").unwrap();
+        let files = service
+            .diff(DiffTarget::Unstaged, &DiffOptions::default())
+            .unwrap();
+        let selection = HunkSelection::new(&files[0], &files[0].hunks[0]);
+        fs::write(root.join("tracked.txt"), "newer edit\n").unwrap();
+        assert!(matches!(
+            service.discard_hunks(&[selection], &Cancellation::default()),
+            Err(GitError::StaleHunkSelection { .. })
+        ));
+        assert_eq!(
+            fs::read_to_string(root.join("tracked.txt")).unwrap(),
+            "newer edit\n"
+        );
+
+        git(&root, ["switch", "-c", "topic"]);
+        fs::write(root.join("tracked.txt"), "topic\n").unwrap();
+        git(&root, ["add", "tracked.txt"]);
+        git(&root, ["commit", "-m", "topic edit"]);
+        git(&root, ["switch", "main"]);
+        fs::write(root.join("tracked.txt"), "main\n").unwrap();
+        git(&root, ["add", "tracked.txt"]);
+        git(&root, ["commit", "-m", "main edit"]);
+        let merge = GitCommand::new(Path::new("git"), &root, GitAccess::LocalWrite)
+            .args(["merge", "topic"])
+            .run(&Cancellation::default());
+        assert!(merge.is_err());
+        let conflicted = fs::read_to_string(root.join("tracked.txt")).unwrap();
+
+        assert!(matches!(
+            service.restore_tracked(
+                ["tracked.txt"],
+                TrackedRestoreSource::Index,
+                &Cancellation::default()
+            ),
+            Err(GitError::UnmergedDiscard { .. })
+        ));
+        assert_eq!(
+            fs::read_to_string(root.join("tracked.txt")).unwrap(),
+            conflicted
+        );
+
+        let conflicted_file = service
+            .diff(DiffTarget::Unstaged, &DiffOptions::default())
+            .unwrap()
+            .into_iter()
+            .find(|file| file.change == crate::FileChange::Unmerged)
+            .unwrap();
+        let selection = HunkSelection::from_parts(
+            conflicted_file.old_path,
+            conflicted_file.new_path,
+            conflicted_file.old_blob_id,
+            conflicted_file.new_blob_id,
+            conflicted_file.context_lines,
+            (1, 1),
+            (1, 1),
+        );
+        assert!(matches!(
+            service.discard_hunks(&[selection], &Cancellation::default()),
+            Err(GitError::UnmergedDiscard { .. })
+        ));
+        assert_eq!(
+            fs::read_to_string(root.join("tracked.txt")).unwrap(),
+            conflicted
+        );
+    }
+
+    #[test]
+    fn a_linked_worktree_lock_blocks_every_discard_operation() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("discard-locked-parent");
+        initialize_repository(&root);
+        let linked = fixture.root.path().join("discard-locked-linked");
+        git(
+            &root,
+            [
+                "worktree",
+                "add",
+                "-b",
+                "locked-topic",
+                linked.to_str().unwrap(),
+            ],
+        );
+        git(
+            &root,
+            [
+                "worktree",
+                "lock",
+                "--reason",
+                "agent is using it",
+                linked.to_str().unwrap(),
+            ],
+        );
+        fs::write(linked.join("tracked.txt"), "do not discard\n").unwrap();
+        fs::write(linked.join("untracked.txt"), "do not delete\n").unwrap();
+        let service = GitService::new(&linked, &fixture.data_dir);
+        let file = service
+            .diff(DiffTarget::Unstaged, &DiffOptions::default())
+            .unwrap()
+            .into_iter()
+            .find(|file| file.new_path.as_deref() == Some(Path::new("tracked.txt")))
+            .unwrap();
+        let selection = HunkSelection::new(&file, &file.hunks[0]);
+
+        assert!(matches!(
+            service.restore_tracked(
+                ["tracked.txt"],
+                TrackedRestoreSource::Index,
+                &Cancellation::default()
+            ),
+            Err(GitError::WorktreeLocked { reason, .. })
+                if reason.as_deref() == Some("agent is using it")
+        ));
+        assert!(matches!(
+            service.delete_untracked(["untracked.txt"], &Cancellation::default()),
+            Err(GitError::WorktreeLocked { .. })
+        ));
+        assert!(matches!(
+            service.discard_hunks(&[selection], &Cancellation::default()),
+            Err(GitError::WorktreeLocked { .. })
+        ));
+        assert_eq!(
+            fs::read_to_string(linked.join("tracked.txt")).unwrap(),
+            "do not discard\n"
+        );
+        assert_eq!(
+            fs::read_to_string(linked.join("untracked.txt")).unwrap(),
+            "do not delete\n"
+        );
+    }
+}
