@@ -1,1 +1,2 @@
 crates/harkness-runtime/src/domain/fixtures/*.json text eol=lf
+crates/harkness-runtime/src/fixtures/*.json text eol=lf
