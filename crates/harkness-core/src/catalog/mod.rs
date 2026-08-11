@@ -16,6 +16,7 @@ use tempfile::NamedTempFile;
 
 use crate::{
     catalog::entry::{Project, ProjectSource},
+    editor::EditorConfiguration,
     project::ProjectError,
 };
 
@@ -27,6 +28,7 @@ pub(crate) const MINIMUM_SUPPORTED_CATALOG_VERSION: u32 = 1;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Catalog {
     pub(crate) projects: Vec<Project>,
+    pub(crate) editor: Option<EditorConfiguration>,
 }
 
 #[derive(Deserialize)]
@@ -34,6 +36,8 @@ pub(crate) struct Catalog {
 struct CatalogWire {
     version: u32,
     projects: Vec<Project>,
+    #[serde(default)]
+    editor: Option<EditorConfiguration>,
 }
 
 /// The forward-compatible prefix of every catalog file.
@@ -90,6 +94,7 @@ pub(crate) fn read_catalog(catalog_path: &Path) -> Result<Catalog, ProjectError>
             debug_assert_eq!(wire.version, probe.version);
             let catalog = Catalog {
                 projects: wire.projects,
+                editor: wire.editor,
             };
             validate_catalog(catalog_path, &catalog)?;
             Ok(catalog)
@@ -189,6 +194,8 @@ fn invalid_catalog(catalog_path: &Path, reason: String) -> ProjectError {
 struct PersistedCatalog<'a> {
     version: u32,
     projects: &'a [Project],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    editor: &'a Option<EditorConfiguration>,
 }
 
 pub(crate) fn persist_catalog(
@@ -214,6 +221,7 @@ pub(crate) fn persist_catalog(
     let persisted = PersistedCatalog {
         version,
         projects: &catalog.projects,
+        editor: &catalog.editor,
     };
     serde_json::to_writer_pretty(&mut temporary, &persisted).map_err(io::Error::other)?;
     temporary.write_all(b"\n")?;

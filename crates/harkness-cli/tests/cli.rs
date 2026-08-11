@@ -157,6 +157,150 @@ fn bare_name_resolution_is_independent_of_current_directory() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn editor_configuration_and_cli_open_use_literal_argv() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
+
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let project_root = fixture.path().join("project");
+    initialize_repository(&project_root);
+    fs::create_dir_all(project_root.join("src")).unwrap();
+    fs::write(project_root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&project_root)
+        .unwrap();
+    let editor = fixture.path().join("record-editor");
+    fs::write(&editor, "#!/bin/sh\nprintf '%s' \"$2\" > \"$1\"\n").unwrap();
+    let mut permissions = fs::metadata(&editor).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&editor, permissions).unwrap();
+    let log = fixture.path().join("editor-argv");
+
+    let configured = harkness(
+        &data_dir,
+        &[
+            "editor",
+            "set",
+            "--",
+            editor.to_str().unwrap(),
+            log.to_str().unwrap(),
+            "{file}:{line}:{column}",
+        ],
+    );
+    assert!(
+        configured.status.success(),
+        "{}",
+        String::from_utf8_lossy(&configured.stderr)
+    );
+    let opened = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "editor",
+            "open",
+            "--project",
+            &project.id.to_string(),
+            "src/main.rs",
+            "--line",
+            "14",
+            "--column",
+            "6",
+        ],
+    );
+    assert!(
+        opened.status.success(),
+        "{}",
+        String::from_utf8_lossy(&opened.stderr)
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !log.exists() {
+        assert!(Instant::now() < deadline, "editor shim did not record argv");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        fs::read(&log).unwrap(),
+        format!("{}:14:6", project.root.join("src/main.rs").display()).as_bytes()
+    );
+    let response: Value = serde_json::from_slice(&opened.stdout).unwrap();
+    assert_eq!(response["data"]["kind"], "editor_open");
+    assert_eq!(response["data"]["line"], 14);
+
+    let missing = "harkness-editor-that-does-not-exist";
+    assert!(
+        harkness(&data_dir, &["editor", "set", "--", missing, "{file}"])
+            .status
+            .success()
+    );
+    let failed = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "editor",
+            "open",
+            "--project",
+            &project.id.to_string(),
+            "src/main.rs",
+        ],
+    );
+    assert_eq!(failed.status.code(), Some(1));
+    let failure: Value = serde_json::from_slice(&failed.stdout).unwrap();
+    assert_eq!(failure["error"]["kind"], "editor_launch");
+    assert_eq!(failure["error"]["details"]["command"], missing);
+    assert!(
+        failure["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(missing)
+    );
+
+    assert!(harkness(&data_dir, &["editor", "clear"]).status.success());
+    let fallback_log = fixture.path().join("visual-argv");
+    let fallback = Command::new(env!("CARGO_BIN_EXE_harkness"))
+        .env("HARKNESS_DATA_DIR", &data_dir)
+        .env(
+            "VISUAL",
+            format!("{} {}", editor.display(), fallback_log.display()),
+        )
+        .env("EDITOR", "harkness-editor-fallback-should-not-run")
+        .args([
+            "editor",
+            "open",
+            "--project",
+            &project.id.to_string(),
+            "src/main.rs",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        fallback.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fallback.stderr)
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fallback_log.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "$VISUAL shim did not record argv"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        fs::read(fallback_log).unwrap(),
+        project
+            .root
+            .join("src/main.rs")
+            .as_os_str()
+            .as_encoded_bytes()
+    );
+}
+
 #[test]
 fn ambiguous_project_name_lists_only_honest_identity_candidates() {
     let fixture = TempDir::new().unwrap();
@@ -2732,7 +2876,7 @@ fn the_contract_publishes_an_exit_code_for_every_error_kind() {
     let body = json_output(&output);
     let data = &body["data"];
     let map = &data["exit_code_by_kind"];
-    for namespace in ["cli", "project", "git"] {
+    for namespace in ["cli", "project", "git", "editor"] {
         let kinds = data["error_kinds"][namespace].as_array().unwrap();
         let mapped = map[namespace].as_object().unwrap();
         assert_eq!(
@@ -2751,6 +2895,8 @@ fn the_contract_publishes_an_exit_code_for_every_error_kind() {
     assert_eq!(map["git"]["worktree_locked"], 3);
     assert_eq!(map["git"]["worktree_already_locked"], 5);
     assert_eq!(map["project"]["worktree_destination_exists"], 5);
+    assert_eq!(map["editor"]["editor_path_outside_project"], 3);
+    assert_eq!(map["editor"]["editor_launch"], 1);
     assert_eq!(map["cli"]["usage_error"], 2);
 }
 

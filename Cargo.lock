@@ -688,6 +688,7 @@ dependencies = [
  "harkness-test-fixtures",
  "serde",
  "serde_json",
+ "shlex",
  "tempfile",
  "thiserror 2.0.19",
  "time",

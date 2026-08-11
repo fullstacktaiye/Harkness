@@ -118,6 +118,16 @@ pub mod ffi {
             path_id: &QString,
         );
 
+        /// Opens the loaded working-tree file at a backend-derived diff line.
+        #[qinvokable]
+        #[cxx_name = "openReviewLine"]
+        fn open_review_line(
+            self: Pin<&mut HarknessBackend>,
+            project_id: &QString,
+            file_id: &QString,
+            line: i32,
+        );
+
         /// Fetches hunk content for one backend-owned review path.
         #[qinvokable]
         #[cxx_name = "loadReviewFile"]
@@ -1686,8 +1696,47 @@ fn to_review_line_row(hunk_id: &str, hunk: &harkness_git::Hunk, index: usize) ->
     row.insert(QString::from("unified"), to_unified_review_line(line));
     row.insert(QString::from("old"), old);
     row.insert(QString::from("new"), new);
+    row.insert(
+        QString::from("openLine"),
+        QVariant::from(&bounded_i32(best_working_tree_line(hunk, index))),
+    );
     row.insert(QString::from("splitHidden"), QVariant::from(&split_hidden));
     QVariant::from(&row)
+}
+
+/// Maps a rendered diff row to the file that exists in the working tree.
+/// Deletions have no new-side coordinate, so prefer their paired replacement,
+/// then the following new-side line, then the preceding neighbourhood.
+fn best_working_tree_line(hunk: &harkness_git::Hunk, index: usize) -> u32 {
+    let line = &hunk.lines[index];
+    if let Some(number) = line.new_line_number {
+        return number.max(1);
+    }
+    if let Some(number) = line
+        .paired_line_index
+        .and_then(|partner| hunk.lines.get(partner))
+        .and_then(|partner| partner.new_line_number)
+    {
+        return number.max(1);
+    }
+    hunk.lines[index + 1..]
+        .iter()
+        .find_map(|candidate| candidate.new_line_number)
+        .or_else(|| {
+            hunk.lines[..index]
+                .iter()
+                .rev()
+                .find_map(|candidate| candidate.new_line_number)
+        })
+        .unwrap_or(hunk.new_start)
+        .max(1)
+}
+
+fn first_working_tree_line(file: &harkness_git::FileDiff) -> u32 {
+    file.hunks
+        .iter()
+        .find_map(|hunk| (!hunk.lines.is_empty()).then(|| best_working_tree_line(hunk, 0)))
+        .unwrap_or(1)
 }
 
 fn to_context_side(content: &[u8], number: u32, present: bool) -> QVariant {
@@ -1742,6 +1791,10 @@ fn to_context_row(line: &ReviewContextLine) -> QVariant {
     row.insert(
         QString::from("new"),
         to_context_side(&line.content, line.new_line, line.new_line > 0),
+    );
+    row.insert(
+        QString::from("openLine"),
+        QVariant::from(&bounded_i32(line.new_line.max(1))),
     );
     row.insert(QString::from("splitHidden"), QVariant::from(&false));
     QVariant::from(&row)
@@ -2205,6 +2258,10 @@ fn to_review(row: &ReviewStateRow, loaded_path_id: &str) -> QVariant {
                 QVariant::from(&QString::from(
                     review_content_summary(&loaded.file).as_str(),
                 )),
+            );
+            value.insert(
+                QString::from("firstLine"),
+                QVariant::from(&bounded_i32(first_working_tree_line(&loaded.file))),
             );
             value.insert(QString::from("binary"), QVariant::from(&loaded.file.binary));
             value.insert(
@@ -3820,6 +3877,71 @@ impl ffi::HarknessBackend {
         launch_working_review(self, project_id, staged, preferred_path);
     }
 
+    fn open_review_line(
+        mut self: Pin<&mut Self>,
+        project_id: &QString,
+        file_id: &QString,
+        line: i32,
+    ) {
+        let project_id_text = project_id.to_string();
+        let file_id = file_id.to_string();
+        let selection = self
+            .as_ref()
+            .rust()
+            .review_state
+            .as_ref()
+            .filter(|state| state.project_id == project_id_text)
+            .and_then(|state| {
+                state.loaded_file.as_ref().and_then(|loaded| {
+                    (loaded.id == file_id).then(|| {
+                        let historical = state.target.as_ref().is_some_and(|target| {
+                            matches!(
+                                target.target,
+                                harkness_git::DiffTarget::Commit { .. }
+                                    | harkness_git::DiffTarget::Revisions { .. }
+                            )
+                        });
+                        (review_path(&loaded.file), historical)
+                    })
+                })
+            });
+        let Some((path, historical)) = selection else {
+            self.as_mut()
+                .set_status("The selected review file is no longer available".into());
+            return;
+        };
+        let Ok(project_id) = project_id_text.parse::<harkness_core::ProjectId>() else {
+            self.as_mut()
+                .set_status("The project identifier is invalid".into());
+            return;
+        };
+        let line = u32::try_from(line).unwrap_or(1).max(1);
+        let result = harkness_core::ProjectService::load().and_then(|service| {
+            service.open_in_editor(
+                project_id,
+                &path,
+                harkness_core::EditorPosition::new(line, 1),
+                harkness_core::EditorFallback::Desktop,
+            )
+        });
+        match result {
+            Ok(launch) => {
+                let mut message = format!(
+                    "Opened {} at line {} with {}",
+                    path.display(),
+                    launch.position.line,
+                    launch.command
+                );
+                if historical {
+                    message
+                        .push_str(" (working-tree content may differ from this historical diff)");
+                }
+                self.as_mut().set_status(message.into());
+            }
+            Err(error) => self.as_mut().set_status(error.to_string().into()),
+        }
+    }
+
     fn load_review_file(mut self: Pin<&mut Self>, project_id: &QString, file_id: &QString) {
         let project_id = project_id.to_string();
         let file_id = file_id.to_string();
@@ -4715,9 +4837,9 @@ mod tests {
         REVIEW_FILE_PAGE_SIZE, REVIEW_ROW_PAGE_SIZE, ReviewContextDirection, ReviewContextOutcome,
         ReviewSelection, WorktreeLockAction, accept_current_catalog_refresh,
         advance_review_file_window, advance_review_row_window, begin_job, begin_job_in_scope,
-        change_worktree_lock_with_service, conflicting_repository_job, display_diff_path,
-        empty_opened, end_job, expand_review_context_with_git, hidden_before, jobs_conflict,
-        load_history_page_with_git, load_review_file_with_git, load_review_with_git,
+        best_working_tree_line, change_worktree_lock_with_service, conflicting_repository_job,
+        display_diff_path, empty_opened, end_job, expand_review_context_with_git, hidden_before,
+        jobs_conflict, load_history_page_with_git, load_review_file_with_git, load_review_with_git,
         load_review_with_initial_file_with_git, move_worktree_with_service, operation_outcome,
         project_repository_lock_scopes, project_rows, project_worktree_lifecycle_lock_scopes,
         register_path_selection, register_review_path_identity, remove_worktree_with_service,
@@ -6204,6 +6326,25 @@ mod tests {
         };
         assert_eq!(changed(deletion), "old");
         assert_eq!(changed(addition), "new");
+        let hunk = &loaded.file.hunks[0];
+        let deletion_index = hunk
+            .lines
+            .iter()
+            .position(|line| matches!(line.kind, harkness_git::DiffLineKind::Deletion))
+            .unwrap();
+        let addition_index = hunk
+            .lines
+            .iter()
+            .position(|line| matches!(line.kind, harkness_git::DiffLineKind::Addition))
+            .unwrap();
+        assert_eq!(
+            best_working_tree_line(hunk, deletion_index),
+            addition.new_line_number.unwrap()
+        );
+        assert_eq!(
+            best_working_tree_line(hunk, addition_index),
+            addition.new_line_number.unwrap()
+        );
     }
 
     #[test]

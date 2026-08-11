@@ -13,6 +13,7 @@ dirs.workspace = true
 harkness-git.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+shlex.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 time.workspace = true

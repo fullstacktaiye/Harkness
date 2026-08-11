@@ -19,6 +19,9 @@ use crate::{
         entry::{Project, ProjectId, ProjectSource},
         lock,
     },
+    editor::{
+        self, EditorConfiguration, EditorError, EditorFallback, EditorLaunch, EditorPosition,
+    },
     paths::{
         self, CATALOG_FILE, CHECKOUT_DIRECTORY, LOCKS_DIRECTORY, REPOSITORIES_DIRECTORY,
         UnreservedPath, WORKTREES_DIRECTORY, canonical_reserved_root,
@@ -300,6 +303,10 @@ pub enum ProjectError {
     /// A Git operation on a catalogued project failed.
     #[error(transparent)]
     Git(GitError),
+
+    /// An external-editor template or launch failed.
+    #[error(transparent)]
+    Editor(EditorError),
 }
 
 macro_rules! impl_project_error_kinds {
@@ -307,8 +314,8 @@ macro_rules! impl_project_error_kinds {
         impl ProjectError {
             /// Stable discriminants defined by the project layer itself.
             ///
-            /// [`ProjectError::Git`] delegates to [`GitError::KINDS`], so callers that
-            /// need the complete namespace should combine both arrays.
+            /// Git and editor failures delegate to their owned kind tables, so
+            /// callers that need the complete namespace should combine all three.
             pub const DIRECT_KINDS: &'static [&'static str] = &[$($kind),+];
 
             /// Stable machine-readable discriminant for agent-facing error handling.
@@ -317,6 +324,7 @@ macro_rules! impl_project_error_kinds {
                 match self {
                     $($pattern => $kind,)+
                     Self::Git(error) => error.kind(),
+                    Self::Editor(error) => error.kind(),
                 }
             }
         }
@@ -455,6 +463,12 @@ impl From<GitError> for ProjectError {
     }
 }
 
+impl From<EditorError> for ProjectError {
+    fn from(error: EditorError) -> Self {
+        Self::Editor(error)
+    }
+}
+
 /// Loads and updates the durable local project catalog.
 ///
 /// Concurrent front ends are safe. Every mutation takes an exclusive advisory
@@ -571,6 +585,48 @@ impl ProjectService {
             .collect::<Vec<_>>();
         sort_recents(&mut projects);
         Ok(projects)
+    }
+
+    /// Reads the one global editor command without rewriting the catalog.
+    pub fn editor_configuration(&self) -> Result<Option<EditorConfiguration>, ProjectError> {
+        Ok(self.read_catalog_shared()?.editor)
+    }
+
+    /// Replaces or clears the global editor command under the catalog lock.
+    pub fn set_editor_configuration(
+        &mut self,
+        editor: Option<EditorConfiguration>,
+    ) -> Result<(), ProjectError> {
+        let _lock = self.lock_exclusive()?;
+        let mut candidate = self.read_catalog()?;
+        candidate.editor = editor;
+        self.persist(&candidate)?;
+        self.catalog = candidate;
+        Ok(())
+    }
+
+    /// Opens a repository-relative path with no repository lock and no wait.
+    ///
+    /// The short shared catalog read completes before the process is spawned.
+    /// Worktrees therefore use their own catalogued root, and a long-lived
+    /// editor can never retain either the catalog or repository lock.
+    pub fn open_in_editor(
+        &self,
+        id: ProjectId,
+        path: &Path,
+        position: EditorPosition,
+        fallback: EditorFallback,
+    ) -> Result<EditorLaunch, ProjectError> {
+        let catalog = self.read_catalog_shared()?;
+        let project = catalog
+            .projects
+            .iter()
+            .find(|project| project.id == id)
+            .ok_or(ProjectError::ProjectNotFound(id))?;
+        let root = project.root.clone();
+        let configured = catalog.editor.clone();
+        drop(catalog);
+        editor::open(&root, path, position, configured.as_ref(), fallback).map_err(Into::into)
     }
 
     /// Resolves one catalog entry without mutating the catalog or Recents.

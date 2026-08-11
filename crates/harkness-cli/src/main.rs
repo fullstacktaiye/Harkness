@@ -15,11 +15,12 @@ use base64::{
     engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD as URL_BASE64},
 };
 use clap::{
-    ArgGroup, Args, Parser, Subcommand,
+    ArgGroup, Args, Parser, Subcommand, ValueEnum,
     error::{Error as ClapError, ErrorKind},
 };
 use harkness_core::{
-    Project, ProjectError, ProjectSelector, ProjectService, ProjectSource, Worktree,
+    EditorConfiguration, EditorError, EditorFallback, EditorPosition, EditorPreset, Project,
+    ProjectError, ProjectSelector, ProjectService, ProjectSource, Worktree,
 };
 use harkness_git::{
     Branch, BranchCheckout, BranchKind, BranchListOptions, Cancellation, CommitInfo, CommitOptions,
@@ -97,8 +98,79 @@ enum Command {
         #[command(subcommand)]
         command: WorktreeCommand,
     },
+    /// Configure and launch an external editor without invoking a shell.
+    Editor {
+        #[command(subcommand)]
+        command: EditorCommand,
+    },
     /// Describe the versioned machine-readable CLI contract.
     Contract,
+}
+
+#[derive(Debug, Subcommand)]
+enum EditorCommand {
+    /// Show the configured argv template and fallback behavior.
+    Show,
+    /// List the built-in convenience templates.
+    Presets,
+    /// Store a preset or custom argv template globally.
+    Set(EditorSetArguments),
+    /// Remove the configured template and restore automatic fallback.
+    Clear,
+    /// Open a repository-relative file at a one-based source position.
+    Open(EditorOpenArguments),
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum EditorPresetArgument {
+    Kate,
+    Code,
+    Zed,
+}
+
+impl From<EditorPresetArgument> for EditorPreset {
+    fn from(value: EditorPresetArgument) -> Self {
+        match value {
+            EditorPresetArgument::Kate => Self::Kate,
+            EditorPresetArgument::Code => Self::VisualStudioCode,
+            EditorPresetArgument::Zed => Self::Zed,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct EditorSetArguments {
+    /// Use a built-in Kate, VS Code, or Zed template.
+    #[arg(
+        long,
+        value_enum,
+        conflicts_with = "command",
+        required_unless_present = "command"
+    )]
+    preset: Option<EditorPresetArgument>,
+    /// Custom argv template. Use `--` before the executable; `{file}` is required.
+    #[arg(
+        value_name = "COMMAND",
+        num_args = 1..,
+        trailing_var_arg = true,
+        required_unless_present = "preset"
+    )]
+    command: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct EditorOpenArguments {
+    #[command(flatten)]
+    selection: ProjectSelection,
+    /// Repository-relative file path.
+    #[arg(value_name = "PATH", allow_hyphen_values = true)]
+    path: PathBuf,
+    /// One-based line number.
+    #[arg(long, default_value_t = 1)]
+    line: u32,
+    /// One-based column number.
+    #[arg(long, default_value_t = 1)]
+    column: u32,
 }
 
 #[derive(Debug, Args)]
@@ -1545,8 +1617,114 @@ fn run(cli: Cli, cancellation: &Cancellation) -> Result<CommandResult, CliError>
         Command::Worktree { command } => {
             run_worktree(command, data_dir.as_deref(), json, cancellation)
         }
+        Command::Editor { command } => run_editor(command, data_dir.as_deref(), json),
         Command::Contract => Ok(contract_result(json)),
     }
+}
+
+fn run_editor(
+    command: EditorCommand,
+    data_dir: Option<&Path>,
+    json_output: bool,
+) -> Result<CommandResult, CliError> {
+    let mut service = load_service(data_dir)?;
+    match command {
+        EditorCommand::Show => {
+            let configuration = service.editor_configuration()?;
+            command_result(
+                json_output,
+                || {
+                    configuration.as_ref().map_or_else(
+                        || "automatic ($VISUAL, $EDITOR, desktop default)".to_owned(),
+                        |configuration| configuration.command().join(" "),
+                    )
+                },
+                || Ok(json!({ "editor": configuration.as_ref().map(editor_configuration_value) })),
+            )
+        }
+        EditorCommand::Presets => command_result(
+            json_output,
+            || {
+                EditorPreset::ALL
+                    .iter()
+                    .map(|preset| {
+                        format!(
+                            "{}\t{}\t{}",
+                            preset.id(),
+                            preset.name(),
+                            preset.configuration().command().join(" ")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            },
+            || {
+                Ok(json!({
+                    "presets": EditorPreset::ALL.iter().map(|preset| json!({
+                        "id": preset.id(),
+                        "name": preset.name(),
+                        "command": preset.configuration().command(),
+                    })).collect::<Vec<_>>()
+                }))
+            },
+        ),
+        EditorCommand::Set(arguments) => {
+            let configuration = match arguments.preset {
+                Some(preset) => EditorPreset::from(preset).configuration(),
+                None => EditorConfiguration::new(arguments.command).map_err(ProjectError::from)?,
+            };
+            service.set_editor_configuration(Some(configuration.clone()))?;
+            command_result(
+                json_output,
+                || format!("editor set to {}", configuration.command().join(" ")),
+                || Ok(json!({ "editor": editor_configuration_value(&configuration) })),
+            )
+        }
+        EditorCommand::Clear => {
+            service.set_editor_configuration(None)?;
+            command_result(
+                json_output,
+                || "editor configuration cleared".to_owned(),
+                || Ok(json!({ "editor": Value::Null })),
+            )
+        }
+        EditorCommand::Open(arguments) => {
+            let project = resolve_project(&service, arguments.selection.project.as_deref())?;
+            let launch = service.open_in_editor(
+                project.id,
+                &arguments.path,
+                EditorPosition::new(arguments.line, arguments.column),
+                EditorFallback::Environment,
+            )?;
+            command_result(
+                json_output,
+                || {
+                    format!(
+                        "opened {} at {}:{} with {}",
+                        arguments.path.display(),
+                        launch.position.line,
+                        launch.position.column,
+                        launch.command
+                    )
+                },
+                || {
+                    let (file, path_is_lossy) = wire_path(&launch.file);
+                    Ok(json!({
+                        "kind": "editor_open",
+                        "command": launch.command,
+                        "file": file,
+                        "path_is_lossy": path_is_lossy,
+                        "line": launch.position.line,
+                        "column": launch.position.column,
+                    }))
+                },
+            )
+        }
+    }
+}
+
+fn editor_configuration_value(configuration: &EditorConfiguration) -> Value {
+    json!({ "command": configuration.command() })
 }
 
 fn run_git(
@@ -3493,6 +3671,7 @@ fn contract_result(json_output: bool) -> CommandResult {
             "cli": CLI_ERROR_KINDS,
             "project": ProjectError::DIRECT_KINDS,
             "git": GitError::KINDS,
+            "editor": EditorError::KINDS,
         },
         // The category map above names the codes; this names which code each
         // error kind actually reports. Without it a caller has to hardcode the
@@ -3502,6 +3681,7 @@ fn contract_result(json_output: bool) -> CommandResult {
             "cli": kind_exit_codes(CLI_KIND_EXIT_CODES),
             "project": kind_exit_codes(PROJECT_KIND_EXIT_CODES),
             "git": kind_exit_codes(GIT_KIND_EXIT_CODES),
+            "editor": kind_exit_codes(EDITOR_KIND_EXIT_CODES),
         },
         "streams": {
             "result": "stdout",
@@ -3643,6 +3823,7 @@ fn project_exit_code(error: &ProjectError) -> u8 {
         | ProjectError::WorktreeDestinationContainsProject { .. }
         | ProjectError::WorktreeDestinationInsideDataDirectory { .. } => EXIT_REFUSED,
         ProjectError::Git(error) => git_exit_code(error),
+        ProjectError::Editor(error) => editor_exit_code(error),
         ProjectError::DataDirectoryUnavailable
         | ProjectError::InvalidDirectory { .. }
         | ProjectError::UnreadableDirectory { .. }
@@ -3662,6 +3843,15 @@ fn project_exit_code(error: &ProjectError) -> u8 {
         | ProjectError::ManagedRepositoryLock { .. }
         | ProjectError::ManagedRepositoryReconciliation { .. }
         | ProjectError::WorktreeMovedCatalogStale { .. } => EXIT_OPERATION_FAILED,
+    }
+}
+
+fn editor_exit_code(error: &EditorError) -> u8 {
+    match error {
+        EditorError::PathOutsideProject { .. } | EditorError::InvalidTemplate { .. } => {
+            EXIT_REFUSED
+        }
+        EditorError::Launch { .. } => EXIT_OPERATION_FAILED,
     }
 }
 
@@ -3868,6 +4058,12 @@ const PROJECT_KIND_EXIT_CODES: &[(&str, u8)] = &[
     ("worktree_moved_catalog_stale", EXIT_OPERATION_FAILED),
 ];
 
+const EDITOR_KIND_EXIT_CODES: &[(&str, u8)] = &[
+    ("invalid_editor_template", EXIT_REFUSED),
+    ("editor_path_outside_project", EXIT_REFUSED),
+    ("editor_launch", EXIT_OPERATION_FAILED),
+];
+
 /// The exit code every CLI-originated error kind reports, in
 /// `CLI_ERROR_KINDS` order.
 const CLI_KIND_EXIT_CODES: &[(&str, u8)] = &[
@@ -3967,7 +4163,19 @@ fn project_error_details(error: &ProjectError) -> Value {
             })
         }
         ProjectError::Git(error) => git_error_details(error),
+        ProjectError::Editor(error) => editor_error_details(error),
         _ => json!({}),
+    }
+}
+
+fn editor_error_details(error: &EditorError) -> Value {
+    match error {
+        EditorError::PathOutsideProject { path } => {
+            let (path, path_is_lossy) = wire_path(path);
+            json!({ "path": path, "path_is_lossy": path_is_lossy })
+        }
+        EditorError::Launch { command, .. } => json!({ "command": command }),
+        EditorError::InvalidTemplate { .. } => json!({}),
     }
 }
 
@@ -4182,11 +4390,11 @@ mod tests {
     };
 
     use super::{
-        CLI_ERROR_KINDS, CLI_KIND_EXIT_CODES, CliError, EXIT_CANCELLED, EXIT_CONFLICT,
-        EXIT_NOT_FOUND, EXIT_OPERATION_FAILED, EXIT_REFUSED, EXIT_USAGE, GIT_KIND_EXIT_CODES,
-        GitError, PROJECT_KIND_EXIT_CODES, Project, ProjectError, RefusalKind, git_error_details,
-        git_exit_code, parse_selection_document, project_exit_code, project_value, requested_json,
-        single_line,
+        CLI_ERROR_KINDS, CLI_KIND_EXIT_CODES, CliError, EDITOR_KIND_EXIT_CODES, EXIT_CANCELLED,
+        EXIT_CONFLICT, EXIT_NOT_FOUND, EXIT_OPERATION_FAILED, EXIT_REFUSED, EXIT_USAGE,
+        EditorError, GIT_KIND_EXIT_CODES, GitError, PROJECT_KIND_EXIT_CODES, Project, ProjectError,
+        RefusalKind, editor_exit_code, git_error_details, git_exit_code, parse_selection_document,
+        project_exit_code, project_value, requested_json, single_line,
     };
 
     #[test]
@@ -4219,6 +4427,28 @@ mod tests {
             declared,
             GitError::KINDS,
             "GIT_KIND_EXIT_CODES must classify every Git error kind, in order"
+        );
+    }
+
+    #[test]
+    fn editor_error_kinds_are_classified_for_the_exit_code_contract() {
+        let declared = EDITOR_KIND_EXIT_CODES
+            .iter()
+            .map(|(kind, _)| *kind)
+            .collect::<Vec<_>>();
+        assert_eq!(declared, EditorError::KINDS);
+        assert_eq!(
+            editor_exit_code(&EditorError::InvalidTemplate {
+                reason: "fixture".to_owned(),
+            }),
+            EXIT_REFUSED
+        );
+        assert_eq!(
+            editor_exit_code(&EditorError::Launch {
+                command: "missing-editor".to_owned(),
+                source: io::Error::new(io::ErrorKind::NotFound, "fixture"),
+            }),
+            EXIT_OPERATION_FAILED
         );
     }
 
@@ -4632,6 +4862,7 @@ mod tests {
             .iter()
             .chain(ProjectError::DIRECT_KINDS)
             .chain(GitError::KINDS)
+            .chain(EditorError::KINDS)
             .copied()
             .collect::<Vec<_>>();
         let unique = kinds.iter().copied().collect::<HashSet<_>>();
