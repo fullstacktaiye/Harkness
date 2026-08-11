@@ -253,6 +253,26 @@ digest it claims, and deduplicating first would drop a second row carrying a
 different digest for a path already present. Every content-derived identity a
 record merely asserts is re-derived on load too, `SymbolId` included.
 
+A probe opens regular files and nothing else. `open(2)` on a FIFO with no writer
+never returns and a character device never reaches end of file, so a capture that
+opened one would hang with no way out — the cancellation token is polled between
+files and inside the block-read loop, neither of which a blocked `open` reaches.
+Anything that is not a regular file contributes a skip, decided from its metadata
+before it is opened. A probe also resolves every path through a check that it has
+no absolute or `..` component: the trait promises never to read outside the
+worktree root, and `PathBuf::join` discards that root outright when handed an
+absolute path, so the promise has to be enforced rather than assumed of callers.
+
+Only a rename removes its source from the index. `StatusEntry::rename_source` is
+populated for copies too, and a copy leaves its source in the index unchanged, so
+recording it as absent would give a staged copy the same `index_digest` as a
+staged delete of the source beside a staged add of the destination.
+
+One path has one spelling. A directory recorded because it could not be expanded
+and the same directory recorded because something inside it failed must not
+differ by a trailing separator, or switching between the two reads as a removal
+beside an addition while nothing moved.
+
 An unreadable branch of the workspace must never make the rest of its tree
 invisible. Collapsing a subtree to one sentinel freezes its digest, and a frozen
 digest means every later edit beneath it verifies as `Fresh` — the exact false

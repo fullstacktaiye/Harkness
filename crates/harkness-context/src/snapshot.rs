@@ -917,7 +917,17 @@ fn collect_entry(
         // A rename's source path leaves the index too, and a set that named only
         // the destination would compare equal to one where the source is still
         // staged under its old name.
-        if let Some(source) = entry.rename_source.as_ref() {
+        //
+        // A *copy* carries the same `rename_source` and means the opposite: the
+        // source is still in the index, unchanged. Recording it as `Absent`
+        // would state a falsehood, and would give a staged copy the same
+        // `index_digest` as a staged delete of the source beside a staged add of
+        // the destination — two different index states, one identity. Git only
+        // reports copies when `status.renames=copies` is configured, which is
+        // exactly the sort of setting an identity must not quietly depend on.
+        if entry.staged == Some(FileChange::Renamed)
+            && let Some(source) = entry.rename_source.as_ref()
+        {
             let source = RepoPath::from_path(source);
             staged.push(FileDigestEntry::new(source, ContentDigest::Absent));
         }
@@ -936,6 +946,12 @@ fn collect_entry(
                 // reaches here — the probe reports those per sub-path, precisely
                 // so that the rest of the tree keeps taking part in identity.
                 None => {
+                    // Stripped, so this route spells a directory the same way
+                    // the per-sub-path route does. Otherwise a directory that
+                    // switched failure mode between two captures would report a
+                    // removed `node_modules/` beside an added `node_modules`
+                    // while nothing moved.
+                    let path = path.without_trailing_separator();
                     diagnostics.paths_skipped.push(SkippedPath {
                         path: path.clone(),
                         reason: failure.reason().to_owned(),
@@ -949,7 +965,7 @@ fn collect_entry(
             if cancellation.is_cancelled() {
                 return Err(CollectFailure::Cancelled);
             }
-            let digest = probe_content(probe, diagnostics, &candidate)?;
+            let digest = probe_content(probe, cancellation, diagnostics, &candidate)?;
             untracked.push(FileDigestEntry::new(candidate, digest));
         }
         for unreadable in expanded.unreadable {
@@ -969,7 +985,7 @@ fn collect_entry(
     // may be asked to resolve, so it belongs to the tracked-dirty set even when
     // Git reports no unstaged change beside the conflict.
     if entry.unstaged.is_some() || entry.conflicted {
-        let digest = probe_content(probe, diagnostics, &path)?;
+        let digest = probe_content(probe, cancellation, diagnostics, &path)?;
         tracked_dirty.push(FileDigestEntry::new(path, digest));
     }
     Ok(())
@@ -989,10 +1005,11 @@ fn refuse(path: &RepoPath, failure: &ProbeFailure) -> Option<CollectFailure> {
 /// Hashes one path, downgrading an ordinary read failure to the sentinel.
 fn probe_content(
     probe: &dyn WorkspaceProbe,
+    cancellation: &Cancellation,
     diagnostics: &mut CaptureDiagnostics,
     path: &RepoPath,
 ) -> Result<ContentDigest, CollectFailure> {
-    match probe.hash_path(path) {
+    match probe.hash_path(path, cancellation) {
         Ok(digest) => {
             diagnostics.paths_hashed += 1;
             Ok(digest)
@@ -1071,7 +1088,7 @@ mod tests {
     use std::path::Path;
 
     use harkness_core::ProjectId;
-    use harkness_git::{Cancellation, GitService};
+    use harkness_git::{Cancellation, FileChange, GitService, StatusEntry};
     use harkness_test_fixtures::{Fixture, commit_all, git, initialize_repository};
 
     use super::{
@@ -1080,7 +1097,7 @@ mod tests {
     };
     use crate::digest::empty_path_set_digest;
     use crate::path::RepoPath;
-    use crate::probe::{ContentDigest, FilesystemProbe};
+    use crate::probe::{ContentDigest, FilesystemProbe, ProbeFailure, WorkspaceProbe};
 
     struct Workspace {
         fixture: Fixture,
@@ -1738,6 +1755,187 @@ mod tests {
         let mut permissions = fs::metadata(&closed).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&closed, permissions).unwrap();
+    }
+
+    /// Runs one status entry through the collector and returns the staged set.
+    ///
+    /// Driven directly rather than through a fixture repository because Git's
+    /// own copy detection is reluctant — `status.renames=copies` does not make
+    /// it emit a `C` record for an ordinary `cp` — while `harkness-git` parses
+    /// and models those records regardless. The decision under test is which
+    /// change kinds remove their source from the index, so it is made here.
+    fn staged_set_for(entry: &StatusEntry) -> Vec<(String, ContentDigest)> {
+        struct AbsentProbe;
+        impl WorkspaceProbe for AbsentProbe {
+            fn expand_untracked(
+                &self,
+                candidate: &RepoPath,
+                _cancellation: &Cancellation,
+            ) -> Result<crate::probe::UntrackedExpansion, ProbeFailure> {
+                Ok(crate::probe::UntrackedExpansion::of_one(candidate.clone()))
+            }
+
+            fn hash_path(
+                &self,
+                _path: &RepoPath,
+                _cancellation: &Cancellation,
+            ) -> Result<ContentDigest, ProbeFailure> {
+                Ok(ContentDigest::Unreadable)
+            }
+
+            fn staged_blob_id(&self, _path: &RepoPath) -> Result<Option<String>, ProbeFailure> {
+                Ok(Some("0123456789abcdef".to_owned()))
+            }
+        }
+
+        let mut staged = Vec::new();
+        let mut tracked_dirty = Vec::new();
+        let mut untracked = Vec::new();
+        super::collect_entry(
+            &AbsentProbe,
+            &Cancellation::default(),
+            &mut super::CaptureDiagnostics::default(),
+            entry,
+            &mut staged,
+            &mut tracked_dirty,
+            &mut untracked,
+        )
+        .unwrap_or_else(|_| panic!("the fixture probe never refuses"));
+        super::canonicalize_entries(staged)
+            .into_iter()
+            .map(|entry| (entry.path.display(), entry.digest))
+            .collect()
+    }
+
+    #[test]
+    fn a_staged_copy_leaves_its_source_in_the_index() {
+        let copied = staged_set_for(&StatusEntry {
+            path: std::path::PathBuf::from("copy.txt"),
+            staged: Some(FileChange::Copied),
+            unstaged: None,
+            rename_source: Some(std::path::PathBuf::from("original.txt")),
+            conflicted: false,
+        });
+        let renamed = staged_set_for(&StatusEntry {
+            path: std::path::PathBuf::from("copy.txt"),
+            staged: Some(FileChange::Renamed),
+            unstaged: None,
+            rename_source: Some(std::path::PathBuf::from("original.txt")),
+            conflicted: false,
+        });
+
+        // A copy leaves the source in the index untouched, so nothing may claim
+        // it is gone. A rename really does remove it.
+        assert_eq!(
+            copied,
+            [(
+                "copy.txt".to_owned(),
+                ContentDigest::StagedBlob("0123456789abcdef".to_owned())
+            )]
+        );
+        assert_eq!(
+            renamed,
+            [
+                (
+                    "copy.txt".to_owned(),
+                    ContentDigest::StagedBlob("0123456789abcdef".to_owned())
+                ),
+                ("original.txt".to_owned(), ContentDigest::Absent),
+            ]
+        );
+        // The two index states must not share one identity: a staged copy is not
+        // a staged delete of the source beside a staged add of the destination.
+        assert_ne!(copied, renamed);
+    }
+
+    #[test]
+    fn a_staged_rename_still_records_its_source_as_absent() {
+        let workspace = Workspace::new("repo");
+        git(&workspace.root, ["mv", "tracked.txt", "renamed.txt"]);
+        let snapshot = workspace.capture();
+        assert!(
+            snapshot
+                .files()
+                .staged()
+                .iter()
+                .any(|entry| entry.path.display() == "tracked.txt"
+                    && entry.digest == ContentDigest::Absent),
+            "{:?}",
+            snapshot.files().staged()
+        );
+    }
+
+    /// Refuses to expand anything, the way the expansion bound does once a tree
+    /// is too large to enumerate deterministically.
+    struct OpaqueProbe;
+
+    impl WorkspaceProbe for OpaqueProbe {
+        fn expand_untracked(
+            &self,
+            _candidate: &RepoPath,
+            _cancellation: &Cancellation,
+        ) -> Result<crate::probe::UntrackedExpansion, ProbeFailure> {
+            Err(ProbeFailure::skipped(
+                "holds more than 10000 untracked files",
+            ))
+        }
+
+        fn hash_path(
+            &self,
+            _path: &RepoPath,
+            _cancellation: &Cancellation,
+        ) -> Result<ContentDigest, ProbeFailure> {
+            Ok(ContentDigest::Unreadable)
+        }
+
+        fn staged_blob_id(&self, _path: &RepoPath) -> Result<Option<String>, ProbeFailure> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn an_opaque_directory_is_spelled_the_same_way_a_readable_one_is() {
+        let workspace = Workspace::new("repo");
+        fs::create_dir(workspace.root.join("build")).unwrap();
+        workspace.write("build/out.txt", "first\n");
+
+        // Git reports `build/`. A candidate the probe cannot expand at all —
+        // the expansion bound, or a directory removed between status and the
+        // walk — must still be recorded under the spelling every other path in
+        // the identity uses, or one directory would have two names depending on
+        // where it failed, and switching between them would read as a removal
+        // beside an addition while nothing moved.
+        let snapshot = WorkspaceSnapshot::capture(
+            &workspace.request,
+            &workspace.service(),
+            &OpaqueProbe,
+            &Cancellation::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            snapshot
+                .files()
+                .untracked()
+                .iter()
+                .map(|entry| entry.path.display())
+                .collect::<Vec<_>>(),
+            ["build"],
+            "the recorded path kept its directory separator"
+        );
+
+        // The same directory, expanded normally, names its contents beneath the
+        // same prefix — so the two routes cannot disagree about the directory.
+        let readable = workspace.capture();
+        assert_eq!(
+            readable
+                .files()
+                .untracked()
+                .iter()
+                .map(|entry| entry.path.display())
+                .collect::<Vec<_>>(),
+            ["build/out.txt"]
+        );
     }
 
     #[test]

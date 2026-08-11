@@ -90,6 +90,21 @@ impl RepoPath {
         self.0.last() == Some(&b'/')
     }
 
+    /// Drops a status entry's trailing `/`, which marks a directory rather than
+    /// forming part of the path.
+    ///
+    /// Every path recorded in a workspace identity is in this form, so the two
+    /// spellings of one directory can never both appear: a set holding
+    /// `node_modules/` from one capture and `node_modules` from the next would
+    /// report a removal and an addition where nothing moved.
+    #[must_use]
+    pub fn without_trailing_separator(&self) -> Self {
+        match self.0.strip_suffix(b"/") {
+            Some(trimmed) => Self(trimmed.to_vec()),
+            None => self.clone(),
+        }
+    }
+
     /// The lossy display form, safe to log and to show.
     #[must_use]
     pub fn display(&self) -> String {
@@ -214,6 +229,21 @@ mod tests {
     fn a_trailing_separator_marks_an_unexpanded_directory_entry() {
         assert!(RepoPath::from_bytes(b"target/".to_vec()).is_directory_entry());
         assert!(!RepoPath::from_bytes(b"target".to_vec()).is_directory_entry());
+    }
+
+    #[test]
+    fn dropping_a_trailing_separator_gives_one_spelling_per_directory() {
+        let bare = RepoPath::from_bytes(b"target".to_vec());
+        assert_eq!(
+            RepoPath::from_bytes(b"target/".to_vec()).without_trailing_separator(),
+            bare
+        );
+        assert_eq!(bare.without_trailing_separator(), bare);
+        // Only the final separator, so a nested path keeps its structure.
+        assert_eq!(
+            RepoPath::from_bytes(b"a/b/".to_vec()).without_trailing_separator(),
+            RepoPath::from_bytes(b"a/b".to_vec())
+        );
     }
 
     #[test]

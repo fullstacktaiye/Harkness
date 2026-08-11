@@ -16,7 +16,7 @@ use std::cell::RefCell;
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
 use harkness_git::Cancellation;
@@ -322,7 +322,14 @@ pub trait WorkspaceProbe {
     ) -> Result<UntrackedExpansion, ProbeFailure>;
 
     /// Describes what the working tree now holds at `path`.
-    fn hash_path(&self, path: &RepoPath) -> Result<ContentDigest, ProbeFailure>;
+    ///
+    /// `cancellation` is polled while content is read, so one very large file
+    /// does not defer a cancellation until it has been hashed.
+    fn hash_path(
+        &self,
+        path: &RepoPath,
+        cancellation: &Cancellation,
+    ) -> Result<ContentDigest, ProbeFailure>;
 
     /// The blob id Git has staged for `path`, if it has one.
     ///
@@ -383,9 +390,29 @@ impl FilesystemProbe {
     ///
     /// A trailing separator is dropped first: `PathBuf::join` keeps it, and
     /// `symlink_metadata` does not accept it everywhere.
-    fn resolve(&self, path: &RepoPath) -> PathBuf {
-        self.root
-            .join(without_trailing_separator(path).to_path_buf())
+    ///
+    /// Every component is checked before the join, because `PathBuf::join`
+    /// silently *discards* the root when handed an absolute path and happily
+    /// walks upward through `..`. Nothing `collect` passes is either — those
+    /// paths come from `git status` and from `DirEntry::file_name` — but this
+    /// type is public, `RepoPath::from_bytes` accepts any bytes at all, and a
+    /// persisted path will start round-tripping back through here with [#110].
+    /// The trait promises never to read outside the worktree root; that promise
+    /// should hold because it is enforced, not because every caller so far has
+    /// happened to behave.
+    ///
+    /// [#110]: https://github.com/fullstacktaiye/harkness/issues/110
+    fn resolve(&self, path: &RepoPath) -> Result<PathBuf, ProbeFailure> {
+        let relative = path.without_trailing_separator().to_path_buf();
+        for component in relative.components() {
+            if !matches!(component, Component::Normal(_) | Component::CurDir) {
+                return Err(ProbeFailure::skipped(format!(
+                    "'{}' is not a path inside the worktree",
+                    path.display()
+                )));
+            }
+        }
+        Ok(self.root.join(relative))
     }
 }
 
@@ -399,13 +426,13 @@ impl WorkspaceProbe for FilesystemProbe {
         candidate: &RepoPath,
         cancellation: &Cancellation,
     ) -> Result<UntrackedExpansion, ProbeFailure> {
-        let resolved = self.resolve(candidate);
+        let resolved = self.resolve(candidate)?;
         let metadata = std::fs::symlink_metadata(&resolved)
             .map_err(|error| ProbeFailure::skipped(format!("cannot stat: {error}")))?;
         if !metadata.is_dir() {
-            return Ok(UntrackedExpansion::of_one(without_trailing_separator(
-                candidate,
-            )));
+            return Ok(UntrackedExpansion::of_one(
+                candidate.without_trailing_separator(),
+            ));
         }
 
         let mut expansion = UntrackedExpansion::default();
@@ -421,7 +448,7 @@ impl WorkspaceProbe for FilesystemProbe {
                 // readable later reads as a change rather than as nothing.
                 Err(error) => {
                     expansion.unreadable.push(UnreadablePath {
-                        path: RepoPath::from_bytes(without_trailing_separator_bytes(&prefix)),
+                        path: directory_at(&prefix),
                         reason: format!("cannot list: {error}"),
                     });
                     continue;
@@ -432,7 +459,7 @@ impl WorkspaceProbe for FilesystemProbe {
                     Ok(entry) => entry,
                     Err(error) => {
                         expansion.unreadable.push(UnreadablePath {
-                            path: RepoPath::from_bytes(without_trailing_separator_bytes(&prefix)),
+                            path: directory_at(&prefix),
                             reason: format!("cannot list: {error}"),
                         });
                         break;
@@ -483,8 +510,12 @@ impl WorkspaceProbe for FilesystemProbe {
         Ok(expansion)
     }
 
-    fn hash_path(&self, path: &RepoPath) -> Result<ContentDigest, ProbeFailure> {
-        let resolved = self.resolve(path);
+    fn hash_path(
+        &self,
+        path: &RepoPath,
+        cancellation: &Cancellation,
+    ) -> Result<ContentDigest, ProbeFailure> {
+        let resolved = self.resolve(path)?;
         let metadata = match std::fs::symlink_metadata(&resolved) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -500,12 +531,29 @@ impl WorkspaceProbe for FilesystemProbe {
         if metadata.is_dir() {
             return Err(ProbeFailure::skipped("is a directory"));
         }
+        // Everything that is not a regular file is refused *before* it is
+        // opened, because opening it is the hazard. `open(2)` on a FIFO with no
+        // writer blocks forever, and a character device such as `/dev/zero`
+        // never reaches end of file — either one would pin a capture with no way
+        // out, since the token is polled between files and not inside a read.
+        // Git reports an untracked directory as one entry without recursing, so
+        // a FIFO one level down reaches this function through the expansion.
+        if !metadata.is_file() {
+            return Err(ProbeFailure::skipped("is not a regular file"));
+        }
 
         let mut file = File::open(&resolved)
             .map_err(|error| ProbeFailure::skipped(format!("cannot open: {error}")))?;
         let mut hasher = Sha256::new();
         let mut buffer = vec![0_u8; READ_BLOCK_BYTES];
         loop {
+            // Per block, not per file. One large untracked file — a VM image, a
+            // core dump — would otherwise hold a cancelled capture for as long
+            // as hashing it takes, which is exactly the case the promptness
+            // promise is about.
+            if cancellation.is_cancelled() {
+                return Err(ProbeFailure::Cancelled);
+            }
             let read = file
                 .read(&mut buffer)
                 .map_err(|error| ProbeFailure::skipped(format!("cannot read: {error}")))?;
@@ -545,19 +593,8 @@ fn directory_prefix(candidate: &RepoPath) -> Vec<u8> {
 }
 
 /// Turns a walk prefix back into the directory path it names.
-fn without_trailing_separator_bytes(prefix: &[u8]) -> Vec<u8> {
-    prefix.strip_suffix(b"/").unwrap_or(prefix).to_vec()
-}
-
-/// Drops a status entry's trailing `/`, which marks a directory rather than
-/// forming part of the path.
-fn without_trailing_separator(path: &RepoPath) -> RepoPath {
-    if path.is_directory_entry() {
-        let bytes = path.as_bytes();
-        RepoPath::from_bytes(bytes[..bytes.len() - 1].to_vec())
-    } else {
-        path.clone()
-    }
+fn directory_at(prefix: &[u8]) -> RepoPath {
+    RepoPath::from_bytes(prefix.strip_suffix(b"/").unwrap_or(prefix).to_vec())
 }
 
 /// Reads every stage-zero index entry once, sorted for binary search.
@@ -649,11 +686,15 @@ mod tests {
         let probe = FilesystemProbe::new(&root);
 
         assert_eq!(
-            probe.hash_path(&path("a.txt")).unwrap(),
+            probe
+                .hash_path(&path("a.txt"), &Cancellation::default())
+                .unwrap(),
             ContentDigest::of_content(b"body")
         );
         assert_eq!(
-            probe.hash_path(&path("gone.txt")).unwrap(),
+            probe
+                .hash_path(&path("gone.txt"), &Cancellation::default())
+                .unwrap(),
             ContentDigest::Absent
         );
         assert_eq!(probe.root(), root);
@@ -667,7 +708,9 @@ mod tests {
         fs::write(root.join("big.bin"), &content).unwrap();
         let probe = FilesystemProbe::new(&root);
         assert_eq!(
-            probe.hash_path(&path("big.bin")).unwrap(),
+            probe
+                .hash_path(&path("big.bin"), &Cancellation::default())
+                .unwrap(),
             ContentDigest::of_content(&content)
         );
     }
@@ -682,7 +725,9 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
         let probe = FilesystemProbe::new(&root);
 
-        let digest = probe.hash_path(&path("link")).unwrap();
+        let digest = probe
+            .hash_path(&path("link"), &Cancellation::default())
+            .unwrap();
         assert_eq!(digest, ContentDigest::of_symlink_target(&outside));
         assert_ne!(digest, ContentDigest::of_content(b"do not read me"));
     }
@@ -823,8 +868,129 @@ mod tests {
         fs::create_dir(root.join("sub")).unwrap();
         let probe = FilesystemProbe::new(&root);
         assert_eq!(
-            probe.hash_path(&path("sub")),
+            probe.hash_path(&path("sub"), &Cancellation::default()),
             Err(ProbeFailure::skipped("is a directory"))
+        );
+    }
+
+    /// Creates a FIFO, or reports that this platform cannot.
+    #[cfg(unix)]
+    fn make_fifo(path: &std::path::Path) -> bool {
+        std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_refused_before_it_is_opened() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("worktree");
+        if !make_fifo(&root.join("pipe")) {
+            return;
+        }
+        let probe = FilesystemProbe::new(&root);
+
+        // Opening it would block forever: `open(2)` on a FIFO with no writer
+        // never returns, and nothing polls the token inside `open`. If this
+        // regresses the test hangs rather than fails, which is the nature of the
+        // bug it covers.
+        let failure = probe
+            .hash_path(&path("pipe"), &Cancellation::default())
+            .unwrap_err();
+        assert_eq!(failure.reason(), "is not a regular file");
+        assert!(!failure.is_fatal());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_inside_an_untracked_directory_does_not_stall_a_walk() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("worktree");
+        fs::create_dir(root.join("new")).unwrap();
+        fs::write(root.join("new/a.txt"), b"a").unwrap();
+        if !make_fifo(&root.join("new/pipe")) {
+            return;
+        }
+        let probe = FilesystemProbe::new(&root);
+
+        // Git reports `new/` as one entry without recursing, so the FIFO reaches
+        // hashing through the expansion rather than through a status entry.
+        let expanded = probe
+            .expand_untracked(&path("new/"), &Cancellation::default())
+            .unwrap();
+        assert_eq!(
+            expanded
+                .paths
+                .iter()
+                .map(RepoPath::display)
+                .collect::<Vec<_>>(),
+            ["new/a.txt", "new/pipe"]
+        );
+        for candidate in &expanded.paths {
+            let _ = probe.hash_path(candidate, &Cancellation::default());
+        }
+    }
+
+    #[test]
+    fn hashing_stops_between_blocks_when_the_token_is_set() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("worktree");
+        fs::write(
+            root.join("big.bin"),
+            vec![b'x'; super::READ_BLOCK_BYTES * 4],
+        )
+        .unwrap();
+        let probe = FilesystemProbe::new(&root);
+
+        let cancellation = Cancellation::default();
+        cancellation.cancel();
+        let failure = probe
+            .hash_path(&path("big.bin"), &cancellation)
+            .unwrap_err();
+        assert!(failure.is_cancelled(), "{failure}");
+    }
+
+    #[test]
+    fn a_path_that_leaves_the_worktree_is_refused_rather_than_read() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("worktree");
+        let outside = fixture.root.path().join("outside.txt");
+        fs::write(&outside, b"do not read me").unwrap();
+        let probe = FilesystemProbe::new(&root);
+
+        // `PathBuf::join` discards the root outright for an absolute path and
+        // walks upward through `..`, so the trait's promise not to read outside
+        // the worktree has to be enforced rather than assumed.
+        for escape in [
+            RepoPath::from_path(&outside),
+            RepoPath::from_bytes(b"../outside.txt".to_vec()),
+            RepoPath::from_bytes(b"nested/../../outside.txt".to_vec()),
+        ] {
+            let failure = probe
+                .hash_path(&escape, &Cancellation::default())
+                .unwrap_err();
+            assert!(
+                failure.reason().contains("not a path inside the worktree"),
+                "read '{}': {failure}",
+                escape.display()
+            );
+            assert!(
+                probe
+                    .expand_untracked(&escape, &Cancellation::default())
+                    .is_err()
+            );
+        }
+        // A path holding `..` in the middle but staying inside is still refused:
+        // the check is on components, not on where they happen to land.
+        assert!(
+            probe
+                .hash_path(
+                    &RepoPath::from_bytes(b"a/../a.txt".to_vec()),
+                    &Cancellation::default()
+                )
+                .is_err()
         );
     }
 

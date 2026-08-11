@@ -550,19 +550,27 @@ impl Provenance {
             check_bound("symbol.qualified_name", &symbol.qualified_name)?;
             check_bound("symbol.kind", &symbol.kind)?;
             check_bound("symbol.language", &symbol.language)?;
+            // A symbol is declared in a file, and its identity derives from that
+            // file's path, so a record naming a symbol and no path is one whose
+            // identity cannot be checked — the single asserted-but-unverified
+            // content identity left in the crate. The rule is the one `range`
+            // already carries.
+            let Some(path) = self.path.as_ref() else {
+                return Err(invalid(
+                    "a symbol names no declaration site without a path".to_owned(),
+                ));
+            };
             // Re-derived rather than trusted, for the reason a snapshot's
             // digests are: a content-derived identity a record merely asserts is
             // one nothing downstream re-checks, so a row could name a symbol its
             // own components do not produce.
-            if let Some(path) = self.path.as_ref() {
-                let derived =
-                    SymbolId::derive(path, &symbol.language, &symbol.qualified_name, &symbol.kind);
-                if derived != symbol.id {
-                    return Err(invalid(format!(
-                        "symbol.id is {} but its components derive {derived}",
-                        symbol.id
-                    )));
-                }
+            let derived =
+                SymbolId::derive(path, &symbol.language, &symbol.qualified_name, &symbol.kind);
+            if derived != symbol.id {
+                return Err(invalid(format!(
+                    "symbol.id is {} but its components derive {derived}",
+                    symbol.id
+                )));
             }
         }
         match &self.sensitivity {
@@ -747,6 +755,17 @@ mod tests {
                 .validate()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn a_symbol_without_a_path_is_refused_because_its_identity_cannot_be_checked() {
+        let mut record =
+            provenance().for_symbol(SymbolRef::new(&path(), "rust", "main", "function"));
+        record.path = None;
+        record.range = None;
+        let error = record.validate().unwrap_err();
+        assert_eq!(error.kind(), "invalid_provenance_wire");
+        assert!(error.to_string().contains("without a path"), "{error}");
     }
 
     #[test]
