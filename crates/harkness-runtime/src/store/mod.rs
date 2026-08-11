@@ -796,13 +796,11 @@ impl Store {
         at: OffsetDateTime,
         event: RunEvent,
     ) -> Result<(ToolCall, EventSeq), StoreError> {
-        // Moved into the closure, which runs once; `succeed` takes the value.
-        let mut output = Some(output);
         self.change_tool_call_with_event(
             "succeeding a tool call with its event",
             id,
             event,
-            |call| call.succeed(output.take().unwrap_or(Value::Null), at),
+            move |call| call.succeed(output, at),
         )
     }
 
@@ -818,15 +816,12 @@ impl Store {
         at: OffsetDateTime,
         event: RunEvent,
     ) -> Result<(ToolCall, EventSeq), StoreError> {
-        let mut failure = Some(failure);
-        self.change_tool_call_with_event("failing a tool call with its event", id, event, |call| {
-            call.fail(
-                failure
-                    .take()
-                    .unwrap_or_else(|| Failure::new("execution_failed", "the tool failed")),
-                at,
-            )
-        })
+        self.change_tool_call_with_event(
+            "failing a tool call with its event",
+            id,
+            event,
+            move |call| call.fail(failure, at),
+        )
     }
 
     /// Applies one tool-call change and appends its event in a single
@@ -836,15 +831,23 @@ impl Store {
     /// is what stops a later outcome from being added with the event outside the
     /// transaction, which would leave a call whose state moved and whose history
     /// does not say so.
+    ///
+    /// `FnOnce` rather than `FnMut`, so a change may simply *own* the value it
+    /// applies. A repeatable bound would force each caller to hand its output or
+    /// its failure over through an `Option` and invent something to store on a
+    /// second call — and the day a busy-retry is wrapped around the transaction
+    /// below, those inventions would quietly persist a null result or a
+    /// placeholder failure instead of failing loudly. The type makes running
+    /// twice impossible instead of merely unlikely.
     fn change_tool_call_with_event<F>(
         &self,
         operation: &'static str,
         id: ToolCallId,
         event: RunEvent,
-        mut change: F,
+        change: F,
     ) -> Result<(ToolCall, EventSeq), StoreError>
     where
-        F: FnMut(&mut ToolCall) -> Result<(), RunDomainError>,
+        F: FnOnce(&mut ToolCall) -> Result<(), RunDomainError>,
     {
         // The run is read before the transaction so the payload can be spilled
         // and redacted outside it: no transaction is held across work that

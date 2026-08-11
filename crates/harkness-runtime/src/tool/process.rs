@@ -33,7 +33,7 @@
 //! from. Only what a tool names explicitly is passed.
 
 use std::ffi::{OsStr, OsString};
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -341,22 +341,45 @@ impl ToolProcess {
                 });
             }
 
-            let waited = child.try_wait().map_err(|error| {
-                ToolError::execution_failed(format!(
-                    "a child process could not be waited on: {error}"
-                ))
-            })?;
+            let waited = match child.try_wait() {
+                Ok(waited) => waited,
+                Err(error) => {
+                    // The one path that must not simply return: a child this
+                    // process has lost track of is still running, and dropping
+                    // its handle neither kills nor reaps it. It would outlive
+                    // the call it was bounded by while that call is recorded as
+                    // failed.
+                    terminate(&mut child, incoming, stdout_reader, stderr_reader);
+                    return Err(ToolError::execution_failed(format!(
+                        "a child process could not be waited on: {error}"
+                    )));
+                }
+            };
             if let Some(status) = waited {
-                // The readers are drained *while* they are waited on, never
+                // The group is ended before its output is collected, and that
+                // ordering is the whole of what makes this return promptly. A
+                // pipe reaches end of file only when *every* write end is
+                // closed, so a child that started a background helper leaves one
+                // open behind it: waiting for the readers would mean waiting for
+                // however long the helper runs, long past the call. The group is
+                // the unit of execution, so it is the unit that ends.
+                //
+                // Signalling after the child has been reaped is sound while any
+                // member of the group is alive — the group keeps the identifier
+                // reserved, so it cannot name anything else — and is a harmless
+                // `ESRCH` once none is.
+                terminate_process_group(&mut child);
+
+                // The readers are then drained *while* they are waited on, never
                 // after. A child can exit with its pipe still full, and the
                 // reader turning that residue into segments blocks as soon as
                 // the bounded queue fills — so joining first would wait on a
                 // thread that is waiting on this one. The symptom is not a slow
                 // call but one that never ends.
                 //
-                // They are still finished before anything is reported, so the
-                // byte counts and the artifacts describe the whole stream rather
-                // than however much had arrived when the child exited.
+                // They still finish before anything is reported, so the byte
+                // counts and the artifacts describe the whole stream rather than
+                // however much had arrived when the child exited.
                 let (stdout, stderr) =
                     drain_until_read(context, &incoming, stdout_reader, stderr_reader);
                 return Ok(ProcessOutput {
@@ -471,13 +494,19 @@ fn drain_until_read(
     (stdout, stderr)
 }
 
-/// Kills the child's process group and waits for its readers to drain.
+/// Kills the child's process group and keeps whatever it had already produced.
 ///
 /// The receiver is consumed rather than borrowed, and dropped *before* the
 /// joins. A reader blocked on a full segment channel would otherwise never
 /// return, and joining it would hang the very path that exists to stop things:
 /// dropping the receiver makes its next send fail, which is how a blocked reader
 /// learns nobody is listening.
+///
+/// The captured streams are *finished*, not discarded. A build log is at its
+/// most useful precisely when the build was killed, and an unfinished
+/// [`ArtifactStream`] deletes the bytes it staged — so discarding here would
+/// destroy the diagnostic in the one case somebody needs it. What arrived before
+/// the kill is already complete and correct; only the rest is missing.
 fn terminate(
     child: &mut Child,
     incoming: Receiver<String>,
@@ -487,8 +516,11 @@ fn terminate(
     terminate_process_group(child);
     drop(incoming);
     let _ = child.wait();
-    let _ = stdout_reader.join();
-    let _ = stderr_reader.join();
+    for reader in [stdout_reader, stderr_reader] {
+        if let Ok(drained) = reader.join() {
+            drained.preserve();
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -514,6 +546,17 @@ struct Drained {
 }
 
 impl Drained {
+    /// Records the artifact and discards everything else.
+    ///
+    /// What a stopped call wants: the bytes that did arrive are worth keeping,
+    /// and there is no caller left to hand a [`CapturedStream`] to. Best effort,
+    /// because the call is already failing for a reason worth more than this.
+    fn preserve(self) {
+        if let Some(artifact) = self.artifact {
+            let _ = artifact.finish();
+        }
+    }
+
     /// Finalizes the artifact and reports what the stream produced.
     fn finish(self) -> Result<CapturedStream, ToolError> {
         if let Some(failure) = self.failure {
@@ -559,8 +602,19 @@ fn drain(
 
     loop {
         let read = match reader.read(&mut buffer) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
             Ok(read) => read,
+            // A signal arriving mid-read is not the end of the stream, and
+            // treating it as one would silently shorten the artifact.
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                // Any other read failure means the recorded size and the
+                // artifact describe a prefix, while `is_truncated` would say the
+                // tail is the whole stream. A consumer cannot tell that from a
+                // complete capture, so it is reported rather than absorbed.
+                drained.failure = Some(format!("a captured stream could not be read: {error}"));
+                break;
+            }
         };
         let chunk = &buffer[..read];
 

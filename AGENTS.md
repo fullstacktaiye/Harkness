@@ -406,6 +406,23 @@ invariant is not "the tool's number wins" but "the call has a way to end", and
 token, which nothing can verify and a caller therefore cannot assert on the
 author's behalf.
 
+Only a `pending` call can be dispatched, and `ToolCall::approve` moves an approved
+call to `running` by itself — so an approval-gated call cannot currently be run
+through `ToolExecutor::execute` and never has its version pinned. That is a known
+gap, not a rule: resuming approved work needs a dispatch of its own, and defining
+it belongs with the approval layer that knows who decided and what the decision
+covered. Do not widen `execute` to accept `running` to work around it.
+
+A process group is the unit of execution, so it is the unit that ends. When the
+direct child exits, the group is signalled before its output is collected: a pipe
+reaches end of file only when every write end closes, and a child that started a
+background helper leaves one open, so waiting for end of file would mean waiting
+however long the helper runs. Signalling after the child has been reaped is sound
+while any member is alive — the group keeps the identifier reserved — and is a
+harmless `ESRCH` once none is. A captured stream is *finished* on the stop paths
+rather than dropped: an unfinished artifact deletes the bytes it staged, and a
+build log matters most when the build was killed.
+
 `tool_calls.tool_version` is the one column of a recorded request that is ever
 rewritten, and only by `ToolCall::dispatch`, which pins the resolved version in the
 same transition that starts the call. `update_tool_call` still names none of the

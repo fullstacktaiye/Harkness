@@ -84,6 +84,15 @@
 //! Scheduling, queueing, and concurrency limits (#93); policy evaluation and
 //! approvals (#91, #92) — the executor assumes the call it is handed is already
 //! authorized; and any concrete tool (#94, #95).
+//!
+//! One consequence is worth stating rather than leaving to be discovered. Only a
+//! `pending` call can be dispatched, and
+//! [`ToolCall::approve`](crate::domain::ToolCall::approve) moves an approved
+//! call to `running` on its own — so an approval-gated call cannot be run
+//! through [`ToolExecutor::execute`] at all, and never has its version pinned.
+//! Resuming approved work needs a dispatch of its own, and defining it belongs
+//! with the approval layer that knows who decided and what the decision covered.
+//! See [`ExecutionError::NotDispatchable`].
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -106,9 +115,13 @@ use super::{
 
 /// Kind recorded when a tool's result is larger than a result may be.
 ///
-/// Borrowed from the store's own namespace rather than invented here, because it
-/// is the store's bound that was broken and a consumer branching on the kind
-/// should not have to learn two spellings for one refusal.
+/// Borrowed from [`StoreError::KINDS`] rather than invented here, because it is
+/// the store's bound that was broken and a consumer branching on the kind should
+/// not have to learn two spellings for one refusal. Borrowing means a recorded
+/// tool-call failure can carry a kind from the *store's* namespace as well as
+/// the tool's — `the_oversized_result_kind_is_one_a_consumer_can_look_up` holds
+/// this constant to that table, so it cannot drift into a spelling no published
+/// namespace defines and no caller can match on.
 const OVERSIZED_RESULT_KIND: &str = "payload_too_large";
 
 /// How long a tool is given to unwind after it has been told to stop.
@@ -239,6 +252,17 @@ pub enum CallOutcome {
     /// The call was stopped through its cancellation token.
     Cancelled,
 
+    /// The worker carrying the call died without reporting anything.
+    ///
+    /// Not something a tool can cause: the invocation pipeline contains the body
+    /// in a panic boundary, so a panicking tool reports a failure like any
+    /// other. This is the layer *underneath* that going away — an abort, a
+    /// failed allocation — and it is recorded as
+    /// [`ToolCallState::Interrupted`](crate::domain::ToolCallState::Interrupted)
+    /// because that state exists for exactly this and nothing else would ever
+    /// reach it.
+    Interrupted,
+
     /// The call exceeded the time it was allowed and was stopped.
     TimedOut {
         /// The limit the call was given.
@@ -319,6 +343,16 @@ pub enum ExecutionError {
     Store(#[from] StoreError),
 
     /// The call is not in a state execution can begin from.
+    ///
+    /// `pending` is the only such state today, and that is a real gap for
+    /// approval-gated work rather than a complete rule.
+    /// [`ToolCall::approve`](crate::domain::ToolCall::approve) moves a call from
+    /// `awaiting_approval` straight to `running` itself, so an approved call
+    /// arrives here already `running` and is refused — and its version is never
+    /// pinned, which is precisely what an approval bound to a version needs.
+    /// Resuming approved work is #91/#92's to define, because only the approval
+    /// layer knows who decided and what the decision covers; this executor
+    /// refuses rather than guessing at it.
     #[error("tool call {call} is {state} and only a pending call can be dispatched")]
     NotDispatchable {
         /// Call that was handed to the executor.
@@ -629,12 +663,7 @@ impl ToolExecutor {
                     // — so this is a panic in the pipeline itself or a failed
                     // allocation, and the call still has to end somewhere.
                     self.record_progress(run_id, call, step, reports);
-                    return stopping.map_or_else(
-                        || CallOutcome::Failed {
-                            failure: ToolError::Interrupted.as_failure(),
-                        },
-                        |(verdict, _)| verdict,
-                    );
+                    return stopping.map_or(CallOutcome::Interrupted, |(verdict, _)| verdict);
                 }
                 Err(RecvTimeoutError::Timeout) => {}
             }
@@ -718,7 +747,11 @@ impl ToolExecutor {
     ///
     /// The commit happens here and nowhere else, so "persisted before delivered"
     /// is a property of one function rather than of every path that reaches one.
-    fn finish(
+    /// `pub(super)` only so a test can drive one terminal recording directly.
+    /// [`CallOutcome::Interrupted`] is reached by a worker thread dying, which
+    /// nothing can arrange deterministically, and the recording is the part
+    /// worth asserting on.
+    pub(super) fn finish(
         &self,
         call: ToolCallId,
         step: StepId,
@@ -801,6 +834,12 @@ impl ToolExecutor {
                 ToolCallState::Cancelled,
                 at,
                 event(ToolCallState::Cancelled, Value::Null),
+            )?,
+            CallOutcome::Interrupted => self.store.transition_tool_call_with_event(
+                call,
+                ToolCallState::Interrupted,
+                at,
+                event(ToolCallState::Interrupted, Value::Null),
             )?,
             CallOutcome::TimedOut { limit } => {
                 // A timeout is persisted as a failure carrying the `timed_out`
@@ -906,6 +945,19 @@ mod tests {
                 "{kind} is claimed by two namespaces"
             );
         }
+    }
+
+    #[test]
+    fn the_oversized_result_kind_is_one_a_consumer_can_look_up() {
+        // The executor records this against a tool call, so it has to be a kind
+        // some published namespace actually defines. It is not the tool's — the
+        // tool did nothing wrong — so it is the store's, and this is what stops
+        // it drifting into a spelling nothing publishes and no caller matches.
+        assert!(
+            crate::store::StoreError::KINDS.contains(&super::OVERSIZED_RESULT_KIND),
+            "{} is recorded but published by no namespace",
+            super::OVERSIZED_RESULT_KIND
+        );
     }
 
     #[test]

@@ -501,6 +501,43 @@ fn tool_output_that_violates_its_schema_is_stored_as_evidence_and_never_as_a_res
 }
 
 #[test]
+fn a_worker_that_dies_without_reporting_is_recorded_interrupted() {
+    // `ToolCallState::Interrupted` exists for "the owning process stopped before
+    // the invocation completed", and this is the only path that reaches it —
+    // a panicking *tool* is contained by the pipeline and reports a failure like
+    // any other. Recording it as a failure with an `interrupted` kind would mean
+    // a consumer filtering on the state never saw one.
+    let fixture = Fixture::new();
+    let executor = fixture.executor(registry_of(vec![erase(Echo("1.0.0"))]));
+    let call = fixture.pending("fixture.echo", json!({"message": "orphaned"}));
+
+    let running = fixture
+        .store
+        .dispatch_tool_call_with_event(
+            call,
+            "1.0.0",
+            at(4),
+            crate::store::RunEvent::new(EventKind::ToolCallStateChanged, at(4)).for_tool_call(call),
+        )
+        .unwrap()
+        .0;
+    assert_eq!(running.state(), ToolCallState::Running);
+
+    // Driven through the executor's own recording path rather than by
+    // arranging a dead worker thread, which nothing can do deterministically.
+    let completed = executor
+        .finish(call, fixture.step.id(), None, CallOutcome::Interrupted)
+        .unwrap();
+
+    assert_eq!(completed.state(), ToolCallState::Interrupted);
+    assert_eq!(completed.outcome(), &CallOutcome::Interrupted);
+    assert_eq!(
+        fixture.store.load_tool_call(call).unwrap().state(),
+        ToolCallState::Interrupted
+    );
+}
+
+#[test]
 fn a_result_too_large_to_store_fails_the_call_rather_than_stranding_it() {
     // The failure mode the store's inline bound creates and this executor has to
     // absorb: refusing the write and returning an error would leave the call in
@@ -1114,6 +1151,50 @@ mod processes {
     }
 
     #[test]
+    fn a_stopped_child_keeps_the_output_it_had_already_produced() {
+        // A build log is at its most useful exactly when the build was killed.
+        // An artifact stream that is dropped rather than finished deletes the
+        // bytes it staged, so a timed-out capture would destroy the one thing a
+        // user needs to find out why it was slow.
+        let fixture = Fixture::new();
+        let shims = ShimFixture::new();
+        let talkative = shim(
+            &shims,
+            "talks-then-hangs",
+            "#!/bin/sh\n\
+             echo 'compiling everything'\n\
+             echo 'still going'\n\
+             sleep 30\n",
+        );
+
+        let executor = fixture.executor(registry_of(vec![erase(RunsAShim(
+            Duration::from_millis(300),
+        ))]));
+        let call = fixture.pending(
+            "fixture.runs",
+            json!({"program": talkative, "capture_stdout": true}),
+        );
+
+        let completed = executor
+            .execute(call, fixture.workspace.path(), &Cancellation::default())
+            .unwrap();
+
+        assert!(matches!(completed.outcome(), CallOutcome::TimedOut { .. }));
+
+        let log = fixture
+            .store
+            .run_artifacts(fixture.run_id())
+            .unwrap()
+            .into_iter()
+            .find(|artifact| artifact.name() == "stdout.log")
+            .expect("the partial capture should survive the kill");
+        assert_eq!(
+            fixture.store.read_artifact(log.id()).unwrap(),
+            b"compiling everything\nstill going\n"
+        );
+    }
+
+    #[test]
     fn a_hanging_child_is_killed_at_its_timeout_with_its_whole_process_group() {
         let fixture = Fixture::new();
         let shims = ShimFixture::new();
@@ -1341,6 +1422,56 @@ mod processes {
         assert_eq!(
             fixture.events_of(&EventKind::ToolProgress).len(),
             whole_lines + 1
+        );
+    }
+
+    #[test]
+    fn a_helper_holding_the_pipes_open_does_not_outlive_the_child_that_started_it() {
+        // A pipe reaches end of file only when *every* write end is closed, and
+        // a child that starts a background helper leaves one open behind it. The
+        // direct child exits immediately, so waiting for the readers to reach
+        // EOF means waiting for the helper — which is the whole length of
+        // whatever it is doing, long past the call it belongs to.
+        //
+        // The group is the unit of execution here, so it is the unit that ends:
+        // the helper is killed with it, and the call returns at once.
+        let fixture = Fixture::new();
+        let shims = ShimFixture::new();
+        let activity = shims.root.path().join("orphan-activity");
+        let orphaning = shim(
+            &shims,
+            "orphaning",
+            &format!(
+                "#!/bin/sh\n\
+                 (while true; do printf x >> '{}'; sleep 0.01; done) &\n\
+                 echo started >&2\n\
+                 exit 0\n",
+                activity.display()
+            ),
+        );
+
+        let executor =
+            fixture.executor(registry_of(vec![erase(RunsAShim(Duration::from_secs(5)))]));
+        let call = fixture.pending("fixture.runs", json!({"program": orphaning}));
+
+        let began = Instant::now();
+        let completed = executor
+            .execute(call, fixture.workspace.path(), &Cancellation::default())
+            .unwrap();
+        let elapsed = began.elapsed();
+
+        assert!(completed.outcome().succeeded(), "{completed:?}");
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "the call waited on a helper it did not own: {elapsed:?}"
+        );
+
+        let at_return = std::fs::read(&activity).unwrap_or_default();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            std::fs::read(&activity).unwrap_or_default(),
+            at_return,
+            "a helper outlived the call that started it"
         );
     }
 
