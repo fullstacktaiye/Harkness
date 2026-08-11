@@ -354,6 +354,79 @@ to resolve twice to learn what ran — and two lookups can disagree where one
 cannot. `InvocationError` therefore has no `From<ToolError>` conversion: building
 a tool failure requires naming the tool, so a `?` cannot produce one that forgot.
 
+## Tool Execution Invariants
+
+A recorded tool call always reaches a terminal state. That is the executor's one
+promise and everything else here serves it: a tool that panics, hangs, ignores its
+token, floods a stream, or contradicts its own output schema becomes one recorded
+failure of one call, never a crashed run or a row stuck in `running` with nothing
+written about why.
+
+The body runs on its own thread and the executor waits on a channel, because a
+synchronous Rust function cannot be interrupted from outside — a timeout enforced
+on the calling thread is not a timeout. When the grace period expires the worker is
+*abandoned*, not killed, since Rust cannot kill a thread; it owns its whole
+`ExecutionContext`, so nothing dangles. A tool that never polls its token therefore
+leaks a thread per call, which is why cancellation is a contract rather than a
+courtesy. A child *process* has no such caveat and is killed by process group.
+
+Stopping means cancelling the token, so a body stopped by its deadline reports
+`cancelled` — that is the echo of the executor's own decision, not evidence. A
+`cancelled` or `timed_out` arriving after the executor decided to stop yields to
+the executor's verdict; every other outcome, including a success completed as the
+stop arrived, is the tool's to report and is recorded as it stands. Do not
+"simplify" this into always taking one side: recording `cancelled` over a completed
+side effect makes the history lie about what is on disk, and recording `cancelled`
+for a timeout tells a user they stopped work they did not.
+
+A timeout is persisted as `failed` with the `timed_out` kind, not as a lifecycle
+state; the domain has none and adding one would be a migration for something the
+kind already says. A result the store refuses for exceeding the inline bound is
+likewise converted into a recorded `payload_too_large` failure rather than returned
+as an error — returning one would strand the call in `running`, the exact outcome
+the bound exists to prevent.
+
+Timeouts are declared per tool and default from `RiskLevel`, following
+`GitAccess::default_timeout`: local work is bounded by wall clock, anything
+reaching a remote by cancellation alone. A caller may *tighten* a declared limit
+and may never remove one — `ToolTimeout::OnlyByCancellation` is the author's claim
+that the body is stoppable, and lifting a limit from a body that never polls
+produces a call with no way to end.
+
+`tool_calls.tool_version` is the one column of a recorded request that is ever
+rewritten, and only by `ToolCall::dispatch`, which pins the resolved version in the
+same transition that starts the call. `update_tool_call` still names none of the
+request columns; the dispatch runs one extra narrowly-scoped statement instead.
+Resolving a second time later can disagree with the first, and an approval bound to
+the recorded version would then no longer describe the work it authorized.
+
+Progress travels over a bounded `sync_channel`, so a tool outrunning its consumer
+blocks rather than queueing: progress describes work in flight, and an unbounded
+queue reports the past while consuming memory in the present. A dropped receiver is
+not an error — a consumer that gave up must not strand a running tool. Bursts are
+appended in one transaction (`Store::append_events`), because a transaction per
+event makes commit latency, not the work, decide whether a call finishes inside its
+timeout; sequence numbers are still allocated one at a time inside that
+transaction, so a batch is indistinguishable from separate appends.
+
+Every buffer a child controls the size of is bounded: the retained stream tail, the
+progress channel, the stderr segment channel, and the accumulating segment itself —
+a program printing a megabyte with no newline must not be able to grow the reader's
+buffer to match. Full streams go to artifacts through `ArtifactStream`, which is
+why `ArtifactWriter::open` is the required method and `write` is provided in terms
+of it: buffered and streamed content must not be able to take different routes to
+redaction, hashing, and naming.
+
+A tool's child inherits *no* environment. `harkness-cli` runs from hooks and from
+inside other processes, so the environment is not a place a decision may come from;
+only what a tool names explicitly is passed.
+
+A result the output schema refuses is never delivered, and the value is not thrown
+away either: it is written as the `rejected-output.json` artifact of that call,
+because only the value says what the tool actually produced. Preserving it is best
+effort — a context with no artifact store must not change the failure the caller is
+told about.
+
 ## Commit & Pull Request Guidelines
 
 Write short, imperative commit subjects, matching history such as `Prevent concurrent imports from orphaning managed checkouts`. Keep each commit focused; append the PR number only when added by the merge workflow. Pull requests should explain the behavior change, testing performed, and relevant issue. Include screenshots for visible QML changes and call out platform or Qt/KDE dependency assumptions.

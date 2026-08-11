@@ -1,4 +1,4 @@
-//! The typed tool contract: descriptors, risk, errors, context, and registry.
+//! The typed tool contract and the layer that executes it.
 //!
 //! # Why a contract layer exists at all
 //!
@@ -133,39 +133,75 @@
 //! unversioned caller onto the candidate. A caller that wants a pre-release names
 //! it.
 //!
+//! # Executing a recorded call
+//!
+//! [`invoke`] runs a tool. [`ToolExecutor`] runs a *recorded call*, which is a
+//! different job: it takes one `pending` [`ToolCall`](crate::domain::ToolCall)
+//! from the run store and guarantees the call reaches a terminal state, however
+//! the tool behaves — panicking, hanging, ignoring its cancellation token,
+//! emitting gigabytes, or returning a shape its own schema refuses. What the
+//! pipeline above guarantees about one invocation, the executor guarantees about
+//! one *record*:
+//!
+//! - The body runs on its own thread, so a hang becomes a
+//!   [`CallOutcome::TimedOut`] rather than a wait with no end. Rust cannot kill
+//!   a thread, so an unstoppable body is abandoned; a child process is not, and
+//!   [`ToolProcess`] kills its whole process group.
+//! - The timeout is [declared by the tool](ToolTimeout) and may be tightened by
+//!   a caller, never removed — a limit the author asked for is the author's
+//!   claim about what the body can do.
+//! - Progress travels over a bounded channel ([`progress_channel`]), so a tool
+//!   reporting faster than the log can record *waits* instead of growing a
+//!   queue, and every event becomes a `tool_progress` entry in the run log.
+//! - The terminal state and its event are committed before the caller is told
+//!   anything, so an outcome in hand always has a record behind it.
+//!
+//! [`ToolProcess`] is the piece a tool that shells out uses: it generalizes
+//! `harkness-git`'s runner — process group, both pipes drained concurrently, a
+//! 20 ms poll honouring the call's deadline and token — and streams each output
+//! stream into an artifact while retaining only a bounded tail in memory.
+//!
 //! # What this module does not do
 //!
-//! It supplies metadata; it does not decide anything with it. There is no policy
-//! evaluation, no approval flow, no timeout enforcement, no progress transport,
-//! and no artifact storage here — [`ProgressSink`] and [`ArtifactWriter`] are
-//! contracts whose implementations live elsewhere, and
-//! [`ToolError::TimedOut`] and [`ToolError::Interrupted`] are kinds this module
-//! defines for the layers that raise them. No concrete production tool is
-//! registered here either; this module only defines the shape they take.
+//! It supplies metadata and execution; it does not decide *whether* to execute.
+//! There is no policy evaluation and no approval flow here — the executor
+//! assumes the call it is handed is already authorized — and no scheduling,
+//! queueing, or concurrency limiting. No concrete production tool is registered
+//! here either; this module only defines the shape they take.
 
 mod context;
 mod descriptor;
 mod erased;
 mod error;
+mod execute;
 mod identifier;
+mod process;
 mod registry;
 mod schema;
 
 #[cfg(test)]
+mod execution_tests;
+#[cfg(test)]
 mod tests;
 
 pub use context::{
-    ArtifactRef, ArtifactWriter, DiscardedProgress, ExecutionContext, ProgressEvent, ProgressSink,
-    ProgressUnit, RecordedProgress, UnsupportedArtifacts,
+    ArtifactRef, ArtifactStream, ArtifactWriter, DEFAULT_PROGRESS_CAPACITY,
+    DEFAULT_STREAM_TAIL_BYTES, Deadline, DiscardedProgress, ExecutionContext, POLL_INTERVAL,
+    ProgressChannel, ProgressEvent, ProgressReceiver, ProgressSink, ProgressUnit, RecordedProgress,
+    UnsupportedArtifacts, progress_channel,
 };
 pub use descriptor::{
-    MAX_DESCRIPTION_LENGTH, MAX_TITLE_LENGTH, RiskLevel, ToolDescriptor, ToolMetadata,
+    MAX_DESCRIPTION_LENGTH, MAX_TITLE_LENGTH, RiskLevel, ToolDescriptor, ToolMetadata, ToolTimeout,
     UnknownRiskLevel,
 };
-pub use erased::{ErasedTool, Tool, erase};
+pub use erased::{ErasedTool, REJECTED_OUTPUT_ARTIFACT, Tool, erase};
 pub use error::{
     InvocationError, MAX_COUNTED_VIOLATIONS, MAX_FAILURE_MESSAGE_BYTES, MAX_REPORTED_VIOLATIONS,
     MAX_VIOLATION_FIELD_BYTES, RegistryError, SchemaDirection, SchemaViolation, ToolError,
 };
+pub use execute::{
+    CallOutcome, CompletedCall, ExecutionError, ExecutionLimits, TERMINATION_GRACE, ToolExecutor,
+};
 pub use identifier::{Capability, MAX_IDENTIFIER_LENGTH, ToolId, ToolIdentity, ToolVersion};
+pub use process::{Capture, CapturedStream, ProcessOutput, ToolProcess};
 pub use registry::{ToolOutcome, ToolRegistry, invoke, invoke_resolved};

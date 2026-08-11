@@ -1064,16 +1064,40 @@ fn a_tool_can_return_an_artifact_reference_in_its_output() {
     struct Storing;
 
     impl super::ArtifactWriter for Storing {
-        fn write(
+        fn open(
             &mut self,
             _name: &str,
             media_type: &str,
-            bytes: &[u8],
-        ) -> Result<super::ArtifactRef, ToolError> {
+        ) -> Result<Box<dyn super::ArtifactStream>, ToolError> {
+            Ok(Box::new(StoringStream {
+                media_type: media_type.to_owned(),
+                byte_len: 0,
+            }))
+        }
+    }
+
+    struct StoringStream {
+        media_type: String,
+        byte_len: u64,
+    }
+
+    impl std::io::Write for StoringStream {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.byte_len += buffer.len() as u64;
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl super::ArtifactStream for StoringStream {
+        fn finish(self: Box<Self>) -> Result<super::ArtifactRef, ToolError> {
             Ok(super::ArtifactRef {
                 id: "artifact-1".to_owned(),
-                media_type: media_type.to_owned(),
-                byte_len: bytes.len() as u64,
+                media_type: self.media_type,
+                byte_len: self.byte_len,
             })
         }
     }

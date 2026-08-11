@@ -1494,6 +1494,171 @@ fn a_tool_call_transition_and_its_event_commit_together() {
 }
 
 #[test]
+fn dispatching_a_tool_call_pins_the_version_that_ran_with_its_event() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = stored_step(&fixture.store, &run);
+    // Recorded without naming a version, which is what a caller that wants
+    // "whichever is latest" leaves behind.
+    let call = ToolCall::new(&step, "fs.read", "", json!({"path": "a.rs"}), at(3));
+    fixture.store.insert_tool_call(&call).unwrap();
+
+    let (running, seq) = fixture
+        .store
+        .dispatch_tool_call_with_event(
+            call.id(),
+            "1.4.0",
+            at(10),
+            RunEvent::new(EventKind::ToolCallStateChanged, at(10)).for_tool_call(call.id()),
+        )
+        .unwrap();
+
+    assert_eq!(running.state(), ToolCallState::Running);
+    assert_eq!(running.tool_version(), "1.4.0");
+
+    // The version has to survive the *next* write, which is where a lifecycle
+    // update that did not name the column would quietly lose it.
+    let succeeded = fixture
+        .store
+        .succeed_tool_call(call.id(), json!({"bytes": 4}), at(11))
+        .unwrap();
+    assert_eq!(succeeded.tool_version(), "1.4.0");
+    assert_eq!(
+        fixture
+            .reopen()
+            .load_tool_call(call.id())
+            .unwrap()
+            .tool_version(),
+        "1.4.0"
+    );
+    assert_eq!(
+        fixture.store.events(run.id(), None, 10).unwrap()[0].seq,
+        seq
+    );
+}
+
+#[test]
+fn dispatching_may_not_replace_a_version_a_caller_already_named() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = stored_step(&fixture.store, &run);
+    // `stored_tool_call` records `fs.read@1.0.0`, so this is a resolution
+    // disagreeing with the request — a caller bug, not a version to overwrite.
+    let call = stored_tool_call(&fixture.store, &step);
+
+    let error = fixture
+        .store
+        .dispatch_tool_call_with_event(
+            call.id(),
+            "2.0.0",
+            at(10),
+            RunEvent::new(EventKind::ToolCallStateChanged, at(10)).for_tool_call(call.id()),
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "invalid_transition");
+    let unchanged = fixture.store.load_tool_call(call.id()).unwrap();
+    assert_eq!(unchanged.state(), ToolCallState::Pending);
+    assert_eq!(unchanged.tool_version(), "1.0.0");
+    assert!(fixture.store.events(run.id(), None, 10).unwrap().is_empty());
+}
+
+#[test]
+fn a_batch_of_events_is_appended_whole_or_not_at_all() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = stored_step(&fixture.store, &run);
+
+    let seqs = fixture
+        .store
+        .append_events(
+            run.id(),
+            (0..5).map(|index| {
+                RunEvent::new(EventKind::ToolProgress, at(10))
+                    .for_step(step.id())
+                    .with_payload(json!({"completed": index}))
+            }),
+        )
+        .unwrap();
+
+    // Numbers are still allocated one at a time inside the transaction, so a
+    // batch is indistinguishable from the same appends made separately.
+    assert_eq!(
+        seqs.iter().map(|seq| seq.get()).collect::<Vec<_>>(),
+        [1, 2, 3, 4, 5]
+    );
+    let stored = fixture.reopen().events(run.id(), None, 10).unwrap();
+    assert_eq!(stored.len(), 5);
+    assert_eq!(stored[4].event.payload()["completed"], json!(4));
+
+    // One refused event refuses the batch: a timeline that stops mid-phase for
+    // no reason a reader can see is worse than one that never claims the phase.
+    let orphan = StepId::new();
+    let error = fixture
+        .store
+        .append_events(
+            run.id(),
+            [
+                RunEvent::new(EventKind::ToolProgress, at(11)),
+                RunEvent::new(EventKind::ToolProgress, at(11)).for_step(orphan),
+            ],
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), "missing_parent");
+    assert_eq!(
+        fixture.store.events(run.id(), None, 10).unwrap().len(),
+        5,
+        "a refused batch must leave the log exactly as it was"
+    );
+
+    assert!(
+        fixture
+            .store
+            .append_events(run.id(), [])
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_refused_batch_leaves_no_spilled_payload_behind() {
+    // The single-event path already cleans up after a rejected write; a batch
+    // has the same duty for every payload it spilled before the refusal, or a
+    // caller retrying accumulates one file per attempt in a store with no
+    // collector.
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let oversized = json!({"stderr": "a".repeat(MAX_INLINE_PAYLOAD_BYTES)});
+
+    let error = fixture
+        .store
+        .append_events(
+            run.id(),
+            [
+                RunEvent::new(EventKind::Diagnostic, at(10)).with_payload(oversized),
+                RunEvent::new(EventKind::Diagnostic, at(10)).for_step(StepId::new()),
+            ],
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "missing_parent");
+    assert!(fixture.store.run_artifacts(run.id()).unwrap().is_empty());
+    let directory = fixture
+        .data_dir
+        .path()
+        .join(ARTIFACTS_DIRECTORY)
+        .join(run.id().to_string());
+    let leftover = std::fs::read_dir(&directory)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(leftover, 0, "a spilled payload outlived its refused batch");
+}
+
+#[test]
 fn oversized_event_payloads_become_artifacts_with_a_reference() {
     let fixture = Fixture::new();
     let task = stored_task(&fixture.store);

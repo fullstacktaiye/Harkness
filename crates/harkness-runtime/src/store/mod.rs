@@ -676,23 +676,188 @@ impl Store {
         at: OffsetDateTime,
         event: RunEvent,
     ) -> Result<(ToolCall, EventSeq), StoreError> {
+        self.change_tool_call_with_event(
+            "transitioning a tool call with its event",
+            id,
+            event,
+            |call| call.transition(to, at),
+        )
+    }
+
+    /// Appends several events to one run's log in a single transaction.
+    ///
+    /// Sequence numbers are still allocated one at a time and inside the
+    /// transaction, so the log is exactly what an equivalent series of
+    /// [`append_event`](Self::append_event) calls would produce — and gaps
+    /// remain permitted while monotonicity remains guaranteed. What changes is
+    /// the cost: a running tool reports progress in bursts, and a transaction
+    /// per event turns a chatty child into a benchmark of commit latency rather
+    /// than of the work it is doing.
+    ///
+    /// Either every event is visible or none is. That is stronger than a series
+    /// of appends would give and is the right way round: a partially recorded
+    /// burst is a timeline that stops mid-phase for no reason a reader can see.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::append_event`]. One refused event refuses the batch, and any
+    /// payload spilled on the way is cleaned up.
+    pub fn append_events(
+        &self,
+        run_id: RunId,
+        events: impl IntoIterator<Item = RunEvent>,
+    ) -> Result<Vec<EventSeq>, StoreError> {
+        // Every payload is redacted, encoded, and — if oversized — spilled to
+        // disk before the transaction opens, exactly as the single-event path
+        // does. What the transaction then holds is inserts.
+        let mut prepared = Vec::new();
+        for event in events {
+            match self.prepare_event(run_id, event) {
+                Ok(event) => prepared.push(event),
+                Err(error) => {
+                    // Whatever earlier events of this batch already spilled is
+                    // removed: none of them will be recorded, and a caller
+                    // retrying must not leave a file per attempt behind.
+                    for spilled in &prepared {
+                        spilled.discard_spill(self);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        if prepared.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let result = self.in_write_transaction("appending run events", |connection| {
+            prepared
+                .iter()
+                .map(|event| event.append(connection, run_id))
+                .collect::<Result<Vec<_>, _>>()
+        });
+        if result.is_err() {
+            for event in &prepared {
+                event.discard_spill(self);
+            }
+        }
+        result
+    }
+
+    /// Begins a tool call, pinning the resolved version, and appends its event.
+    ///
+    /// The one transition that also *writes* a column, because the version that
+    /// ran is only known at the moment execution starts; see
+    /// [`ToolCall::dispatch`](crate::domain::ToolCall::dispatch).
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::transition_tool_call_with_event`], plus
+    /// [`StoreError::InvalidTransition`] when the record already names a
+    /// different version.
+    pub fn dispatch_tool_call_with_event(
+        &self,
+        id: ToolCallId,
+        tool_version: &str,
+        at: OffsetDateTime,
+        event: RunEvent,
+    ) -> Result<(ToolCall, EventSeq), StoreError> {
+        let run_id = self.load_tool_call(id)?.run_id();
+        let prepared = self.prepare_event(run_id, event)?;
+        self.commit_event(
+            "dispatching a tool call with its event",
+            prepared,
+            |connection, prepared| {
+                let mut call = repository::load_tool_call(connection, id)?;
+                call.dispatch(tool_version, at)
+                    .map_err(StoreError::InvalidTransition)?;
+                repository::update_tool_call(connection, &call)?;
+                // The one statement that rewrites part of the recorded request,
+                // and the reason this transition does not go through
+                // `change_tool_call_with_event`: see
+                // [`repository::pin_tool_call_version`].
+                repository::pin_tool_call_version(connection, &call)?;
+                let seq = prepared.append(connection, call.run_id())?;
+                Ok((call, seq))
+            },
+        )
+    }
+
+    /// Succeeds a tool call with its output and appends its event.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::transition_tool_call_with_event`], plus
+    /// [`StoreError::PayloadTooLarge`] when the output exceeds
+    /// [`MAX_INLINE_PAYLOAD_BYTES`].
+    pub fn succeed_tool_call_with_event(
+        &self,
+        id: ToolCallId,
+        output: Value,
+        at: OffsetDateTime,
+        event: RunEvent,
+    ) -> Result<(ToolCall, EventSeq), StoreError> {
+        // Moved into the closure, which runs once; `succeed` takes the value.
+        let mut output = Some(output);
+        self.change_tool_call_with_event(
+            "succeeding a tool call with its event",
+            id,
+            event,
+            |call| call.succeed(output.take().unwrap_or(Value::Null), at),
+        )
+    }
+
+    /// Fails a tool call with structured detail and appends its event.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::transition_tool_call_with_event`].
+    pub fn fail_tool_call_with_event(
+        &self,
+        id: ToolCallId,
+        failure: Failure,
+        at: OffsetDateTime,
+        event: RunEvent,
+    ) -> Result<(ToolCall, EventSeq), StoreError> {
+        let mut failure = Some(failure);
+        self.change_tool_call_with_event("failing a tool call with its event", id, event, |call| {
+            call.fail(
+                failure
+                    .take()
+                    .unwrap_or_else(|| Failure::new("execution_failed", "the tool failed")),
+                at,
+            )
+        })
+    }
+
+    /// Applies one tool-call change and appends its event in a single
+    /// transaction.
+    ///
+    /// The shape every outcome-specific pairing shares. Keeping it in one place
+    /// is what stops a later outcome from being added with the event outside the
+    /// transaction, which would leave a call whose state moved and whose history
+    /// does not say so.
+    fn change_tool_call_with_event<F>(
+        &self,
+        operation: &'static str,
+        id: ToolCallId,
+        event: RunEvent,
+        mut change: F,
+    ) -> Result<(ToolCall, EventSeq), StoreError>
+    where
+        F: FnMut(&mut ToolCall) -> Result<(), RunDomainError>,
+    {
         // The run is read before the transaction so the payload can be spilled
         // and redacted outside it: no transaction is held across work that
         // touches the filesystem.
         let run_id = self.load_tool_call(id)?.run_id();
         let prepared = self.prepare_event(run_id, event)?;
-        self.commit_event(
-            "transitioning a tool call with its event",
-            prepared,
-            |connection, prepared| {
-                let mut call = repository::load_tool_call(connection, id)?;
-                call.transition(to, at)
-                    .map_err(StoreError::InvalidTransition)?;
-                repository::update_tool_call(connection, &call)?;
-                let seq = prepared.append(connection, call.run_id())?;
-                Ok((call, seq))
-            },
-        )
+        self.commit_event(operation, prepared, |connection, prepared| {
+            let mut call = repository::load_tool_call(connection, id)?;
+            change(&mut call).map_err(StoreError::InvalidTransition)?;
+            repository::update_tool_call(connection, &call)?;
+            let seq = prepared.append(connection, call.run_id())?;
+            Ok((call, seq))
+        })
     }
 
     /// Returns one page of a run's event log, oldest first.

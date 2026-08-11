@@ -714,7 +714,9 @@ version = "0.1.0"
 dependencies = [
  "harkness-core",
  "harkness-git",
+ "harkness-test-fixtures",
  "jsonschema",
+ "libc",
  "rusqlite",
  "schemars",
  "semver",

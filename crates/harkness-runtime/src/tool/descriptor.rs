@@ -1,7 +1,8 @@
 use std::fmt;
 use std::str::FromStr;
+use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 
 use super::{Capability, RegistryError, SchemaDirection, ToolId, ToolIdentity, ToolVersion};
@@ -147,6 +148,94 @@ pub struct UnknownRiskLevel {
     pub value: String,
 }
 
+/// How long a tool call at [`RiskLevel::Observe`] may run before it is stopped.
+const OBSERVE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a tool call that changes local state may run before it is stopped.
+const LOCAL_WORK_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// What bounds one tool call's running time.
+///
+/// A timeout is a property of the *operation class*, declared once and
+/// overridable, exactly as `GitAccess` fixes one for every Git invocation. It is
+/// stated on the descriptor rather than chosen per call because the tool author
+/// is the only party who knows whether thirty seconds is generous or absurd, and
+/// because a caller that has to supply one will eventually supply nothing.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ToolTimeout {
+    /// The call is killed once this much wall-clock time has passed.
+    After(Duration),
+
+    /// The call runs until it finishes or its token is cancelled.
+    ///
+    /// Reserved for work that is legitimately slow and whose duration nobody can
+    /// predict — a large clone, a long fetch — following the same reasoning that
+    /// leaves `GitAccess::Network` untimed: a limit chosen without knowing the
+    /// size of the work is a limit that fails the honest cases and lets the
+    /// pathological ones run anyway, and cancellation already bounds it on the
+    /// only terms a user cares about.
+    ///
+    /// Declaring this is also a claim by the tool author that the body is
+    /// *stoppable*: that it polls
+    /// [`check_still_permitted`](super::ExecutionContext::check_still_permitted)
+    /// or hands its token to something that does. Nothing can verify that claim,
+    /// which is precisely why it has to be declared rather than assumed — and
+    /// why a caller may not lift a declared limit from outside.
+    OnlyByCancellation,
+}
+
+impl ToolTimeout {
+    /// The limit a tool inherits when it declares none.
+    ///
+    /// Derived from the declared risk, because risk already classifies what the
+    /// work touches and that is what decides how long it can honestly take.
+    /// Anything reaching a remote is bounded by cancellation alone; everything
+    /// else gets a wall-clock limit.
+    #[must_use]
+    pub const fn for_risk(risk: RiskLevel) -> Self {
+        match risk {
+            RiskLevel::Observe => Self::After(OBSERVE_TIMEOUT),
+            RiskLevel::WorkspaceWrite | RiskLevel::Execute | RiskLevel::Destructive => {
+                Self::After(LOCAL_WORK_TIMEOUT)
+            }
+            RiskLevel::Network | RiskLevel::RemoteWrite => Self::OnlyByCancellation,
+        }
+    }
+
+    /// The wall-clock limit, or `None` when only cancellation bounds the call.
+    #[must_use]
+    pub const fn limit(self) -> Option<Duration> {
+        match self {
+            Self::After(limit) => Some(limit),
+            Self::OnlyByCancellation => None,
+        }
+    }
+}
+
+impl fmt::Display for ToolTimeout {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::After(limit) => write!(formatter, "{limit:?}"),
+            Self::OnlyByCancellation => formatter.write_str("only by cancellation"),
+        }
+    }
+}
+
+impl Serialize for ToolTimeout {
+    /// Publishes the limit in whole milliseconds, or `null` for an untimed tool.
+    ///
+    /// A number rather than a `Duration`'s struct form, because this field is
+    /// read by front ends and by `harkness contract` consumers that are not Rust.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::After(limit) => {
+                serializer.serialize_some(&u64::try_from(limit.as_millis()).unwrap_or(u64::MAX))
+            }
+            Self::OnlyByCancellation => serializer.serialize_none(),
+        }
+    }
+}
+
 /// Everything a tool declares about itself except its schemas.
 ///
 /// Schemas are deliberately absent: they are generated from the `Input` and
@@ -162,10 +251,15 @@ pub struct ToolMetadata {
     description: String,
     risk: RiskLevel,
     capabilities: Vec<Capability>,
+    timeout: ToolTimeout,
 }
 
 impl ToolMetadata {
     /// Declares a tool with no required capabilities.
+    ///
+    /// The timeout starts at [`ToolTimeout::for_risk`], so every tool has one
+    /// whether or not its author thought about it — the case a defaulted limit
+    /// exists for.
     #[must_use]
     pub fn new(
         identity: ToolIdentity,
@@ -179,7 +273,25 @@ impl ToolMetadata {
             description: description.into(),
             risk,
             capabilities: Vec::new(),
+            timeout: ToolTimeout::for_risk(risk),
         }
+    }
+
+    /// Bounds calls of this tool to `limit` of wall-clock time.
+    #[must_use]
+    pub const fn within(mut self, limit: Duration) -> Self {
+        self.timeout = ToolTimeout::After(limit);
+        self
+    }
+
+    /// Declares that only cancellation bounds calls of this tool.
+    ///
+    /// See [`ToolTimeout::OnlyByCancellation`] for what the body then owes its
+    /// caller.
+    #[must_use]
+    pub const fn bounded_only_by_cancellation(mut self) -> Self {
+        self.timeout = ToolTimeout::OnlyByCancellation;
+        self
     }
 
     /// Adds the capabilities this tool requires.
@@ -223,6 +335,12 @@ impl ToolMetadata {
     #[must_use]
     pub fn capabilities(&self) -> &[Capability] {
         &self.capabilities
+    }
+
+    /// What bounds a call of this tool, absent a caller override.
+    #[must_use]
+    pub const fn timeout(&self) -> ToolTimeout {
+        self.timeout
     }
 
     /// Checks the fields a front end has to render.
@@ -291,6 +409,8 @@ pub struct ToolDescriptor {
     description: String,
     risk: RiskLevel,
     capabilities: Vec<Capability>,
+    #[serde(rename = "default_timeout_ms")]
+    timeout: ToolTimeout,
     input_schema: Value,
     output_schema: Value,
 }
@@ -304,6 +424,7 @@ impl ToolDescriptor {
             description,
             risk,
             capabilities,
+            timeout,
         } = metadata;
         Self {
             identity,
@@ -311,6 +432,7 @@ impl ToolDescriptor {
             description,
             risk,
             capabilities,
+            timeout,
             input_schema,
             output_schema,
         }
@@ -358,6 +480,12 @@ impl ToolDescriptor {
         &self.capabilities
     }
 
+    /// What bounds a call of this tool, absent a caller override.
+    #[must_use]
+    pub const fn timeout(&self) -> ToolTimeout {
+        self.timeout
+    }
+
     /// JSON Schema generated from the tool's `Input` associated type.
     #[must_use]
     pub const fn input_schema(&self) -> &Value {
@@ -383,11 +511,13 @@ impl ToolDescriptor {
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+    use std::time::Duration;
 
     use serde_json::json;
 
     use super::{
-        MAX_DESCRIPTION_LENGTH, MAX_TITLE_LENGTH, RiskLevel, ToolDescriptor, ToolMetadata,
+        LOCAL_WORK_TIMEOUT, MAX_DESCRIPTION_LENGTH, MAX_TITLE_LENGTH, OBSERVE_TIMEOUT, RiskLevel,
+        ToolDescriptor, ToolMetadata, ToolTimeout,
     };
     use crate::tool::{Capability, SchemaDirection, ToolIdentity};
 
@@ -547,6 +677,83 @@ mod tests {
     }
 
     #[test]
+    fn every_tool_inherits_a_timeout_from_its_risk_and_may_replace_it() {
+        // A tool author who thought about nothing still gets a bound; the
+        // default has to exist for every level or the guarantee is "most tools
+        // are bounded", which is not one.
+        for risk in RiskLevel::ALL.iter().copied() {
+            let inherited = ToolMetadata::new(
+                ToolIdentity::parse("fixture.tool", "1.0.0").unwrap(),
+                "Fixture tool",
+                "Echoes its input back for tests.",
+                risk,
+            )
+            .timeout();
+            assert_eq!(inherited, ToolTimeout::for_risk(risk));
+        }
+
+        assert_eq!(
+            ToolTimeout::for_risk(RiskLevel::Observe),
+            ToolTimeout::After(OBSERVE_TIMEOUT)
+        );
+        assert_eq!(
+            ToolTimeout::for_risk(RiskLevel::Execute),
+            ToolTimeout::After(LOCAL_WORK_TIMEOUT)
+        );
+        // Anything reaching a remote follows `GitAccess::Network`: a limit
+        // chosen without knowing the size of the transfer fails the honest
+        // cases, so cancellation is the bound.
+        for remote in [RiskLevel::Network, RiskLevel::RemoteWrite] {
+            assert_eq!(
+                ToolTimeout::for_risk(remote),
+                ToolTimeout::OnlyByCancellation
+            );
+            assert_eq!(ToolTimeout::for_risk(remote).limit(), None);
+        }
+
+        let declared = metadata().within(Duration::from_millis(250));
+        assert_eq!(
+            declared.timeout(),
+            ToolTimeout::After(Duration::from_millis(250))
+        );
+        assert_eq!(declared.timeout().limit(), Some(Duration::from_millis(250)));
+        assert_eq!(
+            metadata().bounded_only_by_cancellation().timeout(),
+            ToolTimeout::OnlyByCancellation
+        );
+    }
+
+    #[test]
+    fn a_published_timeout_is_milliseconds_or_null_rather_than_a_duration() {
+        // The field is read by front ends and by `harkness contract` consumers
+        // that are not Rust, so it must not publish `Duration`'s struct form.
+        let timed = ToolDescriptor::new(
+            metadata().within(Duration::from_millis(1_500)),
+            json!({}),
+            json!({}),
+        );
+        assert_eq!(
+            serde_json::to_value(&timed).unwrap()["default_timeout_ms"],
+            json!(1_500)
+        );
+
+        let untimed = ToolDescriptor::new(
+            metadata().bounded_only_by_cancellation(),
+            json!({}),
+            json!({}),
+        );
+        assert_eq!(
+            serde_json::to_value(&untimed).unwrap()["default_timeout_ms"],
+            json!(null)
+        );
+        assert_eq!(untimed.timeout(), ToolTimeout::OnlyByCancellation);
+        assert_eq!(
+            ToolTimeout::OnlyByCancellation.to_string(),
+            "only by cancellation"
+        );
+    }
+
+    #[test]
     fn the_serialized_descriptor_publishes_identity_inline_in_a_fixed_order() {
         let descriptor = ToolDescriptor::new(
             metadata().with_capabilities([Capability::new("fs.read").unwrap()]),
@@ -559,8 +766,8 @@ mod tests {
             concat!(
                 r#"{"id":"fixture.tool","version":"1.0.0","title":"Fixture tool","#,
                 r#""description":"Echoes its input back for tests.","risk":"observe","#,
-                r#""capabilities":["fs.read"],"input_schema":{"type":"object"},"#,
-                r#""output_schema":{"type":"string"}}"#,
+                r#""capabilities":["fs.read"],"default_timeout_ms":30000,"#,
+                r#""input_schema":{"type":"object"},"output_schema":{"type":"string"}}"#,
             )
         );
         assert_eq!(descriptor.id().as_str(), "fixture.tool");

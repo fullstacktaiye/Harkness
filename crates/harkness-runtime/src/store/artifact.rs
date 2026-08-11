@@ -83,7 +83,7 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
 use crate::domain::{ArtifactId, RUNTIME_RECORD_SCHEMA_VERSION, RunId, StepId, ToolCallId};
-use crate::tool::{ArtifactRef, ArtifactWriter, ToolError};
+use crate::tool::{ArtifactRef, ArtifactStream, ArtifactWriter, ToolError};
 
 use super::Store;
 use super::column::{decode_id, decode_timestamp, encode_text, encode_timestamp};
@@ -384,13 +384,36 @@ enum Staging {
     Released,
 }
 
+/// How a sink reaches the store it writes into.
+///
+/// A sink is ordinarily a short-lived borrow of the store a caller already
+/// holds. A sink handed to a *tool* is not: it is opened by the execution
+/// context and then moved onto the reader thread that fills it, which outlives
+/// any borrow the caller could lend. Both are the same sink, so the store handle
+/// is what varies rather than the type around it.
+enum StoreHandle<'a> {
+    Borrowed(&'a Store),
+    Owned(Arc<Store>),
+}
+
+impl std::ops::Deref for StoreHandle<'_> {
+    type Target = Store;
+
+    fn deref(&self) -> &Store {
+        match self {
+            Self::Borrowed(store) => store,
+            Self::Owned(store) => store,
+        }
+    }
+}
+
 /// A streaming write into the artifact store.
 ///
 /// Write to it like any other [`io::Write`], then [`finish`](Self::finish) it.
 /// Dropping it without finishing removes whatever it wrote: an abandoned write
 /// leaves neither a row nor bytes anybody could mistake for an artifact.
 pub struct ArtifactSink<'a> {
-    store: &'a Store,
+    store: StoreHandle<'a>,
     id: ArtifactId,
     run_id: RunId,
     step_id: Option<StepId>,
@@ -405,9 +428,52 @@ pub struct ArtifactSink<'a> {
     staging: Staging,
 }
 
+impl ArtifactSink<'static> {
+    /// Opens a sink that keeps the store alive for as long as it exists.
+    ///
+    /// The shape a tool's artifact writer needs: the sink is handed to whichever
+    /// thread produces the content and finished there, long after any borrow the
+    /// opening call could have lent it.
+    pub(super) fn create_owned(
+        store: Arc<Store>,
+        run_id: RunId,
+        name: &str,
+        media_type: &str,
+        created_at: OffsetDateTime,
+        redaction: Redaction,
+    ) -> Result<Self, StoreError> {
+        Self::open(
+            StoreHandle::Owned(store),
+            run_id,
+            name,
+            media_type,
+            created_at,
+            redaction,
+        )
+    }
+}
+
 impl<'a> ArtifactSink<'a> {
     pub(super) fn create(
         store: &'a Store,
+        run_id: RunId,
+        name: &str,
+        media_type: &str,
+        created_at: OffsetDateTime,
+        redaction: Redaction,
+    ) -> Result<Self, StoreError> {
+        Self::open(
+            StoreHandle::Borrowed(store),
+            run_id,
+            name,
+            media_type,
+            created_at,
+            redaction,
+        )
+    }
+
+    fn open(
+        store: StoreHandle<'a>,
         run_id: RunId,
         name: &str,
         media_type: &str,
@@ -435,7 +501,7 @@ impl<'a> ArtifactSink<'a> {
         encode_text(ARTIFACT, "media_type", &media_type)?;
         // A row can only be inserted against a stored run, and finding that out
         // now costs one index seek instead of a whole wasted stream.
-        require_run(store, run_id)?;
+        require_run(&store, run_id)?;
 
         let id = ArtifactId::new();
         let directory = run_directory(store.data_dir(), run_id);
@@ -459,6 +525,7 @@ impl<'a> ArtifactSink<'a> {
             Redaction::Applied => buffered,
         };
 
+        let destination = artifact_path(store.data_dir(), run_id, id);
         Ok(Self {
             store,
             id,
@@ -469,7 +536,7 @@ impl<'a> ArtifactSink<'a> {
             media_type: media_type.into_owned(),
             created_at,
             temporary,
-            destination: artifact_path(store.data_dir(), run_id, id),
+            destination,
             stream: Some(stream),
             recorded,
             staging: Staging::Temporary,
@@ -648,10 +715,10 @@ impl fmt::Debug for ArtifactSink<'_> {
 
 /// An [`ArtifactWriter`] backed by a store, for a tool's execution context.
 ///
-/// This is the bridge between the tool contract's buffer-shaped `write` and the
-/// streaming store beneath it. A tool that has its content in memory already —
-/// which is what that signature says — pays one copy into the stream and no
-/// accumulation anywhere else.
+/// The bridge between the tool contract and the streaming store beneath it.
+/// Both shapes a tool can produce — a value it already holds and a stream it is
+/// still generating — go through one sink, so a build log stored a chunk at a
+/// time is redacted, hashed and named exactly as a diff stored whole.
 #[derive(Clone, Debug)]
 pub struct StoreArtifacts {
     store: Arc<Store>,
@@ -677,47 +744,66 @@ impl StoreArtifacts {
         }
     }
 
-    fn store_bytes(
-        &self,
-        name: &str,
-        media_type: &str,
-        bytes: &[u8],
-    ) -> Result<Artifact, StoreError> {
-        let mut sink =
-            self.store
-                .create_artifact(self.run_id, name, media_type, OffsetDateTime::now_utc())?;
+    fn open_sink(&self, name: &str, media_type: &str) -> Result<ArtifactSink<'static>, StoreError> {
+        let mut sink = ArtifactSink::create_owned(
+            Arc::clone(&self.store),
+            self.run_id,
+            name,
+            media_type,
+            OffsetDateTime::now_utc(),
+            Redaction::Pending,
+        )?;
         if let Some(step_id) = self.step_id {
             sink = sink.for_step(step_id);
         }
         if let Some(tool_call_id) = self.tool_call_id {
             sink = sink.for_tool_call(tool_call_id);
         }
-        // The staging path, not the caller's label: an error naming "build.log"
-        // points at a location that does not exist.
-        let staged = sink.temporary().to_path_buf();
-        sink.write_all(bytes)
-            .map_err(|error| StoreError::ArtifactIo {
-                operation: "streaming a tool artifact",
-                path: staged,
-                source: error,
-            })?;
-        sink.finish()
+        Ok(sink)
     }
 }
 
 impl ArtifactWriter for StoreArtifacts {
-    /// Stores the content and returns the reference the tool puts in its output.
+    /// Opens a store-backed stream for the tool to fill.
     ///
     /// A storage failure is `execution_failed` rather than a partial success: a
     /// tool that believes it stored a log and returns a reference to nothing is
     /// worse than one that reports it could not.
-    fn write(
-        &mut self,
-        name: &str,
-        media_type: &str,
-        bytes: &[u8],
-    ) -> Result<ArtifactRef, ToolError> {
-        self.store_bytes(name, media_type, bytes)
+    fn open(&mut self, name: &str, media_type: &str) -> Result<Box<dyn ArtifactStream>, ToolError> {
+        let sink =
+            self.open_sink(name, media_type)
+                .map_err(|error| ToolError::ExecutionFailed {
+                    message: format!("{name:?} could not be stored as an artifact: {error}"),
+                })?;
+        Ok(Box::new(StoreArtifactStream {
+            name: name.to_owned(),
+            sink,
+        }))
+    }
+}
+
+/// One tool artifact being streamed into the store.
+struct StoreArtifactStream {
+    /// The caller's label, kept only so a failure names what it was storing.
+    name: String,
+    sink: ArtifactSink<'static>,
+}
+
+impl Write for StoreArtifactStream {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.sink.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.sink.flush()
+    }
+}
+
+impl ArtifactStream for StoreArtifactStream {
+    fn finish(self: Box<Self>) -> Result<ArtifactRef, ToolError> {
+        let name = self.name;
+        self.sink
+            .finish()
             .map(|artifact| artifact.reference())
             .map_err(|error| ToolError::ExecutionFailed {
                 message: format!("{name:?} could not be stored as an artifact: {error}"),

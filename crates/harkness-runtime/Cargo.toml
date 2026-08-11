@@ -24,5 +24,9 @@ thiserror.workspace = true
 time.workspace = true
 uuid.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
+harkness-test-fixtures.workspace = true
 tempfile.workspace = true

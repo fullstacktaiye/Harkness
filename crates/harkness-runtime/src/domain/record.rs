@@ -851,6 +851,44 @@ impl ToolCall {
         self.lifecycle.transition("tool_call", to, at)
     }
 
+    /// Enters `running`, pinning the tool version that was actually resolved.
+    ///
+    /// A call may be recorded without naming a version — "the latest `fs.read`"
+    /// — and which version that turned out to be has to be written down at the
+    /// moment it is chosen. Resolving again later is a second lookup, and a
+    /// second lookup can disagree with the first: a version registered in
+    /// between would make the record name something other than what ran, while
+    /// an approval bound to the recorded version would no longer describe the
+    /// work it authorized. Pinning is therefore part of this transition rather
+    /// than a separate write that could be skipped, reordered, or lost.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunDomainError`] when the call is not `pending`, and when the
+    /// record already names a *different* version — a resolution disagreeing
+    /// with a recorded request is a caller bug, not a version to overwrite.
+    pub fn dispatch(
+        &mut self,
+        tool_version: impl Into<String>,
+        at: OffsetDateTime,
+    ) -> Result<(), RunDomainError> {
+        let resolved = tool_version.into();
+        require_state(
+            "tool_call",
+            self.state() == ToolCallState::Pending,
+            "ToolCall::dispatch begins execution and requires pending",
+        )?;
+        require_state(
+            "tool_call",
+            self.tool_version.is_empty() || self.tool_version == resolved,
+            "a recorded tool version may not be replaced by a different one",
+        )?;
+        self.lifecycle
+            .transition("tool_call", ToolCallState::Running, at)?;
+        self.tool_version = resolved;
+        Ok(())
+    }
+
     /// Enters `succeeded` atomically with the tool output.
     pub fn succeed(&mut self, output: Value, at: OffsetDateTime) -> Result<(), RunDomainError> {
         self.lifecycle
@@ -1214,6 +1252,54 @@ mod tests {
         assert_eq!(call.state(), ToolCallState::Failed);
         assert_eq!(call.started_at(), None);
         assert_eq!(call.failure().unwrap().kind(), "invalid_input");
+    }
+
+    #[test]
+    fn dispatch_pins_the_resolved_version_as_part_of_starting() {
+        // A call may be recorded without naming a version, and which one won has
+        // to be written at the moment execution starts: resolving again later is
+        // a second lookup that can disagree with the first.
+        let step = fresh_step();
+        let mut unpinned = ToolCall::new(&step, "fixture.tool", "", json!({}), at(0));
+        assert_eq!(unpinned.tool_version(), "");
+
+        unpinned.dispatch("1.10.0", at(1)).unwrap();
+
+        assert_eq!(unpinned.state(), ToolCallState::Running);
+        assert_eq!(unpinned.tool_version(), "1.10.0");
+        assert_eq!(unpinned.started_at(), Some(at(1)));
+
+        // Restating what a caller already asked for is fine; contradicting it is
+        // a caller bug, and the record is left exactly as it was.
+        let mut pinned = fresh_call();
+        pinned.dispatch("1.0.0", at(1)).unwrap();
+        assert_eq!(pinned.state(), ToolCallState::Running);
+
+        let mut conflicting = fresh_call();
+        let error = conflicting.dispatch("2.0.0", at(1)).unwrap_err();
+        assert!(error.to_string().contains("may not be replaced"), "{error}");
+        assert_eq!(conflicting.state(), ToolCallState::Pending);
+        assert_eq!(conflicting.tool_version(), "1.0.0");
+    }
+
+    #[test]
+    fn only_a_pending_call_can_be_dispatched() {
+        for state in [
+            ToolCallState::AwaitingApproval,
+            ToolCallState::Running,
+            ToolCallState::Succeeded,
+            ToolCallState::Failed,
+            ToolCallState::Denied,
+            ToolCallState::Cancelled,
+            ToolCallState::Interrupted,
+        ] {
+            let mut call = call_in(state);
+            assert!(
+                call.dispatch("1.0.0", at(9)).is_err(),
+                "a {state} call was dispatched"
+            );
+            assert_eq!(call.state(), state);
+        }
     }
 
     #[test]
