@@ -4,7 +4,7 @@
 //! here can read or write the real Harkness data directory.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -258,6 +258,79 @@ fn a_later_untrusted_decision_replaces_the_earlier_trusted_one() {
             .store
             .resolve_workspace_trust(project_id, workspace.path())
             .unwrap(),
+        TrustState::Untrusted
+    );
+}
+
+#[test]
+fn an_older_writer_cannot_overwrite_a_newer_revocation() {
+    let fixture = Fixture::new();
+    let workspace = TempDir::new().unwrap();
+    let project_id = harkness_core::ProjectId::new();
+    let trusted =
+        WorkspaceTrust::decide(project_id, workspace.path(), TrustState::Trusted, at(8)).unwrap();
+    let stale = trusted.clone();
+    fixture.store.put_workspace_trust(&trusted).unwrap();
+    fixture
+        .store
+        .revoke_workspace_trust(project_id, at(10))
+        .unwrap();
+    fixture.store.put_workspace_trust(&stale).unwrap();
+
+    let stored = fixture.store.workspace_trust(project_id).unwrap().unwrap();
+    assert_eq!(stored.state(), TrustState::Untrusted);
+    assert_eq!(stored.decided_at(), at(10));
+}
+
+#[test]
+fn an_untrusted_decision_wins_a_timestamp_tie() {
+    let fixture = Fixture::new();
+    let workspace = TempDir::new().unwrap();
+    let project_id = harkness_core::ProjectId::new();
+    let trusted =
+        WorkspaceTrust::decide(project_id, workspace.path(), TrustState::Trusted, at(8)).unwrap();
+    let untrusted =
+        WorkspaceTrust::decide(project_id, workspace.path(), TrustState::Untrusted, at(8)).unwrap();
+
+    fixture.store.put_workspace_trust(&untrusted).unwrap();
+    fixture.store.put_workspace_trust(&trusted).unwrap();
+
+    assert_eq!(
+        fixture
+            .store
+            .workspace_trust(project_id)
+            .unwrap()
+            .unwrap()
+            .state(),
+        TrustState::Untrusted
+    );
+}
+
+#[test]
+fn trust_can_be_revoked_after_the_workspace_disappears() {
+    let fixture = Fixture::new();
+    let workspace = TempDir::new().unwrap();
+    let project_id = harkness_core::ProjectId::new();
+    fixture
+        .store
+        .put_workspace_trust(
+            &WorkspaceTrust::decide(project_id, workspace.path(), TrustState::Trusted, at(8))
+                .unwrap(),
+        )
+        .unwrap();
+    drop(workspace);
+
+    fixture
+        .store
+        .revoke_workspace_trust(project_id, at(9))
+        .unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .workspace_trust(project_id)
+            .unwrap()
+            .unwrap()
+            .state(),
         TrustState::Untrusted
     );
 }
@@ -2885,7 +2958,7 @@ fn a_frozen_v3_database_opens_and_reads_its_workspace_trust() {
     let trust = store.workspace_trust(project_id).unwrap().unwrap();
     assert_eq!(trust.project_id(), project_id);
     assert_eq!(trust.state(), TrustState::Trusted);
-    assert!(trust.canonical_root().is_absolute());
+    assert_eq!(trust.canonical_root(), Path::new("/workspace/harkness"));
     assert_eq!(
         trust.resolve(project_id, trust.canonical_root()),
         TrustState::Untrusted,
@@ -3038,7 +3111,7 @@ fn regenerate_the_frozen_v2_fixture() {
 #[ignore = "rewrites a committed fixture; run only when migration 3 changes"]
 fn regenerate_the_frozen_v3_fixture() {
     let data_dir = TempDir::new().unwrap();
-    let store = Store::open(data_dir.path()).unwrap();
+    let store = store_with_migrations(data_dir.path(), &MIGRATIONS[..3]);
     let project_id =
         harkness_core::ProjectId::from_str("55555555-5555-4555-8555-555555555555").unwrap();
     store

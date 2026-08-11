@@ -509,13 +509,7 @@ impl ExecutionContext {
                 reason: "the workspace root must not contain a .. component".to_owned(),
             });
         }
-        let boundary =
-            PathBoundary::new(&supplied, std::iter::empty::<&Path>()).map_err(|error| {
-                ToolError::ForbiddenPath {
-                    path: supplied,
-                    reason: error.to_string(),
-                }
-            })?;
+        let boundary = PathBoundary::new(&supplied, std::iter::empty::<&Path>())?;
         Ok(Self::for_boundary(
             run,
             step,
@@ -751,12 +745,7 @@ impl ExecutionContext {
                 reason: "a workspace path must not be empty".to_owned(),
             });
         }
-        self.boundary
-            .contain(candidate)
-            .map_err(|error| ToolError::ForbiddenPath {
-                path: candidate.to_path_buf(),
-                reason: error.to_string(),
-            })
+        self.boundary.contain(candidate).map_err(ToolError::from)
     }
 }
 
@@ -830,7 +819,13 @@ mod tests {
         let rejected = ["", "..", "../secrets", "src/../../secrets", "./.."];
         for path in rejected {
             let error = context.resolve(path).unwrap_err();
-            assert_eq!(error.kind(), "forbidden_path", "accepted {path:?}");
+            assert!(
+                matches!(
+                    error.kind(),
+                    "forbidden_path" | "outside_allowed_roots" | "candidate_unavailable"
+                ),
+                "accepted {path:?}: {error}"
+            );
             // Deliberately *not* `happened_before_execution`: tools call this
             // mid-body, so a refused second path says nothing about whether an
             // earlier one was already written.

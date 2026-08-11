@@ -196,8 +196,8 @@ pub use context::{
     UnsupportedArtifacts, progress_channel,
 };
 pub use descriptor::{
-    MAX_DESCRIPTION_LENGTH, MAX_TITLE_LENGTH, RiskLevel, ToolDescriptor, ToolMetadata, ToolTimeout,
-    UnknownRiskLevel,
+    EnvironmentError, EnvironmentName, MAX_DESCRIPTION_LENGTH, MAX_ENVIRONMENT_NAME_LENGTH,
+    MAX_TITLE_LENGTH, RiskLevel, ToolDescriptor, ToolMetadata, ToolTimeout, UnknownRiskLevel,
 };
 pub use erased::{ErasedTool, REJECTED_OUTPUT_ARTIFACT, Tool, erase};
 pub use error::{

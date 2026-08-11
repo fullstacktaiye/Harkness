@@ -594,11 +594,10 @@ impl ToolExecutor {
             .limits
             .timeout_for(&identity, tool.descriptor().timeout())?;
 
-        // The context is built before the record moves, because building it can
-        // still refuse the call — an unusable workspace root — and a refusal
-        // after the dispatch would leave a `running` row for work that never
-        // began. Its deadline is attached afterwards, so a tool is given the
-        // limit it declared rather than that limit minus a database write.
+        // Build the context before dispatch, but defer handling a refusal until
+        // after dispatch. Every recorded call must reach a terminal state; an
+        // approved call must also persist the approval and pinned version even
+        // when an unusable workspace means its body cannot start.
         //
         // The token the tool receives is this call's own, not the caller's.
         // `Cancellation` latches and has no reset, so cancelling the caller's to
@@ -613,7 +612,7 @@ impl ToolExecutor {
             // does its work in one non-polling call must not start at all.
             call_token.cancel();
         }
-        let mut context = ExecutionContext::new(
+        let context = ExecutionContext::new(
             record.run_id(),
             record.step_id(),
             call,
@@ -627,8 +626,7 @@ impl ToolExecutor {
                 call,
             )),
         )
-        .map_err(|source| ExecutionError::Context { call, source })?
-        .with_stream_tail_bytes(self.limits.stream_tail_bytes);
+        .map(|context| context.with_stream_tail_bytes(self.limits.stream_tail_bytes));
 
         // Everything that could refuse this call has now refused it, so the
         // record moves to `running` — pinning the version that was resolved —
@@ -659,6 +657,20 @@ impl ToolExecutor {
                 .dispatch_approved_tool_call_with_event(call, decided_by, &version, at, event)?,
         };
         let run_id = dispatched.run_id();
+
+        let mut context = match context {
+            Ok(context) => context,
+            Err(source) => {
+                return self.finish(
+                    call,
+                    step,
+                    Some(identity),
+                    CallOutcome::Failed {
+                        failure: source.as_failure(),
+                    },
+                );
+            }
+        };
 
         let deadline = timeout.limit().and_then(Deadline::starting_now);
         if let Some(deadline) = deadline {

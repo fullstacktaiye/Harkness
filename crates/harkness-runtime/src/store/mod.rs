@@ -283,6 +283,19 @@ impl Store {
         workspace_trust::put(&guard(&self.writer), trust)
     }
 
+    /// Revokes a project's positive trust without consulting its workspace.
+    ///
+    /// This remains available after the checkout is moved, deleted, or made
+    /// unreadable. A decision older than the stored row is ignored, and an
+    /// absent row is already untrusted.
+    pub fn revoke_workspace_trust(
+        &self,
+        project_id: harkness_core::ProjectId,
+        decided_at: OffsetDateTime,
+    ) -> Result<(), StoreError> {
+        workspace_trust::revoke(&guard(&self.writer), project_id, decided_at)
+    }
+
     /// Loads the explicit trust record for `project_id`, if one exists.
     pub fn workspace_trust(
         &self,

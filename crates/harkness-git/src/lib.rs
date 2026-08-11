@@ -15,6 +15,7 @@ mod history;
 mod hunk;
 mod intra_line;
 mod lock;
+mod path;
 mod runner;
 mod status;
 mod sync;
@@ -53,6 +54,8 @@ pub use diff::{
 pub use history::{CommitInfo, CommitSignature, LogCursor, LogOptions, LogPage, LogRange};
 pub use hunk::{HunkSelection, HunkStageOutcome, LineSelection, LineStageOutcome};
 use lock::RepositoryLock;
+#[doc(hidden)]
+pub use path::canonicalize_with_missing_tail;
 pub use runner::{Cancellation, CloneCancellation};
 pub use status::{
     DetailedStatus, FileChange, GitStatus, HeadState, PendingOperation, StatusEntry, UpstreamStatus,

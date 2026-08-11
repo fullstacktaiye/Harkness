@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::domain::Failure;
+use crate::trust::BoundaryError;
 
 use super::ToolIdentity;
 
@@ -304,6 +305,10 @@ pub enum ToolError {
         reason: String,
     },
 
+    /// A canonical filesystem boundary refused a path or root.
+    #[error(transparent)]
+    Boundary(#[from] BoundaryError),
+
     /// The owning process stopped before the invocation completed.
     #[error("the tool invocation was interrupted before it completed")]
     Interrupted,
@@ -329,6 +334,10 @@ impl ToolError {
         "cancelled",
         "denied",
         "forbidden_path",
+        "outside_allowed_roots",
+        "symlink_escapes",
+        "root_unavailable",
+        "candidate_unavailable",
         "interrupted",
         "tool_panicked",
     ];
@@ -345,6 +354,7 @@ impl ToolError {
             Self::Cancelled => "cancelled",
             Self::Denied { .. } => "denied",
             Self::ForbiddenPath { .. } => "forbidden_path",
+            Self::Boundary(error) => error.kind(),
             Self::Interrupted => "interrupted",
             Self::ToolPanicked { .. } => "tool_panicked",
         }
@@ -718,6 +728,7 @@ mod tests {
         TRUNCATION_MARKER, ToolError,
     };
     use crate::tool::ToolIdentity;
+    use crate::trust::BoundaryError;
 
     fn identity() -> ToolIdentity {
         ToolIdentity::parse("fixture.tool", "1.0.0").unwrap()
@@ -782,6 +793,34 @@ mod tests {
                     reason: "fixture".to_owned(),
                 },
                 "forbidden_path",
+            ),
+            (
+                ToolError::Boundary(BoundaryError::OutsideAllowedRoots {
+                    candidate: PathBuf::from("outside"),
+                    roots: vec![PathBuf::from("/workspace")],
+                }),
+                "outside_allowed_roots",
+            ),
+            (
+                ToolError::Boundary(BoundaryError::SymlinkEscapes {
+                    link: PathBuf::from("link"),
+                    target: PathBuf::from("target"),
+                }),
+                "symlink_escapes",
+            ),
+            (
+                ToolError::Boundary(BoundaryError::RootUnavailable {
+                    root: PathBuf::from("root"),
+                    reason: "fixture".to_owned(),
+                }),
+                "root_unavailable",
+            ),
+            (
+                ToolError::Boundary(BoundaryError::CandidateUnavailable {
+                    candidate: PathBuf::from("candidate"),
+                    reason: "fixture".to_owned(),
+                }),
+                "candidate_unavailable",
             ),
             (ToolError::Interrupted, "interrupted"),
             (
@@ -1198,6 +1237,10 @@ mod tests {
                 path: PathBuf::from(".."),
                 reason: "fixture".to_owned(),
             },
+            ToolError::Boundary(BoundaryError::CandidateUnavailable {
+                candidate: PathBuf::from("loop"),
+                reason: "fixture".to_owned(),
+            }),
             ToolError::Cancelled,
             ToolError::Interrupted,
             ToolError::execution_failed("boom"),

@@ -24,7 +24,11 @@ pub(super) fn put(connection: &Connection, trust: &WorkspaceTrust) -> Result<(),
              schema_version = excluded.schema_version, \
              canonical_root = excluded.canonical_root, \
              state = excluded.state, \
-             decided_at = excluded.decided_at",
+             decided_at = excluded.decided_at \
+             WHERE excluded.decided_at > workspace_trust.decided_at \
+                OR (excluded.decided_at = workspace_trust.decided_at \
+                    AND excluded.state = 'untrusted' \
+                    AND workspace_trust.state != 'untrusted')",
             named_params! {
                 ":schema_version": RUNTIME_RECORD_SCHEMA_VERSION,
                 ":project_id": trust.project_id().to_string(),
@@ -35,6 +39,24 @@ pub(super) fn put(connection: &Connection, trust: &WorkspaceTrust) -> Result<(),
         )
         .map(|_| ())
         .map_err(|error| query_failed("recording workspace trust", error))
+}
+
+pub(super) fn revoke(
+    connection: &Connection,
+    project_id: ProjectId,
+    decided_at: time::OffsetDateTime,
+) -> Result<(), StoreError> {
+    connection
+        .execute(
+            "UPDATE workspace_trust SET state = 'untrusted', decided_at = :decided_at \
+             WHERE project_id = :project_id AND decided_at <= :decided_at",
+            named_params! {
+                ":project_id": project_id.to_string(),
+                ":decided_at": encode_timestamp(TRUST, "decided_at", decided_at)?,
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| query_failed("revoking workspace trust", error))
 }
 
 pub(super) fn load(
@@ -63,13 +85,11 @@ fn decode(row: &rusqlite::Row<'_>) -> Result<WorkspaceTrust, StoreError> {
     schema_version(row, TRUST)?;
     let project_id = decode_id(TRUST, "project_id", &text(row, TRUST, "project_id")?)?;
     let canonical_root = PathBuf::from(text(row, TRUST, "canonical_root")?);
-    if !canonical_root.is_absolute() {
-        return Err(StoreError::ColumnEncoding {
-            record: TRUST,
-            field: "canonical_root",
-            reason: "a stored canonical root must be absolute".to_owned(),
-        });
-    }
+    // A path persisted by another supported OS may not be absolute according
+    // to this host's path grammar. It is still safe to load: `resolve` compares
+    // it to a freshly canonicalized native path and therefore returns
+    // `Untrusted`; rejecting the whole portable database would be a denial of
+    // service rather than a trust boundary.
     let stored_state = text(row, TRUST, "state")?;
     let state =
         TrustState::from_stored(&stored_state).ok_or_else(|| StoreError::ColumnEncoding {

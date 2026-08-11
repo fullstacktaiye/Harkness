@@ -16,19 +16,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use harkness_core::ProjectId;
 use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, UtcOffset};
 
+pub use crate::tool::{EnvironmentError, EnvironmentName, MAX_ENVIRONMENT_NAME_LENGTH};
 use crate::tool::{RiskLevel, ToolDescriptor};
 
 /// Variables an arbitrary tool child may inherit without an extra declaration.
 pub const BASELINE_ENVIRONMENT: [&str; 5] = ["PATH", "HOME", "LANG", "LC_ALL", "TERM"];
-
-/// Longest accepted environment-variable declaration.
-pub const MAX_ENVIRONMENT_NAME_LENGTH: usize = 128;
 
 /// Whether the user has decided to trust executable content in one workspace.
 ///
@@ -154,26 +152,39 @@ impl WorkspaceTrust {
 ///
 /// The inner path is private so tools cannot manufacture this capability from
 /// unchecked input. Obtain one only through [`PathBoundary::contain`].
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ContainedPath(PathBuf);
+#[derive(Clone, Debug)]
+pub struct ContainedPath {
+    boundary: PathBoundary,
+    supplied: PathBuf,
+    resolved: PathBuf,
+}
 
-impl ContainedPath {
-    /// Canonical path, including a lexically restored not-yet-existing tail.
-    #[must_use]
-    pub fn as_path(&self) -> &Path {
-        &self.0
-    }
-
-    /// Consumes the capability and returns its canonical path.
-    #[must_use]
-    pub fn into_path_buf(self) -> PathBuf {
-        self.0
+impl PartialEq for ContainedPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.boundary == other.boundary && self.resolved == other.resolved
     }
 }
 
-impl AsRef<Path> for ContainedPath {
-    fn as_ref(&self) -> &Path {
-        self.as_path()
+impl Eq for ContainedPath {}
+
+impl ContainedPath {
+    /// Canonical path at the instant this capability was checked.
+    ///
+    /// Filesystem names can be replaced after any check. Code immediately
+    /// before a filesystem operation must call [`Self::revalidate`] and use
+    /// the fresh capability; process launch does this automatically.
+    #[must_use]
+    pub fn as_path(&self) -> &Path {
+        &self.resolved
+    }
+
+    /// Resolves the caller's original spelling against the current filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed boundary errors as [`PathBoundary::contain`].
+    pub fn revalidate(&self) -> Result<Self, BoundaryError> {
+        self.boundary.contain(&self.supplied)
     }
 }
 
@@ -228,10 +239,9 @@ impl PathBoundary {
     /// Resolves `candidate` and proves it lies inside one allowed root.
     ///
     /// The nearest existing ancestor is canonicalized and any missing tail is
-    /// restored lexically, so a destination that will be created or a file that
-    /// was just deleted remains addressable. `..` is refused before resolution:
-    /// lexically folding it would disagree with filesystem traversal when the
-    /// preceding component is a symlink.
+    /// restored and normalized, so a destination that will be created or a file
+    /// that was just deleted remains addressable. Safe `..` traversal is
+    /// accepted only when the resolved result remains in a granted root.
     ///
     /// # Errors
     ///
@@ -241,25 +251,27 @@ impl PathBoundary {
     /// its resolved target for the audit trail.
     pub fn contain(&self, candidate: impl AsRef<Path>) -> Result<ContainedPath, BoundaryError> {
         let supplied = candidate.as_ref();
-        if supplied
-            .components()
-            .any(|component| component == Component::ParentDir)
-        {
-            return Err(self.outside(supplied));
-        }
-
         let absolute = if supplied.is_absolute() {
             supplied.to_path_buf()
         } else {
             self.workspace_root.join(supplied)
         };
         let resolved =
-            canonicalize_with_missing_tail(&absolute).ok_or_else(|| self.outside(supplied))?;
-        if let Some((link, target)) = self.escaping_symlink(&absolute) {
+            harkness_git::canonicalize_with_missing_tail(&absolute).map_err(|source| {
+                BoundaryError::CandidateUnavailable {
+                    candidate: supplied.to_path_buf(),
+                    reason: source.to_string(),
+                }
+            })?;
+        if let Some((link, target)) = self.escaping_symlink(&absolute)? {
             return Err(BoundaryError::SymlinkEscapes { link, target });
         }
         if self.contains_resolved(&resolved) {
-            return Ok(ContainedPath(resolved));
+            return Ok(ContainedPath {
+                boundary: self.clone(),
+                supplied: supplied.to_path_buf(),
+                resolved,
+            });
         }
         Err(self.outside(supplied))
     }
@@ -277,31 +289,55 @@ impl PathBoundary {
 
     /// Finds the first symlink reached *from inside* an allowed root whose
     /// resolved target leaves every root.
-    fn escaping_symlink(&self, candidate: &Path) -> Option<(PathBuf, PathBuf)> {
+    fn escaping_symlink(
+        &self,
+        candidate: &Path,
+    ) -> Result<Option<(PathBuf, PathBuf)>, BoundaryError> {
         let mut reached = PathBuf::new();
         for component in candidate.components() {
             reached.push(component.as_os_str());
-            let metadata = fs::symlink_metadata(&reached).ok()?;
+            let metadata = match fs::symlink_metadata(&reached) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(BoundaryError::CandidateUnavailable {
+                        candidate: candidate.to_path_buf(),
+                        reason: error.to_string(),
+                    });
+                }
+            };
             if !metadata.file_type().is_symlink() {
                 continue;
             }
-            let parent = reached.parent()?;
+            let Some(parent) = reached.parent() else {
+                return Ok(None);
+            };
             if !self.contains_resolved(parent) {
-                return None;
+                return Ok(None);
             }
-            let target = fs::read_link(&reached).ok()?;
+            let target =
+                fs::read_link(&reached).map_err(|error| BoundaryError::CandidateUnavailable {
+                    candidate: candidate.to_path_buf(),
+                    reason: error.to_string(),
+                })?;
             let target = if target.is_absolute() {
                 target
             } else {
                 parent.join(target)
             };
-            let target = canonicalize_with_missing_tail(&target)?;
+            let target =
+                harkness_git::canonicalize_with_missing_tail(&target).map_err(|error| {
+                    BoundaryError::CandidateUnavailable {
+                        candidate: candidate.to_path_buf(),
+                        reason: error.to_string(),
+                    }
+                })?;
             if !self.contains_resolved(&target) {
-                return Some((reached, target));
+                return Ok(Some((reached, target)));
             }
             reached = target;
         }
-        None
+        Ok(None)
     }
 }
 
@@ -319,24 +355,8 @@ fn canonical_root(root: &Path) -> Result<PathBuf, BoundaryError> {
     Ok(canonical)
 }
 
-/// Canonicalizes the nearest existing ancestor and restores the missing tail.
-fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
-    let mut existing = path;
-    let mut missing = Vec::new();
-    loop {
-        if let Ok(mut canonical) = fs::canonicalize(existing) {
-            for component in missing.iter().rev() {
-                canonical.push(component);
-            }
-            return Some(canonical);
-        }
-        missing.push(existing.file_name()?.to_os_string());
-        existing = existing.parent()?;
-    }
-}
-
 /// A filesystem-boundary refusal.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum BoundaryError {
     /// A resolved path lies outside every allowed root.
@@ -363,6 +383,14 @@ pub enum BoundaryError {
         /// Filesystem explanation.
         reason: String,
     },
+    /// A candidate failed to resolve for a reason other than absence.
+    #[error("candidate {} is unavailable: {reason}", .candidate.display())]
+    CandidateUnavailable {
+        /// Path as the caller supplied it.
+        candidate: PathBuf,
+        /// Filesystem explanation.
+        reason: String,
+    },
 }
 
 impl BoundaryError {
@@ -371,6 +399,7 @@ impl BoundaryError {
         "outside_allowed_roots",
         "symlink_escapes",
         "root_unavailable",
+        "candidate_unavailable",
     ];
 
     /// Stable machine-readable discriminant.
@@ -380,79 +409,13 @@ impl BoundaryError {
             Self::OutsideAllowedRoots { .. } => "outside_allowed_roots",
             Self::SymlinkEscapes { .. } => "symlink_escapes",
             Self::RootUnavailable { .. } => "root_unavailable",
-        }
-    }
-}
-
-/// A validated environment-variable name a tool descriptor may request.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
-pub struct EnvironmentName(String);
-
-impl EnvironmentName {
-    /// Validates an ASCII process-environment name with no wildcard syntax.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EnvironmentError::InvalidName`] for an empty, overlong, or
-    /// non-identifier spelling.
-    pub fn new(name: impl Into<String>) -> Result<Self, EnvironmentError> {
-        let name = name.into();
-        let mut bytes = name.bytes();
-        let first = bytes.next();
-        let valid = first.is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
-            && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric());
-        let reason = if name.is_empty() {
-            Some("it must not be empty")
-        } else if name.len() > MAX_ENVIRONMENT_NAME_LENGTH {
-            Some("it is longer than 128 bytes")
-        } else if !valid {
-            Some("it must match [A-Za-z_][A-Za-z0-9_]*")
-        } else {
-            None
-        };
-        if let Some(reason) = reason {
-            return Err(EnvironmentError::InvalidName { name, reason });
-        }
-        Ok(Self(name))
-    }
-
-    /// Validated name.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// A declaration that cannot become a process-environment name.
-#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-#[non_exhaustive]
-pub enum EnvironmentError {
-    /// The spelling is not one exact environment identifier.
-    #[error("{name:?} is not a valid environment variable name: {reason}")]
-    InvalidName {
-        /// Refused spelling.
-        name: String,
-        /// Stable validation explanation.
-        reason: &'static str,
-    },
-}
-
-impl EnvironmentError {
-    /// Every stable discriminant this error namespace can emit.
-    pub const KINDS: &'static [&'static str] = &["invalid_environment_name"];
-
-    /// Stable machine-readable discriminant.
-    #[must_use]
-    pub const fn kind(&self) -> &'static str {
-        match self {
-            Self::InvalidName { .. } => "invalid_environment_name",
+            Self::CandidateUnavailable { .. } => "candidate_unavailable",
         }
     }
 }
 
 /// Exact environment inherited by one non-Git child process.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AllowlistedEnv(BTreeMap<OsString, OsString>);
 
 impl AllowlistedEnv {
@@ -514,19 +477,40 @@ pub struct CommandSpec {
 
 impl CommandSpec {
     /// Builds a command from one executable and an explicit argv vector.
-    #[must_use]
+    ///
+    /// A relative executable must be one bare name resolved by the allowlisted
+    /// `PATH`. Relative paths containing separators are ambiguous once `cwd`
+    /// is applied and are refused; callers can resolve one through a boundary
+    /// and pass its resulting absolute path instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandSpecError::AmbiguousProgram`] for an empty or
+    /// multi-component relative executable.
     pub fn new(
         program: impl AsRef<OsStr>,
         args: Vec<OsString>,
         cwd: ContainedPath,
         env: AllowlistedEnv,
-    ) -> Self {
-        Self {
-            program: program.as_ref().to_os_string(),
+    ) -> Result<Self, CommandSpecError> {
+        let program = program.as_ref();
+        let path = Path::new(program);
+        let bare = !program.is_empty()
+            && path
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+            && path.components().count() == 1;
+        if !path.is_absolute() && !bare {
+            return Err(CommandSpecError::AmbiguousProgram {
+                program: path.to_path_buf(),
+            });
+        }
+        Ok(Self {
+            program: program.to_os_string(),
             args,
             cwd,
             env,
-        }
+        })
     }
 
     /// Executable passed directly to [`std::process::Command::new`].
@@ -555,6 +539,31 @@ impl CommandSpec {
 
     pub(crate) fn into_parts(self) -> (OsString, Vec<OsString>, ContainedPath, AllowlistedEnv) {
         (self.program, self.args, self.cwd, self.env)
+    }
+}
+
+/// A process description that cannot be interpreted unambiguously.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum CommandSpecError {
+    /// A relative program was empty or contained a path separator.
+    #[error("relative executable {} must be one bare program name", .program.display())]
+    AmbiguousProgram {
+        /// Refused executable spelling.
+        program: PathBuf,
+    },
+}
+
+impl CommandSpecError {
+    /// Every stable discriminant this error namespace can emit.
+    pub const KINDS: &'static [&'static str] = &["ambiguous_program"];
+
+    /// Stable machine-readable discriminant.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::AmbiguousProgram { .. } => "ambiguous_program",
+        }
     }
 }
 
@@ -695,7 +704,6 @@ pub fn classify_request(
 mod tests {
     use std::ffi::OsString;
     use std::fs;
-    use std::process::Command;
 
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
@@ -703,7 +711,10 @@ mod tests {
     use time::macros::datetime;
 
     use super::*;
-    use crate::tool::{ExecutionContext, Tool, ToolError, ToolIdentity, ToolMetadata, erase};
+    use crate::domain::{RunId, StepId, ToolCallId};
+    use crate::tool::{
+        Capture, ExecutionContext, Tool, ToolError, ToolIdentity, ToolMetadata, ToolProcess, erase,
+    };
 
     fn boundary() -> (TempDir, PathBoundary) {
         let directory = TempDir::new().unwrap();
@@ -732,6 +743,21 @@ mod tests {
             assert_eq!(error.kind(), "outside_allowed_roots");
             assert!(matches!(error, BoundaryError::OutsideAllowedRoots { .. }));
         }
+    }
+
+    #[test]
+    fn dot_dot_that_resolves_inside_the_workspace_is_accepted() {
+        let (directory, boundary) = boundary();
+        fs::create_dir(directory.path().join("subdirectory")).unwrap();
+        assert_eq!(
+            boundary
+                .contain("subdirectory/../inside.txt")
+                .unwrap()
+                .as_path(),
+            fs::canonicalize(directory.path())
+                .unwrap()
+                .join("inside.txt")
+        );
     }
 
     #[cfg(unix)]
@@ -774,7 +800,44 @@ mod tests {
         assert!(matches!(
             error,
             BoundaryError::SymlinkEscapes { link: named, target }
-                if named == link && target == absent_target
+                if named == link
+                    && target
+                        == fs::canonicalize(outside.path()).unwrap().join("not-created")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_capability_is_refused_after_its_symlink_is_retargeted_outside() {
+        use std::os::unix::fs::symlink;
+
+        let outside = TempDir::new().unwrap();
+        let (directory, boundary) = boundary();
+        let inside = directory.path().join("inside");
+        fs::create_dir(&inside).unwrap();
+        let link = directory.path().join("current");
+        symlink(&inside, &link).unwrap();
+        let capability = boundary.contain("current").unwrap();
+
+        fs::remove_file(&link).unwrap();
+        symlink(outside.path(), &link).unwrap();
+
+        assert!(matches!(
+            capability.revalidate(),
+            Err(BoundaryError::SymlinkEscapes { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_loop_fails_closed_instead_of_becoming_a_missing_tail() {
+        use std::os::unix::fs::symlink;
+
+        let (directory, boundary) = boundary();
+        symlink("loop", directory.path().join("loop")).unwrap();
+        assert!(matches!(
+            boundary.contain("loop/file"),
+            Err(BoundaryError::CandidateUnavailable { .. })
         ));
     }
 
@@ -825,6 +888,10 @@ mod tests {
                 root: "root".into(),
                 reason: "gone".to_owned(),
             },
+            BoundaryError::CandidateUnavailable {
+                candidate: "candidate".into(),
+                reason: "unreadable".to_owned(),
+            },
         ];
         assert_eq!(
             errors.iter().map(BoundaryError::kind).collect::<Vec<_>>(),
@@ -869,40 +936,54 @@ mod tests {
             EnvironmentName::new("HARKNESS_TOKEN_2").unwrap().as_str(),
             "HARKNESS_TOKEN_2"
         );
+        assert_eq!(EnvironmentName::new("path").unwrap().as_str(), "PATH");
+    }
+
+    #[test]
+    fn relative_program_paths_with_separators_are_refused() {
+        let (_directory, boundary) = boundary();
+        let cwd = boundary.contain(".").unwrap();
+        let env = AllowlistedEnv::build(std::iter::empty::<&EnvironmentName>());
+        let error = CommandSpec::new("bin/tool", Vec::new(), cwd, env).unwrap_err();
+        assert_eq!(error.kind(), "ambiguous_program");
     }
 
     #[cfg(unix)]
     #[test]
     fn an_allowlisted_child_sees_exactly_the_permitted_environment() {
-        let extra = std::env::vars_os().find_map(|(name, _)| {
-            let name = name.into_string().ok()?;
-            (!BASELINE_ENVIRONMENT.contains(&name.as_str()))
-                .then(|| EnvironmentName::new(name).ok())
-                .flatten()
-        });
-        let env = AllowlistedEnv::build(extra.iter());
+        let extra = EnvironmentName::new("CARGO_MANIFEST_DIR").unwrap();
+        assert!(std::env::var_os(extra.as_str()).is_some());
+        let tool = erase(FixtureEnvTool(extra.clone())).unwrap();
+        let env = AllowlistedEnv::for_descriptor(tool.descriptor());
         let expected = env
             .names()
             .map(OsStr::to_os_string)
             .collect::<BTreeSet<_>>();
 
-        let output = Command::new("/usr/bin/env")
-            .arg("-0")
-            .env_clear()
-            .envs(env.iter())
-            .output()
+        let (workspace, boundary) = boundary();
+        let cwd = boundary.contain(".").unwrap();
+        let spec = CommandSpec::new("/usr/bin/env", Vec::new(), cwd, env).unwrap();
+        let mut context = ExecutionContext::detached(
+            RunId::new(),
+            StepId::new(),
+            ToolCallId::new(),
+            workspace.path().to_path_buf(),
+        )
+        .unwrap();
+        let output = ToolProcess::new(spec)
+            .capture_stdout(Capture::Tail)
+            .run(&mut context)
+            .unwrap()
+            .require_success()
             .unwrap();
-        assert!(output.status.success());
         let actual = output
-            .stdout
-            .split(|byte| *byte == 0)
-            .filter(|entry| !entry.is_empty())
-            .map(|entry| {
-                let equals = entry.iter().position(|byte| *byte == b'=').unwrap();
-                OsString::from(String::from_utf8(entry[..equals].to_vec()).unwrap())
-            })
+            .stdout()
+            .tail()
+            .lines()
+            .filter_map(|entry| entry.split_once('=').map(|(name, _)| OsString::from(name)))
             .collect::<BTreeSet<_>>();
         assert_eq!(actual, expected);
+        assert!(actual.contains(OsStr::new(extra.as_str())));
     }
 
     #[derive(Deserialize, JsonSchema)]
@@ -913,6 +994,31 @@ mod tests {
     struct Output {}
 
     struct FixtureTool(RiskLevel);
+
+    struct FixtureEnvTool(EnvironmentName);
+
+    impl Tool for FixtureEnvTool {
+        type Input = Input;
+        type Output = Output;
+
+        fn metadata(&self) -> ToolMetadata {
+            ToolMetadata::new(
+                ToolIdentity::parse("fixture.environment", "1.0.0").unwrap(),
+                "Environment",
+                "Exercises the published environment contract.",
+                RiskLevel::Execute,
+            )
+            .with_environment([self.0.clone()])
+        }
+
+        fn execute(
+            &self,
+            _input: Input,
+            _context: &mut ExecutionContext,
+        ) -> Result<Output, ToolError> {
+            Ok(Output {})
+        }
+    }
 
     impl Tool for FixtureTool {
         type Input = Input;
@@ -1015,13 +1121,5 @@ mod tests {
             ),
             RiskLevel::Destructive
         );
-    }
-
-    #[test]
-    fn runtime_process_construction_contains_no_shell_command_path() {
-        let process = include_str!("tool/process.rs");
-        assert!(!process.contains("Command::new(\"sh\")"));
-        assert!(!process.contains(".arg(\"-c\")"));
-        assert!(!process.contains(".args([\"-c\""));
     }
 }

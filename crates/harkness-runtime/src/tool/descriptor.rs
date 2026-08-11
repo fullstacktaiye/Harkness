@@ -5,8 +5,6 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 
-use crate::trust::EnvironmentName;
-
 use super::{Capability, RegistryError, SchemaDirection, ToolId, ToolIdentity, ToolVersion};
 
 /// Longest accepted descriptor title.
@@ -17,6 +15,82 @@ pub const MAX_TITLE_LENGTH: usize = 120;
 
 /// Longest accepted descriptor description.
 pub const MAX_DESCRIPTION_LENGTH: usize = 2048;
+
+/// Longest accepted environment-variable declaration.
+pub const MAX_ENVIRONMENT_NAME_LENGTH: usize = 128;
+
+/// A validated, cross-platform environment-variable name.
+///
+/// Names are canonicalized to uppercase ASCII. Windows environment lookup is
+/// case-insensitive, so retaining caller casing would let two descriptor names
+/// denote one variable and would let a differently-cased declaration retrieve
+/// a sensitive value. One canonical spelling keeps policy and execution equal
+/// on every supported platform.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct EnvironmentName(String);
+
+impl EnvironmentName {
+    /// Validates an ASCII identifier and returns its canonical spelling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvironmentError::InvalidName`] for an empty, overlong, or
+    /// non-identifier spelling.
+    pub fn new(name: impl Into<String>) -> Result<Self, EnvironmentError> {
+        let name = name.into();
+        let mut bytes = name.bytes();
+        let first = bytes.next();
+        let valid = first.is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
+            && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric());
+        let reason = if name.is_empty() {
+            Some("it must not be empty")
+        } else if name.len() > MAX_ENVIRONMENT_NAME_LENGTH {
+            Some("it is longer than 128 bytes")
+        } else if !valid {
+            Some("it must match [A-Za-z_][A-Za-z0-9_]*")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(EnvironmentError::InvalidName { name, reason });
+        }
+        Ok(Self(name.to_ascii_uppercase()))
+    }
+
+    /// Canonical validated name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A declaration that cannot become a process-environment name.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum EnvironmentError {
+    /// The spelling is not one exact environment identifier.
+    #[error("{name:?} is not a valid environment variable name: {reason}")]
+    InvalidName {
+        /// Refused spelling.
+        name: String,
+        /// Stable validation explanation.
+        reason: &'static str,
+    },
+}
+
+impl EnvironmentError {
+    /// Every stable discriminant this error namespace can emit.
+    pub const KINDS: &'static [&'static str] = &["invalid_environment_name"];
+
+    /// Stable machine-readable discriminant.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::InvalidName { .. } => "invalid_environment_name",
+        }
+    }
+}
 
 /// Reason reported for a blank title or description.
 const BLANK: &str = "it must not be blank; it is what a person reads before approving";
@@ -549,12 +623,12 @@ mod tests {
 
     use serde_json::json;
 
+    use super::EnvironmentName;
     use super::{
         LOCAL_WORK_TIMEOUT, MAX_DESCRIPTION_LENGTH, MAX_TITLE_LENGTH, OBSERVE_TIMEOUT, RiskLevel,
         ToolDescriptor, ToolMetadata, ToolTimeout,
     };
     use crate::tool::{Capability, SchemaDirection, ToolIdentity};
-    use crate::trust::EnvironmentName;
 
     fn metadata() -> ToolMetadata {
         ToolMetadata::new(

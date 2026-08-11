@@ -360,6 +360,13 @@ impl ToolProcess {
 
     /// Starts the child with the invocation policy every tool process carries.
     fn spawn(&self) -> Result<Child, ToolError> {
+        // `ContainedPath` is a point-in-time proof. Re-resolve immediately
+        // before launch so a symlink retargeted while a call awaited approval
+        // cannot redirect the child's working directory outside its grant.
+        let working_directory = self
+            .working_directory
+            .revalidate()
+            .map_err(ToolError::from)?;
         let mut command = Command::new(&self.program);
         command
             .args(&self.arguments)
@@ -371,7 +378,7 @@ impl ToolProcess {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        command.current_dir(self.working_directory.as_path());
+        command.current_dir(working_directory.as_path());
         // The child leads its own group, which is what makes cancellation and
         // the deadline able to stop a whole tree rather than only its root.
         #[cfg(unix)]
