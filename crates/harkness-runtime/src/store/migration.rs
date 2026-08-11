@@ -44,6 +44,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: 3,
         statements: include_str!("migrations/003_workspace_trust.sql"),
     },
+    Migration {
+        version: 4,
+        statements: include_str!("migrations/004_policy_decisions.sql"),
+    },
 ];
 
 /// Newest schema version this build understands.

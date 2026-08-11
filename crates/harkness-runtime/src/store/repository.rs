@@ -17,6 +17,7 @@ use crate::domain::{
     RUNTIME_RECORD_SCHEMA_VERSION, Run, RunId, RunWire, Step, StepId, StepWire, Task, TaskId,
     TaskWire, ToolCall, ToolCallId, ToolCallWire, validate_record_schema_version,
 };
+use crate::policy::PolicyDecision;
 
 use super::column::{
     decode_approvals, decode_execution_state, decode_failure, decode_id, decode_optional_payload,
@@ -41,7 +42,7 @@ const STEP_COLUMNS: &str = "schema_version, id, run_id, ordinal, title, state, r
 
 const TOOL_CALL_COLUMNS: &str = "schema_version, id, run_id, step_id, tool_id, tool_version, \
      input_json, output_json, state, revision, created_at, updated_at, started_at, finished_at, \
-     failure_kind, failure_message, approvals_json";
+     failure_kind, failure_message, approvals_json, policy_decision_json";
 
 // -- tasks ------------------------------------------------------------------
 
@@ -399,13 +400,14 @@ fn step_wire(row: &Row<'_>) -> Result<StepWire, StoreError> {
 
 pub(super) fn insert_tool_call(connection: &Connection, call: &ToolCall) -> Result<(), StoreError> {
     let (failure_kind, failure_message) = encode_failure(TOOL_CALL, call.failure())?;
+    let policy_decision = encode_policy_decision(call.policy_decision())?;
     connection
         .execute(
             &format!(
                 "INSERT INTO tool_calls ({TOOL_CALL_COLUMNS}) VALUES (:schema_version, :id, \
                  :run_id, :step_id, :tool_id, :tool_version, :input_json, :output_json, :state, \
                  :revision, :created_at, :updated_at, :started_at, :finished_at, :failure_kind, \
-                 :failure_message, :approvals_json)"
+                 :failure_message, :approvals_json, :policy_decision_json)"
             ),
             named_params! {
                 ":schema_version": RUNTIME_RECORD_SCHEMA_VERSION,
@@ -425,6 +427,7 @@ pub(super) fn insert_tool_call(connection: &Connection, call: &ToolCall) -> Resu
                 ":failure_kind": failure_kind,
                 ":failure_message": failure_message,
                 ":approvals_json": encode_approvals(TOOL_CALL, call.approvals())?,
+                ":policy_decision_json": policy_decision,
             },
         )
         .map(|_| ())
@@ -443,14 +446,17 @@ pub(super) fn insert_tool_call(connection: &Connection, call: &ToolCall) -> Resu
 
 pub(super) fn update_tool_call(connection: &Connection, call: &ToolCall) -> Result<(), StoreError> {
     let (failure_kind, failure_message) = encode_failure(TOOL_CALL, call.failure())?;
+    let policy_decision = encode_policy_decision(call.policy_decision())?;
     let updated = connection
         .execute(
-            "UPDATE tool_calls SET state = :state, revision = :revision, \
+            "UPDATE tool_calls SET schema_version = :schema_version, state = :state, revision = :revision, \
              updated_at = :updated_at, started_at = :started_at, finished_at = :finished_at, \
              failure_kind = :failure_kind, failure_message = :failure_message, \
-             output_json = :output_json, approvals_json = :approvals_json WHERE id = :id",
+             output_json = :output_json, approvals_json = :approvals_json, \
+             policy_decision_json = :policy_decision_json WHERE id = :id",
             named_params! {
                 ":id": call.id().to_string(),
+                ":schema_version": RUNTIME_RECORD_SCHEMA_VERSION,
                 ":state": call.state().as_str(),
                 ":revision": encode_revision(TOOL_CALL, call.revision())?,
                 ":updated_at": encode_timestamp(TOOL_CALL, "updated_at", call.updated_at())?,
@@ -460,6 +466,7 @@ pub(super) fn update_tool_call(connection: &Connection, call: &ToolCall) -> Resu
                 ":failure_message": failure_message,
                 ":output_json": encode_optional_payload(TOOL_CALL, "output", call.output())?,
                 ":approvals_json": encode_approvals(TOOL_CALL, call.approvals())?,
+                ":policy_decision_json": policy_decision,
             },
         )
         .map_err(|error| query_failed("updating a tool call", error))?;
@@ -582,7 +589,39 @@ fn tool_call_wire(row: &Row<'_>) -> Result<ToolCallWire, StoreError> {
             optional_text(row, TOOL_CALL, "output_json")?,
         )?,
         approvals: decode_approvals(TOOL_CALL, &text(row, TOOL_CALL, "approvals_json")?)?,
+        policy_decision: decode_policy_decision(optional_text(
+            row,
+            TOOL_CALL,
+            "policy_decision_json",
+        )?)?,
     })
+}
+
+fn encode_policy_decision(decision: Option<&PolicyDecision>) -> Result<Option<String>, StoreError> {
+    decision
+        .map(|decision| {
+            let encoded =
+                serde_json::to_string(decision).map_err(|error| StoreError::ColumnEncoding {
+                    record: TOOL_CALL,
+                    field: "policy_decision_json",
+                    reason: error.to_string(),
+                })?;
+            within_inline_limit(TOOL_CALL, "policy_decision_json", encoded.len())?;
+            Ok(encoded)
+        })
+        .transpose()
+}
+
+fn decode_policy_decision(encoded: Option<String>) -> Result<Option<PolicyDecision>, StoreError> {
+    encoded
+        .map(|encoded| {
+            serde_json::from_str(&encoded).map_err(|error| StoreError::ColumnEncoding {
+                record: TOOL_CALL,
+                field: "policy_decision_json",
+                reason: error.to_string(),
+            })
+        })
+        .transpose()
 }
 
 // -- shared column plumbing -------------------------------------------------

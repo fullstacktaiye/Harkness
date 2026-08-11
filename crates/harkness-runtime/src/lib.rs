@@ -14,6 +14,7 @@
 //! with what; [`tool`] is what defines the tool and executes it.
 
 pub mod domain;
+pub mod policy;
 pub mod store;
 pub mod tool;
 pub mod trust;

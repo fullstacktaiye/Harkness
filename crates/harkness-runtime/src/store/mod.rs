@@ -637,6 +637,20 @@ impl Store {
         self.mutate_tool_call(id, |call| call.deny(failure, at))
     }
 
+    /// Persists policy and applies its immediate lifecycle consequence.
+    ///
+    /// The full decision and the `awaiting_approval` or `denied` transition it
+    /// produces share one `BEGIN IMMEDIATE` transaction. `Allow` is persisted
+    /// while the call remains pending, before a later dispatch may start it.
+    pub fn apply_tool_call_policy_decision(
+        &self,
+        id: ToolCallId,
+        decision: crate::policy::PolicyDecision,
+        at: OffsetDateTime,
+    ) -> Result<ToolCall, StoreError> {
+        self.mutate_tool_call(id, |call| call.apply_policy_decision(decision, at))
+    }
+
     /// Records an approval and resumes a tool call awaiting one.
     ///
     /// # Errors

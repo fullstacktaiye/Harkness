@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::{OffsetDateTime, UtcOffset};
 
+use crate::policy::{PolicyDecision, PolicyVerdict};
+
 use super::state::LifecycleState;
 use super::{ExecutionState, RunDomainError, RunId, StepId, TaskId, ToolCallId, ToolCallState};
 
@@ -712,6 +714,7 @@ pub struct ToolCall {
     pub(super) failure: Option<Failure>,
     pub(super) output: Option<Value>,
     pub(super) approvals: Vec<Approval>,
+    pub(super) policy_decision: Option<PolicyDecision>,
 }
 
 impl ToolCall {
@@ -758,6 +761,7 @@ impl ToolCall {
             failure: None,
             output: None,
             approvals: Vec::new(),
+            policy_decision: None,
         }
     }
 
@@ -818,6 +822,54 @@ impl ToolCall {
     #[must_use]
     pub fn approvals(&self) -> &[Approval] {
         &self.approvals
+    }
+
+    /// Policy decision recorded before this call was allowed to proceed.
+    #[must_use]
+    pub const fn policy_decision(&self) -> Option<&PolicyDecision> {
+        self.policy_decision.as_ref()
+    }
+
+    /// Records policy and applies its immediate lifecycle consequence.
+    ///
+    /// `Allow` leaves the call pending for dispatch, `Ask` parks it in
+    /// `awaiting_approval`, and `Deny` terminates it with policy failure detail.
+    /// The store persists this whole mutation in one transaction, so a call can
+    /// never be observed in the governed state without the decision that put it
+    /// there.
+    pub fn apply_policy_decision(
+        &mut self,
+        decision: PolicyDecision,
+        at: OffsetDateTime,
+    ) -> Result<(), RunDomainError> {
+        require_state(
+            "tool_call",
+            self.state() == ToolCallState::Pending,
+            "policy evaluation requires pending",
+        )?;
+        require_state(
+            "tool_call",
+            self.policy_decision.is_none(),
+            "a tool call may carry only one policy decision",
+        )?;
+        if let Err(reason) = decision.validate() {
+            return Err(invalid_lifecycle("tool_call", reason));
+        }
+
+        match decision.verdict() {
+            PolicyVerdict::Allow => {}
+            PolicyVerdict::Ask => {
+                self.lifecycle
+                    .transition("tool_call", ToolCallState::AwaitingApproval, at)?;
+            }
+            PolicyVerdict::Deny => {
+                self.lifecycle
+                    .transition("tool_call", ToolCallState::Denied, at)?;
+                self.failure = Some(Failure::new("policy", decision.reason()));
+            }
+        }
+        self.policy_decision = Some(decision);
+        Ok(())
     }
 
     /// Enters an outcome-free edge in [`super::TOOL_CALL_TRANSITIONS`].
@@ -955,6 +1007,11 @@ impl ToolCall {
             "tool_call",
             self.state() == ToolCallState::Pending,
             "ToolCall::deny is reserved for policy decisions in pending",
+        )?;
+        require_state(
+            "tool_call",
+            self.policy_decision.is_none(),
+            "a governed tool call must use its recorded policy decision",
         )?;
         self.lifecycle
             .transition("tool_call", ToolCallState::Denied, at)?;
