@@ -147,9 +147,9 @@
 //!   [`CallOutcome::TimedOut`] rather than a wait with no end. Rust cannot kill
 //!   a thread, so an unstoppable body is abandoned; a child process is not, and
 //!   [`ToolProcess`] kills its whole process group.
-//! - The timeout is [declared by the tool](ToolTimeout) and may be tightened by
-//!   a caller, never removed — a limit the author asked for is the author's
-//!   claim about what the body can do.
+//! - The timeout is [declared by the tool](ToolTimeout). A caller may replace it
+//!   with any finite limit but may never remove the bound, because what is being
+//!   protected is that the call has a way to end.
 //! - Progress travels over a bounded channel ([`progress_channel`]), so a tool
 //!   reporting faster than the log can record *waits* instead of growing a
 //!   queue, and every event becomes a `tool_progress` entry in the run log.

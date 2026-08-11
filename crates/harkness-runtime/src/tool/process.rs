@@ -62,6 +62,16 @@ const SEGMENT_CHANNEL_CAPACITY: usize = 256;
 /// costs a split message and keeps the promise.
 const MAX_SEGMENT_BYTES: usize = 8 * 1024;
 
+/// Segments the wait loop forwards before returning to its own checks.
+///
+/// A child that talks continuously would otherwise keep the loop inside its
+/// forwarding step indefinitely, and cancellation and the deadline are only
+/// tested between steps. Leaving the rest queued costs nothing — the queue is
+/// bounded and backpressures the child through its own pipe — while a bound here
+/// is what makes the advertised poll cadence true of a chatty child as well as a
+/// quiet one.
+const MAX_SEGMENTS_PER_POLL: usize = 64;
+
 /// Where one of a child's output streams goes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Capture {
@@ -316,7 +326,7 @@ impl ToolProcess {
             thread::spawn(move || drain(stderr, tail_bytes, stderr_artifact, Some(segments)));
 
         loop {
-            forward(context, &incoming);
+            forward(context, &incoming, MAX_SEGMENTS_PER_POLL);
 
             if context.cancellation().is_cancelled() {
                 terminate(&mut child, incoming, stdout_reader, stderr_reader);
@@ -337,12 +347,18 @@ impl ToolProcess {
                 ))
             })?;
             if let Some(status) = waited {
-                // The readers are joined before anything is reported, so the
+                // The readers are drained *while* they are waited on, never
+                // after. A child can exit with its pipe still full, and the
+                // reader turning that residue into segments blocks as soon as
+                // the bounded queue fills — so joining first would wait on a
+                // thread that is waiting on this one. The symptom is not a slow
+                // call but one that never ends.
+                //
+                // They are still finished before anything is reported, so the
                 // byte counts and the artifacts describe the whole stream rather
                 // than however much had arrived when the child exited.
-                let stdout = stdout_reader.join().unwrap_or_default();
-                let stderr = stderr_reader.join().unwrap_or_default();
-                forward(context, &incoming);
+                let (stdout, stderr) =
+                    drain_until_read(context, &incoming, stdout_reader, stderr_reader);
                 return Ok(ProcessOutput {
                     code: status.code(),
                     stdout: stdout.finish()?,
@@ -398,11 +414,61 @@ fn open_capture(
     }
 }
 
-/// Hands the wait loop's queued stderr segments to the call's progress sink.
-fn forward(context: &mut ExecutionContext, incoming: &Receiver<String>) {
-    while let Ok(segment) = incoming.try_recv() {
+/// Hands up to `most` queued stderr segments to the call's progress sink.
+///
+/// Bounded because both halves of this can block: a child flooding standard
+/// error refills the queue as fast as it is read, and each report can wait on
+/// the call's own bounded progress channel. An unbounded drain would therefore
+/// keep the wait loop out of its cancellation and deadline checks for as long as
+/// the child cares to talk, which is precisely when a user is most likely to be
+/// pressing cancel. Returns how many it forwarded, so a caller can tell a
+/// quiet queue from a busy one.
+fn forward(context: &mut ExecutionContext, incoming: &Receiver<String>, most: usize) -> usize {
+    let mut forwarded = 0;
+    while forwarded < most {
+        let Ok(segment) = incoming.try_recv() else {
+            break;
+        };
         context.report(ProgressEvent::message(segment));
+        forwarded += 1;
     }
+    forwarded
+}
+
+/// Drains the segment queue until both readers have finished, then joins them.
+///
+/// The child has already exited by the time this runs, so there is no deadline
+/// left to honour and no reason to stop early: what remains is to move the
+/// residue of both pipes out of the readers, and the only way to do that without
+/// deadlocking against the bounded queue is to keep draining while they work.
+///
+/// Sleeping only when nothing was forwarded keeps a quiet child — the common
+/// case, where both readers are already done — from paying a poll interval for
+/// nothing.
+fn drain_until_read(
+    context: &mut ExecutionContext,
+    incoming: &Receiver<String>,
+    stdout_reader: JoinHandle<Drained>,
+    stderr_reader: JoinHandle<Drained>,
+) -> (Drained, Drained) {
+    loop {
+        let forwarded = forward(context, incoming, usize::MAX);
+        if stdout_reader.is_finished() && stderr_reader.is_finished() {
+            break;
+        }
+        if forwarded == 0 {
+            thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    // Both readers are gone, so whatever they sent last is in the queue and
+    // nothing more can arrive. `is_finished` says a thread has returned, not
+    // that this one has observed everything it sent, which is why this final
+    // drain is after the joins rather than before them.
+    forward(context, incoming, usize::MAX);
+    (stdout, stderr)
 }
 
 /// Kills the child's process group and waits for its readers to drain.
@@ -592,7 +658,12 @@ impl Tail {
         }
 
         if chunk.len() >= self.capacity {
-            self.truncated = true;
+            // Only bytes actually dropped make a stream truncated. A single read
+            // of exactly the capacity, arriving first, loses nothing — and
+            // `is_truncated` is read to decide whether the tail can be shown as
+            // the whole output, so claiming otherwise would send a reader to an
+            // artifact that says the same thing.
+            self.truncated |= chunk.len() > self.capacity || !self.retained.is_empty();
             self.retained.clear();
             self.retained
                 .extend_from_slice(&chunk[chunk.len() - self.capacity..]);
@@ -702,6 +773,22 @@ mod tests {
 
         assert_eq!(tail.retained(), b"xxxx");
         assert_eq!(tail.total, 4096);
+        assert!(tail.truncated);
+    }
+
+    #[test]
+    fn a_stream_of_exactly_the_bound_is_not_reported_as_truncated() {
+        // Nothing was dropped, so the tail *is* the whole stream — and
+        // `is_truncated` is what decides whether it can be shown as such.
+        let mut tail = Tail::new(4);
+        tail.push(b"abcd");
+
+        assert_eq!(tail.retained(), b"abcd");
+        assert_eq!(tail.total, 4);
+        assert!(!tail.truncated);
+
+        // One byte more, and it is.
+        tail.push(b"e");
         assert!(tail.truncated);
     }
 

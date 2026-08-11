@@ -80,8 +80,21 @@ impl Fixture {
         ToolExecutor::new(Arc::clone(&self.store), Arc::new(registry))
     }
 
+    /// The whole log, paged through rather than truncated at one page.
+    ///
+    /// A page limit here would silently cap what a test can assert, which is
+    /// exactly the mistake that hides a dropped progress event behind an
+    /// assertion that counts to the limit and stops.
     fn events(&self) -> Vec<StoredEvent> {
-        self.store.events(self.run.id(), None, 200).unwrap()
+        let mut all: Vec<StoredEvent> = Vec::new();
+        loop {
+            let after = all.last().map(|stored| stored.seq);
+            let page = self.store.events(self.run.id(), after, 500).unwrap();
+            if page.is_empty() {
+                return all;
+            }
+            all.extend(page);
+        }
     }
 
     /// Every event of one kind, in log order.
@@ -331,8 +344,17 @@ fn a_successful_call_is_recorded_with_its_output_and_its_events() {
     assert_eq!(progress.len(), 2);
     assert_eq!(progress[0].event.payload()["event"], json!("stage"));
     assert_eq!(progress[1].event.payload()["completed"], json!(1));
-    for stored in &progress {
+
+    // Every event this call writes names both the call and the step. A consumer
+    // rendering one step's timeline filters by `step_id`, so an event that omits
+    // it would show the call starting and never finishing.
+    for stored in states.iter().chain(&progress) {
         assert_eq!(stored.event.tool_call_id(), Some(call));
+        assert_eq!(
+            stored.event.step_id(),
+            Some(fixture.step.id()),
+            "an event of this call is missing from its step's timeline"
+        );
     }
 }
 
@@ -735,6 +757,43 @@ fn a_caller_may_tighten_a_declared_limit() {
         &CallOutcome::TimedOut {
             limit: Duration::from_millis(60)
         }
+    );
+}
+
+#[test]
+fn a_timeout_does_not_cancel_the_callers_token_for_every_later_call() {
+    // `Cancellation` latches and has no reset, so an executor that enforced its
+    // deadline by cancelling the *caller's* token would leave it cancelled for
+    // good: one slow step would silently cancel the rest of a run that shares
+    // it, and every later call would be recorded `cancelled` with nobody having
+    // cancelled anything. This is the shape #97's coordinator has.
+    let fixture = Fixture::new();
+    let executor = fixture.executor(registry_of(vec![
+        erase(Unstoppable {
+            started: Arc::new(AtomicBool::new(false)),
+        }),
+        erase(Echo("1.0.0")),
+    ]));
+    let run_token = Cancellation::default();
+
+    let slow = fixture.pending("fixture.unstoppable", json!({}));
+    let timed_out = executor
+        .execute(slow, fixture.workspace.path(), &run_token)
+        .unwrap();
+    assert!(matches!(timed_out.outcome(), CallOutcome::TimedOut { .. }));
+
+    assert!(
+        !run_token.is_cancelled(),
+        "the executor cancelled the token its caller owns"
+    );
+
+    let next = fixture.pending("fixture.echo", json!({"message": "still running"}));
+    let after = executor
+        .execute(next, fixture.workspace.path(), &run_token)
+        .unwrap();
+    assert!(
+        after.outcome().succeeded(),
+        "a later call sharing the token was stopped by an earlier timeout: {after:?}"
     );
 }
 
@@ -1230,6 +1289,58 @@ mod processes {
         assert_eq!(
             completed.record().output().unwrap()["stdout_bytes"],
             json!(FLOOD)
+        );
+    }
+
+    #[test]
+    fn a_child_whose_last_output_outruns_the_segment_queue_still_completes() {
+        // The queue between the reader thread and the wait loop is bounded, and
+        // a child can exit with a full pipe still unread. Everything left is
+        // then turned into segments by a thread that blocks once the queue
+        // fills — so a wait loop that stops draining in order to join its
+        // readers waits for a thread that is waiting for it. The symptom is not
+        // a slow call but a call that never ends, and the executor abandoning
+        // it leaks both reader threads, the pipe, and an open artifact sink.
+        //
+        // The burst has to arrive faster than the wait loop drains, which a
+        // shell loop does not: `yes` fills the pipe as fast as the kernel
+        // allows. What has to be true at exit is that more than the queue's 256
+        // slots are still unread, and the pipe holds 64 KiB — so the line length
+        // is what decides it. At 128 bytes a full pipe is ~512 lines, comfortably
+        // past the queue, while the total stays small enough that the test is
+        // not measuring the store's write throughput. A five-second limit turns
+        // a regression into a timed-out call rather than a suite that hangs.
+        const LINE: &str = "a progress line long enough that a full pipe still holds far more of them than the segment queue between the reader and the wait loop can";
+        const EMITTED: usize = 128 * 1024;
+
+        let fixture = Fixture::new();
+        let shims = ShimFixture::new();
+        let chatty = shim(
+            &shims,
+            "chatty-then-exits",
+            &format!("#!/bin/sh\nyes '{LINE}' | head -c {EMITTED} >&2\nexit 0\n"),
+        );
+
+        let executor =
+            fixture.executor(registry_of(vec![erase(RunsAShim(Duration::from_secs(5)))]));
+        let call = fixture.pending("fixture.runs", json!({"program": chatty}));
+
+        let completed = executor
+            .execute(call, fixture.workspace.path(), &Cancellation::default())
+            .unwrap();
+
+        assert!(completed.outcome().succeeded(), "{completed:?}");
+        // Every whole line reaches the log, which is the other half of the
+        // property: draining to avoid the deadlock must not mean discarding.
+        // `head -c` cuts mid-line, so the final partial line is the remainder.
+        let whole_lines = EMITTED / (LINE.len() + 1);
+        assert!(
+            whole_lines > 256,
+            "the burst must outrun the queue to test anything: {whole_lines} lines"
+        );
+        assert_eq!(
+            fixture.events_of(&EventKind::ToolProgress).len(),
+            whole_lines + 1
         );
     }
 

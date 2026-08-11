@@ -35,6 +35,22 @@
 //! deadline and kills its child's whole process group, so the work stops even
 //! though the thread that was waiting on it merely returns.
 //!
+//! # The caller's token is read, never written
+//!
+//! A tool receives a token belonging to *this call*, not the one its caller
+//! holds. [`Cancellation`] latches and has no reset, so enforcing a deadline by
+//! cancelling the caller's token would leave it cancelled for good: one slow
+//! step would silently cancel every later call of the same run, each recorded
+//! `cancelled` with nobody having cancelled anything.
+//!
+//! The executor watches the caller's token and cancels the call's own. That
+//! costs one [`POLL_INTERVAL`] of propagation — a cancel reaches the tool on the
+//! next poll rather than instantly — which is why the measured latency is around
+//! 20 ms rather than around zero, comfortably inside the 250 ms the contract
+//! promises. A cancel that arrives *before* dispatch is seeded onto the call's
+//! token directly, so the pipeline's own gate still refuses to start a body that
+//! was cancelled before it began.
+//!
 //! # Stopping is requested, then waited for
 //!
 //! On cancellation or a passed deadline the executor cancels the token and keeps
@@ -79,7 +95,7 @@ use harkness_git::Cancellation;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 
-use crate::domain::{Failure, RunId, ToolCall, ToolCallId, ToolCallState};
+use crate::domain::{Failure, RunId, StepId, ToolCall, ToolCallId, ToolCallState};
 use crate::store::{EventKind, RunEvent, Store, StoreArtifacts, StoreError};
 
 use super::{
@@ -107,8 +123,15 @@ pub const TERMINATION_GRACE: Duration = Duration::from_millis(500);
 /// Two of the three limits are the executor's own. The third — the timeout — is
 /// declared by the *tool*, because the author is the only party who knows
 /// whether thirty seconds is generous or absurd for the work; see
-/// [`ToolTimeout`]. What a caller may do is tighten it, which is what
-/// [`within`](Self::within) is for.
+/// [`ToolTimeout`].
+///
+/// A caller may replace that limit with any *finite* one, shorter or longer:
+/// only the author knows the usual case, and only the caller knows this one — a
+/// clone of a huge repository legitimately needs longer than the default that
+/// suits every other clone. What a caller may not do is remove the bound
+/// entirely, because the invariant being protected is not "the tool's number
+/// wins" but "the call has a way to end". See
+/// [`bounded_only_by_cancellation`](Self::bounded_only_by_cancellation).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutionLimits {
     timeout: Option<ToolTimeout>,
@@ -128,7 +151,12 @@ impl Default for ExecutionLimits {
 }
 
 impl ExecutionLimits {
-    /// Replaces the tool's declared timeout with `limit`.
+    /// Replaces the tool's declared timeout with `limit`, longer or shorter.
+    ///
+    /// Deliberately not clamped to the declared limit. A caller extending one
+    /// still leaves the call a way to end, which is the property that matters;
+    /// clamping would force anyone with a legitimately slower case to publish a
+    /// second version of the tool to say so.
     #[must_use]
     pub const fn within(mut self, limit: Duration) -> Self {
         self.timeout = Some(ToolTimeout::After(limit));
@@ -138,11 +166,14 @@ impl ExecutionLimits {
     /// Asks that only cancellation bound the call.
     ///
     /// Accepted only for a tool that declared
-    /// [`ToolTimeout::OnlyByCancellation`] itself. A caller cannot lift a limit
-    /// a tool asked for: the declaration is the author's claim that the body is
-    /// stoppable, and lifting a timeout from a body that never polls its token
-    /// produces a call with no way to end at all. Refused with
-    /// [`ExecutionError::UnboundedNotDeclared`].
+    /// [`ToolTimeout::OnlyByCancellation`] itself, and refused with
+    /// [`ExecutionError::UnboundedNotDeclared`] otherwise.
+    ///
+    /// This is the one thing [`within`](Self::within) permits that this does
+    /// not, and the asymmetry is the point. Any finite limit still leaves the
+    /// call a way to end; removing the bound leaves it with none unless the body
+    /// polls its token, and only the tool's author can say whether it does.
+    /// Declaring `OnlyByCancellation` is that claim.
     #[must_use]
     pub const fn bounded_only_by_cancellation(mut self) -> Self {
         self.timeout = Some(ToolTimeout::OnlyByCancellation);
@@ -340,6 +371,24 @@ impl ExecutionError {
     }
 }
 
+/// What one call being waited on consists of.
+///
+/// Grouped rather than passed as eight arguments, and grouped *here* rather than
+/// merged into the executor, because every field belongs to one call while a
+/// [`ToolExecutor`] serves any number of them concurrently.
+struct Supervised<'a> {
+    run_id: RunId,
+    call: ToolCallId,
+    step: StepId,
+    awaiting: &'a Receiver<Result<ToolOutcome, ToolError>>,
+    reports: &'a ProgressReceiver,
+    /// The token a user cancels. Read, never written.
+    caller: &'a Cancellation,
+    /// The token this call's body and children hold, cancelled to stop them.
+    call_token: &'a Cancellation,
+    deadline: Option<Deadline>,
+}
+
 /// Runs recorded tool calls against a registry, writing through a store.
 ///
 /// One executor serves any number of concurrent calls: it holds nothing
@@ -410,11 +459,12 @@ impl ToolExecutor {
 
         // Resolution happens before anything is written, so a call naming a tool
         // that does not exist fails without ever having been `running`.
+        let step = record.step_id();
         let tool = match self.resolve(&record) {
             Ok(tool) => tool,
             Err(error) => {
                 let failure = error.as_failure();
-                return self.finish(call, None, CallOutcome::Failed { failure });
+                return self.finish(call, step, None, CallOutcome::Failed { failure });
             }
         };
         let identity = tool.descriptor().identity().clone();
@@ -427,13 +477,26 @@ impl ToolExecutor {
         // after the dispatch would leave a `running` row for work that never
         // began. Its deadline is attached afterwards, so a tool is given the
         // limit it declared rather than that limit minus a database write.
+        //
+        // The token the tool receives is this call's own, not the caller's.
+        // `Cancellation` latches and has no reset, so cancelling the caller's to
+        // enforce a deadline would leave it cancelled for every later call
+        // sharing it: one slow step would silently cancel the rest of its run.
+        // The executor watches the caller's token and cancels this one.
         let (progress, reports) = progress_channel(self.limits.progress_capacity);
+        let call_token = Cancellation::default();
+        if cancellation.is_cancelled() {
+            // Seeded rather than left for the first poll, so the pipeline's own
+            // gate still refuses a body dispatched after a cancel: a tool that
+            // does its work in one non-polling call must not start at all.
+            call_token.cancel();
+        }
         let mut context = ExecutionContext::new(
             record.run_id(),
             record.step_id(),
             call,
             workspace_root,
-            cancellation.clone(),
+            call_token.clone(),
             Box::new(progress),
             Box::new(StoreArtifacts::new(
                 Arc::clone(&self.store),
@@ -465,7 +528,7 @@ impl ToolExecutor {
         )?;
         let run_id = dispatched.run_id();
 
-        let deadline = timeout.limit().map(Deadline::starting_now);
+        let deadline = timeout.limit().and_then(Deadline::starting_now);
         if let Some(deadline) = deadline {
             context = context.with_deadline(deadline);
         }
@@ -479,8 +542,17 @@ impl ToolExecutor {
             let _ = finished.send(invoke_resolved(&tool, &input, &mut context));
         });
 
-        let outcome = self.supervise(run_id, call, &awaiting, &reports, cancellation, deadline);
-        self.finish(call, Some(identity), outcome)
+        let outcome = self.supervise(Supervised {
+            run_id,
+            call,
+            step,
+            awaiting: &awaiting,
+            reports: &reports,
+            caller: cancellation,
+            call_token: &call_token,
+            deadline,
+        });
+        self.finish(call, step, Some(identity), outcome)
     }
 
     /// Resolves the tool a recorded call names.
@@ -504,22 +576,25 @@ impl ToolExecutor {
     }
 
     /// Waits for the body, forwarding progress and enforcing the two limits.
-    fn supervise(
-        &self,
-        run_id: RunId,
-        call: ToolCallId,
-        awaiting: &Receiver<Result<ToolOutcome, ToolError>>,
-        reports: &ProgressReceiver,
-        cancellation: &Cancellation,
-        deadline: Option<Deadline>,
-    ) -> CallOutcome {
+    fn supervise(&self, watched: Supervised<'_>) -> CallOutcome {
+        let Supervised {
+            run_id,
+            call,
+            step,
+            awaiting,
+            reports,
+            caller,
+            call_token,
+            deadline,
+        } = watched;
+
         // `Some` once the executor has asked the call to stop: it holds the
         // verdict to record if the body does not come back, and the instant the
         // grace period is measured from.
         let mut stopping: Option<(CallOutcome, std::time::Instant)> = None;
 
         loop {
-            self.record_progress(run_id, call, reports);
+            self.record_progress(run_id, call, step, reports);
 
             // Waiting on the channel rather than sleeping beside it: a fast
             // tool is not made to pay a poll interval it had no reason to, and a
@@ -527,7 +602,7 @@ impl ToolExecutor {
             // and the two limits are checked at.
             match awaiting.recv_timeout(POLL_INTERVAL) {
                 Ok(result) => {
-                    self.record_progress(run_id, call, reports);
+                    self.record_progress(run_id, call, step, reports);
                     let reported = outcome_of(result);
                     // A body that finished on its own terms outranks anything
                     // the executor could infer about work it could not see —
@@ -535,11 +610,11 @@ impl ToolExecutor {
                     // whose side effects have happened and must be recorded.
                     //
                     // What it does *not* outrank is the executor's own reason
-                    // for stopping. Stopping means cancelling the token, so a
-                    // tool killed by its deadline reports `cancelled`: that is
-                    // the echo of this decision, not independent evidence, and
-                    // recording it would tell a user their work was cancelled
-                    // when in fact it ran out of time.
+                    // for stopping. Stopping means cancelling the call's own
+                    // token, so a tool killed by its deadline reports
+                    // `cancelled`: that is the echo of this decision, not
+                    // independent evidence, and recording it would tell a user
+                    // their work was cancelled when in fact it ran out of time.
                     return match (&stopping, &reported) {
                         (
                             Some((verdict, _)),
@@ -553,7 +628,7 @@ impl ToolExecutor {
                     // inside the pipeline makes impossible for a panicking tool
                     // — so this is a panic in the pipeline itself or a failed
                     // allocation, and the call still has to end somewhere.
-                    self.record_progress(run_id, call, reports);
+                    self.record_progress(run_id, call, step, reports);
                     return stopping.map_or_else(
                         || CallOutcome::Failed {
                             failure: ToolError::Interrupted.as_failure(),
@@ -568,23 +643,29 @@ impl ToolExecutor {
                 if since.elapsed() >= TERMINATION_GRACE {
                     return verdict.clone();
                 }
-            } else if let Some(verdict) = self.reason_to_stop(cancellation, deadline) {
-                // Cancelling the token is what actually stops the work: a
-                // process-backed tool kills its child's group off the back of
-                // it, and a cooperative body returns at its next check.
-                cancellation.cancel();
+            } else if let Some(verdict) = Self::reason_to_stop(caller, call_token, deadline) {
+                // Cancelling *this call's* token is what actually stops the
+                // work: a process-backed tool kills its child's group off the
+                // back of it, and a cooperative body returns at its next check.
+                // The caller's token is only ever read — it latches, and
+                // cancelling it here would cancel every later call sharing it.
+                call_token.cancel();
                 stopping = Some((verdict, std::time::Instant::now()));
             }
         }
     }
 
     /// The verdict to record, when there is a reason to stop the call.
+    ///
+    /// Either token counts as a cancellation: the caller's is how a user asks,
+    /// and the call's own is how work that already stopped itself reports the
+    /// same thing.
     fn reason_to_stop(
-        &self,
-        cancellation: &Cancellation,
+        caller: &Cancellation,
+        call_token: &Cancellation,
         deadline: Option<Deadline>,
     ) -> Option<CallOutcome> {
-        if cancellation.is_cancelled() {
+        if caller.is_cancelled() || call_token.is_cancelled() {
             return Some(CallOutcome::Cancelled);
         }
         // Cancellation is tested first, so a call that was cancelled and also
@@ -602,7 +683,13 @@ impl ToolExecutor {
     /// itself is unaffected — so a refused append is dropped rather than
     /// propagated. The terminal state is a different matter and is not treated
     /// this way.
-    fn record_progress(&self, run_id: RunId, call: ToolCallId, reports: &ProgressReceiver) {
+    fn record_progress(
+        &self,
+        run_id: RunId,
+        call: ToolCallId,
+        step: StepId,
+        reports: &ProgressReceiver,
+    ) {
         let reported = reports.drain();
         if reported.is_empty() {
             return;
@@ -615,7 +702,12 @@ impl ToolExecutor {
         let _ = self.store.append_events(
             run_id,
             reported.into_iter().map(|event| {
+                // Associated with the step as well as the call, like every other
+                // event this module writes: a consumer rendering one step's
+                // timeline filters by `step_id`, and an event that omits it
+                // simply does not appear there.
                 RunEvent::new(EventKind::ToolProgress, at)
+                    .for_step(step)
                     .for_tool_call(call)
                     .with_payload(serde_json::to_value(&event).unwrap_or(Value::Null))
             }),
@@ -629,11 +721,12 @@ impl ToolExecutor {
     fn finish(
         &self,
         call: ToolCallId,
+        step: StepId,
         tool: Option<ToolIdentity>,
         outcome: CallOutcome,
     ) -> Result<CompletedCall, ExecutionError> {
         let at = OffsetDateTime::now_utc();
-        let record = match self.persist(call, &outcome, at) {
+        let record = match self.persist(call, step, &outcome, at) {
             Ok(record) => record,
             // A result the store cannot hold becomes a *recorded failure* rather
             // than an error handed back. Returning one would leave the call in
@@ -651,7 +744,7 @@ impl ToolExecutor {
                         ),
                     ),
                 };
-                let record = self.persist(call, &outcome, at)?;
+                let record = self.persist(call, step, &outcome, at)?;
                 return Ok(CompletedCall {
                     tool,
                     record,
@@ -673,11 +766,13 @@ impl ToolExecutor {
     fn persist(
         &self,
         call: ToolCallId,
+        step: StepId,
         outcome: &CallOutcome,
         at: OffsetDateTime,
     ) -> Result<ToolCall, StoreError> {
         let event = |state: ToolCallState, detail: Value| {
             RunEvent::new(EventKind::ToolCallStateChanged, at)
+                .for_step(step)
                 .for_tool_call(call)
                 .with_payload(json!({ "state": state.as_str(), "detail": detail }))
         };
@@ -814,7 +909,7 @@ mod tests {
     }
 
     #[test]
-    fn a_caller_may_tighten_a_declared_limit_but_never_remove_one() {
+    fn a_caller_may_replace_a_declared_limit_but_never_remove_the_bound() {
         let declared = ToolTimeout::After(Duration::from_secs(30));
 
         assert_eq!(
@@ -831,9 +926,19 @@ mod tests {
                 .unwrap(),
             ToolTimeout::After(Duration::from_millis(50))
         );
+        // Longer is permitted too, and deliberately not clamped: the call still
+        // has a way to end, and clamping would make anyone with a legitimately
+        // slower case publish a second version of the tool to say so.
+        assert_eq!(
+            ExecutionLimits::default()
+                .within(Duration::from_secs(3_600))
+                .timeout_for(&identity(), declared)
+                .unwrap(),
+            ToolTimeout::After(Duration::from_secs(3_600))
+        );
 
-        // Lifting a limit the tool asked for would produce a call with no way to
-        // end: the declaration is the author's claim that the body is stoppable.
+        // Removing the bound is the one thing refused, because only the author
+        // can claim the body polls its token.
         let error = ExecutionLimits::default()
             .bounded_only_by_cancellation()
             .timeout_for(&identity(), declared)

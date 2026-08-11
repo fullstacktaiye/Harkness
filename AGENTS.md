@@ -370,6 +370,16 @@ on the calling thread is not a timeout. When the grace period expires the worker
 leaks a thread per call, which is why cancellation is a contract rather than a
 courtesy. A child *process* has no such caveat and is killed by process group.
 
+A tool receives a token belonging to its own call, never the caller's.
+`Cancellation` latches and has no reset, so enforcing a deadline by cancelling the
+caller's would leave it cancelled for good — one slow step silently cancelling
+every later call of a run that shares it, each recorded `cancelled` with nobody
+having cancelled anything. The executor reads the caller's token and cancels the
+call's, which costs one poll interval of propagation and is why cancellation
+latency is ~20ms rather than ~0. A cancel that arrives before dispatch is seeded
+onto the call's token directly, so the pipeline's gate still refuses to start a
+body that was cancelled before it began.
+
 Stopping means cancelling the token, so a body stopped by its deadline reports
 `cancelled` — that is the echo of the executor's own decision, not evidence. A
 `cancelled` or `timed_out` arriving after the executor decided to stop yields to
@@ -388,10 +398,13 @@ the bound exists to prevent.
 
 Timeouts are declared per tool and default from `RiskLevel`, following
 `GitAccess::default_timeout`: local work is bounded by wall clock, anything
-reaching a remote by cancellation alone. A caller may *tighten* a declared limit
-and may never remove one — `ToolTimeout::OnlyByCancellation` is the author's claim
-that the body is stoppable, and lifting a limit from a body that never polls
-produces a call with no way to end.
+reaching a remote by cancellation alone. A caller may replace a declared limit
+with any *finite* one, longer or shorter — only the author knows the usual case
+and only the caller knows this one — but may never remove the bound. The
+invariant is not "the tool's number wins" but "the call has a way to end", and
+`ToolTimeout::OnlyByCancellation` is the author's claim that the body polls its
+token, which nothing can verify and a caller therefore cannot assert on the
+author's behalf.
 
 `tool_calls.tool_version` is the one column of a recorded request that is ever
 rewritten, and only by `ToolCall::dispatch`, which pins the resolved version in the

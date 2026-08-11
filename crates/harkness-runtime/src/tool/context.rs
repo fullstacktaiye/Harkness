@@ -409,12 +409,18 @@ pub struct Deadline {
 
 impl Deadline {
     /// Bounds a call that starts now to `limit`.
+    ///
+    /// Returns `None` when the limit lands further into the future than an
+    /// [`Instant`] can represent — a call that would outlive the machine, and so
+    /// one bounded by cancellation alone. An `Option` rather than a panic
+    /// because the caller is an executor that has already moved a record to
+    /// `running`: unwinding there would strand the call in the one state the
+    /// execution layer promises is impossible, over a limit nobody could reach.
     #[must_use]
-    pub fn starting_now(limit: Duration) -> Self {
-        Self {
-            limit,
-            at: Instant::now() + limit,
-        }
+    pub fn starting_now(limit: Duration) -> Option<Self> {
+        Instant::now()
+            .checked_add(limit)
+            .map(|at| Self { limit, at })
     }
 
     /// The limit the call was given.
@@ -1130,9 +1136,15 @@ mod tests {
         assert_eq!(context.stream_tail_bytes(), DEFAULT_STREAM_TAIL_BYTES);
         assert!(context.check_still_permitted().is_ok());
 
-        let deadline = Deadline::starting_now(Duration::from_millis(0));
+        let deadline = Deadline::starting_now(Duration::from_millis(0)).unwrap();
         assert_eq!(deadline.limit(), Duration::from_millis(0));
         assert!(deadline.has_passed());
+
+        // A limit further away than an `Instant` can express is reported rather
+        // than panicked over: the executor asking for one has already moved a
+        // record to `running`, and unwinding there would strand the call in the
+        // one state the execution layer promises is impossible.
+        assert_eq!(Deadline::starting_now(Duration::MAX), None);
 
         let bounded =
             ExecutionContext::detached(RunId::new(), StepId::new(), ToolCallId::new(), ROOT)
@@ -1165,7 +1177,7 @@ mod tests {
             Box::new(UnsupportedArtifacts),
         )
         .unwrap()
-        .with_deadline(Deadline::starting_now(Duration::ZERO));
+        .with_deadline(Deadline::starting_now(Duration::ZERO).unwrap());
 
         cancellation.cancel();
 
