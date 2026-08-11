@@ -1113,6 +1113,7 @@ mod processes {
 
     use super::*;
     use crate::tool::{Capture, ProcessOutput, ToolProcess};
+    use crate::trust::{AllowlistedEnv, CommandSpec, EnvironmentName};
 
     /// A tool that runs one shim and reports what it produced.
     ///
@@ -1150,7 +1151,10 @@ mod processes {
             input: RunInput,
             context: &mut ExecutionContext,
         ) -> Result<RunOutput, ToolError> {
-            let mut process = ToolProcess::new(&input.program).capture_stderr(Capture::Tail);
+            let cwd = context.resolve(".")?;
+            let env = AllowlistedEnv::build(std::iter::empty::<&EnvironmentName>());
+            let spec = CommandSpec::new(&input.program, Vec::new(), cwd, env);
+            let mut process = ToolProcess::new(spec).capture_stderr(Capture::Tail);
             if input.capture_stdout {
                 process = process.capture_stdout(Capture::artifact("stdout.log"));
             }

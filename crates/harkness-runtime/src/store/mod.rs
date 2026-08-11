@@ -106,6 +106,7 @@ mod listing;
 mod migration;
 mod redaction;
 mod repository;
+mod workspace_trust;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -121,6 +122,7 @@ use crate::domain::{
     ArtifactId, Failure, Run, RunDomainError, RunId, Step, StepId, Task, TaskId, ToolCall,
     ToolCallId,
 };
+use crate::trust::{TrustState, WorkspaceTrust};
 
 pub use artifact::{ARTIFACTS_DIRECTORY, Artifact, ArtifactSink, Availability, StoreArtifacts};
 pub use error::{OpenFailure, StoreError};
@@ -264,6 +266,47 @@ impl Store {
             });
         }
         Ok(())
+    }
+
+    // -- workspace trust ---------------------------------------------------
+
+    /// Stores the latest explicit trust decision for one project identity.
+    ///
+    /// The decision already carries a canonical root. Replacing an earlier row
+    /// is one SQLite statement, so another process sees either complete record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NonUtf8Path`] when the platform path cannot be
+    /// represented in the current SQLite schema.
+    pub fn put_workspace_trust(&self, trust: &WorkspaceTrust) -> Result<(), StoreError> {
+        workspace_trust::put(&guard(&self.writer), trust)
+    }
+
+    /// Loads the explicit trust record for `project_id`, if one exists.
+    pub fn workspace_trust(
+        &self,
+        project_id: harkness_core::ProjectId,
+    ) -> Result<Option<WorkspaceTrust>, StoreError> {
+        self.with_reader(|connection| workspace_trust::load(connection, project_id))
+    }
+
+    /// Resolves trust for the exact project identity and current workspace path.
+    ///
+    /// No row, an unavailable root, a moved checkout, and a path reused by a
+    /// different project all resolve to [`TrustState::Untrusted`]. This read
+    /// never repairs or rewrites the stored decision.
+    pub fn resolve_workspace_trust(
+        &self,
+        project_id: harkness_core::ProjectId,
+        root: impl AsRef<Path>,
+    ) -> Result<TrustState, StoreError> {
+        Ok(self
+            .workspace_trust(project_id)?
+            .as_ref()
+            .map_or(TrustState::Untrusted, |trust| {
+                trust.resolve(project_id, root)
+            }))
     }
 
     // -- tasks --------------------------------------------------------------

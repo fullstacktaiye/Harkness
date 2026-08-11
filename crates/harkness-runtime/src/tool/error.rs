@@ -301,7 +301,7 @@ pub enum ToolError {
         /// Path that was refused, as the caller supplied it.
         path: PathBuf,
         /// Stable explanation of the refusal.
-        reason: &'static str,
+        reason: String,
     },
 
     /// The owning process stopped before the invocation completed.
@@ -779,7 +779,7 @@ mod tests {
             (
                 ToolError::ForbiddenPath {
                     path: PathBuf::from("../etc/passwd"),
-                    reason: "fixture",
+                    reason: "fixture".to_owned(),
                 },
                 "forbidden_path",
             ),
@@ -1196,7 +1196,7 @@ mod tests {
             },
             ToolError::ForbiddenPath {
                 path: PathBuf::from(".."),
-                reason: "fixture",
+                reason: "fixture".to_owned(),
             },
             ToolError::Cancelled,
             ToolError::Interrupted,

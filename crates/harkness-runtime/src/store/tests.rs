@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -23,6 +23,7 @@ use crate::domain::{
     ToolCallId, ToolCallState, ToolCallWire,
 };
 use crate::tool::ArtifactWriter;
+use crate::trust::{TrustState, WorkspaceTrust};
 
 use super::artifact::artifact_path;
 use super::migration::{MIGRATIONS, Migration, SCHEMA_VERSION, apply, recorded_version};
@@ -178,6 +179,141 @@ fn opening_an_existing_database_reuses_it_instead_of_replacing_it() {
     let reopened = fixture.reopen();
 
     assert_eq!(reopened.list_runs(RunPage::new(10)).unwrap().runs.len(), 1);
+}
+
+// -- workspace trust -------------------------------------------------------
+
+#[test]
+fn an_undecided_workspace_is_untrusted_by_default() {
+    let fixture = Fixture::new();
+    let workspace = TempDir::new().unwrap();
+
+    assert_eq!(
+        fixture
+            .store
+            .resolve_workspace_trust(harkness_core::ProjectId::new(), workspace.path())
+            .unwrap(),
+        TrustState::Untrusted
+    );
+}
+
+#[test]
+fn workspace_trust_requires_both_project_identity_and_canonical_path() {
+    let fixture = Fixture::new();
+    let workspace = TempDir::new().unwrap();
+    let elsewhere = TempDir::new().unwrap();
+    let project_id = harkness_core::ProjectId::new();
+    let trust =
+        WorkspaceTrust::decide(project_id, workspace.path(), TrustState::Trusted, at(8)).unwrap();
+    fixture.store.put_workspace_trust(&trust).unwrap();
+
+    assert_eq!(
+        fixture
+            .store
+            .resolve_workspace_trust(project_id, workspace.path())
+            .unwrap(),
+        TrustState::Trusted
+    );
+    assert_eq!(
+        fixture
+            .store
+            .resolve_workspace_trust(harkness_core::ProjectId::new(), workspace.path())
+            .unwrap(),
+        TrustState::Untrusted,
+        "a path match cannot transfer trust to a recreated catalog entry"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .resolve_workspace_trust(project_id, elsewhere.path())
+            .unwrap(),
+        TrustState::Untrusted,
+        "a project-id match cannot transfer trust to a moved checkout"
+    );
+
+    let reopened = fixture.reopen();
+    assert_eq!(
+        reopened.workspace_trust(project_id).unwrap().unwrap(),
+        trust,
+        "the decision must survive a new connection"
+    );
+}
+
+#[test]
+fn a_later_untrusted_decision_replaces_the_earlier_trusted_one() {
+    let fixture = Fixture::new();
+    let workspace = TempDir::new().unwrap();
+    let project_id = harkness_core::ProjectId::new();
+    for (state, at) in [(TrustState::Trusted, at(8)), (TrustState::Untrusted, at(9))] {
+        fixture
+            .store
+            .put_workspace_trust(
+                &WorkspaceTrust::decide(project_id, workspace.path(), state, at).unwrap(),
+            )
+            .unwrap();
+    }
+
+    assert_eq!(
+        fixture
+            .store
+            .resolve_workspace_trust(project_id, workspace.path())
+            .unwrap(),
+        TrustState::Untrusted
+    );
+}
+
+#[test]
+fn a_future_workspace_trust_row_requests_an_upgrade_before_decoding_its_body() {
+    let fixture = Fixture::new();
+    let workspace = TempDir::new().unwrap();
+    let project_id = harkness_core::ProjectId::new();
+    fixture
+        .store
+        .put_workspace_trust(
+            &WorkspaceTrust::decide(project_id, workspace.path(), TrustState::Trusted, at(8))
+                .unwrap(),
+        )
+        .unwrap();
+    guard(&fixture.store.writer)
+        .execute(
+            "UPDATE workspace_trust SET schema_version = 99, state = 'future', \
+             decided_at = 'future' WHERE project_id = ?1",
+            [project_id.to_string()],
+        )
+        .unwrap();
+
+    let error = fixture.store.workspace_trust(project_id).unwrap_err();
+    assert_eq!(error.kind(), "invalid_record");
+    assert!(error.to_string().contains("upgrade Harkness"), "{error}");
+}
+
+#[test]
+fn an_unknown_current_workspace_trust_state_is_refused() {
+    let fixture = Fixture::new();
+    let workspace = TempDir::new().unwrap();
+    let project_id = harkness_core::ProjectId::new();
+    fixture
+        .store
+        .put_workspace_trust(
+            &WorkspaceTrust::decide(project_id, workspace.path(), TrustState::Trusted, at(8))
+                .unwrap(),
+        )
+        .unwrap();
+    guard(&fixture.store.writer)
+        .execute(
+            "UPDATE workspace_trust SET state = 'future' WHERE project_id = ?1",
+            [project_id.to_string()],
+        )
+        .unwrap();
+
+    assert_eq!(
+        fixture
+            .store
+            .workspace_trust(project_id)
+            .unwrap_err()
+            .kind(),
+        "column_encoding"
+    );
 }
 
 #[test]
@@ -2628,7 +2764,10 @@ fn the_data_directory_override_redirects_the_default_store() {
 /// exactly the case a restored database has to survive.
 const FROZEN_V2_DATABASE: &[u8] = include_bytes!("fixtures/runtime-v2.db");
 
-/// A later migration, standing in for the one #92 will add.
+/// The frozen v3 database carrying one exact workspace trust decision.
+const FROZEN_V3_DATABASE: &[u8] = include_bytes!("fixtures/runtime-v3.db");
+
+/// A later migration, standing in for a future store feature.
 const LATER_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -2640,6 +2779,10 @@ const LATER_MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 3,
+        statements: include_str!("migrations/003_workspace_trust.sql"),
+    },
+    Migration {
+        version: 4,
         statements: "ALTER TABLE runs ADD COLUMN cancelled_by TEXT;",
     },
 ];
@@ -2651,7 +2794,7 @@ fn restore_frozen_database(bytes: &[u8]) -> TempDir {
 }
 
 #[test]
-fn a_v1_database_migrates_to_v2_and_still_reads_its_existing_runs() {
+fn a_v1_database_migrates_to_current_and_still_reads_its_existing_runs() {
     let data_dir = restore_frozen_database(FROZEN_V1_DATABASE);
 
     let store = Store::open(data_dir.path()).unwrap();
@@ -2702,8 +2845,8 @@ fn a_frozen_v2_database_opens_and_reads_its_log_and_artifacts() {
 
     assert_eq!(
         recorded_version(&guard(&store.writer)).unwrap(),
-        2,
-        "opening must not invent a migration"
+        SCHEMA_VERSION,
+        "opening must apply the recorded migration ladder"
     );
     let run_id = RunId::from_str(FIXTURE_RUN_ID).unwrap();
     let events = store.events(run_id, None, 10).unwrap();
@@ -2729,6 +2872,28 @@ fn a_frozen_v2_database_opens_and_reads_its_log_and_artifacts() {
 }
 
 #[test]
+fn a_frozen_v3_database_opens_and_reads_its_workspace_trust() {
+    let data_dir = restore_frozen_database(FROZEN_V3_DATABASE);
+    let store = Store::open(data_dir.path()).unwrap();
+    let project_id =
+        harkness_core::ProjectId::from_str("55555555-5555-4555-8555-555555555555").unwrap();
+
+    assert_eq!(
+        recorded_version(&guard(&store.writer)).unwrap(),
+        SCHEMA_VERSION
+    );
+    let trust = store.workspace_trust(project_id).unwrap().unwrap();
+    assert_eq!(trust.project_id(), project_id);
+    assert_eq!(trust.state(), TrustState::Trusted);
+    assert!(trust.canonical_root().is_absolute());
+    assert_eq!(
+        trust.resolve(project_id, trust.canonical_root()),
+        TrustState::Untrusted,
+        "the fixture's temporary workspace is gone, so its old path is not an active trust grant"
+    );
+}
+
+#[test]
 fn a_frozen_v2_database_opens_after_future_migrations() {
     let data_dir = restore_frozen_database(FROZEN_V2_DATABASE);
     let path = data_dir.path().join(DATABASE_FILE);
@@ -2739,7 +2904,7 @@ fn a_frozen_v2_database_opens_after_future_migrations() {
 
     apply(&mut connection, LATER_MIGRATIONS).unwrap();
 
-    assert_eq!(recorded_version(&connection).unwrap(), 3);
+    assert_eq!(recorded_version(&connection).unwrap(), 4);
     let run =
         super::repository::load_run(&connection, RunId::from_str(FIXTURE_RUN_ID).unwrap()).unwrap();
     assert_eq!(run.state(), ExecutionState::Running);
@@ -2825,7 +2990,7 @@ fn regenerate_the_frozen_v1_fixture() {
 #[ignore = "rewrites a committed fixture; run only when migration 2 changes"]
 fn regenerate_the_frozen_v2_fixture() {
     let data_dir = TempDir::new().unwrap();
-    let store = Store::open(data_dir.path()).unwrap();
+    let store = store_with_migrations(data_dir.path(), &MIGRATIONS[..2]);
     let task = stored_task(&store);
     let run = stored_run(&store, &task);
     let step = stored_step(&store, &run);
@@ -2865,6 +3030,45 @@ fn regenerate_the_frozen_v2_fixture() {
     freeze(&guard(&store.writer), "runtime-v2.db");
 }
 
+/// Writes the frozen v3 fixture, including one exact trust decision.
+///
+/// Run deliberately, and only when migration 3 itself changes:
+/// `cargo test -p harkness-runtime regenerate_the_frozen_v3_fixture -- --ignored`.
+#[test]
+#[ignore = "rewrites a committed fixture; run only when migration 3 changes"]
+fn regenerate_the_frozen_v3_fixture() {
+    let data_dir = TempDir::new().unwrap();
+    let store = Store::open(data_dir.path()).unwrap();
+    let project_id =
+        harkness_core::ProjectId::from_str("55555555-5555-4555-8555-555555555555").unwrap();
+    store
+        .put_workspace_trust(&WorkspaceTrust::from_stored(
+            project_id,
+            PathBuf::from("/workspace/harkness"),
+            TrustState::Trusted,
+            at(14),
+        ))
+        .unwrap();
+
+    freeze(&guard(&store.writer), "runtime-v3.db");
+}
+
+/// Builds a store stopped at an older migration for fixture regeneration.
+fn store_with_migrations(data_dir: &std::path::Path, migrations: &[Migration]) -> Store {
+    std::fs::create_dir_all(data_dir).unwrap();
+    let path = data_dir.join(DATABASE_FILE);
+    let mut connection = super::connect(&path).unwrap();
+    super::enable_wal(&connection).unwrap();
+    apply(&mut connection, migrations).unwrap();
+    Store {
+        data_dir: data_dir.to_path_buf(),
+        path,
+        writer: Mutex::new(connection),
+        readers: Mutex::new(Vec::new()),
+        redactor: Arc::new(super::PassThrough),
+    }
+}
+
 /// Writes a compact rollback-journal copy of `connection` into the fixtures.
 fn freeze(connection: &Connection, name: &str) {
     let destination = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2879,8 +3083,8 @@ fn freeze(connection: &Connection, name: &str) {
 
 #[test]
 fn every_migration_in_this_build_is_recorded_in_order() {
-    assert_eq!(MIGRATIONS.len(), 2, "add coverage for a new migration");
-    assert_eq!(SCHEMA_VERSION, 2);
+    assert_eq!(MIGRATIONS.len(), 3, "add coverage for a new migration");
+    assert_eq!(SCHEMA_VERSION, 3);
 }
 
 // -- performance -------------------------------------------------------------

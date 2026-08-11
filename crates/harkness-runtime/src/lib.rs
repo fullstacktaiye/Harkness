@@ -16,3 +16,4 @@
 pub mod domain;
 pub mod store;
 pub mod tool;
+pub mod trust;

@@ -5,6 +5,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 
+use crate::trust::EnvironmentName;
+
 use super::{Capability, RegistryError, SchemaDirection, ToolId, ToolIdentity, ToolVersion};
 
 /// Longest accepted descriptor title.
@@ -251,6 +253,7 @@ pub struct ToolMetadata {
     description: String,
     risk: RiskLevel,
     capabilities: Vec<Capability>,
+    environment: Vec<EnvironmentName>,
     timeout: ToolTimeout,
 }
 
@@ -273,6 +276,7 @@ impl ToolMetadata {
             description: description.into(),
             risk,
             capabilities: Vec::new(),
+            environment: Vec::new(),
             timeout: ToolTimeout::for_risk(risk),
         }
     }
@@ -307,6 +311,21 @@ impl ToolMetadata {
         self
     }
 
+    /// Declares parent-environment variables this tool's child processes need.
+    ///
+    /// Names are validated before they reach this builder. The list is sorted
+    /// and deduplicated so it is a stable part of the published contract.
+    #[must_use]
+    pub fn with_environment(
+        mut self,
+        environment: impl IntoIterator<Item = EnvironmentName>,
+    ) -> Self {
+        self.environment.extend(environment);
+        self.environment.sort_unstable();
+        self.environment.dedup();
+        self
+    }
+
     /// Identity this tool is registered and recorded under.
     #[must_use]
     pub const fn identity(&self) -> &ToolIdentity {
@@ -335,6 +354,12 @@ impl ToolMetadata {
     #[must_use]
     pub fn capabilities(&self) -> &[Capability] {
         &self.capabilities
+    }
+
+    /// Parent-environment variables child processes may inherit.
+    #[must_use]
+    pub fn environment(&self) -> &[EnvironmentName] {
+        &self.environment
     }
 
     /// What bounds a call of this tool, absent a caller override.
@@ -409,6 +434,7 @@ pub struct ToolDescriptor {
     description: String,
     risk: RiskLevel,
     capabilities: Vec<Capability>,
+    environment: Vec<EnvironmentName>,
     #[serde(rename = "default_timeout_ms")]
     timeout: ToolTimeout,
     input_schema: Value,
@@ -424,6 +450,7 @@ impl ToolDescriptor {
             description,
             risk,
             capabilities,
+            environment,
             timeout,
         } = metadata;
         Self {
@@ -432,6 +459,7 @@ impl ToolDescriptor {
             description,
             risk,
             capabilities,
+            environment,
             timeout,
             input_schema,
             output_schema,
@@ -480,6 +508,12 @@ impl ToolDescriptor {
         &self.capabilities
     }
 
+    /// Parent-environment variables child processes may inherit.
+    #[must_use]
+    pub fn environment(&self) -> &[EnvironmentName] {
+        &self.environment
+    }
+
     /// What bounds a call of this tool, absent a caller override.
     #[must_use]
     pub const fn timeout(&self) -> ToolTimeout {
@@ -520,6 +554,7 @@ mod tests {
         ToolDescriptor, ToolMetadata, ToolTimeout,
     };
     use crate::tool::{Capability, SchemaDirection, ToolIdentity};
+    use crate::trust::EnvironmentName;
 
     fn metadata() -> ToolMetadata {
         ToolMetadata::new(
@@ -613,6 +648,30 @@ mod tests {
             .map(|capability| capability.as_str())
             .collect::<Vec<_>>();
         assert_eq!(spellings, ["fs.read", "fs.write", "network"]);
+    }
+
+    #[test]
+    fn environment_declarations_are_sorted_deduplicated_and_published() {
+        let metadata = metadata().with_environment([
+            EnvironmentName::new("SSH_AUTH_SOCK").unwrap(),
+            EnvironmentName::new("CARGO_HOME").unwrap(),
+            EnvironmentName::new("SSH_AUTH_SOCK").unwrap(),
+        ]);
+        assert_eq!(
+            metadata
+                .environment()
+                .iter()
+                .map(EnvironmentName::as_str)
+                .collect::<Vec<_>>(),
+            ["CARGO_HOME", "SSH_AUTH_SOCK"]
+        );
+
+        let descriptor = ToolDescriptor::new(metadata, json!({}), json!({}));
+        assert_eq!(descriptor.environment().len(), 2);
+        assert_eq!(
+            serde_json::to_value(descriptor).unwrap()["environment"],
+            json!(["CARGO_HOME", "SSH_AUTH_SOCK"])
+        );
     }
 
     #[test]
@@ -766,7 +825,7 @@ mod tests {
             concat!(
                 r#"{"id":"fixture.tool","version":"1.0.0","title":"Fixture tool","#,
                 r#""description":"Echoes its input back for tests.","risk":"observe","#,
-                r#""capabilities":["fs.read"],"default_timeout_ms":30000,"#,
+                r#""capabilities":["fs.read"],"environment":[],"default_timeout_ms":30000,"#,
                 r#""input_schema":{"type":"object"},"output_schema":{"type":"string"}}"#,
             )
         );
