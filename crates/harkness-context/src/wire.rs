@@ -241,6 +241,15 @@ impl TryFrom<SnapshotWire> for WorkspaceSnapshot {
             return Err(invalid("branch is present and empty".to_owned()));
         }
 
+        // Checked before the lists are normalized, because normalizing first
+        // would hide the disagreement: a reordered list re-sorts to the same
+        // digest, and a duplicated path is deduplicated, so a second row
+        // carrying a *different* digest for a path already present would be
+        // dropped in silence. The stored order is part of what was stored.
+        check_canonical_order("staged", &wire.staged)?;
+        check_canonical_order("tracked_dirty", &wire.tracked_dirty)?;
+        check_canonical_order("untracked", &wire.untracked)?;
+
         let request = CaptureRequest {
             project_id: wire.project_id,
             instructions_digest: wire.instructions_digest,
@@ -258,9 +267,9 @@ impl TryFrom<SnapshotWire> for WorkspaceSnapshot {
             wire.captured_at,
         );
 
-        // Re-derived rather than trusted. A row whose entry list was edited, or
-        // whose paths were reordered or duplicated, no longer digests to what it
-        // claims, and that is exactly the row this refuses.
+        // Re-derived rather than trusted. A row whose entry list was edited no
+        // longer digests to what it claims, and that is exactly the row this
+        // refuses.
         check_digest("index", snapshot.index_digest(), &wire.index_digest)?;
         check_digest(
             "tracked_dirty",
@@ -275,6 +284,36 @@ impl TryFrom<SnapshotWire> for WorkspaceSnapshot {
         snapshot.require_digest(&wire.digest)?;
         Ok(snapshot)
     }
+}
+
+/// Refuses an entry list that is not sorted by path and free of duplicates.
+///
+/// Every list this crate writes is already in that form, so a list that is not
+/// was edited by something else, and re-canonicalizing it silently would mean
+/// accepting a row while changing what it says.
+fn check_canonical_order(
+    component: &'static str,
+    entries: &[FileDigestEntry],
+) -> Result<(), ContextDomainError> {
+    for pair in entries.windows(2) {
+        let ordering = pair[0].path.cmp(&pair[1].path);
+        if ordering != std::cmp::Ordering::Less {
+            let reason = if ordering == std::cmp::Ordering::Equal {
+                format!(
+                    "{component} names '{}' more than once",
+                    pair[0].path.display()
+                )
+            } else {
+                format!(
+                    "{component} is not sorted by path: '{}' precedes '{}'",
+                    pair[0].path.display(),
+                    pair[1].path.display()
+                )
+            };
+            return Err(ContextDomainError::InvalidSnapshotWire { reason });
+        }
+    }
+    Ok(())
 }
 
 /// Refuses one component digest that disagrees with the entries beneath it.
@@ -788,15 +827,44 @@ mod tests {
     }
 
     #[test]
-    fn a_reordered_entry_list_is_refused_rather_than_silently_normalized() {
+    fn an_added_entry_moves_the_digest_and_is_refused() {
         let snapshot = snapshot();
         let mut wire = SnapshotWire::from(&snapshot);
         wire.untracked.push(FileDigestEntry::new(
             path("aaa.txt"),
             ContentDigest::of_content(b"a"),
         ));
+        // Sorted, so the order check passes and the digest check is what fires.
+        wire.untracked.sort();
         let error = WorkspaceSnapshot::try_from(wire).unwrap_err();
         assert_eq!(error.kind(), "digest_mismatch");
+    }
+
+    #[test]
+    fn a_reordered_entry_list_is_refused_rather_than_silently_normalized() {
+        let mut wire = SnapshotWire::from(&snapshot());
+        wire.untracked.push(FileDigestEntry::new(
+            path("aaa.txt"),
+            ContentDigest::of_content(b"a"),
+        ));
+        // Deliberately not re-sorted: `notes/scratch.md` now precedes `aaa.txt`.
+        let error = WorkspaceSnapshot::try_from(wire).unwrap_err();
+        assert_eq!(error.kind(), "invalid_snapshot_wire");
+        assert!(error.to_string().contains("not sorted by path"), "{error}");
+    }
+
+    #[test]
+    fn a_duplicated_path_is_refused_rather_than_deduplicated() {
+        let mut wire = SnapshotWire::from(&snapshot());
+        // The same path a second time, carrying a different digest: normalizing
+        // first would drop this row and load the snapshot as though it agreed.
+        wire.tracked_dirty.push(FileDigestEntry::new(
+            path("src/main.rs"),
+            ContentDigest::of_content(b"something else entirely"),
+        ));
+        let error = WorkspaceSnapshot::try_from(wire).unwrap_err();
+        assert_eq!(error.kind(), "invalid_snapshot_wire");
+        assert!(error.to_string().contains("more than once"), "{error}");
     }
 
     #[test]

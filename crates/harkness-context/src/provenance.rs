@@ -253,7 +253,10 @@ impl RankExplanation {
         if !self.score.is_finite() {
             return Err(invalid(format!("rank score {} is not finite", self.score)));
         }
-        if self.candidates > 0 && self.position >= self.candidates {
+        // Unconditionally, including `candidates == 0`. Guarding the comparison
+        // on a non-empty candidate set would exempt `position: 7, candidates: 0`
+        // — an impossible pair, and precisely the one this check exists for.
+        if self.position >= self.candidates {
             return Err(invalid(format!(
                 "rank position {} is not within {} candidates",
                 self.position, self.candidates
@@ -547,6 +550,20 @@ impl Provenance {
             check_bound("symbol.qualified_name", &symbol.qualified_name)?;
             check_bound("symbol.kind", &symbol.kind)?;
             check_bound("symbol.language", &symbol.language)?;
+            // Re-derived rather than trusted, for the reason a snapshot's
+            // digests are: a content-derived identity a record merely asserts is
+            // one nothing downstream re-checks, so a row could name a symbol its
+            // own components do not produce.
+            if let Some(path) = self.path.as_ref() {
+                let derived =
+                    SymbolId::derive(path, &symbol.language, &symbol.qualified_name, &symbol.kind);
+                if derived != symbol.id {
+                    return Err(invalid(format!(
+                        "symbol.id is {} but its components derive {derived}",
+                        symbol.id
+                    )));
+                }
+            }
         }
         match &self.sensitivity {
             Sensitivity::Normal => {}
@@ -716,17 +733,31 @@ mod tests {
 
     #[test]
     fn a_rank_outside_its_candidate_set_is_refused() {
-        let record = provenance().ranked(RankExplanation::new(1.0, 5, 3));
-        assert_eq!(
-            record.validate().unwrap_err().kind(),
-            "invalid_provenance_wire"
-        );
+        for (position, candidates) in [(5, 3), (7, 0), (0, 0)] {
+            let record = provenance().ranked(RankExplanation::new(1.0, position, candidates));
+            assert_eq!(
+                record.validate().unwrap_err().kind(),
+                "invalid_provenance_wire",
+                "accepted position {position} of {candidates}"
+            );
+        }
         assert!(
             provenance()
                 .ranked(RankExplanation::new(1.0, 2, 3))
                 .validate()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn a_symbol_identity_that_its_components_do_not_derive_is_refused() {
+        let mut record =
+            provenance().for_symbol(SymbolRef::new(&path(), "rust", "main", "function"));
+        let symbol = record.symbol.as_mut().expect("the fixture names a symbol");
+        symbol.qualified_name = "renamed_after_the_fact".to_owned();
+        let error = record.validate().unwrap_err();
+        assert_eq!(error.kind(), "invalid_provenance_wire");
+        assert!(error.to_string().contains("symbol.id"), "{error}");
     }
 
     #[test]

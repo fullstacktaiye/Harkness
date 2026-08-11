@@ -34,7 +34,7 @@ use crate::digest::{
 use crate::error::ContextDomainError;
 use crate::ids::SnapshotId;
 use crate::path::RepoPath;
-use crate::probe::{ContentDigest, WorkspaceProbe};
+use crate::probe::{ContentDigest, ProbeFailure, WorkspaceProbe};
 
 /// The composite digest that answers "is this the same workspace?".
 ///
@@ -853,6 +853,9 @@ fn collect(
     if cancellation.is_cancelled() {
         return Err(CollectFailure::Cancelled);
     }
+    // Before anything is read, so a probe that caches cannot answer this read
+    // from the last one.
+    probe.begin_read();
     let root = git.root();
     let worktree_root =
         std::fs::canonicalize(root).map_err(|_| CollectFailure::WorktreeRootMissing)?;
@@ -924,29 +927,40 @@ fn collect_entry(
 
     let is_untracked = entry.unstaged == Some(FileChange::Untracked);
     if is_untracked {
-        let expanded = match probe.expand_untracked(&path) {
+        let expanded = match probe.expand_untracked(&path, cancellation) {
             Ok(expanded) => expanded,
-            Err(failure) if failure.is_fatal() => {
-                return Err(CollectFailure::Hashing {
-                    path,
-                    reason: failure.reason().to_owned(),
-                });
-            }
-            Err(failure) => {
-                diagnostics.paths_skipped.push(SkippedPath {
-                    path: path.clone(),
-                    reason: failure.reason().to_owned(),
-                });
-                untracked.push(FileDigestEntry::new(path, ContentDigest::Unreadable));
-                return Ok(());
-            }
+            Err(failure) => match refuse(&path, &failure) {
+                Some(refusal) => return Err(refusal),
+                // The candidate could not be read at all, so it is opaque: one
+                // sentinel under its own name. A failure *inside* the tree never
+                // reaches here — the probe reports those per sub-path, precisely
+                // so that the rest of the tree keeps taking part in identity.
+                None => {
+                    diagnostics.paths_skipped.push(SkippedPath {
+                        path: path.clone(),
+                        reason: failure.reason().to_owned(),
+                    });
+                    untracked.push(FileDigestEntry::new(path, ContentDigest::Unreadable));
+                    return Ok(());
+                }
+            },
         };
-        for candidate in expanded {
+        for candidate in expanded.paths {
             if cancellation.is_cancelled() {
                 return Err(CollectFailure::Cancelled);
             }
             let digest = probe_content(probe, diagnostics, &candidate)?;
             untracked.push(FileDigestEntry::new(candidate, digest));
+        }
+        for unreadable in expanded.unreadable {
+            diagnostics.paths_skipped.push(SkippedPath {
+                path: unreadable.path.clone(),
+                reason: unreadable.reason,
+            });
+            untracked.push(FileDigestEntry::new(
+                unreadable.path,
+                ContentDigest::Unreadable,
+            ));
         }
         return Ok(());
     }
@@ -961,6 +975,17 @@ fn collect_entry(
     Ok(())
 }
 
+/// Translates a probe failure the read must not survive, or `None` for a skip.
+fn refuse(path: &RepoPath, failure: &ProbeFailure) -> Option<CollectFailure> {
+    if failure.is_cancelled() {
+        return Some(CollectFailure::Cancelled);
+    }
+    failure.is_fatal().then(|| CollectFailure::Hashing {
+        path: path.clone(),
+        reason: failure.reason().to_owned(),
+    })
+}
+
 /// Hashes one path, downgrading an ordinary read failure to the sentinel.
 fn probe_content(
     probe: &dyn WorkspaceProbe,
@@ -972,17 +997,16 @@ fn probe_content(
             diagnostics.paths_hashed += 1;
             Ok(digest)
         }
-        Err(failure) if failure.is_fatal() => Err(CollectFailure::Hashing {
-            path: path.clone(),
-            reason: failure.reason().to_owned(),
-        }),
-        Err(failure) => {
-            diagnostics.paths_skipped.push(SkippedPath {
-                path: path.clone(),
-                reason: failure.reason().to_owned(),
-            });
-            Ok(ContentDigest::Unreadable)
-        }
+        Err(failure) => match refuse(path, &failure) {
+            Some(refusal) => Err(refusal),
+            None => {
+                diagnostics.paths_skipped.push(SkippedPath {
+                    path: path.clone(),
+                    reason: failure.reason().to_owned(),
+                });
+                Ok(ContentDigest::Unreadable)
+            }
+        },
     }
 }
 
@@ -995,17 +1019,16 @@ fn probe_staged_blob(
     match probe.staged_blob_id(path) {
         Ok(Some(id)) => Ok(ContentDigest::StagedBlob(id)),
         Ok(None) => Ok(ContentDigest::Absent),
-        Err(failure) if failure.is_fatal() => Err(CollectFailure::Hashing {
-            path: path.clone(),
-            reason: failure.reason().to_owned(),
-        }),
-        Err(failure) => {
-            diagnostics.paths_skipped.push(SkippedPath {
-                path: path.clone(),
-                reason: failure.reason().to_owned(),
-            });
-            Ok(ContentDigest::Unreadable)
-        }
+        Err(failure) => match refuse(path, &failure) {
+            Some(refusal) => Err(refusal),
+            None => {
+                diagnostics.paths_skipped.push(SkippedPath {
+                    path: path.clone(),
+                    reason: failure.reason().to_owned(),
+                });
+                Ok(ContentDigest::Unreadable)
+            }
+        },
     }
 }
 
@@ -1573,6 +1596,148 @@ mod tests {
                 "the link target's content must never be hashed"
             );
         }
+    }
+
+    #[test]
+    fn one_probe_reused_across_a_capture_and_a_verification_sees_the_new_index() {
+        let workspace = Workspace::new("repo");
+        // Held for the worktree's lifetime, which is the natural caller pattern
+        // and the one a probe caching its index at construction gets wrong.
+        let probe = FilesystemProbe::new(&workspace.root);
+
+        workspace.write("tracked.txt", "staged once\n");
+        git(&workspace.root, ["add", "tracked.txt"]);
+        let snapshot = WorkspaceSnapshot::capture(
+            &workspace.request,
+            &workspace.service(),
+            &probe,
+            &Cancellation::default(),
+        )
+        .unwrap();
+
+        workspace.write("tracked.txt", "staged twice\n");
+        git(&workspace.root, ["add", "tracked.txt"]);
+        let state = snapshot
+            .verify(&workspace.service(), &probe, &Cancellation::default())
+            .unwrap();
+
+        assert_eq!(
+            state,
+            FreshnessState::Stale {
+                changed: vec![StalePath {
+                    path: Some(RepoPath::from_bytes(b"tracked.txt".to_vec())),
+                    component: SnapshotComponent::Index,
+                    change: PathDivergence::Changed,
+                }],
+            },
+            "a staged change was invisible to a reused probe"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_branch_never_makes_the_rest_of_its_tree_invisible() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = Workspace::new("repo");
+        fs::create_dir_all(workspace.root.join("build/open")).unwrap();
+        fs::create_dir(workspace.root.join("build/closed")).unwrap();
+        workspace.write("build/open/out.txt", "first\n");
+        fs::write(workspace.root.join("build/closed/secret.txt"), "s\n").unwrap();
+
+        let closed = workspace.root.join("build/closed");
+        let mut permissions = fs::metadata(&closed).unwrap().permissions();
+        permissions.set_mode(0o000);
+        fs::set_permissions(&closed, permissions).unwrap();
+        if fs::read_dir(&closed).is_ok() {
+            // Running as root: the fixture cannot deny access to itself.
+            return;
+        }
+
+        let snapshot = workspace.capture();
+        assert_eq!(workspace.verify(&snapshot), FreshnessState::Fresh);
+
+        // Collapsing the tree to one sentinel would freeze its digest, and every
+        // edit under it would read as `Fresh` — the false negative that lets a
+        // stale write land.
+        workspace.write("build/open/out.txt", "second\n");
+        assert_eq!(
+            workspace.verify(&snapshot),
+            FreshnessState::Stale {
+                changed: vec![StalePath {
+                    path: Some(RepoPath::from_bytes(b"build/open/out.txt".to_vec())),
+                    component: SnapshotComponent::Untracked,
+                    change: PathDivergence::Changed,
+                }],
+            }
+        );
+
+        workspace.write("build/open/new.txt", "appeared\n");
+        assert!(matches!(
+            workspace.verify(&snapshot),
+            FreshnessState::Stale { .. }
+        ));
+
+        let mut permissions = fs::metadata(&closed).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&closed, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_branch_is_named_in_the_capture_diagnostics() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = Workspace::new("repo");
+        fs::create_dir_all(workspace.root.join("build/closed")).unwrap();
+        workspace.write("build/out.txt", "first\n");
+        let closed = workspace.root.join("build/closed");
+        let mut permissions = fs::metadata(&closed).unwrap().permissions();
+        permissions.set_mode(0o000);
+        fs::set_permissions(&closed, permissions).unwrap();
+        if fs::read_dir(&closed).is_ok() {
+            return;
+        }
+
+        let probe = FilesystemProbe::new(&workspace.root);
+        let capture = WorkspaceSnapshot::capture_with_diagnostics(
+            &workspace.request,
+            &workspace.service(),
+            &probe,
+            &Cancellation::default(),
+        )
+        .unwrap();
+
+        assert_eq!(capture.diagnostics.paths_hashed, 1);
+        assert_eq!(
+            capture
+                .diagnostics
+                .paths_skipped
+                .iter()
+                .map(|skipped| skipped.path.display())
+                .collect::<Vec<_>>(),
+            ["build/closed"]
+        );
+        assert_eq!(
+            capture
+                .snapshot
+                .files()
+                .untracked()
+                .iter()
+                .map(|entry| (entry.path.display(), entry.digest.clone()))
+                .collect::<Vec<_>>(),
+            [
+                ("build/closed".to_owned(), ContentDigest::Unreadable),
+                (
+                    "build/out.txt".to_owned(),
+                    ContentDigest::of_content(b"first\n")
+                ),
+            ]
+        );
+
+        let mut permissions = fs::metadata(&closed).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&closed, permissions).unwrap();
     }
 
     #[test]

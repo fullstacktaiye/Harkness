@@ -247,7 +247,20 @@ A snapshot's three content digests are derived from its entry lists and never
 stored independently of them. Loading a persisted snapshot re-derives all three
 and the composite, and refuses the row by name when either disagrees, so a
 hand-edited row cannot enter the process claiming an identity its own contents
-do not support.
+do not support. The stored *order* is checked before anything is normalized, for
+the same reason: sorting first would re-canonicalize an out-of-order list to the
+digest it claims, and deduplicating first would drop a second row carrying a
+different digest for a path already present. Every content-derived identity a
+record merely asserts is re-derived on load too, `SymbolId` included.
+
+An unreadable branch of the workspace must never make the rest of its tree
+invisible. Collapsing a subtree to one sentinel freezes its digest, and a frozen
+digest means every later edit beneath it verifies as `Fresh` — the exact false
+negative this whole mechanism exists to prevent. A probe reports a failure inside
+a tree per sub-path, so what was walked keeps taking part in identity and the
+branch that failed is named on its own. A probe that caches anything about the
+workspace invalidates it in `begin_read`, because a probe outlives a read and a
+cached index served to a later verification answers from the past.
 
 Capture and verification fail differently on purpose. Capture must never yield a
 half-built identity, so cancellation is an error; verification always owes a

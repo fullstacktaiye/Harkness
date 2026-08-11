@@ -12,12 +12,14 @@
 //!
 //! [#112]: https://github.com/fullstacktaiye/harkness/issues/112
 
+use std::cell::RefCell;
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use harkness_git::Cancellation;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use sha2::{Digest, Sha256};
 
@@ -35,8 +37,15 @@ const READ_BLOCK_BYTES: usize = 64 * 1024;
 ///
 /// `git status` reports an untracked directory as a single entry rather than
 /// recursing, so a probe that expanded one without a bound would walk a
-/// `node_modules/` a user never intended to index. Exceeding the bound is
-/// reported as a skip, so the capture still succeeds and says what it left out.
+/// `node_modules/` a user never intended to index.
+///
+/// Exceeding the bound makes the whole candidate opaque: it contributes one
+/// sentinel and a capture diagnostic, and changes beneath it stop being visible
+/// to identity. That is a real cost, and it is still the only deterministic
+/// answer available — a partial set would depend on the order the filesystem
+/// enumerated the tree, and an identity that changed with enumeration order is
+/// worse than one that is coarse. A tree this large is one that wants a
+/// `.gitignore` entry, which is what [#112] will honour.
 const MAX_UNTRACKED_EXPANSION: usize = 10_000;
 
 /// What one path contributes to a workspace identity.
@@ -160,18 +169,23 @@ impl<'de> Deserialize<'de> for ContentDigest {
 
 /// Why a probe could not answer for one path.
 ///
-/// The two variants carry the whole policy decision: a [`ProbeFailure::Skipped`]
-/// path contributes [`ContentDigest::Unreadable`] and a line in the capture
-/// diagnostics, while a [`ProbeFailure::Fatal`] one ends the capture. Anything a
-/// user can cause by accident — a permission bit, a file that vanished mid-walk
-/// — is a skip; only a probe that cannot function at all is fatal.
+/// The three variants carry the whole policy decision: a
+/// [`ProbeFailure::Skipped`] path contributes [`ContentDigest::Unreadable`] and a
+/// line in the capture diagnostics, a [`ProbeFailure::Cancelled`] read ends the
+/// operation through its cancellation contract, and a [`ProbeFailure::Fatal`] one
+/// ends the capture with an error. Anything a user can cause by accident — a
+/// permission bit, a file that vanished mid-walk — is a skip; only a probe that
+/// cannot function at all is fatal.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ProbeFailure {
     /// This path could not be read, and the capture goes on without it.
     Skipped {
         /// Stable human-readable explanation.
         reason: String,
     },
+    /// The read observed its cancellation token.
+    Cancelled,
     /// The probe cannot answer at all, and the capture must not continue.
     Fatal {
         /// Stable human-readable explanation.
@@ -201,19 +215,70 @@ impl ProbeFailure {
     pub fn reason(&self) -> &str {
         match self {
             Self::Skipped { reason } | Self::Fatal { reason } => reason,
+            Self::Cancelled => "the workspace read was cancelled",
         }
     }
 
-    /// Whether this failure ends the capture.
+    /// Whether this failure ends the capture with an error.
     #[must_use]
     pub const fn is_fatal(&self) -> bool {
         matches!(self, Self::Fatal { .. })
+    }
+
+    /// Whether the read stopped because it was cancelled.
+    #[must_use]
+    pub const fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
     }
 }
 
 impl fmt::Display for ProbeFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.reason())
+    }
+}
+
+/// One sub-path an expansion could not walk.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnreadablePath {
+    /// The repository-relative path that could not be read.
+    pub path: RepoPath,
+    /// Stable human-readable explanation.
+    pub reason: String,
+}
+
+/// What one untracked status entry expanded into.
+///
+/// The two lists are separate because a failure inside a tree must not cost the
+/// rest of it. Collapsing a whole subtree to one sentinel would make its digest
+/// constant, and a constant digest means every later edit under that tree reads
+/// as `Fresh` — the exact false negative snapshot identity exists to prevent. So
+/// the files that *were* walked take part in identity as themselves, and each
+/// branch that failed is named on its own: it contributes a sentinel under its
+/// own path, and becomes readable — and therefore visible as a change — the
+/// moment it can be read again.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct UntrackedExpansion {
+    /// Paths whose content takes part in identity.
+    pub paths: Vec<RepoPath>,
+    /// Sub-paths that could not be walked.
+    pub unreadable: Vec<UnreadablePath>,
+}
+
+impl UntrackedExpansion {
+    /// Expands to exactly one path, which is what a plain file does.
+    #[must_use]
+    pub fn of_one(path: RepoPath) -> Self {
+        Self {
+            paths: vec![path],
+            unreadable: Vec::new(),
+        }
+    }
+
+    /// Whether the expansion found nothing at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty() && self.unreadable.is_empty()
     }
 }
 
@@ -224,12 +289,37 @@ impl fmt::Display for ProbeFailure {
 /// root; identity is meant to describe one worktree, and a probe that reached
 /// past it would make that claim false.
 pub trait WorkspaceProbe {
+    /// Announces that a fresh capture or verification is about to begin.
+    ///
+    /// Called once, before anything else, by both [`WorkspaceSnapshot::capture`]
+    /// and [`WorkspaceSnapshot::verify`]. An implementation that caches anything
+    /// about the workspace — the Git index, a directory listing — **must**
+    /// invalidate it here. A probe is naturally held for the lifetime of a
+    /// worktree rather than of a read, and a cached index served to a later
+    /// verification would report `Fresh` across a staged change: a staleness
+    /// gate that answers from a snapshot of the past is not a gate.
+    ///
+    /// The default is a no-op, for probes that hold nothing.
+    ///
+    /// [`WorkspaceSnapshot::capture`]: crate::WorkspaceSnapshot::capture
+    /// [`WorkspaceSnapshot::verify`]: crate::WorkspaceSnapshot::verify
+    fn begin_read(&self) {}
+
     /// Expands one untracked status entry into the paths that take part in
     /// identity.
     ///
     /// Git reports an untracked directory as a single `dir/` entry, so this is
-    /// where eligibility is decided. A plain file expands to itself.
-    fn expand_untracked(&self, candidate: &RepoPath) -> Result<Vec<RepoPath>, ProbeFailure>;
+    /// where eligibility is decided. A plain file expands to itself. A failure
+    /// *inside* the tree belongs in [`UntrackedExpansion::unreadable`]; `Err` is
+    /// for a candidate that could not be read at all.
+    ///
+    /// `cancellation` is polled during the walk, so a large untracked tree does
+    /// not defer a cancellation until it finishes.
+    fn expand_untracked(
+        &self,
+        candidate: &RepoPath,
+        cancellation: &Cancellation,
+    ) -> Result<UntrackedExpansion, ProbeFailure>;
 
     /// Describes what the working tree now holds at `path`.
     fn hash_path(&self, path: &RepoPath) -> Result<ContentDigest, ProbeFailure>;
@@ -250,26 +340,37 @@ pub trait WorkspaceProbe {
 /// classification behind it.
 ///
 /// [#112]: https://github.com/fullstacktaiye/harkness/issues/112
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct FilesystemProbe {
     root: PathBuf,
-    staged_blobs: Option<Vec<(RepoPath, String)>>,
+    staged_blobs: RefCell<IndexCache>,
+}
+
+/// The Git index, read at most once per capture or verification.
+#[derive(Debug)]
+enum IndexCache {
+    /// Not read yet during the current read.
+    Unloaded,
+    /// The repository or its index could not be opened.
+    Unavailable,
+    /// Stage-zero entries, sorted by path for binary search.
+    Loaded(Vec<(RepoPath, String)>),
 }
 
 impl FilesystemProbe {
     /// Reads the worktree rooted at `root`.
     ///
-    /// The Git index is loaded once, here, rather than per staged path: it is
-    /// one file, and a snapshot of a repository with a thousand staged paths
-    /// would otherwise re-read it a thousand times. A repository that cannot be
-    /// opened leaves the index unavailable rather than failing construction,
-    /// because a worktree with no readable index still has content worth
-    /// hashing.
+    /// Nothing is read here. The Git index is loaded lazily on the first staged
+    /// lookup of a read and dropped again by [`WorkspaceProbe::begin_read`], so
+    /// one probe held for a worktree's lifetime costs one index read per
+    /// capture — not one per staged path, and never one shared across two reads
+    /// that must see different indexes.
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        let root = root.into();
-        let staged_blobs = load_index_blobs(&root);
-        Self { root, staged_blobs }
+        Self {
+            root: root.into(),
+            staged_blobs: RefCell::new(IndexCache::Unloaded),
+        }
     }
 
     /// The worktree this probe reads.
@@ -289,29 +390,54 @@ impl FilesystemProbe {
 }
 
 impl WorkspaceProbe for FilesystemProbe {
-    fn expand_untracked(&self, candidate: &RepoPath) -> Result<Vec<RepoPath>, ProbeFailure> {
+    fn begin_read(&self) {
+        *self.staged_blobs.borrow_mut() = IndexCache::Unloaded;
+    }
+
+    fn expand_untracked(
+        &self,
+        candidate: &RepoPath,
+        cancellation: &Cancellation,
+    ) -> Result<UntrackedExpansion, ProbeFailure> {
         let resolved = self.resolve(candidate);
         let metadata = std::fs::symlink_metadata(&resolved)
             .map_err(|error| ProbeFailure::skipped(format!("cannot stat: {error}")))?;
         if !metadata.is_dir() {
-            return Ok(vec![without_trailing_separator(candidate)]);
+            return Ok(UntrackedExpansion::of_one(without_trailing_separator(
+                candidate,
+            )));
         }
 
-        let mut found = Vec::new();
-        let prefix = {
-            let mut bytes = candidate.as_bytes().to_vec();
-            if bytes.last() != Some(&b'/') {
-                bytes.push(b'/');
-            }
-            bytes
-        };
-        let mut pending = vec![(resolved, prefix)];
+        let mut expansion = UntrackedExpansion::default();
+        let mut pending = vec![(resolved, directory_prefix(candidate))];
         while let Some((directory, prefix)) = pending.pop() {
-            let entries = std::fs::read_dir(&directory)
-                .map_err(|error| ProbeFailure::skipped(format!("cannot list: {error}")))?;
+            if cancellation.is_cancelled() {
+                return Err(ProbeFailure::Cancelled);
+            }
+            let entries = match std::fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                // Only this branch is lost. Everything already walked stays in
+                // the identity, and this path is named on its own, so becoming
+                // readable later reads as a change rather than as nothing.
+                Err(error) => {
+                    expansion.unreadable.push(UnreadablePath {
+                        path: RepoPath::from_bytes(without_trailing_separator_bytes(&prefix)),
+                        reason: format!("cannot list: {error}"),
+                    });
+                    continue;
+                }
+            };
             for entry in entries {
-                let entry = entry
-                    .map_err(|error| ProbeFailure::skipped(format!("cannot list: {error}")))?;
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        expansion.unreadable.push(UnreadablePath {
+                            path: RepoPath::from_bytes(without_trailing_separator_bytes(&prefix)),
+                            reason: format!("cannot list: {error}"),
+                        });
+                        break;
+                    }
+                };
                 let name = RepoPath::from_path(Path::new(&entry.file_name()));
                 // Git's own administrative directory is never workspace content.
                 if name.as_bytes() == b".git" {
@@ -321,26 +447,40 @@ impl WorkspaceProbe for FilesystemProbe {
                 child.extend_from_slice(name.as_bytes());
                 // `file_type` on a `DirEntry` does not follow symlinks, so a
                 // link to a directory is recorded rather than descended into.
-                let file_type = entry
-                    .file_type()
-                    .map_err(|error| ProbeFailure::skipped(format!("cannot stat: {error}")))?;
+                let Ok(file_type) = entry.file_type() else {
+                    expansion.unreadable.push(UnreadablePath {
+                        path: RepoPath::from_bytes(child),
+                        reason: "cannot stat".to_owned(),
+                    });
+                    continue;
+                };
                 if file_type.is_dir() {
                     let mut nested = child;
                     nested.push(b'/');
                     pending.push((entry.path(), nested));
                 } else {
-                    if found.len() >= MAX_UNTRACKED_EXPANSION {
+                    if expansion.paths.len() >= MAX_UNTRACKED_EXPANSION {
+                        // A partial set here would depend on the order the
+                        // filesystem enumerated the tree, and identity must not.
+                        // One opaque entry for the whole candidate is the only
+                        // deterministic answer left.
                         return Err(ProbeFailure::skipped(format!(
                             "holds more than {MAX_UNTRACKED_EXPANSION} untracked files"
                         )));
                     }
-                    found.push(RepoPath::from_bytes(child));
+                    expansion.paths.push(RepoPath::from_bytes(child));
                 }
             }
         }
         // The walk order depends on the filesystem; identity must not.
-        found.sort();
-        Ok(found)
+        expansion.paths.sort();
+        expansion
+            .unreadable
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        expansion
+            .unreadable
+            .dedup_by(|left, right| left.path == right.path);
+        Ok(expansion)
     }
 
     fn hash_path(&self, path: &RepoPath) -> Result<ContentDigest, ProbeFailure> {
@@ -378,7 +518,14 @@ impl WorkspaceProbe for FilesystemProbe {
     }
 
     fn staged_blob_id(&self, path: &RepoPath) -> Result<Option<String>, ProbeFailure> {
-        let Some(blobs) = self.staged_blobs.as_ref() else {
+        let mut cache = self.staged_blobs.borrow_mut();
+        if matches!(*cache, IndexCache::Unloaded) {
+            *cache = match load_index_blobs(&self.root) {
+                Some(blobs) => IndexCache::Loaded(blobs),
+                None => IndexCache::Unavailable,
+            };
+        }
+        let IndexCache::Loaded(blobs) = &*cache else {
             return Err(ProbeFailure::skipped("the Git index could not be read"));
         };
         Ok(blobs
@@ -386,6 +533,20 @@ impl WorkspaceProbe for FilesystemProbe {
             .ok()
             .map(|position| blobs[position].1.clone()))
     }
+}
+
+/// The `dir/` prefix every path beneath an untracked directory entry carries.
+fn directory_prefix(candidate: &RepoPath) -> Vec<u8> {
+    let mut bytes = candidate.as_bytes().to_vec();
+    if bytes.last() != Some(&b'/') {
+        bytes.push(b'/');
+    }
+    bytes
+}
+
+/// Turns a walk prefix back into the directory path it names.
+fn without_trailing_separator_bytes(prefix: &[u8]) -> Vec<u8> {
+    prefix.strip_suffix(b"/").unwrap_or(prefix).to_vec()
 }
 
 /// Drops a status entry's trailing `/`, which marks a directory rather than
@@ -430,9 +591,10 @@ fn load_index_blobs(root: &Path) -> Option<Vec<(RepoPath, String)>> {
 mod tests {
     use std::fs;
 
-    use harkness_test_fixtures::Fixture;
+    use harkness_git::Cancellation;
+    use harkness_test_fixtures::{Fixture, git, initialize_repository};
 
-    use super::{ContentDigest, FilesystemProbe, ProbeFailure, WorkspaceProbe};
+    use super::{ContentDigest, FilesystemProbe, ProbeFailure, UntrackedExpansion, WorkspaceProbe};
     use crate::digest::Sha256Hex;
     use crate::path::RepoPath;
 
@@ -535,11 +697,18 @@ mod tests {
         fs::write(root.join("new/nested/c.txt"), b"c").unwrap();
         let probe = FilesystemProbe::new(&root);
 
-        let expanded = probe.expand_untracked(&path("new/")).unwrap();
+        let expanded = probe
+            .expand_untracked(&path("new/"), &Cancellation::default())
+            .unwrap();
         assert_eq!(
-            expanded.iter().map(RepoPath::display).collect::<Vec<_>>(),
+            expanded
+                .paths
+                .iter()
+                .map(RepoPath::display)
+                .collect::<Vec<_>>(),
             ["new/a.txt", "new/b.txt", "new/nested/c.txt"]
         );
+        assert!(expanded.unreadable.is_empty());
     }
 
     #[test]
@@ -549,9 +718,102 @@ mod tests {
         fs::write(root.join("a.txt"), b"a").unwrap();
         let probe = FilesystemProbe::new(&root);
         assert_eq!(
-            probe.expand_untracked(&path("a.txt")).unwrap(),
-            vec![path("a.txt")]
+            probe
+                .expand_untracked(&path("a.txt"), &Cancellation::default())
+                .unwrap(),
+            UntrackedExpansion::of_one(path("a.txt"))
         );
+    }
+
+    /// Skips rather than fails when the process can read a mode-`000`
+    /// directory anyway, which is what running as root does.
+    #[cfg(unix)]
+    fn deny_directory_access(directory: &std::path::Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(directory).unwrap().permissions();
+        permissions.set_mode(0o000);
+        fs::set_permissions(directory, permissions).unwrap();
+        fs::read_dir(directory).is_err()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_unreadable_branch_does_not_cost_the_rest_of_the_tree() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("worktree");
+        fs::create_dir_all(root.join("new/open")).unwrap();
+        fs::create_dir(root.join("new/closed")).unwrap();
+        fs::write(root.join("new/open/a.txt"), b"a").unwrap();
+        fs::write(root.join("new/closed/secret.txt"), b"s").unwrap();
+        if !deny_directory_access(&root.join("new/closed")) {
+            return;
+        }
+
+        let probe = FilesystemProbe::new(&root);
+        let expanded = probe
+            .expand_untracked(&path("new/"), &Cancellation::default())
+            .unwrap();
+
+        // The readable half still takes part in identity, and the branch that
+        // failed is named under its own path rather than swallowing the tree.
+        assert_eq!(
+            expanded
+                .paths
+                .iter()
+                .map(RepoPath::display)
+                .collect::<Vec<_>>(),
+            ["new/open/a.txt"]
+        );
+        assert_eq!(
+            expanded
+                .unreadable
+                .iter()
+                .map(|entry| entry.path.display())
+                .collect::<Vec<_>>(),
+            ["new/closed"]
+        );
+    }
+
+    #[test]
+    fn expansion_stops_when_the_walk_is_cancelled() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("worktree");
+        fs::create_dir(root.join("new")).unwrap();
+        fs::write(root.join("new/a.txt"), b"a").unwrap();
+        let probe = FilesystemProbe::new(&root);
+
+        let cancellation = Cancellation::default();
+        cancellation.cancel();
+        let failure = probe
+            .expand_untracked(&path("new/"), &cancellation)
+            .unwrap_err();
+        assert!(failure.is_cancelled(), "{failure}");
+        assert!(!failure.is_fatal());
+    }
+
+    #[test]
+    fn a_staged_lookup_reflects_the_index_as_of_the_current_read() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("worktree");
+        initialize_repository(&root);
+        fs::write(root.join("tracked.txt"), b"changed\n").unwrap();
+        git(&root, ["add", "tracked.txt"]);
+
+        // Constructed before the second `git add`, and reused across both reads:
+        // the natural caller pattern, and the one a cache-at-construction probe
+        // would answer wrongly.
+        let probe = FilesystemProbe::new(&root);
+        probe.begin_read();
+        let first = probe.staged_blob_id(&path("tracked.txt")).unwrap();
+
+        fs::write(root.join("tracked.txt"), b"changed again\n").unwrap();
+        git(&root, ["add", "tracked.txt"]);
+        probe.begin_read();
+        let second = probe.staged_blob_id(&path("tracked.txt")).unwrap();
+
+        assert!(first.is_some() && second.is_some());
+        assert_ne!(first, second, "the probe served a stale index");
     }
 
     #[test]

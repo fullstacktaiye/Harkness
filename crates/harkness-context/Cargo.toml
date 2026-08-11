@@ -22,4 +22,3 @@ uuid.workspace = true
 
 [dev-dependencies]
 harkness-test-fixtures.workspace = true
-tempfile.workspace = true

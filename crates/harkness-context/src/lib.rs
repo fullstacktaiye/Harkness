@@ -81,7 +81,10 @@ pub use ids::{
     ChunkId, ContextItemId, ContextPackId, ContextQueryId, FileVersionId, SnapshotId, SymbolId,
 };
 pub use path::RepoPath;
-pub use probe::{ContentDigest, FilesystemProbe, ProbeFailure, WorkspaceProbe};
+pub use probe::{
+    ContentDigest, FilesystemProbe, ProbeFailure, UnreadablePath, UntrackedExpansion,
+    WorkspaceProbe,
+};
 pub use provenance::{
     ByteRange, MAX_PROVENANCE_TEXT_BYTES, Provenance, RankExplanation, RankSignal, RetrievalSource,
     SelectionReason, SelectionReasonKind, Sensitivity, SymbolRef,
