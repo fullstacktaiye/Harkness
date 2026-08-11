@@ -19,6 +19,9 @@ use crate::{
         entry::{Project, ProjectId, ProjectSource},
         lock,
     },
+    editor::{
+        self, EditorConfiguration, EditorError, EditorLaunch, EditorLaunchContext, EditorPosition,
+    },
     paths::{
         self, CATALOG_FILE, CHECKOUT_DIRECTORY, LOCKS_DIRECTORY, REPOSITORIES_DIRECTORY,
         UnreservedPath, WORKTREES_DIRECTORY, canonical_reserved_root,
@@ -300,6 +303,10 @@ pub enum ProjectError {
     /// A Git operation on a catalogued project failed.
     #[error(transparent)]
     Git(GitError),
+
+    /// An external-editor template or launch failed.
+    #[error(transparent)]
+    Editor(EditorError),
 }
 
 macro_rules! impl_project_error_kinds {
@@ -307,8 +314,8 @@ macro_rules! impl_project_error_kinds {
         impl ProjectError {
             /// Stable discriminants defined by the project layer itself.
             ///
-            /// [`ProjectError::Git`] delegates to [`GitError::KINDS`], so callers that
-            /// need the complete namespace should combine both arrays.
+            /// Git and editor failures delegate to their owned kind tables, so
+            /// callers that need the complete namespace should combine all three.
             pub const DIRECT_KINDS: &'static [&'static str] = &[$($kind),+];
 
             /// Stable machine-readable discriminant for agent-facing error handling.
@@ -317,6 +324,7 @@ macro_rules! impl_project_error_kinds {
                 match self {
                     $($pattern => $kind,)+
                     Self::Git(error) => error.kind(),
+                    Self::Editor(error) => error.kind(),
                 }
             }
         }
@@ -455,6 +463,12 @@ impl From<GitError> for ProjectError {
     }
 }
 
+impl From<EditorError> for ProjectError {
+    fn from(error: EditorError) -> Self {
+        Self::Editor(error)
+    }
+}
+
 /// Loads and updates the durable local project catalog.
 ///
 /// Concurrent front ends are safe. Every mutation takes an exclusive advisory
@@ -571,6 +585,48 @@ impl ProjectService {
             .collect::<Vec<_>>();
         sort_recents(&mut projects);
         Ok(projects)
+    }
+
+    /// Reads the one global editor command without rewriting the catalog.
+    pub fn editor_configuration(&self) -> Result<Option<EditorConfiguration>, ProjectError> {
+        Ok(self.read_catalog_shared()?.editor)
+    }
+
+    /// Replaces or clears the global editor command under the catalog lock.
+    pub fn set_editor_configuration(
+        &mut self,
+        editor: Option<EditorConfiguration>,
+    ) -> Result<(), ProjectError> {
+        let _lock = self.lock_exclusive()?;
+        let mut candidate = self.read_catalog()?;
+        candidate.editor = editor;
+        self.persist(&candidate)?;
+        self.catalog = candidate;
+        Ok(())
+    }
+
+    /// Opens a repository-relative path with no repository lock and no wait.
+    ///
+    /// The short shared catalog read completes before the process is spawned.
+    /// Worktrees therefore use their own catalogued root, and a long-lived
+    /// editor can never retain either the catalog or repository lock.
+    pub fn open_in_editor(
+        &self,
+        id: ProjectId,
+        path: &Path,
+        position: EditorPosition,
+        context: EditorLaunchContext,
+    ) -> Result<EditorLaunch, ProjectError> {
+        let catalog = self.read_catalog_shared()?;
+        let project = catalog
+            .projects
+            .iter()
+            .find(|project| project.id == id)
+            .ok_or(ProjectError::ProjectNotFound(id))?;
+        let root = project.root.clone();
+        let configured = catalog.editor.clone();
+        drop(catalog);
+        editor::open(&root, path, position, configured.as_ref(), context).map_err(Into::into)
     }
 
     /// Resolves one catalog entry without mutating the catalog or Recents.
@@ -2778,7 +2834,7 @@ mod tests {
     };
     use crate::{
         catalog::{
-            CATALOG_VERSION, MINIMUM_SUPPORTED_CATALOG_VERSION,
+            CATALOG_VERSION, MINIMUM_SUPPORTED_CATALOG_VERSION, WORKTREE_CATALOG_VERSION,
             entry::{Project, ProjectId, ProjectSource},
         },
         list_directory,
@@ -2801,6 +2857,7 @@ mod tests {
 
     const VERSION_ONE_CATALOG: &str = include_str!("catalog/fixtures/v1.json");
     const VERSION_TWO_CATALOG: &str = include_str!("catalog/fixtures/v2.json");
+    const VERSION_THREE_CATALOG: &str = include_str!("catalog/fixtures/v3.json");
 
     /// A path in the form the catalog records it.
     ///
@@ -3572,6 +3629,28 @@ mod tests {
         assert_eq!(projects[1]["worktree_branch"], "agent/catalog-v2");
     }
 
+    #[test]
+    fn frozen_version_three_editor_configuration_loads_without_rewrite() {
+        let fixture = Fixture::new();
+        let local_root = fixture.directory("version-three-local");
+        fs::create_dir_all(&fixture.data_dir).unwrap();
+        let catalog_path = fixture.data_dir.join(CATALOG_FILE);
+        let fixture_bytes = catalog_fixture(
+            VERSION_THREE_CATALOG,
+            &[("__LOCAL_ROOT__", &as_catalogued(&local_root))],
+        );
+        fs::write(&catalog_path, &fixture_bytes).unwrap();
+
+        let service = ProjectService::load_from_data_dir(&fixture.data_dir).unwrap();
+
+        assert_eq!(service.list_catalog_only().unwrap().len(), 1);
+        assert_eq!(
+            service.editor_configuration().unwrap().unwrap().command(),
+            ["code", "--goto", "{file}:{line}:{column}"]
+        );
+        assert_eq!(fs::read(catalog_path).unwrap(), fixture_bytes);
+    }
+
     /// Set through `Command::env` on a re-executed child rather than
     /// `std::env::set_var`, which is unsound in a multithreaded test binary
     /// under Rust 2024.
@@ -3762,7 +3841,7 @@ mod tests {
                 project.get("available").is_none() && project.get("git").is_none()
             })
         );
-        assert_eq!(stored["version"], CATALOG_VERSION);
+        assert_eq!(stored["version"], WORKTREE_CATALOG_VERSION);
         let local = projects
             .iter()
             .find(|project| project["source"] == "local")
@@ -6155,6 +6234,25 @@ mod tests {
             Err(ProjectError::CatalogVersionTooNew { found, maximum })
                 if found == future_version && maximum == CATALOG_VERSION
         ));
+
+        // An editor field is v3 data. Accepting it under an older version
+        // would let a v1/v2 writer silently discard the user's configuration.
+        for legacy_version in [1, WORKTREE_CATALOG_VERSION] {
+            fs::write(
+                &catalog_path,
+                serde_json::to_vec(&serde_json::json!({
+                    "version": legacy_version,
+                    "projects": [],
+                    "editor": { "command": ["code", "{file}"] }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(matches!(
+                ProjectService::load_from_data_dir(&fixture.data_dir),
+                Err(ProjectError::MalformedCatalog { .. })
+            ));
+        }
     }
 
     #[test]

@@ -103,6 +103,13 @@ harkness --json worktree lock --reason <text> [--replace] [--project <worktree-s
 harkness --json worktree unlock [--project <worktree-selector>]
 harkness --json worktree prune [--project <parent-selector>]
 
+harkness --json editor show
+harkness --json editor presets
+harkness --json editor set --preset <kate|code|zed>
+harkness --json editor set -- <executable> <argument>... {file}
+harkness --json editor clear
+harkness --json editor open <path> [--line <line>] [--column <column>] [--project <selector>]
+
 harkness --json contract
 ```
 
@@ -114,8 +121,27 @@ JSON object per line, keeping standard output parseable. Help and version are
 deliberately plain text even when `--json` is present. `harkness --json contract`
 reports the current envelope version, exit codes, streams, and complete
 error-kind namespaces. It also reports `exit_code_by_kind`, which maps every
-CLI, project, and Git error kind to the exit code it returns, so a caller reads
-the classification instead of hardcoding it.
+CLI, project, Git, and editor error kind to the exit code it returns, so a
+caller reads the classification instead of hardcoding it.
+
+Editor commands store an argv template, not a shell command. Each argument is
+persisted separately and Harkness substitutes `{file}`, `{line}`, and
+`{column}` without invoking a shell, so paths containing spaces, metacharacters,
+or platform-native non-Unicode units stay one literal argument. `{file}` is
+required and line and column values are one-based. `editor presets` exposes
+templates for Kate, VS Code, and Zed; any executable can be configured with
+`editor set --`.
+
+An `editor open` launched from the CLI inherits the terminal. Without a saved
+configuration it tries `$VISUAL`, then `$EDITOR`, and finally the platform
+desktop opener. The GUI deliberately ignores terminal-editor environment
+variables and uses only a saved configuration or the desktop opener, with
+standard streams detached. Both front ends return as soon as the child starts;
+Harkness reaps the child in the background and never holds a project catalog or
+repository lock while the editor is running. Paths must be relative to the
+selected project, and the GUI refuses to launch when the corresponding
+working-tree file is absent. A staged or historical review also warns that its
+pinned content may differ from the file the editor opens.
 
 `git log` accepts one Git-style range: `REVISION` walks everything reachable
 from it, `OLD..NEW` walks commits reachable from `NEW` but not `OLD`, and

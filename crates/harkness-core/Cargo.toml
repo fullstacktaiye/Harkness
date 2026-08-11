@@ -13,6 +13,7 @@ dirs.workspace = true
 harkness-git.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+shlex.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 time.workspace = true
@@ -21,3 +22,4 @@ uuid.workspace = true
 [dev-dependencies]
 git2.workspace = true
 harkness-test-fixtures.workspace = true
+libc.workspace = true

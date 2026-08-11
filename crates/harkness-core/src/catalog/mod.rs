@@ -16,22 +16,39 @@ use tempfile::NamedTempFile;
 
 use crate::{
     catalog::entry::{Project, ProjectSource},
+    editor::EditorConfiguration,
     project::ProjectError,
 };
 
 /// The newest catalog schema understood by this Harkness build.
-pub(crate) const CATALOG_VERSION: u32 = 2;
+pub(crate) const CATALOG_VERSION: u32 = 3;
+/// The first schema that can represent managed worktrees.
+pub(crate) const WORKTREE_CATALOG_VERSION: u32 = 2;
 /// The oldest catalog schema this build can load without losing data.
 pub(crate) const MINIMUM_SUPPORTED_CATALOG_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Catalog {
     pub(crate) projects: Vec<Project>,
+    pub(crate) editor: Option<EditorConfiguration>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CatalogWire {
+    version: u32,
+    projects: Vec<Project>,
+    #[serde(default)]
+    editor: Option<EditorConfiguration>,
+}
+
+/// The strict body shared by the released v1 and v2 schemas.
+///
+/// Keeping this separate from [`CatalogWire`] prevents a new build from
+/// accepting v3-only data under an older version number.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyCatalogWire {
     version: u32,
     projects: Vec<Project>,
 }
@@ -82,14 +99,30 @@ pub(crate) fn read_catalog(catalog_path: &Path) -> Result<Catalog, ProjectError>
             if probe.version == 1 {
                 normalize_legacy_managed_rows(&mut body);
             }
-            let wire: CatalogWire =
-                serde_json::from_value(body).map_err(|source| ProjectError::MalformedCatalog {
-                    path: catalog_path.to_path_buf(),
-                    source,
+            let catalog = if probe.version < CATALOG_VERSION {
+                let wire: LegacyCatalogWire = serde_json::from_value(body).map_err(|source| {
+                    ProjectError::MalformedCatalog {
+                        path: catalog_path.to_path_buf(),
+                        source,
+                    }
                 })?;
-            debug_assert_eq!(wire.version, probe.version);
-            let catalog = Catalog {
-                projects: wire.projects,
+                debug_assert_eq!(wire.version, probe.version);
+                Catalog {
+                    projects: wire.projects,
+                    editor: None,
+                }
+            } else {
+                let wire: CatalogWire = serde_json::from_value(body).map_err(|source| {
+                    ProjectError::MalformedCatalog {
+                        path: catalog_path.to_path_buf(),
+                        source,
+                    }
+                })?;
+                debug_assert_eq!(wire.version, probe.version);
+                Catalog {
+                    projects: wire.projects,
+                    editor: wire.editor,
+                }
             };
             validate_catalog(catalog_path, &catalog)?;
             Ok(catalog)
@@ -189,6 +222,8 @@ fn invalid_catalog(catalog_path: &Path, reason: String) -> ProjectError {
 struct PersistedCatalog<'a> {
     version: u32,
     projects: &'a [Project],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    editor: &'a Option<EditorConfiguration>,
 }
 
 pub(crate) fn persist_catalog(
@@ -198,22 +233,25 @@ pub(crate) fn persist_catalog(
 ) -> io::Result<()> {
     fs::create_dir_all(data_dir)?;
     let mut temporary = NamedTempFile::new_in(data_dir)?;
-    // v2 is required only once v2-only data exists. Keeping v1-compatible
-    // catalogs at v1 means opening or importing a project never prevents the
-    // previous Harkness release from reading the file. Removing the final
-    // worktree naturally restores that downgrade path.
-    let version = if catalog
+    // Persist the oldest schema that can represent every field: editor
+    // configuration requires v3, a worktree requires v2, and an ordinary
+    // project remains v1-compatible. Removing the last newer field naturally
+    // restores the corresponding downgrade path.
+    let version = if catalog.editor.is_some() {
+        CATALOG_VERSION
+    } else if catalog
         .projects
         .iter()
         .any(|project| matches!(project.source, ProjectSource::Worktree { .. }))
     {
-        CATALOG_VERSION
+        WORKTREE_CATALOG_VERSION
     } else {
         MINIMUM_SUPPORTED_CATALOG_VERSION
     };
     let persisted = PersistedCatalog {
         version,
         projects: &catalog.projects,
+        editor: &catalog.editor,
     };
     serde_json::to_writer_pretty(&mut temporary, &persisted).map_err(io::Error::other)?;
     temporary.write_all(b"\n")?;

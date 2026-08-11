@@ -220,6 +220,21 @@ ColumnLayout {
         });
     }
 
+    function openReviewLine(line) {
+        if (reviewFile.fileId === undefined)
+            return;
+        backend.openReviewLine(project.id, reviewFile.fileId, Math.max(1, Number(line || 1)));
+    }
+
+    function openCurrentReviewLine() {
+        const index = reviewLineView.currentIndex;
+        if (index < 0 || index >= reviewRows.length)
+            return;
+        const row = reviewRows[index];
+        if (row.type === "line" && reviewRowDisplayed(row))
+            openReviewLine(row.openLine);
+    }
+
     function reviewRowDisplayed(row) {
         return !(splitLayout && row.type === "line" && row.splitHidden === true);
     }
@@ -844,14 +859,31 @@ ColumnLayout {
                         }
                     }
 
-                    Controls.Label {
+                    RowLayout {
                         Layout.fillWidth: true
-                        elide: Text.ElideMiddle
-                        font.bold: true
-                        font.family: "monospace"
-                        text: reviewSurface.reviewFile.path || ""
-                        textFormat: Text.PlainText
-                        visible: text.length > 0
+                        visible: reviewSurface.reviewFile.path !== undefined
+                            && String(reviewSurface.reviewFile.path).length > 0
+
+                        Controls.Label {
+                            Layout.fillWidth: true
+                            elide: Text.ElideMiddle
+                            font.bold: true
+                            font.family: "monospace"
+                            text: reviewSurface.reviewFile.path || ""
+                            textFormat: Text.PlainText
+                        }
+
+                        Controls.ToolButton {
+                            Accessible.name: text
+                            Controls.ToolTip.text: qsTr("Open the first changed line in the configured editor")
+                            Controls.ToolTip.visible: hovered
+                            display: Controls.AbstractButton.IconOnly
+                            icon.name: "document-edit"
+                            text: qsTr("Open in editor")
+                            onClicked: reviewSurface.openReviewLine(
+                                reviewSurface.reviewFile.firstLine || 1
+                            )
+                        }
                     }
 
                     Kirigami.InlineMessage {
@@ -865,6 +897,8 @@ ColumnLayout {
                         id: reviewLineView
 
                         Accessible.name: qsTr("Changed lines for %1").arg(reviewSurface.reviewFile.path || "")
+                        Accessible.description: qsTr("Use the arrow keys to select a row and Enter to open a changed line in the editor")
+                        Accessible.role: Accessible.List
                         // The diff takes every row the chrome above it does not need, and
                         // scrolls itself rather than riding a scroll view around the whole
                         // surface — which is what used to cap it at a fixed box.
@@ -879,6 +913,9 @@ ColumnLayout {
                         model: reviewSurface.reviewRows
                         reuseItems: true
                         visible: reviewSurface.reviewRows.length > 0
+
+                        Keys.onEnterPressed: reviewSurface.openCurrentReviewLine()
+                        Keys.onReturnPressed: reviewSurface.openCurrentReviewLine()
 
                         delegate: Loader {
                             id: reviewRowLoader
@@ -1033,6 +1070,13 @@ ColumnLayout {
                 "segments": []
             })
             readonly property bool hidden: !reviewSurface.reviewRowDisplayed(row)
+            readonly property bool current: reviewLineView.currentIndex === rowIndex
+            Accessible.name: qsTr("Open diff line %1 in editor").arg(row.openLine || 1)
+            Accessible.role: Accessible.Button
+            Accessible.selectable: true
+            Accessible.selected: current
+            Controls.ToolTip.text: qsTr("Open line %1 in editor").arg(row.openLine || 1)
+            Controls.ToolTip.visible: reviewLineHover.hovered
             implicitHeight: hidden
                 ? 0
                 : reviewSurface.splitLayout
@@ -1041,11 +1085,28 @@ ColumnLayout {
             visible: !hidden
             width: ListView.view ? ListView.view.width : implicitWidth
 
+            HoverHandler {
+                id: reviewLineHover
+            }
+
+            TapHandler {
+                acceptedButtons: Qt.LeftButton
+                onTapped: {
+                    reviewLineView.currentIndex = reviewLineDelegate.rowIndex;
+                    reviewLineView.forceActiveFocus();
+                    reviewSurface.openReviewLine(reviewLineDelegate.row.openLine);
+                }
+            }
+
             Rectangle {
                 id: unifiedLine
 
                 anchors.left: parent.left
                 anchors.right: parent.right
+                border.color: reviewLineDelegate.current
+                    ? Kirigami.Theme.highlightColor
+                    : "transparent"
+                border.width: reviewLineDelegate.current ? 2 : 0
                 color: reviewSurface.lineColor(reviewLineDelegate.unified.kind)
                 implicitHeight: unifiedLayout.implicitHeight + Kirigami.Units.smallSpacing
                 visible: !reviewSurface.splitLayout
@@ -1118,6 +1179,10 @@ ColumnLayout {
                         required property var modelData
 
                         Layout.fillWidth: true
+                        border.color: reviewLineDelegate.current
+                            ? Kirigami.Theme.highlightColor
+                            : "transparent"
+                        border.width: reviewLineDelegate.current ? 2 : 0
                         color: modelData.present === true
                             ? reviewSurface.lineColor(modelData.kind)
                             : reviewSurface.tint(Kirigami.Theme.disabledTextColor, 0.04)

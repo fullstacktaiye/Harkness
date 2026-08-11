@@ -6,6 +6,7 @@
 //! dependency.
 
 mod catalog;
+mod editor;
 mod listing;
 mod paths;
 mod project;
@@ -14,6 +15,10 @@ mod remote;
 mod testing;
 
 pub use catalog::entry::{Project, ProjectId, ProjectSource};
+pub use editor::{
+    EditorConfiguration, EditorError, EditorLaunch, EditorLaunchContext, EditorPosition,
+    EditorPreset,
+};
 pub use harkness_git;
 pub use harkness_git::{
     Cancellation, GitError, GitService, GitStatus, InspectionSource, WorktreeBase,
