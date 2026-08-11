@@ -132,6 +132,28 @@ incomplete fold in its result row instead of failing, so a reader on another
 connection can leave frames behind; the store reads that row and refuses rather
 than letting a backup be taken on a checkpoint that never finished.
 
+## Workspace Trust & Process Safety Invariants
+
+Workspace trust binds a decision to both `ProjectId` and the canonical root.
+Neither identity alone is a grant: no row, a moved or unavailable checkout, and
+a path reused by another catalog entry all resolve as `Untrusted`. Trust lives
+in its own versioned `runtime.db` table, not in `projects.json`, and a trust read
+never repairs or rewrites either store.
+
+Every tool-supplied filesystem path crosses `PathBoundary` before use. The
+boundary canonicalizes the nearest existing ancestor, restores a missing tail,
+and checks the result against the canonical workspace and explicit extra roots.
+A symlink reached inside an allowed root that targets outside every allowed root
+is refused by name. Downstream APIs accept `ContainedPath`; do not add a second
+unchecked path route or turn it back into a public tuple field.
+
+Arbitrary tool children are described only by `CommandSpec`: an executable, an
+argv vector, a contained working directory, and an exact `AllowlistedEnv`. The
+environment starts empty and admits present baseline variables plus validated
+exact names published by the tool descriptor; no wildcard and no shell-string
+API exists. This does not change `GitCommand`: Git is one known executable whose
+credential integrations require its deliberately separate denylist model.
+
 ## Event Log & Artifact Store Invariants
 
 `run_events` is append-only in the strict sense: the repository layer contains no
@@ -531,9 +553,10 @@ why `ArtifactWriter::open` is the required method and `write` is provided in ter
 of it: buffered and streamed content must not be able to take different routes to
 redaction, hashing, and naming.
 
-A tool's child inherits *no* environment. `harkness-cli` runs from hooks and from
-inside other processes, so the environment is not a place a decision may come from;
-only what a tool names explicitly is passed.
+A tool's child starts with *no* inherited environment. `harkness-cli` runs from
+hooks and from inside other processes, so the environment is not a place a decision
+may come from; only the fixed baseline and exact names published by the tool
+descriptor are copied into the empty environment.
 
 A result the output schema refuses is never delivered, and the value is not thrown
 away either: it is written as the `rejected-output.json` artifact of that call,

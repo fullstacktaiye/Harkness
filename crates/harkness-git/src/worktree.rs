@@ -499,10 +499,10 @@ fn path_from_git(path: &[u8]) -> Result<PathBuf, GitError> {
 
 pub(crate) fn same_path(left: &Path, right: &Path) -> bool {
     match (
-        canonicalize_with_missing_tail(left),
-        canonicalize_with_missing_tail(right),
+        crate::canonicalize_with_missing_tail(left),
+        crate::canonicalize_with_missing_tail(right),
     ) {
-        (Some(left), Some(right)) => left == right,
+        (Ok(left), Ok(right)) => left == right,
         _ => left == right,
     }
 }
@@ -518,29 +518,6 @@ fn administrative_name_at(root: &Path) -> Option<String> {
     }
     let path = path_from_git(git_dir).ok()?;
     path.file_name()?.to_str().map(str::to_owned)
-}
-
-/// Canonicalizes as much of a path as still exists, then restores its missing
-/// suffix. Git retains administrative rows after a checkout is deleted, and
-/// on Windows its path spelling can differ from Rust's canonical catalog path
-/// (notably the extended-length prefix). Comparing the nearest surviving
-/// ancestor keeps those stale rows matchable without requiring the leaf to
-/// exist.
-fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
-    let mut ancestor = path;
-    let mut missing = Vec::new();
-
-    loop {
-        if let Ok(mut canonical) = ancestor.canonicalize() {
-            for component in missing.iter().rev() {
-                canonical.push(component);
-            }
-            return Some(canonical);
-        }
-
-        missing.push(ancestor.file_name()?.to_os_string());
-        ancestor = ancestor.parent()?;
-    }
 }
 
 fn inspection(path: &Path, source: git2::Error) -> GitError {

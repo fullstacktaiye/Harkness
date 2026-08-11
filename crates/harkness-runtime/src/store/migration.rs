@@ -40,6 +40,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: 2,
         statements: include_str!("migrations/002_events_and_artifacts.sql"),
     },
+    Migration {
+        version: 3,
+        statements: include_str!("migrations/003_workspace_trust.sql"),
+    },
 ];
 
 /// Newest schema version this build understands.
@@ -167,7 +171,8 @@ mod tests {
                 "runs",
                 "steps",
                 "tasks",
-                "tool_calls"
+                "tool_calls",
+                "workspace_trust"
             ]
         );
 

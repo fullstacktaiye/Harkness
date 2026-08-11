@@ -7,7 +7,6 @@
 //! that it resolves within the addressed working tree.
 
 use std::{
-    ffi::OsString,
     fs,
     path::{Path, PathBuf},
 };
@@ -484,10 +483,10 @@ pub(crate) fn validate_paths(root: &Path, paths: &[PathBuf]) -> Result<(), GitEr
         } else {
             root.join(path)
         };
-        let resolved = canonicalize_with_missing_tail(&candidate);
+        let resolved = crate::canonicalize_with_missing_tail(&candidate);
         if resolved
             .as_ref()
-            .is_none_or(|resolved| !resolved.starts_with(&repository))
+            .map_or(true, |resolved| !resolved.starts_with(&repository))
         {
             return Err(GitError::PathOutsideRepository {
                 path: path.clone(),
@@ -496,27 +495,6 @@ pub(crate) fn validate_paths(root: &Path, paths: &[PathBuf]) -> Result<(), GitEr
         }
     }
     Ok(())
-}
-
-/// Canonicalizes the existing prefix and lexically restores a missing tail.
-///
-/// Deleted tracked files have to be valid staging targets, so requiring the
-/// complete path to exist would reject exactly the deletion `git add` needs to
-/// record. Resolving the nearest existing ancestor still catches `..` and
-/// symlink escapes while permitting that absent leaf.
-fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
-    let mut current = path;
-    let mut missing = Vec::<OsString>::new();
-    loop {
-        if let Ok(mut resolved) = fs::canonicalize(current) {
-            for component in missing.iter().rev() {
-                resolved.push(component);
-            }
-            return Some(resolved);
-        }
-        missing.push(current.file_name()?.to_os_string());
-        current = current.parent()?;
-    }
 }
 
 /// Whether the index differs from `HEAD`, optionally only for `paths`.

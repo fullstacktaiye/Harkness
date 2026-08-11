@@ -32,14 +32,12 @@ use super::{
     ToolMetadata, ToolRegistry, ToolVersion, UnsupportedArtifacts, erase, invoke, invoke_resolved,
 };
 
-const WORKSPACE: &str = if cfg!(windows) {
-    r"C:\workspace"
-} else {
-    "/workspace"
-};
+fn workspace() -> std::path::PathBuf {
+    std::env::temp_dir()
+}
 
 fn context() -> ExecutionContext {
-    ExecutionContext::detached(RunId::new(), StepId::new(), ToolCallId::new(), WORKSPACE).unwrap()
+    ExecutionContext::detached(RunId::new(), StepId::new(), ToolCallId::new(), workspace()).unwrap()
 }
 
 fn raw(json: &str) -> Box<RawValue> {
@@ -626,7 +624,7 @@ fn a_tool_dispatched_after_cancellation_never_starts() {
         RunId::new(),
         StepId::new(),
         ToolCallId::new(),
-        WORKSPACE,
+        workspace(),
         cancellation.clone(),
         Box::new(DiscardedProgress),
         Box::new(UnsupportedArtifacts),
@@ -990,7 +988,7 @@ fn a_failed_unpinned_call_still_reports_the_version_that_ran() {
             RunId::new(),
             StepId::new(),
             ToolCallId::new(),
-            WORKSPACE,
+            workspace(),
             cancellation.clone(),
             Box::new(DiscardedProgress),
             Box::new(UnsupportedArtifacts),
@@ -1126,7 +1124,7 @@ fn a_tool_can_return_an_artifact_reference_in_its_output() {
         RunId::new(),
         StepId::new(),
         ToolCallId::new(),
-        WORKSPACE,
+        workspace(),
         Cancellation::default(),
         Box::new(DiscardedProgress),
         Box::new(Storing),
@@ -1331,7 +1329,7 @@ fn cancellation_reaches_the_tool_through_the_shared_token() {
         RunId::new(),
         StepId::new(),
         ToolCallId::new(),
-        WORKSPACE,
+        workspace(),
         cancellation.clone(),
         Box::new(DiscardedProgress),
         Box::new(UnsupportedArtifacts),
@@ -1364,7 +1362,7 @@ fn a_running_tool_reports_progress_through_its_context() {
         RunId::new(),
         StepId::new(),
         ToolCallId::new(),
-        WORKSPACE,
+        workspace(),
         Cancellation::default(),
         Box::new(recorder.clone()),
         Box::new(UnsupportedArtifacts),

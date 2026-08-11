@@ -16,6 +16,82 @@ pub const MAX_TITLE_LENGTH: usize = 120;
 /// Longest accepted descriptor description.
 pub const MAX_DESCRIPTION_LENGTH: usize = 2048;
 
+/// Longest accepted environment-variable declaration.
+pub const MAX_ENVIRONMENT_NAME_LENGTH: usize = 128;
+
+/// A validated, cross-platform environment-variable name.
+///
+/// Names are canonicalized to uppercase ASCII. Windows environment lookup is
+/// case-insensitive, so retaining caller casing would let two descriptor names
+/// denote one variable and would let a differently-cased declaration retrieve
+/// a sensitive value. One canonical spelling keeps policy and execution equal
+/// on every supported platform.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct EnvironmentName(String);
+
+impl EnvironmentName {
+    /// Validates an ASCII identifier and returns its canonical spelling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvironmentError::InvalidName`] for an empty, overlong, or
+    /// non-identifier spelling.
+    pub fn new(name: impl Into<String>) -> Result<Self, EnvironmentError> {
+        let name = name.into();
+        let mut bytes = name.bytes();
+        let first = bytes.next();
+        let valid = first.is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
+            && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric());
+        let reason = if name.is_empty() {
+            Some("it must not be empty")
+        } else if name.len() > MAX_ENVIRONMENT_NAME_LENGTH {
+            Some("it is longer than 128 bytes")
+        } else if !valid {
+            Some("it must match [A-Za-z_][A-Za-z0-9_]*")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(EnvironmentError::InvalidName { name, reason });
+        }
+        Ok(Self(name.to_ascii_uppercase()))
+    }
+
+    /// Canonical validated name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A declaration that cannot become a process-environment name.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum EnvironmentError {
+    /// The spelling is not one exact environment identifier.
+    #[error("{name:?} is not a valid environment variable name: {reason}")]
+    InvalidName {
+        /// Refused spelling.
+        name: String,
+        /// Stable validation explanation.
+        reason: &'static str,
+    },
+}
+
+impl EnvironmentError {
+    /// Every stable discriminant this error namespace can emit.
+    pub const KINDS: &'static [&'static str] = &["invalid_environment_name"];
+
+    /// Stable machine-readable discriminant.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::InvalidName { .. } => "invalid_environment_name",
+        }
+    }
+}
+
 /// Reason reported for a blank title or description.
 const BLANK: &str = "it must not be blank; it is what a person reads before approving";
 
@@ -251,6 +327,7 @@ pub struct ToolMetadata {
     description: String,
     risk: RiskLevel,
     capabilities: Vec<Capability>,
+    environment: Vec<EnvironmentName>,
     timeout: ToolTimeout,
 }
 
@@ -273,6 +350,7 @@ impl ToolMetadata {
             description: description.into(),
             risk,
             capabilities: Vec::new(),
+            environment: Vec::new(),
             timeout: ToolTimeout::for_risk(risk),
         }
     }
@@ -307,6 +385,21 @@ impl ToolMetadata {
         self
     }
 
+    /// Declares parent-environment variables this tool's child processes need.
+    ///
+    /// Names are validated before they reach this builder. The list is sorted
+    /// and deduplicated so it is a stable part of the published contract.
+    #[must_use]
+    pub fn with_environment(
+        mut self,
+        environment: impl IntoIterator<Item = EnvironmentName>,
+    ) -> Self {
+        self.environment.extend(environment);
+        self.environment.sort_unstable();
+        self.environment.dedup();
+        self
+    }
+
     /// Identity this tool is registered and recorded under.
     #[must_use]
     pub const fn identity(&self) -> &ToolIdentity {
@@ -335,6 +428,12 @@ impl ToolMetadata {
     #[must_use]
     pub fn capabilities(&self) -> &[Capability] {
         &self.capabilities
+    }
+
+    /// Parent-environment variables child processes may inherit.
+    #[must_use]
+    pub fn environment(&self) -> &[EnvironmentName] {
+        &self.environment
     }
 
     /// What bounds a call of this tool, absent a caller override.
@@ -409,6 +508,7 @@ pub struct ToolDescriptor {
     description: String,
     risk: RiskLevel,
     capabilities: Vec<Capability>,
+    environment: Vec<EnvironmentName>,
     #[serde(rename = "default_timeout_ms")]
     timeout: ToolTimeout,
     input_schema: Value,
@@ -424,6 +524,7 @@ impl ToolDescriptor {
             description,
             risk,
             capabilities,
+            environment,
             timeout,
         } = metadata;
         Self {
@@ -432,6 +533,7 @@ impl ToolDescriptor {
             description,
             risk,
             capabilities,
+            environment,
             timeout,
             input_schema,
             output_schema,
@@ -480,6 +582,12 @@ impl ToolDescriptor {
         &self.capabilities
     }
 
+    /// Parent-environment variables child processes may inherit.
+    #[must_use]
+    pub fn environment(&self) -> &[EnvironmentName] {
+        &self.environment
+    }
+
     /// What bounds a call of this tool, absent a caller override.
     #[must_use]
     pub const fn timeout(&self) -> ToolTimeout {
@@ -515,6 +623,7 @@ mod tests {
 
     use serde_json::json;
 
+    use super::EnvironmentName;
     use super::{
         LOCAL_WORK_TIMEOUT, MAX_DESCRIPTION_LENGTH, MAX_TITLE_LENGTH, OBSERVE_TIMEOUT, RiskLevel,
         ToolDescriptor, ToolMetadata, ToolTimeout,
@@ -613,6 +722,30 @@ mod tests {
             .map(|capability| capability.as_str())
             .collect::<Vec<_>>();
         assert_eq!(spellings, ["fs.read", "fs.write", "network"]);
+    }
+
+    #[test]
+    fn environment_declarations_are_sorted_deduplicated_and_published() {
+        let metadata = metadata().with_environment([
+            EnvironmentName::new("SSH_AUTH_SOCK").unwrap(),
+            EnvironmentName::new("CARGO_HOME").unwrap(),
+            EnvironmentName::new("SSH_AUTH_SOCK").unwrap(),
+        ]);
+        assert_eq!(
+            metadata
+                .environment()
+                .iter()
+                .map(EnvironmentName::as_str)
+                .collect::<Vec<_>>(),
+            ["CARGO_HOME", "SSH_AUTH_SOCK"]
+        );
+
+        let descriptor = ToolDescriptor::new(metadata, json!({}), json!({}));
+        assert_eq!(descriptor.environment().len(), 2);
+        assert_eq!(
+            serde_json::to_value(descriptor).unwrap()["environment"],
+            json!(["CARGO_HOME", "SSH_AUTH_SOCK"])
+        );
     }
 
     #[test]
@@ -766,7 +899,7 @@ mod tests {
             concat!(
                 r#"{"id":"fixture.tool","version":"1.0.0","title":"Fixture tool","#,
                 r#""description":"Echoes its input back for tests.","risk":"observe","#,
-                r#""capabilities":["fs.read"],"default_timeout_ms":30000,"#,
+                r#""capabilities":["fs.read"],"environment":[],"default_timeout_ms":30000,"#,
                 r#""input_schema":{"type":"object"},"output_schema":{"type":"string"}}"#,
             )
         );

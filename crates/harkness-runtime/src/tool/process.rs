@@ -27,14 +27,14 @@
 //!
 //! # The environment is scrubbed, not inherited
 //!
-//! A tool's child inherits nothing that could redirect it, for the same reason
+//! A tool's child starts with an empty environment, for the same reason
 //! `harkness-git` pins its own: `harkness-cli` runs from hooks and from inside
 //! other processes, so "the environment" is not a place a decision may come
-//! from. Only what a tool names explicitly is passed.
+//! from. Only the fixed baseline and exact names published by the tool are
+//! copied into it.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::io::{self, Read};
-use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::{self, JoinHandle};
@@ -42,6 +42,7 @@ use std::thread::{self, JoinHandle};
 use super::{
     ArtifactRef, ArtifactStream, ExecutionContext, POLL_INTERVAL, ProgressEvent, ToolError,
 };
+use crate::trust::{AllowlistedEnv, CommandSpec, ContainedPath};
 
 /// Bytes read from a child's pipe in one go.
 const READ_BUFFER_BYTES: usize = 8 * 1024;
@@ -213,61 +214,25 @@ impl ProcessOutput {
 pub struct ToolProcess {
     program: OsString,
     arguments: Vec<OsString>,
-    working_directory: Option<PathBuf>,
-    environment: Vec<(OsString, OsString)>,
+    working_directory: ContainedPath,
+    environment: AllowlistedEnv,
     stdout: Capture,
     stderr: Capture,
 }
 
 impl ToolProcess {
-    /// Prepares an invocation of `program`.
+    /// Prepares an invocation from an argv-only, contained command description.
     #[must_use]
-    pub fn new(program: impl AsRef<OsStr>) -> Self {
+    pub fn new(spec: CommandSpec) -> Self {
+        let (program, arguments, working_directory, environment) = spec.into_parts();
         Self {
-            program: program.as_ref().to_os_string(),
-            arguments: Vec::new(),
-            working_directory: None,
-            environment: Vec::new(),
+            program,
+            arguments,
+            working_directory,
+            environment,
             stdout: Capture::Tail,
             stderr: Capture::Tail,
         }
-    }
-
-    /// Appends one argument.
-    #[must_use]
-    pub fn arg(mut self, argument: impl AsRef<OsStr>) -> Self {
-        self.arguments.push(argument.as_ref().to_os_string());
-        self
-    }
-
-    /// Appends several arguments.
-    #[must_use]
-    pub fn args(mut self, arguments: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Self {
-        self.arguments.extend(
-            arguments
-                .into_iter()
-                .map(|argument| argument.as_ref().to_os_string()),
-        );
-        self
-    }
-
-    /// Runs the child in `directory` rather than in the calling process's.
-    #[must_use]
-    pub fn current_dir(mut self, directory: impl Into<PathBuf>) -> Self {
-        self.working_directory = Some(directory.into());
-        self
-    }
-
-    /// Sets one environment variable for the child.
-    ///
-    /// The child's environment is otherwise empty: nothing is inherited, so a
-    /// variable a hook or a parent process exported cannot change what a tool
-    /// does. A tool that needs `PATH` or `HOME` asks for it here.
-    #[must_use]
-    pub fn env(mut self, name: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
-        self.environment
-            .push((name.as_ref().to_os_string(), value.as_ref().to_os_string()));
-        self
     }
 
     /// Decides what becomes of the child's standard output.
@@ -395,20 +360,25 @@ impl ToolProcess {
 
     /// Starts the child with the invocation policy every tool process carries.
     fn spawn(&self) -> Result<Child, ToolError> {
+        // `ContainedPath` is a point-in-time proof. Re-resolve immediately
+        // before launch so a symlink retargeted while a call awaited approval
+        // cannot redirect the child's working directory outside its grant.
+        let working_directory = self
+            .working_directory
+            .revalidate()
+            .map_err(ToolError::from)?;
         let mut command = Command::new(&self.program);
         command
             .args(&self.arguments)
             .env_clear()
-            .envs(self.environment.iter().map(|(name, value)| (name, value)))
+            .envs(self.environment.iter())
             // Closed rather than inherited: a front end has no terminal to answer
             // a prompt on, so a child that reaches for one must fail rather than
             // hang on a question nobody can see.
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(directory) = &self.working_directory {
-            command.current_dir(directory);
-        }
+        command.current_dir(working_directory.as_path());
         // The child leads its own group, which is what makes cancellation and
         // the deadline able to stop a whole tree rather than only its root.
         #[cfg(unix)]

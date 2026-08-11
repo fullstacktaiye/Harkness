@@ -555,6 +555,51 @@ fn an_approved_call_runs_and_records_the_decision_beside_the_version_it_authoriz
 }
 
 #[test]
+fn an_unavailable_workspace_terminalizes_a_pending_call() {
+    let fixture = Fixture::new();
+    let executor = fixture.executor(registry_of(vec![erase(Echo("1.0.0"))]));
+    let call = fixture.pending("fixture.echo", json!({"message": "never runs"}));
+    let missing = fixture.workspace.path().join("missing");
+
+    let completed = executor
+        .execute(call, &missing, &Cancellation::default())
+        .unwrap();
+
+    assert_eq!(completed.state(), ToolCallState::Failed);
+    assert_eq!(completed.outcome().failure_kind(), Some("root_unavailable"));
+    assert_eq!(
+        fixture.store.load_tool_call(call).unwrap().state(),
+        ToolCallState::Failed
+    );
+}
+
+#[test]
+fn an_unavailable_workspace_still_records_an_approval_and_terminal_failure() {
+    let fixture = Fixture::new();
+    let executor = fixture.executor(registry_of(vec![erase(Echo("1.0.0"))]));
+    let call = fixture.pending("fixture.echo", json!({"message": "never runs"}));
+    fixture
+        .store
+        .transition_tool_call(call, ToolCallState::AwaitingApproval, at(4))
+        .unwrap();
+    let missing = fixture.workspace.path().join("missing");
+
+    let completed = executor
+        .execute_approved(
+            call,
+            "taiye@example.com",
+            &missing,
+            &Cancellation::default(),
+        )
+        .unwrap();
+
+    assert_eq!(completed.state(), ToolCallState::Failed);
+    assert_eq!(completed.outcome().failure_kind(), Some("root_unavailable"));
+    assert_eq!(completed.record().approvals().len(), 1);
+    assert_eq!(completed.record().tool_version(), "1.0.0");
+}
+
+#[test]
 fn each_entry_point_admits_exactly_one_state() {
     let fixture = Fixture::new();
     let executor = fixture.executor(registry_of(vec![erase(Echo("1.0.0"))]));
@@ -1112,7 +1157,9 @@ mod processes {
     use harkness_test_fixtures::Fixture as ShimFixture;
 
     use super::*;
+    use crate::tool::EnvironmentName;
     use crate::tool::{Capture, ProcessOutput, ToolProcess};
+    use crate::trust::{AllowlistedEnv, CommandSpec};
 
     /// A tool that runs one shim and reports what it produced.
     ///
@@ -1150,7 +1197,11 @@ mod processes {
             input: RunInput,
             context: &mut ExecutionContext,
         ) -> Result<RunOutput, ToolError> {
-            let mut process = ToolProcess::new(&input.program).capture_stderr(Capture::Tail);
+            let cwd = context.resolve(".")?;
+            let env = AllowlistedEnv::build(std::iter::empty::<&EnvironmentName>());
+            let spec = CommandSpec::new(&input.program, Vec::new(), cwd, env)
+                .map_err(ToolError::execution_failed)?;
+            let mut process = ToolProcess::new(spec).capture_stderr(Capture::Tail);
             if input.capture_stdout {
                 process = process.capture_stdout(Capture::artifact("stdout.log"));
             }

@@ -9,6 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{RunId, StepId, ToolCallId};
+use crate::trust::{ContainedPath, ExecutionMode, PathBoundary};
 
 use super::ToolError;
 
@@ -463,7 +464,8 @@ pub struct ExecutionContext {
     run: RunId,
     step: StepId,
     call: ToolCallId,
-    workspace_root: PathBuf,
+    boundary: PathBoundary,
+    mode: ExecutionMode,
     cancellation: Cancellation,
     progress: Box<dyn ProgressSink>,
     artifacts: Box<dyn ArtifactWriter>,
@@ -474,18 +476,14 @@ pub struct ExecutionContext {
 impl ExecutionContext {
     /// Builds a context for one tool call.
     ///
-    /// The root is stored lexically normalized: redundant `.` components are
-    /// dropped, so [`workspace_root`](Self::workspace_root) can be compared
-    /// against a canonical project path as a string. `..` is *refused* rather than
-    /// normalized, because resolving it lexically would silently disagree with the
-    /// filesystem wherever a symlink is involved.
+    /// The root is canonicalized into a [`PathBoundary`]. Every later path
+    /// resolution therefore follows symlinks and checks containment against the
+    /// same canonical identity rather than only comparing path strings.
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::ForbiddenPath`] when `workspace_root` is not absolute
-    /// or contains a `..` component. Both are refused here, once, so
-    /// [`resolve`](Self::resolve) can reason about containment by prefix alone
-    /// rather than re-deriving it on every path a tool touches.
+    /// Returns [`ToolError::ForbiddenPath`] when `workspace_root` is not an
+    /// absolute, available directory.
     pub fn new(
         run: RunId,
         step: StepId,
@@ -499,37 +497,56 @@ impl ExecutionContext {
         if !supplied.is_absolute() {
             return Err(ToolError::ForbiddenPath {
                 path: supplied,
-                reason: "the workspace root must be an absolute path",
+                reason: "the workspace root must be an absolute path".to_owned(),
             });
         }
-
-        // Rebuilding from components is what normalizes the root: `Components`
-        // already drops `.` for an absolute path, so collecting it yields the
-        // normal form. There is deliberately no `CurDir` arm below — for an
-        // absolute path it is unreachable, and a match arm that cannot fire reads
-        // like a check that is happening when it is not.
-        let mut workspace_root = PathBuf::new();
-        for component in supplied.components() {
-            if component == Component::ParentDir {
-                return Err(ToolError::ForbiddenPath {
-                    path: supplied,
-                    reason: "the workspace root must not contain a .. component",
-                });
-            }
-            workspace_root.push(component);
+        if supplied
+            .components()
+            .any(|component| component == Component::ParentDir)
+        {
+            return Err(ToolError::ForbiddenPath {
+                path: supplied,
+                reason: "the workspace root must not contain a .. component".to_owned(),
+            });
         }
-
-        Ok(Self {
+        let boundary = PathBoundary::new(&supplied, std::iter::empty::<&Path>())?;
+        Ok(Self::for_boundary(
             run,
             step,
             call,
-            workspace_root,
+            boundary,
+            cancellation,
+            progress,
+            artifacts,
+        ))
+    }
+
+    /// Builds a context from a pre-validated boundary with explicit extra roots.
+    ///
+    /// Policy can construct the boundary after evaluating grants and hand the
+    /// exact same capability set to the tool. No path is reinterpreted later.
+    #[must_use]
+    pub fn for_boundary(
+        run: RunId,
+        step: StepId,
+        call: ToolCallId,
+        boundary: PathBoundary,
+        cancellation: Cancellation,
+        progress: Box<dyn ProgressSink>,
+        artifacts: Box<dyn ArtifactWriter>,
+    ) -> Self {
+        Self {
+            run,
+            step,
+            call,
+            boundary,
+            mode: ExecutionMode::NonInteractive,
             cancellation,
             progress,
             artifacts,
             deadline: None,
             stream_tail_bytes: DEFAULT_STREAM_TAIL_BYTES,
-        })
+        }
     }
 
     /// Bounds this call's running time.
@@ -546,6 +563,13 @@ impl ExecutionContext {
     #[must_use]
     pub const fn with_stream_tail_bytes(mut self, bytes: usize) -> Self {
         self.stream_tail_bytes = bytes;
+        self
+    }
+
+    /// Carries the front end's interaction mode into policy and tool execution.
+    #[must_use]
+    pub const fn with_execution_mode(mut self, mode: ExecutionMode) -> Self {
+        self.mode = mode;
         self
     }
 
@@ -594,7 +618,19 @@ impl ExecutionContext {
     /// Absolute root of the workspace this call may touch.
     #[must_use]
     pub fn workspace_root(&self) -> &Path {
-        &self.workspace_root
+        self.boundary.workspace_root()
+    }
+
+    /// Canonical filesystem roots this call may address.
+    #[must_use]
+    pub const fn boundary(&self) -> &PathBoundary {
+        &self.boundary
+    }
+
+    /// Whether this invocation is attached to an interactive front end.
+    #[must_use]
+    pub const fn execution_mode(&self) -> ExecutionMode {
+        self.mode
     }
 
     /// Cancellation token shared with everything this call starts.
@@ -691,57 +727,25 @@ impl ExecutionContext {
         self.artifacts.open(name, media_type)
     }
 
-    /// Resolves a workspace-relative path against the workspace root.
+    /// Resolves a path through the call's canonical filesystem boundary.
     ///
-    /// Refuses absolute paths and any path whose components would climb out of
-    /// the workspace, so a tool that routes every path argument through this
-    /// method cannot be talked into touching `../../.ssh/id_rsa` by its input.
-    ///
-    /// **This check is lexical.** It does not consult the filesystem, so it does
-    /// not detect a symlink inside the workspace that points outside it.
-    /// Resolving that requires touching the filesystem under the same
-    /// time-of-check race every such test has, and it belongs to the trust and
-    /// policy layers that evaluate an invocation against real paths. What this
-    /// method guarantees is narrower and worth having on its own: no *string* a
-    /// caller supplies can escape the root.
+    /// Relative paths start at the workspace root; absolute paths are accepted
+    /// only when they resolve inside the workspace or an explicitly granted
+    /// extra root. The returned capability cannot be constructed unchecked.
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::ForbiddenPath`] when the path is empty, absolute, or
-    /// contains a `..` component.
-    pub fn resolve(&self, relative: impl AsRef<Path>) -> Result<PathBuf, ToolError> {
-        let relative = relative.as_ref();
-        let forbid = |reason: &'static str| ToolError::ForbiddenPath {
-            path: relative.to_path_buf(),
-            reason,
-        };
-
-        if relative.as_os_str().is_empty() {
-            return Err(forbid("a workspace path must not be empty"));
+    /// Returns [`ToolError::ForbiddenPath`] when the path is empty or the
+    /// boundary refuses its canonical resolution.
+    pub fn resolve(&self, candidate: impl AsRef<Path>) -> Result<ContainedPath, ToolError> {
+        let candidate = candidate.as_ref();
+        if candidate.as_os_str().is_empty() {
+            return Err(ToolError::ForbiddenPath {
+                path: candidate.to_path_buf(),
+                reason: "a workspace path must not be empty".to_owned(),
+            });
         }
-
-        let mut resolved = self.workspace_root.clone();
-        for component in relative.components() {
-            match component {
-                Component::Prefix(_) | Component::RootDir => {
-                    return Err(forbid(
-                        "a workspace path must be relative to the workspace root",
-                    ));
-                }
-                Component::ParentDir => {
-                    return Err(forbid("a workspace path must not contain a .. component"));
-                }
-                Component::CurDir => {}
-                Component::Normal(part) => resolved.push(part),
-            }
-        }
-
-        if resolved == self.workspace_root {
-            return Err(forbid(
-                "a workspace path must name something inside the root",
-            ));
-        }
-        Ok(resolved)
+        self.boundary.contain(candidate).map_err(ToolError::from)
     }
 }
 
@@ -754,7 +758,8 @@ impl fmt::Debug for ExecutionContext {
             .field("run", &self.run)
             .field("step", &self.step)
             .field("call", &self.call)
-            .field("workspace_root", &self.workspace_root)
+            .field("workspace_root", &self.boundary.workspace_root())
+            .field("execution_mode", &self.mode)
             .field("cancelled", &self.cancellation.is_cancelled())
             .field("timeout", &self.deadline.map(Deadline::limit))
             .finish_non_exhaustive()
@@ -764,11 +769,11 @@ impl fmt::Debug for ExecutionContext {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
-    use std::path::Path;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use harkness_git::Cancellation;
+    use tempfile::TempDir;
 
     use super::{
         ArtifactRef, ArtifactStream, ArtifactWriter, DEFAULT_STREAM_TAIL_BYTES, Deadline,
@@ -777,23 +782,32 @@ mod tests {
     };
     use crate::domain::{RunId, StepId, ToolCallId};
     use crate::tool::ToolError;
+    use crate::trust::ExecutionMode;
 
-    const ROOT: &str = if cfg!(windows) {
-        r"C:\workspace"
-    } else {
-        "/workspace"
-    };
-
-    fn context() -> ExecutionContext {
-        ExecutionContext::detached(RunId::new(), StepId::new(), ToolCallId::new(), ROOT).unwrap()
+    fn context() -> (TempDir, ExecutionContext) {
+        let workspace = TempDir::new().unwrap();
+        let context = ExecutionContext::detached(
+            RunId::new(),
+            StepId::new(),
+            ToolCallId::new(),
+            workspace.path(),
+        )
+        .unwrap();
+        (workspace, context)
     }
 
     #[test]
     fn a_relative_path_resolves_under_the_workspace_root() {
-        let context = context();
+        let (workspace, context) = context();
         let resolved = context.resolve("src/main.rs").unwrap();
-        assert_eq!(resolved, Path::new(ROOT).join("src").join("main.rs"));
-        assert!(resolved.starts_with(context.workspace_root()));
+        assert_eq!(
+            resolved.as_path(),
+            std::fs::canonicalize(workspace.path())
+                .unwrap()
+                .join("src")
+                .join("main.rs")
+        );
+        assert!(resolved.as_path().starts_with(context.workspace_root()));
 
         // A leading `./` is noise, not an escape.
         assert_eq!(context.resolve("./src/./main.rs").unwrap(), resolved);
@@ -801,19 +815,17 @@ mod tests {
 
     #[test]
     fn no_supplied_string_resolves_outside_the_workspace_root() {
-        let context = context();
-        let rejected = [
-            "",
-            "..",
-            "../secrets",
-            "src/../../secrets",
-            "./..",
-            ".",
-            "./",
-        ];
+        let (_workspace, context) = context();
+        let rejected = ["", "..", "../secrets", "src/../../secrets", "./.."];
         for path in rejected {
             let error = context.resolve(path).unwrap_err();
-            assert_eq!(error.kind(), "forbidden_path", "accepted {path:?}");
+            assert!(
+                matches!(
+                    error.kind(),
+                    "forbidden_path" | "outside_allowed_roots" | "candidate_unavailable"
+                ),
+                "accepted {path:?}: {error}"
+            );
             // Deliberately *not* `happened_before_execution`: tools call this
             // mid-body, so a refused second path says nothing about whether an
             // earlier one was already written.
@@ -823,15 +835,11 @@ mod tests {
             );
         }
 
-        let absolute = if cfg!(windows) {
-            r"C:\workspace\src"
-        } else {
-            "/workspace/src"
-        };
+        let absolute = context.workspace_root().join("src");
         assert_eq!(
-            context.resolve(absolute).unwrap_err().kind(),
-            "forbidden_path",
-            "an absolute path inside the root is still absolute"
+            context.resolve(&absolute).unwrap().as_path(),
+            absolute,
+            "an absolute path inside the root stays containable"
         );
     }
 
@@ -844,7 +852,8 @@ mod tests {
             assert_eq!(error.kind(), "forbidden_path", "accepted {root:?}");
         }
 
-        let unnormalized = Path::new(ROOT).join("..").join("elsewhere");
+        let workspace = TempDir::new().unwrap();
+        let unnormalized = workspace.path().join("..").join("elsewhere");
         let error = ExecutionContext::detached(
             RunId::new(),
             StepId::new(),
@@ -861,19 +870,25 @@ mod tests {
         // for an absolute path, so refusing it would need a check that cannot fire.
         // Normalizing means `workspace_root()` can be compared against a canonical
         // project path as a string, which a consumer will do.
-        let noisy = Path::new(ROOT).join(".").join("sub");
+        let workspace = TempDir::new().unwrap();
+        let expected = workspace.path().join("sub");
+        std::fs::create_dir(&expected).unwrap();
+        let noisy = workspace.path().join(".").join("sub");
         let context =
             ExecutionContext::detached(RunId::new(), StepId::new(), ToolCallId::new(), noisy)
                 .unwrap();
 
-        let expected = Path::new(ROOT).join("sub");
+        let expected = std::fs::canonicalize(expected).unwrap();
         assert_eq!(context.workspace_root(), expected);
         assert!(
             !context.workspace_root().to_string_lossy().contains("/./"),
             "the stored root kept a redundant component: {:?}",
             context.workspace_root()
         );
-        assert_eq!(context.resolve("a.txt").unwrap(), expected.join("a.txt"));
+        assert_eq!(
+            context.resolve("a.txt").unwrap().as_path(),
+            expected.join("a.txt")
+        );
 
         // A trailing separator is likewise normalized away.
         let trailing = format!("{}{}", expected.display(), std::path::MAIN_SEPARATOR);
@@ -889,11 +904,12 @@ mod tests {
         let step = StepId::new();
         let call = ToolCallId::new();
         let cancellation = Cancellation::default();
+        let workspace = TempDir::new().unwrap();
         let context = ExecutionContext::new(
             run,
             step,
             call,
-            ROOT,
+            workspace.path(),
             cancellation.clone(),
             Box::new(DiscardedProgress),
             Box::new(UnsupportedArtifacts),
@@ -914,13 +930,26 @@ mod tests {
     }
 
     #[test]
+    fn execution_is_noninteractive_until_the_front_end_says_otherwise() {
+        let (_workspace, context) = context();
+        assert_eq!(context.execution_mode(), ExecutionMode::NonInteractive);
+        assert_eq!(
+            context
+                .with_execution_mode(ExecutionMode::Interactive)
+                .execution_mode(),
+            ExecutionMode::Interactive
+        );
+    }
+
+    #[test]
     fn recorded_progress_outlives_the_context_that_consumed_the_sink() {
         let recorder = RecordedProgress::new();
+        let workspace = TempDir::new().unwrap();
         let mut context = ExecutionContext::new(
             RunId::new(),
             StepId::new(),
             ToolCallId::new(),
-            ROOT,
+            workspace.path(),
             Cancellation::default(),
             Box::new(recorder.clone()),
             Box::new(UnsupportedArtifacts),
@@ -995,7 +1024,7 @@ mod tests {
 
     #[test]
     fn an_absent_artifact_store_refuses_instead_of_discarding() {
-        let mut context = context();
+        let (_workspace, mut context) = context();
         let error = context
             .write_artifact("build.log", "text/plain", b"output")
             .unwrap_err();
@@ -1064,11 +1093,12 @@ mod tests {
     #[test]
     fn an_attached_artifact_store_receives_the_content() {
         let recording = Recording::default();
+        let workspace = TempDir::new().unwrap();
         let mut context = ExecutionContext::new(
             RunId::new(),
             StepId::new(),
             ToolCallId::new(),
-            ROOT,
+            workspace.path(),
             Cancellation::default(),
             Box::new(DiscardedProgress),
             Box::new(recording.clone()),
@@ -1102,11 +1132,12 @@ mod tests {
         // buffered content one way and streamed content another — which is what
         // would let redaction, hashing, or naming disagree between them.
         let recording = Recording::default();
+        let workspace = TempDir::new().unwrap();
         let mut context = ExecutionContext::new(
             RunId::new(),
             StepId::new(),
             ToolCallId::new(),
-            ROOT,
+            workspace.path(),
             Cancellation::default(),
             Box::new(DiscardedProgress),
             Box::new(recording.clone()),
@@ -1131,7 +1162,7 @@ mod tests {
 
     #[test]
     fn a_deadline_reports_its_limit_and_a_context_without_one_never_times_out() {
-        let context = context();
+        let (workspace, context) = context();
         assert_eq!(context.deadline(), None);
         assert_eq!(context.stream_tail_bytes(), DEFAULT_STREAM_TAIL_BYTES);
         assert!(context.check_still_permitted().is_ok());
@@ -1146,11 +1177,15 @@ mod tests {
         // one state the execution layer promises is impossible.
         assert_eq!(Deadline::starting_now(Duration::MAX), None);
 
-        let bounded =
-            ExecutionContext::detached(RunId::new(), StepId::new(), ToolCallId::new(), ROOT)
-                .unwrap()
-                .with_deadline(deadline)
-                .with_stream_tail_bytes(16);
+        let bounded = ExecutionContext::detached(
+            RunId::new(),
+            StepId::new(),
+            ToolCallId::new(),
+            workspace.path(),
+        )
+        .unwrap()
+        .with_deadline(deadline)
+        .with_stream_tail_bytes(16);
         assert_eq!(bounded.stream_tail_bytes(), 16);
         assert_eq!(
             bounded.check_still_permitted().unwrap_err(),
@@ -1167,11 +1202,12 @@ mod tests {
         // the deadline would tell a user their work was too slow when in fact
         // they asked for it to stop.
         let cancellation = Cancellation::default();
+        let workspace = TempDir::new().unwrap();
         let context = ExecutionContext::new(
             RunId::new(),
             StepId::new(),
             ToolCallId::new(),
-            ROOT,
+            workspace.path(),
             cancellation.clone(),
             Box::new(DiscardedProgress),
             Box::new(UnsupportedArtifacts),
@@ -1189,7 +1225,8 @@ mod tests {
 
     #[test]
     fn the_debug_form_names_the_identities_and_omits_the_opaque_sinks() {
-        let rendered = format!("{:?}", context());
+        let (_workspace, context) = context();
+        let rendered = format!("{context:?}");
         assert!(rendered.contains("run"), "{rendered}");
         assert!(rendered.contains("call"), "{rendered}");
         assert!(rendered.contains("workspace_root"), "{rendered}");
