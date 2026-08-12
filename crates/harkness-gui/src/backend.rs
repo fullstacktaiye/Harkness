@@ -1460,18 +1460,26 @@ fn load_github_issues(remote: &str) -> Result<(String, Vec<IssueRow>), GitFailur
         .trim()
         .to_owned();
     let endpoint = format!("repos/{slug}/issues?state=all&per_page=100");
-    let bytes = github_cli_output(&["api", endpoint.as_str(), "--cache", "1m"])?;
+    let bytes = github_cli_output(&[
+        "api",
+        endpoint.as_str(),
+        "--paginate",
+        "--slurp",
+        "--cache",
+        "1m",
+    ])?;
     parse_github_issues(&viewer, &bytes).map(|rows| (viewer, rows))
 }
 
 fn parse_github_issues(viewer: &str, bytes: &[u8]) -> Result<Vec<IssueRow>, GitFailure> {
-    let issues =
-        serde_json::from_slice::<Vec<GithubIssueRow>>(bytes).map_err(|error| GitFailure {
+    let pages =
+        serde_json::from_slice::<Vec<Vec<GithubIssueRow>>>(bytes).map_err(|error| GitFailure {
             kind: "github_api".to_owned(),
-            message: format!("GitHub returned an invalid issue list: {error}"),
+            message: format!("GitHub returned invalid paginated issue data: {error}"),
         })?;
-    let rows = issues
+    let rows = pages
         .into_iter()
+        .flatten()
         .filter(|issue| issue.pull_request.is_none())
         .map(|issue| {
             let created_by_me = issue.user.login.eq_ignore_ascii_case(viewer);
@@ -5422,7 +5430,7 @@ mod tests {
     fn github_issue_projection_filters_pull_requests_and_marks_viewer_scopes() {
         let rows = parse_github_issues(
             "octocat",
-            br##"[
+            br##"[[
                 {
                     "id": 101,
                     "number": 7,
@@ -5451,16 +5459,33 @@ mod tests {
                     "comments": 0,
                     "pull_request": {}
                 }
-            ]"##,
+            ], [
+                {
+                    "id": 103,
+                    "number": 9,
+                    "title": "Issue from the next API page",
+                    "state": "closed",
+                    "html_url": "https://github.com/example/sample/issues/9",
+                    "user": {"login": "someone"},
+                    "updated_at": "2026-08-12T13:00:00Z",
+                    "labels": [],
+                    "milestone": null,
+                    "assignees": [],
+                    "comments": 0,
+                    "pull_request": null
+                }
+            ]]"##,
         )
         .unwrap();
 
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, "101");
         assert_eq!(rows[0].url, "https://github.com/example/sample/issues/7");
         assert!(rows[0].created_by_me && rows[0].assigned_to_me);
         assert_eq!(rows[0].labels[0].color, "#3fb950");
         assert_eq!(rows[0].milestone, "v1");
+        assert_eq!(rows[1].id, "103");
+        assert_eq!(rows[1].state, "closed");
     }
 
     #[test]
