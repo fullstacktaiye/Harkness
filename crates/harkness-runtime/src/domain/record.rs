@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::{OffsetDateTime, UtcOffset};
 
+use crate::policy::{PolicyDecision, PolicyVerdict};
+
 use super::state::LifecycleState;
 use super::{ExecutionState, RunDomainError, RunId, StepId, TaskId, ToolCallId, ToolCallState};
 
@@ -712,6 +714,7 @@ pub struct ToolCall {
     pub(super) failure: Option<Failure>,
     pub(super) output: Option<Value>,
     pub(super) approvals: Vec<Approval>,
+    pub(super) policy_decision: Option<PolicyDecision>,
 }
 
 impl ToolCall {
@@ -758,6 +761,7 @@ impl ToolCall {
             failure: None,
             output: None,
             approvals: Vec::new(),
+            policy_decision: None,
         }
     }
 
@@ -818,6 +822,60 @@ impl ToolCall {
     #[must_use]
     pub fn approvals(&self) -> &[Approval] {
         &self.approvals
+    }
+
+    /// Policy decision recorded before this call was allowed to proceed.
+    #[must_use]
+    pub const fn policy_decision(&self) -> Option<&PolicyDecision> {
+        self.policy_decision.as_ref()
+    }
+
+    /// Records policy and applies its immediate lifecycle consequence.
+    ///
+    /// `Allow` leaves the call pending for dispatch, `Ask` parks it in
+    /// `awaiting_approval`, and `Deny` terminates it with policy failure detail.
+    /// The store persists this whole mutation in one transaction, so a call can
+    /// never be observed in the governed state without the decision that put it
+    /// there.
+    ///
+    /// This is the only edge from `pending` to `denied`. There is deliberately
+    /// no decision-free denial to reach for: a denied call that carried no
+    /// verdict, reason, or source would be exactly the audit gap this record
+    /// exists to close. A refusal after an approval prompt uses
+    /// [`Self::reject_approval`], which records who refused it.
+    pub fn apply_policy_decision(
+        &mut self,
+        decision: PolicyDecision,
+        at: OffsetDateTime,
+    ) -> Result<(), RunDomainError> {
+        require_state(
+            "tool_call",
+            self.state() == ToolCallState::Pending,
+            "policy evaluation requires pending",
+        )?;
+        require_state(
+            "tool_call",
+            self.policy_decision.is_none(),
+            "a tool call may carry only one policy decision",
+        )?;
+        if let Err(reason) = decision.validate() {
+            return Err(invalid_lifecycle("tool_call", reason));
+        }
+
+        match decision.verdict() {
+            PolicyVerdict::Allow => {}
+            PolicyVerdict::Ask => {
+                self.lifecycle
+                    .transition("tool_call", ToolCallState::AwaitingApproval, at)?;
+            }
+            PolicyVerdict::Deny => {
+                self.lifecycle
+                    .transition("tool_call", ToolCallState::Denied, at)?;
+                self.failure = Some(Failure::new("policy", decision.reason()));
+            }
+        }
+        self.policy_decision = Some(decision);
+        Ok(())
     }
 
     /// Enters an outcome-free edge in [`super::TOOL_CALL_TRANSITIONS`].
@@ -948,20 +1006,6 @@ impl ToolCall {
         Ok(())
     }
 
-    /// Records a policy denial from `pending` with structured detail.
-    pub fn deny(&mut self, failure: Failure, at: OffsetDateTime) -> Result<(), RunDomainError> {
-        self.lifecycle.validate_edge(ToolCallState::Denied)?;
-        require_state(
-            "tool_call",
-            self.state() == ToolCallState::Pending,
-            "ToolCall::deny is reserved for policy decisions in pending",
-        )?;
-        self.lifecycle
-            .transition("tool_call", ToolCallState::Denied, at)?;
-        self.failure = Some(failure);
-        Ok(())
-    }
-
     /// Records an approval and resumes from `awaiting_approval`.
     pub fn approve(
         &mut self,
@@ -1076,6 +1120,7 @@ mod tests {
         EXECUTION_TRANSITIONS, ExecutionState, InvalidTransition, RunDomainError, RunId, StepId,
         TOOL_CALL_TRANSITIONS, TaskId, ToolCallId, ToolCallState,
     };
+    use crate::policy::PolicyDecision;
 
     fn at(second: i64) -> OffsetDateTime {
         OffsetDateTime::UNIX_EPOCH + Duration::seconds(second)
@@ -1083,6 +1128,16 @@ mod tests {
 
     fn failure() -> Failure {
         Failure::new("fixture_failure", "fixture failed")
+    }
+
+    /// The only way a pending call reaches `denied` is a recorded denial.
+    fn denial() -> PolicyDecision {
+        serde_json::from_value(json!({
+            "verdict": "deny",
+            "reason": "denied: workspace is untrusted",
+            "source": "built_in"
+        }))
+        .unwrap()
     }
 
     fn task() -> Task {
@@ -1155,7 +1210,7 @@ mod tests {
                 call.succeed(json!({"ok": true}), at(2)).unwrap();
             }
             ToolCallState::Failed => call.fail(failure(), at(1)).unwrap(),
-            ToolCallState::Denied => call.deny(failure(), at(1)).unwrap(),
+            ToolCallState::Denied => call.apply_policy_decision(denial(), at(1)).unwrap(),
             ToolCallState::Cancelled | ToolCallState::Interrupted => {
                 call.transition(state, at(1)).unwrap();
             }
@@ -1194,9 +1249,11 @@ mod tests {
             (ToolCallState::AwaitingApproval, ToolCallState::Denied) => {
                 call.reject_approval("fixture-user", failure(), at(3))
             }
+            (ToolCallState::Pending, ToolCallState::Denied) => {
+                call.apply_policy_decision(denial(), at(3))
+            }
             (_, ToolCallState::Succeeded) => call.succeed(json!({"ok": true}), at(3)),
             (_, ToolCallState::Failed) => call.fail(failure(), at(3)),
-            (_, ToolCallState::Denied) => call.deny(failure(), at(3)),
             _ => call.transition(to, at(3)),
         }
     }

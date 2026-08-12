@@ -12,8 +12,16 @@
 //! structured errors, an execution context, and a registry that validates both
 //! directions of a call. A [`domain::ToolCall`] records *that* a tool ran and
 //! with what; [`tool`] is what defines the tool and executes it.
+//!
+//! [`trust`] classifies one concrete invocation — its boundary-checked paths,
+//! its effects, and its force-push variant — and [`policy`] decides whether the
+//! classification may proceed. The split matters: policy never accepts a
+//! separately asserted risk level, only a [`trust::RequestClassification`], so
+//! a caller cannot describe a request as milder than the descriptor and its
+//! validated input make it.
 
 pub mod domain;
+pub mod policy;
 pub mod store;
 pub mod tool;
 pub mod trust;

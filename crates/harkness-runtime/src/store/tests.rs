@@ -22,6 +22,7 @@ use crate::domain::{
     ArtifactId, ExecutionState, Failure, Run, RunId, Step, StepId, Task, TaskId, ToolCall,
     ToolCallId, ToolCallState, ToolCallWire,
 };
+use crate::policy::{PolicyDecision, PolicyVerdict};
 use crate::tool::ArtifactWriter;
 use crate::trust::{TrustState, WorkspaceTrust};
 
@@ -138,6 +139,15 @@ fn stored_tool_call(store: &Store, step: &Step) -> ToolCall {
     );
     store.insert_tool_call(&call).unwrap();
     call
+}
+
+fn policy_decision(verdict: PolicyVerdict) -> PolicyDecision {
+    serde_json::from_value(json!({
+        "verdict": verdict.as_str(),
+        "reason": format!("fixture policy decision: {}", verdict.as_str()),
+        "source": "built_in"
+    }))
+    .unwrap()
 }
 
 /// A run created against `task` with a distinct identity and creation time.
@@ -750,6 +760,7 @@ fn a_tool_call_cannot_claim_a_run_its_step_does_not_belong_to() {
         failure: None,
         output: None,
         approvals: Vec::new(),
+        policy_decision: None,
     })
     .unwrap();
 
@@ -1168,17 +1179,74 @@ fn a_denied_tool_call_records_the_policy_decision() {
     let step = stored_step(&fixture.store, &run);
     let call = stored_tool_call(&fixture.store, &step);
 
+    let decision = policy_decision(PolicyVerdict::Deny);
     let denied = fixture
         .store
-        .deny_tool_call(
-            call.id(),
-            Failure::new("policy", "fs.write is not permitted"),
-            at(10),
-        )
+        .apply_tool_call_policy_decision(call.id(), decision.clone(), at(10))
         .unwrap();
 
     assert_eq!(denied.state(), ToolCallState::Denied);
-    assert_eq!(fixture.reopen().load_tool_call(call.id()).unwrap(), denied);
+    // The point of the test: a denied row that reached the database without the
+    // decision that produced it is an audit gap, not a lifecycle detail.
+    assert_eq!(denied.policy_decision(), Some(&decision));
+    assert_eq!(
+        denied.failure(),
+        Some(&Failure::new("policy", decision.reason()))
+    );
+    let reloaded = fixture.reopen().load_tool_call(call.id()).unwrap();
+    assert_eq!(reloaded, denied);
+    assert_eq!(reloaded.policy_decision(), Some(&decision));
+}
+
+#[test]
+fn every_policy_verdict_is_persisted_before_its_lifecycle_consequence() {
+    for (verdict, expected_state) in [
+        (PolicyVerdict::Allow, ToolCallState::Pending),
+        (PolicyVerdict::Ask, ToolCallState::AwaitingApproval),
+        (PolicyVerdict::Deny, ToolCallState::Denied),
+    ] {
+        let fixture = Fixture::new();
+        let task = stored_task(&fixture.store);
+        let run = stored_run(&fixture.store, &task);
+        let step = stored_step(&fixture.store, &run);
+        let call = stored_tool_call(&fixture.store, &step);
+        let decision = policy_decision(verdict);
+
+        let governed = fixture
+            .store
+            .apply_tool_call_policy_decision(call.id(), decision.clone(), at(10))
+            .unwrap();
+
+        assert_eq!(governed.state(), expected_state);
+        assert_eq!(governed.policy_decision(), Some(&decision));
+        let reloaded = fixture.reopen().load_tool_call(call.id()).unwrap();
+        assert_eq!(reloaded, governed);
+        if verdict == PolicyVerdict::Deny {
+            assert_eq!(reloaded.failure().unwrap().kind(), "policy");
+            assert_eq!(reloaded.failure().unwrap().message(), decision.reason());
+        }
+    }
+}
+
+#[test]
+fn a_policy_decision_cannot_be_replaced() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = stored_step(&fixture.store, &run);
+    let call = stored_tool_call(&fixture.store, &step);
+    let allowed = fixture
+        .store
+        .apply_tool_call_policy_decision(call.id(), policy_decision(PolicyVerdict::Allow), at(10))
+        .unwrap();
+
+    let error = fixture
+        .store
+        .apply_tool_call_policy_decision(call.id(), policy_decision(PolicyVerdict::Deny), at(11))
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "invalid_transition");
+    assert_eq!(fixture.store.load_tool_call(call.id()).unwrap(), allowed);
 }
 
 #[test]
@@ -2840,6 +2908,9 @@ const FROZEN_V2_DATABASE: &[u8] = include_bytes!("fixtures/runtime-v2.db");
 /// The frozen v3 database carrying one exact workspace trust decision.
 const FROZEN_V3_DATABASE: &[u8] = include_bytes!("fixtures/runtime-v3.db");
 
+/// The frozen v4 database carrying one binding policy decision.
+const FROZEN_V4_DATABASE: &[u8] = include_bytes!("fixtures/runtime-v4.db");
+
 /// A later migration, standing in for a future store feature.
 const LATER_MIGRATIONS: &[Migration] = &[
     Migration {
@@ -2856,6 +2927,10 @@ const LATER_MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 4,
+        statements: include_str!("migrations/004_policy_decisions.sql"),
+    },
+    Migration {
+        version: 5,
         statements: "ALTER TABLE runs ADD COLUMN cancelled_by TEXT;",
     },
 ];
@@ -2967,6 +3042,24 @@ fn a_frozen_v3_database_opens_and_reads_its_workspace_trust() {
 }
 
 #[test]
+fn a_frozen_v4_database_opens_and_reads_its_policy_decision() {
+    let data_dir = restore_frozen_database(FROZEN_V4_DATABASE);
+    let store = Store::open(data_dir.path()).unwrap();
+
+    assert_eq!(
+        recorded_version(&guard(&store.writer)).unwrap(),
+        SCHEMA_VERSION
+    );
+    let call = store
+        .load_tool_call(ToolCallId::from_str(FIXTURE_TOOL_CALL_ID).unwrap())
+        .unwrap();
+    let decision = call.policy_decision().unwrap();
+    assert_eq!(call.state(), ToolCallState::AwaitingApproval);
+    assert_eq!(decision.verdict(), PolicyVerdict::Ask);
+    assert_eq!(decision.reason(), "fixture policy decision: ask");
+}
+
+#[test]
 fn a_frozen_v2_database_opens_after_future_migrations() {
     let data_dir = restore_frozen_database(FROZEN_V2_DATABASE);
     let path = data_dir.path().join(DATABASE_FILE);
@@ -2977,7 +3070,7 @@ fn a_frozen_v2_database_opens_after_future_migrations() {
 
     apply(&mut connection, LATER_MIGRATIONS).unwrap();
 
-    assert_eq!(recorded_version(&connection).unwrap(), 4);
+    assert_eq!(recorded_version(&connection).unwrap(), 5);
     let run =
         super::repository::load_run(&connection, RunId::from_str(FIXTURE_RUN_ID).unwrap()).unwrap();
     assert_eq!(run.state(), ExecutionState::Running);
@@ -3126,6 +3219,26 @@ fn regenerate_the_frozen_v3_fixture() {
     freeze(&guard(&store.writer), "runtime-v3.db");
 }
 
+/// Writes the frozen v4 fixture, including one binding policy decision.
+///
+/// Run deliberately, and only when migration 4 changes:
+/// `cargo test -p harkness-runtime regenerate_the_frozen_v4_fixture -- --ignored`.
+#[test]
+#[ignore = "rewrites a committed fixture; run only when migration 4 changes"]
+fn regenerate_the_frozen_v4_fixture() {
+    let data_dir = TempDir::new().unwrap();
+    let store = store_with_migrations(data_dir.path(), &MIGRATIONS[..4]);
+    let task = stored_task(&store);
+    let run = stored_run(&store, &task);
+    let step = stored_step(&store, &run);
+    let call = stored_tool_call(&store, &step);
+    store
+        .apply_tool_call_policy_decision(call.id(), policy_decision(PolicyVerdict::Ask), at(15))
+        .unwrap();
+
+    freeze(&guard(&store.writer), "runtime-v4.db");
+}
+
 /// Builds a store stopped at an older migration for fixture regeneration.
 fn store_with_migrations(data_dir: &std::path::Path, migrations: &[Migration]) -> Store {
     std::fs::create_dir_all(data_dir).unwrap();
@@ -3156,8 +3269,8 @@ fn freeze(connection: &Connection, name: &str) {
 
 #[test]
 fn every_migration_in_this_build_is_recorded_in_order() {
-    assert_eq!(MIGRATIONS.len(), 3, "add coverage for a new migration");
-    assert_eq!(SCHEMA_VERSION, 3);
+    assert_eq!(MIGRATIONS.len(), 4, "add coverage for a new migration");
+    assert_eq!(SCHEMA_VERSION, 4);
 }
 
 // -- performance -------------------------------------------------------------

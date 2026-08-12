@@ -10,9 +10,10 @@ use super::{
     Approval, ApprovalDecision, ExecutionState, Failure, Run, RunDomainError, RunId, Step, StepId,
     Task, TaskId, ToolCall, ToolCallId, ToolCallState,
 };
+use crate::policy::{PolicyDecision, PolicyVerdict};
 
 /// Newest durable runtime-record schema understood by this build.
-pub const RUNTIME_RECORD_SCHEMA_VERSION: u32 = 1;
+pub const RUNTIME_RECORD_SCHEMA_VERSION: u32 = 2;
 /// Oldest durable runtime-record schema understood by this build.
 pub const MINIMUM_RUNTIME_RECORD_SCHEMA_VERSION: u32 = 1;
 
@@ -175,6 +176,9 @@ pub struct ToolCallWire {
     /// Durable approval audit history.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approvals: Vec<Approval>,
+    /// Binding policy decision, once this call has been evaluated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_decision: Option<PolicyDecision>,
 }
 
 /// Borrowing representation used to serialize a [`Task`] without cloning it.
@@ -326,6 +330,9 @@ pub struct ToolCallWireRef<'a> {
     /// Durable approval audit history.
     #[serde(skip_serializing_if = "slice_is_empty")]
     pub approvals: &'a [Approval],
+    /// Binding policy decision, once this call has been evaluated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_decision: Option<&'a PolicyDecision>,
 }
 
 impl<'a> From<&'a Task> for TaskWireRef<'a> {
@@ -398,6 +405,7 @@ impl<'a> From<&'a ToolCall> for ToolCallWireRef<'a> {
             failure: call.failure(),
             output: call.output(),
             approvals: call.approvals(),
+            policy_decision: call.policy_decision(),
         }
     }
 }
@@ -525,6 +533,18 @@ impl TryFrom<ToolCallWire> for ToolCall {
             wire.revision,
             &wire.approvals,
         )?;
+        if wire.schema_version == 1 && wire.policy_decision.is_some() {
+            return Err(invalid_lifecycle(
+                "tool_call",
+                "schema version 1 cannot carry a policy decision",
+            ));
+        }
+        validate_policy_decision(
+            wire.state,
+            wire.failure.as_ref(),
+            &wire.approvals,
+            wire.policy_decision.as_ref(),
+        )?;
         Ok(Self {
             id: wire.id,
             run_id: wire.run_id,
@@ -536,8 +556,44 @@ impl TryFrom<ToolCallWire> for ToolCall {
             failure: wire.failure,
             output: wire.output,
             approvals: wire.approvals,
+            policy_decision: wire.policy_decision,
         })
     }
+}
+
+fn validate_policy_decision(
+    state: ToolCallState,
+    failure: Option<&Failure>,
+    approvals: &[Approval],
+    decision: Option<&PolicyDecision>,
+) -> Result<(), RunDomainError> {
+    let Some(decision) = decision else {
+        return Ok(());
+    };
+    if let Err(reason) = decision.validate() {
+        return Err(invalid_lifecycle("tool_call", reason));
+    }
+    let consistent = match decision.verdict() {
+        PolicyVerdict::Allow => !matches!(
+            state,
+            ToolCallState::AwaitingApproval | ToolCallState::Denied
+        ),
+        PolicyVerdict::Ask => state != ToolCallState::Pending,
+        PolicyVerdict::Deny => {
+            state == ToolCallState::Denied
+                && approvals.is_empty()
+                && failure.is_some_and(|failure| {
+                    failure.kind() == "policy" && failure.message() == decision.reason()
+                })
+        }
+    };
+    if !consistent {
+        return Err(invalid_lifecycle(
+            "tool_call",
+            "policy decision contradicts the tool-call lifecycle",
+        ));
+    }
+    Ok(())
 }
 
 /// Refuses a record schema version this build cannot read.
@@ -937,6 +993,8 @@ struct ToolCallWireStrict {
     output: Option<Value>,
     #[serde(default)]
     approvals: Vec<Approval>,
+    #[serde(default)]
+    policy_decision: Option<PolicyDecision>,
 }
 
 impl From<ToolCallWireStrict> for ToolCallWire {
@@ -958,6 +1016,7 @@ impl From<ToolCallWireStrict> for ToolCallWire {
             failure: wire.failure,
             output: wire.output,
             approvals: wire.approvals,
+            policy_decision: wire.policy_decision,
         }
     }
 }
@@ -985,6 +1044,7 @@ mod tests {
         RunDomainError, RunId, Step, StepId, TOOL_CALL_TRANSITIONS, Task, TaskId, ToolCall,
         ToolCallId, ToolCallState,
     };
+    use crate::policy::PolicyDecision;
 
     fn at(second: i64) -> OffsetDateTime {
         OffsetDateTime::UNIX_EPOCH + Duration::seconds(second)
@@ -1008,6 +1068,24 @@ mod tests {
 
     fn failure() -> Failure {
         Failure::new("fixture_failure", "fixture failed")
+    }
+
+    fn ask_decision() -> PolicyDecision {
+        serde_json::from_value(json!({
+            "verdict": "ask",
+            "reason": "execution requires approval (built-in default for Execute)",
+            "source": "built_in"
+        }))
+        .unwrap()
+    }
+
+    fn deny_decision() -> PolicyDecision {
+        serde_json::from_value(json!({
+            "verdict": "deny",
+            "reason": "denied: workspace is untrusted",
+            "source": "built_in"
+        }))
+        .unwrap()
     }
 
     fn task_wire() -> TaskWire {
@@ -1084,7 +1162,7 @@ mod tests {
                 call.succeed(json!({"clean": true}), at(2)).unwrap();
             }
             ToolCallState::Failed => call.fail(failure(), at(1)).unwrap(),
-            ToolCallState::Denied => call.deny(failure(), at(1)).unwrap(),
+            ToolCallState::Denied => call.apply_policy_decision(deny_decision(), at(1)).unwrap(),
             ToolCallState::Cancelled | ToolCallState::Interrupted => {
                 call.transition(state, at(1)).unwrap();
             }
@@ -1171,7 +1249,7 @@ mod tests {
     }
 
     #[test]
-    fn frozen_v1_json_fixtures_cover_every_record_type() {
+    fn frozen_v2_json_fixtures_cover_every_record_type() {
         let task = Task::try_from(task_wire()).unwrap();
 
         let mut run = Run::with_id(run_id(), task.id(), at(0));
@@ -1195,29 +1273,49 @@ mod tests {
             json!({"include_untracked": true}),
             at(0),
         );
-        call.transition(ToolCallState::AwaitingApproval, at(1))
-            .unwrap();
+        call.apply_policy_decision(ask_decision(), at(1)).unwrap();
         call.approve("user:42", at(2)).unwrap();
         call.succeed(json!({"clean": true}), at(3)).unwrap();
 
         assert_fixture(
             TaskWireRef::from(&task),
-            include_str!("fixtures/task-v1.json"),
+            include_str!("fixtures/task-v2.json"),
         );
-        assert_fixture(RunWireRef::from(&run), include_str!("fixtures/run-v1.json"));
+        assert_fixture(RunWireRef::from(&run), include_str!("fixtures/run-v2.json"));
         assert_fixture(
             StepWireRef::from(&step),
-            include_str!("fixtures/step-v1.json"),
+            include_str!("fixtures/step-v2.json"),
         );
         assert_fixture(
             ToolCallWireRef::from(&call),
-            include_str!("fixtures/tool-call-v1.json"),
+            include_str!("fixtures/tool-call-v2.json"),
         );
 
+        assert_owned_fixture::<TaskWire>(include_str!("fixtures/task-v2.json"));
+        assert_owned_fixture::<RunWire>(include_str!("fixtures/run-v2.json"));
+        assert_owned_fixture::<StepWire>(include_str!("fixtures/step-v2.json"));
+        assert_owned_fixture::<ToolCallWire>(include_str!("fixtures/tool-call-v2.json"));
+
+        // The previous frozen version remains readable after the additive
+        // policy-decision field and record-version bump.
         assert_owned_fixture::<TaskWire>(include_str!("fixtures/task-v1.json"));
         assert_owned_fixture::<RunWire>(include_str!("fixtures/run-v1.json"));
         assert_owned_fixture::<StepWire>(include_str!("fixtures/step-v1.json"));
         assert_owned_fixture::<ToolCallWire>(include_str!("fixtures/tool-call-v1.json"));
+    }
+
+    #[test]
+    fn a_policy_decision_that_contradicts_the_lifecycle_is_refused() {
+        let mut wire = call_wire(ToolCallState::Pending);
+        wire.policy_decision = Some(ask_decision());
+
+        let error = ToolCall::try_from(wire).unwrap_err();
+        assert_eq!(error.kind(), "invalid_lifecycle");
+        assert!(
+            error
+                .to_string()
+                .contains("policy decision contradicts the tool-call lifecycle")
+        );
     }
 
     fn assert_fixture(wire: impl Serialize, fixture: &str) {
@@ -1346,9 +1444,11 @@ mod tests {
             (ToolCallState::AwaitingApproval, ToolCallState::Denied) => {
                 call.reject_approval("fixture-user", failure(), at).unwrap();
             }
+            (ToolCallState::Pending, ToolCallState::Denied) => {
+                call.apply_policy_decision(deny_decision(), at).unwrap();
+            }
             (_, ToolCallState::Succeeded) => call.succeed(json!({"ok": true}), at).unwrap(),
             (_, ToolCallState::Failed) => call.fail(failure(), at).unwrap(),
-            (_, ToolCallState::Denied) => call.deny(failure(), at).unwrap(),
             _ => call.transition(to, at).unwrap(),
         }
     }
