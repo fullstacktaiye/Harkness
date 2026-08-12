@@ -11,6 +11,7 @@ mod clone;
 mod commit;
 mod context;
 mod diff;
+mod discard;
 mod history;
 mod hunk;
 mod intra_line;
@@ -50,6 +51,10 @@ pub use diff::{
     DEFAULT_MAX_DIFF_TOTAL_BYTES, DiffLine, DiffLineKind, DiffOmission, DiffOptions, DiffTarget,
     FileDiff, Hunk, IntraLineDegradation, IntraLineRange, MAX_INTRA_LINE_BYTES,
     MAX_INTRA_LINE_COMPARISONS,
+};
+pub use discard::{
+    DiscardDescription, DiscardOperation, DiscardOutcome, DiscardRecoverability, DiscardSnapshot,
+    TrackedRestoreSource,
 };
 pub use history::{CommitInfo, CommitSignature, LogCursor, LogOptions, LogPage, LogRange};
 pub use hunk::{HunkSelection, HunkStageOutcome, LineSelection, LineStageOutcome};
@@ -261,10 +266,11 @@ pub enum GitError {
     #[error("failed to clean worktree destination '{}': {detail}", path.display())]
     WorktreeAddCleanup { path: PathBuf, detail: String },
 
-    /// A worktree was explicitly locked by Git against every lifecycle change.
+    /// A worktree was explicitly locked by Git against protected mutations.
     ///
-    /// The message names no single operation because one lock refuses removal,
-    /// relocation and pruning alike, and `--force` overrides none of them.
+    /// The message names no single operation because one lock refuses index,
+    /// history, discard, and lifecycle mutations alike, and `--force`
+    /// overrides none of them.
     #[error(
         "worktree at '{}' is locked{}; run 'worktree unlock' before changing it",
         path.display(),
@@ -445,6 +451,44 @@ pub enum GitError {
         source: io::Error,
     },
 
+    /// The paths, index, or `HEAD` changed after destructive confirmation.
+    #[error("the selected changes are stale; refresh and confirm the discard again")]
+    StaleDiscardSelection,
+
+    /// A tracked-content restore was asked to delete a path Git does not track.
+    #[error(
+        "'{}' is untracked; delete it only through the explicit untracked-file operation",
+        path.display()
+    )]
+    UntrackedDiscardRequiresDelete { path: PathBuf },
+
+    /// An untracked-file deletion was asked to remove a path Git tracks.
+    #[error(
+        "'{}' is tracked by Git; restore it through a tracked-content operation instead",
+        path.display()
+    )]
+    TrackedDiscardRequiresRestore { path: PathBuf },
+
+    /// A conflicted index has no single baseline from which content can be restored.
+    #[error("'{}' is unmerged; resolve the conflict before discarding it", path.display())]
+    UnmergedDiscard { path: PathBuf },
+
+    /// The selected path has no change at the requested discard boundary.
+    #[error("'{}' has no changes to discard at the requested boundary", path.display())]
+    NothingToDiscard { path: PathBuf },
+
+    /// Untracked deletion is deliberately file-only and never recurses.
+    #[error("'{}' is not an untracked file; directories are never deleted recursively", path.display())]
+    UntrackedDiscardNotFile { path: PathBuf },
+
+    /// A validated untracked file could not be removed from the filesystem.
+    #[error("failed to delete untracked file '{}': {source}", path.display())]
+    UntrackedDiscardIo {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
     /// A file-context request did not contain a complete object ID valid for
     /// its selected source.
     #[error("'{blob_id}' is not a valid full blob object ID for this context source")]
@@ -610,6 +654,13 @@ impl GitError {
         "detached_head",
         "inspection",
         "diff_content",
+        "stale_discard_selection",
+        "untracked_discard_requires_delete",
+        "tracked_discard_requires_restore",
+        "unmerged_discard",
+        "nothing_to_discard",
+        "untracked_discard_not_file",
+        "untracked_discard_io",
         "invalid_blob_id",
         "blob_not_found",
         "malformed_diff",
@@ -680,6 +731,13 @@ impl GitError {
             Self::DetachedHead { .. } => "detached_head",
             Self::Inspection { .. } => "inspection",
             Self::DiffContent { .. } => "diff_content",
+            Self::StaleDiscardSelection => "stale_discard_selection",
+            Self::UntrackedDiscardRequiresDelete { .. } => "untracked_discard_requires_delete",
+            Self::TrackedDiscardRequiresRestore { .. } => "tracked_discard_requires_restore",
+            Self::UnmergedDiscard { .. } => "unmerged_discard",
+            Self::NothingToDiscard { .. } => "nothing_to_discard",
+            Self::UntrackedDiscardNotFile { .. } => "untracked_discard_not_file",
+            Self::UntrackedDiscardIo { .. } => "untracked_discard_io",
             Self::InvalidBlobId { .. } => "invalid_blob_id",
             Self::BlobNotFound { .. } => "blob_not_found",
             Self::MalformedDiff { .. } => "malformed_diff",
@@ -911,6 +969,173 @@ impl GitService {
         request: &FileContextRequest,
     ) -> Result<FileContextResponse, GitError> {
         context::load(&self.root, request)
+    }
+
+    /// Restores tracked paths from an explicit Git boundary.
+    ///
+    /// [`TrackedRestoreSource::Index`] changes only the working tree, preserving
+    /// staged content. [`TrackedRestoreSource::Head`] restores both the index
+    /// and working tree. Untracked paths and unmerged paths are refused before
+    /// Git is spawned, and a linked-worktree lock is never bypassed.
+    pub fn restore_tracked<I, P>(
+        &self,
+        paths: I,
+        source: TrackedRestoreSource,
+        cancellation: &Cancellation,
+    ) -> Result<DiscardOutcome, GitError>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let paths = paths
+            .into_iter()
+            .map(|path| path.as_ref().to_path_buf())
+            .collect::<Vec<_>>();
+        let lock = self.acquire_lock(cancellation)?;
+        discard::restore_tracked(
+            &self.git_executable,
+            &self.root,
+            &lock,
+            &paths,
+            source,
+            None,
+            cancellation,
+        )
+    }
+
+    /// Captures the exact worktree, index, and `HEAD` state a discard confirmation describes.
+    pub fn discard_snapshot<I, P>(&self, paths: I) -> Result<DiscardSnapshot, GitError>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let paths = paths
+            .into_iter()
+            .map(|path| path.as_ref().to_path_buf())
+            .collect::<Vec<_>>();
+        discard::snapshot(&self.root, &paths)
+    }
+
+    /// Restores tracked paths only if they still match a previously captured snapshot.
+    pub fn restore_tracked_if_unchanged<I, P>(
+        &self,
+        paths: I,
+        source: TrackedRestoreSource,
+        expected: &DiscardSnapshot,
+        cancellation: &Cancellation,
+    ) -> Result<DiscardOutcome, GitError>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let paths = paths
+            .into_iter()
+            .map(|path| path.as_ref().to_path_buf())
+            .collect::<Vec<_>>();
+        let lock = self.acquire_lock(cancellation)?;
+        discard::restore_tracked(
+            &self.git_executable,
+            &self.root,
+            &lock,
+            &paths,
+            source,
+            Some(expected),
+            cancellation,
+        )
+    }
+
+    /// Deletes explicit untracked files without ever recursing into a directory.
+    ///
+    /// Every path is validated as an untracked file before the first one is
+    /// removed. Tracked and unmerged paths are typed refusals, and a worktree
+    /// lock cannot be overridden.
+    pub fn delete_untracked<I, P>(
+        &self,
+        paths: I,
+        cancellation: &Cancellation,
+    ) -> Result<DiscardOutcome, GitError>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let paths = paths
+            .into_iter()
+            .map(|path| path.as_ref().to_path_buf())
+            .collect::<Vec<_>>();
+        let lock = self.acquire_lock(cancellation)?;
+        discard::delete_untracked(
+            &self.git_executable,
+            &self.root,
+            &lock,
+            &paths,
+            None,
+            cancellation,
+        )
+    }
+
+    /// Deletes untracked files only if they still match a previously captured snapshot.
+    pub fn delete_untracked_if_unchanged<I, P>(
+        &self,
+        paths: I,
+        expected: &DiscardSnapshot,
+        cancellation: &Cancellation,
+    ) -> Result<DiscardOutcome, GitError>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let paths = paths
+            .into_iter()
+            .map(|path| path.as_ref().to_path_buf())
+            .collect::<Vec<_>>();
+        let lock = self.acquire_lock(cancellation)?;
+        discard::delete_untracked(
+            &self.git_executable,
+            &self.root,
+            &lock,
+            &paths,
+            Some(expected),
+            cancellation,
+        )
+    }
+
+    /// Discards selected tracked working-tree hunks while leaving the index alone.
+    ///
+    /// Selections are recomputed and revalidated under the repository lock,
+    /// then the trusted reverse patch is applied to the working tree. Untracked
+    /// and unmerged content is refused rather than being deleted implicitly.
+    pub fn discard_hunks(
+        &self,
+        selections: &[HunkSelection],
+        cancellation: &Cancellation,
+    ) -> Result<DiscardOutcome, GitError> {
+        let lock = self.acquire_lock(cancellation)?;
+        discard::discard_hunks(
+            &self.git_executable,
+            &self.root,
+            &lock,
+            selections,
+            cancellation,
+        )
+    }
+
+    /// Discards selected tracked working-tree lines while leaving the index alone.
+    ///
+    /// Each line retains its enclosing hunk identity, so the same stale-safe
+    /// recomputation used for line staging protects this destructive direction.
+    pub fn discard_lines(
+        &self,
+        selections: &[LineSelection],
+        cancellation: &Cancellation,
+    ) -> Result<DiscardOutcome, GitError> {
+        let lock = self.acquire_lock(cancellation)?;
+        discard::discard_lines(
+            &self.git_executable,
+            &self.root,
+            &lock,
+            selections,
+            cancellation,
+        )
     }
 
     /// Stages selected working-tree hunks without writing the working tree.
@@ -2027,6 +2252,34 @@ mod tests {
                     source: io_error(),
                 },
                 "diff_content",
+            ),
+            (GitError::StaleDiscardSelection, "stale_discard_selection"),
+            (
+                GitError::UntrackedDiscardRequiresDelete { path: path.clone() },
+                "untracked_discard_requires_delete",
+            ),
+            (
+                GitError::TrackedDiscardRequiresRestore { path: path.clone() },
+                "tracked_discard_requires_restore",
+            ),
+            (
+                GitError::UnmergedDiscard { path: path.clone() },
+                "unmerged_discard",
+            ),
+            (
+                GitError::NothingToDiscard { path: path.clone() },
+                "nothing_to_discard",
+            ),
+            (
+                GitError::UntrackedDiscardNotFile { path: path.clone() },
+                "untracked_discard_not_file",
+            ),
+            (
+                GitError::UntrackedDiscardIo {
+                    path: path.clone(),
+                    source: io_error(),
+                },
+                "untracked_discard_io",
             ),
             (
                 GitError::InvalidBlobId {

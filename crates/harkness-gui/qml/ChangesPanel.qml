@@ -28,6 +28,7 @@ ColumnLayout {
 
     readonly property var gitState: activity.gitState
     readonly property var entries: activity.entries
+    property string pendingDiscardPathId: ""
 
     spacing: 0
 
@@ -67,6 +68,13 @@ ColumnLayout {
         if (entry.conflicted)
             states.push(qsTr("conflict"));
         return states.join(" · ");
+    }
+
+    function confirmDiscard(entry) {
+        pendingDiscardPathId = String(entry.pathId || "");
+        discardPrompt.description = entry.discard || ({});
+        discardPrompt.subject = String(entry.path || "");
+        discardPrompt.open();
     }
 
     // A file that is gone from the working tree must not stay excluded in
@@ -261,9 +269,39 @@ ColumnLayout {
                         visible: text.length > 0
                     }
                 }
+
+                Controls.ToolButton {
+                    Accessible.name: String((entryDelegate.modelData.discard || ({})).operation || "")
+                        === "delete_untracked"
+                        ? qsTr("Delete untracked file %1").arg(entryDelegate.modelData.path)
+                        : qsTr("Discard changes in %1").arg(entryDelegate.modelData.path)
+                    Controls.ToolTip.text: Accessible.name
+                    Controls.ToolTip.visible: hovered
+                    display: Controls.AbstractButton.IconOnly
+                    enabled: !changes.activity.repositoryMutationRunning()
+                    icon.name: "edit-delete"
+                    text: Accessible.name
+                    visible: entryDelegate.modelData.discard !== undefined
+                        && String(entryDelegate.modelData.discard.operation || "").length > 0
+                    onClicked: changes.confirmDiscard(entryDelegate.modelData)
+                }
             }
         }
 
         Controls.ScrollBar.vertical: Controls.ScrollBar {}
+    }
+
+    DiscardPrompt {
+        id: discardPrompt
+
+        onConfirmed: function(operation) {
+            changes.backend.discardPath(
+                changes.project.id,
+                changes.pendingDiscardPathId,
+                operation
+            );
+            changes.pendingDiscardPathId = "";
+        }
+        onRejected: changes.pendingDiscardPathId = ""
     }
 }

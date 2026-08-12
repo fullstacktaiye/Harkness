@@ -38,6 +38,8 @@ ColumnLayout {
     property alias reviewCurrentIndex: reviewLineView.currentIndex
     property bool splitLayout: false
     property int pendingHunkNavigation: 0
+    property string pendingDiscardKind: ""
+    property string pendingDiscardId: ""
 
     spacing: Kirigami.Units.smallSpacing
 
@@ -224,6 +226,22 @@ ColumnLayout {
         if (reviewFile.fileId === undefined)
             return;
         backend.openReviewLine(project.id, reviewFile.fileId, Math.max(1, Number(line || 1)));
+    }
+
+    function confirmFileDiscard() {
+        pendingDiscardKind = "file";
+        pendingDiscardId = String(reviewFile.fileId || "");
+        discardPrompt.description = reviewFile.discard || ({});
+        discardPrompt.subject = String(reviewFile.path || "");
+        discardPrompt.open();
+    }
+
+    function confirmHunkDiscard(row) {
+        pendingDiscardKind = "hunk";
+        pendingDiscardId = String(row.hunkId || "");
+        discardPrompt.description = row.discard || ({});
+        discardPrompt.subject = String(reviewFile.path || "");
+        discardPrompt.open();
     }
 
     function openCurrentReviewLine() {
@@ -884,6 +902,22 @@ ColumnLayout {
                                 reviewSurface.reviewFile.firstLine || 1
                             )
                         }
+
+                        Controls.ToolButton {
+                            Accessible.name: String((reviewSurface.reviewFile.discard || ({})).operation || "")
+                                === "delete_untracked"
+                                ? qsTr("Delete untracked file")
+                                : qsTr("Discard file changes")
+                            Controls.ToolTip.text: Accessible.name
+                            Controls.ToolTip.visible: hovered
+                            display: Controls.AbstractButton.IconOnly
+                            enabled: !reviewSurface.repositoryMutationRunning()
+                                && !reviewSurface.reviewReadRunning()
+                            icon.name: "edit-delete"
+                            text: Accessible.name
+                            visible: String((reviewSurface.reviewFile.discard || ({})).operation || "").length > 0
+                            onClicked: reviewSurface.confirmFileDiscard()
+                        }
                     }
 
                     Kirigami.InlineMessage {
@@ -989,13 +1023,26 @@ ColumnLayout {
             contentItem: ColumnLayout {
                 spacing: Kirigami.Units.smallSpacing
 
-                Controls.Label {
+                RowLayout {
                     Layout.fillWidth: true
-                    color: Kirigami.Theme.highlightColor
-                    font.family: "monospace"
-                    text: reviewHunk.row.header || ""
-                    textFormat: Text.PlainText
-                    wrapMode: Text.WrapAnywhere
+
+                    Controls.Label {
+                        Layout.fillWidth: true
+                        color: Kirigami.Theme.highlightColor
+                        font.family: "monospace"
+                        text: reviewHunk.row.header || ""
+                        textFormat: Text.PlainText
+                        wrapMode: Text.WrapAnywhere
+                    }
+
+                    Controls.Button {
+                        enabled: !reviewSurface.repositoryMutationRunning()
+                            && !reviewSurface.reviewReadRunning()
+                        icon.name: "edit-delete"
+                        text: qsTr("Discard hunk…")
+                        visible: String((reviewHunk.row.discard || ({})).operation || "").length > 0
+                        onClicked: reviewSurface.confirmHunkDiscard(reviewHunk.row)
+                    }
                 }
 
                 Controls.Label {
@@ -1029,6 +1076,31 @@ ColumnLayout {
                 row.hunkId,
                 row.direction
             )
+        }
+    }
+
+    DiscardPrompt {
+        id: discardPrompt
+
+        onConfirmed: function(operation) {
+            if (reviewSurface.pendingDiscardKind === "hunk") {
+                reviewSurface.backend.discardReviewHunk(
+                    reviewSurface.project.id,
+                    reviewSurface.pendingDiscardId
+                );
+            } else if (reviewSurface.pendingDiscardKind === "file") {
+                reviewSurface.backend.discardReviewFile(
+                    reviewSurface.project.id,
+                    reviewSurface.pendingDiscardId,
+                    operation
+                );
+            }
+            reviewSurface.pendingDiscardKind = "";
+            reviewSurface.pendingDiscardId = "";
+        }
+        onRejected: {
+            reviewSurface.pendingDiscardKind = "";
+            reviewSurface.pendingDiscardId = "";
         }
     }
 

@@ -118,6 +118,35 @@ pub mod ffi {
             path_id: &QString,
         );
 
+        /// Applies a confirmed discard to one backend-owned status path.
+        #[qinvokable]
+        #[cxx_name = "discardPath"]
+        fn discard_path(
+            self: Pin<&mut HarknessBackend>,
+            project_id: &QString,
+            path_id: &QString,
+            operation: &QString,
+        );
+
+        /// Applies a confirmed whole-file discard to the loaded review file.
+        #[qinvokable]
+        #[cxx_name = "discardReviewFile"]
+        fn discard_review_file(
+            self: Pin<&mut HarknessBackend>,
+            project_id: &QString,
+            file_id: &QString,
+            operation: &QString,
+        );
+
+        /// Applies a confirmed reverse patch for one loaded review hunk.
+        #[qinvokable]
+        #[cxx_name = "discardReviewHunk"]
+        fn discard_review_hunk(
+            self: Pin<&mut HarknessBackend>,
+            project_id: &QString,
+            hunk_id: &QString,
+        );
+
         /// Opens the loaded working-tree file at a backend-derived diff line.
         #[qinvokable]
         #[cxx_name = "openReviewLine"]
@@ -284,9 +313,12 @@ pub mod ffi {
 }
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    fs,
     path::{Path, PathBuf},
     pin::Pin,
+    sync::{Arc, Mutex},
+    time::UNIX_EPOCH,
 };
 
 use cxx_qt::{CxxQtType, Threading};
@@ -307,6 +339,9 @@ pub struct HarknessBackendRust {
     cancellations: HashMap<String, harkness_git::Cancellation>,
     path_selections: HashMap<String, PathSelectionKey>,
     path_selection_ids: HashMap<PathSelectionKey, String>,
+    path_discard_operations: HashMap<String, String>,
+    path_discard_snapshots: HashMap<String, harkness_git::DiscardSnapshot>,
+    discard_snapshot_cache: DiscardSnapshotCache,
     review_path_ids: HashMap<PathSelectionKey, String>,
     /// Catalog project ID to the actual Git common-directory scheduling domain.
     repository_lock_scopes: HashMap<String, String>,
@@ -345,6 +380,9 @@ impl Default for HarknessBackendRust {
             cancellations: HashMap::new(),
             path_selections: HashMap::new(),
             path_selection_ids: HashMap::new(),
+            path_discard_operations: HashMap::new(),
+            path_discard_snapshots: HashMap::new(),
+            discard_snapshot_cache: Arc::default(),
             review_path_ids: HashMap::new(),
             repository_lock_scopes: HashMap::new(),
             worktree_lifecycle_lock_scopes: HashMap::new(),
@@ -485,6 +523,8 @@ fn is_repository_mutation_job(kind: &str) -> bool {
             | "unstage"
             | "stage_hunk"
             | "unstage_hunk"
+            | "discard_path"
+            | "discard_hunk"
             | "commit"
             | "fetch"
             | "pull"
@@ -647,6 +687,99 @@ impl PathSelectionKey {
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct DiscardSnapshotCacheKey {
+    root: PathBuf,
+    selection: PathSelectionKey,
+    operation: String,
+    staged: String,
+    unstaged: String,
+}
+
+#[derive(Clone, Debug)]
+struct CachedDiscardSnapshot {
+    metadata: Vec<PathMetadataFingerprint>,
+    snapshot: harkness_git::DiscardSnapshot,
+}
+
+type DiscardSnapshotCache = Arc<Mutex<HashMap<DiscardSnapshotCacheKey, CachedDiscardSnapshot>>>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PathMetadataFingerprint {
+    path: PathBuf,
+    state: MetadataState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MetadataState {
+    Present(MetadataFingerprint),
+    Unavailable(std::io::ErrorKind),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MetadataFingerprint {
+    len: u64,
+    modified_seconds: u64,
+    modified_nanoseconds: u32,
+    is_file: bool,
+    is_dir: bool,
+    is_symlink: bool,
+    readonly: bool,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+}
+
+fn path_metadata_fingerprints(root: &Path, paths: &[PathBuf]) -> Vec<PathMetadataFingerprint> {
+    paths
+        .iter()
+        .map(|path| {
+            let state = fs::symlink_metadata(root.join(path)).map_or_else(
+                |error| MetadataState::Unavailable(error.kind()),
+                |metadata| {
+                    let modified = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                        .unwrap_or_default();
+                    #[cfg(unix)]
+                    use std::os::unix::fs::MetadataExt;
+                    MetadataState::Present(MetadataFingerprint {
+                        len: metadata.len(),
+                        modified_seconds: modified.as_secs(),
+                        modified_nanoseconds: modified.subsec_nanos(),
+                        is_file: metadata.file_type().is_file(),
+                        is_dir: metadata.file_type().is_dir(),
+                        is_symlink: metadata.file_type().is_symlink(),
+                        readonly: metadata.permissions().readonly(),
+                        #[cfg(unix)]
+                        device: metadata.dev(),
+                        #[cfg(unix)]
+                        inode: metadata.ino(),
+                        #[cfg(unix)]
+                        mode: metadata.mode(),
+                        #[cfg(unix)]
+                        changed_seconds: metadata.ctime(),
+                        #[cfg(unix)]
+                        changed_nanoseconds: metadata.ctime_nsec(),
+                    })
+                },
+            );
+            PathMetadataFingerprint {
+                path: path.clone(),
+                state,
+            }
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 struct StatusEntryRow {
     path: PathBuf,
@@ -658,6 +791,7 @@ struct StatusEntryRow {
     staged_rename: bool,
     unstaged_rename: bool,
     conflicted: bool,
+    discard_snapshot: Option<harkness_git::DiscardSnapshot>,
 }
 
 #[derive(Debug)]
@@ -727,6 +861,7 @@ impl GitStateRow {
                     staged_rename,
                     unstaged_rename,
                     conflicted: entry.conflicted,
+                    discard_snapshot: None,
                 }
             })
             .collect();
@@ -751,6 +886,84 @@ impl GitStateRow {
         self.error_kind.clone_from(&failure.kind);
         self
     }
+}
+
+fn attach_discard_snapshots(
+    git: &harkness_git::GitService,
+    state: &mut GitStateRow,
+    cache: &DiscardSnapshotCache,
+) {
+    attach_discard_snapshots_with(git.root(), state, cache, |paths| {
+        git.discard_snapshot(paths).ok()
+    });
+}
+
+fn attach_discard_snapshots_with(
+    root: &Path,
+    state: &mut GitStateRow,
+    cache: &DiscardSnapshotCache,
+    mut capture: impl FnMut(Vec<PathBuf>) -> Option<harkness_git::DiscardSnapshot>,
+) {
+    let mut current_keys = HashSet::new();
+    for entry in &mut state.entries {
+        let Some(description) = status_discard_description(entry) else {
+            continue;
+        };
+        let selection = PathSelectionKey {
+            project_id: state.project_id.clone(),
+            path: entry.path.clone(),
+            staged_rename_source: entry
+                .staged_rename
+                .then(|| entry.rename_source_path.clone())
+                .flatten(),
+            unstaged_rename_source: entry
+                .unstaged_rename
+                .then(|| entry.rename_source_path.clone())
+                .flatten(),
+        };
+        let paths = selection.commit_paths();
+        let key = DiscardSnapshotCacheKey {
+            root: root.to_path_buf(),
+            selection,
+            operation: discard_operation_name(&description).to_owned(),
+            staged: entry.staged.clone(),
+            unstaged: entry.unstaged.clone(),
+        };
+        let metadata = path_metadata_fingerprints(root, &paths);
+        current_keys.insert(key.clone());
+        let cached = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .filter(|cached| cached.metadata == metadata)
+            .map(|cached| cached.snapshot.clone());
+        entry.discard_snapshot = if let Some(snapshot) = cached {
+            Some(snapshot)
+        } else {
+            let snapshot = capture(paths);
+            let mut cache = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(snapshot) = &snapshot {
+                cache.insert(
+                    key,
+                    CachedDiscardSnapshot {
+                        metadata,
+                        snapshot: snapshot.clone(),
+                    },
+                );
+            } else {
+                cache.remove(&key);
+            }
+            snapshot
+        };
+    }
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|key, _| {
+            key.selection.project_id != state.project_id || current_keys.contains(key)
+        });
 }
 
 fn change_name(change: harkness_git::FileChange) -> &'static str {
@@ -875,6 +1088,125 @@ fn resolve_commit_scope(
     Ok(harkness_git::CommitScope::Paths(paths))
 }
 
+fn status_discard_description(entry: &StatusEntryRow) -> Option<harkness_git::DiscardDescription> {
+    if entry.conflicted {
+        return None;
+    }
+    let mut paths = vec![entry.path.as_path()];
+    if (entry.staged_rename || entry.unstaged_rename)
+        && let Some(source) = entry.rename_source_path.as_deref()
+        && !paths.contains(&source)
+    {
+        paths.push(source);
+    }
+    if entry.unstaged == "untracked" {
+        return Some(harkness_git::DiscardDescription::delete_untracked(paths));
+    }
+    if !entry.unstaged.is_empty() {
+        return Some(harkness_git::DiscardDescription::restore_tracked(
+            paths,
+            harkness_git::TrackedRestoreSource::Index,
+        ));
+    }
+    (!entry.staged.is_empty()).then(|| {
+        harkness_git::DiscardDescription::restore_tracked(
+            paths,
+            harkness_git::TrackedRestoreSource::Head,
+        )
+    })
+}
+
+fn review_file_discard_description(
+    file: &harkness_git::FileDiff,
+) -> Option<harkness_git::DiscardDescription> {
+    let path = review_path(file);
+    let mut paths = [file.old_path.as_deref(), file.new_path.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    paths.dedup();
+    match (&file.target, file.change) {
+        (_, harkness_git::FileChange::Unmerged) => None,
+        (harkness_git::DiffTarget::Unstaged, harkness_git::FileChange::Untracked) => {
+            Some(harkness_git::DiscardDescription::delete_untracked([path]))
+        }
+        (harkness_git::DiffTarget::Unstaged, _) => {
+            Some(harkness_git::DiscardDescription::restore_tracked(
+                paths,
+                harkness_git::TrackedRestoreSource::Index,
+            ))
+        }
+        (harkness_git::DiffTarget::Staged, _) => {
+            Some(harkness_git::DiscardDescription::restore_tracked(
+                paths,
+                harkness_git::TrackedRestoreSource::Head,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn discard_operation_name(description: &harkness_git::DiscardDescription) -> &'static str {
+    match description.operation() {
+        harkness_git::DiscardOperation::RestoreTracked {
+            source: harkness_git::TrackedRestoreSource::Index,
+        } => "restore_index",
+        harkness_git::DiscardOperation::RestoreTracked {
+            source: harkness_git::TrackedRestoreSource::Head,
+        } => "restore_head",
+        harkness_git::DiscardOperation::RestoreTrackedHunks { .. } => "restore_hunks",
+        harkness_git::DiscardOperation::RestoreTrackedLines { .. } => "restore_lines",
+        harkness_git::DiscardOperation::DeleteUntracked => "delete_untracked",
+        _ => "",
+    }
+}
+
+fn to_discard_description(description: Option<&harkness_git::DiscardDescription>) -> QVariant {
+    let Some(description) = description else {
+        return QVariant::from(&QMap::<QMapPair_QString_QVariant>::default());
+    };
+    let mut value = QMap::<QMapPair_QString_QVariant>::default();
+    value.insert(
+        QString::from("operation"),
+        QVariant::from(&QString::from(discard_operation_name(description))),
+    );
+    value.insert(
+        QString::from("trackedFiles"),
+        QVariant::from(&i32::try_from(description.tracked_files()).unwrap_or(i32::MAX)),
+    );
+    value.insert(
+        QString::from("untrackedFiles"),
+        QVariant::from(&i32::try_from(description.untracked_files()).unwrap_or(i32::MAX)),
+    );
+    value.insert(
+        QString::from("unrecoverable"),
+        QVariant::from(&matches!(
+            description.recoverability(),
+            harkness_git::DiscardRecoverability::Unrecoverable
+        )),
+    );
+    let (hunks, lines) = match description.operation() {
+        harkness_git::DiscardOperation::RestoreTrackedHunks { hunks } => (hunks, 0),
+        harkness_git::DiscardOperation::RestoreTrackedLines { lines, hunks } => (hunks, lines),
+        _ => (0, 0),
+    };
+    value.insert(
+        QString::from("hunks"),
+        QVariant::from(&i32::try_from(hunks).unwrap_or(i32::MAX)),
+    );
+    value.insert(
+        QString::from("lines"),
+        QVariant::from(&i32::try_from(lines).unwrap_or(i32::MAX)),
+    );
+    let mut paths = QList::<QVariant>::default();
+    for path in description.paths() {
+        paths.append(QVariant::from(&QString::from(path.display().to_string())));
+    }
+    value.insert(QString::from("paths"), QVariant::from(&paths));
+    QVariant::from(&value)
+}
+
 fn to_git(row: &GitStateRow, path_selection_ids: &[String]) -> QVariant {
     debug_assert_eq!(row.entries.len(), path_selection_ids.len());
     let mut state = QMap::<QMapPair_QString_QVariant>::default();
@@ -937,6 +1269,8 @@ fn to_git(row: &GitStateRow, path_selection_ids: &[String]) -> QVariant {
             QVariant::from(&QString::from(row.rename_source.as_str())),
         );
         insert("conflicted", QVariant::from(&row.conflicted));
+        let discard = status_discard_description(row);
+        insert("discard", to_discard_description(discard.as_ref()));
         entries.append(QVariant::from(&entry));
     }
     insert("entries", QVariant::from(&entries));
@@ -957,17 +1291,31 @@ fn replace_status_path_selections(
     // repository state.
     backend.path_selections.clear();
     backend.path_selection_ids.clear();
+    backend.path_discard_operations.clear();
+    backend.path_discard_snapshots.clear();
     row.entries
         .iter()
         .map(|entry| {
-            register_path_selection(
+            let token = register_path_selection(
                 backend,
                 &row.project_id,
                 &entry.path,
                 entry.rename_source_path.as_deref(),
                 entry.staged_rename,
                 entry.unstaged_rename,
-            )
+            );
+            if let Some(description) = status_discard_description(entry) {
+                backend.path_discard_operations.insert(
+                    token.clone(),
+                    discard_operation_name(&description).to_owned(),
+                );
+                if let Some(snapshot) = &entry.discard_snapshot {
+                    backend
+                        .path_discard_snapshots
+                        .insert(token.clone(), snapshot.clone());
+                }
+            }
+            token
         })
         .collect()
 }
@@ -985,6 +1333,8 @@ fn clear_git_state(mut backend: Pin<&mut ffi::HarknessBackend>) {
         let rust = backend.as_mut().rust_mut().get_mut();
         rust.path_selections.clear();
         rust.path_selection_ids.clear();
+        rust.path_discard_operations.clear();
+        rust.path_discard_snapshots.clear();
     }
     backend.as_mut().set_git(empty_git());
 }
@@ -1267,6 +1617,7 @@ struct ReviewHunkState {
 struct ReviewLoadedFile {
     id: String,
     file: harkness_git::FileDiff,
+    discard_snapshot: Option<harkness_git::DiscardSnapshot>,
     hunks: Vec<ReviewHunkState>,
     total_lines: Option<u32>,
     row_offset: usize,
@@ -1527,9 +1878,18 @@ fn load_review_file_with_git(
             after: Vec::new(),
         })
         .collect();
+    let discard_paths = [file.old_path.as_ref(), file.new_path.as_ref()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let discard_snapshot = review_file_discard_description(&file)
+        .map(|_| git.discard_snapshot(discard_paths))
+        .transpose()
+        .map_err(GitFailure::from)?;
     Ok(ReviewLoadedFile {
         id: entry.id.clone(),
         file,
+        discard_snapshot,
         hunks,
         total_lines,
         row_offset: 0,
@@ -1825,7 +2185,11 @@ fn collapsed_review_row(hunk_id: &str, direction: &str, count: u32) -> QVariant 
     QVariant::from(&row)
 }
 
-fn review_hunk_row(hunk_id: &str, hunk: &harkness_git::Hunk) -> QVariant {
+fn review_hunk_row(
+    hunk_id: &str,
+    hunk: &harkness_git::Hunk,
+    file: &harkness_git::FileDiff,
+) -> QVariant {
     let mut row = QMap::<QMapPair_QString_QVariant>::default();
     row.insert(
         QString::from("type"),
@@ -1842,6 +2206,19 @@ fn review_hunk_row(hunk_id: &str, hunk: &harkness_git::Hunk) -> QVariant {
     row.insert(
         QString::from("degradation"),
         QVariant::from(&QString::from(hunk_degradation_summary(hunk).as_str())),
+    );
+    let discard = matches!(file.target, harkness_git::DiffTarget::Unstaged)
+        .then(|| match file.change {
+            harkness_git::FileChange::Untracked | harkness_git::FileChange::Unmerged => None,
+            _ => Some(harkness_git::DiscardDescription::restore_hunks(
+                [review_path(file)],
+                1,
+            )),
+        })
+        .flatten();
+    row.insert(
+        QString::from("discard"),
+        to_discard_description(discard.as_ref()),
     );
     QVariant::from(&row)
 }
@@ -2100,7 +2477,7 @@ fn review_rows(loaded: &ReviewLoadedFile) -> QList<QVariant> {
             break 'all_rows;
         }
         if !append_review_row(&mut rows, &mut row_index, start, end, || {
-            review_hunk_row(&state.id, hunk)
+            review_hunk_row(&state.id, hunk, &loaded.file)
         }) {
             break 'all_rows;
         }
@@ -2271,6 +2648,11 @@ fn to_review(row: &ReviewStateRow, loaded_path_id: &str) -> QVariant {
                 QVariant::from(&bounded_i32(first_working_tree_line(&loaded.file))),
             );
             value.insert(QString::from("binary"), QVariant::from(&loaded.file.binary));
+            let discard = review_file_discard_description(&loaded.file);
+            value.insert(
+                QString::from("discard"),
+                to_discard_description(discard.as_ref()),
+            );
             value.insert(
                 QString::from("hunkCount"),
                 QVariant::from(&i32::try_from(loaded.file.hunks.len()).unwrap_or(i32::MAX)),
@@ -2636,18 +3018,30 @@ struct GitWorkerResult {
 fn run_git_status(
     project_id: String,
     cancellation: &harkness_git::Cancellation,
+    discard_snapshot_cache: &DiscardSnapshotCache,
 ) -> GitWorkerResult {
-    run_git_status_with_git(
+    run_git_status_with_git_and_cache(
         project_id.clone(),
         load_project_git(&project_id),
         cancellation,
+        discard_snapshot_cache,
     )
 }
 
+#[cfg(test)]
 fn run_git_status_with_git(
     project_id: String,
     git: Result<harkness_git::GitService, GitFailure>,
     cancellation: &harkness_git::Cancellation,
+) -> GitWorkerResult {
+    run_git_status_with_git_and_cache(project_id, git, cancellation, &Arc::default())
+}
+
+fn run_git_status_with_git_and_cache(
+    project_id: String,
+    git: Result<harkness_git::GitService, GitFailure>,
+    cancellation: &harkness_git::Cancellation,
+    discard_snapshot_cache: &DiscardSnapshotCache,
 ) -> GitWorkerResult {
     let git = match git {
         Ok(git) => git,
@@ -2660,11 +3054,15 @@ fn run_git_status_with_git(
         }
     };
     match git.detailed_status(cancellation) {
-        Ok(status) => GitWorkerResult {
-            state: Some(GitStateRow::from_status(project_id.clone(), status)),
-            project_id,
-            message: Ok("Git status refreshed".to_owned()),
-        },
+        Ok(status) => {
+            let mut state = GitStateRow::from_status(project_id.clone(), status);
+            attach_discard_snapshots(&git, &mut state, discard_snapshot_cache);
+            GitWorkerResult {
+                state: Some(state),
+                project_id,
+                message: Ok("Git status refreshed".to_owned()),
+            }
+        }
         Err(error) => GitWorkerResult {
             project_id,
             message: Err(GitFailure::from(error)),
@@ -2676,23 +3074,39 @@ fn run_git_status_with_git(
 fn run_git_operation(
     project_id: String,
     cancellation: &harkness_git::Cancellation,
+    discard_snapshot_cache: &DiscardSnapshotCache,
     operation: impl FnOnce(
         &harkness_git::GitService,
         &harkness_git::Cancellation,
     ) -> Result<String, GitFailure>,
 ) -> GitWorkerResult {
-    run_git_operation_with_git(
+    run_git_operation_with_git_and_cache(
         project_id.clone(),
         load_project_git(&project_id),
         cancellation,
+        discard_snapshot_cache,
         operation,
     )
 }
 
+#[cfg(test)]
 fn run_git_operation_with_git(
     project_id: String,
     git: Result<harkness_git::GitService, GitFailure>,
     cancellation: &harkness_git::Cancellation,
+    operation: impl FnOnce(
+        &harkness_git::GitService,
+        &harkness_git::Cancellation,
+    ) -> Result<String, GitFailure>,
+) -> GitWorkerResult {
+    run_git_operation_with_git_and_cache(project_id, git, cancellation, &Arc::default(), operation)
+}
+
+fn run_git_operation_with_git_and_cache(
+    project_id: String,
+    git: Result<harkness_git::GitService, GitFailure>,
+    cancellation: &harkness_git::Cancellation,
+    discard_snapshot_cache: &DiscardSnapshotCache,
     operation: impl FnOnce(
         &harkness_git::GitService,
         &harkness_git::Cancellation,
@@ -2714,7 +3128,8 @@ fn run_git_operation_with_git(
     // suppressed by the user's cancellation request.
     let state = match git.detailed_status(&harkness_git::Cancellation::default()) {
         Ok(status) => {
-            let state = GitStateRow::from_status(project_id.clone(), status);
+            let mut state = GitStateRow::from_status(project_id.clone(), status);
+            attach_discard_snapshots(&git, &mut state, discard_snapshot_cache);
             Some(match &message {
                 Ok(_) => state,
                 Err(failure) => state.with_failure(failure),
@@ -2732,6 +3147,139 @@ fn run_git_operation_with_git(
         message,
         state,
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GuiDiscardOperation {
+    RestoreIndex,
+    RestoreHead,
+    DeleteUntracked,
+}
+
+impl GuiDiscardOperation {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "restore_index" => Some(Self::RestoreIndex),
+            "restore_head" => Some(Self::RestoreHead),
+            "delete_untracked" => Some(Self::DeleteUntracked),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::RestoreIndex => "restore_index",
+            Self::RestoreHead => "restore_head",
+            Self::DeleteUntracked => "delete_untracked",
+        }
+    }
+}
+
+fn discard_success_message(description: &harkness_git::DiscardDescription) -> String {
+    match description.operation() {
+        harkness_git::DiscardOperation::RestoreTracked { source } => format!(
+            "Restored {} tracked file(s) from {}",
+            description.tracked_files(),
+            match source {
+                harkness_git::TrackedRestoreSource::Index => "the index",
+                harkness_git::TrackedRestoreSource::Head => "HEAD",
+                _ => "the selected boundary",
+            }
+        ),
+        harkness_git::DiscardOperation::RestoreTrackedHunks { hunks } => {
+            format!("Discarded {hunks} tracked hunk(s)")
+        }
+        harkness_git::DiscardOperation::DeleteUntracked => format!(
+            "Permanently deleted {} untracked file(s)",
+            description.untracked_files()
+        ),
+        _ => "Discarded selected changes".to_owned(),
+    }
+}
+
+fn launch_path_discard(
+    mut backend: Pin<&mut ffi::HarknessBackend>,
+    project_id: String,
+    paths: Vec<PathBuf>,
+    operation: GuiDiscardOperation,
+    snapshot: harkness_git::DiscardSnapshot,
+) {
+    let Some((job_id, cancellation)) = start_job(
+        backend.as_mut(),
+        "discard_path",
+        &project_id,
+        "Discard file changes",
+        true,
+    ) else {
+        return;
+    };
+    let discard_snapshot_cache = backend.as_ref().rust().discard_snapshot_cache.clone();
+    let qt_thread = backend.qt_thread();
+    std::thread::spawn(move || {
+        let result = run_git_operation(
+            project_id,
+            &cancellation,
+            &discard_snapshot_cache,
+            |git, cancellation| {
+                let outcome = match operation {
+                    GuiDiscardOperation::RestoreIndex => git.restore_tracked_if_unchanged(
+                        &paths,
+                        harkness_git::TrackedRestoreSource::Index,
+                        &snapshot,
+                        cancellation,
+                    ),
+                    GuiDiscardOperation::RestoreHead => git.restore_tracked_if_unchanged(
+                        &paths,
+                        harkness_git::TrackedRestoreSource::Head,
+                        &snapshot,
+                        cancellation,
+                    ),
+                    GuiDiscardOperation::DeleteUntracked => {
+                        git.delete_untracked_if_unchanged(&paths, &snapshot, cancellation)
+                    }
+                }
+                .map_err(GitFailure::from)?;
+                Ok(discard_success_message(&outcome.description))
+            },
+        );
+        let _ = qt_thread.queue(move |mut backend| {
+            apply_git_result(backend.as_mut(), &job_id, result, true, false, false, true);
+        });
+    });
+}
+
+fn launch_hunk_discard(
+    mut backend: Pin<&mut ffi::HarknessBackend>,
+    project_id: String,
+    selection: harkness_git::HunkSelection,
+) {
+    let Some((job_id, cancellation)) = start_job(
+        backend.as_mut(),
+        "discard_hunk",
+        &project_id,
+        "Discard hunk",
+        true,
+    ) else {
+        return;
+    };
+    let discard_snapshot_cache = backend.as_ref().rust().discard_snapshot_cache.clone();
+    let qt_thread = backend.qt_thread();
+    std::thread::spawn(move || {
+        let result = run_git_operation(
+            project_id,
+            &cancellation,
+            &discard_snapshot_cache,
+            |git, cancellation| {
+                let outcome = git
+                    .discard_hunks(std::slice::from_ref(&selection), cancellation)
+                    .map_err(GitFailure::from)?;
+                Ok(discard_success_message(&outcome.description))
+            },
+        );
+        let _ = qt_thread.queue(move |mut backend| {
+            apply_git_result(backend.as_mut(), &job_id, result, true, false, false, true);
+        });
+    });
 }
 
 fn apply_git_result(
@@ -3676,9 +4224,10 @@ impl ffi::HarknessBackend {
         ) else {
             return;
         };
+        let discard_snapshot_cache = self.as_ref().rust().discard_snapshot_cache.clone();
         let qt_thread = self.qt_thread();
         std::thread::spawn(move || {
-            let result = run_git_status(project_id, &cancellation);
+            let result = run_git_status(project_id, &cancellation, &discard_snapshot_cache);
             let _ = qt_thread.queue(move |mut backend| {
                 apply_git_result(backend.as_mut(), &job_id, result, false, false, true, true);
             });
@@ -3882,6 +4431,146 @@ impl ffi::HarknessBackend {
             }
         };
         launch_working_review(self, project_id, staged, preferred_path);
+    }
+
+    fn discard_path(
+        mut self: Pin<&mut Self>,
+        project_id: &QString,
+        path_id: &QString,
+        operation: &QString,
+    ) {
+        let project_id = project_id.to_string();
+        let path_id = path_id.to_string();
+        let operation = operation.to_string();
+        let Some(operation) = GuiDiscardOperation::parse(&operation) else {
+            self.as_mut()
+                .set_status("The discard operation is invalid; refresh Git status".into());
+            return;
+        };
+        let selection = match resolve_path_selection(self.as_ref().rust(), &project_id, &path_id) {
+            Ok(selection) => selection,
+            Err(error) => {
+                self.as_mut().set_status(error.into());
+                return;
+            }
+        };
+        let expected = self
+            .as_ref()
+            .rust()
+            .path_discard_operations
+            .get(&path_id)
+            .cloned();
+        if expected.as_deref() != Some(operation.name()) {
+            self.as_mut().set_status(
+                "The path changed after confirmation; refresh Git status and review it again"
+                    .into(),
+            );
+            return;
+        }
+        let Some(snapshot) = self
+            .as_ref()
+            .rust()
+            .path_discard_snapshots
+            .get(&path_id)
+            .cloned()
+        else {
+            self.as_mut().set_status(
+                "The path could not be verified; refresh Git status and confirm again".into(),
+            );
+            return;
+        };
+        launch_path_discard(
+            self,
+            project_id,
+            selection.commit_paths(),
+            operation,
+            snapshot,
+        );
+    }
+
+    fn discard_review_file(
+        mut self: Pin<&mut Self>,
+        project_id: &QString,
+        file_id: &QString,
+        operation: &QString,
+    ) {
+        let project_id = project_id.to_string();
+        let file_id = file_id.to_string();
+        let operation_text = operation.to_string();
+        let Some(operation) = GuiDiscardOperation::parse(&operation_text) else {
+            self.as_mut()
+                .set_status("The discard operation is invalid; refresh the review".into());
+            return;
+        };
+        let resolved = self
+            .as_ref()
+            .rust()
+            .review_state
+            .as_ref()
+            .filter(|state| state.project_id == project_id)
+            .and_then(|state| state.loaded_file.as_ref())
+            .filter(|loaded| loaded.id == file_id)
+            .and_then(|loaded| {
+                review_file_discard_description(&loaded.file)
+                    .zip(loaded.discard_snapshot.clone())
+                    .map(|(description, snapshot)| {
+                        let mut paths =
+                            [loaded.file.old_path.clone(), loaded.file.new_path.clone()]
+                                .into_iter()
+                                .flatten()
+                                .collect::<Vec<_>>();
+                        paths.sort_unstable();
+                        paths.dedup();
+                        (paths, description, snapshot)
+                    })
+            });
+        let Some((paths, description, snapshot)) = resolved else {
+            self.as_mut()
+                .set_status("The selected review file is no longer discardable".into());
+            return;
+        };
+        if discard_operation_name(&description) != operation.name() {
+            self.as_mut().set_status(
+                "The review file changed after confirmation; refresh it and review again".into(),
+            );
+            return;
+        }
+        launch_path_discard(self, project_id, paths, operation, snapshot);
+    }
+
+    fn discard_review_hunk(mut self: Pin<&mut Self>, project_id: &QString, hunk_id: &QString) {
+        let project_id = project_id.to_string();
+        let hunk_id = hunk_id.to_string();
+        let selection = self
+            .as_ref()
+            .rust()
+            .review_state
+            .as_ref()
+            .filter(|state| state.project_id == project_id)
+            .and_then(|state| state.loaded_file.as_ref())
+            .filter(|loaded| {
+                matches!(loaded.file.target, harkness_git::DiffTarget::Unstaged)
+                    && !matches!(
+                        loaded.file.change,
+                        harkness_git::FileChange::Untracked | harkness_git::FileChange::Unmerged
+                    )
+            })
+            .and_then(|loaded| {
+                loaded
+                    .hunks
+                    .iter()
+                    .position(|state| state.id == hunk_id)
+                    .map(|index| {
+                        harkness_git::HunkSelection::new(&loaded.file, &loaded.file.hunks[index])
+                    })
+            });
+        let Some(selection) = selection else {
+            self.as_mut().set_status(
+                "The selected hunk is no longer discardable; refresh the review".into(),
+            );
+            return;
+        };
+        launch_hunk_discard(self, project_id, selection);
     }
 
     fn open_review_line(
@@ -4268,25 +4957,31 @@ impl ffi::HarknessBackend {
         else {
             return;
         };
+        let discard_snapshot_cache = self.as_ref().rust().discard_snapshot_cache.clone();
         let qt_thread = self.qt_thread();
         std::thread::spawn(move || {
-            let result = run_git_operation(project_id, &cancellation, |git, cancellation| {
-                let outcome = git
-                    .commit(
-                        &message,
-                        &harkness_git::CommitOptions::default()
-                            .with_amend(amend)
-                            .with_scope(scope),
-                        cancellation,
-                    )
-                    .map_err(GitFailure::from)?;
-                let short = outcome.commit_id.chars().take(12).collect::<String>();
-                Ok(if outcome.amended {
-                    format!("Amended commit {short}")
-                } else {
-                    format!("Created commit {short}")
-                })
-            });
+            let result = run_git_operation(
+                project_id,
+                &cancellation,
+                &discard_snapshot_cache,
+                |git, cancellation| {
+                    let outcome = git
+                        .commit(
+                            &message,
+                            &harkness_git::CommitOptions::default()
+                                .with_amend(amend)
+                                .with_scope(scope),
+                            cancellation,
+                        )
+                        .map_err(GitFailure::from)?;
+                    let short = outcome.commit_id.chars().take(12).collect::<String>();
+                    Ok(if outcome.amended {
+                        format!("Amended commit {short}")
+                    } else {
+                        format!("Created commit {short}")
+                    })
+                },
+            );
             let _ = qt_thread.queue(move |mut backend| {
                 apply_git_result(backend.as_mut(), &job_id, result, true, false, false, true);
             });
@@ -4300,29 +4995,35 @@ impl ffi::HarknessBackend {
         else {
             return;
         };
+        let discard_snapshot_cache = self.as_ref().rust().discard_snapshot_cache.clone();
         let qt_thread = self.qt_thread();
         std::thread::spawn(move || {
             let progress_thread = qt_thread.clone();
             let progress_job_id = job_id.clone();
-            let result = run_git_operation(project_id, &cancellation, |git, cancellation| {
-                let outcome = git
-                    .fetch(
-                        &harkness_git::FetchOptions::default(),
-                        cancellation,
-                        move |message| {
-                            let update_job_id = progress_job_id.clone();
-                            let _ = progress_thread.queue(move |mut backend| {
-                                update_backend_job(backend.as_mut(), &update_job_id, message);
-                            });
-                        },
-                    )
-                    .map_err(GitFailure::from)?;
-                Ok(if outcome.updated {
-                    format!("Fetched updates from {}", outcome.remote)
-                } else {
-                    format!("{} is already up to date", outcome.remote)
-                })
-            });
+            let result = run_git_operation(
+                project_id,
+                &cancellation,
+                &discard_snapshot_cache,
+                |git, cancellation| {
+                    let outcome = git
+                        .fetch(
+                            &harkness_git::FetchOptions::default(),
+                            cancellation,
+                            move |message| {
+                                let update_job_id = progress_job_id.clone();
+                                let _ = progress_thread.queue(move |mut backend| {
+                                    update_backend_job(backend.as_mut(), &update_job_id, message);
+                                });
+                            },
+                        )
+                        .map_err(GitFailure::from)?;
+                    Ok(if outcome.updated {
+                        format!("Fetched updates from {}", outcome.remote)
+                    } else {
+                        format!("{} is already up to date", outcome.remote)
+                    })
+                },
+            );
             let _ = qt_thread.queue(move |mut backend| {
                 apply_git_result(backend.as_mut(), &job_id, result, true, false, quiet, true);
             });
@@ -4336,29 +5037,35 @@ impl ffi::HarknessBackend {
         else {
             return;
         };
+        let discard_snapshot_cache = self.as_ref().rust().discard_snapshot_cache.clone();
         let qt_thread = self.qt_thread();
         std::thread::spawn(move || {
             let progress_thread = qt_thread.clone();
             let progress_job_id = job_id.clone();
-            let result = run_git_operation(project_id, &cancellation, |git, cancellation| {
-                let outcome = git
-                    .pull(
-                        &harkness_git::PullOptions::default(),
-                        cancellation,
-                        move |message| {
-                            let update_job_id = progress_job_id.clone();
-                            let _ = progress_thread.queue(move |mut backend| {
-                                update_backend_job(backend.as_mut(), &update_job_id, message);
-                            });
-                        },
-                    )
-                    .map_err(GitFailure::from)?;
-                Ok(if outcome.updated {
-                    format!("Pulled {} from {}", outcome.branch, outcome.remote)
-                } else {
-                    format!("{} is already up to date", outcome.branch)
-                })
-            });
+            let result = run_git_operation(
+                project_id,
+                &cancellation,
+                &discard_snapshot_cache,
+                |git, cancellation| {
+                    let outcome = git
+                        .pull(
+                            &harkness_git::PullOptions::default(),
+                            cancellation,
+                            move |message| {
+                                let update_job_id = progress_job_id.clone();
+                                let _ = progress_thread.queue(move |mut backend| {
+                                    update_backend_job(backend.as_mut(), &update_job_id, message);
+                                });
+                            },
+                        )
+                        .map_err(GitFailure::from)?;
+                    Ok(if outcome.updated {
+                        format!("Pulled {} from {}", outcome.branch, outcome.remote)
+                    } else {
+                        format!("{} is already up to date", outcome.branch)
+                    })
+                },
+            );
             let _ = qt_thread.queue(move |mut backend| {
                 apply_git_result(backend.as_mut(), &job_id, result, true, false, false, true);
             });
@@ -4372,33 +5079,39 @@ impl ffi::HarknessBackend {
         else {
             return;
         };
+        let discard_snapshot_cache = self.as_ref().rust().discard_snapshot_cache.clone();
         let qt_thread = self.qt_thread();
         std::thread::spawn(move || {
             let progress_thread = qt_thread.clone();
             let progress_job_id = job_id.clone();
-            let result = run_git_operation(project_id, &cancellation, |git, cancellation| {
-                let outcome = git
-                    .push(
-                        &harkness_git::PushOptions {
-                            set_upstream: true,
-                            allow_default_branch,
-                            ..harkness_git::PushOptions::default()
-                        },
-                        cancellation,
-                        move |message| {
-                            let update_job_id = progress_job_id.clone();
-                            let _ = progress_thread.queue(move |mut backend| {
-                                update_backend_job(backend.as_mut(), &update_job_id, message);
-                            });
-                        },
-                    )
-                    .map_err(GitFailure::from)?;
-                Ok(if outcome.updated() {
-                    format!("Pushed {} to {}", outcome.branch, outcome.remote)
-                } else {
-                    format!("{} is already published", outcome.branch)
-                })
-            });
+            let result = run_git_operation(
+                project_id,
+                &cancellation,
+                &discard_snapshot_cache,
+                |git, cancellation| {
+                    let outcome = git
+                        .push(
+                            &harkness_git::PushOptions {
+                                set_upstream: true,
+                                allow_default_branch,
+                                ..harkness_git::PushOptions::default()
+                            },
+                            cancellation,
+                            move |message| {
+                                let update_job_id = progress_job_id.clone();
+                                let _ = progress_thread.queue(move |mut backend| {
+                                    update_backend_job(backend.as_mut(), &update_job_id, message);
+                                });
+                            },
+                        )
+                        .map_err(GitFailure::from)?;
+                    Ok(if outcome.updated() {
+                        format!("Pushed {} to {}", outcome.branch, outcome.remote)
+                    } else {
+                        format!("{} is already published", outcome.branch)
+                    })
+                },
+            );
             let _ = qt_thread.queue(move |mut backend| {
                 apply_git_result(backend.as_mut(), &job_id, result, true, false, false, true);
             });
@@ -4465,13 +5178,19 @@ impl ffi::HarknessBackend {
         ) else {
             return;
         };
+        let discard_snapshot_cache = self.as_ref().rust().discard_snapshot_cache.clone();
         let qt_thread = self.qt_thread();
         std::thread::spawn(move || {
-            let result = run_git_operation(project_id, &cancellation, |git, cancellation| {
-                git.checkout_branch(&branch, cancellation)
-                    .map_err(GitFailure::from)?;
-                Ok(format!("Checked out {branch}"))
-            });
+            let result = run_git_operation(
+                project_id,
+                &cancellation,
+                &discard_snapshot_cache,
+                |git, cancellation| {
+                    git.checkout_branch(&branch, cancellation)
+                        .map_err(GitFailure::from)?;
+                    Ok(format!("Checked out {branch}"))
+                },
+            );
             let _ = qt_thread.queue(move |mut backend| {
                 apply_git_result(backend.as_mut(), &job_id, result, true, true, false, true);
             });
@@ -4500,20 +5219,26 @@ impl ffi::HarknessBackend {
         ) else {
             return;
         };
+        let discard_snapshot_cache = self.as_ref().rust().discard_snapshot_cache.clone();
         let qt_thread = self.qt_thread();
         std::thread::spawn(move || {
-            let result = run_git_operation(project_id, &cancellation, |git, cancellation| {
-                git.create_branch(
-                    &branch,
-                    &harkness_git::CreateBranchOptions {
-                        start_point: (!start_point.is_empty()).then_some(start_point),
-                        checkout: true,
-                    },
-                    cancellation,
-                )
-                .map_err(GitFailure::from)?;
-                Ok(format!("Created and checked out {branch}"))
-            });
+            let result = run_git_operation(
+                project_id,
+                &cancellation,
+                &discard_snapshot_cache,
+                |git, cancellation| {
+                    git.create_branch(
+                        &branch,
+                        &harkness_git::CreateBranchOptions {
+                            start_point: (!start_point.is_empty()).then_some(start_point),
+                            checkout: true,
+                        },
+                        cancellation,
+                    )
+                    .map_err(GitFailure::from)?;
+                    Ok(format!("Created and checked out {branch}"))
+                },
+            );
             let _ = qt_thread.queue(move |mut backend| {
                 apply_git_result(backend.as_mut(), &job_id, result, true, true, false, true);
             });
@@ -4842,19 +5567,21 @@ mod tests {
         BranchRow, GitFailure, GitStateRow, HarknessBackendRust, OpenedUpdate, ProjectRow,
         REVIEW_FILE_PAGE_SIZE, REVIEW_ROW_PAGE_SIZE, ReviewContextDirection, ReviewContextOutcome,
         ReviewSelection, WorktreeLockAction, accept_current_catalog_refresh,
-        advance_review_file_window, advance_review_row_window, begin_job, begin_job_in_scope,
-        best_working_tree_line, change_worktree_lock_with_service, conflicting_repository_job,
-        display_diff_path, empty_opened, end_job, expand_review_context_with_git, hidden_before,
-        jobs_conflict, load_history_page_with_git, load_review_file_with_git, load_review_with_git,
-        load_review_with_initial_file_with_git, move_worktree_with_service, operation_outcome,
-        project_repository_lock_scopes, project_rows, project_worktree_lifecycle_lock_scopes,
-        register_path_selection, register_review_path_identity, remove_worktree_with_service,
+        advance_review_file_window, advance_review_row_window, attach_discard_snapshots_with,
+        begin_job, begin_job_in_scope, best_working_tree_line, change_worktree_lock_with_service,
+        conflicting_repository_job, display_diff_path, empty_opened, end_job,
+        expand_review_context_with_git, hidden_before, jobs_conflict, load_history_page_with_git,
+        load_review_file_with_git, load_review_with_git, load_review_with_initial_file_with_git,
+        move_worktree_with_service, operation_outcome, project_repository_lock_scopes,
+        project_rows, project_worktree_lifecycle_lock_scopes, register_path_selection,
+        register_review_path_identity, remove_worktree_with_service,
         replace_status_path_selections, resolve_commit_scope, resolve_path_selection,
         retreat_review_file_window, retreat_review_row_window, review_content_summary,
-        review_file_window, review_hunk_exists_where, review_path, review_row_count, review_rows,
-        run_git_operation_with_git, run_git_status_with_git, selected_review_path, to_branches,
-        to_git, to_jobs, to_map, to_projects, to_review, update_job, working_tree_may_differ,
-        worktree_base, worktree_job_lock_scope,
+        review_file_discard_description, review_file_window, review_hunk_exists_where, review_path,
+        review_row_count, review_rows, run_git_operation_with_git, run_git_status_with_git,
+        selected_review_path, status_discard_description, to_branches, to_git, to_jobs, to_map,
+        to_projects, to_review, update_job, working_tree_may_differ, worktree_base,
+        worktree_job_lock_scope,
     };
 
     fn project(
@@ -5582,6 +6309,98 @@ mod tests {
                     .collect(),
             },
         )
+    }
+
+    #[test]
+    fn rename_discard_descriptions_name_source_and_destination() {
+        let status = status_row(&[("new-name.txt", Some("old-name.txt"), false)]);
+        let description = status_discard_description(&status.entries[0]).unwrap();
+        assert_eq!(
+            description.paths(),
+            &[PathBuf::from("new-name.txt"), PathBuf::from("old-name.txt")]
+        );
+
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("rename-description-repository");
+        initialize_repository(&root);
+        let old_path = Path::new("old-name.txt");
+        let new_path = Path::new("new-name.txt");
+        commit_file(&root, old_path, "original\n", "add rename fixture");
+        fs::rename(root.join(old_path), root.join(new_path)).unwrap();
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
+        git.stage([old_path, new_path], &harkness_git::Cancellation::default())
+            .unwrap();
+        let file = git
+            .diff(
+                harkness_git::DiffTarget::Staged,
+                &harkness_git::DiffOptions::default(),
+            )
+            .unwrap()
+            .into_iter()
+            .find(|file| file.old_path.as_deref() == Some(old_path))
+            .unwrap();
+        let description = review_file_discard_description(&file).unwrap();
+        assert_eq!(
+            description.paths(),
+            &[PathBuf::from("new-name.txt"), PathBuf::from("old-name.txt")]
+        );
+    }
+
+    #[test]
+    fn unchanged_status_refreshes_reuse_discard_snapshots_and_keep_stale_refusals() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("discard-snapshot-cache-repository");
+        initialize_repository(&root);
+        let path = Path::new("cached.txt");
+        commit_file(&root, path, "original\n", "add cache fixture");
+        fs::write(root.join(path), "changed once\n").unwrap();
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
+        let cache = super::DiscardSnapshotCache::default();
+        let captures = std::cell::Cell::new(0);
+
+        let refresh = || {
+            let status = git
+                .detailed_status(&harkness_git::Cancellation::default())
+                .unwrap();
+            let mut state = GitStateRow::from_status("project-1".to_owned(), status);
+            attach_discard_snapshots_with(&root, &mut state, &cache, |paths| {
+                captures.set(captures.get() + 1);
+                git.discard_snapshot(paths).ok()
+            });
+            state
+        };
+
+        let first = refresh();
+        assert_eq!(captures.get(), 1);
+        let second = refresh();
+        assert_eq!(
+            captures.get(),
+            1,
+            "an unchanged poll must not hash the file again"
+        );
+        let stale_snapshot = second.entries[0].discard_snapshot.clone().unwrap();
+        drop(first);
+
+        fs::write(root.join(path), "changed twice and longer\n").unwrap();
+        let error = git
+            .restore_tracked_if_unchanged(
+                [path],
+                harkness_git::TrackedRestoreSource::Index,
+                &stale_snapshot,
+                &harkness_git::Cancellation::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            harkness_git::GitError::StaleDiscardSelection
+        ));
+
+        let _third = refresh();
+        assert_eq!(
+            captures.get(),
+            2,
+            "a metadata change must refresh the snapshot"
+        );
     }
 
     #[test]

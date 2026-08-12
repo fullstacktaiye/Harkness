@@ -16,7 +16,7 @@ use git2::{ErrorCode, Repository, Status, StatusOptions};
 use crate::{
     DetailedStatus, GitError, RepositoryLock,
     runner::{Cancellation, GitAccess, GitCommand},
-    status,
+    status, worktree,
 };
 
 /// Which changes one commit records.
@@ -224,6 +224,7 @@ pub(crate) fn stage(
 ) -> Result<StageOutcome, GitError> {
     validate_paths(root, paths)?;
     open(root)?;
+    worktree::refuse_locked(git_executable, root, cancellation)?;
     let path_outcomes = run_paths(paths, cancellation, |path| {
         GitCommand::new(git_executable, root, GitAccess::LocalWrite)
             // Explicit paths are literal filesystem names, not pathspec
@@ -248,6 +249,7 @@ pub(crate) fn stage_all(
     cancellation: &Cancellation,
 ) -> Result<StatusRefreshOutcome, GitError> {
     open(root)?;
+    worktree::refuse_locked(git_executable, root, cancellation)?;
     add_all(git_executable, root, cancellation)?;
     Ok(refresh_status(
         git_executable,
@@ -300,6 +302,7 @@ pub(crate) fn unstage(
     validate_paths(root, paths)?;
     let repository = open(root)?;
     let unborn = is_unborn(&repository, root)?;
+    worktree::refuse_locked(git_executable, root, cancellation)?;
     let path_outcomes = run_paths(paths, cancellation, |path| {
         let command =
             GitCommand::new(git_executable, root, GitAccess::LocalWrite).arg("--literal-pathspecs");
@@ -358,6 +361,19 @@ pub(crate) fn commit(
         CommitScope::Index | CommitScope::WorkingTree => None,
     };
 
+    // An index-only no-op is knowable without spawning Git. Preserve that
+    // typed refusal before consulting the administrative worktree lock, just
+    // as the other in-process validation above precedes every child process.
+    if matches!(options.scope, CommitScope::Index)
+        && !options.allow_empty
+        && !options.amend
+        && !has_staged_changes(&repository, root, scoped_paths)?
+    {
+        return Err(GitError::NothingStaged);
+    }
+
+    worktree::refuse_locked(git_executable, root, cancellation)?;
+
     // Staging happens after the refusals above so a commit this function was
     // never going to make cannot leave the index rewritten behind it.
     let repository = match &options.scope {
@@ -378,6 +394,7 @@ pub(crate) fn commit(
     // no way to correct a commit message.
     if !options.allow_empty
         && !options.amend
+        && !matches!(options.scope, CommitScope::Index)
         && !has_staged_changes(&repository, root, scoped_paths)?
     {
         return Err(GitError::NothingStaged);
@@ -575,7 +592,7 @@ mod tests {
         HeadState, PendingOperation, StageOptions, StagePathResult, StatusEntry,
         StatusRefreshOutcome,
         testing::{
-            Fixture, PROCESS_PROJECT_ROOT_ENV, commit_all, configure_commit_identity,
+            Fixture, PROCESS_PROJECT_ROOT_ENV, commit_all, configure_commit_identity, git,
             initialize_repository, spawn_child,
         },
     };
@@ -636,6 +653,66 @@ mod tests {
             Some(FileChange::Added)
         );
         assert!(status.entries.iter().all(|entry| entry.unstaged.is_none()));
+    }
+
+    #[test]
+    fn a_linked_worktree_lock_blocks_stage_unstage_and_commit() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("locked-mutation-parent");
+        initialize_repository(&root);
+        let linked = fixture.root.path().join("locked-mutation-linked");
+        git(
+            &root,
+            [
+                "worktree",
+                "add",
+                "-b",
+                "locked-mutation-topic",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let service = GitService::new(&linked, &fixture.data_dir);
+        let cancellation = Cancellation::default();
+
+        fs::write(linked.join("tracked.txt"), "staged before lock\n").unwrap();
+        service.stage(["tracked.txt"], &cancellation).unwrap();
+        fs::write(linked.join("tracked.txt"), "working tree after lock\n").unwrap();
+        let head_before = Repository::open(&linked).unwrap().head().unwrap().target();
+        git(
+            &root,
+            [
+                "worktree",
+                "lock",
+                "--reason",
+                "agent is using it",
+                linked.to_str().unwrap(),
+            ],
+        );
+
+        assert!(matches!(
+            service.stage(["tracked.txt"], &cancellation),
+            Err(GitError::WorktreeLocked { reason, .. })
+                if reason.as_deref() == Some("agent is using it")
+        ));
+        assert!(matches!(
+            service.stage_all(&cancellation),
+            Err(GitError::WorktreeLocked { .. })
+        ));
+        assert!(matches!(
+            service.unstage(["tracked.txt"], &cancellation),
+            Err(GitError::WorktreeLocked { .. })
+        ));
+        assert!(matches!(
+            service.commit("must not commit", &CommitOptions::default(), &cancellation),
+            Err(GitError::WorktreeLocked { .. })
+        ));
+
+        let repository = Repository::open(&linked).unwrap();
+        assert_eq!(repository.head().unwrap().target(), head_before);
+        let status = service.detailed_status(&cancellation).unwrap();
+        let tracked = entry(&status.entries, Path::new("tracked.txt"));
+        assert_eq!(tracked.staged, Some(FileChange::Modified));
+        assert_eq!(tracked.unstaged, Some(FileChange::Modified));
     }
 
     #[test]
