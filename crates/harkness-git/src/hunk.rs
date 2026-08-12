@@ -3,8 +3,9 @@
 //! A selection never supplies patch text. It names the two blobs and one hunk
 //! from the structured diff contract; this module recomputes that diff while
 //! holding the repository lock, finds the named hunk, and renders trusted bytes
-//! from the fresh model. Libgit2 checks and applies the resulting patch to the
-//! index only.
+//! from the fresh model. Libgit2 checks every resulting patch and applies index
+//! mutations; working-tree discard is handed to the hermetic system-Git runner
+//! after that validation.
 //!
 //! Path-level staging in [`super::commit`] shells out to system Git; every
 //! index write here goes through libgit2 instead, because only libgit2 offers
@@ -25,14 +26,18 @@
 
 use std::{
     borrow::Cow,
+    io::Write,
     path::{Path, PathBuf},
 };
 
 use git2::{ApplyLocation, ApplyOptions, AttrCheckFlags, AttrValue, Diff, Repository};
+use tempfile::NamedTempFile;
 
 use crate::{
     Cancellation, DiffLine, DiffLineKind, DiffOptions, DiffTarget, FileChange, FileDiff, GitError,
     Hunk, RepositoryLock, StageOptions, StatusRefreshOutcome, commit, diff,
+    runner::{GitAccess, GitCommand},
+    worktree,
 };
 
 /// One selected hunk from a [`FileDiff`].
@@ -422,6 +427,7 @@ fn mutate(
     let paths = selection_paths(selections);
     commit::validate_paths(root, &paths)?;
     let repository = commit::open(root)?;
+    worktree::refuse_locked(git_executable, root, cancellation)?;
     // Validated and opened first even for an empty batch, so an accidental
     // no-op reports the same refusals and the same refreshed status a real one
     // would. Cancellation was already honoured by the caller's lock.
@@ -439,11 +445,13 @@ fn mutate(
         )?;
         hunks = prepared.iter().map(|file| file.hunks.len()).sum();
         apply(
+            git_executable,
+            root,
             &repository,
             &prepared,
             &paths,
-            mode.direction(),
-            mode.apply_target(),
+            mode,
+            cancellation,
         )?;
     }
     Ok(HunkStageOutcome {
@@ -463,6 +471,7 @@ fn mutate_lines(
     let paths = selection_paths(selections);
     commit::validate_paths(root, &paths)?;
     let repository = commit::open(root)?;
+    worktree::refuse_locked(git_executable, root, cancellation)?;
     let (mut lines, mut hunks) = (0, 0);
     if !selections.is_empty() {
         refuse_filtered_paths(&repository, root, &paths)?;
@@ -482,11 +491,13 @@ fn mutate_lines(
             .sum();
         hunks = prepared.iter().map(|file| file.hunks.len()).sum();
         apply(
+            git_executable,
+            root,
             &repository,
             &prepared,
             &paths,
-            mode.direction(),
-            mode.apply_target(),
+            mode,
+            cancellation,
         )?;
     }
     Ok(LineStageOutcome {
@@ -890,15 +901,17 @@ fn ranges_intersect(start: u32, lines: u32, other_start: u32, other_lines: u32) 
     start < other_end && other_start < end
 }
 
-/// Renders the batch and hands it to libgit2 for an index-only apply.
+/// Renders the batch and applies it through the mutation engine for its target.
 fn apply(
+    git_executable: &Path,
+    root: &Path,
     repository: &Repository,
     prepared: &[PreparedFile],
     paths: &[PathBuf],
-    direction: Direction,
-    target: ApplyTarget,
+    mode: MutationMode,
+    cancellation: &Cancellation,
 ) -> Result<(), GitError> {
-    let patch = render_patch(prepared, direction)?;
+    let patch = render_patch(prepared, mode.direction())?;
     let failure = |source| GitError::HunkApplication {
         paths: paths.to_vec(),
         source,
@@ -912,6 +925,7 @@ fn apply(
     // only to roll back. It is cheap: the patch is a few hunks at most.
     let mut check = ApplyOptions::new();
     check.check(true);
+    let target = mode.apply_target();
     let location = match target {
         ApplyTarget::Index => ApplyLocation::Index,
         ApplyTarget::Worktree => ApplyLocation::WorkDir,
@@ -919,7 +933,35 @@ fn apply(
     repository
         .apply(&parsed, location, Some(&mut check))
         .map_err(failure)?;
-    repository.apply(&parsed, location, None).map_err(failure)
+    match target {
+        ApplyTarget::Index => repository.apply(&parsed, location, None).map_err(failure),
+        ApplyTarget::Worktree => {
+            // Libgit2 remains the inspection and validation engine, but every
+            // working-tree mutation belongs to the hermetic system-Git runner.
+            // A private temporary file avoids adding a second stdin/process
+            // orchestration path to the runner for one bounded patch.
+            let mut patch_file = NamedTempFile::new().map_err(|source| {
+                failure(git2::Error::from_str(&format!(
+                    "failed to create temporary patch: {source}"
+                )))
+            })?;
+            patch_file.write_all(&patch).map_err(|source| {
+                failure(git2::Error::from_str(&format!(
+                    "failed to write temporary patch: {source}"
+                )))
+            })?;
+            patch_file.flush().map_err(|source| {
+                failure(git2::Error::from_str(&format!(
+                    "failed to flush temporary patch: {source}"
+                )))
+            })?;
+            GitCommand::new(git_executable, root, GitAccess::LocalWrite)
+                .args(["apply", "--whitespace=nowarn"])
+                .arg(patch_file.path())
+                .run(cancellation)
+                .map(|_| ())
+        }
+    }
 }
 
 /// Whether a selection names `hunk` in the freshly recomputed diff.

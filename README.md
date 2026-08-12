@@ -311,8 +311,9 @@ Harkness-owned rows and their exact Git administrative records. It never
 performs a repository-wide prune or adopts or removes external worktrees.
 
 A worktree lock records a mandatory reason and protects the checkout from
-removal, relocation, and pruning; `--force` does not override it, so clearing
-protection always takes an explicit `worktree unlock`. Git trims the stored
+stage, unstage, commit, discard, removal, relocation, and pruning operations;
+`--force` does not override it, so clearing protection always takes an explicit
+`worktree unlock`. Git trims the stored
 reason and `worktree list` reports it as `lock_reason`, which is `null` when a
 lock records no reason at all. Locking an already-locked worktree is refused
 rather than silently replaced; `--replace` supersedes an existing reason

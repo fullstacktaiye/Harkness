@@ -2105,19 +2105,25 @@ fn run_git(
                     Some(GranularSelections::Hunks(selections)),
                     Some(TrackedRestoreSource::Index),
                     false,
-                ) => harkness_git::DiscardDescription::restore_hunks(
-                    selections.iter().filter_map(HunkSelection::path),
-                    selections.len(),
-                ),
+                ) => {
+                    let hunks = distinct_hunk_selection_count(selections);
+                    harkness_git::DiscardDescription::restore_hunks(
+                        selections.iter().filter_map(HunkSelection::path),
+                        hunks,
+                    )
+                }
                 (
                     Some(GranularSelections::Lines(selections)),
                     Some(TrackedRestoreSource::Index),
                     false,
-                ) => harkness_git::DiscardDescription::restore_lines(
-                    selections.iter().filter_map(LineSelection::path),
-                    selections.len(),
-                    selections.len(),
-                ),
+                ) => {
+                    let (lines, hunks) = distinct_line_selection_counts(selections);
+                    harkness_git::DiscardDescription::restore_lines(
+                        selections.iter().filter_map(LineSelection::path),
+                        lines,
+                        hunks,
+                    )
+                }
                 (Some(_), Some(TrackedRestoreSource::Head), false) => {
                     return Err(CliError::Usage(
                         "hunk and line discard restore from the index; use --from index".to_owned(),
@@ -3587,6 +3593,72 @@ fn hunk_outcome_line(verb: &str, count: usize) -> String {
     format!("{verb} {count} hunk{}", if count == 1 { "" } else { "s" })
 }
 
+/// Counts the hunk identities the execution pipeline will retain after
+/// duplicate selections are merged.
+fn distinct_hunk_selection_count(selections: &[HunkSelection]) -> usize {
+    selections
+        .iter()
+        .enumerate()
+        .filter(|(index, selection)| {
+            !selections[..*index]
+                .iter()
+                .any(|other| hunk_selections_share_hunk(other, selection))
+        })
+        .count()
+}
+
+fn hunk_selections_share_hunk(left: &HunkSelection, right: &HunkSelection) -> bool {
+    left.old_path == right.old_path
+        && left.new_path == right.new_path
+        && left.old_blob_id == right.old_blob_id
+        && left.new_blob_id == right.new_blob_id
+        && left.old_start == right.old_start
+        && left.old_lines == right.old_lines
+        && left.new_start == right.new_start
+        && left.new_lines == right.new_lines
+}
+
+/// Counts distinct selected lines and the distinct enclosing hunks that will
+/// contain them after execution merges the batch.
+fn distinct_line_selection_counts(selections: &[LineSelection]) -> (usize, usize) {
+    let lines = selections
+        .iter()
+        .enumerate()
+        .filter(|(index, selection)| {
+            !selections[..*index]
+                .iter()
+                .any(|other| line_selections_share_line(other, selection))
+        })
+        .count();
+    let hunks = selections
+        .iter()
+        .enumerate()
+        .filter(|(index, selection)| {
+            !selections[..*index]
+                .iter()
+                .any(|other| line_selections_share_hunk(other, selection))
+        })
+        .count();
+    (lines, hunks)
+}
+
+fn line_selections_share_line(left: &LineSelection, right: &LineSelection) -> bool {
+    line_selections_share_hunk(left, right)
+        && left.old_line_number == right.old_line_number
+        && left.new_line_number == right.new_line_number
+}
+
+fn line_selections_share_hunk(left: &LineSelection, right: &LineSelection) -> bool {
+    left.old_path == right.old_path
+        && left.new_path == right.new_path
+        && left.old_blob_id == right.old_blob_id
+        && left.new_blob_id == right.new_blob_id
+        && left.old_start == right.old_start
+        && left.old_lines == right.old_lines
+        && left.new_start == right.new_start
+        && left.new_lines == right.new_lines
+}
+
 fn discard_description_value(description: &harkness_git::DiscardDescription) -> Value {
     let (operation, source, hunks, lines) = match description.operation() {
         harkness_git::DiscardOperation::RestoreTracked { source } => (
@@ -4145,6 +4217,7 @@ fn git_exit_code(error: &GitError) -> u8 {
         | GitError::UnmergedDiscard { .. }
         | GitError::NothingToDiscard { .. }
         | GitError::UntrackedDiscardNotFile { .. }
+        | GitError::StaleDiscardSelection
         | GitError::StaleHunkSelection { .. }
         | GitError::BinaryHunkSelection { .. }
         | GitError::RenameOnlyHunkSelection { .. }
@@ -4660,9 +4733,10 @@ mod tests {
     use super::{
         CLI_ERROR_KINDS, CLI_KIND_EXIT_CODES, CliError, EDITOR_KIND_EXIT_CODES, EXIT_CANCELLED,
         EXIT_CONFLICT, EXIT_NOT_FOUND, EXIT_OPERATION_FAILED, EXIT_REFUSED, EXIT_USAGE,
-        EditorError, GIT_KIND_EXIT_CODES, GitError, PROJECT_KIND_EXIT_CODES, Project, ProjectError,
-        RefusalKind, editor_exit_code, git_error_details, git_exit_code, parse_selection_document,
-        project_exit_code, project_value, requested_json, single_line,
+        EditorError, GIT_KIND_EXIT_CODES, GitError, HunkSelection, LineSelection,
+        PROJECT_KIND_EXIT_CODES, Project, ProjectError, RefusalKind, distinct_hunk_selection_count,
+        distinct_line_selection_counts, editor_exit_code, git_error_details, git_exit_code,
+        parse_selection_document, project_exit_code, project_value, requested_json, single_line,
     };
 
     #[test]
@@ -4695,6 +4769,82 @@ mod tests {
             declared,
             GitError::KINDS,
             "GIT_KIND_EXIT_CODES must classify every Git error kind, in order"
+        );
+        assert_eq!(
+            git_exit_code(&GitError::StaleDiscardSelection),
+            EXIT_REFUSED,
+            "a stale destructive confirmation is a refusal, not an operation failure"
+        );
+    }
+
+    #[test]
+    fn discard_confirmation_counts_distinct_hunks_and_lines() {
+        let hunk = HunkSelection::from_parts(
+            Some(PathBuf::from("tracked.txt")),
+            Some(PathBuf::from("tracked.txt")),
+            "old",
+            "new",
+            3,
+            (10, 4),
+            (10, 5),
+        );
+        let same_hunk_with_different_context = HunkSelection::from_parts(
+            Some(PathBuf::from("tracked.txt")),
+            Some(PathBuf::from("tracked.txt")),
+            "old",
+            "new",
+            8,
+            (10, 4),
+            (10, 5),
+        );
+        assert_eq!(
+            distinct_hunk_selection_count(&[hunk.clone(), hunk, same_hunk_with_different_context,]),
+            1,
+            "a repeated hunk must be confirmed once"
+        );
+
+        let first = LineSelection::from_parts(
+            Some(PathBuf::from("tracked.txt")),
+            Some(PathBuf::from("tracked.txt")),
+            "old",
+            "new",
+            3,
+            (10, 4),
+            (10, 5),
+            None,
+            Some(11),
+        );
+        let second = LineSelection::from_parts(
+            Some(PathBuf::from("tracked.txt")),
+            Some(PathBuf::from("tracked.txt")),
+            "old",
+            "new",
+            3,
+            (10, 4),
+            (10, 5),
+            None,
+            Some(12),
+        );
+        let repeated_with_different_context = LineSelection::from_parts(
+            Some(PathBuf::from("tracked.txt")),
+            Some(PathBuf::from("tracked.txt")),
+            "old",
+            "new",
+            8,
+            (10, 4),
+            (10, 5),
+            None,
+            Some(11),
+        );
+        assert_eq!(
+            distinct_line_selection_counts(&[
+                first.clone(),
+                first,
+                second,
+                repeated_with_different_context,
+            ]),
+            (2, 1),
+            "repeated lines are deduplicated and lines in one hunk share its count"
         );
     }
 

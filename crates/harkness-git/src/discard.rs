@@ -8,12 +8,10 @@
 
 use std::{
     fs,
-    io::Read,
     path::{Path, PathBuf},
 };
 
-use git2::{ErrorCode, Repository, Status};
-use sha2::{Digest, Sha256};
+use git2::{ErrorCode, ObjectType, Repository, Status};
 
 use crate::{
     Cancellation, GitError, HunkSelection, RepositoryLock, StatusRefreshOutcome, commit, hunk,
@@ -208,7 +206,7 @@ struct DiscardPathSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum WorktreeIdentity {
     Missing,
-    File([u8; 32]),
+    File(git2::Oid, u32),
     Symlink(PathBuf),
     Other,
 }
@@ -253,26 +251,16 @@ fn snapshot_with_repository(
                 })?)
             }
             Ok(metadata) if metadata.is_file() => {
-                let mut file =
-                    fs::File::open(&resolved).map_err(|source| GitError::DiffContent {
-                        path: path.clone(),
-                        source,
-                    })?;
-                let mut hash = Sha256::new();
-                let mut buffer = [0_u8; 64 * 1024];
-                loop {
-                    let read = file
-                        .read(&mut buffer)
-                        .map_err(|source| GitError::DiffContent {
-                            path: path.clone(),
-                            source,
-                        })?;
-                    if read == 0 {
-                        break;
-                    }
-                    hash.update(&buffer[..read]);
-                }
-                WorktreeIdentity::File(hash.finalize().into())
+                let id = git2::Oid::hash_file_ext(
+                    ObjectType::Blob,
+                    &resolved,
+                    repository.object_format(),
+                )
+                .map_err(|source| GitError::Inspection {
+                    path: path.clone(),
+                    source: source.into(),
+                })?;
+                WorktreeIdentity::File(id, worktree_file_mode(&metadata))
             }
             Ok(_) => WorktreeIdentity::Other,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
@@ -302,6 +290,29 @@ fn snapshot_with_repository(
     Ok(DiscardSnapshot(snapshots))
 }
 
+/// The portion of a regular file's mode Git records in trees and the index.
+///
+/// Git tracks only whether a regular file is executable, not its complete
+/// platform permission mask. Non-Unix working trees have no executable bits
+/// to inspect, so they use Git's ordinary blob mode.
+fn worktree_file_mode(metadata: &fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if metadata.permissions().mode() & 0o111 == 0 {
+            0o100644
+        } else {
+            0o100755
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        0o100644
+    }
+}
+
 fn require_snapshot(
     repository: &Repository,
     root: &Path,
@@ -328,7 +339,7 @@ pub(crate) fn restore_tracked(
     if let Some(expected) = expected {
         require_snapshot(&repository, root, paths, expected)?;
     }
-    refuse_locked_worktree(git_executable, root, cancellation)?;
+    worktree::refuse_locked(git_executable, root, cancellation)?;
     if cancellation.is_cancelled() {
         return Err(GitError::Cancelled);
     }
@@ -375,7 +386,7 @@ pub(crate) fn delete_untracked(
     if let Some(expected) = expected {
         require_snapshot(&repository, root, paths, expected)?;
     }
-    refuse_locked_worktree(git_executable, root, cancellation)?;
+    worktree::refuse_locked(git_executable, root, cancellation)?;
     if cancellation.is_cancelled() {
         return Err(GitError::Cancelled);
     }
@@ -416,7 +427,6 @@ pub(crate) fn discard_hunks(
     selections: &[HunkSelection],
     cancellation: &Cancellation,
 ) -> Result<DiscardOutcome, GitError> {
-    refuse_locked_worktree(git_executable, root, cancellation)?;
     let outcome = hunk::discard(git_executable, root, selections, cancellation)?;
     let paths = selections.iter().filter_map(HunkSelection::path);
     Ok(DiscardOutcome {
@@ -432,7 +442,6 @@ pub(crate) fn discard_lines(
     selections: &[crate::LineSelection],
     cancellation: &Cancellation,
 ) -> Result<DiscardOutcome, GitError> {
-    refuse_locked_worktree(git_executable, root, cancellation)?;
     let outcome = hunk::discard_lines(git_executable, root, selections, cancellation)?;
     let paths = selections.iter().filter_map(crate::LineSelection::path);
     Ok(DiscardOutcome {
@@ -449,24 +458,6 @@ fn refuse_pending(repository: &Repository, root: &Path) -> Result<(), GitError> 
         }),
         None => Ok(()),
     }
-}
-
-fn refuse_locked_worktree(
-    git_executable: &Path,
-    root: &Path,
-    cancellation: &Cancellation,
-) -> Result<(), GitError> {
-    if let Some(row) = worktree::list(git_executable, root, cancellation)?
-        .into_iter()
-        .find(|row| row.matches_path(root))
-        .filter(|row| row.is_locked())
-    {
-        return Err(GitError::WorktreeLocked {
-            path: row.root().to_path_buf(),
-            reason: row.lock_reason().map(str::to_owned),
-        });
-    }
-    Ok(())
 }
 
 fn repository_path<'path>(root: &Path, path: &'path Path) -> &'path Path {
@@ -768,6 +759,39 @@ mod tests {
         );
     }
 
+    /// Executability is part of Git's worktree identity even when the blob
+    /// bytes are unchanged. A confirmation captured before chmod must not be
+    /// allowed to erase the newly observed mode change.
+    #[cfg(unix)]
+    #[test]
+    fn a_confirmed_snapshot_refuses_a_newer_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new();
+        let root = fixture.directory("discard-snapshot-mode");
+        initialize_repository(&root);
+        let service = GitService::new(&root, &fixture.data_dir);
+        let path = root.join("tracked.txt");
+        fs::write(&path, "shown edit\n").unwrap();
+        let snapshot = service.discard_snapshot(["tracked.txt"]).unwrap();
+
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(permissions.mode() | 0o111);
+        fs::set_permissions(&path, permissions).unwrap();
+
+        assert!(matches!(
+            service.restore_tracked_if_unchanged(
+                ["tracked.txt"],
+                TrackedRestoreSource::Index,
+                &snapshot,
+                &Cancellation::default(),
+            ),
+            Err(GitError::StaleDiscardSelection)
+        ));
+        assert_ne!(fs::metadata(&path).unwrap().permissions().mode() & 0o111, 0);
+        assert_eq!(worktree_text(&path), "shown edit\n");
+    }
+
     #[test]
     fn restoring_both_rename_paths_recreates_the_source_without_a_staged_deletion() {
         let fixture = Fixture::new();
@@ -838,6 +862,46 @@ mod tests {
             outcome.description.operation(),
             DiscardOperation::RestoreTrackedHunks { hunks: 1 }
         );
+    }
+
+    /// Worktree hunk discard is a real mutation, so it must travel through
+    /// the same hermetic system-Git policy as whole-path restore.
+    #[cfg(unix)]
+    #[test]
+    fn hunk_discard_applies_through_the_hermetic_git_runner() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("discard-hunk-runner");
+        initialize_repository(&root);
+        fs::write(root.join("tracked.txt"), "working edit\n").unwrap();
+        let invoked = fixture.root.path().join("hunk-apply-invoked");
+        let shim = fixture.shim(
+            "hunk-apply-git",
+            &format!(
+                "#!/bin/sh\n\
+                 for argument in \"$@\"; do\n\
+                   if [ \"$argument\" = apply ]; then\n\
+                     test \"$GIT_TERMINAL_PROMPT\" = 0 || exit 91\n\
+                     test \"$LC_ALL\" = C || exit 92\n\
+                     test \"$GIT_EDITOR\" = harkness-has-no-editor || exit 93\n\
+                     printf invoked > '{}'\n\
+                   fi\n\
+                 done\n\
+                 exec git \"$@\"\n",
+                invoked.display()
+            ),
+        );
+        let service = GitService::new(&root, &fixture.data_dir).with_git_executable(shim);
+        let files = service
+            .diff(DiffTarget::Unstaged, &DiffOptions::default())
+            .unwrap();
+        let selection = HunkSelection::new(&files[0], &files[0].hunks[0]);
+
+        service
+            .discard_hunks(&[selection], &Cancellation::default())
+            .unwrap();
+
+        assert_eq!(worktree_text(&root.join("tracked.txt")), "initial\n");
+        assert_eq!(fs::read_to_string(invoked).unwrap(), "invoked");
     }
 
     #[test]

@@ -266,10 +266,11 @@ pub enum GitError {
     #[error("failed to clean worktree destination '{}': {detail}", path.display())]
     WorktreeAddCleanup { path: PathBuf, detail: String },
 
-    /// A worktree was explicitly locked by Git against every lifecycle change.
+    /// A worktree was explicitly locked by Git against protected mutations.
     ///
-    /// The message names no single operation because one lock refuses removal,
-    /// relocation and pruning alike, and `--force` overrides none of them.
+    /// The message names no single operation because one lock refuses index,
+    /// history, discard, and lifecycle mutations alike, and `--force`
+    /// overrides none of them.
     #[error(
         "worktree at '{}' is locked{}; run 'worktree unlock' before changing it",
         path.display(),
