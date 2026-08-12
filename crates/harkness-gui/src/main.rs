@@ -379,6 +379,8 @@ Kirigami.ApplicationWindow {
     QtObject {
         id: fixtureBackend
 
+        property int refreshCallCount: 0
+
         property var issues: ({
             "projectId": window.projectFixture.id,
             "remote": window.projectFixture.githubRemote,
@@ -390,7 +392,9 @@ Kirigami.ApplicationWindow {
             "error": ""
         })
 
-        function refreshIssues(projectId, githubRemote) {}
+        function refreshIssues(projectId, githubRemote) {
+            refreshCallCount += 1;
+        }
         function loadMoreIssues(projectId, githubRemote) {}
     }
 
@@ -410,6 +414,9 @@ Kirigami.ApplicationWindow {
         }
 
         check("availableForGitProject", issues.viewAvailable);
+        check("refreshesOnceOnInitialization", fixtureBackend.refreshCallCount === 1);
+        window.projectFixture = JSON.parse(JSON.stringify(window.projectFixture));
+        check("refreshesAfterProjectReplacement", fixtureBackend.refreshCallCount === 2);
         check("countsOpenRows", issues.openIssueCount === 2);
         check("countsClosedRows", issues.closedIssueCount === 1);
         check("defaultsToOpen", issues.visibleIssueCount === 2);

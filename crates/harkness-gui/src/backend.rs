@@ -1573,6 +1573,37 @@ fn terminate_github_process(child: &mut Child) {
     let _ = child.wait();
 }
 
+const GITHUB_CLI_REMOVED_ENV: &[&str] = &[
+    "GH_HOST",
+    "GH_FORCE_TTY",
+    "GH_DEBUG",
+    "DEBUG",
+    "GH_PAGER",
+    "PAGER",
+    "CLICOLOR_FORCE",
+];
+
+fn github_cli_command(executable: &Path, arguments: &[String]) -> Command {
+    let mut command = Command::new(executable);
+    for name in GITHUB_CLI_REMOVED_ENV {
+        command.env_remove(name);
+    }
+    command
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
+        .env("NO_COLOR", "1")
+        .env("CLICOLOR", "0")
+        .args(arguments)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command
+}
+
 fn github_cli_output_with_executable(
     executable: &Path,
     arguments: &[String],
@@ -1585,18 +1616,7 @@ fn github_cli_output_with_executable(
             message: "GitHub issue loading was cancelled".to_owned(),
         });
     }
-    let mut command = Command::new(executable);
-    command
-        .env_remove("GH_HOST")
-        .env("GH_PROMPT_DISABLED", "1")
-        .args(arguments)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+    let mut command = github_cli_command(executable, arguments);
     let mut child = command.spawn().map_err(|error| GitFailure {
         kind: "github_cli_missing".to_owned(),
         message: format!("Could not start GitHub CLI: {error}. Install gh and sign in."),
@@ -1658,6 +1678,10 @@ fn github_cli_output_with_executable(
         }
         thread::sleep(GITHUB_POLL_INTERVAL);
     };
+    // A descendant can outlive the direct child while retaining either pipe.
+    // End the whole group before joining readers so output collection cannot
+    // escape the cancellation and deadline loop above.
+    terminate_github_process(&mut child);
     let stdout = stdout_reader.join().unwrap_or(BoundedOutput {
         bytes: Vec::new(),
         exceeded: true,
@@ -5641,18 +5665,19 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        BranchRow, GitFailure, GitStateRow, HarknessBackendRust, OpenedUpdate, ProjectRow,
-        REVIEW_FILE_PAGE_SIZE, REVIEW_ROW_PAGE_SIZE, ReviewContextDirection, ReviewContextOutcome,
-        ReviewSelection, WorktreeLockAction, accept_current_catalog_refresh,
-        advance_review_file_window, advance_review_row_window, begin_job, begin_job_in_scope,
-        best_working_tree_line, cancel_issue_jobs, change_worktree_lock_with_service,
-        conflicting_repository_job, display_diff_path, empty_opened, end_job,
-        expand_review_context_with_git, github_cli_output_with_executable,
-        github_graphql_arguments, hidden_before, jobs_conflict, load_history_page_with_git,
-        load_review_file_with_git, load_review_with_git, load_review_with_initial_file_with_git,
-        move_worktree_with_service, operation_outcome, parse_github_issues,
-        project_repository_lock_scopes, project_rows, project_worktree_lifecycle_lock_scopes,
-        register_path_selection, register_review_path_identity, remove_worktree_with_service,
+        BranchRow, GITHUB_CLI_REMOVED_ENV, GitFailure, GitStateRow, HarknessBackendRust,
+        OpenedUpdate, ProjectRow, REVIEW_FILE_PAGE_SIZE, REVIEW_ROW_PAGE_SIZE,
+        ReviewContextDirection, ReviewContextOutcome, ReviewSelection, WorktreeLockAction,
+        accept_current_catalog_refresh, advance_review_file_window, advance_review_row_window,
+        begin_job, begin_job_in_scope, best_working_tree_line, cancel_issue_jobs,
+        change_worktree_lock_with_service, conflicting_repository_job, display_diff_path,
+        empty_opened, end_job, expand_review_context_with_git, github_cli_command,
+        github_cli_output_with_executable, github_graphql_arguments, hidden_before, jobs_conflict,
+        load_history_page_with_git, load_review_file_with_git, load_review_with_git,
+        load_review_with_initial_file_with_git, move_worktree_with_service, operation_outcome,
+        parse_github_issues, project_repository_lock_scopes, project_rows,
+        project_worktree_lifecycle_lock_scopes, register_path_selection,
+        register_review_path_identity, remove_worktree_with_service,
         replace_status_path_selections, resolve_commit_scope, resolve_path_selection,
         retreat_review_file_window, retreat_review_row_window, review_content_summary,
         review_file_window, review_hunk_exists_where, review_path, review_row_count, review_rows,
@@ -5896,6 +5921,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn github_transport_sanitizes_output_control_environment() {
+        let command = github_cli_command(Path::new("gh"), &[]);
+        for name in GITHUB_CLI_REMOVED_ENV {
+            assert!(command.get_envs().any(|(configured, value)| {
+                configured == std::ffi::OsStr::new(name) && value.is_none()
+            }));
+        }
+        for (name, expected) in [
+            ("GH_PROMPT_DISABLED", "1"),
+            ("GH_NO_UPDATE_NOTIFIER", "1"),
+            ("NO_COLOR", "1"),
+            ("CLICOLOR", "0"),
+        ] {
+            assert!(command.get_envs().any(|(configured, value)| {
+                configured == std::ffi::OsStr::new(name)
+                    && value == Some(std::ffi::OsStr::new(expected))
+            }));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn github_transport_refuses_oversized_stdout() {
@@ -5942,6 +5988,22 @@ mod tests {
         );
 
         assert_eq!(result.unwrap_err().kind, "github_timeout");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_transport_ends_descendants_before_joining_output_readers() {
+        let started = std::time::Instant::now();
+        let output = github_cli_output_with_executable(
+            Path::new("/bin/sh"),
+            &["-c".to_owned(), "sleep 10 & printf done".to_owned()],
+            &harkness_git::Cancellation::default(),
+            started + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert_eq!(output, b"done");
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 

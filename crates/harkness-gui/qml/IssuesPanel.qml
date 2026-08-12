@@ -37,6 +37,7 @@ Item {
     property string assigneeFilter: ""
     property string sortOrder: "oldest"
     property var selectedIssueIds: []
+    property bool initialRefreshCompleted: false
 
     readonly property var visibleIssues: filteredIssues()
     readonly property int visibleIssueCount: visibleIssues.length
@@ -81,8 +82,14 @@ Item {
         backend.loadMoreIssues(project.id, githubRemote);
     }
 
-    onProjectChanged: refreshIssues()
-    Component.onCompleted: refreshIssues()
+    onProjectChanged: {
+        if (initialRefreshCompleted)
+            refreshIssues();
+    }
+    Component.onCompleted: {
+        initialRefreshCompleted = true;
+        refreshIssues();
+    }
 
     component NavigationRow: Controls.AbstractButton {
         id: navigationRow
