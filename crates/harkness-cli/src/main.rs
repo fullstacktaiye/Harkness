@@ -4246,6 +4246,7 @@ const GIT_KIND_EXIT_CODES: &[(&str, u8)] = &[
     ("detached_head", EXIT_REFUSED),
     ("inspection", EXIT_OPERATION_FAILED),
     ("diff_content", EXIT_OPERATION_FAILED),
+    ("stale_discard_selection", EXIT_REFUSED),
     ("untracked_discard_requires_delete", EXIT_REFUSED),
     ("tracked_discard_requires_restore", EXIT_REFUSED),
     ("unmerged_discard", EXIT_REFUSED),

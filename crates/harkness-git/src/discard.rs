@@ -8,10 +8,12 @@
 
 use std::{
     fs,
+    io::Read,
     path::{Path, PathBuf},
 };
 
 use git2::{ErrorCode, Repository, Status};
+use sha2::{Digest, Sha256};
 
 use crate::{
     Cancellation, GitError, HunkSelection, RepositoryLock, StatusRefreshOutcome, commit, hunk,
@@ -191,16 +193,141 @@ pub struct DiscardOutcome {
     pub status: StatusRefreshOutcome,
 }
 
+/// Opaque identity of the path, index, and `HEAD` state a confirmation showed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscardSnapshot(Vec<DiscardPathSnapshot>);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DiscardPathSnapshot {
+    path: PathBuf,
+    worktree: WorktreeIdentity,
+    index: Option<(git2::Oid, u32)>,
+    head: Option<(git2::Oid, u32)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WorktreeIdentity {
+    Missing,
+    File([u8; 32]),
+    Symlink(PathBuf),
+    Other,
+}
+
+pub(crate) fn snapshot(root: &Path, paths: &[PathBuf]) -> Result<DiscardSnapshot, GitError> {
+    commit::validate_paths(root, paths)?;
+    let repository = commit::open(root)?;
+    snapshot_with_repository(&repository, root, paths)
+}
+
+fn snapshot_with_repository(
+    repository: &Repository,
+    root: &Path,
+    paths: &[PathBuf],
+) -> Result<DiscardSnapshot, GitError> {
+    let index = repository.index().map_err(|source| GitError::Inspection {
+        path: root.to_path_buf(),
+        source: source.into(),
+    })?;
+    let head_tree = repository
+        .head()
+        .ok()
+        .and_then(|head| head.peel_to_tree().ok());
+    let mut distinct = paths.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let mut snapshots = Vec::with_capacity(distinct.len());
+    for path in distinct {
+        let relative = repository_path(root, &path);
+        let resolved = if path.is_absolute() {
+            path.clone()
+        } else {
+            root.join(&path)
+        };
+        let worktree = match fs::symlink_metadata(&resolved) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                WorktreeIdentity::Symlink(fs::read_link(&resolved).map_err(|source| {
+                    GitError::DiffContent {
+                        path: path.clone(),
+                        source,
+                    }
+                })?)
+            }
+            Ok(metadata) if metadata.is_file() => {
+                let mut file =
+                    fs::File::open(&resolved).map_err(|source| GitError::DiffContent {
+                        path: path.clone(),
+                        source,
+                    })?;
+                let mut hash = Sha256::new();
+                let mut buffer = [0_u8; 64 * 1024];
+                loop {
+                    let read = file
+                        .read(&mut buffer)
+                        .map_err(|source| GitError::DiffContent {
+                            path: path.clone(),
+                            source,
+                        })?;
+                    if read == 0 {
+                        break;
+                    }
+                    hash.update(&buffer[..read]);
+                }
+                WorktreeIdentity::File(hash.finalize().into())
+            }
+            Ok(_) => WorktreeIdentity::Other,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                WorktreeIdentity::Missing
+            }
+            Err(source) => {
+                return Err(GitError::DiffContent {
+                    path: path.clone(),
+                    source,
+                });
+            }
+        };
+        let index = index
+            .get_path(relative, 0)
+            .map(|entry| (entry.id, entry.mode));
+        let head = head_tree
+            .as_ref()
+            .and_then(|tree| tree.get_path(relative).ok())
+            .map(|entry| (entry.id(), entry.filemode_raw() as u32));
+        snapshots.push(DiscardPathSnapshot {
+            path,
+            worktree,
+            index,
+            head,
+        });
+    }
+    Ok(DiscardSnapshot(snapshots))
+}
+
+fn require_snapshot(
+    repository: &Repository,
+    root: &Path,
+    paths: &[PathBuf],
+    expected: &DiscardSnapshot,
+) -> Result<(), GitError> {
+    if &snapshot_with_repository(repository, root, paths)? != expected {
+        return Err(GitError::StaleDiscardSelection);
+    }
+    Ok(())
+}
+
 pub(crate) fn restore_tracked(
     git_executable: &Path,
     root: &Path,
     _lock: &RepositoryLock,
     paths: &[PathBuf],
     source: TrackedRestoreSource,
+    expected: Option<&DiscardSnapshot>,
     cancellation: &Cancellation,
 ) -> Result<DiscardOutcome, GitError> {
     commit::validate_paths(root, paths)?;
     let repository = commit::open(root)?;
+    if let Some(expected) = expected {
+        require_snapshot(&repository, root, paths, expected)?;
+    }
     refuse_locked_worktree(git_executable, root, cancellation)?;
     if cancellation.is_cancelled() {
         return Err(GitError::Cancelled);
@@ -240,17 +367,24 @@ pub(crate) fn delete_untracked(
     root: &Path,
     _lock: &RepositoryLock,
     paths: &[PathBuf],
+    expected: Option<&DiscardSnapshot>,
     cancellation: &Cancellation,
 ) -> Result<DiscardOutcome, GitError> {
     commit::validate_paths(root, paths)?;
     let repository = commit::open(root)?;
+    if let Some(expected) = expected {
+        require_snapshot(&repository, root, paths, expected)?;
+    }
     refuse_locked_worktree(git_executable, root, cancellation)?;
     if cancellation.is_cancelled() {
         return Err(GitError::Cancelled);
     }
 
+    let mut paths = paths.to_vec();
+    paths.sort_unstable();
+    paths.dedup();
     let mut resolved = Vec::with_capacity(paths.len());
-    for path in paths {
+    for path in &paths {
         require_untracked_file(&repository, root, path)?;
         resolved.push(if path.is_absolute() {
             path.clone()
@@ -270,7 +404,7 @@ pub(crate) fn delete_untracked(
     }
 
     Ok(DiscardOutcome {
-        description: DiscardDescription::delete_untracked(paths),
+        description: DiscardDescription::delete_untracked(&paths),
         status: commit::refresh_status(git_executable, root, true, cancellation),
     })
 }
@@ -461,7 +595,10 @@ fn head_or_empty_tree(repository: &Repository, root: &Path) -> Result<git2::Oid,
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
     use crate::{
         Cancellation, DiffLineKind, DiffOptions, DiffTarget, DiscardOperation,
@@ -574,6 +711,93 @@ mod tests {
         assert_eq!(
             outcome.description.recoverability(),
             DiscardRecoverability::Unrecoverable
+        );
+    }
+
+    #[test]
+    fn duplicate_untracked_paths_are_deleted_once_and_report_success() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("discard-duplicate-untracked");
+        initialize_repository(&root);
+        fs::write(root.join("untracked.txt"), "delete once\n").unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+
+        let outcome = service
+            .delete_untracked(["untracked.txt", "untracked.txt"], &Cancellation::default())
+            .unwrap();
+
+        assert!(!root.join("untracked.txt").exists());
+        assert_eq!(outcome.description.untracked_files(), 1);
+    }
+
+    #[test]
+    fn a_confirmed_snapshot_refuses_newer_worktree_index_and_head_bytes() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("discard-snapshot");
+        initialize_repository(&root);
+        let service = GitService::new(&root, &fixture.data_dir);
+        fs::write(root.join("tracked.txt"), "shown edit\n").unwrap();
+        let snapshot = service.discard_snapshot(["tracked.txt"]).unwrap();
+        fs::write(root.join("tracked.txt"), "newer edit\n").unwrap();
+
+        assert!(matches!(
+            service.restore_tracked_if_unchanged(
+                ["tracked.txt"],
+                TrackedRestoreSource::Index,
+                &snapshot,
+                &Cancellation::default(),
+            ),
+            Err(GitError::StaleDiscardSelection)
+        ));
+        assert_eq!(worktree_text(&root.join("tracked.txt")), "newer edit\n");
+
+        fs::write(root.join("untracked.txt"), "shown untracked\n").unwrap();
+        let snapshot = service.discard_snapshot(["untracked.txt"]).unwrap();
+        fs::write(root.join("untracked.txt"), "newer untracked\n").unwrap();
+        assert!(matches!(
+            service.delete_untracked_if_unchanged(
+                ["untracked.txt"],
+                &snapshot,
+                &Cancellation::default(),
+            ),
+            Err(GitError::StaleDiscardSelection)
+        ));
+        assert_eq!(
+            worktree_text(&root.join("untracked.txt")),
+            "newer untracked\n"
+        );
+    }
+
+    #[test]
+    fn restoring_both_rename_paths_recreates_the_source_without_a_staged_deletion() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("discard-rename");
+        initialize_repository(&root);
+        let service = GitService::new(&root, &fixture.data_dir);
+        fs::rename(root.join("tracked.txt"), root.join("renamed.txt")).unwrap();
+        service
+            .stage(["tracked.txt", "renamed.txt"], &Cancellation::default())
+            .unwrap();
+        let paths = [PathBuf::from("tracked.txt"), PathBuf::from("renamed.txt")];
+        let snapshot = service.discard_snapshot(&paths).unwrap();
+
+        service
+            .restore_tracked_if_unchanged(
+                &paths,
+                TrackedRestoreSource::Head,
+                &snapshot,
+                &Cancellation::default(),
+            )
+            .unwrap();
+
+        assert!(root.join("tracked.txt").exists());
+        assert!(!root.join("renamed.txt").exists());
+        assert!(
+            service
+                .detailed_status(&Cancellation::default())
+                .unwrap()
+                .entries
+                .is_empty()
         );
     }
 

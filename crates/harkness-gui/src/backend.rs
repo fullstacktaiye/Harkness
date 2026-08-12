@@ -337,6 +337,7 @@ pub struct HarknessBackendRust {
     path_selections: HashMap<String, PathSelectionKey>,
     path_selection_ids: HashMap<PathSelectionKey, String>,
     path_discard_operations: HashMap<String, String>,
+    path_discard_snapshots: HashMap<String, harkness_git::DiscardSnapshot>,
     review_path_ids: HashMap<PathSelectionKey, String>,
     /// Catalog project ID to the actual Git common-directory scheduling domain.
     repository_lock_scopes: HashMap<String, String>,
@@ -376,6 +377,7 @@ impl Default for HarknessBackendRust {
             path_selections: HashMap::new(),
             path_selection_ids: HashMap::new(),
             path_discard_operations: HashMap::new(),
+            path_discard_snapshots: HashMap::new(),
             review_path_ids: HashMap::new(),
             repository_lock_scopes: HashMap::new(),
             worktree_lifecycle_lock_scopes: HashMap::new(),
@@ -691,6 +693,7 @@ struct StatusEntryRow {
     staged_rename: bool,
     unstaged_rename: bool,
     conflicted: bool,
+    discard_snapshot: Option<harkness_git::DiscardSnapshot>,
 }
 
 #[derive(Debug)]
@@ -760,6 +763,7 @@ impl GitStateRow {
                     staged_rename,
                     unstaged_rename,
                     conflicted: entry.conflicted,
+                    discard_snapshot: None,
                 }
             })
             .collect();
@@ -783,6 +787,27 @@ impl GitStateRow {
         self.error.clone_from(&failure.message);
         self.error_kind.clone_from(&failure.kind);
         self
+    }
+}
+
+fn attach_discard_snapshots(git: &harkness_git::GitService, state: &mut GitStateRow) {
+    for entry in &mut state.entries {
+        if status_discard_description(entry).is_none() {
+            continue;
+        }
+        let selection = PathSelectionKey {
+            project_id: state.project_id.clone(),
+            path: entry.path.clone(),
+            staged_rename_source: entry
+                .staged_rename
+                .then(|| entry.rename_source_path.clone())
+                .flatten(),
+            unstaged_rename_source: entry
+                .unstaged_rename
+                .then(|| entry.rename_source_path.clone())
+                .flatten(),
+        };
+        entry.discard_snapshot = git.discard_snapshot(selection.commit_paths()).ok();
     }
 }
 
@@ -1101,6 +1126,7 @@ fn replace_status_path_selections(
     backend.path_selections.clear();
     backend.path_selection_ids.clear();
     backend.path_discard_operations.clear();
+    backend.path_discard_snapshots.clear();
     row.entries
         .iter()
         .map(|entry| {
@@ -1117,6 +1143,11 @@ fn replace_status_path_selections(
                     token.clone(),
                     discard_operation_name(&description).to_owned(),
                 );
+                if let Some(snapshot) = &entry.discard_snapshot {
+                    backend
+                        .path_discard_snapshots
+                        .insert(token.clone(), snapshot.clone());
+                }
             }
             token
         })
@@ -1137,6 +1168,7 @@ fn clear_git_state(mut backend: Pin<&mut ffi::HarknessBackend>) {
         rust.path_selections.clear();
         rust.path_selection_ids.clear();
         rust.path_discard_operations.clear();
+        rust.path_discard_snapshots.clear();
     }
     backend.as_mut().set_git(empty_git());
 }
@@ -1419,6 +1451,7 @@ struct ReviewHunkState {
 struct ReviewLoadedFile {
     id: String,
     file: harkness_git::FileDiff,
+    discard_snapshot: Option<harkness_git::DiscardSnapshot>,
     hunks: Vec<ReviewHunkState>,
     total_lines: Option<u32>,
     row_offset: usize,
@@ -1679,9 +1712,18 @@ fn load_review_file_with_git(
             after: Vec::new(),
         })
         .collect();
+    let discard_paths = [file.old_path.as_ref(), file.new_path.as_ref()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let discard_snapshot = review_file_discard_description(&file)
+        .map(|_| git.discard_snapshot(discard_paths))
+        .transpose()
+        .map_err(GitFailure::from)?;
     Ok(ReviewLoadedFile {
         id: entry.id.clone(),
         file,
+        discard_snapshot,
         hunks,
         total_lines,
         row_offset: 0,
@@ -2834,11 +2876,15 @@ fn run_git_status_with_git(
         }
     };
     match git.detailed_status(cancellation) {
-        Ok(status) => GitWorkerResult {
-            state: Some(GitStateRow::from_status(project_id.clone(), status)),
-            project_id,
-            message: Ok("Git status refreshed".to_owned()),
-        },
+        Ok(status) => {
+            let mut state = GitStateRow::from_status(project_id.clone(), status);
+            attach_discard_snapshots(&git, &mut state);
+            GitWorkerResult {
+                state: Some(state),
+                project_id,
+                message: Ok("Git status refreshed".to_owned()),
+            }
+        }
         Err(error) => GitWorkerResult {
             project_id,
             message: Err(GitFailure::from(error)),
@@ -2888,7 +2934,8 @@ fn run_git_operation_with_git(
     // suppressed by the user's cancellation request.
     let state = match git.detailed_status(&harkness_git::Cancellation::default()) {
         Ok(status) => {
-            let state = GitStateRow::from_status(project_id.clone(), status);
+            let mut state = GitStateRow::from_status(project_id.clone(), status);
+            attach_discard_snapshots(&git, &mut state);
             Some(match &message {
                 Ok(_) => state,
                 Err(failure) => state.with_failure(failure),
@@ -2961,6 +3008,7 @@ fn launch_path_discard(
     project_id: String,
     paths: Vec<PathBuf>,
     operation: GuiDiscardOperation,
+    snapshot: harkness_git::DiscardSnapshot,
 ) {
     let Some((job_id, cancellation)) = start_job(
         backend.as_mut(),
@@ -2975,17 +3023,21 @@ fn launch_path_discard(
     std::thread::spawn(move || {
         let result = run_git_operation(project_id, &cancellation, |git, cancellation| {
             let outcome = match operation {
-                GuiDiscardOperation::RestoreIndex => git.restore_tracked(
+                GuiDiscardOperation::RestoreIndex => git.restore_tracked_if_unchanged(
                     &paths,
                     harkness_git::TrackedRestoreSource::Index,
+                    &snapshot,
                     cancellation,
                 ),
-                GuiDiscardOperation::RestoreHead => git.restore_tracked(
+                GuiDiscardOperation::RestoreHead => git.restore_tracked_if_unchanged(
                     &paths,
                     harkness_git::TrackedRestoreSource::Head,
+                    &snapshot,
                     cancellation,
                 ),
-                GuiDiscardOperation::DeleteUntracked => git.delete_untracked(&paths, cancellation),
+                GuiDiscardOperation::DeleteUntracked => {
+                    git.delete_untracked_if_unchanged(&paths, &snapshot, cancellation)
+                }
             }
             .map_err(GitFailure::from)?;
             Ok(discard_success_message(&outcome.description))
@@ -4208,7 +4260,25 @@ impl ffi::HarknessBackend {
             );
             return;
         }
-        launch_path_discard(self, project_id, vec![selection.path], operation);
+        let Some(snapshot) = self
+            .as_ref()
+            .rust()
+            .path_discard_snapshots
+            .get(&path_id)
+            .cloned()
+        else {
+            self.as_mut().set_status(
+                "The path could not be verified; refresh Git status and confirm again".into(),
+            );
+            return;
+        };
+        launch_path_discard(
+            self,
+            project_id,
+            selection.commit_paths(),
+            operation,
+            snapshot,
+        );
     }
 
     fn discard_review_file(
@@ -4235,9 +4305,19 @@ impl ffi::HarknessBackend {
             .filter(|loaded| loaded.id == file_id)
             .and_then(|loaded| {
                 review_file_discard_description(&loaded.file)
-                    .map(|description| (review_path(&loaded.file), description))
+                    .zip(loaded.discard_snapshot.clone())
+                    .map(|(description, snapshot)| {
+                        let mut paths =
+                            [loaded.file.old_path.clone(), loaded.file.new_path.clone()]
+                                .into_iter()
+                                .flatten()
+                                .collect::<Vec<_>>();
+                        paths.sort_unstable();
+                        paths.dedup();
+                        (paths, description, snapshot)
+                    })
             });
-        let Some((path, description)) = resolved else {
+        let Some((paths, description, snapshot)) = resolved else {
             self.as_mut()
                 .set_status("The selected review file is no longer discardable".into());
             return;
@@ -4248,7 +4328,7 @@ impl ffi::HarknessBackend {
             );
             return;
         }
-        launch_path_discard(self, project_id, vec![path], operation);
+        launch_path_discard(self, project_id, paths, operation, snapshot);
     }
 
     fn discard_review_hunk(mut self: Pin<&mut Self>, project_id: &QString, hunk_id: &QString) {

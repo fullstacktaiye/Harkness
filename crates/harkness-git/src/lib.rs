@@ -53,7 +53,7 @@ pub use diff::{
     MAX_INTRA_LINE_COMPARISONS,
 };
 pub use discard::{
-    DiscardDescription, DiscardOperation, DiscardOutcome, DiscardRecoverability,
+    DiscardDescription, DiscardOperation, DiscardOutcome, DiscardRecoverability, DiscardSnapshot,
     TrackedRestoreSource,
 };
 pub use history::{CommitInfo, CommitSignature, LogCursor, LogOptions, LogPage, LogRange};
@@ -450,6 +450,10 @@ pub enum GitError {
         source: io::Error,
     },
 
+    /// The paths, index, or `HEAD` changed after destructive confirmation.
+    #[error("the selected changes are stale; refresh and confirm the discard again")]
+    StaleDiscardSelection,
+
     /// A tracked-content restore was asked to delete a path Git does not track.
     #[error(
         "'{}' is untracked; delete it only through the explicit untracked-file operation",
@@ -649,6 +653,7 @@ impl GitError {
         "detached_head",
         "inspection",
         "diff_content",
+        "stale_discard_selection",
         "untracked_discard_requires_delete",
         "tracked_discard_requires_restore",
         "unmerged_discard",
@@ -725,6 +730,7 @@ impl GitError {
             Self::DetachedHead { .. } => "detached_head",
             Self::Inspection { .. } => "inspection",
             Self::DiffContent { .. } => "diff_content",
+            Self::StaleDiscardSelection => "stale_discard_selection",
             Self::UntrackedDiscardRequiresDelete { .. } => "untracked_discard_requires_delete",
             Self::TrackedDiscardRequiresRestore { .. } => "tracked_discard_requires_restore",
             Self::UnmergedDiscard { .. } => "unmerged_discard",
@@ -991,6 +997,48 @@ impl GitService {
             &lock,
             &paths,
             source,
+            None,
+            cancellation,
+        )
+    }
+
+    /// Captures the exact worktree, index, and `HEAD` state a discard confirmation describes.
+    pub fn discard_snapshot<I, P>(&self, paths: I) -> Result<DiscardSnapshot, GitError>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let paths = paths
+            .into_iter()
+            .map(|path| path.as_ref().to_path_buf())
+            .collect::<Vec<_>>();
+        discard::snapshot(&self.root, &paths)
+    }
+
+    /// Restores tracked paths only if they still match a previously captured snapshot.
+    pub fn restore_tracked_if_unchanged<I, P>(
+        &self,
+        paths: I,
+        source: TrackedRestoreSource,
+        expected: &DiscardSnapshot,
+        cancellation: &Cancellation,
+    ) -> Result<DiscardOutcome, GitError>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let paths = paths
+            .into_iter()
+            .map(|path| path.as_ref().to_path_buf())
+            .collect::<Vec<_>>();
+        let lock = self.acquire_lock(cancellation)?;
+        discard::restore_tracked(
+            &self.git_executable,
+            &self.root,
+            &lock,
+            &paths,
+            source,
+            Some(expected),
             cancellation,
         )
     }
@@ -1019,6 +1067,33 @@ impl GitService {
             &self.root,
             &lock,
             &paths,
+            None,
+            cancellation,
+        )
+    }
+
+    /// Deletes untracked files only if they still match a previously captured snapshot.
+    pub fn delete_untracked_if_unchanged<I, P>(
+        &self,
+        paths: I,
+        expected: &DiscardSnapshot,
+        cancellation: &Cancellation,
+    ) -> Result<DiscardOutcome, GitError>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let paths = paths
+            .into_iter()
+            .map(|path| path.as_ref().to_path_buf())
+            .collect::<Vec<_>>();
+        let lock = self.acquire_lock(cancellation)?;
+        discard::delete_untracked(
+            &self.git_executable,
+            &self.root,
+            &lock,
+            &paths,
+            Some(expected),
             cancellation,
         )
     }
@@ -2177,6 +2252,7 @@ mod tests {
                 },
                 "diff_content",
             ),
+            (GitError::StaleDiscardSelection, "stale_discard_selection"),
             (
                 GitError::UntrackedDiscardRequiresDelete { path: path.clone() },
                 "untracked_discard_requires_delete",

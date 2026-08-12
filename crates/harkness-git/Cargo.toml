@@ -12,6 +12,7 @@ path = "src/lib.rs"
 git2.workspace = true
 libgit2-sys.workspace = true
 serde.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
