@@ -90,6 +90,43 @@ jobs:
       - name: Test CLI
         run: cargo test --locked -p harkness-cli
 
+  # Latency targets are `#[ignore]`d because a debug build measures nothing
+  # meaningful. Running them nowhere leaves the numbers unverified, so the named
+  # ones run here in release, by exact name: a bare `--ignored` sweep would also
+  # run the fixture regenerators, which rewrite committed files.
+  latency:
+    name: Latency targets (release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache Cargo dependencies and build output
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+      # v0.3 puts policy evaluation on every protected tool call, so its 5 ms
+      # budget is a release requirement rather than a note in the issue.
+      - name: Measure policy evaluation
+        run: >-
+          sh .github/scripts/run-ignored-exact-test.sh
+          harkness-runtime
+          policy::tests::policy_evaluation_meets_the_latency_target
+          --release
+      - name: Measure registry lookup
+        run: >-
+          sh .github/scripts/run-ignored-exact-test.sh
+          harkness-runtime
+          tool::tests::registry_lookup_meets_the_latency_target
+          --release
+
   github-remote-import:
     name: GitHub remote import
     runs-on: [self-hosted, Linux, X64, harkness]
