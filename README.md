@@ -91,6 +91,7 @@ harkness --json git branch checkout <name> [--project <selector>]
 harkness --json git branch delete <name> [--force] [--project <selector>]
 harkness --json git stage (<path>... | --all | --hunk <selection-flags> | --hunk-selection <path|-> | --line-selection <path|->) [--project <selector>]
 harkness --json git unstage (<path>... | --hunk <selection-flags> | --hunk-selection <path|-> | --line-selection <path|->) [--project <selector>]
+harkness --json git discard (--from <index|head> | --delete-untracked) (<path>... | --hunk <selection-flags> | --hunk-selection <path|-> | --line-selection <path|->) [--yes] [--project <selector>]
 harkness --json git commit --message <message> [--amend] [--allow-empty] [--project <selector>]
 
 harkness --json worktree list [--project <parent-selector>]
@@ -279,6 +280,19 @@ overlap cannot be expressed as one patch and are refused with
 Whole-path staging and unstaging keep their existing syntax. A path that begins
 with a hyphen goes after a `--` separator, as Git itself requires.
 
+Discard is deliberately split by boundary. `git discard --from index` restores
+tracked working-tree content while preserving staged changes;
+`git discard --from head` restores both the index and working tree. Hunk and
+line selections always restore from the index and use the same stale-safe
+selection documents as staging. Untracked content is never swept into either
+operation: only `git discard --delete-untracked` can delete explicitly named
+untracked files. Every form first returns `confirmation_required` with the
+affected paths, counts, boundary, and recoverability; repeat the reviewed
+operation with `--yes` to execute it. No safety stash is created. Git retains
+the named index or HEAD baseline for tracked restoration, but the discarded
+uncommitted edits—and all deleted untracked bytes—are not recoverable through
+Harkness.
+
 Project JSON uses an explicit CLI projection rather than the catalog's storage
 serializer. `last_opened` is RFC 3339, source-specific optional fields are
 always present with `null` when inapplicable, and `git` has a fixed documented
@@ -297,8 +311,9 @@ Harkness-owned rows and their exact Git administrative records. It never
 performs a repository-wide prune or adopts or removes external worktrees.
 
 A worktree lock records a mandatory reason and protects the checkout from
-removal, relocation, and pruning; `--force` does not override it, so clearing
-protection always takes an explicit `worktree unlock`. Git trims the stored
+stage, unstage, commit, discard, removal, relocation, and pruning operations;
+`--force` does not override it, so clearing protection always takes an explicit
+`worktree unlock`. Git trims the stored
 reason and `worktree list` reports it as `lock_reason`, which is `null` when a
 lock records no reason at all. Locking an already-locked worktree is refused
 rather than silently replaced; `--replace` supersedes an existing reason
@@ -317,7 +332,9 @@ The GUI opens a Kirigami window on the project launcher backed by the Rust
 same creation modes, live linked-worktree inventory, selective reconciliation,
 and a second confirmation before dirty files can be discarded. Selecting a
 changed path loads only that path's staged and unstaged content, marks added
-and removed lines, and stages or unstages stale-safe hunks or selected lines.
+and removed lines, and stages, unstages, or discards stale-safe hunks or selected
+lines. Whole-file and changed-file discard actions share a cancel-default
+confirmation that names the affected paths, Git boundary, and recoverability.
 Click selects one changed line, Shift-click extends a range, and Space provides
 the keyboard equivalent while the diff list is focused. Binary,
 byte-bounded, and line-bounded content stays visible as a named summary instead

@@ -421,6 +421,29 @@ pub(crate) fn list(
     parse_porcelain(&output.stdout)
 }
 
+/// Refuses a mutation addressed through a worktree Git has marked as locked.
+///
+/// Callers hold the repository mutation lock while checking, so another
+/// Harkness operation cannot replace or clear the administrative lock between
+/// this check and the mutation it guards.
+pub(crate) fn refuse_locked(
+    git_executable: &Path,
+    root: &Path,
+    cancellation: &Cancellation,
+) -> Result<(), GitError> {
+    if let Some(row) = list(git_executable, root, cancellation)?
+        .into_iter()
+        .find(|row| row.matches_path(root))
+        .filter(GitWorktree::is_locked)
+    {
+        return Err(GitError::WorktreeLocked {
+            path: row.root().to_path_buf(),
+            reason: row.lock_reason().map(str::to_owned),
+        });
+    }
+    Ok(())
+}
+
 fn parse_porcelain(output: &[u8]) -> Result<Vec<GitWorktree>, GitError> {
     let mut listed = Vec::new();
     let mut root = None;

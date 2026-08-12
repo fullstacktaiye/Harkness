@@ -1442,6 +1442,201 @@ fn diff_hunk_flags_stage_unstage_and_refuse_a_stale_selection() {
 }
 
 #[test]
+fn discard_requires_confirmation_and_keeps_tracked_boundaries_explicit() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("discard-project");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    fs::write(root.join("tracked.txt"), b"committed\n").unwrap();
+    commit_all(&repository, "prepare discard fixture");
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+
+    fs::write(root.join("tracked.txt"), b"staged\n").unwrap();
+    run_git(&root, &["add", "--", "tracked.txt"]);
+    fs::write(root.join("tracked.txt"), b"working tree\n").unwrap();
+
+    let confirmation = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "discard",
+            "--from",
+            "index",
+            "--project",
+            &project_id,
+            "tracked.txt",
+        ],
+    );
+    assert_eq!(confirmation.status.code(), Some(3));
+    let body = json_output(&confirmation);
+    assert_eq!(body["error"]["kind"], "confirmation_required");
+    assert_eq!(body["error"]["details"]["override_flag"], "--yes");
+    assert_eq!(
+        body["error"]["details"]["discard"]["operation"],
+        "restore_tracked"
+    );
+    assert_eq!(body["error"]["details"]["discard"]["source"], "index");
+    assert_eq!(
+        body["error"]["details"]["discard"]["recoverability"],
+        "git_recorded_baseline"
+    );
+    assert_eq!(
+        fs::read(root.join("tracked.txt")).unwrap(),
+        b"working tree\n",
+        "declining confirmation must not touch the file"
+    );
+
+    let restored = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "discard",
+            "--from",
+            "index",
+            "--yes",
+            "--project",
+            &project_id,
+            "tracked.txt",
+        ],
+    );
+    assert_success(&restored);
+    assert_eq!(worktree_text(&root.join("tracked.txt")), "staged\n");
+    let mut index = repository.index().unwrap();
+    index.read(true).unwrap();
+    let entry = index.get_path(Path::new("tracked.txt"), 0).unwrap();
+    assert_eq!(
+        repository.find_blob(entry.id).unwrap().content(),
+        b"staged\n"
+    );
+
+    let reset_to_head = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "discard",
+            "--from",
+            "head",
+            "--yes",
+            "--project",
+            &project_id,
+            "tracked.txt",
+        ],
+    );
+    assert_success(&reset_to_head);
+    assert_eq!(worktree_text(&root.join("tracked.txt")), "committed\n");
+    let mut index = repository.index().unwrap();
+    index.read(true).unwrap();
+    let entry = index.get_path(Path::new("tracked.txt"), 0).unwrap();
+    assert_eq!(
+        repository.find_blob(entry.id).unwrap().content(),
+        b"committed\n"
+    );
+}
+
+#[test]
+fn discard_separates_untracked_deletion_and_can_reverse_one_hunk() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("granular-discard-project");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    let original = (1..=30)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    fs::write(root.join("tracked.txt"), original.as_bytes()).unwrap();
+    commit_all(&repository, "prepare granular discard fixture");
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+    let changed = original
+        .replace("line 2\n", "FIRST\n")
+        .replace("line 28\n", "SECOND\n");
+    fs::write(root.join("tracked.txt"), changed.as_bytes()).unwrap();
+    fs::write(root.join("untracked.txt"), b"unrecoverable\n").unwrap();
+
+    let refused = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "discard",
+            "--from",
+            "index",
+            "--yes",
+            "--project",
+            &project_id,
+            "untracked.txt",
+        ],
+    );
+    assert_eq!(refused.status.code(), Some(3));
+    assert_eq!(
+        json_output(&refused)["error"]["kind"],
+        "untracked_discard_requires_delete"
+    );
+    assert!(root.join("untracked.txt").exists());
+
+    let delete_confirmation = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "discard",
+            "--delete-untracked",
+            "--project",
+            &project_id,
+            "untracked.txt",
+        ],
+    );
+    assert_eq!(delete_confirmation.status.code(), Some(3));
+    let body = json_output(&delete_confirmation);
+    assert_eq!(body["error"]["kind"], "confirmation_required");
+    assert_eq!(
+        body["error"]["details"]["discard"]["recoverability"],
+        "unrecoverable"
+    );
+    assert!(root.join("untracked.txt").exists());
+
+    let deleted = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "discard",
+            "--delete-untracked",
+            "--yes",
+            "--project",
+            &project_id,
+            "untracked.txt",
+        ],
+    );
+    assert_success(&deleted);
+    assert!(!root.join("untracked.txt").exists());
+
+    let file = diff_file(&data_dir, &project_id, "--unstaged", "tracked.txt");
+    assert_eq!(file["hunks"].as_array().unwrap().len(), 2);
+    let mut arguments = hunk_arguments("discard", &project_id, &file, 0);
+    arguments.extend(["--from".to_owned(), "index".to_owned(), "--yes".to_owned()]);
+    assert_success(&harkness(&data_dir, &arguments));
+    let remaining = diff_file(&data_dir, &project_id, "--unstaged", "tracked.txt");
+    assert_eq!(remaining["hunks"].as_array().unwrap().len(), 1);
+    assert!(
+        fs::read_to_string(root.join("tracked.txt"))
+            .unwrap()
+            .contains("SECOND")
+    );
+}
+
+#[test]
 fn selector_help_is_exposed_only_where_it_is_accepted() {
     let fixture = TempDir::new().unwrap();
     let list_help = harkness(fixture.path(), &["project", "list", "--help"]);
@@ -1501,7 +1696,7 @@ fn new_command_help_offers_every_diff_and_hunk_flag() {
         assert!(diff_help.contains(flag), "git diff --help lacks {flag}");
     }
 
-    for command in ["stage", "unstage"] {
+    for command in ["stage", "unstage", "discard"] {
         let help = String::from_utf8(harkness(fixture.path(), &["git", command, "--help"]).stdout)
             .unwrap();
         for flag in [
@@ -1515,6 +1710,14 @@ fn new_command_help_offers_every_diff_and_hunk_flag() {
         ] {
             assert!(help.contains(flag), "git {command} --help lacks {flag}");
         }
+    }
+    let discard_help =
+        String::from_utf8(harkness(fixture.path(), &["git", "discard", "--help"]).stdout).unwrap();
+    for flag in ["--from", "--delete-untracked", "--yes"] {
+        assert!(
+            discard_help.contains(flag),
+            "git discard --help lacks {flag}"
+        );
     }
 }
 
@@ -3676,6 +3879,10 @@ fn initialize_repository(root: &Path) {
     configure_identity(&repository);
     fs::write(root.join("README.md"), "fixture\n").unwrap();
     commit_all(&repository, "fixture");
+}
+
+fn worktree_text(path: &Path) -> String {
+    fs::read_to_string(path).unwrap().replace("\r\n", "\n")
 }
 
 fn configure_identity(repository: &Repository) {

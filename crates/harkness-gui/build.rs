@@ -23,6 +23,7 @@ fn main() {
             "qml/GitPanel.qml",
             "qml/IssuesPanel.qml",
             "qml/ChangesPanel.qml",
+            "qml/DiscardPrompt.qml",
             "qml/HistoryPanel.qml",
             "qml/ReviewSurface.qml",
         ]),
