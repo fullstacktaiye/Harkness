@@ -297,6 +297,183 @@ Kirigami.ApplicationWindow {
             "activity bar and side panel view contract check failed"
         );
 
+        // Exercise the Issues surface with representative backend projection
+        // rows so labels, metadata, counts, scopes, filters, selection, and
+        // sorting all instantiate without making a network request.
+        LOADED.store(false, Ordering::SeqCst);
+        static ISSUES_ROOT: AtomicPtr<QObject> = AtomicPtr::new(ptr::null_mut());
+        if let Some(mut engine) = engine.as_mut() {
+            let _connection = engine.as_mut().on_object_created(|_engine, object, _url| {
+                LOADED.store(!object.is_null(), Ordering::SeqCst);
+                ISSUES_ROOT.store(object, Ordering::SeqCst);
+            });
+            engine.as_mut().load_data(
+                &QByteArray::from(
+                    br##"
+import QtQuick
+import org.kde.kirigami as Kirigami
+import io.github.fullstacktaiye.harkness
+
+Kirigami.ApplicationWindow {
+    id: window
+
+    visible: true
+    width: 1180
+    height: 760
+
+    property var projectFixture: ({
+        "id": "00000000-0000-0000-0000-000000000000",
+        "displayName": "Issues fixture",
+        "root": "/tmp",
+        "remote": "github.com/example/repository",
+        "githubRemote": "github.com/example/repository",
+        "available": true,
+        "isGit": true
+    })
+
+    property var issueFixtureRows: [
+            {
+                "number": 186,
+                "title": "ACP agents, MCP integrations, and GitHub issues",
+                "state": "open",
+                "author": "octocat",
+                "updated": "updated 2d ago",
+                "labels": [
+                    { "name": "enhancement", "color": "#56d4dd" },
+                    { "name": "v0.5", "color": "#3fb950" }
+                ],
+                "milestone": "v0.5",
+                "assignees": ["@octocat", "@maintainer"],
+                "commentCount": 41,
+                "createdByMe": true,
+                "assignedToMe": false
+            },
+            {
+                "number": 185,
+                "title": "Performance and output-bound stress benchmarks",
+                "state": "open",
+                "author": "maintainer",
+                "updated": "updated 3d ago",
+                "labels": [{ "name": "testing", "color": "#a5d6a7" }],
+                "milestone": "v0.5",
+                "assignees": ["@me"],
+                "commentCount": 3,
+                "createdByMe": false,
+                "assignedToMe": true
+            },
+            {
+                "number": 120,
+                "title": "Persist workspace snapshot identity",
+                "state": "closed",
+                "author": "octocat",
+                "updated": "closed last week",
+                "labels": [{ "name": "architecture", "color": "#a371f7" }],
+                "milestone": "",
+                "assignees": [],
+                "commentCount": 8,
+                "createdByMe": true,
+                "assignedToMe": false
+            }
+    ]
+
+    QtObject {
+        id: fixtureBackend
+
+        property int refreshCallCount: 0
+
+        property var issues: ({
+            "projectId": window.projectFixture.id,
+            "remote": window.projectFixture.githubRemote,
+            "loading": false,
+            "viewer": "octocat",
+            "rows": window.issueFixtureRows,
+            "hasMore": false,
+            "limitReached": false,
+            "error": ""
+        })
+
+        function refreshIssues(projectId, githubRemote) {
+            refreshCallCount += 1;
+        }
+        function loadMoreIssues(projectId, githubRemote) {}
+    }
+
+    IssuesPanel {
+        id: issues
+
+        anchors.fill: parent
+        backend: fixtureBackend
+        project: window.projectFixture
+    }
+
+    Component.onCompleted: {
+        const failures = [];
+        function check(name, passed) {
+            if (!passed)
+                failures.push(name);
+        }
+
+        check("availableForGitProject", issues.viewAvailable);
+        check("refreshesOnceOnInitialization", fixtureBackend.refreshCallCount === 1);
+        window.projectFixture = JSON.parse(JSON.stringify(window.projectFixture));
+        check("refreshesAfterProjectReplacement", fixtureBackend.refreshCallCount === 2);
+        check("countsOpenRows", issues.openIssueCount === 2);
+        check("countsClosedRows", issues.closedIssueCount === 1);
+        check("defaultsToOpen", issues.visibleIssueCount === 2);
+        check("defaultsToOldest", issues.sortOrder === "oldest"
+            && Number(issues.filteredIssues()[0].number) === 185);
+
+        issues.searchText = "performance";
+        check("searchesIssueText", issues.filteredIssues().length === 1);
+        issues.searchText = "";
+
+        issues.selectScope("assigned");
+        check("filtersAssignedToMe", issues.filteredIssues().length === 1);
+        check("countsSelectedScope", issues.countByStateAndSelectedScope("open") === 1);
+        issues.selectScope("issues");
+
+        issues.setIssueSelected(issues.issueRows[0], true);
+        issues.sortOrder = "newest";
+        check("selectionUsesIdentity", issues.issueSelected(issues.issueRows[0]));
+        check("selectionDoesNotMigrate", !issues.issueSelected(issues.issueRows[1]));
+        issues.sortOrder = "oldest";
+
+        issues.labelFilter = "v0.5";
+        check("filtersLabels", issues.filteredIssues().length === 1);
+        issues.labelFilter = "";
+
+        issues.assigneeFilter = "@octocat";
+        check("filtersOneMemberOfAssignmentSet", issues.filteredIssues().length === 1);
+        issues.assigneeFilter = "";
+
+        issues.stateFilter = "closed";
+        check("switchesState", issues.filteredIssues().length === 1);
+        issues.stateFilter = "open";
+        check("sortsOldest", Number(issues.filteredIssues()[0].number) === 185);
+
+        window.objectName = failures.length === 0
+            ? "IssuesPanelSmokePassed"
+            : "IssuesPanelSmokeFailed[" + failures.join(",") + "]";
+    }
+
+}
+"##,
+                ),
+                &QUrl::from("qrc:/IssuesPanelSmoke.qml"),
+            );
+        }
+        assert!(
+            LOADED.load(Ordering::SeqCst),
+            "IssuesPanel.qml failed to load; see QML warnings above"
+        );
+        let issues_name = unsafe { ISSUES_ROOT.load(Ordering::SeqCst).as_ref() }
+            .map(|object| object.object_name().to_string())
+            .unwrap_or_default();
+        assert_eq!(
+            issues_name, "IssuesPanelSmokePassed",
+            "IssuesPanel filter and projection check failed"
+        );
+
         // Exercise every GitPanel delegate with hand-written state. Main.qml
         // cannot populate changed paths or running jobs without driving real
         // asynchronous Git operations, so this fixture is what catches typos

@@ -34,6 +34,7 @@ pub mod ffi {
         #[qproperty(QVariant, opened)]
         #[qproperty(QVariant, git)]
         #[qproperty(QVariant, history)]
+        #[qproperty(QVariant, issues)]
         #[qproperty(QVariant, review)]
         type HarknessBackend = super::HarknessBackendRust;
 
@@ -91,6 +92,24 @@ pub mod ffi {
         #[qinvokable]
         #[cxx_name = "loadMoreHistory"]
         fn load_more_history(self: Pin<&mut HarknessBackend>, project_id: &QString);
+
+        /// Loads the open repository's issues through the authenticated GitHub CLI.
+        #[qinvokable]
+        #[cxx_name = "refreshIssues"]
+        fn refresh_issues(
+            self: Pin<&mut HarknessBackend>,
+            project_id: &QString,
+            github_remote: &QString,
+        );
+
+        /// Loads one additional bounded page for the open repository.
+        #[qinvokable]
+        #[cxx_name = "loadMoreIssues"]
+        fn load_more_issues(
+            self: Pin<&mut HarknessBackend>,
+            project_id: &QString,
+            github_remote: &QString,
+        );
 
         /// Opens a commit against its first parent in the read-only review surface.
         #[qinvokable]
@@ -315,14 +334,21 @@ pub mod ffi {
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    io::Read,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex},
-    time::UNIX_EPOCH,
+    process::{Child, Command, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use cxx_qt::{CxxQtType, Threading};
 use cxx_qt_lib::{QList, QMap, QMapPair_QString_QVariant, QString, QVariant};
+use serde::Deserialize;
 
 pub struct HarknessBackendRust {
     busy: bool,
@@ -334,6 +360,7 @@ pub struct HarknessBackendRust {
     opened: QVariant,
     git: QVariant,
     history: QVariant,
+    issues: QVariant,
     review: QVariant,
     job_records: Vec<JobRecord>,
     cancellations: HashMap<String, harkness_git::Cancellation>,
@@ -354,9 +381,11 @@ pub struct HarknessBackendRust {
     next_path_selection: u64,
     next_review_path_identity: u64,
     history_state: Option<HistoryStateRow>,
+    issues_state: Option<IssuesStateRow>,
     review_state: Option<ReviewStateRow>,
     next_catalog_request: u64,
     next_history_request: u64,
+    next_issues_request: u64,
     next_branch_request: u64,
     next_worktree_request: u64,
     next_review_request: u64,
@@ -375,6 +404,7 @@ impl Default for HarknessBackendRust {
             opened: empty_opened(),
             git: empty_git(),
             history: empty_history(),
+            issues: empty_issues(),
             review: empty_review(),
             job_records: Vec::new(),
             cancellations: HashMap::new(),
@@ -391,9 +421,11 @@ impl Default for HarknessBackendRust {
             next_path_selection: 0,
             next_review_path_identity: 0,
             history_state: None,
+            issues_state: None,
             review_state: None,
             next_catalog_request: 0,
             next_history_request: 0,
+            next_issues_request: 0,
             next_branch_request: 0,
             next_worktree_request: 0,
             next_review_request: 0,
@@ -1575,6 +1607,633 @@ fn clear_history_state(mut backend: Pin<&mut ffi::HarknessBackend>) {
     rust.next_history_request += 1;
     rust.history_state = None;
     backend.as_mut().set_history(empty_history());
+}
+
+#[derive(Clone, Debug)]
+struct IssueLabelRow {
+    name: String,
+    color: String,
+}
+
+#[derive(Clone, Debug)]
+struct IssueRow {
+    id: String,
+    number: u64,
+    title: String,
+    state: String,
+    url: String,
+    author: String,
+    updated: String,
+    labels: Vec<IssueLabelRow>,
+    milestone: String,
+    assignees: Vec<String>,
+    comment_count: u64,
+    created_by_me: bool,
+    assigned_to_me: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GithubUserRow {
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubLabelRow {
+    name: String,
+    color: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubMilestoneRow {
+    title: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubNodeConnection<T> {
+    nodes: Vec<T>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GithubPageInfo {
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubCount {
+    #[serde(rename = "totalCount")]
+    total_count: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GithubIssueRow {
+    id: String,
+    number: u64,
+    title: String,
+    state: String,
+    url: String,
+    author: Option<GithubUserRow>,
+    updated_at: String,
+    labels: GithubNodeConnection<GithubLabelRow>,
+    milestone: Option<GithubMilestoneRow>,
+    assignees: GithubNodeConnection<GithubUserRow>,
+    comments: GithubCount,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GithubIssueConnection {
+    total_count: u64,
+    page_info: GithubPageInfo,
+    nodes: Vec<GithubIssueRow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubRepositoryRow {
+    issues: GithubIssueConnection,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubGraphqlData {
+    viewer: GithubUserRow,
+    repository: Option<GithubRepositoryRow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubGraphqlError {
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubGraphqlResponse {
+    data: Option<GithubGraphqlData>,
+    #[serde(default)]
+    errors: Vec<GithubGraphqlError>,
+}
+
+#[derive(Debug)]
+struct GithubIssuePage {
+    viewer: String,
+    rows: Vec<IssueRow>,
+    next_cursor: Option<String>,
+    total_count: u64,
+    limit_reached: bool,
+}
+
+#[derive(Clone, Debug)]
+struct IssuesStateRow {
+    project_id: String,
+    remote: String,
+    loading: bool,
+    viewer: String,
+    rows: Vec<IssueRow>,
+    next_cursor: Option<String>,
+    total_count: u64,
+    limit_reached: bool,
+    error: String,
+    error_kind: String,
+}
+
+impl IssuesStateRow {
+    fn loading(project_id: String, remote: String) -> Self {
+        Self {
+            project_id,
+            remote,
+            loading: true,
+            viewer: String::new(),
+            rows: Vec::new(),
+            next_cursor: None,
+            total_count: 0,
+            limit_reached: false,
+            error: String::new(),
+            error_kind: String::new(),
+        }
+    }
+
+    fn with_failure(mut self, failure: GitFailure) -> Self {
+        self.loading = false;
+        self.error = failure.message;
+        self.error_kind = failure.kind;
+        self
+    }
+}
+
+const GITHUB_HOST: &str = "github.com";
+const GITHUB_MAX_ISSUES: usize = 1_000;
+const GITHUB_OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
+const GITHUB_ERROR_LIMIT: usize = 64 * 1024;
+const GITHUB_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const GITHUB_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+const GITHUB_ISSUES_QUERY: &str = r#"
+query($owner: String!, $name: String!, $endCursor: String) {
+  viewer { login }
+  repository(owner: $owner, name: $name) {
+    issues(
+      first: 100
+      after: $endCursor
+      orderBy: {field: CREATED_AT, direction: ASC}
+      states: [OPEN, CLOSED]
+    ) {
+      totalCount
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        id number title state url updatedAt
+        author { login }
+        labels(first: 100) { nodes { name color } }
+        milestone { title }
+        assignees(first: 100) { nodes { login } }
+        comments { totalCount }
+      }
+    }
+  }
+}
+"#;
+
+fn empty_issues() -> QVariant {
+    QVariant::from(&QMap::<QMapPair_QString_QVariant>::default())
+}
+
+fn to_issues(row: &IssuesStateRow) -> QVariant {
+    let mut state = QMap::<QMapPair_QString_QVariant>::default();
+    let mut insert = |key: &str, value: QVariant| state.insert(QString::from(key), value);
+    insert(
+        "projectId",
+        QVariant::from(&QString::from(row.project_id.as_str())),
+    );
+    insert(
+        "remote",
+        QVariant::from(&QString::from(row.remote.as_str())),
+    );
+    insert("loading", QVariant::from(&row.loading));
+    insert(
+        "viewer",
+        QVariant::from(&QString::from(row.viewer.as_str())),
+    );
+    insert("error", QVariant::from(&QString::from(row.error.as_str())));
+    insert(
+        "errorKind",
+        QVariant::from(&QString::from(row.error_kind.as_str())),
+    );
+    insert("hasMore", QVariant::from(&row.next_cursor.is_some()));
+    insert("limitReached", QVariant::from(&row.limit_reached));
+    insert(
+        "totalCount",
+        QVariant::from(&i32::try_from(row.total_count).unwrap_or(i32::MAX)),
+    );
+
+    let mut issues = QList::<QVariant>::default();
+    for row in &row.rows {
+        let mut issue = QMap::<QMapPair_QString_QVariant>::default();
+        let mut insert = |key: &str, value: QVariant| issue.insert(QString::from(key), value);
+        insert("id", QVariant::from(&QString::from(row.id.as_str())));
+        insert(
+            "number",
+            QVariant::from(&i32::try_from(row.number).unwrap_or(i32::MAX)),
+        );
+        insert("title", QVariant::from(&QString::from(row.title.as_str())));
+        insert("state", QVariant::from(&QString::from(row.state.as_str())));
+        insert("url", QVariant::from(&QString::from(row.url.as_str())));
+        insert(
+            "author",
+            QVariant::from(&QString::from(row.author.as_str())),
+        );
+        insert(
+            "updated",
+            QVariant::from(&QString::from(row.updated.as_str())),
+        );
+        insert(
+            "milestone",
+            QVariant::from(&QString::from(row.milestone.as_str())),
+        );
+        let mut assignees = QList::<QVariant>::default();
+        for assignee in &row.assignees {
+            assignees.append(QVariant::from(&QString::from(assignee.as_str())));
+        }
+        insert("assignees", QVariant::from(&assignees));
+        insert(
+            "commentCount",
+            QVariant::from(&i32::try_from(row.comment_count).unwrap_or(i32::MAX)),
+        );
+        insert("createdByMe", QVariant::from(&row.created_by_me));
+        insert("assignedToMe", QVariant::from(&row.assigned_to_me));
+
+        let mut labels = QList::<QVariant>::default();
+        for row in &row.labels {
+            let mut label = QMap::<QMapPair_QString_QVariant>::default();
+            label.insert(
+                QString::from("name"),
+                QVariant::from(&QString::from(row.name.as_str())),
+            );
+            label.insert(
+                QString::from("color"),
+                QVariant::from(&QString::from(row.color.as_str())),
+            );
+            labels.append(QVariant::from(&label));
+        }
+        insert("labels", QVariant::from(&labels));
+        issues.append(QVariant::from(&issue));
+    }
+    insert("rows", QVariant::from(&issues));
+    QVariant::from(&state)
+}
+
+fn set_issues_state(mut backend: Pin<&mut ffi::HarknessBackend>, row: IssuesStateRow) {
+    let issues = to_issues(&row);
+    backend.as_mut().rust_mut().get_mut().issues_state = Some(row);
+    backend.as_mut().set_issues(issues);
+}
+
+#[derive(Debug)]
+struct BoundedOutput {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+fn read_bounded(mut stream: impl Read, limit: usize, exceeded: Arc<AtomicBool>) -> BoundedOutput {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    while let Ok(read) = stream.read(&mut buffer) {
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(bytes.len());
+        bytes.extend_from_slice(&buffer[..read.min(remaining)]);
+        if read > remaining {
+            exceeded.store(true, Ordering::Release);
+        }
+    }
+    BoundedOutput {
+        bytes,
+        exceeded: exceeded.load(Ordering::Acquire),
+    }
+}
+
+fn terminate_github_process(child: &mut Child) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+const GITHUB_CLI_REMOVED_ENV: &[&str] = &[
+    "GH_HOST",
+    "GH_FORCE_TTY",
+    "GH_DEBUG",
+    "DEBUG",
+    "GH_PAGER",
+    "PAGER",
+    "CLICOLOR_FORCE",
+];
+
+fn github_cli_command(executable: &Path, arguments: &[String]) -> Command {
+    let mut command = Command::new(executable);
+    for name in GITHUB_CLI_REMOVED_ENV {
+        command.env_remove(name);
+    }
+    command
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
+        .env("NO_COLOR", "1")
+        .env("CLICOLOR", "0")
+        .args(arguments)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command
+}
+
+fn github_cli_output_with_executable(
+    executable: &Path,
+    arguments: &[String],
+    cancellation: &harkness_git::Cancellation,
+    deadline: Instant,
+) -> Result<Vec<u8>, GitFailure> {
+    if cancellation.is_cancelled() {
+        return Err(GitFailure {
+            kind: "cancelled".to_owned(),
+            message: "GitHub issue loading was cancelled".to_owned(),
+        });
+    }
+    let mut command = github_cli_command(executable, arguments);
+    let mut child = command.spawn().map_err(|error| GitFailure {
+        kind: "github_cli_missing".to_owned(),
+        message: format!("Could not start GitHub CLI: {error}. Install gh and sign in."),
+    })?;
+    let stdout = child.stdout.take().expect("piped GitHub stdout");
+    let stderr = child.stderr.take().expect("piped GitHub stderr");
+    let stdout_exceeded = Arc::new(AtomicBool::new(false));
+    let stderr_exceeded = Arc::new(AtomicBool::new(false));
+    let stdout_flag = stdout_exceeded.clone();
+    let stderr_flag = stderr_exceeded.clone();
+    let stdout_reader =
+        thread::spawn(move || read_bounded(stdout, GITHUB_OUTPUT_LIMIT, stdout_flag));
+    let stderr_reader =
+        thread::spawn(move || read_bounded(stderr, GITHUB_ERROR_LIMIT, stderr_flag));
+
+    let status = loop {
+        if cancellation.is_cancelled() {
+            terminate_github_process(&mut child);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(GitFailure {
+                kind: "cancelled".to_owned(),
+                message: "GitHub issue loading was cancelled".to_owned(),
+            });
+        }
+        if Instant::now() >= deadline {
+            terminate_github_process(&mut child);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(GitFailure {
+                kind: "github_timeout".to_owned(),
+                message: format!(
+                    "GitHub did not answer within {} seconds",
+                    GITHUB_REQUEST_TIMEOUT.as_secs()
+                ),
+            });
+        }
+        if stdout_exceeded.load(Ordering::Acquire) || stderr_exceeded.load(Ordering::Acquire) {
+            terminate_github_process(&mut child);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(GitFailure {
+                kind: "github_output_too_large".to_owned(),
+                message: "GitHub returned more data than the issue loader accepts".to_owned(),
+            });
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                terminate_github_process(&mut child);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(GitFailure {
+                    kind: "github_api".to_owned(),
+                    message: format!("Could not wait for GitHub CLI: {error}"),
+                });
+            }
+        }
+        thread::sleep(GITHUB_POLL_INTERVAL);
+    };
+    // A descendant can outlive the direct child while retaining either pipe.
+    // End the whole group before joining readers so output collection cannot
+    // escape the cancellation and deadline loop above.
+    terminate_github_process(&mut child);
+    let stdout = stdout_reader.join().unwrap_or(BoundedOutput {
+        bytes: Vec::new(),
+        exceeded: true,
+    });
+    let stderr = stderr_reader.join().unwrap_or(BoundedOutput {
+        bytes: Vec::new(),
+        exceeded: true,
+    });
+    if stdout.exceeded || stderr.exceeded {
+        return Err(GitFailure {
+            kind: "github_output_too_large".to_owned(),
+            message: "GitHub returned more data than the issue loader accepts".to_owned(),
+        });
+    }
+    if status.success() {
+        return Ok(stdout.bytes);
+    }
+    let detail = String::from_utf8_lossy(&stderr.bytes).trim().to_owned();
+    let detail = if detail.is_empty() {
+        format!("GitHub CLI exited with {status}")
+    } else {
+        detail
+    };
+    Err(GitFailure {
+        kind: "github_api".to_owned(),
+        message: format!("Could not load GitHub issues: {detail}"),
+    })
+}
+
+fn github_graphql_arguments(owner: &str, name: &str, cursor: Option<&str>) -> Vec<String> {
+    let mut arguments = vec![
+        "api".to_owned(),
+        "graphql".to_owned(),
+        "--hostname".to_owned(),
+        GITHUB_HOST.to_owned(),
+        "-f".to_owned(),
+        format!("query={GITHUB_ISSUES_QUERY}"),
+        "-f".to_owned(),
+        format!("owner={owner}"),
+        "-f".to_owned(),
+        format!("name={name}"),
+    ];
+    if let Some(cursor) = cursor {
+        arguments.extend(["-f".to_owned(), format!("endCursor={cursor}")]);
+    }
+    arguments
+}
+
+fn load_github_issue_page(
+    remote: &str,
+    cursor: Option<&str>,
+    loaded_count: usize,
+    cancellation: &harkness_git::Cancellation,
+) -> Result<GithubIssuePage, GitFailure> {
+    let Some(slug) = remote.strip_prefix("github.com/") else {
+        return Err(GitFailure {
+            kind: "unsupported_remote".to_owned(),
+            message: "Issues require a GitHub repository remote".to_owned(),
+        });
+    };
+    let mut parts = slug.split('/');
+    let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(GitFailure {
+            kind: "unsupported_remote".to_owned(),
+            message: "The GitHub repository identity is invalid".to_owned(),
+        });
+    };
+    if owner.is_empty() || name.is_empty() {
+        return Err(GitFailure {
+            kind: "unsupported_remote".to_owned(),
+            message: "The GitHub repository identity is invalid".to_owned(),
+        });
+    }
+    let arguments = github_graphql_arguments(owner, name, cursor);
+    let bytes = github_cli_output_with_executable(
+        Path::new("gh"),
+        &arguments,
+        cancellation,
+        Instant::now() + GITHUB_REQUEST_TIMEOUT,
+    )?;
+    parse_github_issues(&bytes, loaded_count)
+}
+
+fn parse_github_issues(bytes: &[u8], loaded_count: usize) -> Result<GithubIssuePage, GitFailure> {
+    let response =
+        serde_json::from_slice::<GithubGraphqlResponse>(bytes).map_err(|error| GitFailure {
+            kind: "github_api".to_owned(),
+            message: format!("GitHub returned invalid issue data: {error}"),
+        })?;
+    if !response.errors.is_empty() {
+        return Err(GitFailure {
+            kind: "github_api".to_owned(),
+            message: format!(
+                "Could not load GitHub issues: {}",
+                response
+                    .errors
+                    .into_iter()
+                    .map(|error| error.message)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        });
+    }
+    let data = response.data.ok_or_else(|| GitFailure {
+        kind: "github_api".to_owned(),
+        message: "GitHub returned no issue data".to_owned(),
+    })?;
+    let repository = data.repository.ok_or_else(|| GitFailure {
+        kind: "github_api".to_owned(),
+        message: "GitHub could not find this repository".to_owned(),
+    })?;
+    let viewer = data.viewer.login;
+    let connection = repository.issues;
+    let remaining = GITHUB_MAX_ISSUES.saturating_sub(loaded_count);
+    let mut rows = connection
+        .nodes
+        .into_iter()
+        .map(|issue| {
+            let author = issue.author.map(|author| author.login).unwrap_or_default();
+            let created_by_me = author.eq_ignore_ascii_case(&viewer);
+            let assigned_to_me = issue
+                .assignees
+                .nodes
+                .iter()
+                .any(|user| user.login.eq_ignore_ascii_case(&viewer));
+            IssueRow {
+                id: issue.id,
+                number: issue.number,
+                title: issue.title,
+                state: issue.state.to_ascii_lowercase(),
+                url: issue.url,
+                author,
+                updated: issue.updated_at,
+                labels: issue
+                    .labels
+                    .nodes
+                    .into_iter()
+                    .map(|label| IssueLabelRow {
+                        name: label.name,
+                        color: format!("#{}", label.color),
+                    })
+                    .collect(),
+                milestone: issue
+                    .milestone
+                    .map(|milestone| milestone.title)
+                    .unwrap_or_default(),
+                assignees: issue
+                    .assignees
+                    .nodes
+                    .into_iter()
+                    .map(|user| format!("@{}", user.login))
+                    .collect(),
+                comment_count: issue.comments.total_count,
+                created_by_me,
+                assigned_to_me,
+            }
+        })
+        .take(remaining)
+        .collect::<Vec<_>>();
+    let loaded_after_page = loaded_count.saturating_add(rows.len());
+    let limit_reached =
+        connection.page_info.has_next_page && loaded_after_page >= GITHUB_MAX_ISSUES;
+    let next_cursor = (connection.page_info.has_next_page && !limit_reached)
+        .then_some(connection.page_info.end_cursor)
+        .flatten();
+    rows.shrink_to_fit();
+    Ok(GithubIssuePage {
+        viewer,
+        rows,
+        next_cursor,
+        total_count: connection.total_count,
+        limit_reached,
+    })
+}
+
+fn clear_issues_state(mut backend: Pin<&mut ffi::HarknessBackend>) {
+    let jobs_changed = {
+        let rust = backend.as_mut().rust_mut().get_mut();
+        rust.next_issues_request += 1;
+        rust.issues_state = None;
+        cancel_issue_jobs(&mut rust.job_records, &mut rust.cancellations)
+    };
+    if jobs_changed {
+        sync_jobs(backend.as_mut());
+    }
+    backend.as_mut().set_issues(empty_issues());
+}
+
+fn cancel_issue_jobs(
+    jobs: &mut Vec<JobRecord>,
+    cancellations: &mut HashMap<String, harkness_git::Cancellation>,
+) -> bool {
+    let issue_jobs = jobs
+        .iter()
+        .filter(|job| job.kind == "issues")
+        .map(|job| job.id.clone())
+        .collect::<Vec<_>>();
+    for job_id in &issue_jobs {
+        if let Some(cancellation) = cancellations.remove(job_id) {
+            cancellation.cancel();
+        }
+        end_job(jobs, job_id);
+    }
+    !issue_jobs.is_empty()
 }
 
 #[derive(Clone, Debug)]
@@ -3406,6 +4065,7 @@ struct ProjectRow {
     display_name: String,
     root: String,
     remote: String,
+    github_remote: String,
     branch: String,
     managed: bool,
     worktree: bool,
@@ -3437,6 +4097,17 @@ impl ProjectRow {
                 worktree_branch.clone().unwrap_or_default(),
             ),
         };
+        let github_remote = if remote.starts_with("github.com/") {
+            remote.clone()
+        } else if project.available && project.git.is_some() {
+            harkness_git::repository_remote_url(&project.root)
+                .ok()
+                .flatten()
+                .and_then(|url| harkness_core::normalize_remote(&url).ok())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         let id = project.id.to_string();
         let (lock_scope, lock_scope_resolved) = if project.available && project.git.is_some() {
             match harkness_git::repository_identity(&project.root) {
@@ -3456,6 +4127,7 @@ impl ProjectRow {
             display_name: project.display_name,
             root: project.root.display().to_string(),
             remote,
+            github_remote,
             // Left empty for a detached head, which `is_git` distinguishes
             // from a directory that is not a repository at all.
             branch: project
@@ -3574,6 +4246,10 @@ fn to_map(row: &ProjectRow) -> QVariant {
     insert(
         "remote",
         QVariant::from(&QString::from(row.remote.as_str())),
+    );
+    insert(
+        "githubRemote",
+        QVariant::from(&QString::from(row.github_remote.as_str())),
     );
     insert(
         "branch",
@@ -3918,6 +4594,15 @@ fn opened_project_id(opened: &QVariant) -> Option<String> {
         .filter(|id| !id.is_empty())
 }
 
+fn opened_github_remote(opened: &QVariant) -> Option<String> {
+    opened
+        .value::<QMap<QMapPair_QString_QVariant>>()?
+        .get(&QString::from("githubRemote"))?
+        .value::<QString>()
+        .map(|remote| remote.to_string())
+        .filter(|remote| !remote.is_empty())
+}
+
 fn opened_repository_lock_scope(opened: &QVariant) -> Option<String> {
     let opened = opened.value::<QMap<QMapPair_QString_QVariant>>()?;
     if let Some(scope) = opened
@@ -4001,8 +4686,14 @@ fn apply_result(
     backend.as_mut().set_status(outcome.status.into());
     match outcome.opened {
         OpenedUpdate::Keep => {}
-        OpenedUpdate::Open(row) => backend.as_mut().set_opened(to_map(&row)),
-        OpenedUpdate::Clear => backend.as_mut().set_opened(empty_opened()),
+        OpenedUpdate::Open(row) => {
+            clear_issues_state(backend.as_mut());
+            backend.as_mut().set_opened(to_map(&row));
+        }
+        OpenedUpdate::Clear => {
+            clear_issues_state(backend.as_mut());
+            backend.as_mut().set_opened(empty_opened());
+        }
     }
     backend.as_mut().refresh();
 }
@@ -4172,6 +4863,7 @@ impl ffi::HarknessBackend {
         self.as_mut().set_branches(QList::default());
         self.as_mut().set_worktrees(QList::default());
         clear_history_state(self.as_mut());
+        clear_issues_state(self.as_mut());
         clear_review_state(self.as_mut());
     }
 
@@ -4351,6 +5043,138 @@ impl ffi::HarknessBackend {
                     Err(failure) => {
                         backend.as_mut().set_status(failure.message.as_str().into());
                         set_history_state(backend.as_mut(), current.with_failure(&failure));
+                    }
+                }
+            });
+        });
+    }
+
+    fn refresh_issues(mut self: Pin<&mut Self>, project_id: &QString, github_remote: &QString) {
+        let project_id = project_id.to_string();
+        let github_remote = github_remote.to_string();
+        if opened_project_id(self.as_ref().opened()).as_deref() != Some(project_id.as_str())
+            || opened_github_remote(self.as_ref().opened()).as_deref()
+                != Some(github_remote.as_str())
+        {
+            self.as_mut()
+                .set_status("The requested issues do not belong to the open project".into());
+            return;
+        }
+        let Some((job_id, cancellation)) =
+            start_job(self.as_mut(), "issues", &project_id, "Refresh issues", true)
+        else {
+            return;
+        };
+        let request_id = {
+            let rust = self.as_mut().rust_mut().get_mut();
+            rust.next_issues_request += 1;
+            rust.next_issues_request
+        };
+        let loading = IssuesStateRow::loading(project_id.clone(), github_remote.clone());
+        set_issues_state(self.as_mut(), loading.clone());
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let result = load_github_issue_page(&github_remote, None, 0, &cancellation);
+            let _ = qt_thread.queue(move |mut backend| {
+                finish_job(backend.as_mut(), &job_id);
+                if backend.as_ref().rust().next_issues_request != request_id
+                    || opened_project_id(backend.as_ref().opened()).as_deref()
+                        != Some(project_id.as_str())
+                    || opened_github_remote(backend.as_ref().opened()).as_deref()
+                        != Some(github_remote.as_str())
+                {
+                    return;
+                }
+                match result {
+                    Ok(page) => set_issues_state(
+                        backend.as_mut(),
+                        IssuesStateRow {
+                            project_id,
+                            remote: github_remote,
+                            loading: false,
+                            viewer: page.viewer,
+                            rows: page.rows,
+                            next_cursor: page.next_cursor,
+                            total_count: page.total_count,
+                            limit_reached: page.limit_reached,
+                            error: String::new(),
+                            error_kind: String::new(),
+                        },
+                    ),
+                    Err(failure) => {
+                        backend.as_mut().set_status(failure.message.as_str().into());
+                        set_issues_state(backend.as_mut(), loading.with_failure(failure));
+                    }
+                }
+            });
+        });
+    }
+
+    fn load_more_issues(mut self: Pin<&mut Self>, project_id: &QString, github_remote: &QString) {
+        let project_id = project_id.to_string();
+        let github_remote = github_remote.to_string();
+        let Some(mut current) = self.as_ref().rust().issues_state.clone() else {
+            self.as_mut()
+                .set_status("Refresh issues before loading more".into());
+            return;
+        };
+        if current.project_id != project_id || current.remote != github_remote {
+            self.as_mut()
+                .set_status("The visible issues belong to a different project".into());
+            return;
+        }
+        let Some(cursor) = current.next_cursor.clone() else {
+            return;
+        };
+        let Some((job_id, cancellation)) = start_job(
+            self.as_mut(),
+            "issues",
+            &project_id,
+            "Load more issues",
+            true,
+        ) else {
+            return;
+        };
+        let request_id = {
+            let rust = self.as_mut().rust_mut().get_mut();
+            rust.next_issues_request += 1;
+            rust.next_issues_request
+        };
+        current.loading = true;
+        current.error.clear();
+        current.error_kind.clear();
+        set_issues_state(self.as_mut(), current.clone());
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let result = load_github_issue_page(
+                &github_remote,
+                Some(&cursor),
+                current.rows.len(),
+                &cancellation,
+            );
+            let _ = qt_thread.queue(move |mut backend| {
+                finish_job(backend.as_mut(), &job_id);
+                if backend.as_ref().rust().next_issues_request != request_id
+                    || opened_project_id(backend.as_ref().opened()).as_deref()
+                        != Some(project_id.as_str())
+                    || opened_github_remote(backend.as_ref().opened()).as_deref()
+                        != Some(github_remote.as_str())
+                {
+                    return;
+                }
+                match result {
+                    Ok(page) => {
+                        current.rows.extend(page.rows);
+                        current.viewer = page.viewer;
+                        current.next_cursor = page.next_cursor;
+                        current.total_count = page.total_count;
+                        current.limit_reached = page.limit_reached;
+                        current.loading = false;
+                        set_issues_state(backend.as_mut(), current);
+                    }
+                    Err(failure) => {
+                        backend.as_mut().set_status(failure.message.as_str().into());
+                        set_issues_state(backend.as_mut(), current.with_failure(failure));
                     }
                 }
             });
@@ -5564,16 +6388,18 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        BranchRow, GitFailure, GitStateRow, HarknessBackendRust, OpenedUpdate, ProjectRow,
-        REVIEW_FILE_PAGE_SIZE, REVIEW_ROW_PAGE_SIZE, ReviewContextDirection, ReviewContextOutcome,
-        ReviewSelection, WorktreeLockAction, accept_current_catalog_refresh,
-        advance_review_file_window, advance_review_row_window, attach_discard_snapshots_with,
-        begin_job, begin_job_in_scope, best_working_tree_line, change_worktree_lock_with_service,
-        conflicting_repository_job, display_diff_path, empty_opened, end_job,
-        expand_review_context_with_git, hidden_before, jobs_conflict, load_history_page_with_git,
-        load_review_file_with_git, load_review_with_git, load_review_with_initial_file_with_git,
-        move_worktree_with_service, operation_outcome, project_repository_lock_scopes,
-        project_rows, project_worktree_lifecycle_lock_scopes, register_path_selection,
+        BranchRow, GITHUB_CLI_REMOVED_ENV, GitFailure, GitStateRow, HarknessBackendRust,
+        OpenedUpdate, ProjectRow, REVIEW_FILE_PAGE_SIZE, REVIEW_ROW_PAGE_SIZE,
+        ReviewContextDirection, ReviewContextOutcome, ReviewSelection, WorktreeLockAction,
+        accept_current_catalog_refresh, advance_review_file_window, advance_review_row_window,
+        attach_discard_snapshots_with, begin_job, begin_job_in_scope, best_working_tree_line,
+        cancel_issue_jobs, change_worktree_lock_with_service, conflicting_repository_job,
+        display_diff_path, empty_opened, end_job, expand_review_context_with_git,
+        github_cli_command, github_cli_output_with_executable, github_graphql_arguments,
+        hidden_before, jobs_conflict, load_history_page_with_git, load_review_file_with_git,
+        load_review_with_git, load_review_with_initial_file_with_git, move_worktree_with_service,
+        operation_outcome, parse_github_issues, project_repository_lock_scopes, project_rows,
+        project_worktree_lifecycle_lock_scopes, register_path_selection,
         register_review_path_identity, remove_worktree_with_service,
         replace_status_path_selections, resolve_commit_scope, resolve_path_selection,
         retreat_review_file_window, retreat_review_row_window, review_content_summary,
@@ -5722,6 +6548,7 @@ mod tests {
 
         assert!(row.managed);
         assert_eq!(row.branch, "main");
+        assert_eq!(row.github_remote, "github.com/example/sample");
         assert!(row.is_git && row.dirty);
 
         let map = row_map(&row);
@@ -5731,6 +6558,7 @@ mod tests {
             "displayName",
             "root",
             "remote",
+            "githubRemote",
             "branch",
             "managed",
             "worktree",
@@ -5753,6 +6581,185 @@ mod tests {
             map.get(&QString::from("managed"))
                 .and_then(|value| value.value::<bool>()),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn github_issue_projection_uses_bounded_graphql_page_contract() {
+        let page = parse_github_issues(
+            br##"{
+                "data": {
+                    "viewer": {"login": "octocat"},
+                    "repository": {
+                        "issues": {
+                            "totalCount": 101,
+                            "pageInfo": {"hasNextPage": true, "endCursor": "cursor-1"},
+                            "nodes": [{
+                                "id": "I_101",
+                                "number": 7,
+                                "title": "Keep issue browsing live",
+                                "state": "OPEN",
+                                "url": "https://github.com/example/sample/issues/7",
+                                "author": {"login": "OctoCat"},
+                                "updatedAt": "2026-08-12T12:00:00Z",
+                                "labels": {"nodes": [{"name": "enhancement", "color": "3fb950"}]},
+                                "milestone": {"title": "v1"},
+                                "assignees": {"nodes": [{"login": "octocat"}, {"login": "alice"}]},
+                                "comments": {"totalCount": 3}
+                            }]
+                        }
+                    }
+                }
+            }"##,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(page.viewer, "octocat");
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].id, "I_101");
+        assert_eq!(
+            page.rows[0].url,
+            "https://github.com/example/sample/issues/7"
+        );
+        assert!(page.rows[0].created_by_me && page.rows[0].assigned_to_me);
+        assert_eq!(page.rows[0].labels[0].color, "#3fb950");
+        assert_eq!(page.rows[0].milestone, "v1");
+        assert_eq!(page.rows[0].assignees, ["@octocat", "@alice"]);
+        assert_eq!(page.next_cursor.as_deref(), Some("cursor-1"));
+        assert!(!page.limit_reached);
+    }
+
+    #[test]
+    fn github_graphql_calls_are_pinned_to_github_dot_com() {
+        let arguments = github_graphql_arguments("example", "sample", Some("cursor"));
+        let hostname = arguments
+            .windows(2)
+            .find(|pair| pair[0] == "--hostname")
+            .map(|pair| pair[1].as_str());
+        assert_eq!(hostname, Some("github.com"));
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument == "endCursor=cursor")
+        );
+    }
+
+    #[test]
+    fn github_transport_sanitizes_output_control_environment() {
+        let command = github_cli_command(Path::new("gh"), &[]);
+        for name in GITHUB_CLI_REMOVED_ENV {
+            assert!(command.get_envs().any(|(configured, value)| {
+                configured == std::ffi::OsStr::new(name) && value.is_none()
+            }));
+        }
+        for (name, expected) in [
+            ("GH_PROMPT_DISABLED", "1"),
+            ("GH_NO_UPDATE_NOTIFIER", "1"),
+            ("NO_COLOR", "1"),
+            ("CLICOLOR", "0"),
+        ] {
+            assert!(command.get_envs().any(|(configured, value)| {
+                configured == std::ffi::OsStr::new(name)
+                    && value == Some(std::ffi::OsStr::new(expected))
+            }));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_transport_refuses_oversized_stdout() {
+        let result = github_cli_output_with_executable(
+            Path::new("/bin/sh"),
+            &["-c".to_owned(), "head -c 2097153 /dev/zero".to_owned()],
+            &harkness_git::Cancellation::default(),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        );
+        assert_eq!(result.unwrap_err().kind, "github_output_too_large");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_transport_cancels_a_running_process_group() {
+        let cancellation = harkness_git::Cancellation::default();
+        let trigger = cancellation.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            trigger.cancel();
+        });
+        let started = std::time::Instant::now();
+        let result = github_cli_output_with_executable(
+            Path::new("/bin/sh"),
+            &["-c".to_owned(), "sleep 10".to_owned()],
+            &cancellation,
+            started + std::time::Duration::from_secs(5),
+        );
+        canceller.join().unwrap();
+
+        assert_eq!(result.unwrap_err().kind, "cancelled");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_transport_times_out_a_running_process_group() {
+        let started = std::time::Instant::now();
+        let result = github_cli_output_with_executable(
+            Path::new("/bin/sh"),
+            &["-c".to_owned(), "sleep 10".to_owned()],
+            &harkness_git::Cancellation::default(),
+            started + std::time::Duration::from_millis(50),
+        );
+
+        assert_eq!(result.unwrap_err().kind, "github_timeout");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_transport_ends_descendants_before_joining_output_readers() {
+        let started = std::time::Instant::now();
+        let output = github_cli_output_with_executable(
+            Path::new("/bin/sh"),
+            &["-c".to_owned(), "sleep 10 & printf done".to_owned()],
+            &harkness_git::Cancellation::default(),
+            started + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert_eq!(output, b"done");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn clearing_issue_jobs_allows_an_immediate_reopen_refresh() {
+        let mut jobs = Vec::new();
+        let mut next_id = 0;
+        let old_job = begin_job(
+            &mut jobs,
+            &mut next_id,
+            "issues",
+            "project-1",
+            "Refresh issues",
+            true,
+        )
+        .unwrap();
+        let cancellation = harkness_git::Cancellation::default();
+        let mut cancellations = HashMap::from([(old_job.id, cancellation.clone())]);
+
+        assert!(cancel_issue_jobs(&mut jobs, &mut cancellations));
+        assert!(cancellation.is_cancelled());
+        assert!(cancellations.is_empty());
+        assert!(
+            begin_job(
+                &mut jobs,
+                &mut next_id,
+                "issues",
+                "project-1",
+                "Refresh issues",
+                true,
+            )
+            .is_some()
         );
     }
 
