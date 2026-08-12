@@ -26,12 +26,13 @@ Item {
         : []
     readonly property bool loading: issueStateReady && backendIssues.loading === true
     readonly property string loadError: issueStateReady ? String(backendIssues.error || "") : ""
+    readonly property bool hasMoreIssues: issueStateReady && backendIssues.hasMore === true
+    readonly property bool issueLimitReached: issueStateReady && backendIssues.limitReached === true
     property string selectedScope: "issues"
     property string stateFilter: "open"
     property string searchText: ""
     property string authorFilter: ""
     property string labelFilter: ""
-    property string projectFilter: ""
     property string milestoneFilter: ""
     property string assigneeFilter: ""
     property string sortOrder: "oldest"
@@ -41,7 +42,6 @@ Item {
     readonly property int visibleIssueCount: visibleIssues.length
     readonly property int openIssueCount: countByState("open")
     readonly property int closedIssueCount: countByState("closed")
-    readonly property bool projectFilterControlVisible: projectFilterButton.visible
     readonly property bool milestoneFilterControlVisible: milestoneFilterButton.visible
     readonly property bool assigneeFilterControlVisible: assigneeFilterButton.visible
 
@@ -73,6 +73,12 @@ Item {
         if (!viewAvailable || !backend || typeof backend.refreshIssues !== "function")
             return;
         backend.refreshIssues(project.id, githubRemote);
+    }
+
+    function loadMoreIssues() {
+        if (!hasMoreIssues || loading || !backend || typeof backend.loadMoreIssues !== "function")
+            return;
+        backend.loadMoreIssues(project.id, githubRemote);
     }
 
     onProjectChanged: refreshIssues()
@@ -345,16 +351,24 @@ Item {
         return rowLabels(row).some(label => labelName(label).toLowerCase() === lowered);
     }
 
+    function rowAssignees(row) {
+        const source = row && row.assignees;
+        if (source && source.length !== undefined && typeof source !== "string") {
+            const assignees = [];
+            for (let index = 0; index < source.length; ++index)
+                assignees.push(textValue(source[index]));
+            return assignees;
+        }
+        const legacy = textValue(source);
+        return legacy.length > 0 ? legacy.split(",").map(value => value.trim()) : [];
+    }
+
     function matchesNamedScope(row, scope) {
         switch (scope) {
         case "assigned":
             return row.assignedToMe === true;
         case "created":
             return row.createdByMe === true;
-        case "views":
-            return row.savedView === true;
-        case "projects":
-            return textValue(row.project).length > 0;
         case "milestones":
             return textValue(row.milestone).length > 0;
         case "labels":
@@ -376,8 +390,8 @@ Item {
             textValue(row.number),
             textValue(row.title),
             textValue(row.author),
-            textValue(row.project),
             textValue(row.milestone),
+            rowAssignees(row).join(" "),
             rowLabels(row).map(label => labelName(label)).join(" ")
         ].join(" ").toLowerCase();
         return haystack.indexOf(needle) !== -1;
@@ -397,11 +411,9 @@ Item {
                 return false;
             if (labelFilter.length > 0 && !rowHasLabel(row, labelFilter))
                 return false;
-            if (projectFilter.length > 0 && textValue(row.project) !== projectFilter)
-                return false;
             if (milestoneFilter.length > 0 && textValue(row.milestone) !== milestoneFilter)
                 return false;
-            if (assigneeFilter.length > 0 && textValue(row.assignees) !== assigneeFilter)
+            if (assigneeFilter.length > 0 && rowAssignees(row).indexOf(assigneeFilter) === -1)
                 return false;
             return true;
         });
@@ -466,12 +478,23 @@ Item {
         return values.sort();
     }
 
+    function uniqueAssignees() {
+        const seen = {};
+        const values = [];
+        const rows = filteredRowsForScope("issues");
+        rows.forEach(row => rowAssignees(row).forEach(value => {
+            if (value.length > 0 && seen[value] !== true) {
+                seen[value] = true;
+                values.push(value);
+            }
+        }));
+        return values.sort();
+    }
+
     function scopeTitle() {
         switch (selectedScope) {
         case "assigned": return qsTr("Assigned to me");
         case "created": return qsTr("Created by me");
-        case "views": return qsTr("Views");
-        case "projects": return qsTr("Projects");
         case "milestones": return qsTr("Milestones");
         case "labels": return qsTr("Labels");
         default: return qsTr("All issues");
@@ -593,22 +616,6 @@ Item {
                     Layout.leftMargin: Kirigami.Units.smallSpacing
                     Layout.rightMargin: Kirigami.Units.smallSpacing
                     Layout.topMargin: Kirigami.Units.largeSpacing
-                }
-
-                NavigationRow {
-                    iconName: "view-list-tree"
-                    label: qsTr("Views")
-                    scope: "views"
-                    selected: panel.selectedScope === scope
-                    onScopeRequested: scope => panel.selectScope(scope)
-                }
-
-                NavigationRow {
-                    iconName: "project-open"
-                    label: qsTr("Projects")
-                    scope: "projects"
-                    selected: panel.selectedScope === scope
-                    onScopeRequested: scope => panel.selectScope(scope)
                 }
 
                 NavigationRow {
@@ -741,7 +748,7 @@ Item {
 
                     Layout.fillWidth: true
                     objectName: "issueSearch"
-                    placeholderText: qsTr("Search issues by title, number, author, label, project, or milestone")
+                    placeholderText: qsTr("Search issues by title, number, author, assignee, label, or milestone")
                     color: Kirigami.Theme.textColor
                     placeholderTextColor: Kirigami.Theme.disabledTextColor
                     text: panel.searchText
@@ -811,17 +818,6 @@ Item {
                                 }
 
                                 IssueFilterButton {
-                                    id: projectFilterButton
-
-                                    choices: panel.uniqueTextValues("project")
-                                    filterLabel: qsTr("Projects")
-                                    selectedValue: panel.projectFilter
-                                    visible: panel.responsiveFilterVisible(selectedValue,
-                                        Kirigami.Units.gridUnit * 55)
-                                    onValueRequested: value => panel.projectFilter = value
-                                }
-
-                                IssueFilterButton {
                                     id: milestoneFilterButton
 
                                     choices: panel.uniqueTextValues("milestone")
@@ -835,7 +831,7 @@ Item {
                                 IssueFilterButton {
                                     id: assigneeFilterButton
 
-                                    choices: panel.uniqueTextValues("assignees")
+                                    choices: panel.uniqueAssignees()
                                     filterLabel: qsTr("Assignees")
                                     selectedValue: panel.assigneeFilter
                                     visible: panel.responsiveFilterVisible(selectedValue,
@@ -984,7 +980,7 @@ Item {
 
                                                 Controls.Label {
                                                     color: Kirigami.Theme.disabledTextColor
-                                                    text: panel.textValue(issueDelegate.modelData.assignees)
+                                                    text: panel.rowAssignees(issueDelegate.modelData).join(", ")
                                                     textFormat: Text.PlainText
                                                     visible: text.length > 0
                                                 }
@@ -1022,6 +1018,29 @@ Item {
                                 }
 
                                 Controls.ScrollBar.vertical: Controls.ScrollBar {}
+
+                                footer: ColumnLayout {
+                                    width: issueList.width
+                                    spacing: Kirigami.Units.smallSpacing
+
+                                    Controls.Button {
+                                        Layout.alignment: Qt.AlignHCenter
+                                        Layout.margins: Kirigami.Units.largeSpacing
+                                        enabled: !panel.loading
+                                        text: qsTr("Load more issues")
+                                        visible: panel.hasMoreIssues
+                                        onClicked: panel.loadMoreIssues()
+                                    }
+
+                                    Controls.Label {
+                                        Layout.alignment: Qt.AlignHCenter
+                                        Layout.bottomMargin: Kirigami.Units.largeSpacing
+                                        color: Kirigami.Theme.disabledTextColor
+                                        text: qsTr("Showing the first 1,000 issues. Use GitHub to browse the remaining results.")
+                                        visible: panel.issueLimitReached
+                                        wrapMode: Text.Wrap
+                                    }
+                                }
                             }
 
                             Kirigami.PlaceholderMessage {

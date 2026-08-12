@@ -342,13 +342,11 @@ Kirigami.ApplicationWindow {
                     { "name": "enhancement", "color": "#56d4dd" },
                     { "name": "v0.5", "color": "#3fb950" }
                 ],
-                "project": "v0.5 release",
                 "milestone": "v0.5",
-                "assignees": "@octocat",
+                "assignees": ["@octocat", "@maintainer"],
                 "commentCount": 41,
                 "createdByMe": true,
-                "assignedToMe": false,
-                "savedView": true
+                "assignedToMe": false
             },
             {
                 "number": 185,
@@ -357,13 +355,11 @@ Kirigami.ApplicationWindow {
                 "author": "maintainer",
                 "updated": "updated 3d ago",
                 "labels": [{ "name": "testing", "color": "#a5d6a7" }],
-                "project": "v0.5 release",
                 "milestone": "v0.5",
-                "assignees": "@me",
+                "assignees": ["@me"],
                 "commentCount": 3,
                 "createdByMe": false,
-                "assignedToMe": true,
-                "savedView": false
+                "assignedToMe": true
             },
             {
                 "number": 120,
@@ -372,13 +368,11 @@ Kirigami.ApplicationWindow {
                 "author": "octocat",
                 "updated": "closed last week",
                 "labels": [{ "name": "architecture", "color": "#a371f7" }],
-                "project": "",
                 "milestone": "",
-                "assignees": "",
+                "assignees": [],
                 "commentCount": 8,
                 "createdByMe": true,
-                "assignedToMe": false,
-                "savedView": false
+                "assignedToMe": false
             }
     ]
 
@@ -391,10 +385,13 @@ Kirigami.ApplicationWindow {
             "loading": false,
             "viewer": "octocat",
             "rows": window.issueFixtureRows,
+            "hasMore": false,
+            "limitReached": false,
             "error": ""
         })
 
         function refreshIssues(projectId, githubRemote) {}
+        function loadMoreIssues(projectId, githubRemote) {}
     }
 
     IssuesPanel {
@@ -438,12 +435,9 @@ Kirigami.ApplicationWindow {
         check("filtersLabels", issues.filteredIssues().length === 1);
         issues.labelFilter = "";
 
-        issues.projectFilter = "v0.5 release";
-        check("keepsActiveResponsiveFilterVisible",
-            issues.responsiveFilterVisible(issues.projectFilter, issues.width + 1));
-        issues.projectFilter = "";
-        check("hidesInactiveResponsiveFilter",
-            !issues.responsiveFilterVisible(issues.projectFilter, issues.width + 1));
+        issues.assigneeFilter = "@octocat";
+        check("filtersOneMemberOfAssignmentSet", issues.filteredIssues().length === 1);
+        issues.assigneeFilter = "";
 
         issues.stateFilter = "closed";
         check("switchesState", issues.filteredIssues().length === 1);
