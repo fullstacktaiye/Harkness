@@ -34,7 +34,7 @@ Item {
     property string projectFilter: ""
     property string milestoneFilter: ""
     property string assigneeFilter: ""
-    property string sortOrder: "newest"
+    property string sortOrder: "oldest"
     property var selectedIssueIds: []
 
     readonly property var visibleIssues: filteredIssues()

@@ -416,6 +416,8 @@ Kirigami.ApplicationWindow {
         check("countsOpenRows", issues.openIssueCount === 2);
         check("countsClosedRows", issues.closedIssueCount === 1);
         check("defaultsToOpen", issues.visibleIssueCount === 2);
+        check("defaultsToOldest", issues.sortOrder === "oldest"
+            && Number(issues.filteredIssues()[0].number) === 185);
 
         issues.searchText = "performance";
         check("searchesIssueText", issues.filteredIssues().length === 1);
@@ -427,10 +429,10 @@ Kirigami.ApplicationWindow {
         issues.selectScope("issues");
 
         issues.setIssueSelected(issues.issueRows[0], true);
-        issues.sortOrder = "oldest";
+        issues.sortOrder = "newest";
         check("selectionUsesIdentity", issues.issueSelected(issues.issueRows[0]));
         check("selectionDoesNotMigrate", !issues.issueSelected(issues.issueRows[1]));
-        issues.sortOrder = "newest";
+        issues.sortOrder = "oldest";
 
         issues.labelFilter = "v0.5";
         check("filtersLabels", issues.filteredIssues().length === 1);
@@ -446,7 +448,6 @@ Kirigami.ApplicationWindow {
         issues.stateFilter = "closed";
         check("switchesState", issues.filteredIssues().length === 1);
         issues.stateFilter = "open";
-        issues.sortOrder = "oldest";
         check("sortsOldest", Number(issues.filteredIssues()[0].number) === 185);
 
         window.objectName = failures.length === 0
