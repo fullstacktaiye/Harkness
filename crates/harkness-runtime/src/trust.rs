@@ -633,6 +633,42 @@ impl<'a> RequestPath<'a> {
     }
 }
 
+/// Force variant a validated remote-write request selects.
+///
+/// Both variants overwrite history someone else may already have fetched;
+/// `--force-with-lease` only narrows the window in which that happens. Policy
+/// therefore treats them alike, and this enum exists so the audit trail can
+/// still name which one was requested.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ForcePush {
+    /// The request performs no force update.
+    #[default]
+    None,
+    /// `--force-with-lease`: the remote is overwritten only if it still matches
+    /// the ref the caller last observed.
+    WithLease,
+    /// Plain `--force`: the remote is overwritten unconditionally.
+    Force,
+}
+
+impl ForcePush {
+    /// Stable spelling used in reasons and persisted rows.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::WithLease => "force_with_lease",
+            Self::Force => "force",
+        }
+    }
+
+    /// Whether this request overwrites remote history at all.
+    #[must_use]
+    pub const fn is_forcing(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
 /// Non-filesystem effects discovered in one concrete invocation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RequestFlags {
@@ -640,6 +676,7 @@ pub struct RequestFlags {
     network: bool,
     remote_write: bool,
     destructive: bool,
+    force_push: ForcePush,
 }
 
 impl RequestFlags {
@@ -671,6 +708,25 @@ impl RequestFlags {
         self
     }
 
+    /// Marks the force variant a validated remote-write request selects.
+    ///
+    /// Forcing implies remote write, so a caller cannot describe a force push
+    /// as anything less consequential by omitting [`Self::writing_remote`].
+    #[must_use]
+    pub const fn force_pushing(mut self, variant: ForcePush) -> Self {
+        self.force_push = variant;
+        if variant.is_forcing() {
+            self.remote_write = true;
+        }
+        self
+    }
+
+    /// Force variant this request selects, if any.
+    #[must_use]
+    pub const fn force_push(self) -> ForcePush {
+        self.force_push
+    }
+
     const fn risk(self) -> RiskLevel {
         if self.destructive {
             RiskLevel::Destructive
@@ -686,6 +742,33 @@ impl RequestFlags {
     }
 }
 
+/// What one concrete invocation was classified as.
+///
+/// The fields are private and there is no public constructor, so this value can
+/// only come from [`classify_request`]. That is what stops a caller from
+/// declaring a request less consequential — or less forceful — than the tool
+/// descriptor and the validated input make it: policy consumes the
+/// classification, never separately supplied risk and force flags.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RequestClassification {
+    risk: RiskLevel,
+    force_push: ForcePush,
+}
+
+impl RequestClassification {
+    /// Effective risk, never below the descriptor's declared level.
+    #[must_use]
+    pub const fn risk(self) -> RiskLevel {
+        self.risk
+    }
+
+    /// Force variant the validated input selected.
+    #[must_use]
+    pub const fn force_push(self) -> ForcePush {
+        self.force_push
+    }
+}
+
 /// Classifies one validated invocation without making an allow/deny decision.
 ///
 /// The declared descriptor risk is a floor. Concrete path access and flags may
@@ -697,13 +780,17 @@ pub fn classify_request(
     descriptor: &ToolDescriptor,
     input_paths: &[RequestPath<'_>],
     flags: RequestFlags,
-) -> RiskLevel {
-    input_paths
+) -> RequestClassification {
+    let risk = input_paths
         .iter()
         .map(|path| path.access.risk())
         .chain([descriptor.risk(), flags.risk()])
         .max()
-        .unwrap_or(RiskLevel::Observe)
+        .unwrap_or(RiskLevel::Observe);
+    RequestClassification {
+        risk,
+        force_push: flags.force_push(),
+    }
 }
 
 #[cfg(test)]
@@ -1070,7 +1157,8 @@ mod tests {
                 observe.descriptor(),
                 &[RequestPath::new(&path, PathAccess::Read)],
                 RequestFlags::default(),
-            ),
+            )
+            .risk(),
             RiskLevel::Observe
         );
         assert_eq!(
@@ -1078,7 +1166,8 @@ mod tests {
                 observe.descriptor(),
                 &[RequestPath::new(&path, PathAccess::Write)],
                 RequestFlags::default(),
-            ),
+            )
+            .risk(),
             RiskLevel::WorkspaceWrite
         );
         assert_eq!(
@@ -1086,7 +1175,8 @@ mod tests {
                 observe.descriptor(),
                 &[],
                 RequestFlags::default().executing()
-            ),
+            )
+            .risk(),
             RiskLevel::Execute
         );
         assert_eq!(
@@ -1094,7 +1184,8 @@ mod tests {
                 observe.descriptor(),
                 &[],
                 RequestFlags::default().using_network()
-            ),
+            )
+            .risk(),
             RiskLevel::Network
         );
         assert_eq!(
@@ -1102,7 +1193,8 @@ mod tests {
                 observe.descriptor(),
                 &[],
                 RequestFlags::default().writing_remote()
-            ),
+            )
+            .risk(),
             RiskLevel::RemoteWrite
         );
         assert_eq!(
@@ -1110,7 +1202,8 @@ mod tests {
                 observe.descriptor(),
                 &[RequestPath::new(&path, PathAccess::Destructive)],
                 RequestFlags::default(),
-            ),
+            )
+            .risk(),
             RiskLevel::Destructive
         );
     }
@@ -1123,7 +1216,8 @@ mod tests {
                 declared.descriptor(),
                 &[],
                 RequestFlags::default().executing()
-            ),
+            )
+            .risk(),
             RiskLevel::Network
         );
         assert_eq!(
@@ -1131,8 +1225,45 @@ mod tests {
                 declared.descriptor(),
                 &[],
                 RequestFlags::default().destructive()
-            ),
+            )
+            .risk(),
             RiskLevel::Destructive
         );
+    }
+
+    #[test]
+    fn every_force_variant_is_carried_and_implies_remote_write() {
+        let observe = descriptor(RiskLevel::Observe);
+        for variant in [ForcePush::WithLease, ForcePush::Force] {
+            let classification = classify_request(
+                observe.descriptor(),
+                &[],
+                RequestFlags::default().force_pushing(variant),
+            );
+            assert_eq!(classification.force_push(), variant);
+            assert!(variant.is_forcing());
+            assert_eq!(
+                classification.risk(),
+                RiskLevel::RemoteWrite,
+                "{variant:?} must classify at least as a remote write"
+            );
+        }
+
+        let plain = classify_request(observe.descriptor(), &[], RequestFlags::default());
+        assert_eq!(plain.force_push(), ForcePush::None);
+        assert!(!ForcePush::None.is_forcing());
+        assert_eq!(plain.risk(), RiskLevel::Observe);
+    }
+
+    #[test]
+    fn a_destructive_force_push_keeps_the_higher_risk_and_the_variant() {
+        let declared = descriptor(RiskLevel::Destructive);
+        let classification = classify_request(
+            declared.descriptor(),
+            &[],
+            RequestFlags::default().force_pushing(ForcePush::Force),
+        );
+        assert_eq!(classification.risk(), RiskLevel::Destructive);
+        assert_eq!(classification.force_push(), ForcePush::Force);
     }
 }

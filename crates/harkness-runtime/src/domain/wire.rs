@@ -1079,6 +1079,15 @@ mod tests {
         .unwrap()
     }
 
+    fn deny_decision() -> PolicyDecision {
+        serde_json::from_value(json!({
+            "verdict": "deny",
+            "reason": "denied: workspace is untrusted",
+            "source": "built_in"
+        }))
+        .unwrap()
+    }
+
     fn task_wire() -> TaskWire {
         TaskWire {
             schema_version: RUNTIME_RECORD_SCHEMA_VERSION,
@@ -1153,7 +1162,7 @@ mod tests {
                 call.succeed(json!({"clean": true}), at(2)).unwrap();
             }
             ToolCallState::Failed => call.fail(failure(), at(1)).unwrap(),
-            ToolCallState::Denied => call.deny(failure(), at(1)).unwrap(),
+            ToolCallState::Denied => call.apply_policy_decision(deny_decision(), at(1)).unwrap(),
             ToolCallState::Cancelled | ToolCallState::Interrupted => {
                 call.transition(state, at(1)).unwrap();
             }
@@ -1435,9 +1444,11 @@ mod tests {
             (ToolCallState::AwaitingApproval, ToolCallState::Denied) => {
                 call.reject_approval("fixture-user", failure(), at).unwrap();
             }
+            (ToolCallState::Pending, ToolCallState::Denied) => {
+                call.apply_policy_decision(deny_decision(), at).unwrap();
+            }
             (_, ToolCallState::Succeeded) => call.succeed(json!({"ok": true}), at).unwrap(),
             (_, ToolCallState::Failed) => call.fail(failure(), at).unwrap(),
-            (_, ToolCallState::Denied) => call.deny(failure(), at).unwrap(),
             _ => call.transition(to, at).unwrap(),
         }
     }

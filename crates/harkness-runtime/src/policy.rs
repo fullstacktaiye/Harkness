@@ -3,17 +3,33 @@
 //! Policy files are read once at a run boundary. [`PolicyEngine::evaluate`]
 //! performs no I/O, reads no clock, and takes no lock: identical loaded policy
 //! and request values always produce the same decision.
+//!
+//! Three inputs to a decision are attacker-influenced, and each is narrowed to
+//! something that cannot be asserted:
+//!
+//! - **What the request is.** [`PolicyRequest`] carries a
+//!   [`RequestClassification`], not a risk level and a force-push flag, and
+//!   floors it at the descriptor's declared risk. Understating a request raises
+//!   no privilege.
+//! - **Whether an approval exists.** [`RunGrant`] has no public constructor;
+//!   only #92's matcher may decide a grant applies to a candidate.
+//! - **What the repository says.** `.harkness/policy.json` is repository
+//!   content, so it is resolved through the workspace boundary, refused if it
+//!   is not a regular file inside the workspace, and bounded in size before it
+//!   is read. Its rules can then only tighten a verdict, never weaken one.
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
 use crate::tool::{RiskLevel, ToolDescriptor, ToolId};
-use crate::trust::{ContainedPath, ExecutionMode, TrustState};
+use crate::trust::{
+    ContainedPath, ExecutionMode, ForcePush, PathBoundary, RequestClassification, TrustState,
+};
 
 /// Current version of `policy.json`.
 pub const POLICY_SCHEMA_VERSION: u32 = 1;
@@ -21,6 +37,11 @@ pub const POLICY_SCHEMA_VERSION: u32 = 1;
 pub const USER_POLICY_FILE: &str = "policy.json";
 /// Repository-relative policy path.
 pub const REPOSITORY_POLICY_FILE: &str = ".harkness/policy.json";
+/// Largest policy file this build will read into memory.
+///
+/// Rules are a handful of short keys; anything larger is a mistake or an
+/// attempt to make a load allocate without bound.
+pub const MAX_POLICY_FILE_BYTES: u64 = 64 * 1024;
 
 /// Policy severity, ordered so `max` is the safe way to combine layers.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -166,8 +187,24 @@ pub struct RunGrant {
 
 impl RunGrant {
     /// Projects one live, matching approval grant into policy evaluation.
+    ///
+    /// Deliberately crate-private: a grant is an authorization, and only the
+    /// approval module's matcher may decide that one applies to a candidate
+    /// request. If any caller could mint one, every `Ask` would be one line of
+    /// code away from `Allow`. #92 owns the only production constructor.
+    ///
+    /// Until #92 lands, nothing outside this module's tests builds one. The
+    /// lint expectation keeps that visible: when the matcher starts calling
+    /// this, the expectation goes unfulfilled and has to be removed.
     #[must_use]
-    pub const fn matching(scope: RunGrantScope) -> Self {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "#92's approval matcher is the only production constructor"
+        )
+    )]
+    pub(crate) const fn matching(scope: RunGrantScope) -> Self {
         Self { scope }
     }
 
@@ -179,21 +216,103 @@ impl RunGrant {
 }
 
 /// Concrete facts policy consumes after validation and boundary checking.
+///
+/// Every field is private, and the two a caller could use to understate a
+/// request — its risk and its force-push variant — are not fields at all. They
+/// are read from a [`RequestClassification`], which only
+/// [`classify_request`](crate::trust::classify_request) can produce, and
+/// [`Self::risk`] additionally floors the result at the descriptor's declared
+/// level so a classification built against a different tool cannot lower it.
+#[derive(Clone, Copy, Debug)]
 pub struct PolicyRequest<'a> {
+    descriptor: &'a ToolDescriptor,
+    classification: RequestClassification,
+    trust: TrustState,
+    mode: ExecutionMode,
+    paths: &'a [ContainedPath],
+    grants: &'a [RunGrant],
+}
+
+impl<'a> PolicyRequest<'a> {
+    /// Builds a request from a published descriptor and its classification.
+    ///
+    /// Paths and grants default to empty; add them with [`Self::with_paths`]
+    /// and [`Self::with_grants`].
+    #[must_use]
+    pub const fn new(
+        descriptor: &'a ToolDescriptor,
+        classification: RequestClassification,
+        trust: TrustState,
+        mode: ExecutionMode,
+    ) -> Self {
+        Self {
+            descriptor,
+            classification,
+            trust,
+            mode,
+            paths: &[],
+            grants: &[],
+        }
+    }
+
+    /// Attaches every filesystem input, already checked by the boundary.
+    #[must_use]
+    pub const fn with_paths(mut self, paths: &'a [ContainedPath]) -> Self {
+        self.paths = paths;
+        self
+    }
+
+    /// Attaches grants the approval module already matched to this candidate.
+    #[must_use]
+    pub const fn with_grants(mut self, grants: &'a [RunGrant]) -> Self {
+        self.grants = grants;
+        self
+    }
+
     /// Immutable published tool contract.
-    pub descriptor: &'a ToolDescriptor,
-    /// Risk after request-specific classification.
-    pub risk: RiskLevel,
+    #[must_use]
+    pub const fn descriptor(&self) -> &'a ToolDescriptor {
+        self.descriptor
+    }
+
+    /// Effective risk: the classification, floored at the declared risk.
+    ///
+    /// A tool may never be evaluated below the level its descriptor publishes,
+    /// so an understated classification raises no privilege.
+    #[must_use]
+    pub fn risk(&self) -> RiskLevel {
+        self.classification.risk().max(self.descriptor.risk())
+    }
+
+    /// Force variant the validated input selected, if any.
+    #[must_use]
+    pub const fn force_push(&self) -> ForcePush {
+        self.classification.force_push()
+    }
+
     /// Trust resolved for this project identity and canonical workspace root.
-    pub trust: TrustState,
+    #[must_use]
+    pub const fn trust(&self) -> TrustState {
+        self.trust
+    }
+
     /// Whether a human can answer a new prompt.
-    pub mode: ExecutionMode,
+    #[must_use]
+    pub const fn mode(&self) -> ExecutionMode {
+        self.mode
+    }
+
     /// Every filesystem input, already checked by the workspace boundary.
-    pub paths: &'a [ContainedPath],
+    #[must_use]
+    pub const fn paths(&self) -> &'a [ContainedPath] {
+        self.paths
+    }
+
     /// Live grants already matched to this candidate by the approval module.
-    pub grants: &'a [RunGrant],
-    /// Whether the validated request selects any force-push variant.
-    pub force_push: bool,
+    #[must_use]
+    pub const fn grants(&self) -> &'a [RunGrant] {
+        self.grants
+    }
 }
 
 /// Versioned policy rules shared by global and repository files.
@@ -216,22 +335,34 @@ impl PolicyFile {
         }
     }
 
+    /// The strictest rule in this file that matches the request.
+    ///
+    /// A tool rule and a risk rule can both match. They are combined with the
+    /// same `max` the layers use rather than letting the more specific one win:
+    /// a file that denies a risk level has denied it, and a permissive rule for
+    /// one tool inside the same file must not carve an exception out of it.
     fn selected(&self, request: &PolicyRequest<'_>) -> Option<(PolicyVerdict, String)> {
-        self.tools
-            .get(request.descriptor.id().as_str())
+        let risk = request.risk();
+        let tool = self
+            .tools
+            .get(request.descriptor().id().as_str())
             .copied()
             .map(|verdict| {
                 (
                     verdict,
-                    format!("tool {}", request.descriptor.id().as_str()),
+                    format!("tool {}", request.descriptor().id().as_str()),
                 )
-            })
-            .or_else(|| {
-                self.risks
-                    .get(&request.risk)
-                    .copied()
-                    .map(|verdict| (verdict, format!("risk {}", request.risk.as_str())))
-            })
+            });
+        let risk = self
+            .risks
+            .get(&risk)
+            .copied()
+            .map(|verdict| (verdict, format!("risk {}", risk.as_str())));
+        match (tool, risk) {
+            (Some(tool), Some(risk)) => Some(if tool.0 >= risk.0 { tool } else { risk }),
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (None, None) => None,
+        }
     }
 
     fn validate(&self, path: &Path) -> Result<(), PolicyLoadError> {
@@ -353,16 +484,17 @@ impl PolicyEngine {
     /// Loads `<data_dir>/policy.json` and `<workspace>/.harkness/policy.json`.
     ///
     /// Errors are retained rather than returned so evaluation fails closed with
-    /// a persisted, human-readable policy decision.
+    /// a persisted, human-readable policy decision. That includes a repository
+    /// policy that does not resolve to a regular file inside the workspace: a
+    /// symlink out of it is a refusal, not a file to read.
     #[must_use]
     pub fn load(data_dir: impl AsRef<Path>, workspace: impl AsRef<Path>) -> Self {
         let user_path = data_dir.as_ref().join(USER_POLICY_FILE);
-        let repository_path = workspace.as_ref().join(REPOSITORY_POLICY_FILE);
         let user = match UserPolicy::load(&user_path) {
             Ok(policy) => LoadedPolicy::Loaded(policy),
             Err(error) => LoadedPolicy::Failed(error),
         };
-        let repository = match load_optional_file(&repository_path) {
+        let repository = match load_repository_policy(workspace.as_ref()) {
             Ok(policy) => LoadedPolicy::Loaded(policy.map(RepositoryPolicy)),
             Err(error) => LoadedPolicy::Failed(error),
         };
@@ -372,16 +504,28 @@ impl PolicyEngine {
     /// Evaluates a fully classified request without I/O, clock reads, or locks.
     ///
     /// Built-in, user, and repository rules combine with `max` on
-    /// `Deny > Ask > Allow`. A repository can therefore tighten a decision and
-    /// cannot weaken it. A live matching grant answers only `Ask`; it can never
-    /// override `Deny`, and broad grants cannot answer remote-write or
-    /// destructive requests.
+    /// `Deny > Ask > Allow` — across layers *and* within one file, where a
+    /// tool rule and a risk rule can both match. A repository can therefore
+    /// tighten a decision and cannot weaken it. A live matching grant answers
+    /// only `Ask`; it can never override `Deny`, and broad grants cannot answer
+    /// remote-write or destructive requests.
+    ///
+    /// Every rule is selected against [`PolicyRequest::risk`], which is floored
+    /// at the descriptor's declared risk, so no classification reaches a weaker
+    /// rule than the tool's own contract allows. The force-push refusal is
+    /// checked first and reads the same classification, so it cannot be
+    /// sidestepped by any layer, any grant, or a descriptor that declares
+    /// something milder.
     #[must_use]
     pub fn evaluate(&self, request: &PolicyRequest<'_>) -> PolicyDecision {
-        if request.force_push {
+        let force_push = request.force_push();
+        if force_push.is_forcing() {
             return PolicyDecision::new(
                 PolicyVerdict::Deny,
-                "denied: force push is not permitted in v0.3",
+                format!(
+                    "denied: force push is not permitted in v0.3 ({})",
+                    force_push.as_str()
+                ),
                 PolicySource::BuiltIn,
                 false,
             );
@@ -417,11 +561,11 @@ impl PolicyEngine {
         }
 
         let exact_only = matches!(
-            request.risk,
+            request.risk(),
             RiskLevel::RemoteWrite | RiskLevel::Destructive
         );
         let matching_grant = request
-            .grants
+            .grants()
             .iter()
             .any(|grant| !exact_only || grant.scope == RunGrantScope::ExactCall);
         if verdict == PolicyVerdict::Ask && matching_grant {
@@ -432,7 +576,7 @@ impl PolicyEngine {
                 false,
             );
         }
-        if verdict == PolicyVerdict::Ask && request.mode == ExecutionMode::NonInteractive {
+        if verdict == PolicyVerdict::Ask && request.mode() == ExecutionMode::NonInteractive {
             return PolicyDecision::new(
                 PolicyVerdict::Deny,
                 format!("denied: noninteractive execution cannot answer approval; {reason}"),
@@ -451,27 +595,25 @@ impl PolicyEngine {
 }
 
 fn built_in(request: &PolicyRequest<'_>) -> (PolicyVerdict, PolicySource, String) {
-    let verdict = match (request.trust, request.risk) {
+    let trust = request.trust();
+    let risk = request.risk();
+    let verdict = match (trust, risk) {
         (TrustState::Trusted, RiskLevel::Observe) => PolicyVerdict::Allow,
         (TrustState::Trusted, _) => PolicyVerdict::Ask,
         (TrustState::Untrusted, RiskLevel::Observe) => PolicyVerdict::Ask,
         (TrustState::Untrusted, _) => PolicyVerdict::Deny,
     };
-    let reason = match (request.trust, verdict) {
+    let reason = match (trust, verdict) {
         (TrustState::Untrusted, PolicyVerdict::Deny) => "denied: workspace is untrusted".to_owned(),
         (TrustState::Untrusted, PolicyVerdict::Ask) => {
             "workspace observation requires approval because the workspace is untrusted".to_owned()
         }
         (_, PolicyVerdict::Allow) => {
-            format!(
-                "{} is allowed by the trusted-workspace default",
-                request.risk
-            )
+            format!("{risk} is allowed by the trusted-workspace default")
         }
         (_, PolicyVerdict::Ask) => format!(
-            "{} requires approval (built-in default for {})",
-            risk_label(request.risk),
-            request.risk
+            "{} requires approval (built-in default for {risk})",
+            risk_label(risk),
         ),
         (_, PolicyVerdict::Deny) => unreachable!(),
     };
@@ -528,18 +670,37 @@ fn load_file(path: &Path) -> Result<PolicyFile, PolicyLoadError> {
     Ok(load_optional_file(path)?.unwrap_or_else(PolicyFile::empty))
 }
 
-fn load_optional_file(path: &Path) -> Result<Option<PolicyFile>, PolicyLoadError> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(None);
+/// Reads `<workspace>/.harkness/policy.json` through the workspace boundary.
+///
+/// The file is repository content, so its *name* is attacker-controlled even
+/// when its bytes are reviewed: committing `.harkness/policy.json` as a symlink
+/// would otherwise make Harkness read — and apply — a file the workspace does
+/// not contain. Resolving through [`PathBoundary`] refuses that, and refuses it
+/// as a load failure, so evaluation fails closed instead of silently falling
+/// back to defaults.
+fn load_repository_policy(workspace: &Path) -> Result<Option<PolicyFile>, PolicyLoadError> {
+    let nominal = workspace.join(REPOSITORY_POLICY_FILE);
+    let boundary = PathBoundary::new(workspace, std::iter::empty::<&Path>()).map_err(|error| {
+        PolicyLoadError::Unreadable {
+            path: nominal.clone(),
+            reason: error.to_string(),
         }
-        Err(error) => {
-            return Err(PolicyLoadError::Unreadable {
-                path: path.to_path_buf(),
+    })?;
+    let contained =
+        boundary
+            .contain(REPOSITORY_POLICY_FILE)
+            .map_err(|error| PolicyLoadError::Unreadable {
+                path: nominal,
                 reason: error.to_string(),
-            });
-        }
+            })?;
+    load_optional_file(contained.as_path())
+}
+
+fn load_optional_file(path: &Path) -> Result<Option<PolicyFile>, PolicyLoadError> {
+    let bytes = match read_bounded(path) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Ok(None),
+        Err(error) => return Err(error),
     };
     let probe: VersionProbe =
         serde_json::from_slice(&bytes).map_err(|error| PolicyLoadError::Malformed {
@@ -560,6 +721,38 @@ fn load_optional_file(path: &Path) -> Result<Option<PolicyFile>, PolicyLoadError
         })?;
     policy.validate(path)?;
     Ok(Some(policy))
+}
+
+/// Reads a policy file without letting its size choose this process's memory.
+///
+/// A missing file is `Ok(None)`; anything that is not a regular file, and
+/// anything past [`MAX_POLICY_FILE_BYTES`], is refused. The cap is enforced on
+/// the read itself rather than on the metadata that preceded it, so a file that
+/// grows between the two checks is still bounded.
+fn read_bounded(path: &Path) -> Result<Option<Vec<u8>>, PolicyLoadError> {
+    let unreadable = |reason: String| PolicyLoadError::Unreadable {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(unreadable(error.to_string())),
+    };
+    if !metadata.is_file() {
+        return Err(unreadable("it is not a regular file".to_owned()));
+    }
+    let file = fs::File::open(path).map_err(|error| unreadable(error.to_string()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_POLICY_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| unreadable(error.to_string()))?;
+    if bytes.len() as u64 > MAX_POLICY_FILE_BYTES {
+        return Err(unreadable(format!(
+            "it exceeds the {MAX_POLICY_FILE_BYTES}-byte maximum policy size"
+        )));
+    }
+    Ok(Some(bytes))
 }
 
 fn persist_file(path: &Path, policy: &PolicyFile) -> Result<(), PolicyLoadError> {
@@ -669,7 +862,6 @@ impl PolicyLoadError {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::time::Instant;
 
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
@@ -677,6 +869,7 @@ mod tests {
 
     use super::*;
     use crate::tool::{ExecutionContext, Tool, ToolError, ToolIdentity, ToolMetadata, erase};
+    use crate::trust::{RequestFlags, classify_request};
 
     #[derive(Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
@@ -709,27 +902,47 @@ mod tests {
         }
     }
 
+    /// Enough of the repository policy path to identify it in a reason on any
+    /// platform, since canonical spellings differ between them.
+    const REPOSITORY_POLICY_FILE_NAME: &str = "policy.json";
+
     fn descriptor(risk: RiskLevel) -> ToolDescriptor {
         erase(FixtureTool(risk)).unwrap().descriptor().clone()
     }
 
+    /// The classification a request with no extra paths or flags produces.
+    fn declared(descriptor: &ToolDescriptor) -> RequestClassification {
+        classify_request(descriptor, &[], RequestFlags::default())
+    }
+
     fn request<'a>(
         descriptor: &'a ToolDescriptor,
-        risk: RiskLevel,
         trust: TrustState,
         mode: ExecutionMode,
         grants: &'a [RunGrant],
     ) -> PolicyRequest<'a> {
-        PolicyRequest {
-            descriptor,
-            risk,
-            trust,
-            mode,
-            paths: &[],
-            grants,
-            force_push: false,
-        }
+        PolicyRequest::new(descriptor, declared(descriptor), trust, mode).with_grants(grants)
     }
+
+    fn write_repository_policy(workspace: &Path, contents: &str) {
+        let path = workspace.join(REPOSITORY_POLICY_FILE);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+
+    fn repository_decision(workspace: &Path) -> PolicyDecision {
+        let data = TempDir::new().unwrap();
+        let engine = PolicyEngine::load(data.path(), workspace);
+        let descriptor = descriptor(RiskLevel::Observe);
+        engine.evaluate(&request(
+            &descriptor,
+            TrustState::Trusted,
+            ExecutionMode::Interactive,
+            &[],
+        ))
+    }
+
+    // -- built-in defaults and the severity lattice --------------------------
 
     #[test]
     fn built_in_table_covers_every_risk_and_trust_branch() {
@@ -739,7 +952,6 @@ mod tests {
                 let descriptor = descriptor(risk);
                 let decision = engine.evaluate(&request(
                     &descriptor,
-                    risk,
                     trust,
                     ExecutionMode::Interactive,
                     &[],
@@ -765,7 +977,6 @@ mod tests {
         );
         let raised = engine.evaluate(&request(
             &observe,
-            RiskLevel::Observe,
             TrustState::Trusted,
             ExecutionMode::Interactive,
             &[],
@@ -783,7 +994,6 @@ mod tests {
         );
         let unchanged = engine.evaluate(&request(
             &write,
-            RiskLevel::WorkspaceWrite,
             TrustState::Trusted,
             ExecutionMode::Interactive,
             &[],
@@ -801,7 +1011,6 @@ mod tests {
         );
         let decision = engine.evaluate(&request(
             &descriptor,
-            RiskLevel::Observe,
             TrustState::Trusted,
             ExecutionMode::Interactive,
             &[],
@@ -812,62 +1021,263 @@ mod tests {
     }
 
     #[test]
-    fn every_repository_rule_preserves_or_raises_severity() {
+    fn a_tool_rule_never_weakens_a_risk_rule_in_the_same_file() {
+        let descriptor = descriptor(RiskLevel::Observe);
+        // The permissive tool rule is the more specific of the two, and is
+        // still folded with `max` rather than shadowing the risk rule.
+        let engine = PolicyEngine::new(
+            UserPolicy::default()
+                .with_risk(RiskLevel::Observe, PolicyVerdict::Deny)
+                .with_tool(descriptor.id(), PolicyVerdict::Allow),
+            None,
+        );
+        let decision = engine.evaluate(&request(
+            &descriptor,
+            TrustState::Trusted,
+            ExecutionMode::Interactive,
+            &[],
+        ));
+        assert_eq!(decision.verdict(), PolicyVerdict::Deny);
+        assert!(decision.reason().contains("risk observe"));
+
+        // The reverse pairing is what makes the rule a `max` and not a
+        // "risk rule always wins": a stricter tool rule still binds.
+        let engine = PolicyEngine::new(
+            UserPolicy::default()
+                .with_risk(RiskLevel::Observe, PolicyVerdict::Ask)
+                .with_tool(descriptor.id(), PolicyVerdict::Deny),
+            None,
+        );
+        let decision = engine.evaluate(&request(
+            &descriptor,
+            TrustState::Trusted,
+            ExecutionMode::Interactive,
+            &[],
+        ));
+        assert_eq!(decision.verdict(), PolicyVerdict::Deny);
+        assert!(decision.reason().contains("tool fixture.policy"));
+    }
+
+    #[test]
+    fn no_repository_policy_input_can_lower_any_verdict() {
+        let verdicts = [
+            None,
+            Some(PolicyVerdict::Allow),
+            Some(PolicyVerdict::Ask),
+            Some(PolicyVerdict::Deny),
+        ];
+        let other_tool = "other.tool".parse::<ToolId>().unwrap();
+
         for risk in RiskLevel::ALL.iter().copied() {
             let descriptor = descriptor(risk);
-            for trust in [TrustState::Trusted, TrustState::Untrusted] {
-                let baseline = PolicyEngine::new(UserPolicy::default(), None).evaluate(&request(
-                    &descriptor,
-                    risk,
-                    trust,
-                    ExecutionMode::Interactive,
-                    &[],
-                ));
-                for candidate in [
-                    PolicyVerdict::Allow,
-                    PolicyVerdict::Ask,
-                    PolicyVerdict::Deny,
-                ] {
-                    let with_repository = PolicyEngine::new(
-                        UserPolicy::default(),
-                        Some(RepositoryPolicy::default().with_risk(risk, candidate)),
-                    )
-                    .evaluate(&request(
-                        &descriptor,
-                        risk,
-                        trust,
-                        ExecutionMode::Interactive,
-                        &[],
-                    ));
-                    assert!(with_repository.verdict() >= baseline.verdict());
+            // A different risk level, so a rule that does not match this
+            // request is exercised alongside the ones that do.
+            let unrelated_risk = if risk == RiskLevel::Observe {
+                RiskLevel::Destructive
+            } else {
+                RiskLevel::Observe
+            };
+            for user in [
+                UserPolicy::default(),
+                UserPolicy::default().with_risk(risk, PolicyVerdict::Allow),
+                UserPolicy::default().with_tool(descriptor.id(), PolicyVerdict::Ask),
+            ] {
+                for trust in [TrustState::Trusted, TrustState::Untrusted] {
+                    for mode in [ExecutionMode::Interactive, ExecutionMode::NonInteractive] {
+                        let baseline = PolicyEngine::new(user.clone(), None).evaluate(&request(
+                            &descriptor,
+                            trust,
+                            mode,
+                            &[],
+                        ));
+                        for matching_risk in verdicts {
+                            for unrelated in verdicts {
+                                for matching_tool in verdicts {
+                                    for unrelated_tool in verdicts {
+                                        let mut repository = RepositoryPolicy::default();
+                                        if let Some(verdict) = matching_risk {
+                                            repository = repository.with_risk(risk, verdict);
+                                        }
+                                        if let Some(verdict) = unrelated {
+                                            repository =
+                                                repository.with_risk(unrelated_risk, verdict);
+                                        }
+                                        if let Some(verdict) = matching_tool {
+                                            repository =
+                                                repository.with_tool(descriptor.id(), verdict);
+                                        }
+                                        if let Some(verdict) = unrelated_tool {
+                                            repository = repository.with_tool(&other_tool, verdict);
+                                        }
+                                        let decision =
+                                            PolicyEngine::new(user.clone(), Some(repository))
+                                                .evaluate(&request(&descriptor, trust, mode, &[]));
+                                        assert!(
+                                            decision.verdict() >= baseline.verdict(),
+                                            "{risk:?}/{trust:?}/{mode:?} lowered \
+                                             {:?} to {:?}",
+                                            baseline.verdict(),
+                                            decision.verdict(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
+    // -- classification cannot understate a request --------------------------
+
     #[test]
-    fn force_push_is_a_non_overridable_built_in_denial() {
-        let descriptor = descriptor(RiskLevel::RemoteWrite);
-        let grant = [RunGrant::matching(RunGrantScope::ExactCall)];
-        let engine = PolicyEngine::new(
-            UserPolicy::default().with_risk(RiskLevel::RemoteWrite, PolicyVerdict::Allow),
-            Some(
-                RepositoryPolicy::default().with_risk(RiskLevel::RemoteWrite, PolicyVerdict::Allow),
-            ),
-        );
-        let mut request = request(
-            &descriptor,
-            RiskLevel::RemoteWrite,
+    fn an_understated_classification_cannot_lower_the_declared_risk() {
+        for declared_risk in RiskLevel::ALL.iter().copied() {
+            let declared_descriptor = descriptor(declared_risk);
+            let baseline = PolicyEngine::new(UserPolicy::default(), None).evaluate(&request(
+                &declared_descriptor,
+                TrustState::Trusted,
+                ExecutionMode::Interactive,
+                &[],
+            ));
+            for lower in RiskLevel::ALL
+                .iter()
+                .copied()
+                .take_while(|risk| *risk < declared_risk)
+            {
+                let understated = declared(&descriptor(lower));
+                let request = PolicyRequest::new(
+                    &declared_descriptor,
+                    understated,
+                    TrustState::Trusted,
+                    ExecutionMode::Interactive,
+                );
+                assert_eq!(
+                    request.risk(),
+                    declared_risk,
+                    "{lower:?} must not lower {declared_risk:?}"
+                );
+
+                let decision = PolicyEngine::new(UserPolicy::default(), None).evaluate(&request);
+                assert_eq!(decision.verdict(), baseline.verdict());
+                assert_eq!(decision.one_call_only(), baseline.one_call_only());
+            }
+        }
+    }
+
+    #[test]
+    fn an_understated_classification_keeps_the_one_call_only_ceiling() {
+        // The specific downgrade that would otherwise buy both a weaker verdict
+        // and a run-wide grant: a destructive tool classified as observation.
+        let destructive = descriptor(RiskLevel::Destructive);
+        let engine = PolicyEngine::new(UserPolicy::default(), None);
+        let understated = PolicyRequest::new(
+            &destructive,
+            declared(&descriptor(RiskLevel::Observe)),
             TrustState::Trusted,
             ExecutionMode::Interactive,
-            &grant,
         );
-        request.force_push = true;
-        let decision = engine.evaluate(&request);
+        let decision = engine.evaluate(&understated);
+        assert_eq!(decision.verdict(), PolicyVerdict::Ask);
+        assert!(decision.one_call_only());
+
+        let broad = [RunGrant::matching(RunGrantScope::ToolForRun)];
+        let with_broad_grant = PolicyRequest::new(
+            &destructive,
+            declared(&descriptor(RiskLevel::Observe)),
+            TrustState::Trusted,
+            ExecutionMode::NonInteractive,
+        )
+        .with_grants(&broad);
+        assert_eq!(
+            engine.evaluate(&with_broad_grant).verdict(),
+            PolicyVerdict::Deny
+        );
+    }
+
+    #[test]
+    fn an_understated_classification_cannot_escape_a_user_risk_rule() {
+        let destructive = descriptor(RiskLevel::Destructive);
+        let engine = PolicyEngine::new(
+            UserPolicy::default().with_risk(RiskLevel::Destructive, PolicyVerdict::Deny),
+            None,
+        );
+        let decision = engine.evaluate(&PolicyRequest::new(
+            &destructive,
+            declared(&descriptor(RiskLevel::Observe)),
+            TrustState::Trusted,
+            ExecutionMode::Interactive,
+        ));
+        assert_eq!(decision.verdict(), PolicyVerdict::Deny);
+        assert_eq!(decision.source(), PolicySource::UserPolicy);
+    }
+
+    // -- force push ----------------------------------------------------------
+
+    #[test]
+    fn every_force_variant_is_a_non_overridable_built_in_denial() {
+        let descriptor = descriptor(RiskLevel::RemoteWrite);
+        let grants = [
+            RunGrant::matching(RunGrantScope::ExactCall),
+            RunGrant::matching(RunGrantScope::ToolForRun),
+            RunGrant::matching(RunGrantScope::CapabilityForRun),
+        ];
+        let engine = PolicyEngine::new(
+            UserPolicy::default()
+                .with_risk(RiskLevel::RemoteWrite, PolicyVerdict::Allow)
+                .with_tool(descriptor.id(), PolicyVerdict::Allow),
+            Some(
+                RepositoryPolicy::default()
+                    .with_risk(RiskLevel::RemoteWrite, PolicyVerdict::Allow)
+                    .with_tool(descriptor.id(), PolicyVerdict::Allow),
+            ),
+        );
+
+        for variant in [ForcePush::Force, ForcePush::WithLease] {
+            for mode in [ExecutionMode::Interactive, ExecutionMode::NonInteractive] {
+                let classification = classify_request(
+                    &descriptor,
+                    &[],
+                    RequestFlags::default().force_pushing(variant),
+                );
+                let decision = engine.evaluate(
+                    &PolicyRequest::new(&descriptor, classification, TrustState::Trusted, mode)
+                        .with_grants(&grants),
+                );
+                assert_eq!(decision.verdict(), PolicyVerdict::Deny, "{variant:?}");
+                assert_eq!(decision.source(), PolicySource::BuiltIn);
+                assert!(decision.reason().contains("force push"));
+                assert!(decision.reason().contains(variant.as_str()));
+            }
+        }
+    }
+
+    #[test]
+    fn a_force_push_is_denied_even_when_its_descriptor_looks_harmless() {
+        // The force variant travels with the classification, so a descriptor
+        // that declares mere observation cannot hide one.
+        let descriptor = descriptor(RiskLevel::Observe);
+        let classification = classify_request(
+            &descriptor,
+            &[],
+            RequestFlags::default().force_pushing(ForcePush::WithLease),
+        );
+        assert_eq!(classification.risk(), RiskLevel::RemoteWrite);
+
+        let decision =
+            PolicyEngine::new(UserPolicy::default(), None).evaluate(&PolicyRequest::new(
+                &descriptor,
+                classification,
+                TrustState::Trusted,
+                ExecutionMode::Interactive,
+            ));
         assert_eq!(decision.verdict(), PolicyVerdict::Deny);
         assert_eq!(decision.source(), PolicySource::BuiltIn);
         assert!(decision.reason().contains("force push"));
     }
+
+    // -- grants and noninteractive resolution --------------------------------
 
     #[test]
     fn noninteractive_ask_requires_a_live_matching_grant() {
@@ -875,7 +1285,6 @@ mod tests {
         let engine = PolicyEngine::new(UserPolicy::default(), None);
         let denied = engine.evaluate(&request(
             &descriptor,
-            RiskLevel::WorkspaceWrite,
             TrustState::Trusted,
             ExecutionMode::NonInteractive,
             &[],
@@ -886,7 +1295,6 @@ mod tests {
         let grants = [RunGrant::matching(RunGrantScope::ToolForRun)];
         let allowed = engine.evaluate(&request(
             &descriptor,
-            RiskLevel::WorkspaceWrite,
             TrustState::Trusted,
             ExecutionMode::NonInteractive,
             &grants,
@@ -896,13 +1304,35 @@ mod tests {
     }
 
     #[test]
+    fn no_grant_can_answer_a_denial() {
+        let descriptor = descriptor(RiskLevel::Observe);
+        let engine = PolicyEngine::new(
+            UserPolicy::default().with_risk(RiskLevel::Observe, PolicyVerdict::Deny),
+            None,
+        );
+        for scope in [
+            RunGrantScope::ExactCall,
+            RunGrantScope::ToolForRun,
+            RunGrantScope::CapabilityForRun,
+        ] {
+            let grants = [RunGrant::matching(scope)];
+            let decision = engine.evaluate(&request(
+                &descriptor,
+                TrustState::Trusted,
+                ExecutionMode::Interactive,
+                &grants,
+            ));
+            assert_eq!(decision.verdict(), PolicyVerdict::Deny, "{scope:?}");
+        }
+    }
+
+    #[test]
     fn remote_and_destructive_approvals_are_one_call_only() {
         let engine = PolicyEngine::new(UserPolicy::default(), None);
         for risk in [RiskLevel::RemoteWrite, RiskLevel::Destructive] {
             let descriptor = descriptor(risk);
             let decision = engine.evaluate(&request(
                 &descriptor,
-                risk,
                 TrustState::Trusted,
                 ExecutionMode::Interactive,
                 &[],
@@ -915,7 +1345,6 @@ mod tests {
                 engine
                     .evaluate(&request(
                         &descriptor,
-                        risk,
                         TrustState::Trusted,
                         ExecutionMode::NonInteractive,
                         &broad,
@@ -927,7 +1356,6 @@ mod tests {
             let exact = [RunGrant::matching(RunGrantScope::ExactCall)];
             let allowed = engine.evaluate(&request(
                 &descriptor,
-                risk,
                 TrustState::Trusted,
                 ExecutionMode::NonInteractive,
                 &exact,
@@ -936,6 +1364,8 @@ mod tests {
             assert_eq!(allowed.source(), PolicySource::RunGrant);
         }
     }
+
+    // -- versioned files -----------------------------------------------------
 
     #[test]
     fn strict_versioned_file_round_trips_and_is_frozen() {
@@ -983,7 +1413,6 @@ mod tests {
         let descriptor = descriptor(RiskLevel::Observe);
         let decision = engine.evaluate(&request(
             &descriptor,
-            RiskLevel::Observe,
             TrustState::Trusted,
             ExecutionMode::Interactive,
             &[],
@@ -1007,7 +1436,6 @@ mod tests {
             let descriptor = descriptor(RiskLevel::Observe);
             let decision = engine.evaluate(&request(
                 &descriptor,
-                RiskLevel::Observe,
                 TrustState::Trusted,
                 ExecutionMode::Interactive,
                 &[],
@@ -1016,6 +1444,134 @@ mod tests {
             assert_eq!(decision.source(), source);
             assert!(decision.reason().contains(policy_path.to_str().unwrap()));
         }
+    }
+
+    // -- repository policy is repository-controlled content ------------------
+
+    #[test]
+    fn a_repository_policy_that_cannot_be_read_denies_and_names_itself() {
+        for contents in ["{", r#"{"version":2}"#, r#"{"version":1,"surprise":true}"#] {
+            let workspace = TempDir::new().unwrap();
+            write_repository_policy(workspace.path(), contents);
+            let decision = repository_decision(workspace.path());
+            assert_eq!(decision.verdict(), PolicyVerdict::Deny, "{contents}");
+            assert_eq!(decision.source(), PolicySource::RepositoryPolicy);
+            assert!(decision.reason().contains(REPOSITORY_POLICY_FILE_NAME));
+        }
+    }
+
+    #[test]
+    fn a_repository_policy_that_is_not_a_regular_file_is_refused() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir_all(workspace.path().join(REPOSITORY_POLICY_FILE)).unwrap();
+        let decision = repository_decision(workspace.path());
+        assert_eq!(decision.verdict(), PolicyVerdict::Deny);
+        assert_eq!(decision.source(), PolicySource::RepositoryPolicy);
+        assert!(decision.reason().contains("not a regular file"));
+    }
+
+    #[test]
+    fn an_oversized_policy_file_is_refused_before_it_is_parsed() {
+        let workspace = TempDir::new().unwrap();
+        let oversized = usize::try_from(MAX_POLICY_FILE_BYTES).unwrap() + 1;
+        let mut contents = String::from(r#"{"version":1,"tools":{}}"#);
+        contents.push_str(&" ".repeat(oversized));
+        write_repository_policy(workspace.path(), &contents);
+
+        let decision = repository_decision(workspace.path());
+        assert_eq!(decision.verdict(), PolicyVerdict::Deny);
+        assert_eq!(decision.source(), PolicySource::RepositoryPolicy);
+        assert!(decision.reason().contains("maximum policy size"));
+    }
+
+    #[test]
+    fn a_policy_file_at_exactly_the_maximum_size_still_loads() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join(USER_POLICY_FILE);
+        let head = r#"{"version":1,"tools":{}}"#;
+        let padding = usize::try_from(MAX_POLICY_FILE_BYTES).unwrap() - head.len();
+        fs::write(&path, format!("{head}{}", " ".repeat(padding))).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            MAX_POLICY_FILE_BYTES,
+            "the fixture must sit exactly on the boundary"
+        );
+        assert_eq!(UserPolicy::load(&path).unwrap(), UserPolicy::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_repository_policy_symlinked_out_of_the_workspace_is_refused() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let planted = outside.path().join("hostile-policy.json");
+        fs::write(&planted, r#"{"version":1,"risks":{"destructive":"allow"}}"#).unwrap();
+
+        let path = workspace.path().join(REPOSITORY_POLICY_FILE);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&planted, &path).unwrap();
+
+        let decision = repository_decision(workspace.path());
+        assert_eq!(decision.verdict(), PolicyVerdict::Deny);
+        assert_eq!(decision.source(), PolicySource::RepositoryPolicy);
+        assert!(decision.reason().contains(REPOSITORY_POLICY_FILE_NAME));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_repository_policy_directory_symlinked_out_of_the_workspace_is_refused() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(
+            outside.path().join("policy.json"),
+            r#"{"version":1,"risks":{"destructive":"allow"}}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join(".harkness")).unwrap();
+
+        let decision = repository_decision(workspace.path());
+        assert_eq!(decision.verdict(), PolicyVerdict::Deny);
+        assert_eq!(decision.source(), PolicySource::RepositoryPolicy);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_repository_policy_symlinked_inside_the_workspace_still_loads() {
+        let workspace = TempDir::new().unwrap();
+        let inside = workspace.path().join("shared-policy.json");
+        fs::write(&inside, r#"{"version":1,"risks":{"observe":"ask"}}"#).unwrap();
+        let path = workspace.path().join(REPOSITORY_POLICY_FILE);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&inside, &path).unwrap();
+
+        let decision = repository_decision(workspace.path());
+        assert_eq!(decision.verdict(), PolicyVerdict::Ask);
+        assert_eq!(decision.source(), PolicySource::RepositoryPolicy);
+    }
+
+    #[test]
+    fn a_workspace_that_cannot_be_resolved_fails_closed() {
+        let data = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let missing = workspace.path().join("gone");
+        let engine = PolicyEngine::load(data.path(), &missing);
+        let descriptor = descriptor(RiskLevel::Observe);
+        let decision = engine.evaluate(&request(
+            &descriptor,
+            TrustState::Trusted,
+            ExecutionMode::Interactive,
+            &[],
+        ));
+        assert_eq!(decision.verdict(), PolicyVerdict::Deny);
+        assert_eq!(decision.source(), PolicySource::RepositoryPolicy);
+    }
+
+    #[test]
+    fn an_absent_repository_policy_leaves_the_defaults_in_place() {
+        let workspace = TempDir::new().unwrap();
+        let decision = repository_decision(workspace.path());
+        assert_eq!(decision.verdict(), PolicyVerdict::Allow);
+        assert_eq!(decision.source(), PolicySource::BuiltIn);
     }
 
     #[test]
@@ -1042,11 +1598,13 @@ mod tests {
         );
     }
 
+    // -- latency -------------------------------------------------------------
+
+    /// Latency targets are meaningful only in a release build, so debug and CI
+    /// runs skip them; run with `--release ... -- --ignored` to record numbers.
     #[test]
-    fn release_policy_evaluation_stays_below_five_milliseconds() {
-        if cfg!(debug_assertions) {
-            return;
-        }
+    #[ignore = "latency target; meaningful only in a release build"]
+    fn policy_evaluation_meets_the_latency_target() {
         let descriptor = descriptor(RiskLevel::WorkspaceWrite);
         let engine = PolicyEngine::new(
             UserPolicy::default().with_risk(RiskLevel::WorkspaceWrite, PolicyVerdict::Ask),
@@ -1057,13 +1615,12 @@ mod tests {
         );
         let request = request(
             &descriptor,
-            RiskLevel::WorkspaceWrite,
             TrustState::Trusted,
             ExecutionMode::Interactive,
             &[],
         );
         let iterations = 10_000u32;
-        let started = Instant::now();
+        let started = std::time::Instant::now();
         for _ in 0..iterations {
             std::hint::black_box(engine.evaluate(std::hint::black_box(&request)));
         }

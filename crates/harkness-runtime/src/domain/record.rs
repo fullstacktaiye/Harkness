@@ -837,6 +837,12 @@ impl ToolCall {
     /// The store persists this whole mutation in one transaction, so a call can
     /// never be observed in the governed state without the decision that put it
     /// there.
+    ///
+    /// This is the only edge from `pending` to `denied`. There is deliberately
+    /// no decision-free denial to reach for: a denied call that carried no
+    /// verdict, reason, or source would be exactly the audit gap this record
+    /// exists to close. A refusal after an approval prompt uses
+    /// [`Self::reject_approval`], which records who refused it.
     pub fn apply_policy_decision(
         &mut self,
         decision: PolicyDecision,
@@ -1000,25 +1006,6 @@ impl ToolCall {
         Ok(())
     }
 
-    /// Records a policy denial from `pending` with structured detail.
-    pub fn deny(&mut self, failure: Failure, at: OffsetDateTime) -> Result<(), RunDomainError> {
-        self.lifecycle.validate_edge(ToolCallState::Denied)?;
-        require_state(
-            "tool_call",
-            self.state() == ToolCallState::Pending,
-            "ToolCall::deny is reserved for policy decisions in pending",
-        )?;
-        require_state(
-            "tool_call",
-            self.policy_decision.is_none(),
-            "a governed tool call must use its recorded policy decision",
-        )?;
-        self.lifecycle
-            .transition("tool_call", ToolCallState::Denied, at)?;
-        self.failure = Some(failure);
-        Ok(())
-    }
-
     /// Records an approval and resumes from `awaiting_approval`.
     pub fn approve(
         &mut self,
@@ -1133,6 +1120,7 @@ mod tests {
         EXECUTION_TRANSITIONS, ExecutionState, InvalidTransition, RunDomainError, RunId, StepId,
         TOOL_CALL_TRANSITIONS, TaskId, ToolCallId, ToolCallState,
     };
+    use crate::policy::PolicyDecision;
 
     fn at(second: i64) -> OffsetDateTime {
         OffsetDateTime::UNIX_EPOCH + Duration::seconds(second)
@@ -1140,6 +1128,16 @@ mod tests {
 
     fn failure() -> Failure {
         Failure::new("fixture_failure", "fixture failed")
+    }
+
+    /// The only way a pending call reaches `denied` is a recorded denial.
+    fn denial() -> PolicyDecision {
+        serde_json::from_value(json!({
+            "verdict": "deny",
+            "reason": "denied: workspace is untrusted",
+            "source": "built_in"
+        }))
+        .unwrap()
     }
 
     fn task() -> Task {
@@ -1212,7 +1210,7 @@ mod tests {
                 call.succeed(json!({"ok": true}), at(2)).unwrap();
             }
             ToolCallState::Failed => call.fail(failure(), at(1)).unwrap(),
-            ToolCallState::Denied => call.deny(failure(), at(1)).unwrap(),
+            ToolCallState::Denied => call.apply_policy_decision(denial(), at(1)).unwrap(),
             ToolCallState::Cancelled | ToolCallState::Interrupted => {
                 call.transition(state, at(1)).unwrap();
             }
@@ -1251,9 +1249,11 @@ mod tests {
             (ToolCallState::AwaitingApproval, ToolCallState::Denied) => {
                 call.reject_approval("fixture-user", failure(), at(3))
             }
+            (ToolCallState::Pending, ToolCallState::Denied) => {
+                call.apply_policy_decision(denial(), at(3))
+            }
             (_, ToolCallState::Succeeded) => call.succeed(json!({"ok": true}), at(3)),
             (_, ToolCallState::Failed) => call.fail(failure(), at(3)),
-            (_, ToolCallState::Denied) => call.deny(failure(), at(3)),
             _ => call.transition(to, at(3)),
         }
     }

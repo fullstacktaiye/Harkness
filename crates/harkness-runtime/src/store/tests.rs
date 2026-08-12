@@ -1179,17 +1179,23 @@ fn a_denied_tool_call_records_the_policy_decision() {
     let step = stored_step(&fixture.store, &run);
     let call = stored_tool_call(&fixture.store, &step);
 
+    let decision = policy_decision(PolicyVerdict::Deny);
     let denied = fixture
         .store
-        .deny_tool_call(
-            call.id(),
-            Failure::new("policy", "fs.write is not permitted"),
-            at(10),
-        )
+        .apply_tool_call_policy_decision(call.id(), decision.clone(), at(10))
         .unwrap();
 
     assert_eq!(denied.state(), ToolCallState::Denied);
-    assert_eq!(fixture.reopen().load_tool_call(call.id()).unwrap(), denied);
+    // The point of the test: a denied row that reached the database without the
+    // decision that produced it is an audit gap, not a lifecycle detail.
+    assert_eq!(denied.policy_decision(), Some(&decision));
+    assert_eq!(
+        denied.failure(),
+        Some(&Failure::new("policy", decision.reason()))
+    );
+    let reloaded = fixture.reopen().load_tool_call(call.id()).unwrap();
+    assert_eq!(reloaded, denied);
+    assert_eq!(reloaded.policy_decision(), Some(&decision));
 }
 
 #[test]

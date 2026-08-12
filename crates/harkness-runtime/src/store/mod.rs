@@ -623,25 +623,21 @@ impl Store {
         self.mutate_tool_call(id, |call| call.fail(failure, at))
     }
 
-    /// Records a policy denial of a pending tool call.
-    ///
-    /// # Errors
-    ///
-    /// As [`Store::transition_run`], for tool calls.
-    pub fn deny_tool_call(
-        &self,
-        id: ToolCallId,
-        failure: Failure,
-        at: OffsetDateTime,
-    ) -> Result<ToolCall, StoreError> {
-        self.mutate_tool_call(id, |call| call.deny(failure, at))
-    }
-
     /// Persists policy and applies its immediate lifecycle consequence.
+    ///
+    /// This is the only route from `pending` to `denied`. There is deliberately
+    /// no decision-free denial: a call that was stopped by policy always
+    /// carries the verdict, reason, and source that stopped it. A refusal at
+    /// approval time goes through [`Store::reject_tool_call_approval`] instead
+    /// and carries its own audit entry.
     ///
     /// The full decision and the `awaiting_approval` or `denied` transition it
     /// produces share one `BEGIN IMMEDIATE` transaction. `Allow` is persisted
     /// while the call remains pending, before a later dispatch may start it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::transition_run`], for tool calls.
     pub fn apply_tool_call_policy_decision(
         &self,
         id: ToolCallId,
