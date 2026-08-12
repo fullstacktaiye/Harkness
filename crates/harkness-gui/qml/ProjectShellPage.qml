@@ -102,6 +102,12 @@ Kirigami.Page {
         onActivated: shell.activateView(gitPanel.viewId)
     }
 
+    Shortcut {
+        enabled: issuesPanel.viewAvailable
+        sequences: [issuesPanel.viewShortcut]
+        onActivated: shell.activateView(issuesPanel.viewId)
+    }
+
     // The header toolbar answers the same job and Git-state questions the
     // source-control view does; both derive them from this projection so a
     // running operation disables the toolbar and the panel together.
@@ -334,6 +340,14 @@ Kirigami.Page {
 
                     GitPanel {
                         id: gitPanel
+
+                        backend: shell.backend
+                        project: shell.project
+                        onHideRequested: shell.sidePanelExpanded = false
+                    }
+
+                    IssuesPanel {
+                        id: issuesPanel
 
                         backend: shell.backend
                         project: shell.project

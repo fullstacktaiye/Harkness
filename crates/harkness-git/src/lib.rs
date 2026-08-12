@@ -79,6 +79,40 @@ pub fn repository_identity(repository: impl AsRef<Path>) -> Result<String, GitEr
     lock::repository_identity(repository.as_ref()).map(|identity| identity.to_string())
 }
 
+/// Returns the URL of the repository's preferred configured remote.
+///
+/// `origin` wins when present, otherwise a sole configured remote is used.
+/// Repositories with no remote or with several equally plausible non-origin
+/// remotes return `None`; inspection never guesses which forge owns them.
+/// This is local, read-only configuration inspection and spawns no process.
+pub fn repository_remote_url(repository: impl AsRef<Path>) -> Result<Option<String>, GitError> {
+    let root = repository.as_ref();
+    let repository = Repository::open(root).map_err(|source| inspection(root, source))?;
+    let remotes = repository
+        .remotes()
+        .map_err(|source| inspection(root, source))?;
+    let configured = remotes
+        .iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| inspection(root, source))?;
+    let configured = configured.into_iter().flatten().collect::<Vec<_>>();
+    let selected = if configured.contains(&DEFAULT_REMOTE) {
+        Some(DEFAULT_REMOTE)
+    } else if configured.len() == 1 {
+        configured.first().copied()
+    } else {
+        None
+    };
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let remote = repository
+        .find_remote(selected)
+        .map_err(|source| inspection(root, source))?;
+    let url = remote.url().map_err(|source| inspection(root, source))?;
+    Ok(Some(url.to_owned()))
+}
+
 /// A Git inspection diagnostic without exposing the underlying libgit2 type
 /// across crate boundaries.
 #[derive(Debug)]
@@ -1659,8 +1693,41 @@ fn inspection(path: &Path, source: git2::Error) -> GitError {
 mod tests {
     use std::{io, path::PathBuf, time::Duration};
 
-    use super::{Cancellation, FileChange, GitError, GitService, PendingOperation, WorktreeBase};
+    use git2::Repository;
+
+    use super::{
+        Cancellation, FileChange, GitError, GitService, PendingOperation, WorktreeBase,
+        repository_remote_url,
+    };
     use crate::testing::{Fixture, initialize_repository};
+
+    #[test]
+    fn repository_remote_url_prefers_origin_then_a_sole_remote() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("remote-url");
+        initialize_repository(&root);
+        let repository = Repository::open(&root).unwrap();
+
+        assert_eq!(repository_remote_url(&root).unwrap(), None);
+        repository
+            .remote("upstream", "https://github.com/example/upstream.git")
+            .unwrap();
+        assert_eq!(
+            repository_remote_url(&root).unwrap().as_deref(),
+            Some("https://github.com/example/upstream.git")
+        );
+        repository
+            .remote("backup", "https://github.com/example/backup.git")
+            .unwrap();
+        assert_eq!(repository_remote_url(&root).unwrap(), None);
+        repository
+            .remote("origin", "git@github.com:example/origin.git")
+            .unwrap();
+        assert_eq!(
+            repository_remote_url(&root).unwrap().as_deref(),
+            Some("git@github.com:example/origin.git")
+        );
+    }
 
     #[test]
     fn locked_sessions_hold_the_repository_lock_while_they_exist() {

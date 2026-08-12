@@ -34,6 +34,7 @@ pub mod ffi {
         #[qproperty(QVariant, opened)]
         #[qproperty(QVariant, git)]
         #[qproperty(QVariant, history)]
+        #[qproperty(QVariant, issues)]
         #[qproperty(QVariant, review)]
         type HarknessBackend = super::HarknessBackendRust;
 
@@ -91,6 +92,15 @@ pub mod ffi {
         #[qinvokable]
         #[cxx_name = "loadMoreHistory"]
         fn load_more_history(self: Pin<&mut HarknessBackend>, project_id: &QString);
+
+        /// Loads the open repository's issues through the authenticated GitHub CLI.
+        #[qinvokable]
+        #[cxx_name = "refreshIssues"]
+        fn refresh_issues(
+            self: Pin<&mut HarknessBackend>,
+            project_id: &QString,
+            github_remote: &QString,
+        );
 
         /// Opens a commit against its first parent in the read-only review surface.
         #[qinvokable]
@@ -287,10 +297,12 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     pin::Pin,
+    process::Command,
 };
 
 use cxx_qt::{CxxQtType, Threading};
 use cxx_qt_lib::{QList, QMap, QMapPair_QString_QVariant, QString, QVariant};
+use serde::Deserialize;
 
 pub struct HarknessBackendRust {
     busy: bool,
@@ -302,6 +314,7 @@ pub struct HarknessBackendRust {
     opened: QVariant,
     git: QVariant,
     history: QVariant,
+    issues: QVariant,
     review: QVariant,
     job_records: Vec<JobRecord>,
     cancellations: HashMap<String, harkness_git::Cancellation>,
@@ -322,6 +335,7 @@ pub struct HarknessBackendRust {
     review_state: Option<ReviewStateRow>,
     next_catalog_request: u64,
     next_history_request: u64,
+    next_issues_request: u64,
     next_branch_request: u64,
     next_worktree_request: u64,
     next_review_request: u64,
@@ -340,6 +354,7 @@ impl Default for HarknessBackendRust {
             opened: empty_opened(),
             git: empty_git(),
             history: empty_history(),
+            issues: empty_issues(),
             review: empty_review(),
             job_records: Vec::new(),
             cancellations: HashMap::new(),
@@ -356,6 +371,7 @@ impl Default for HarknessBackendRust {
             review_state: None,
             next_catalog_request: 0,
             next_history_request: 0,
+            next_issues_request: 0,
             next_branch_request: 0,
             next_worktree_request: 0,
             next_review_request: 0,
@@ -1225,6 +1241,282 @@ fn clear_history_state(mut backend: Pin<&mut ffi::HarknessBackend>) {
     rust.next_history_request += 1;
     rust.history_state = None;
     backend.as_mut().set_history(empty_history());
+}
+
+#[derive(Clone, Debug)]
+struct IssueLabelRow {
+    name: String,
+    color: String,
+}
+
+#[derive(Clone, Debug)]
+struct IssueRow {
+    id: String,
+    number: u64,
+    title: String,
+    state: String,
+    url: String,
+    author: String,
+    updated: String,
+    labels: Vec<IssueLabelRow>,
+    milestone: String,
+    assignees: String,
+    comment_count: u64,
+    created_by_me: bool,
+    assigned_to_me: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubUserRow {
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubLabelRow {
+    name: String,
+    color: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubMilestoneRow {
+    title: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubIssueRow {
+    id: u64,
+    number: u64,
+    title: String,
+    state: String,
+    html_url: String,
+    user: GithubUserRow,
+    updated_at: String,
+    #[serde(default)]
+    labels: Vec<GithubLabelRow>,
+    milestone: Option<GithubMilestoneRow>,
+    #[serde(default)]
+    assignees: Vec<GithubUserRow>,
+    comments: u64,
+    pull_request: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug)]
+struct IssuesStateRow {
+    project_id: String,
+    remote: String,
+    loading: bool,
+    viewer: String,
+    rows: Vec<IssueRow>,
+    error: String,
+    error_kind: String,
+}
+
+impl IssuesStateRow {
+    fn loading(project_id: String, remote: String) -> Self {
+        Self {
+            project_id,
+            remote,
+            loading: true,
+            viewer: String::new(),
+            rows: Vec::new(),
+            error: String::new(),
+            error_kind: String::new(),
+        }
+    }
+
+    fn with_failure(mut self, failure: GitFailure) -> Self {
+        self.loading = false;
+        self.error = failure.message;
+        self.error_kind = failure.kind;
+        self
+    }
+}
+
+fn empty_issues() -> QVariant {
+    QVariant::from(&QMap::<QMapPair_QString_QVariant>::default())
+}
+
+fn to_issues(row: &IssuesStateRow) -> QVariant {
+    let mut state = QMap::<QMapPair_QString_QVariant>::default();
+    let mut insert = |key: &str, value: QVariant| state.insert(QString::from(key), value);
+    insert(
+        "projectId",
+        QVariant::from(&QString::from(row.project_id.as_str())),
+    );
+    insert(
+        "remote",
+        QVariant::from(&QString::from(row.remote.as_str())),
+    );
+    insert("loading", QVariant::from(&row.loading));
+    insert(
+        "viewer",
+        QVariant::from(&QString::from(row.viewer.as_str())),
+    );
+    insert("error", QVariant::from(&QString::from(row.error.as_str())));
+    insert(
+        "errorKind",
+        QVariant::from(&QString::from(row.error_kind.as_str())),
+    );
+
+    let mut issues = QList::<QVariant>::default();
+    for row in &row.rows {
+        let mut issue = QMap::<QMapPair_QString_QVariant>::default();
+        let mut insert = |key: &str, value: QVariant| issue.insert(QString::from(key), value);
+        insert("id", QVariant::from(&QString::from(row.id.as_str())));
+        insert(
+            "number",
+            QVariant::from(&i32::try_from(row.number).unwrap_or(i32::MAX)),
+        );
+        insert("title", QVariant::from(&QString::from(row.title.as_str())));
+        insert("state", QVariant::from(&QString::from(row.state.as_str())));
+        insert("url", QVariant::from(&QString::from(row.url.as_str())));
+        insert(
+            "author",
+            QVariant::from(&QString::from(row.author.as_str())),
+        );
+        insert(
+            "updated",
+            QVariant::from(&QString::from(row.updated.as_str())),
+        );
+        insert(
+            "milestone",
+            QVariant::from(&QString::from(row.milestone.as_str())),
+        );
+        insert(
+            "assignees",
+            QVariant::from(&QString::from(row.assignees.as_str())),
+        );
+        insert(
+            "commentCount",
+            QVariant::from(&i32::try_from(row.comment_count).unwrap_or(i32::MAX)),
+        );
+        insert("createdByMe", QVariant::from(&row.created_by_me));
+        insert("assignedToMe", QVariant::from(&row.assigned_to_me));
+
+        let mut labels = QList::<QVariant>::default();
+        for row in &row.labels {
+            let mut label = QMap::<QMapPair_QString_QVariant>::default();
+            label.insert(
+                QString::from("name"),
+                QVariant::from(&QString::from(row.name.as_str())),
+            );
+            label.insert(
+                QString::from("color"),
+                QVariant::from(&QString::from(row.color.as_str())),
+            );
+            labels.append(QVariant::from(&label));
+        }
+        insert("labels", QVariant::from(&labels));
+        issues.append(QVariant::from(&issue));
+    }
+    insert("rows", QVariant::from(&issues));
+    QVariant::from(&state)
+}
+
+fn github_cli_output(arguments: &[&str]) -> Result<Vec<u8>, GitFailure> {
+    let output = Command::new("gh")
+        .env("GH_PROMPT_DISABLED", "1")
+        .args(arguments)
+        .output()
+        .map_err(|error| GitFailure {
+            kind: "github_cli_missing".to_owned(),
+            message: format!("Could not start GitHub CLI: {error}. Install gh and sign in."),
+        })?;
+    if output.status.success() {
+        return Ok(output.stdout);
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let detail = if detail.is_empty() {
+        format!("GitHub CLI exited with {}", output.status)
+    } else {
+        detail
+    };
+    Err(GitFailure {
+        kind: "github_api".to_owned(),
+        message: format!("Could not load GitHub issues: {detail}"),
+    })
+}
+
+fn load_github_issues(remote: &str) -> Result<(String, Vec<IssueRow>), GitFailure> {
+    let Some(slug) = remote.strip_prefix("github.com/") else {
+        return Err(GitFailure {
+            kind: "unsupported_remote".to_owned(),
+            message: "Issues require a GitHub repository remote".to_owned(),
+        });
+    };
+    if slug.split('/').count() != 2 {
+        return Err(GitFailure {
+            kind: "unsupported_remote".to_owned(),
+            message: "The GitHub repository identity is invalid".to_owned(),
+        });
+    }
+    let viewer = github_cli_output(&["api", "user", "--jq", ".login", "--cache", "5m"])
+        .and_then(|bytes| {
+            String::from_utf8(bytes).map_err(|_| GitFailure {
+                kind: "github_api".to_owned(),
+                message: "GitHub CLI returned a non-UTF-8 account name".to_owned(),
+            })
+        })?
+        .trim()
+        .to_owned();
+    let endpoint = format!("repos/{slug}/issues?state=all&per_page=100");
+    let bytes = github_cli_output(&["api", endpoint.as_str(), "--cache", "1m"])?;
+    parse_github_issues(&viewer, &bytes).map(|rows| (viewer, rows))
+}
+
+fn parse_github_issues(viewer: &str, bytes: &[u8]) -> Result<Vec<IssueRow>, GitFailure> {
+    let issues =
+        serde_json::from_slice::<Vec<GithubIssueRow>>(bytes).map_err(|error| GitFailure {
+            kind: "github_api".to_owned(),
+            message: format!("GitHub returned an invalid issue list: {error}"),
+        })?;
+    let rows = issues
+        .into_iter()
+        .filter(|issue| issue.pull_request.is_none())
+        .map(|issue| {
+            let created_by_me = issue.user.login.eq_ignore_ascii_case(viewer);
+            let assigned_to_me = issue
+                .assignees
+                .iter()
+                .any(|user| user.login.eq_ignore_ascii_case(viewer));
+            IssueRow {
+                id: issue.id.to_string(),
+                number: issue.number,
+                title: issue.title,
+                state: issue.state,
+                url: issue.html_url,
+                author: issue.user.login,
+                updated: issue.updated_at,
+                labels: issue
+                    .labels
+                    .into_iter()
+                    .map(|label| IssueLabelRow {
+                        name: label.name,
+                        color: format!("#{}", label.color),
+                    })
+                    .collect(),
+                milestone: issue
+                    .milestone
+                    .map(|milestone| milestone.title)
+                    .unwrap_or_default(),
+                assignees: issue
+                    .assignees
+                    .into_iter()
+                    .map(|user| format!("@{}", user.login))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                comment_count: issue.comments,
+                created_by_me,
+                assigned_to_me,
+            }
+        })
+        .collect();
+    Ok(rows)
+}
+
+fn clear_issues_state(mut backend: Pin<&mut ffi::HarknessBackend>) {
+    backend.as_mut().rust_mut().get_mut().next_issues_request += 1;
+    backend.as_mut().set_issues(empty_issues());
 }
 
 #[derive(Clone, Debug)]
@@ -2858,6 +3150,7 @@ struct ProjectRow {
     display_name: String,
     root: String,
     remote: String,
+    github_remote: String,
     branch: String,
     managed: bool,
     worktree: bool,
@@ -2889,6 +3182,17 @@ impl ProjectRow {
                 worktree_branch.clone().unwrap_or_default(),
             ),
         };
+        let github_remote = if remote.starts_with("github.com/") {
+            remote.clone()
+        } else if project.available && project.git.is_some() {
+            harkness_git::repository_remote_url(&project.root)
+                .ok()
+                .flatten()
+                .and_then(|url| harkness_core::normalize_remote(&url).ok())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         let id = project.id.to_string();
         let (lock_scope, lock_scope_resolved) = if project.available && project.git.is_some() {
             match harkness_git::repository_identity(&project.root) {
@@ -2908,6 +3212,7 @@ impl ProjectRow {
             display_name: project.display_name,
             root: project.root.display().to_string(),
             remote,
+            github_remote,
             // Left empty for a detached head, which `is_git` distinguishes
             // from a directory that is not a repository at all.
             branch: project
@@ -3026,6 +3331,10 @@ fn to_map(row: &ProjectRow) -> QVariant {
     insert(
         "remote",
         QVariant::from(&QString::from(row.remote.as_str())),
+    );
+    insert(
+        "githubRemote",
+        QVariant::from(&QString::from(row.github_remote.as_str())),
     );
     insert(
         "branch",
@@ -3370,6 +3679,15 @@ fn opened_project_id(opened: &QVariant) -> Option<String> {
         .filter(|id| !id.is_empty())
 }
 
+fn opened_github_remote(opened: &QVariant) -> Option<String> {
+    opened
+        .value::<QMap<QMapPair_QString_QVariant>>()?
+        .get(&QString::from("githubRemote"))?
+        .value::<QString>()
+        .map(|remote| remote.to_string())
+        .filter(|remote| !remote.is_empty())
+}
+
 fn opened_repository_lock_scope(opened: &QVariant) -> Option<String> {
     let opened = opened.value::<QMap<QMapPair_QString_QVariant>>()?;
     if let Some(scope) = opened
@@ -3453,8 +3771,14 @@ fn apply_result(
     backend.as_mut().set_status(outcome.status.into());
     match outcome.opened {
         OpenedUpdate::Keep => {}
-        OpenedUpdate::Open(row) => backend.as_mut().set_opened(to_map(&row)),
-        OpenedUpdate::Clear => backend.as_mut().set_opened(empty_opened()),
+        OpenedUpdate::Open(row) => {
+            clear_issues_state(backend.as_mut());
+            backend.as_mut().set_opened(to_map(&row));
+        }
+        OpenedUpdate::Clear => {
+            clear_issues_state(backend.as_mut());
+            backend.as_mut().set_opened(empty_opened());
+        }
     }
     backend.as_mut().refresh();
 }
@@ -3624,6 +3948,7 @@ impl ffi::HarknessBackend {
         self.as_mut().set_branches(QList::default());
         self.as_mut().set_worktrees(QList::default());
         clear_history_state(self.as_mut());
+        clear_issues_state(self.as_mut());
         clear_review_state(self.as_mut());
     }
 
@@ -3802,6 +4127,67 @@ impl ffi::HarknessBackend {
                     Err(failure) => {
                         backend.as_mut().set_status(failure.message.as_str().into());
                         set_history_state(backend.as_mut(), current.with_failure(&failure));
+                    }
+                }
+            });
+        });
+    }
+
+    fn refresh_issues(mut self: Pin<&mut Self>, project_id: &QString, github_remote: &QString) {
+        let project_id = project_id.to_string();
+        let github_remote = github_remote.to_string();
+        if opened_project_id(self.as_ref().opened()).as_deref() != Some(project_id.as_str())
+            || opened_github_remote(self.as_ref().opened()).as_deref()
+                != Some(github_remote.as_str())
+        {
+            self.as_mut()
+                .set_status("The requested issues do not belong to the open project".into());
+            return;
+        }
+        let Some((job_id, _cancellation)) = start_job(
+            self.as_mut(),
+            "issues",
+            &project_id,
+            "Refresh issues",
+            false,
+        ) else {
+            return;
+        };
+        let request_id = {
+            let rust = self.as_mut().rust_mut().get_mut();
+            rust.next_issues_request += 1;
+            rust.next_issues_request
+        };
+        let loading = IssuesStateRow::loading(project_id.clone(), github_remote.clone());
+        self.as_mut().set_issues(to_issues(&loading));
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let result = load_github_issues(&github_remote);
+            let _ = qt_thread.queue(move |mut backend| {
+                finish_job(backend.as_mut(), &job_id);
+                if backend.as_ref().rust().next_issues_request != request_id
+                    || opened_project_id(backend.as_ref().opened()).as_deref()
+                        != Some(project_id.as_str())
+                    || opened_github_remote(backend.as_ref().opened()).as_deref()
+                        != Some(github_remote.as_str())
+                {
+                    return;
+                }
+                match result {
+                    Ok((viewer, rows)) => backend.as_mut().set_issues(to_issues(&IssuesStateRow {
+                        project_id,
+                        remote: github_remote,
+                        loading: false,
+                        viewer,
+                        rows,
+                        error: String::new(),
+                        error_kind: String::new(),
+                    })),
+                    Err(failure) => {
+                        backend.as_mut().set_status(failure.message.as_str().into());
+                        backend
+                            .as_mut()
+                            .set_issues(to_issues(&loading.with_failure(failure)));
                     }
                 }
             });
@@ -4847,8 +5233,9 @@ mod tests {
         display_diff_path, empty_opened, end_job, expand_review_context_with_git, hidden_before,
         jobs_conflict, load_history_page_with_git, load_review_file_with_git, load_review_with_git,
         load_review_with_initial_file_with_git, move_worktree_with_service, operation_outcome,
-        project_repository_lock_scopes, project_rows, project_worktree_lifecycle_lock_scopes,
-        register_path_selection, register_review_path_identity, remove_worktree_with_service,
+        parse_github_issues, project_repository_lock_scopes, project_rows,
+        project_worktree_lifecycle_lock_scopes, register_path_selection,
+        register_review_path_identity, remove_worktree_with_service,
         replace_status_path_selections, resolve_commit_scope, resolve_path_selection,
         retreat_review_file_window, retreat_review_row_window, review_content_summary,
         review_file_window, review_hunk_exists_where, review_path, review_row_count, review_rows,
@@ -4995,6 +5382,7 @@ mod tests {
 
         assert!(row.managed);
         assert_eq!(row.branch, "main");
+        assert_eq!(row.github_remote, "github.com/example/sample");
         assert!(row.is_git && row.dirty);
 
         let map = row_map(&row);
@@ -5004,6 +5392,7 @@ mod tests {
             "displayName",
             "root",
             "remote",
+            "githubRemote",
             "branch",
             "managed",
             "worktree",
@@ -5027,6 +5416,51 @@ mod tests {
                 .and_then(|value| value.value::<bool>()),
             Some(true)
         );
+    }
+
+    #[test]
+    fn github_issue_projection_filters_pull_requests_and_marks_viewer_scopes() {
+        let rows = parse_github_issues(
+            "octocat",
+            br##"[
+                {
+                    "id": 101,
+                    "number": 7,
+                    "title": "Keep issue browsing live",
+                    "state": "open",
+                    "html_url": "https://github.com/example/sample/issues/7",
+                    "user": {"login": "OctoCat"},
+                    "updated_at": "2026-08-12T12:00:00Z",
+                    "labels": [{"name": "enhancement", "color": "3fb950"}],
+                    "milestone": {"title": "v1"},
+                    "assignees": [{"login": "octocat"}],
+                    "comments": 3,
+                    "pull_request": null
+                },
+                {
+                    "id": 102,
+                    "number": 8,
+                    "title": "This is a pull request",
+                    "state": "open",
+                    "html_url": "https://github.com/example/sample/pull/8",
+                    "user": {"login": "someone"},
+                    "updated_at": "2026-08-12T12:00:00Z",
+                    "labels": [],
+                    "milestone": null,
+                    "assignees": [],
+                    "comments": 0,
+                    "pull_request": {}
+                }
+            ]"##,
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "101");
+        assert_eq!(rows[0].url, "https://github.com/example/sample/issues/7");
+        assert!(rows[0].created_by_me && rows[0].assigned_to_me);
+        assert_eq!(rows[0].labels[0].color, "#3fb950");
+        assert_eq!(rows[0].milestone, "v1");
     }
 
     #[test]

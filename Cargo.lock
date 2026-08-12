@@ -722,6 +722,8 @@ dependencies = [
  "git2",
  "harkness-core",
  "harkness-git",
+ "serde",
+ "serde_json",
  "tempfile",
  "time",
 ]

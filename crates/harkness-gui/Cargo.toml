@@ -26,6 +26,8 @@ cxx-qt = "0.9"
 cxx-qt-lib = { version = "0.9", features = ["qt_full"] }
 harkness-core.workspace = true
 harkness-git.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [build-dependencies]
 cxx-qt-build = { version = "0.9", features = ["link_qt_object_files"] }
