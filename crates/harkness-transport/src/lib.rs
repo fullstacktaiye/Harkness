@@ -114,7 +114,7 @@ pub use message::{Message, Notification, PeerError, Request, RequestId, Response
 pub use spawn::{DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_STARTUP_DEADLINE, SpawnSpec};
 pub use stderr::{DiscardedStderr, StderrSink, StderrTail};
 pub use stdio::StdioTransport;
-pub use transport::{Counters, JsonRpcTransport, ShutdownOutcome, ShutdownRung};
+pub use transport::{Counters, JsonRpcTransport, SendRejection, ShutdownOutcome, ShutdownRung};
 
 /// The workspace's cancellation token, re-exported.
 ///

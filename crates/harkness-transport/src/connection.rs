@@ -48,7 +48,7 @@ use crate::{
     message::{Message, Notification, PeerError, Request, RequestId, Response},
     spawn::SpawnSpec,
     stdio::StdioTransport,
-    transport::{Counters, JsonRpcTransport, ShutdownOutcome},
+    transport::{Counters, JsonRpcTransport, SendRejection, ShutdownOutcome},
 };
 
 /// How often a waiting caller re-checks its deadline, its token, and the pump.
@@ -335,9 +335,8 @@ impl Connection {
             pending.slots.insert(id.clone(), Slot::Waiting);
         }
 
-        if let Err(error) = self
-            .transport
-            .send(Message::request(id.clone(), method, params), deadline)
+        if let Err(error) =
+            self.send_pumping(Message::request(id.clone(), method, params), deadline)
         {
             self.retire(&id, false);
             return Err(error);
@@ -397,8 +396,7 @@ impl Connection {
         params: Option<Value>,
         deadline: Instant,
     ) -> Result<(), TransportError> {
-        self.transport
-            .send(Message::notification(method, params), deadline)
+        self.send_pumping(Message::notification(method, params), deadline)
     }
 
     /// Answers a peer-initiated request, giving up at `deadline`.
@@ -412,8 +410,39 @@ impl Connection {
         outcome: Result<Value, PeerError>,
         deadline: Instant,
     ) -> Result<(), TransportError> {
-        self.transport
-            .send(Message::Response(Response { id, outcome }), deadline)
+        self.send_pumping(Message::Response(Response { id, outcome }), deadline)
+    }
+
+    /// Hands a message over, draining what the peer sent while waiting for room.
+    ///
+    /// A blocking send that does not read is half of a deadlock. The other half
+    /// is a peer that floods its own output and stops reading its input until
+    /// somebody drains it: this side's reader fills the inbound queue and parks,
+    /// the peer's pipe fills, the peer stops reading, and the two wait for each
+    /// other until a deadline breaks the tie. Pumping between attempts is what
+    /// makes that unreachable rather than merely bounded, and it is why
+    /// [`JsonRpcTransport::try_send`] hands the message back instead of taking
+    /// it.
+    fn send_pumping(&self, message: Message, deadline: Instant) -> Result<(), TransportError> {
+        let mut message = message;
+        loop {
+            match self.transport.try_send(message) {
+                Ok(()) => return Ok(()),
+                Err(SendRejection::NoRoom(returned)) => message = returned,
+                Err(SendRejection::Failed(error)) => {
+                    self.remember(&error);
+                    return Err(error);
+                }
+            }
+            if self.cancel.is_cancelled() {
+                self.give_up(&TransportError::Cancelled);
+                return Err(TransportError::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(TransportError::SendTimedOut);
+            }
+            self.pump_once(deadline, &self.answered, &self.pending)?;
+        }
     }
 
     /// Takes the next peer-initiated message, waiting until `deadline`.
@@ -615,7 +644,10 @@ impl Connection {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
         time::{Duration, Instant},
     };
 
@@ -626,7 +658,7 @@ mod tests {
     use crate::{
         error::{DisconnectKind, TransportError},
         message::{Message, PeerError, RequestId},
-        transport::{Counters, JsonRpcTransport, ShutdownOutcome, ShutdownRung},
+        transport::{Counters, JsonRpcTransport, SendRejection, ShutdownOutcome, ShutdownRung},
     };
 
     /// What a scripted transport recorded, readable after the connection that
@@ -647,6 +679,9 @@ mod tests {
         /// Answers each request as it is sent, which models a prompt peer with
         /// no thread and no ordering to get wrong.
         echo: bool,
+        /// Refuses the first handover, so the pumping retry loop in
+        /// `send_pumping` is exercised rather than merely compiled.
+        refuse_once: AtomicBool,
     }
 
     impl ScriptedTransport {
@@ -658,6 +693,7 @@ mod tests {
                 inbound: Mutex::new(messages.into_iter().rev().collect()),
                 recorded: recorded.clone(),
                 echo: false,
+                refuse_once: AtomicBool::new(false),
             });
             (transport, recorded)
         }
@@ -671,6 +707,19 @@ mod tests {
 
     impl JsonRpcTransport for ScriptedTransport {
         fn send(&self, message: Message, _deadline: Instant) -> Result<(), TransportError> {
+            match self.try_send(message) {
+                Ok(()) => Ok(()),
+                Err(SendRejection::NoRoom(_)) => Err(TransportError::SendTimedOut),
+                Err(SendRejection::Failed(error)) => Err(error),
+            }
+        }
+
+        fn try_send(&self, message: Message) -> Result<(), SendRejection> {
+            // A scripted peer that refuses one message and then accepts it, so
+            // the pumping retry loop is exercised rather than merely compiled.
+            if self.refuse_once.swap(false, Ordering::Relaxed) {
+                return Err(SendRejection::NoRoom(message));
+            }
             if self.echo
                 && let Message::Request(request) = &message
             {
@@ -1132,6 +1181,40 @@ mod tests {
             Ok(json!({"ok": true})),
             "the abandoned request's late answer was discarded, not quarantined"
         );
+    }
+
+    /// A send that waits without reading is half of a deadlock: a peer flooding
+    /// its own output stops reading its input until somebody drains it. The
+    /// retry has to pump, not merely sleep.
+    #[test]
+    fn a_send_with_no_room_drains_the_peer_while_it_waits() {
+        let (transport, recorded) = ScriptedTransport::with(vec![
+            Ok(Message::notification(
+                "session/update",
+                Some(json!({"n": 1})),
+            )),
+            Ok(Message::result(RequestId::Number(1), json!({"ok": true}))),
+        ]);
+        transport.refuse_once.store(true, Ordering::Relaxed);
+        let connection = Connection::new(transport, Cancellation::default());
+
+        // The first handover is refused, so the only way this completes is by
+        // pumping between attempts and retrying with the message it got back.
+        assert_eq!(
+            connection.request("initialize", None, soon()).unwrap(),
+            Ok(json!({"ok": true}))
+        );
+        assert_eq!(
+            recorded.sent.lock().unwrap().len(),
+            1,
+            "the message was handed over once, not rebuilt and duplicated"
+        );
+        let PeerMessage::Notification(drained) =
+            connection.next_peer_message(soon()).unwrap().unwrap()
+        else {
+            panic!("the update was drained while the send waited");
+        };
+        assert_eq!(drained.method, "session/update");
     }
 
     /// A count bounds messages, not memory. Sixteen-mebibyte notifications

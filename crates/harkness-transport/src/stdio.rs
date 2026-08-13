@@ -28,7 +28,7 @@
 //! event.
 
 use std::{
-    io::{Read, Write},
+    io::{self, Read, Write},
     process::{Child, ChildStderr, ChildStdin, ChildStdout},
     sync::{
         Arc, Mutex,
@@ -47,7 +47,7 @@ use crate::{
     message::Message,
     spawn::SpawnSpec,
     stderr::StderrSink,
-    transport::{Counters, JsonRpcTransport, ShutdownOutcome, ShutdownRung},
+    transport::{Counters, JsonRpcTransport, SendRejection, ShutdownOutcome, ShutdownRung},
 };
 
 /// Bytes read from a peer's pipe in one go.
@@ -351,67 +351,19 @@ impl Inner {
 
 impl JsonRpcTransport for StdioTransport {
     fn send(&self, message: Message, deadline: Instant) -> Result<(), TransportError> {
-        self.inner.check_all()?;
-
-        let mut command = WriterCommand::Write(frame(&message.encode()?)?);
-        let sender = {
-            let guard = self
-                .inner
-                .outbound
-                .lock()
-                .expect("transport outbound queue is not poisoned");
-            match guard.as_ref() {
-                Some(sender) => sender.clone(),
-                None => {
-                    return Err(self.inner.terminal().map_or_else(
-                        || TransportError::WriteFailed {
-                            detail: "the peer's standard input is closed".to_owned(),
-                        },
-                        |terminal| terminal.error(),
-                    ));
-                }
-            }
-        };
-
         // Whichever comes first. The caller's deadline is what it actually asked
         // for; the backstop bounds a caller that named a distant one, since a
         // peer that has stopped reading is never coming back and there is
         // nothing to wait for.
         let backstop = Instant::now() + OUTBOUND_ENQUEUE_TIMEOUT;
         let give_up_at = deadline.min(backstop);
+        let mut message = message;
         loop {
-            // Counted *before* the handover and undone if it does not happen.
-            // The writer subtracts the moment it dequeues, and it routinely wins
-            // that race against a `fetch_add` placed after a successful send —
-            // which takes an unsigned counter below zero and makes the depth a
-            // front end shows for a stuck connection read `usize::MAX`.
-            self.inner
-                .counts
-                .outbound_depth
-                .fetch_add(1, Ordering::Relaxed);
-            match sender.try_send(command) {
+            match self.try_send(message) {
                 Ok(()) => return Ok(()),
-                Err(TrySendError::Full(returned)) => {
-                    self.inner
-                        .counts
-                        .outbound_depth
-                        .fetch_sub(1, Ordering::Relaxed);
-                    command = returned;
-                }
-                Err(TrySendError::Disconnected(_)) => {
-                    self.inner
-                        .counts
-                        .outbound_depth
-                        .fetch_sub(1, Ordering::Relaxed);
-                    return Err(self.inner.terminal().map_or_else(
-                        || TransportError::WriteFailed {
-                            detail: "the peer's standard input is closed".to_owned(),
-                        },
-                        |terminal| terminal.error(),
-                    ));
-                }
+                Err(SendRejection::NoRoom(returned)) => message = returned,
+                Err(SendRejection::Failed(error)) => return Err(error),
             }
-            self.inner.check_all()?;
             if Instant::now() >= give_up_at {
                 // Which bound ran out decides which failure this is. The
                 // backstop expiring means the peer has not read a byte for
@@ -428,6 +380,63 @@ impl JsonRpcTransport for StdioTransport {
                 return Err(TransportError::WriteFailed { detail });
             }
             thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    fn try_send(&self, message: Message) -> Result<(), SendRejection> {
+        if let Err(error) = self.inner.check_all() {
+            return Err(SendRejection::Failed(error));
+        }
+
+        // Asked before the message is encoded. A peer that has stopped reading
+        // is retried against every poll interval, and serializing a large
+        // message each time to discover there is still nowhere to put it is
+        // work proportional to how long the peer stays wedged.
+        if self.inner.counts.outbound_depth.load(Ordering::Relaxed) >= OUTBOUND_CAPACITY {
+            return Err(SendRejection::NoRoom(message));
+        }
+
+        let sender = {
+            let guard = self
+                .inner
+                .outbound
+                .lock()
+                .expect("transport outbound queue is not poisoned");
+            match guard.as_ref() {
+                Some(sender) => sender.clone(),
+                None => return Err(SendRejection::Failed(self.closed_input())),
+            }
+        };
+        let framed = match message.encode().and_then(|encoded| frame(&encoded)) {
+            Ok(framed) => framed,
+            Err(error) => return Err(SendRejection::Failed(error)),
+        };
+
+        // Counted *before* the handover and undone if it does not happen. The
+        // writer subtracts the moment it dequeues, and it routinely wins that
+        // race against a `fetch_add` placed after a successful send — which
+        // takes an unsigned counter below zero and makes the depth a front end
+        // shows for a stuck connection read `usize::MAX`.
+        self.inner
+            .counts
+            .outbound_depth
+            .fetch_add(1, Ordering::Relaxed);
+        match sender.try_send(WriterCommand::Write(framed)) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                self.inner
+                    .counts
+                    .outbound_depth
+                    .fetch_sub(1, Ordering::Relaxed);
+                Err(SendRejection::NoRoom(message))
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.inner
+                    .counts
+                    .outbound_depth
+                    .fetch_sub(1, Ordering::Relaxed);
+                Err(SendRejection::Failed(self.closed_input()))
+            }
         }
     }
 
@@ -614,6 +623,15 @@ impl StdioTransport {
             }
         }
 
+        // Nothing is queued for a peer that is gone, and by here the writer's
+        // receiver has been dropped too, so a `send` racing this teardown fails
+        // and undoes its own count. Setting the depth rather than decrementing
+        // toward it is what makes that exact: a message handed over between the
+        // writer's own drain and its receiver disappearing is counted, dequeued
+        // by nobody, and would otherwise leave a dead connection reporting work
+        // in flight forever.
+        self.inner.counts.outbound_depth.store(0, Ordering::Relaxed);
+
         let outcome = ShutdownOutcome {
             rung,
             exit_code,
@@ -621,6 +639,16 @@ impl StdioTransport {
         };
         teardown.outcome = Some(outcome.clone());
         outcome
+    }
+
+    /// What a caller is told when the peer's standard input is no longer there.
+    fn closed_input(&self) -> TransportError {
+        self.inner.terminal().map_or_else(
+            || TransportError::WriteFailed {
+                detail: "the peer's standard input is closed".to_owned(),
+            },
+            |terminal| terminal.error(),
+        )
     }
 
     /// Discards anything the reader has queued, so it can finish and be joined.
@@ -743,8 +771,16 @@ fn read_messages(
                 return;
             }
             Ok(read) => read,
-            // A read error on a pipe means the peer's end is gone; the peer
-            // decides that, so it is a disconnect rather than a fault of ours.
+            // A signal that arrived while this thread was parked in `read` says
+            // nothing at all about the peer. `Read::read` does not retry it —
+            // only the convenience methods built on it do — so a handler
+            // installed without `SA_RESTART` anywhere in the process, by Qt or a
+            // profiler or whatever embeds Harkness, would otherwise make a
+            // healthy peer look like it had exited, and the disconnect is
+            // sticky.
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            // Any other read error means the peer's end of the pipe is gone; the
+            // peer decides that, so it is a disconnect rather than a fault here.
             Err(_) => {
                 let _ = events.send(ReaderEvent::Closed {
                     partial: splitter.has_partial_line(),
@@ -849,6 +885,7 @@ fn drain_stderr(stderr: ChildStderr, sink: Box<dyn StderrSink>, counts: &Counts)
     let mut buffer = [0u8; READ_BUFFER_BYTES];
     loop {
         match stderr.read(&mut buffer) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Ok(0) | Err(_) => break,
             Ok(read) => {
                 counts
@@ -864,6 +901,7 @@ fn drain_stderr(stderr: ChildStderr, sink: Box<dyn StderrSink>, counts: &Counts)
 #[cfg(test)]
 mod tests {
     use std::{
+        io,
         path::{Path, PathBuf},
         time::{Duration, Instant},
     };
@@ -897,10 +935,35 @@ mod tests {
     }
 
     fn connect(program: &Path, working_dir: &Path) -> Box<StdioTransport> {
-        match StdioTransport::spawn(spec(program, working_dir), Cancellation::default()) {
-            Ok(transport) => Box::new(transport),
-            Err(error) => panic!("failed to launch '{}': {error}", program.display()),
+        launch(|| spec(program, working_dir), Cancellation::default())
+    }
+
+    /// Launches a shim, retrying the one failure this test binary causes itself.
+    ///
+    /// These tests write executables and fork concurrently, and a `fork` in one
+    /// thread inherits the write descriptor another thread holds on a shim it is
+    /// still creating — so the `exec` fails `ETXTBSY` for as long as that
+    /// descriptor lives. It is an artifact of the fixtures, not of the engine,
+    /// which is why it is answered here rather than by a retry inside
+    /// `StdioTransport::spawn`: a production `spawn_failed` naming the operating
+    /// system's reason is the diagnosis a user needs, and quietly retrying it
+    /// would hide a genuinely unusable agent binary.
+    fn launch(
+        mut describe: impl FnMut() -> SpawnSpec,
+        cancellation: Cancellation,
+    ) -> Box<StdioTransport> {
+        for _ in 0..50 {
+            match StdioTransport::spawn(describe(), cancellation.clone()) {
+                Ok(transport) => return Box::new(transport),
+                Err(TransportError::SpawnFailed { source, .. })
+                    if source.kind() == io::ErrorKind::ExecutableFileBusy =>
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("failed to launch the peer: {error}"),
+            }
         }
+        panic!("the peer's executable stayed busy");
     }
 
     /// Waits for one message, failing rather than hanging.
@@ -967,12 +1030,9 @@ printf '{"jsonrpc":"2.0","method":"env","params":{"canary":"%s","allowed":"%s","
 "#,
         );
 
-        let transport = Box::new(
-            StdioTransport::spawn(
-                spec(&reporting_peer, &workspace).env("HARKNESS_ALLOWED", "yes"),
-                Cancellation::default(),
-            )
-            .unwrap(),
+        let transport = launch(
+            || spec(&reporting_peer, &workspace).env("HARKNESS_ALLOWED", "yes"),
+            Cancellation::default(),
         );
 
         // Set on the child that runs the shim rather than on this process:
@@ -1007,12 +1067,9 @@ while IFS= read -r line; do :; done
 "#,
         );
         let tail = StderrTail::new(4096);
-        let transport = Box::new(
-            StdioTransport::spawn(
-                spec(&chatty_peer, &workspace).stderr_sink(tail.clone()),
-                Cancellation::default(),
-            )
-            .unwrap(),
+        let transport = launch(
+            || spec(&chatty_peer, &workspace).stderr_sink(tail.clone()),
+            Cancellation::default(),
         );
 
         assert_eq!(
@@ -1070,12 +1127,9 @@ while IFS= read -r line; do :; done
             "flooding-peer",
             "#!/bin/sh\nyes harkness | tr -d '\\n' | head -c 200000\nprintf '\\n'\n",
         );
-        let transport = Box::new(
-            StdioTransport::spawn(
-                spec(&flooding_peer, &workspace).max_message_bytes(1024),
-                Cancellation::default(),
-            )
-            .unwrap(),
+        let transport = launch(
+            || spec(&flooding_peer, &workspace).max_message_bytes(1024),
+            Cancellation::default(),
         );
 
         let error = next(&transport).unwrap_err();
@@ -1274,14 +1328,13 @@ exit 0
                 activity.display()
             ),
         );
-        let transport = Box::new(
-            StdioTransport::spawn(
+        let transport = launch(
+            || {
                 SpawnSpec::new(&slow_peer, &workspace)
                     .env("PATH", SHIM_PATH)
-                    .startup_deadline(Duration::from_millis(150)),
-                Cancellation::default(),
-            )
-            .unwrap(),
+                    .startup_deadline(Duration::from_millis(150))
+            },
+            Cancellation::default(),
         );
 
         let error = transport
@@ -1306,14 +1359,13 @@ exit 0
             "quiet-peer",
             "#!/bin/sh\nwhile IFS= read -r line; do :; done\n",
         );
-        let transport = Box::new(
-            StdioTransport::spawn(
+        let transport = launch(
+            || {
                 SpawnSpec::new(&quiet_peer, &workspace)
                     .env("PATH", SHIM_PATH)
-                    .startup_deadline(Duration::from_millis(50)),
-                Cancellation::default(),
-            )
-            .unwrap(),
+                    .startup_deadline(Duration::from_millis(50))
+            },
+            Cancellation::default(),
         );
         transport.handshake_complete();
 
@@ -1337,9 +1389,7 @@ exit 0
             "#!/bin/sh\nwhile IFS= read -r line; do :; done\n",
         );
         let cancellation = Cancellation::default();
-        let transport = Box::new(
-            StdioTransport::spawn(spec(&quiet_peer, &workspace), cancellation.clone()).unwrap(),
-        );
+        let transport = launch(|| spec(&quiet_peer, &workspace), cancellation.clone());
         transport.handshake_complete();
 
         let waiting = cancellation.clone();
@@ -1378,9 +1428,7 @@ done
 "#,
         );
         let cancellation = Cancellation::default();
-        let transport = Box::new(
-            StdioTransport::spawn(spec(&streaming_peer, &workspace), cancellation.clone()).unwrap(),
-        );
+        let transport = launch(|| spec(&streaming_peer, &workspace), cancellation.clone());
         transport.handshake_complete();
 
         let tripping = cancellation.clone();

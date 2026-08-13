@@ -50,6 +50,23 @@ pub trait JsonRpcTransport: Send + Sync {
     /// over before `deadline`.
     fn send(&self, message: Message, deadline: Instant) -> Result<(), TransportError>;
 
+    /// Hands over one message if there is room for it right now.
+    ///
+    /// The non-blocking half of [`send`](Self::send), and the reason it exists
+    /// is a deadlock rather than a preference. A caller blocked inside `send`
+    /// is not reading, and a peer that floods its own output stops reading its
+    /// input until somebody drains it — so a `send` that waits without reading
+    /// is two sides waiting for each other. Returning the message instead lets
+    /// the caller pump between attempts, and returning it rather than requiring
+    /// a clone is what keeps that affordable for a large one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SendRejection::NoRoom`] with the message back when the peer's
+    /// queue is full, and [`SendRejection::Failed`] when the connection cannot
+    /// carry the message at all.
+    fn try_send(&self, message: Message) -> Result<(), SendRejection>;
+
     /// Takes the next message from the peer, waiting until `deadline`.
     ///
     /// Blocking with an explicit deadline rather than returning a future is the
@@ -102,6 +119,16 @@ pub trait JsonRpcTransport: Send + Sync {
     /// and nothing to do about it. What it reports instead is the rung reached,
     /// which is a diagnostic about the peer rather than about the teardown.
     fn shutdown(self: Box<Self>, grace: Duration) -> ShutdownOutcome;
+}
+
+/// Why [`JsonRpcTransport::try_send`] did not hand a message over.
+#[derive(Debug)]
+pub enum SendRejection {
+    /// There is no room at the moment. The message comes back so a caller can
+    /// drain what the peer has sent and try again without rebuilding it.
+    NoRoom(Message),
+    /// The connection cannot carry the message at all.
+    Failed(TransportError),
 }
 
 /// How far a teardown had to escalate.

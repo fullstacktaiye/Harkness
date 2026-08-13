@@ -871,9 +871,11 @@ gone, so a peer that had already exited would otherwise strand a thread teardown
 group is then killed on **every** rung, not only when the escalation is reached: the direct child
 being gone is not the group being gone, and a peer that backgrounded a helper and exited politely
 leaves that helper on the workspace *and* holding the standard-output pipe, so the reader never sees
-end of file either. Signalling a group whose last member has gone is a harmless `ESRCH`, and a group
-keeps its identifier reserved while any member is alive, so a reaped child's pid cannot have been
-recycled underneath it. `ShutdownOutcome` records the rung reached, because "this agent had to be
+end of file either. While any member is alive the group keeps its identifier, so the signal is exact
+in the case it exists for; where the reaped child was the last member the group is already gone and
+the call is a harmless `ESRCH`, with a residual race — a window of microseconds in which that pid was
+recycled as another group's leader — that is stated rather than argued away. `harkness-runtime` takes
+the same trade signalling a reaped tool child's group. `ShutdownOutcome` records the rung reached, because "this agent had to be
 killed" is a bug report rather than an implementation detail. Windows has no `SIGTERM` and reports
 `killed` rather than claiming an escalation that did not happen.
 
@@ -908,6 +910,14 @@ taken while the pending table or the peer queue is held. Three OS threads per co
 reader, writer, stderr reader — is the whole cost, and a fourth must not be added to "simplify"
 reading: a dispatcher blocked pushing into a full queue stalls every response behind it, which is the
 same stall with another thread paid for.
+
+A send that waits without reading is half of a deadlock, so `Connection` pumps between attempts
+rather than blocking inside the transport. The other half is a peer that floods its own output and
+stops reading its input until somebody drains it: this side's reader fills the inbound queue and
+parks, the peer's pipe fills, and the two wait for each other. `try_send` therefore hands the message
+*back* instead of taking it — returning it rather than requiring a clone is what keeps retrying
+affordable for a large one — and `send` is the blocking convenience built on top. A blocking send
+that does not drain must not be reintroduced.
 
 A caller's deadline bounds its *send* as well as its wait. A peer that stops reading its standard
 input fills its pipe and then the queue behind it, and an enqueue bounded only by the transport's own

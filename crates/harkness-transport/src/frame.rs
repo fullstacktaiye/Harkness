@@ -18,6 +18,16 @@ use crate::error::TransportError;
 pub(crate) struct LineSplitter {
     limit: usize,
     pending: Vec<u8>,
+    /// A carriage return held back because it may be the first half of a `\r\n`
+    /// terminator.
+    ///
+    /// Held rather than appended so that it is not charged against the bound
+    /// when it turns out to be part of a terminator. Appending it and trimming
+    /// it at the newline would make the effective limit one byte smaller for a
+    /// peer writing Windows line endings — and only for those peers, which is
+    /// the kind of difference nobody finds until a message lands on the
+    /// boundary.
+    deferred_carriage_return: bool,
 }
 
 impl LineSplitter {
@@ -26,6 +36,7 @@ impl LineSplitter {
         Self {
             limit,
             pending: Vec::new(),
+            deferred_carriage_return: false,
         }
     }
 
@@ -52,18 +63,38 @@ impl LineSplitter {
         on_line: &mut impl FnMut(&[u8]),
     ) -> Result<(), TransportError> {
         while let Some(offset) = chunk.iter().position(|&byte| byte == b'\n') {
-            self.extend(&chunk[..offset])?;
-            let end = match self.pending.last() {
-                Some(b'\r') => self.pending.len() - 1,
-                _ => self.pending.len(),
-            };
-            if end > 0 {
-                on_line(&self.pending[..end]);
+            self.absorb(&chunk[..offset])?;
+            // A held-back carriage return was the first half of this terminator,
+            // and goes with it.
+            self.deferred_carriage_return = false;
+            if !self.pending.is_empty() {
+                on_line(&self.pending);
             }
             self.pending.clear();
             chunk = &chunk[offset + 1..];
         }
-        self.extend(chunk)
+        self.absorb(chunk)
+    }
+
+    /// Appends `run` to the pending line, holding back a trailing carriage
+    /// return in case a newline follows it.
+    fn absorb(&mut self, run: &[u8]) -> Result<(), TransportError> {
+        if run.is_empty() {
+            return Ok(());
+        }
+        // Something other than a newline follows the held-back carriage return,
+        // so it was content after all.
+        if std::mem::take(&mut self.deferred_carriage_return) {
+            self.extend(b"\r")?;
+        }
+        match run.split_last() {
+            Some((b'\r', head)) => {
+                self.extend(head)?;
+                self.deferred_carriage_return = true;
+                Ok(())
+            }
+            _ => self.extend(run),
+        }
     }
 
     /// Appends `run` to the pending line, or refuses the line for exceeding the
@@ -92,7 +123,7 @@ impl LineSplitter {
     ///
     /// [`DisconnectKind::MidResponse`]: crate::DisconnectKind::MidResponse
     pub(crate) fn has_partial_line(&self) -> bool {
-        !self.pending.is_empty()
+        !self.pending.is_empty() || self.deferred_carriage_return
     }
 }
 
@@ -150,6 +181,37 @@ mod tests {
     #[test]
     fn a_carriage_return_terminator_is_consumed_whole() {
         assert_eq!(lines(64, &[b"{\"a\":1}\r\n"]).unwrap(), ["{\"a\":1}"]);
+        // Including when a read lands between its two halves.
+        assert_eq!(lines(64, &[b"{\"a\":1}\r", b"\n"]).unwrap(), ["{\"a\":1}"]);
+    }
+
+    /// The bound is on the message, and a terminator is not part of the
+    /// message. Charging the `\r` of a `\r\n` would make the effective limit one
+    /// byte smaller for a peer writing Windows line endings, and for nobody
+    /// else — a difference that only shows up on the boundary.
+    #[test]
+    fn a_carriage_return_terminator_is_not_charged_against_the_bound() {
+        let exact = "x".repeat(16);
+        for chunks in [
+            vec![format!("{exact}\r\n").into_bytes()],
+            vec![format!("{exact}\r").into_bytes(), b"\n".to_vec()],
+            vec![exact.clone().into_bytes(), b"\r\n".to_vec()],
+        ] {
+            let borrowed = chunks.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            assert_eq!(lines(16, &borrowed).unwrap(), std::slice::from_ref(&exact));
+        }
+    }
+
+    /// A carriage return that is *not* followed by a newline is content, and is
+    /// charged like any other byte.
+    #[test]
+    fn a_carriage_return_inside_a_line_is_content() {
+        assert_eq!(lines(64, &[b"a\rb\n"]).unwrap(), ["a\rb"]);
+        assert_eq!(lines(64, &[b"a\r", b"b\n"]).unwrap(), ["a\rb"]);
+        assert!(matches!(
+            lines(2, &[b"a\rb\n"]),
+            Err(TransportError::MessageTooLarge { .. })
+        ));
     }
 
     /// A blank line carries no message, so reporting one would turn a peer's
