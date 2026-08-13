@@ -500,6 +500,8 @@ import org.kde.kirigami as Kirigami
 import io.github.fullstacktaiye.harkness
 
 Kirigami.ApplicationWindow {
+    id: window
+
     objectName: screenshotSaved
         ? "GitPanelScreenshotSaved"
         : fixtureBackend.workingReviewCalls === 1
@@ -524,6 +526,9 @@ Kirigami.ApplicationWindow {
         && historyPreviewDetected === true
         && largeModelDetected === true
         && deepScrollDetected === true
+        && whitespaceRenderDetected === true
+        && whitespaceCopyDetected === true
+        && revealScrollDetected === true
         && realBridgePassed === true
         ? "GitPanelSmokePassed"
         : "GitPanelSmokeFailed-" + selectionDetected
@@ -547,6 +552,9 @@ Kirigami.ApplicationWindow {
             + "-" + reviewFixture.pendingHunkNavigation
             + "-" + largeModelDetected
             + "-" + deepScrollDetected
+            + "-" + whitespaceRenderDetected
+            + "-" + whitespaceCopyDetected
+            + "-" + revealScrollDetected
             + "-" + reviewFixture.reviewCurrentIndex
             + "-" + realBridgePhase
             + "-" + realBridgePassed
@@ -572,13 +580,40 @@ Kirigami.ApplicationWindow {
     property bool historyPreviewDetected: false
     property bool largeModelDetected: false
     property bool deepScrollDetected: false
+    property bool whitespaceRenderDetected: false
+    property bool whitespaceCopyDetected: false
+    property bool revealScrollDetected: false
     property bool screenshotSaved: false
+    property bool screenshotReveal: __SCREENSHOT_REVEAL__
     property bool fakePassed: false
     property bool realBridgePassed: false
     property int realBridgePhase: 0
     property string realProjectId: "__REAL_PROJECT_ID__"
     property string screenshotPath: "__SCREENSHOT_PATH__"
     property string realPathId: ""
+
+    // The pair the review fixture shows differs by a word, by an indent that
+    // swapped a tab for spaces, by a trailing run and by its terminator: one
+    // row that carries every treatment the surface has to render at once.
+    readonly property var oldWordSegments: [
+        { "text": "\t", "changed": true, "whitespace": "tab", "zone": "leading" },
+        { "text": "let old_word = true;", "changed": true, "whitespace": "", "zone": "" },
+        { "text": "  ", "changed": false, "whitespace": "space", "zone": "trailing" }
+    ]
+    readonly property var newWordSegments: [
+        { "text": "    ", "changed": true, "whitespace": "space", "zone": "leading" },
+        { "text": "let new_word = true;", "changed": true, "whitespace": "", "zone": "" }
+    ]
+
+    // Every entity and every drawn character is one column; the markup around
+    // them is worth none. Comparing the two reveal states through this is what
+    // proves a glyph never moves a column out from under the other side.
+    function renderedColumns(html) {
+        return String(html)
+            .replace(/<[^>]*>/g, "")
+            .replace(/&nbsp;/g, "\u0001")
+            .length;
+    }
 
     function finishIfReady() {
         if (fakePassed && realBridgePassed) {
@@ -754,22 +789,36 @@ Kirigami.ApplicationWindow {
             Qt.callLater(function() {
                 deepScrollDetected = reviewFixture.reviewContentY > 1000
                     && reviewFixture.reviewCurrentIndex === 11000;
-                // A commit is the one mutation this surface still has to wait
-                // out: navigation must be refused while the index is moving
-                // under the rows it would jump between.
-                fixtureBackend.jobs = [{
-                    "id": "job-commit-navigation",
-                    "kind": "commit",
-                    "projectId": String(projectFixture.id),
-                    "lockScope": String(projectFixture.lockScope),
-                    "label": "Commit",
-                    "progress": "Starting...",
-                    "cancellable": true
-                }];
-                navigationLockDetected = !reviewFixture.hunkNavigationEnabled();
-                fixtureBackend.jobs = [];
-                fakePassed = true;
-                finishIfReady();
+                // Deep in a long file is exactly where a reader reaches for
+                // the reveal control, and exactly where losing their place
+                // would cost them the most.
+                const heldFile = String(fixtureBackend.review.file.fileId);
+                const heldPosition = reviewFixture.reviewContentY;
+                const heldIndex = reviewFixture.reviewCurrentIndex;
+                reviewFixture.setRevealWhitespace(true);
+                Qt.callLater(function() {
+                    revealScrollDetected = reviewFixture.revealWhitespace
+                        && reviewFixture.reviewCurrentIndex === heldIndex
+                        && Math.abs(reviewFixture.reviewContentY - heldPosition) < 1
+                        && String(fixtureBackend.review.file.fileId) === heldFile;
+                    reviewFixture.setRevealWhitespace(false);
+                    // A commit is the one mutation this surface still has to
+                    // wait out: navigation must be refused while the index is
+                    // moving under the rows it would jump between.
+                    fixtureBackend.jobs = [{
+                        "id": "job-commit-navigation",
+                        "kind": "commit",
+                        "projectId": String(projectFixture.id),
+                        "lockScope": String(projectFixture.lockScope),
+                        "label": "Commit",
+                        "progress": "Starting...",
+                        "cancellable": true
+                    }];
+                    navigationLockDetected = !reviewFixture.hunkNavigationEnabled();
+                    fixtureBackend.jobs = [];
+                    fakePassed = true;
+                    finishIfReady();
+                });
             });
         });
     }
@@ -1035,50 +1084,51 @@ Kirigami.ApplicationWindow {
                     "hunkId": "review-hunk-fixture",
                     "openLine": 1,
                     "splitHidden": false,
+                    // The pair also loses a trailing run and a carriage
+                    // return, so the delegates render the whitespace
+                    // treatment rather than only the word emphasis.
+                    "lineEndChanged": true,
                     "unified": {
                         "oldLine": 1,
                         "newLine": 0,
                         "kind": "deletion",
                         "marker": "-",
-                        "segments": [{
-                            "text": "let old_word = true;",
-                            "changed": true
-                        }]
+                        "lineEnd": "crlf",
+                        "copyText": "\tlet old_word = true;  \r\n",
+                        "segments": window.oldWordSegments
                     },
                     "old": {
                         "present": true,
                         "line": 1,
                         "kind": "deletion",
                         "marker": "-",
-                        "segments": [{
-                            "text": "let old_word = true;",
-                            "changed": true
-                        }]
+                        "lineEnd": "crlf",
+                        "copyText": "\tlet old_word = true;  \r\n",
+                        "segments": window.oldWordSegments
                     },
                     "new": {
                         "present": true,
                         "line": 1,
                         "kind": "addition",
                         "marker": "+",
-                        "segments": [{
-                            "text": "let new_word = true;",
-                            "changed": true
-                        }]
+                        "lineEnd": "lf",
+                        "copyText": "    let new_word = true;\n",
+                        "segments": window.newWordSegments
                     }
                 }, {
                     "type": "line",
                     "hunkId": "review-hunk-fixture",
                     "openLine": 1,
                     "splitHidden": true,
+                    "lineEndChanged": true,
                     "unified": {
                         "oldLine": 0,
                         "newLine": 1,
                         "kind": "addition",
                         "marker": "+",
-                        "segments": [{
-                            "text": "let new_word = true;",
-                            "changed": true
-                        }]
+                        "lineEnd": "lf",
+                        "copyText": "    let new_word = true;\n",
+                        "segments": window.newWordSegments
                     },
                     "old": { "present": false },
                     "new": { "present": false }
@@ -1271,11 +1321,73 @@ Kirigami.ApplicationWindow {
     Component.onCompleted: {
         if (screenshotPath.length > 0) {
             fixtureBackend.jobs = [];
+            if (screenshotReveal)
+                reviewFixture.setRevealWhitespace(true);
             smokeTimeout.stop();
             screenshotTimer.start();
             return;
         }
         realBackend.openProject(realProjectId);
+
+        // Whitespace rendering, both ways round. The property is written
+        // directly rather than through `setRevealWhitespace` so that nothing
+        // is queued behind this block; what the setter adds
+        // on top of it, holding the reader's place, is checked once there is
+        // a diff long enough to have a place to hold.
+        const revealedBefore = reviewFixture.revealWhitespace;
+        const quiet = reviewFixture.highlightedLine(
+            oldWordSegments, "src/main.rs", "deletion", "none", false
+        );
+        const quietUnchangedEnding = reviewFixture.highlightedLine(
+            newWordSegments, "src/main.rs", "addition", "lf", false
+        );
+        const quietChangedEnding = reviewFixture.highlightedLine(
+            oldWordSegments, "src/main.rs", "deletion", "crlf", true
+        );
+        reviewFixture.revealWhitespace = true;
+        const revealed = reviewFixture.highlightedLine(
+            oldWordSegments, "src/main.rs", "deletion", "none", false
+        );
+        const revealedEnding = reviewFixture.highlightedLine(
+            newWordSegments, "src/main.rs", "addition", "lf", false
+        );
+        const revealedCopy = reviewFixture.copyTextForRow(
+            fixtureBackend.review.file.rows[2]
+        );
+        reviewFixture.revealWhitespace = false;
+
+        whitespaceRenderDetected =
+            // Off by default, and the trailing run is tinted anyway: it is
+            // the change nobody thinks to look for.
+            revealedBefore === false
+            && quiet.indexOf("background-color") !== -1
+            && quiet.indexOf("\u00b7") === -1
+            && quiet.indexOf("\u00bb") === -1
+            // A changed run that is nothing but whitespace carries the
+            // emphasis and a tint at once, rather than an empty underline.
+            && quiet.indexOf("text-decoration:underline") !== -1
+            && quiet.split("background-color").length - 1 >= 2
+            // An unchanged line ending says nothing until it is asked to.
+            && quietUnchangedEnding.indexOf("\u21b5") === -1
+            && quietChangedEnding.indexOf("CRLF") !== -1
+            // Revealed, both whitespace bytes are told apart, every ending is
+            // marked, and not one column has moved.
+            && revealed.indexOf("\u00b7") !== -1
+            && revealed.indexOf("\u00bb") !== -1
+            && revealedEnding.indexOf("\u21b5") !== -1
+            && renderedColumns(revealed) === renderedColumns(quiet);
+
+        // What reaches the clipboard is the line as it was read, never the
+        // glyphs drawn over it.
+        whitespaceCopyDetected = revealedCopy === "\tlet old_word = true;  \r\n"
+            && reviewFixture.copyTextForRow(
+                fixtureBackend.review.file.rows[1]
+            ) === "";
+        // The write itself cannot be read back without a display, so this
+        // covers the call rather than the paste: a broken one raises, and a
+        // raised warning is fatal to this run.
+        reviewFixture.reviewCurrentIndex = 2;
+        reviewFixture.copyCurrentReviewLine();
         changesFixture.selectPath("fixture-path", "added", "modified");
         fixtureBackend.jobs = [];
         const previewProbe = historyFixture.commitSummaryPreview(
@@ -1471,6 +1583,19 @@ Kirigami.ApplicationWindow {
             )
             .unwrap()
             .replace("__REAL_PROJECT_ID__", &real_project_id)
+            // Both reveal states are worth a screenshot, and a screenshot run
+            // does not drive the surface through its checks: the state is
+            // chosen before the grab rather than toggled during one.
+            .replace(
+                "__SCREENSHOT_REVEAL__",
+                if std::env::var("HARKNESS_QML_SCREENSHOT_REVEAL")
+                    .is_ok_and(|value| value == "1" || value == "true")
+                {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
             .replace(
                 "__SCREENSHOT_PATH__",
                 &screenshot_path

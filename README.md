@@ -343,12 +343,17 @@ pages commit history through Git cursors, compares commits or a branch against
 its pinned merge-base, and loads one selected file at a time. Its virtualized
 unified and side-by-side layouts render the Git layer's intra-line ranges, apply
 presentation-only syntax color, expand stable blob-addressed context, and expose
-keyboard navigation between files and hunks. Managed worktree rows expose move,
+keyboard navigation between files and hunks. Trailing whitespace and a changed
+indent are tinted without being asked for, a changed line ending is named on the
+line it changed on, and a reveal control (Alt+W) draws every space and tab
+without moving a column; copying a line yields the bytes, never the glyphs. Managed worktree rows expose move,
 lock, and unlock while showing the stored lock reason inline.
 
 ### Git review UI
 
 ![Selected changed lines in the lazily loaded unified review diff](docs/screenshots/review-surface.png)
+
+![The same diff with whitespace revealed, spaces and tabs drawn apart](docs/screenshots/review-whitespace.png)
 
 ![Git panel showing a selected hunk diff](docs/screenshots/git-panel.png)
 

@@ -2688,38 +2688,231 @@ fn display_line_end(bytes: &[u8]) -> usize {
         .len()
 }
 
-fn to_text_segments(
-    bytes: &[u8],
-    ranges: Option<&[harkness_git::IntraLineRange]>,
-) -> QList<QVariant> {
-    let end = display_line_end(bytes);
-    let mut segments = QList::<QVariant>::default();
-    let mut push = |slice: &[u8], changed: bool| {
-        if slice.is_empty() {
-            return;
-        }
-        let mut value = QMap::<QMapPair_QString_QVariant>::default();
-        value.insert(
-            QString::from("text"),
-            QVariant::from(&QString::from(String::from_utf8_lossy(slice).as_ref())),
-        );
-        value.insert(QString::from("changed"), QVariant::from(&changed));
-        segments.append(QVariant::from(&value));
-    };
+/// The terminator `display_line_end` cuts away, named for QML.
+///
+/// The segment text stays free of the bytes — a renderer that had to carry
+/// them would have to decide what a carriage return looks like in the middle
+/// of a run — so the row says which ending it had instead. Without this a
+/// CRLF-to-LF change reaches the surface as two identical-looking lines.
+fn line_ending_name(bytes: &[u8]) -> &'static str {
+    if bytes.ends_with(b"\r\n") {
+        "crlf"
+    } else if bytes.ends_with(b"\n") {
+        "lf"
+    } else if bytes.ends_with(b"\r") {
+        "cr"
+    } else {
+        "none"
+    }
+}
 
+/// Which whitespace byte a run is made of, when it is one run of one byte.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WhitespaceRun {
+    /// The run is file content, whatever bytes it happens to hold.
+    None,
+    Space,
+    Tab,
+}
+
+impl WhitespaceRun {
+    fn name(self) -> &'static str {
+        match self {
+            Self::None => "",
+            Self::Space => "space",
+            Self::Tab => "tab",
+        }
+    }
+}
+
+/// Where in the line a run sits, for the runs whose position is the point.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LineZone {
+    Content,
+    Leading,
+    Trailing,
+}
+
+impl LineZone {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Content => "",
+            Self::Leading => "leading",
+            Self::Trailing => "trailing",
+        }
+    }
+}
+
+/// One run of a diff line as QML paints it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TextSegment<'a> {
+    text: &'a [u8],
+    changed: bool,
+    whitespace: WhitespaceRun,
+    zone: LineZone,
+}
+
+/// The first content byte and the byte after the last one.
+///
+/// A line that is nothing but whitespace has no content byte, so it reports an
+/// empty trailing boundary at zero: `zone_at` tests trailing first, which
+/// makes the whole of such a line trailing whitespace. That is the reading a
+/// reviewer wants — an all-blank line is the accident, not an indent.
+fn whitespace_zones(display: &[u8]) -> (usize, usize) {
+    let leading_end = display
+        .iter()
+        .position(|byte| !matches!(byte, b' ' | b'\t'))
+        .unwrap_or(display.len());
+    let trailing_start = display
+        .iter()
+        .rposition(|byte| !matches!(byte, b' ' | b'\t'))
+        .map_or(0, |index| index + 1);
+    (leading_end, trailing_start)
+}
+
+/// How one byte is painted: where it sits, and whether it is whitespace the
+/// reader is being shown rather than content they are reading.
+fn run_at(
+    display: &[u8],
+    index: usize,
+    leading_end: usize,
+    trailing_start: usize,
+) -> (LineZone, WhitespaceRun) {
+    let zone = if index >= trailing_start {
+        LineZone::Trailing
+    } else if index < leading_end {
+        LineZone::Leading
+    } else {
+        LineZone::Content
+    };
+    let whitespace = match (zone, display[index]) {
+        (LineZone::Content, _) => WhitespaceRun::None,
+        (_, b'\t') => WhitespaceRun::Tab,
+        (_, _) => WhitespaceRun::Space,
+    };
+    (zone, whitespace)
+}
+
+/// Splits `display[start..stop]` into runs QML can paint separately.
+///
+/// Only the leading and trailing whitespace runs are cut out, one segment per
+/// whitespace byte kind, so a tab is never handed over as the same run as the
+/// spaces beside it. Whitespace *inside* the line stays in its content run on
+/// purpose: the QML lexer reads a segment as a whole, and splitting every
+/// interior space would break a string literal into unrecognisable halves. The
+/// renderer reveals those bytes within the run instead.
+///
+/// Every cut lands on an ASCII space or tab, which is never a UTF-8
+/// continuation byte, so this never turns valid content into replacement
+/// characters that lossy decoding would not have produced anyway.
+fn push_segments<'a>(
+    display: &'a [u8],
+    start: usize,
+    stop: usize,
+    changed: bool,
+    leading_end: usize,
+    trailing_start: usize,
+    out: &mut Vec<TextSegment<'a>>,
+) {
+    let mut cursor = start;
+    while cursor < stop {
+        let (zone, whitespace) = run_at(display, cursor, leading_end, trailing_start);
+        let mut end = cursor + 1;
+        while end < stop && run_at(display, end, leading_end, trailing_start) == (zone, whitespace)
+        {
+            end += 1;
+        }
+        out.push(TextSegment {
+            text: &display[cursor..end],
+            changed,
+            whitespace,
+            zone,
+        });
+        cursor = end;
+    }
+}
+
+/// The rendered runs of one diff line, in order, terminator excluded.
+fn text_segments<'a>(
+    bytes: &'a [u8],
+    ranges: Option<&[harkness_git::IntraLineRange]>,
+) -> Vec<TextSegment<'a>> {
+    let end = display_line_end(bytes);
+    let display = &bytes[..end];
+    let (leading_end, trailing_start) = whitespace_zones(display);
+    let mut segments = Vec::new();
     let Some(ranges) = ranges else {
-        push(&bytes[..end], false);
+        push_segments(
+            display,
+            0,
+            end,
+            false,
+            leading_end,
+            trailing_start,
+            &mut segments,
+        );
         return segments;
     };
     let mut cursor = 0;
     for range in ranges {
         let start = range.start.min(end).max(cursor);
         let range_end = range.end.min(end).max(start);
-        push(&bytes[cursor..start], false);
-        push(&bytes[start..range_end], true);
+        push_segments(
+            display,
+            cursor,
+            start,
+            false,
+            leading_end,
+            trailing_start,
+            &mut segments,
+        );
+        push_segments(
+            display,
+            start,
+            range_end,
+            true,
+            leading_end,
+            trailing_start,
+            &mut segments,
+        );
         cursor = range_end;
     }
-    push(&bytes[cursor..end], false);
+    push_segments(
+        display,
+        cursor,
+        end,
+        false,
+        leading_end,
+        trailing_start,
+        &mut segments,
+    );
+    segments
+}
+
+fn to_text_segments(
+    bytes: &[u8],
+    ranges: Option<&[harkness_git::IntraLineRange]>,
+) -> QList<QVariant> {
+    let mut segments = QList::<QVariant>::default();
+    for segment in text_segments(bytes, ranges) {
+        let mut value = QMap::<QMapPair_QString_QVariant>::default();
+        value.insert(
+            QString::from("text"),
+            QVariant::from(&QString::from(
+                String::from_utf8_lossy(segment.text).as_ref(),
+            )),
+        );
+        value.insert(QString::from("changed"), QVariant::from(&segment.changed));
+        value.insert(
+            QString::from("whitespace"),
+            QVariant::from(&QString::from(segment.whitespace.name())),
+        );
+        value.insert(
+            QString::from("zone"),
+            QVariant::from(&QString::from(segment.zone.name())),
+        );
+        segments.append(QVariant::from(&value));
+    }
     segments
 }
 
@@ -2727,6 +2920,15 @@ fn empty_review_side() -> QVariant {
     let mut side = QMap::<QMapPair_QString_QVariant>::default();
     side.insert(QString::from("present"), QVariant::from(&false));
     QVariant::from(&side)
+}
+
+/// The line exactly as it exists, for the clipboard.
+///
+/// What the reader copies is the content bytes, never the glyphs a revealing
+/// renderer drew over them, so the copy carries the terminator the row only
+/// names.
+fn to_copy_text(bytes: &[u8]) -> QVariant {
+    QVariant::from(&QString::from(String::from_utf8_lossy(bytes).as_ref()))
 }
 
 fn to_review_side(line: &harkness_git::DiffLine, number: Option<u32>) -> QVariant {
@@ -2749,6 +2951,11 @@ fn to_review_side(line: &harkness_git::DiffLine, number: Option<u32>) -> QVarian
             line.intra_line_ranges.as_deref(),
         )),
     );
+    side.insert(
+        QString::from("lineEnd"),
+        QVariant::from(&QString::from(line_ending_name(&line.content))),
+    );
+    side.insert(QString::from("copyText"), to_copy_text(&line.content));
     QVariant::from(&side)
 }
 
@@ -2775,6 +2982,11 @@ fn to_unified_review_line(line: &harkness_git::DiffLine) -> QVariant {
             line.intra_line_ranges.as_deref(),
         )),
     );
+    value.insert(
+        QString::from("lineEnd"),
+        QVariant::from(&QString::from(line_ending_name(&line.content))),
+    );
+    value.insert(QString::from("copyText"), to_copy_text(&line.content));
     QVariant::from(&value)
 }
 
@@ -2822,6 +3034,15 @@ fn to_review_line_row(hunk_id: &str, hunk: &harkness_git::Hunk, index: usize) ->
         QVariant::from(&bounded_i32(best_working_tree_line(hunk, index))),
     );
     row.insert(QString::from("splitHidden"), QVariant::from(&split_hidden));
+    // A line whose only change is its terminator has no changed byte inside
+    // the segments — the ranges clamp to nothing — so the pair reports the
+    // difference here or it is never shown at all.
+    row.insert(
+        QString::from("lineEndChanged"),
+        QVariant::from(&partner.is_some_and(|partner| {
+            line_ending_name(&partner.content) != line_ending_name(&line.content)
+        })),
+    );
     QVariant::from(&row)
 }
 
@@ -2876,6 +3097,11 @@ fn to_context_side(content: &[u8], number: u32, present: bool) -> QVariant {
         QString::from("segments"),
         QVariant::from(&to_text_segments(content, None)),
     );
+    side.insert(
+        QString::from("lineEnd"),
+        QVariant::from(&QString::from(line_ending_name(content))),
+    );
+    side.insert(QString::from("copyText"), to_copy_text(content));
     QVariant::from(&side)
 }
 
@@ -2898,6 +3124,11 @@ fn to_context_row(line: &ReviewContextLine) -> QVariant {
         QString::from("segments"),
         QVariant::from(&to_text_segments(&line.content, None)),
     );
+    unified.insert(
+        QString::from("lineEnd"),
+        QVariant::from(&QString::from(line_ending_name(&line.content))),
+    );
+    unified.insert(QString::from("copyText"), to_copy_text(&line.content));
 
     let mut row = QMap::<QMapPair_QString_QVariant>::default();
     row.insert(
@@ -2918,6 +3149,9 @@ fn to_context_row(line: &ReviewContextLine) -> QVariant {
         QVariant::from(&bounded_i32(line.new_line.max(1))),
     );
     row.insert(QString::from("splitHidden"), QVariant::from(&false));
+    // Expanded context is one line read from one side; there is no pair whose
+    // terminators could disagree.
+    row.insert(QString::from("lineEndChanged"), QVariant::from(&false));
     QVariant::from(&row)
 }
 
@@ -6894,20 +7128,21 @@ mod tests {
         advance_review_file_window, advance_review_row_window, attach_discard_snapshots,
         attach_discard_snapshots_with, begin_job, begin_job_in_scope, best_working_tree_line,
         cancel_issue_jobs, change_worktree_lock_with_service, conflicting_repository_job,
-        display_diff_path, empty_opened, end_job, exact_hunk_selections,
+        display_diff_path, display_line_end, empty_opened, end_job, exact_hunk_selections,
         expand_review_context_with_git, github_cli_command, github_cli_output_with_executable,
-        github_graphql_arguments, hidden_before, jobs_conflict, load_history_page_with_git,
-        load_review_file_with_git, load_review_with_git, load_review_with_initial_file_with_git,
-        move_worktree_with_service, operation_outcome, parse_github_issues, parse_whitespace_mode,
-        project_repository_lock_scopes, project_rows, project_worktree_lifecycle_lock_scopes,
-        register_path_selection, register_review_path_identity, remove_worktree_with_service,
+        github_graphql_arguments, hidden_before, jobs_conflict, line_ending_name,
+        load_history_page_with_git, load_review_file_with_git, load_review_with_git,
+        load_review_with_initial_file_with_git, move_worktree_with_service, operation_outcome,
+        parse_github_issues, parse_whitespace_mode, project_repository_lock_scopes, project_rows,
+        project_worktree_lifecycle_lock_scopes, register_path_selection,
+        register_review_path_identity, remove_worktree_with_service,
         replace_status_path_selections, resolve_commit_scope, resolve_path_selection, resume_at,
         retreat_review_file_window, retreat_review_row_window, review_content_summary,
         review_file_discard_description, review_file_window, review_hunk_exists_where, review_path,
         review_row_count, review_rows, run_git_operation_with_git, run_git_status_with_git,
-        selected_review_path, status_discard_description, to_branches, to_git, to_jobs, to_map,
-        to_projects, to_review, update_job, working_tree_may_differ, worktree_base,
-        worktree_job_lock_scope,
+        selected_review_path, status_discard_description, text_segments, to_branches, to_git,
+        to_jobs, to_map, to_projects, to_review, to_review_line_row, update_job,
+        working_tree_may_differ, worktree_base, worktree_job_lock_scope,
     };
 
     fn project(
@@ -9022,6 +9257,210 @@ mod tests {
             .rposition(|line| matches!(line.kind, harkness_git::DiffLineKind::Deletion))
             .unwrap();
         assert_eq!(best_working_tree_line(hunk, final_deletion_index), 1);
+    }
+
+    fn segment_shapes(
+        bytes: &[u8],
+        ranges: Option<&[harkness_git::IntraLineRange]>,
+    ) -> Vec<(String, bool, &'static str, &'static str)> {
+        text_segments(bytes, ranges)
+            .into_iter()
+            .map(|segment| {
+                (
+                    String::from_utf8_lossy(segment.text).into_owned(),
+                    segment.changed,
+                    segment.whitespace.name(),
+                    segment.zone.name(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn diff_line_segments_cut_out_the_runs_the_reader_cannot_see() {
+        // One run per whitespace byte kind, so a tab is never handed over as
+        // the same run as the spaces beside it. Interior whitespace stays in
+        // its content run: the QML lexer reads a segment whole, and a string
+        // literal split at its space would stop being recognisable as one.
+        assert_eq!(
+            segment_shapes(b"\t  value = 1;  \t\r\n", None),
+            vec![
+                ("\t".to_owned(), false, "tab", "leading"),
+                ("  ".to_owned(), false, "space", "leading"),
+                ("value = 1;".to_owned(), false, "", ""),
+                ("  ".to_owned(), false, "space", "trailing"),
+                ("\t".to_owned(), false, "tab", "trailing"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_line_of_nothing_but_whitespace_is_trailing_whitespace() {
+        assert_eq!(
+            segment_shapes(b"   \t\n", None),
+            vec![
+                ("   ".to_owned(), false, "space", "trailing"),
+                ("\t".to_owned(), false, "tab", "trailing"),
+            ]
+        );
+    }
+
+    #[test]
+    fn intra_line_emphasis_lands_on_the_leading_run_that_changed() {
+        let ranges = [harkness_git::IntraLineRange { start: 0, end: 4 }];
+        assert_eq!(
+            segment_shapes(b"    value\n", Some(&ranges)),
+            vec![
+                ("    ".to_owned(), true, "space", "leading"),
+                ("value".to_owned(), false, "", ""),
+            ]
+        );
+    }
+
+    #[test]
+    fn whitespace_runs_never_split_a_multibyte_character() {
+        // Latin-1 bytes that are not valid UTF-8, indented and with a trailing
+        // space. Every cut lands on an ASCII space or tab, which is never a
+        // continuation byte, so the invalid bytes reach QML in one run and are
+        // decoded lossily exactly where they would have been anyway.
+        assert_eq!(
+            segment_shapes(b"  caf\xe9 \n", None),
+            vec![
+                ("  ".to_owned(), false, "space", "leading"),
+                ("caf\u{fffd}".to_owned(), false, "", ""),
+                (" ".to_owned(), false, "space", "trailing"),
+            ]
+        );
+    }
+
+    #[test]
+    fn line_endings_are_named_rather_than_segmented() {
+        assert_eq!(line_ending_name(b"value\r\n"), "crlf");
+        assert_eq!(line_ending_name(b"value\n"), "lf");
+        assert_eq!(line_ending_name(b"value\r"), "cr");
+        assert_eq!(line_ending_name(b"value"), "none");
+        assert_eq!(display_line_end(b"value\r\n"), "value".len());
+    }
+
+    fn review_map(value: &QVariant) -> QMap<QMapPair_QString_QVariant> {
+        value
+            .value::<QMap<QMapPair_QString_QVariant>>()
+            .expect("a review projection should flatten to a QVariantMap")
+    }
+
+    fn review_field(map: &QMap<QMapPair_QString_QVariant>, key: &str) -> QVariant {
+        map.get(&QString::from(key))
+            .unwrap_or_else(|| panic!("the review projection should carry {key}"))
+    }
+
+    fn review_text(map: &QMap<QMapPair_QString_QVariant>, key: &str) -> String {
+        review_field(map, key)
+            .value::<QString>()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn review_flag(map: &QMap<QMapPair_QString_QVariant>, key: &str) -> bool {
+        review_field(map, key).value::<bool>().unwrap_or_default()
+    }
+
+    fn review_segment_shapes(
+        map: &QMap<QMapPair_QString_QVariant>,
+    ) -> Vec<(String, bool, String, String)> {
+        review_field(map, "segments")
+            .value::<QList<QVariant>>()
+            .expect("segments should flatten to a QVariantList")
+            .iter()
+            .map(review_map)
+            .map(|segment| {
+                (
+                    review_text(&segment, "text"),
+                    review_flag(&segment, "changed"),
+                    review_text(&segment, "whitespace"),
+                    review_text(&segment, "zone"),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn review_rows_carry_the_whitespace_change_the_text_alone_hides() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("whitespace-review-repository");
+        initialize_repository(&root);
+        // The terminator *is* the fixture here, and a developer whose global
+        // configuration sets `core.autocrlf` would otherwise have it rewritten
+        // on the way into the index, taking the case under test with it.
+        let repository = Repository::open(&root).unwrap();
+        repository
+            .config()
+            .unwrap()
+            .set_bool("core.autocrlf", false)
+            .unwrap();
+        drop(repository);
+        let path = Path::new("indent.txt");
+        commit_file(&root, path, "value = 1;   \nwindows\r\n", "add whitespace");
+        fs::write(root.join(path), "value = 1;\nwindows\n").unwrap();
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
+        let files = git
+            .diff(
+                harkness_git::DiffTarget::Unstaged,
+                &harkness_git::DiffOptions::default().with_intra_line_ranges(true),
+            )
+            .unwrap();
+        let hunk = &files[0].hunks[0];
+        let deletion_at = |prefix: &[u8]| {
+            hunk.lines
+                .iter()
+                .position(|line| {
+                    matches!(line.kind, harkness_git::DiffLineKind::Deletion)
+                        && line.content.starts_with(prefix)
+                })
+                .expect("the fixture should delete this line")
+        };
+
+        // The stripped trailing run is the whole change, and it survives to
+        // QML as a trailing run on the old side that the new side does not
+        // have — which is the difference the two texts do not show.
+        let stripped = review_map(&to_review_line_row("hunk-1", hunk, deletion_at(b"value")));
+        let old_side = review_map(&review_field(&stripped, "old"));
+        let new_side = review_map(&review_field(&stripped, "new"));
+        assert_eq!(
+            review_segment_shapes(&old_side).last(),
+            Some(&(
+                "   ".to_owned(),
+                true,
+                "space".to_owned(),
+                "trailing".to_owned()
+            ))
+        );
+        assert_eq!(
+            review_segment_shapes(&new_side),
+            vec![("value = 1;".to_owned(), false, String::new(), String::new())]
+        );
+        assert!(!review_flag(&stripped, "lineEndChanged"));
+        assert_eq!(review_text(&old_side, "copyText"), "value = 1;   \n");
+
+        // The terminator change has no changed byte inside the segments at
+        // all: the ranges clamp to nothing, so the row is the only place it
+        // can be reported.
+        let terminated = review_map(&to_review_line_row("hunk-1", hunk, deletion_at(b"windows")));
+        assert!(review_flag(&terminated, "lineEndChanged"));
+        assert_eq!(
+            review_text(&review_map(&review_field(&terminated, "old")), "lineEnd"),
+            "crlf"
+        );
+        assert_eq!(
+            review_text(&review_map(&review_field(&terminated, "new")), "lineEnd"),
+            "lf"
+        );
+        assert_eq!(
+            review_text(
+                &review_map(&review_field(&terminated, "unified")),
+                "copyText"
+            ),
+            "windows\r\n"
+        );
     }
 
     #[test]

@@ -36,6 +36,10 @@ ColumnLayout {
     )
     property alias reviewContentY: reviewLineView.contentY
     property alias reviewCurrentIndex: reviewLineView.currentIndex
+    // Whether every whitespace byte is drawn, rather than only the runs that
+    // are wrong on their own. It belongs to the surface and not to a file:
+    // a reader who turned it on is auditing indentation, not one file's.
+    property bool revealWhitespace: false
     property bool splitLayout: false
     property int pendingHunkNavigation: 0
     property string pendingDiscardKind: ""
@@ -75,13 +79,140 @@ ColumnLayout {
         return Kirigami.Theme.disabledTextColor;
     }
 
+    // Blends `over` into `base` and returns an opaque colour. Every tint the
+    // reveal treatment paints ends up inside a rich-text span, which cannot
+    // see through itself to the row behind it, so the blend is resolved here
+    // instead of being left to an alpha channel.
+    function mixColor(base, over, amount) {
+        return Qt.rgba(
+            base.r + (over.r - base.r) * amount,
+            base.g + (over.g - base.g) * amount,
+            base.b + (over.b - base.b) * amount,
+            1
+        );
+    }
+
+    // What `lineColor` looks like once it has been painted: that function
+    // returns a translucent tint, and a span drawn on top of it has to start
+    // from the colour the row actually ended up.
+    function lineBackground(kind) {
+        if (kind === "addition") {
+            return mixColor(
+                Kirigami.Theme.backgroundColor,
+                Kirigami.Theme.positiveTextColor,
+                0.14
+            );
+        }
+        if (kind === "deletion") {
+            return mixColor(
+                Kirigami.Theme.backgroundColor,
+                Kirigami.Theme.negativeTextColor,
+                0.14
+            );
+        }
+        return Kirigami.Theme.backgroundColor;
+    }
+
+    // Trailing whitespace is tinted with the reveal control off, because it is
+    // the change a reader is least likely to think to look for and the one
+    // most likely to be an accident. A changed run is tinted too, so that
+    // intra-line emphasis over a range that is entirely whitespace marks
+    // something the eye can find rather than an apparently empty box.
+    // Everything else waits to be asked for.
+    function whitespaceBackground(segment, kind) {
+        if (segment.changed === true) {
+            return mixColor(
+                lineBackground(kind),
+                Kirigami.Theme.highlightColor,
+                0.34
+            ).toString();
+        }
+        if (segment.zone === "trailing") {
+            return mixColor(
+                lineBackground(kind),
+                Kirigami.Theme.neutralTextColor,
+                0.32
+            ).toString();
+        }
+        if (revealWhitespace) {
+            return mixColor(
+                lineBackground(kind),
+                Kirigami.Theme.disabledTextColor,
+                0.16
+            ).toString();
+        }
+        return "";
+    }
+
+    // Spaces and tabs become entities because rich text collapses runs of
+    // them. Revealed, each one becomes a glyph of the same advance width — a
+    // tab stays four columns wide and a space stays one — so no column moves
+    // between the two states and the side-by-side columns stay aligned.
+    //
+    // The reveal pass rewrites both byte kinds in a single scan on purpose:
+    // the markup it inserts contains spaces of its own, which a second pass
+    // over the result would go on to replace.
     function escapeCode(value) {
-        return String(value)
+        const escaped = String(value)
             .replace(/&/g, "&amp;")
             .replace(/</g, "&lt;")
-            .replace(/>/g, "&gt;")
-            .replace(/ /g, "&nbsp;")
-            .replace(/\t/g, "&nbsp;&nbsp;&nbsp;&nbsp;");
+            .replace(/>/g, "&gt;");
+        if (!revealWhitespace) {
+            return escaped
+                .replace(/ /g, "&nbsp;")
+                .replace(/\t/g, "&nbsp;&nbsp;&nbsp;&nbsp;");
+        }
+        // Both glyphs are Latin-1, which the monospace face the diff is set
+        // in covers itself. An arrow reads better and is what an editor would
+        // use, but it falls back to another font here, which draws it at that
+        // font's size and off the baseline the rest of the line sits on.
+        const opening = "<span style=\"color:"
+            + Kirigami.Theme.disabledTextColor.toString() + "\">";
+        return escaped.replace(/[ \t]/g, function(match) {
+            return match === "\t"
+                ? opening + "»</span>&nbsp;&nbsp;&nbsp;"
+                : opening + "·</span>";
+        });
+    }
+
+    // A run the backend cut out as whitespace: the glyphs come from
+    // `escapeCode` like any other text, and only the tint is decided here.
+    function whitespaceHtml(segment, kind) {
+        const body = escapeCode(String(segment.text));
+        const background = whitespaceBackground(segment, kind);
+        if (background.length === 0)
+            return body;
+        return "<span style=\"background-color:" + background + "\">"
+            + body + "</span>";
+    }
+
+    // The terminator is named rather than drawn. A CRLF and an LF differ by a
+    // byte with no width, so a pair whose endings disagree says which ending
+    // it had in as many letters; revealed, every other terminator is marked
+    // with one glyph so the reader can audit a file without reading labels.
+    function lineEndHtml(lineEnd, changed, kind) {
+        const ending = String(lineEnd || "");
+        if (ending.length === 0 || ending === "none")
+            return "";
+        if (changed !== true && !revealWhitespace)
+            return "";
+        // The one that changed is a label and has to be read, so it is a chip
+        // in the selection colours rather than a tint; the rest are marks and
+        // must not compete with the code beside them.
+        if (changed === true) {
+            return "&nbsp;<span style=\"background-color:"
+                + Kirigami.Theme.highlightColor.toString()
+                + ";color:" + Kirigami.Theme.highlightedTextColor.toString()
+                + "\">" + ending.toUpperCase() + "</span>";
+        }
+        return "&nbsp;<span style=\"background-color:"
+            + mixColor(
+                lineBackground(kind),
+                Kirigami.Theme.disabledTextColor,
+                0.16
+            ).toString()
+            + ";color:" + Kirigami.Theme.disabledTextColor.toString()
+            + "\">↵</span>";
     }
 
     function syntaxKeywords(path) {
@@ -197,18 +328,71 @@ ColumnLayout {
         return result;
     }
 
-    function highlightedLine(segments, path) {
+    // Emphasis wraps the whitespace treatment rather than replacing it, so a
+    // changed run that is nothing but spaces carries both at once.
+    function highlightedLine(segments, path, kind, lineEnd, lineEndChanged) {
         let result = "<span>";
         for (let index = 0; index < segments.length; ++index) {
             const segment = segments[index];
-            let content = syntaxHtml(segment.text, path);
+            let content = String(segment.whitespace || "").length > 0
+                ? whitespaceHtml(segment, kind)
+                : syntaxHtml(segment.text, path);
             if (segment.changed === true) {
                 content = "<span style=\"font-weight:700;text-decoration:underline\">"
                     + content + "</span>";
             }
             result += content;
         }
-        return result + "</span>";
+        return result + lineEndHtml(lineEnd, lineEndChanged, kind) + "</span>";
+    }
+
+    // Revealing changes no row's height, but the diff is a long list and the
+    // reader was somewhere in it: the position is restored the way a layout
+    // change restores it, rather than trusted to stay put.
+    function setRevealWhitespace(value) {
+        if (revealWhitespace === value)
+            return;
+        const position = reviewLineView.contentY;
+        const index = reviewLineView.currentIndex;
+        revealWhitespace = value;
+        Qt.callLater(function() {
+            const maximum = Math.max(0, reviewLineView.contentHeight - reviewLineView.height);
+            reviewLineView.contentY = Math.min(position, maximum);
+            reviewLineView.currentIndex = index;
+        });
+    }
+
+    // What a copy takes is the content the backend read, never the glyphs
+    // drawn over it: the reveal treatment lives entirely in the markup above
+    // and none of it reaches this text. Side-by-side copies the side that
+    // exists, preferring the one the reader can still edit.
+    function copyTextForRow(row) {
+        if (!row || row.type !== "line")
+            return "";
+        if (splitLayout) {
+            const side = row.new && row.new.present === true
+                ? row.new
+                : row.old;
+            if (side && side.present === true)
+                return String(side.copyText || "");
+        }
+        return String((row.unified || ({})).copyText || "");
+    }
+
+    function copyCurrentReviewLine() {
+        const index = reviewLineView.currentIndex;
+        if (index < 0 || index >= reviewRows.length)
+            return;
+        const value = copyTextForRow(reviewRows[index]);
+        if (value.length === 0)
+            return;
+        // A TextEdit is the only writer QtQuick offers for the clipboard, and
+        // this one is never shown, never focused and never left holding the
+        // line it just handed over.
+        clipboardBridge.text = value;
+        clipboardBridge.selectAll();
+        clipboardBridge.copy();
+        clipboardBridge.text = "";
     }
 
     function setSplitLayout(value) {
@@ -533,6 +717,12 @@ ColumnLayout {
     }
 
     Shortcut {
+        enabled: reviewSurface.reviewReady
+        sequence: "Alt+W"
+        onActivated: reviewSurface.setRevealWhitespace(!reviewSurface.revealWhitespace)
+    }
+
+    Shortcut {
         enabled: reviewSurface.hunkNavigationEnabled(1)
         sequence: "Alt+Shift+J"
         onActivated: reviewSurface.navigateHunk(1)
@@ -542,6 +732,24 @@ ColumnLayout {
         enabled: reviewSurface.hunkNavigationEnabled(-1)
         sequence: "Alt+Shift+K"
         onActivated: reviewSurface.navigateHunk(-1)
+    }
+
+    // Off screen and out of the layout: it exists to own a selection long
+    // enough to put one line on the clipboard.
+    TextEdit {
+        id: clipboardBridge
+
+        visible: false
+        width: 0
+    }
+
+    Controls.Menu {
+        id: reviewLineMenu
+
+        Controls.MenuItem {
+            text: qsTr("Copy line")
+            onTriggered: reviewSurface.copyCurrentReviewLine()
+        }
     }
 
     // The surface is driven entirely from the column beside it: a changed file,
@@ -941,6 +1149,21 @@ ColumnLayout {
                             Layout.fillWidth: true
                         }
 
+                        // Deliberately not `checkable`, for the reason the
+                        // blank-lines button above gives: a checkable button
+                        // toggles its own `checked` on click and destroys the
+                        // binding that reports the setting actually in force.
+                        Controls.ToolButton {
+                            Accessible.name: text
+                            Controls.ToolTip.text: qsTr("Show spaces, tabs and line endings (Alt+W)")
+                            Controls.ToolTip.visible: hovered
+                            checked: reviewSurface.revealWhitespace
+                            display: Controls.AbstractButton.IconOnly
+                            icon.name: "view-visible"
+                            text: qsTr("Reveal whitespace")
+                            onClicked: reviewSurface.setRevealWhitespace(!checked)
+                        }
+
                         Controls.ButtonGroup {
                             id: reviewLayoutGroup
                         }
@@ -1045,6 +1268,16 @@ ColumnLayout {
 
                         Keys.onEnterPressed: reviewSurface.openCurrentReviewLine()
                         Keys.onReturnPressed: reviewSurface.openCurrentReviewLine()
+                        // Scoped to the list rather than declared as a
+                        // Shortcut: copy belongs to whatever the reader is
+                        // actually in, and the surface has no claim on it
+                        // while the focus is somewhere else.
+                        Keys.onPressed: function(event) {
+                            if (event.matches(StandardKey.Copy)) {
+                                reviewSurface.copyCurrentReviewLine();
+                                event.accepted = true;
+                            }
+                        }
 
                         delegate: Loader {
                             id: reviewRowLoader
@@ -1265,6 +1498,15 @@ ColumnLayout {
                 }
             }
 
+            TapHandler {
+                acceptedButtons: Qt.RightButton
+                onTapped: {
+                    reviewLineView.currentIndex = reviewLineDelegate.rowIndex;
+                    reviewLineView.forceActiveFocus();
+                    reviewLineMenu.popup();
+                }
+            }
+
             Rectangle {
                 id: unifiedLine
 
@@ -1317,7 +1559,10 @@ ColumnLayout {
                         font.family: "monospace"
                         text: reviewSurface.highlightedLine(
                             reviewLineDelegate.unified.segments,
-                            reviewSurface.reviewFile.path || ""
+                            reviewSurface.reviewFile.path || "",
+                            reviewLineDelegate.unified.kind,
+                            reviewLineDelegate.unified.lineEnd,
+                            reviewLineDelegate.row.lineEndChanged === true
                         )
                         textFormat: Text.RichText
                         wrapMode: Text.WrapAnywhere
@@ -1395,7 +1640,10 @@ ColumnLayout {
                                 text: splitSide.modelData.present === true
                                     ? reviewSurface.highlightedLine(
                                         splitSide.modelData.segments,
-                                        reviewSurface.reviewFile.path || ""
+                                        reviewSurface.reviewFile.path || "",
+                                        splitSide.modelData.kind,
+                                        splitSide.modelData.lineEnd,
+                                        reviewLineDelegate.row.lineEndChanged === true
                                     )
                                     : ""
                                 textFormat: Text.RichText
