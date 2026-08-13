@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
+use crate::integration::IntegrationIdentity;
 use crate::tool::{RiskLevel, ToolDescriptor, ToolId};
 use crate::trust::{
     ContainedPath, ExecutionMode, ForcePush, PathBoundary, RequestClassification, TrustState,
@@ -39,7 +40,9 @@ pub use integration::{
 };
 
 /// Current version of `policy.json`.
-pub const POLICY_SCHEMA_VERSION: u32 = 1;
+pub const POLICY_SCHEMA_VERSION: u32 = 2;
+/// Oldest `policy.json` version this build can read.
+pub const MINIMUM_POLICY_SCHEMA_VERSION: u32 = 1;
 /// Name of the global policy file below the Harkness data directory.
 pub const USER_POLICY_FILE: &str = "policy.json";
 /// Repository-relative policy path.
@@ -206,8 +209,22 @@ impl PolicyDecision {
             if external.schema_version() != EXTERNAL_POLICY_CONTEXT_SCHEMA_VERSION {
                 return Err("external policy context was written by a newer Harkness build");
             }
-            external.validate_identity_shape()?;
-        } else if self.denial_kind.is_some() {
+            if external.validate_identity_shape().is_err() {
+                if !(self.verdict == PolicyVerdict::Deny
+                    && self.denial_kind.as_deref() == external.invalid_identity_denial_kind())
+                {
+                    return Err(
+                        "external policy context carries missing or irrelevant identity evidence",
+                    );
+                }
+            } else if let Some(kind) = self.denial_kind.as_deref()
+                && kind != external.capability().noninteractive_denial_kind()
+            {
+                return Err("external denial kind does not match the evaluated request");
+            }
+        } else if self.denial_kind.is_some()
+            && self.denial_kind.as_deref() != Some("external_identity_context_invalid")
+        {
             return Err("an external denial kind requires an external request context");
         }
         Ok(())
@@ -237,6 +254,7 @@ pub enum RunGrantScope {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RunGrant {
     scope: RunGrantScope,
+    integration_identity: IntegrationIdentity,
 }
 
 impl RunGrant {
@@ -251,14 +269,26 @@ impl RunGrant {
     /// the one production caller, and it reaches this only after every binding
     /// axis of the durable grant matched the candidate.
     #[must_use]
-    pub(crate) const fn matching(scope: RunGrantScope) -> Self {
-        Self { scope }
+    pub(crate) const fn matching(
+        scope: RunGrantScope,
+        integration_identity: IntegrationIdentity,
+    ) -> Self {
+        Self {
+            scope,
+            integration_identity,
+        }
     }
 
     /// Effective scope after approval scope ceilings were applied.
     #[must_use]
     pub const fn scope(self) -> RunGrantScope {
         self.scope
+    }
+
+    /// External identity evidence the approval matcher accepted.
+    #[must_use]
+    pub const fn integration_identity(self) -> IntegrationIdentity {
+        self.integration_identity
     }
 }
 
@@ -443,13 +473,19 @@ impl PolicyFile {
     }
 
     fn validate(&self, path: &Path) -> Result<(), PolicyLoadError> {
-        if self.version != POLICY_SCHEMA_VERSION {
+        if self.version < MINIMUM_POLICY_SCHEMA_VERSION {
             return Err(PolicyLoadError::Malformed {
                 path: path.to_path_buf(),
                 reason: format!(
                     "unsupported policy version {}; the minimum supported version is {}",
-                    self.version, POLICY_SCHEMA_VERSION
+                    self.version, MINIMUM_POLICY_SCHEMA_VERSION
                 ),
+            });
+        }
+        if self.version == 1 && !self.external_capabilities.is_empty() {
+            return Err(PolicyLoadError::Malformed {
+                path: path.to_path_buf(),
+                reason: "policy version 1 cannot carry external capability rules".to_owned(),
             });
         }
         for id in self.tools.keys() {
@@ -628,21 +664,38 @@ impl PolicyEngine {
     /// something milder.
     #[must_use]
     pub fn evaluate(&self, request: &PolicyRequest<'_>) -> PolicyDecision {
+        let declared_external = request
+            .descriptor()
+            .capabilities()
+            .iter()
+            .filter_map(ExternalCapability::from_capability)
+            .collect::<Vec<_>>();
+        if declared_external.len() > 1 {
+            return PolicyDecision::new(
+                PolicyVerdict::Deny,
+                "denied: a tool call must declare exactly one external operation",
+                PolicySource::BuiltIn,
+                false,
+            )
+            .for_request(request)
+            .denied_as("external_identity_context_invalid");
+        }
+        if declared_external.len() == 1 && request.external().is_none() {
+            return PolicyDecision::new(
+                PolicyVerdict::Deny,
+                format!(
+                    "denied: {} requires external policy context",
+                    declared_external[0].as_str()
+                ),
+                PolicySource::BuiltIn,
+                false,
+            )
+            .for_request(request)
+            .denied_as("external_identity_context_invalid");
+        }
         if let Some(external) = request.external() {
-            if let Some(kind) = external.identity_denial_kind() {
-                return PolicyDecision::new(
-                    PolicyVerdict::Deny,
-                    format!(
-                        "denied: {} requires observed identity evidence before evaluation",
-                        external.capability().as_str()
-                    ),
-                    PolicySource::BuiltIn,
-                    false,
-                )
-                .for_request(request)
-                .denied_as(kind);
-            }
-            if let Err(reason) = external.validate(request.descriptor().capabilities()) {
+            if let Err(reason) = external.validate_declaration(request.descriptor().capabilities())
+            {
                 return PolicyDecision::new(
                     PolicyVerdict::Deny,
                     format!("denied: {reason}"),
@@ -651,6 +704,19 @@ impl PolicyEngine {
                 )
                 .for_request(request)
                 .denied_as("external_identity_context_invalid");
+            }
+            if let Some(kind) = external.invalid_identity_denial_kind() {
+                return PolicyDecision::new(
+                    PolicyVerdict::Deny,
+                    format!(
+                        "denied: {} requires valid observed identity evidence before evaluation",
+                        external.capability().as_str()
+                    ),
+                    PolicySource::BuiltIn,
+                    false,
+                )
+                .for_request(request)
+                .denied_as(kind);
             }
         }
 
@@ -703,10 +769,13 @@ impl PolicyEngine {
             request.risk(),
             RiskLevel::RemoteWrite | RiskLevel::Destructive
         );
-        let matching_grant = request
-            .grants()
-            .iter()
-            .any(|grant| !exact_only || grant.scope == RunGrantScope::ExactCall);
+        let matching_grant = request.grants().iter().any(|grant| {
+            (!exact_only || grant.scope == RunGrantScope::ExactCall)
+                && request.external().map_or_else(
+                    || grant.integration_identity().is_empty(),
+                    |external| grant.integration_identity() == external.identity(),
+                )
+        });
         if verdict == PolicyVerdict::Ask && matching_grant {
             return PolicyDecision::new(
                 PolicyVerdict::Allow,
@@ -863,12 +932,16 @@ fn load_optional_file(path: &Path) -> Result<Option<PolicyFile>, PolicyLoadError
             maximum: POLICY_SCHEMA_VERSION,
         });
     }
-    let policy: PolicyFile =
+    let mut policy: PolicyFile =
         serde_json::from_slice(&bytes).map_err(|error| PolicyLoadError::Malformed {
             path: path.to_path_buf(),
             reason: error.to_string(),
         })?;
     policy.validate(path)?;
+    // Keep old files readable without rewriting them. Any later explicit
+    // persistence writes the newest schema, so v1 can never acquire a v2-only
+    // field while still claiming the old version.
+    policy.version = POLICY_SCHEMA_VERSION;
     Ok(Some(policy))
 }
 
@@ -1108,8 +1181,49 @@ mod tests {
     }
 
     fn external_context(capability: ExternalCapability) -> ExternalPolicyContext {
-        ExternalPolicyContext::new(capability, RiskLevel::Observe)
-            .with_identity(identity_for(capability))
+        match capability {
+            ExternalCapability::LaunchExternalAgent => {
+                ExternalPolicyContext::launch_external_agent(
+                    identity_for(capability).agent_executable_sha256(),
+                )
+            }
+            ExternalCapability::ConnectMcpServer => ExternalPolicyContext::connect_mcp_server(
+                identity_for(capability).agent_executable_sha256(),
+            ),
+            ExternalCapability::InvokeMcpTool => ExternalPolicyContext::invoke_mcp_tool(
+                declared(&descriptor(RiskLevel::Observe)),
+                identity_for(capability).mcp_tool_schema_fingerprint(),
+            ),
+            ExternalCapability::ReadForgeResource => ExternalPolicyContext::read_forge_resource(),
+            ExternalCapability::PushRemoteBranch => ExternalPolicyContext::push_remote_branch(),
+            ExternalCapability::CreatePullRequest => ExternalPolicyContext::create_pull_request(),
+            ExternalCapability::ModifyForgeResource => {
+                ExternalPolicyContext::modify_forge_resource()
+            }
+            ExternalCapability::ExecuteWorkflowRecipe => {
+                ExternalPolicyContext::execute_workflow_recipe(
+                    [RiskLevel::Observe],
+                    identity_for(capability).recipe_content_hash(),
+                )
+            }
+        }
+    }
+
+    fn external_context_without_identity(capability: ExternalCapability) -> ExternalPolicyContext {
+        match capability {
+            ExternalCapability::LaunchExternalAgent => {
+                ExternalPolicyContext::launch_external_agent(None)
+            }
+            ExternalCapability::ConnectMcpServer => ExternalPolicyContext::connect_mcp_server(None),
+            ExternalCapability::InvokeMcpTool => ExternalPolicyContext::invoke_mcp_tool(
+                declared(&descriptor(RiskLevel::Observe)),
+                None,
+            ),
+            ExternalCapability::ExecuteWorkflowRecipe => {
+                ExternalPolicyContext::execute_workflow_recipe([RiskLevel::Observe], None)
+            }
+            _ => external_context(capability),
+        }
     }
 
     /// The classification a request with no extra paths or flags produces.
@@ -1384,7 +1498,10 @@ mod tests {
         assert_eq!(decision.verdict(), PolicyVerdict::Ask);
         assert!(decision.one_call_only());
 
-        let broad = [RunGrant::matching(RunGrantScope::ToolForRun)];
+        let broad = [RunGrant::matching(
+            RunGrantScope::ToolForRun,
+            IntegrationIdentity::none(),
+        )];
         let with_broad_grant = PolicyRequest::new(
             &destructive,
             declared(&descriptor(RiskLevel::Observe)),
@@ -1421,9 +1538,9 @@ mod tests {
     fn every_force_variant_is_a_non_overridable_built_in_denial() {
         let descriptor = descriptor(RiskLevel::RemoteWrite);
         let grants = [
-            RunGrant::matching(RunGrantScope::ExactCall),
-            RunGrant::matching(RunGrantScope::ToolForRun),
-            RunGrant::matching(RunGrantScope::CapabilityForRun),
+            RunGrant::matching(RunGrantScope::ExactCall, IntegrationIdentity::none()),
+            RunGrant::matching(RunGrantScope::ToolForRun, IntegrationIdentity::none()),
+            RunGrant::matching(RunGrantScope::CapabilityForRun, IntegrationIdentity::none()),
         ];
         let engine = PolicyEngine::new(
             UserPolicy::default()
@@ -1531,10 +1648,10 @@ mod tests {
                 TrustState::Trusted,
                 ExecutionMode::Interactive,
             )
-            .with_external_context(
-                ExternalPolicyContext::new(capability, risk)
-                    .with_identity(identity_for(capability)),
-            );
+            .with_external_context(ExternalPolicyContext::execute_workflow_recipe(
+                [RiskLevel::Observe, risk],
+                identity_for(capability).recipe_content_hash(),
+            ));
             assert_eq!(request.risk(), risk);
         }
     }
@@ -1567,11 +1684,57 @@ mod tests {
                     TrustState::Trusted,
                     ExecutionMode::Interactive,
                 )
-                .with_external_context(ExternalPolicyContext::new(capability, RiskLevel::Observe)),
+                .with_external_context(external_context_without_identity(capability)),
             );
             assert_eq!(decision.verdict(), PolicyVerdict::Deny);
             assert_eq!(decision.denial_kind(), Some(kind));
+            assert!(decision.validate().is_ok(), "{capability:?}");
         }
+    }
+
+    #[test]
+    fn declaring_an_external_capability_requires_external_context() {
+        let capability = ExternalCapability::LaunchExternalAgent;
+        let descriptor = external_descriptor(capability, RiskLevel::Observe);
+        let decision =
+            PolicyEngine::new(UserPolicy::default(), None).evaluate(&PolicyRequest::new(
+                &descriptor,
+                declared(&descriptor),
+                TrustState::Trusted,
+                ExecutionMode::Interactive,
+            ));
+        assert_eq!(decision.verdict(), PolicyVerdict::Deny);
+        assert_eq!(
+            decision.denial_kind(),
+            Some("external_identity_context_invalid")
+        );
+        assert!(decision.validate().is_ok());
+    }
+
+    #[test]
+    fn a_grant_matched_to_an_old_identity_cannot_answer_policy_for_a_new_one() {
+        let capability = ExternalCapability::LaunchExternalAgent;
+        let descriptor = external_descriptor(capability, RiskLevel::Observe);
+        let approved =
+            IntegrationIdentity::none().with_agent_executable_sha256(Sha256Hash::of("agent-v1"));
+        let grants = [RunGrant::matching(RunGrantScope::ToolForRun, approved)];
+        let current =
+            ExternalPolicyContext::launch_external_agent(Some(Sha256Hash::of("agent-v2")));
+        let decision = PolicyEngine::new(UserPolicy::default(), None).evaluate(
+            &PolicyRequest::new(
+                &descriptor,
+                declared(&descriptor),
+                TrustState::Trusted,
+                ExecutionMode::NonInteractive,
+            )
+            .with_grants(&grants)
+            .with_external_context(current),
+        );
+        assert_eq!(decision.verdict(), PolicyVerdict::Deny);
+        assert_eq!(
+            decision.denial_kind(),
+            Some("noninteractive_external_agent_launch_denied")
+        );
     }
 
     #[test]
@@ -1619,8 +1782,14 @@ mod tests {
     fn every_external_noninteractive_ask_has_a_registered_denial_kind() {
         for capability in ExternalCapability::ALL.iter().copied() {
             let descriptor = external_descriptor(capability, RiskLevel::Observe);
-            let context = ExternalPolicyContext::new(capability, RiskLevel::WorkspaceWrite)
-                .with_identity(identity_for(capability));
+            let context = if capability == ExternalCapability::ExecuteWorkflowRecipe {
+                ExternalPolicyContext::execute_workflow_recipe(
+                    [RiskLevel::WorkspaceWrite],
+                    identity_for(capability).recipe_content_hash(),
+                )
+            } else {
+                external_context(capability)
+            };
             let decision = PolicyEngine::new(UserPolicy::default(), None).evaluate(
                 &PolicyRequest::new(
                     &descriptor,
@@ -1648,7 +1817,7 @@ mod tests {
         write_repository_policy(
             workspace.path(),
             r#"{
-  "version": 1,
+  "version": 2,
   "external_capabilities": {
     "launch_external_agent": "allow"
   }
@@ -1681,6 +1850,16 @@ mod tests {
         let mut unknown = encoded;
         unknown["future"] = serde_json::json!(true);
         assert!(serde_json::from_value::<ExternalPolicyContext>(unknown).is_err());
+
+        let future = serde_json::json!({
+            "schema_version": 2,
+            "capability": "invoke_mcp_tool",
+            "classified_risk": "execute",
+            "future": true
+        });
+        let error = serde_json::from_value::<ExternalPolicyContext>(future).unwrap_err();
+        assert!(error.to_string().contains("newer Harkness build"));
+        assert!(!error.to_string().contains("unknown field"));
     }
 
     #[test]
@@ -1724,7 +1903,10 @@ mod tests {
         assert_eq!(denied.verdict(), PolicyVerdict::Deny);
         assert!(denied.reason().contains("noninteractive"));
 
-        let grants = [RunGrant::matching(RunGrantScope::ToolForRun)];
+        let grants = [RunGrant::matching(
+            RunGrantScope::ToolForRun,
+            IntegrationIdentity::none(),
+        )];
         let allowed = engine.evaluate(&request(
             &descriptor,
             TrustState::Trusted,
@@ -1747,7 +1929,7 @@ mod tests {
             RunGrantScope::ToolForRun,
             RunGrantScope::CapabilityForRun,
         ] {
-            let grants = [RunGrant::matching(scope)];
+            let grants = [RunGrant::matching(scope, IntegrationIdentity::none())];
             let decision = engine.evaluate(&request(
                 &descriptor,
                 TrustState::Trusted,
@@ -1772,7 +1954,10 @@ mod tests {
             assert_eq!(decision.verdict(), PolicyVerdict::Ask);
             assert!(decision.one_call_only());
 
-            let broad = [RunGrant::matching(RunGrantScope::ToolForRun)];
+            let broad = [RunGrant::matching(
+                RunGrantScope::ToolForRun,
+                IntegrationIdentity::none(),
+            )];
             assert_eq!(
                 engine
                     .evaluate(&request(
@@ -1785,7 +1970,10 @@ mod tests {
                 PolicyVerdict::Deny
             );
 
-            let exact = [RunGrant::matching(RunGrantScope::ExactCall)];
+            let exact = [RunGrant::matching(
+                RunGrantScope::ExactCall,
+                IntegrationIdentity::none(),
+            )];
             let allowed = engine.evaluate(&request(
                 &descriptor,
                 TrustState::Trusted,
@@ -1811,7 +1999,24 @@ mod tests {
         assert_eq!(UserPolicy::load(&path).unwrap(), policy);
         assert_eq!(
             fs::read_to_string(path).unwrap(),
-            include_str!("fixtures/policy-v1.json")
+            include_str!("fixtures/policy-v2.json")
+        );
+    }
+
+    #[test]
+    fn a_v1_policy_loads_without_rewrite_and_upgrades_on_explicit_persist() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join(USER_POLICY_FILE);
+        let frozen = include_str!("fixtures/policy-v1.json");
+        fs::write(&path, frozen).unwrap();
+
+        let policy = UserPolicy::load(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), frozen);
+        policy.persist(&path).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&fs::read_to_string(path).unwrap()).unwrap()
+                ["version"],
+            2
         );
     }
 
@@ -1821,10 +2026,15 @@ mod tests {
             ("malformed.json", "{", "policy_malformed"),
             (
                 "unknown.json",
-                r#"{"version":1,"surprise":true}"#,
+                r#"{"version":2,"surprise":true}"#,
                 "policy_malformed",
             ),
-            ("future.json", r#"{"version":2}"#, "policy_version_too_new"),
+            ("future.json", r#"{"version":3}"#, "policy_version_too_new"),
+            (
+                "v1-external.json",
+                r#"{"version":1,"external_capabilities":{"invoke_mcp_tool":"deny"}}"#,
+                "policy_malformed",
+            ),
         ] {
             let directory = TempDir::new().unwrap();
             let path = directory.path().join(name);
@@ -1858,7 +2068,7 @@ mod tests {
     fn malformed_and_future_files_also_fail_closed_during_evaluation() {
         for (contents, source) in [
             ("{", PolicySource::UserPolicy),
-            (r#"{"version":2}"#, PolicySource::UserPolicy),
+            (r#"{"version":3}"#, PolicySource::UserPolicy),
         ] {
             let data = TempDir::new().unwrap();
             let workspace = TempDir::new().unwrap();
@@ -1882,7 +2092,7 @@ mod tests {
 
     #[test]
     fn a_repository_policy_that_cannot_be_read_denies_and_names_itself() {
-        for contents in ["{", r#"{"version":2}"#, r#"{"version":1,"surprise":true}"#] {
+        for contents in ["{", r#"{"version":3}"#, r#"{"version":2,"surprise":true}"#] {
             let workspace = TempDir::new().unwrap();
             write_repository_policy(workspace.path(), contents);
             let decision = repository_decision(workspace.path());
@@ -2020,8 +2230,8 @@ mod tests {
             },
             PolicyLoadError::VersionTooNew {
                 path,
-                found: 2,
-                maximum: 1,
+                found: 3,
+                maximum: 2,
             },
         ];
         assert_eq!(

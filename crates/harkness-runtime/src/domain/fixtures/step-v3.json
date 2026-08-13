@@ -1,0 +1,19 @@
+{
+  "schema_version": 3,
+  "id": "33333333-3333-4333-8333-333333333333",
+  "run_id": "22222222-2222-4222-8222-222222222222",
+  "ordinal": 0,
+  "title": "Inspect repository",
+  "state": "running",
+  "revision": 3,
+  "created_at": "1970-01-01T00:00:00Z",
+  "updated_at": "1970-01-01T00:00:03Z",
+  "started_at": "1970-01-01T00:00:01Z",
+  "approvals": [
+    {
+      "decided_by": "user:42",
+      "decision": "approved",
+      "decided_at": "1970-01-01T00:00:03Z"
+    }
+  ]
+}

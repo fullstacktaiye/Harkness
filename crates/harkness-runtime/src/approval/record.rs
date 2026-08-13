@@ -8,6 +8,7 @@ use time::{OffsetDateTime, UtcOffset};
 
 use crate::domain::{ApprovalId, RunId, ToolCallId};
 use crate::integration::IntegrationIdentity;
+use crate::policy::ExternalCapability;
 use crate::tool::{Capability, RiskLevel, ToolIdentity};
 
 use super::{ApprovalError, ApprovalGrant, InputHash};
@@ -570,6 +571,8 @@ impl ApprovalRequest {
                 scope: ApprovalScope::CapabilityForRun,
             });
         }
+        validate_integration_identity(&pending.capabilities, pending.integration_identity)
+            .map_err(|reason| ApprovalError::InvalidIntegrationIdentity { reason })?;
         Ok(Self {
             id,
             pending,
@@ -626,6 +629,11 @@ impl ApprovalRequest {
         }
         if effective_scope == ApprovalScope::CapabilityForRun && pending.capabilities.is_empty() {
             return refuse("it is scoped to a capability but names none");
+        }
+        if let Err(reason) =
+            validate_integration_identity(&pending.capabilities, pending.integration_identity)
+        {
+            return refuse(reason);
         }
         if state.is_terminal() != resolved_at.is_some() {
             return refuse(
@@ -939,6 +947,22 @@ impl ApprovalRequest {
     /// As [`ApprovalRequest::resolve`].
     pub fn supersede(&mut self, at: OffsetDateTime) -> Result<(), ApprovalError> {
         self.resolve(ApprovalState::Superseded, at)
+    }
+}
+
+fn validate_integration_identity(
+    capabilities: &[Capability],
+    identity: IntegrationIdentity,
+) -> Result<(), &'static str> {
+    let external = capabilities
+        .iter()
+        .filter_map(ExternalCapability::from_capability)
+        .collect::<Vec<_>>();
+    match external.as_slice() {
+        [] if identity.is_empty() => Ok(()),
+        [] => Err("a local operation cannot carry external integration identity"),
+        [capability] => capability.validate_identity_shape(identity),
+        _ => Err("an approval must describe exactly one external operation"),
     }
 }
 
@@ -1372,6 +1396,16 @@ pub(super) mod tests {
                 .collect::<Vec<_>>(),
             ["fs.write", "network"]
         );
+    }
+
+    #[test]
+    fn identity_bearing_external_approvals_cannot_omit_their_identity() {
+        let error = ApprovalRequest::open(
+            pending(RiskLevel::Execute)
+                .with_capabilities([Capability::new("invoke_mcp_tool").unwrap()]),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), "approval_invalid_integration_identity");
     }
 
     #[test]

@@ -1205,6 +1205,35 @@ fn a_denied_tool_call_records_the_policy_decision() {
 }
 
 #[test]
+fn a_missing_external_identity_denial_is_persisted_and_terminalizes_the_call() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = stored_step(&fixture.store, &run);
+    let call = stored_tool_call(&fixture.store, &step);
+    let decision: PolicyDecision = serde_json::from_value(json!({
+        "verdict": "deny",
+        "reason": "denied: invoke_mcp_tool requires observed identity evidence",
+        "source": "built_in",
+        "external_request": {
+            "schema_version": 1,
+            "capability": "invoke_mcp_tool",
+            "classified_risk": "execute"
+        },
+        "denial_kind": "mcp_tool_schema_identity_required"
+    }))
+    .unwrap();
+
+    let denied = fixture
+        .store
+        .apply_tool_call_policy_decision(call.id(), decision.clone(), at(10))
+        .unwrap();
+    assert_eq!(denied.state(), ToolCallState::Denied);
+    assert_eq!(denied.policy_decision(), Some(&decision));
+    assert_eq!(fixture.store.load_tool_call(call.id()).unwrap(), denied);
+}
+
+#[test]
 fn every_policy_verdict_is_persisted_before_its_lifecycle_consequence() {
     for (verdict, expected_state) in [
         (PolicyVerdict::Allow, ToolCallState::Pending),
@@ -3468,7 +3497,7 @@ fn only_granted_requests_become_grants_and_they_bind_to_their_own_call() {
         &tool,
         canonical_input_hash(&approval_input()).unwrap(),
     );
-    assert_eq!(matching_grants(&grants, &approved).len(), 1);
+    assert_eq!(matching_grants(&grants, &approved).grants().len(), 1);
 
     // The same tool, one byte of input different.
     let altered = CandidateCall::new(
@@ -3479,7 +3508,7 @@ fn only_granted_requests_become_grants_and_they_bind_to_their_own_call() {
         canonical_input_hash(&json!({"path": "src/lib.rs", "contents": "fn main() { rm() }"}))
             .unwrap(),
     );
-    assert!(matching_grants(&grants, &altered).is_empty());
+    assert!(matching_grants(&grants, &altered).grants().is_empty());
 
     // The same call, in a later run.
     let replayed = CandidateCall::new(
@@ -3489,7 +3518,7 @@ fn only_granted_requests_become_grants_and_they_bind_to_their_own_call() {
         &tool,
         canonical_input_hash(&approval_input()).unwrap(),
     );
-    assert!(matching_grants(&grants, &replayed).is_empty());
+    assert!(matching_grants(&grants, &replayed).grants().is_empty());
 }
 
 #[test]
@@ -3990,7 +4019,7 @@ fn a_frozen_v5_database_opens_and_reads_its_approvals() {
         &tool,
         canonical_input_hash(&approval_input()).unwrap(),
     );
-    assert_eq!(matching_grants(&grants, &covered).len(), 1);
+    assert_eq!(matching_grants(&grants, &covered).grants().len(), 1);
     assert_eq!(store.run_approvals(run_id).unwrap().len(), 2);
 }
 
@@ -4013,6 +4042,7 @@ fn a_frozen_v6_database_opens_and_reads_its_external_identity_binding() {
     let grants = store.run_grants(request.run_id()).unwrap();
     let workspace = approval_workspace();
     let tool = ToolIdentity::parse("fs.write", "1.2.0").unwrap();
+    let capabilities = [Capability::new("invoke_mcp_tool").unwrap()];
     let candidate = CandidateCall::new(
         request.run_id(),
         request.tool_call_id(),
@@ -4020,18 +4050,18 @@ fn a_frozen_v6_database_opens_and_reads_its_external_identity_binding() {
         &tool,
         canonical_input_hash(&approval_input()).unwrap(),
     )
+    .with_capabilities(&capabilities)
     .with_integration_identity(identity);
-    assert_eq!(matching_grants(&grants, &candidate).len(), 1);
-    assert!(
-        matching_grants(
-            &grants,
-            &candidate.with_integration_identity(
-                IntegrationIdentity::none()
-                    .with_mcp_tool_schema_fingerprint(Sha256Hash::of("changed schema")),
-            ),
-        )
-        .is_empty()
+    assert_eq!(matching_grants(&grants, &candidate).grants().len(), 1);
+    let drifted = matching_grants(
+        &grants,
+        &candidate.with_integration_identity(
+            IntegrationIdentity::none()
+                .with_mcp_tool_schema_fingerprint(Sha256Hash::of("changed schema")),
+        ),
     );
+    assert!(drifted.grants().is_empty());
+    assert_eq!(drifted.identity_drifts().len(), 1);
 }
 
 #[test]
@@ -4302,6 +4332,7 @@ fn regenerate_the_frozen_v6_fixture() {
             RiskLevel::Execute,
             at(4),
         )
+        .with_capabilities([Capability::new("invoke_mcp_tool").unwrap()])
         .with_integration_identity(identity)
         .summarized_as("invoke an imported MCP tool"),
     )

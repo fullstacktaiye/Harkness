@@ -70,7 +70,10 @@ pub use crate::domain::ApprovalId;
 pub use canonical::{CANONICAL_INPUT_DOMAIN, InputHash, canonical_input, canonical_input_hash};
 pub use error::ApprovalError;
 pub use gate::{ApprovalGate, ApprovalObservation, ApprovalTicket};
-pub use matcher::{ApprovalGrant, CandidateCall, grant_applies, matching_grants};
+pub use matcher::{
+    ApprovalGrant, CandidateCall, GrantMatch, GrantMatches, IntegrationIdentityDrift,
+    IntegrationIdentityField, grant_applies, matching_grants,
+};
 pub use record::{
     APPROVAL_TRANSITIONS, ApprovalDecision, ApprovalRequest, ApprovalScope, ApprovalState,
     ApprovalVerdict, DecidedVia, PendingApproval, WorkspaceBinding,

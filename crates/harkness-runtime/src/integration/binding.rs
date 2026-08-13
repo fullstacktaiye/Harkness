@@ -42,6 +42,14 @@ impl IntegrationIdentity {
         self
     }
 
+    pub(crate) const fn with_agent_executable_sha256_optional(
+        mut self,
+        hash: Option<Sha256Hash>,
+    ) -> Self {
+        self.agent_executable_sha256 = hash;
+        self
+    }
+
     /// Binds the schema fingerprint observed for one MCP tool.
     #[must_use]
     pub const fn with_mcp_tool_schema_fingerprint(mut self, hash: Sha256Hash) -> Self {
@@ -49,10 +57,26 @@ impl IntegrationIdentity {
         self
     }
 
+    pub(crate) const fn with_mcp_tool_schema_fingerprint_optional(
+        mut self,
+        hash: Option<Sha256Hash>,
+    ) -> Self {
+        self.mcp_tool_schema_fingerprint = hash;
+        self
+    }
+
     /// Binds the content digest of a compiled workflow recipe.
     #[must_use]
     pub const fn with_recipe_content_hash(mut self, hash: Sha256Hash) -> Self {
         self.recipe_content_hash = Some(hash);
+        self
+    }
+
+    pub(crate) const fn with_recipe_content_hash_optional(
+        mut self,
+        hash: Option<Sha256Hash>,
+    ) -> Self {
+        self.recipe_content_hash = hash;
         self
     }
 

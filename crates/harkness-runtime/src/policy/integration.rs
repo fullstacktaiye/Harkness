@@ -1,9 +1,11 @@
 //! Policy vocabulary for external agents, MCP, forges, and workflow recipes.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
+use serde_json::Value;
 
-use crate::integration::IntegrationIdentity;
+use crate::integration::{IntegrationIdentity, Sha256Hash};
 use crate::tool::{Capability, RegistryError, RiskLevel};
+use crate::trust::RequestClassification;
 
 /// Schema version of the external request context embedded in policy decisions.
 pub const EXTERNAL_POLICY_CONTEXT_SCHEMA_VERSION: u32 = 1;
@@ -35,6 +37,7 @@ pub const EXTERNAL_POLICY_DENIAL_KINDS: &[&str] = &[
 /// while integration adapters use these exact stable spellings.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ExternalCapability {
     /// Start an ACP agent, evaluated against the agent executable identity.
     LaunchExternalAgent,
@@ -130,6 +133,27 @@ impl ExternalCapability {
             Self::ExecuteWorkflowRecipe => "noninteractive_workflow_recipe_execute_denied",
         }
     }
+
+    pub(crate) fn validate_identity_shape(
+        self,
+        identity: IntegrationIdentity,
+    ) -> Result<(), &'static str> {
+        let executable = identity.agent_executable_sha256().is_some();
+        let schema = identity.mcp_tool_schema_fingerprint().is_some();
+        let recipe = identity.recipe_content_hash().is_some();
+        let valid_shape = match self {
+            Self::LaunchExternalAgent | Self::ConnectMcpServer => executable && !schema && !recipe,
+            Self::InvokeMcpTool => !executable && schema && !recipe,
+            Self::ExecuteWorkflowRecipe => !executable && !schema && recipe,
+            Self::ReadForgeResource
+            | Self::PushRemoteBranch
+            | Self::CreatePullRequest
+            | Self::ModifyForgeResource => !executable && !schema && !recipe,
+        };
+        valid_shape
+            .then_some(())
+            .ok_or("external operation carries missing or irrelevant identity evidence")
+    }
 }
 
 /// One permission option an ACP agent supplied with a permission request.
@@ -186,8 +210,7 @@ pub struct ExternalPermissionContext {
 /// This strict, explicitly versioned value is copied into the durable policy
 /// decision. Hash fields omitted by older producers remain absent, while an
 /// unknown same-version field is rejected rather than discarded on rewrite.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct ExternalPolicyContext {
     schema_version: u32,
     capability: ExternalCapability,
@@ -199,27 +222,121 @@ pub struct ExternalPolicyContext {
 }
 
 impl ExternalPolicyContext {
-    /// Starts a request context with no identity evidence.
-    ///
-    /// `classified_risk` is the MCP classifier result or the maximum risk of a
-    /// compiled recipe's steps. Evaluation applies the capability's fixed floor
-    /// even if this value is understated.
+    /// Starts an ACP-agent launch context from the executable observation.
     #[must_use]
-    pub const fn new(capability: ExternalCapability, classified_risk: RiskLevel) -> Self {
+    pub const fn launch_external_agent(executable: Option<Sha256Hash>) -> Self {
+        Self::fixed(
+            ExternalCapability::LaunchExternalAgent,
+            IntegrationIdentity::none().with_agent_executable_sha256_optional(executable),
+        )
+    }
+
+    /// Starts an MCP-server connection context from the executable observation.
+    #[must_use]
+    pub const fn connect_mcp_server(executable: Option<Sha256Hash>) -> Self {
+        Self::fixed(
+            ExternalCapability::ConnectMcpServer,
+            IntegrationIdentity::none().with_agent_executable_sha256_optional(executable),
+        )
+    }
+
+    /// Starts an imported MCP-tool invocation context.
+    ///
+    /// The classification is opaque and can only be produced by Harkness's
+    /// request classifier, so a caller cannot replace a destructive result with
+    /// an asserted lower risk.
+    #[must_use]
+    pub const fn invoke_mcp_tool(
+        classification: RequestClassification,
+        schema: Option<Sha256Hash>,
+    ) -> Self {
+        Self::from_parts(
+            ExternalCapability::InvokeMcpTool,
+            classification.risk(),
+            IntegrationIdentity::none().with_mcp_tool_schema_fingerprint_optional(schema),
+        )
+    }
+
+    /// Starts a forge-resource read context.
+    #[must_use]
+    pub const fn read_forge_resource() -> Self {
+        Self::fixed(
+            ExternalCapability::ReadForgeResource,
+            IntegrationIdentity::none(),
+        )
+    }
+
+    /// Starts a remote-branch push context.
+    #[must_use]
+    pub const fn push_remote_branch() -> Self {
+        Self::fixed(
+            ExternalCapability::PushRemoteBranch,
+            IntegrationIdentity::none(),
+        )
+    }
+
+    /// Starts a pull-request creation context.
+    #[must_use]
+    pub const fn create_pull_request() -> Self {
+        Self::fixed(
+            ExternalCapability::CreatePullRequest,
+            IntegrationIdentity::none(),
+        )
+    }
+
+    /// Starts a forge-resource mutation context.
+    #[must_use]
+    pub const fn modify_forge_resource() -> Self {
+        Self::fixed(
+            ExternalCapability::ModifyForgeResource,
+            IntegrationIdentity::none(),
+        )
+    }
+
+    /// Starts a compiled workflow-recipe context.
+    ///
+    /// The effective classification is derived as the maximum risk of the
+    /// compiled steps. An empty recipe is observational; fixed policy floors
+    /// are applied separately by [`Self::risk_floor`].
+    #[must_use]
+    pub fn execute_workflow_recipe(
+        step_risks: impl IntoIterator<Item = RiskLevel>,
+        content: Option<Sha256Hash>,
+    ) -> Self {
+        let classified_risk = step_risks.into_iter().max().unwrap_or(RiskLevel::Observe);
+        Self::from_parts(
+            ExternalCapability::ExecuteWorkflowRecipe,
+            classified_risk,
+            IntegrationIdentity::none().with_recipe_content_hash_optional(content),
+        )
+    }
+
+    const fn fixed(capability: ExternalCapability, identity: IntegrationIdentity) -> Self {
+        let risk = match capability {
+            ExternalCapability::LaunchExternalAgent
+            | ExternalCapability::ConnectMcpServer
+            | ExternalCapability::InvokeMcpTool => RiskLevel::Execute,
+            ExternalCapability::ReadForgeResource => RiskLevel::Network,
+            ExternalCapability::PushRemoteBranch
+            | ExternalCapability::CreatePullRequest
+            | ExternalCapability::ModifyForgeResource => RiskLevel::RemoteWrite,
+            ExternalCapability::ExecuteWorkflowRecipe => RiskLevel::Observe,
+        };
+        Self::from_parts(capability, risk, identity)
+    }
+
+    const fn from_parts(
+        capability: ExternalCapability,
+        classified_risk: RiskLevel,
+        identity: IntegrationIdentity,
+    ) -> Self {
         Self {
             schema_version: EXTERNAL_POLICY_CONTEXT_SCHEMA_VERSION,
             capability,
             classified_risk,
-            identity: IntegrationIdentity::none(),
+            identity,
             external_permission_context: None,
         }
-    }
-
-    /// Attaches the identity evidence this request was observed against.
-    #[must_use]
-    pub const fn with_identity(mut self, identity: IntegrationIdentity) -> Self {
-        self.identity = identity;
-        self
     }
 
     /// Attaches untrusted external permission hints for audit and presentation.
@@ -263,39 +380,42 @@ impl ExternalPolicyContext {
         self.external_permission_context
     }
 
-    /// Validates version, descriptor membership, and identity relevance.
-    pub(super) fn validate(self, declared: &[Capability]) -> Result<(), &'static str> {
-        if self.schema_version != EXTERNAL_POLICY_CONTEXT_SCHEMA_VERSION {
-            return Err("external policy context was written by a newer Harkness build");
-        }
+    pub(super) fn validate_declaration(self, declared: &[Capability]) -> Result<(), &'static str> {
         if !declared
             .iter()
             .any(|capability| capability.as_str() == self.capability.as_str())
         {
             return Err("external policy context names a capability the tool did not declare");
         }
-
-        self.validate_identity_shape()
+        Ok(())
     }
 
     pub(super) fn validate_identity_shape(self) -> Result<(), &'static str> {
+        self.capability.validate_identity_shape(self.identity)
+    }
+
+    /// Stable denial kind for the context's exact invalid identity shape.
+    #[must_use]
+    pub(super) const fn invalid_identity_denial_kind(self) -> Option<&'static str> {
         let executable = self.identity.agent_executable_sha256().is_some();
         let schema = self.identity.mcp_tool_schema_fingerprint().is_some();
         let recipe = self.identity.recipe_content_hash().is_some();
-        let valid_shape = match self.capability {
+        let has_irrelevant_identity = match self.capability {
             ExternalCapability::LaunchExternalAgent | ExternalCapability::ConnectMcpServer => {
-                executable && !schema && !recipe
+                schema || recipe
             }
-            ExternalCapability::InvokeMcpTool => !executable && schema && !recipe,
-            ExternalCapability::ExecuteWorkflowRecipe => !executable && !schema && recipe,
+            ExternalCapability::InvokeMcpTool => executable || recipe,
+            ExternalCapability::ExecuteWorkflowRecipe => executable || schema,
             ExternalCapability::ReadForgeResource
             | ExternalCapability::PushRemoteBranch
             | ExternalCapability::CreatePullRequest
-            | ExternalCapability::ModifyForgeResource => !executable && !schema && !recipe,
+            | ExternalCapability::ModifyForgeResource => executable || schema || recipe,
         };
-        valid_shape
-            .then_some(())
-            .ok_or("external policy context carries missing or irrelevant identity evidence")
+        if has_irrelevant_identity {
+            Some("external_identity_context_invalid")
+        } else {
+            self.identity_denial_kind()
+        }
     }
 
     /// Stable refusal for a required identity that is absent.
@@ -319,6 +439,54 @@ impl ExternalPolicyContext {
             }
             _ => None,
         }
+    }
+}
+
+#[derive(Deserialize)]
+struct ExternalPolicyContextVersionProbe {
+    schema_version: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalPolicyContextStrict {
+    schema_version: u32,
+    capability: ExternalCapability,
+    classified_risk: RiskLevel,
+    #[serde(default)]
+    identity: IntegrationIdentity,
+    #[serde(default)]
+    external_permission_context: Option<ExternalPermissionContext>,
+}
+
+impl From<ExternalPolicyContextStrict> for ExternalPolicyContext {
+    fn from(context: ExternalPolicyContextStrict) -> Self {
+        Self {
+            schema_version: context.schema_version,
+            capability: context.capability,
+            classified_risk: context.classified_risk,
+            identity: context.identity,
+            external_permission_context: context.external_permission_context,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ExternalPolicyContext {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let probe =
+            ExternalPolicyContextVersionProbe::deserialize(&value).map_err(de::Error::custom)?;
+        if probe.schema_version != EXTERNAL_POLICY_CONTEXT_SCHEMA_VERSION {
+            return Err(de::Error::custom(
+                "external policy context was written by a newer Harkness build",
+            ));
+        }
+        ExternalPolicyContextStrict::deserialize(value)
+            .map(Into::into)
+            .map_err(de::Error::custom)
     }
 }
 
