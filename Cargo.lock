@@ -647,6 +647,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "harkness-acp"
+version = "0.1.0"
+
+[[package]]
 name = "harkness-cli"
 version = "0.1.0"
 dependencies = [
@@ -697,6 +701,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "harkness-forge"
+version = "0.1.0"
+
+[[package]]
 name = "harkness-git"
 version = "0.1.0"
 dependencies = [
@@ -728,6 +736,14 @@ dependencies = [
  "tempfile",
  "time",
 ]
+
+[[package]]
+name = "harkness-mcp"
+version = "0.1.0"
+
+[[package]]
+name = "harkness-recipe"
+version = "0.1.0"
 
 [[package]]
 name = "harkness-runtime"

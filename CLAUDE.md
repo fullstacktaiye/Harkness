@@ -72,6 +72,9 @@ harkness-gui ──┴─> harkness-core ─────────────
                    (domain | store | tool)    │
                    harkness-context ──────────┘
                    (also depends on harkness-core, for ProjectId)
+
+harkness-acp  harkness-mcp  harkness-forge  harkness-recipe
+                   └─> all strictly below harkness-runtime; see ADR-0009
 ```
 
 `harkness-runtime` depends on `harkness-git` for one thing: `Cancellation`, which `tool`'s
@@ -99,6 +102,13 @@ translating between two cancellation mechanisms.
   database of runs in the process. Read `snapshot.rs`'s module doc before
   changing anything a digest absorbs; the wire forms are frozen by fixtures under
   `src/fixtures/` because #110 turns them into `runtime.db` columns.
+- **`harkness-acp`, `harkness-mcp`, `harkness-forge`, `harkness-recipe`** are the v0.5
+  external-integration adapters, currently compile-clean skeletons whose only code is the test each
+  one runs against its own `Cargo.toml`. They may depend on `harkness-git` and `harkness-core`,
+  never on `harkness-runtime`, a front end, or one another; protocol wire types stay private to the
+  adapter that speaks them. `docs/adr/0009` through `docs/adr/0018` decide the layering, the
+  protocol revisions, the transport seam, the trust shape, and the activity classes these crates
+  are built against — read them before adding code here.
 - **`harkness-test-fixtures`** is dev-only: hermetic temp repos, process fixtures, and the
   child-re-execution helpers. `COMMIT_EPOCH_SECONDS` is fixed so fixture repos hash identically.
 

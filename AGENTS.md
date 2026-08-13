@@ -2,11 +2,12 @@
 
 ## Project Structure & Module Organization
 
-Harkness is a Rust 2024 workspace split into seven crates under `crates/`:
+Harkness is a Rust 2024 workspace split into eleven crates under `crates/`:
 
 - `harkness-core`: project catalog, storage layout, cross-domain project workflows, and directory-listing logic shared by front ends.
 - `harkness-git`: all production Git behavior: inspection, diffs and history, file context and hunk staging, branch and worktree mutation, commits, clone and synchronization, hermetic process execution, and repository locking.
 - `harkness-context`: the context engine's typed vocabulary — workspace snapshot identity, stable identifiers, provenance, and file classification.
+- `harkness-acp`, `harkness-mcp`, `harkness-forge`, `harkness-recipe`: the v0.5 external-integration adapters — the Agent Client Protocol client, the Model Context Protocol client, forge-neutral contracts with the GitHub REST adapter, and the workflow-recipe source format and compiler. Currently skeletons; see the invariants below.
 - `harkness-test-fixtures`: hermetic repository, filesystem, and process fixtures shared only by crate tests.
 - `harkness-runtime`: typed task, run, step, and tool-call records, the typed tool contract and registry every executable operation implements, the execution contracts shared by front ends, and the SQLite run store that makes those records durable.
 - `harkness-cli`: the `harkness` command and its integration tests in `tests/`.
@@ -563,6 +564,40 @@ away either: it is written as the `rejected-output.json` artifact of that call,
 because only the value says what the tool actually produced. Preserving it is best
 effort — a context with no artifact store must not change the failure the caller is
 told about.
+
+## External-Integration Boundary Invariants
+
+`harkness-acp`, `harkness-mcp`, `harkness-forge`, and `harkness-recipe` sit strictly below
+`harkness-runtime`. None of them may name `harkness-runtime`, `harkness-cli`, or `harkness-gui` in
+its manifest, and none may depend on another adapter — shared machinery goes below all four, not
+sideways between two of them. Each crate carries a test that reads its own `Cargo.toml` and fails
+on those names, so the rule breaks the build rather than a review. ADR-0009 records why.
+
+Protocol wire types are private to their adapter. No type defined by ACP, MCP, or the GitHub REST
+API — and no type generated from their schemas — may appear in an adapter's public API, in a
+`harkness-runtime` domain record, or in anything persisted: `runtime.db` columns, event payloads,
+artifact metadata, `projects.json`, or CLI JSON output. Conversion to Harkness-owned types happens
+at the adapter's public surface, which is the only place an upstream protocol revision may break.
+A raw transcript captured as an artifact is opaque content, not a typed dependence, and is allowed.
+
+External identity and trust are `harkness-runtime` types, not adapter types, because they compose
+with workspace trust and policy. An adapter reports what it observed — a path, a hash, a version, a
+schema fingerprint — as plain data; the runtime builds the record. Trust is per subject and bound to
+that identity, never a boolean, and it is a precondition rather than an authorization: a trusted
+agent still passes policy and approval on every action. An external permission system supplements
+Harkness policy and never replaces it. ADR-0016 records the shape.
+
+Pinned external versions: ACP protocol version 1 (ADR-0014), MCP revisions 2026-07-28 primary and
+2025-11-25 fallback (ADR-0013), `X-GitHub-Api-Version: 2026-03-10` on every GitHub request
+(ADR-0018), and `agent-client-protocol-schema` at a schema/v1 release with every `unstable_*`
+feature off (ADR-0010). Targeting a newer protocol revision requires a superseding ADR, not a
+version bump. No `tokio`, `async-std`, `smol`, or `futures` enters the workspace, and no `async fn`
+appears in any crate (ADR-0003, ADR-0011).
+
+Every persisted activity row and every user-facing presentation carries exactly one activity class:
+`HarknessObserved`, `HarknessMediated`, `AcpReported`, `SnapshotInferred`, or `Unobserved`. An agent
+claim is never rendered as a verified Harkness observation, and `Unobserved` is a class rather than
+an omission — v0.5 has no OS-level sandbox and says so. ADR-0017 records why.
 
 ## Commit & Pull Request Guidelines
 
