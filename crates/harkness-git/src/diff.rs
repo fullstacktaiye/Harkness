@@ -159,7 +159,7 @@ impl Whitespace {
         ignore_blank_lines: false,
     };
 
-    /// Byte-exact comparison with the given mode and no blank-line suppression.
+    /// The given mode, with blank lines still taking part in the comparison.
     #[must_use]
     pub const fn new(mode: WhitespaceMode) -> Self {
         Self {

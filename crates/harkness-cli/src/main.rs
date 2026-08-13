@@ -536,19 +536,25 @@ impl LogArguments {
 
 /// The `--whitespace` spellings, kept in step with [`WhitespaceMode`].
 ///
-/// Clap renders these kebab-cased on the command line while the JSON envelope
-/// keeps the snake-cased [`WhitespaceMode::name`] spelling, so a flag value and
-/// a wire value are never mistaken for one another.
+/// Clap renders these kebab-cased, which is the house style for a flag value.
+/// Each also accepts the snake-cased [`WhitespaceMode::name`] spelling as an
+/// alias, because `git stage --hunk` asks a caller to copy `whitespace.mode`
+/// straight off a diff record: a flag that rejected the exact bytes the
+/// envelope published would be a translation step, and a translation step is
+/// somewhere to get it wrong.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 enum WhitespaceArgument {
     /// Compare bytes; every whitespace difference is a change.
     #[default]
     Exact,
     /// Ignore whitespace at end of line, which is what a CRLF-to-LF pass changes.
+    #[value(alias = "ignore_eol")]
     IgnoreEol,
     /// Ignore changes in the amount of whitespace, such as a re-indent.
+    #[value(alias = "ignore_change")]
     IgnoreChange,
     /// Ignore whitespace everywhere, including whitespace added to a line.
+    #[value(alias = "ignore_all")]
     IgnoreAll,
 }
 
@@ -825,6 +831,7 @@ struct HunkArguments {
             "old_blob_id",
             "new_blob_id",
             "context_lines",
+            "whitespace",
             "old_start",
             "old_lines",
             "new_start",
@@ -838,6 +845,12 @@ struct HunkArguments {
     /// arrays have been narrowed to the wanted hunks, or {"selections": [...]}
     /// holding flat records. One invocation is one atomic index write, so the
     /// coordinate shift that invalidates a second single-hunk call cannot occur.
+    ///
+    /// A flat record carries the file's "old_path", "new_path", "old_blob_id",
+    /// "new_blob_id", "context_lines" and "whitespace" alongside the hunk's four
+    /// coordinates. Copy "whitespace" across with the rest: a record built from
+    /// a whitespace-insensitive diff names coordinates that do not describe the
+    /// file, and omitting the field claims they came from an exact one.
     #[arg(
         long,
         value_name = "PATH",
@@ -897,6 +910,22 @@ struct HunkArguments {
     /// Context-line count from the diff file record.
     #[arg(long, value_name = "LINES", requires = "hunk")]
     context_lines: Option<u32>,
+    /// Whitespace mode from the diff file record's "whitespace.mode", which for
+    /// an ordinary diff is `exact`.
+    ///
+    /// Required rather than defaulted, and for the same reason the coordinates
+    /// themselves are: it describes where these numbers came from. Hunk
+    /// revalidation matches on blob IDs and coordinates, and a
+    /// whitespace-insensitive hunk can carry exactly the coordinates of an
+    /// exact hunk that also contains the whitespace change the relaxed view was
+    /// hiding. Naming the mode is what turns that into a refusal instead of an
+    /// apply nobody asked for.
+    #[arg(long, value_name = "MODE", requires = "hunk", value_enum)]
+    whitespace: Option<WhitespaceArgument>,
+    /// Blank-line handling from the diff file record's
+    /// "whitespace.ignore_blank_lines".
+    #[arg(long, requires = "hunk")]
+    ignore_blank_lines: bool,
     /// Old-side start line from the selected hunk.
     #[arg(long, value_name = "LINE", requires = "hunk")]
     old_start: Option<u32>,
@@ -963,13 +992,10 @@ impl HunkArguments {
                 self.old_blob_id.ok_or_else(|| missing("old_blob_id"))?,
                 self.new_blob_id.ok_or_else(|| missing("new_blob_id"))?,
                 self.context_lines.ok_or_else(|| missing("context_lines"))?,
-                // The flag form names one hunk by hand and has no whitespace
-                // flags of its own: a view-only diff is exactly what it must
-                // not be spelling, and offering the flag would only let a
-                // caller write down a selection the service is going to refuse.
-                // A whitespace-insensitive document reaches the refusal through
-                // --hunk-selection, which is where such a record comes from.
-                Whitespace::EXACT,
+                Whitespace {
+                    mode: self.whitespace.ok_or_else(|| missing("whitespace"))?.into(),
+                    ignore_blank_lines: self.ignore_blank_lines,
+                },
                 (
                     self.old_start.ok_or_else(|| missing("old_start"))?,
                     self.old_lines.ok_or_else(|| missing("old_lines"))?,

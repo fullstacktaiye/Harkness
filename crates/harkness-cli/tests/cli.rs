@@ -1709,6 +1709,8 @@ fn new_command_help_offers_every_diff_and_hunk_flag() {
             "--new-path-base64",
             "--old-blob-id",
             "--new-lines",
+            "--whitespace",
+            "--ignore-blank-lines",
         ] {
             assert!(help.contains(flag), "git {command} --help lacks {flag}");
         }
@@ -3132,6 +3134,8 @@ fn hunk_refusals_carry_structured_details() {
             new_blob.to_owned(),
             "--context-lines".to_owned(),
             "3".to_owned(),
+            "--whitespace".to_owned(),
+            "exact".to_owned(),
             "--old-start".to_owned(),
             "1".to_owned(),
             "--old-lines".to_owned(),
@@ -3917,6 +3921,119 @@ fn whitespace_handling_is_reported_and_refuses_to_feed_a_selection() {
     assert_success(&accepted);
 }
 
+/// The case that makes `--whitespace` mandatory on the flag form rather than
+/// defaulted: a relaxed hunk and an exact hunk can carry *identical*
+/// coordinates whenever the hidden whitespace change sits strictly inside a
+/// region bounded by real changes. Revalidation matches on blob IDs and
+/// coordinates and never on hunk interior, so a selection that silently claimed
+/// to be exact would match and apply the change the reader could not see.
+#[test]
+fn relaxed_coordinates_that_collide_with_an_exact_hunk_are_still_refused() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("collision-project");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    let original = (1..=20)
+        .map(|line| format!("    line {line}\n"))
+        .collect::<String>();
+    fs::write(root.join("tracked.txt"), original.as_bytes()).unwrap();
+    commit_all(&repository, "prepare a coordinate collision");
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+    // Real edits at 8 and 12 bound the region; the whitespace-only change at 10
+    // sits between them, so both models produce one hunk over the same lines.
+    let edited = original
+        .replace("    line 8\n", "    line eight\n")
+        .replace("    line 10\n", "\t\tline 10\n")
+        .replace("    line 12\n", "    line twelve\n");
+    fs::write(root.join("tracked.txt"), edited.as_bytes()).unwrap();
+
+    let exact = diff_file(&data_dir, &project_id, "--unstaged", "tracked.txt");
+    let relaxed_output = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--unstaged",
+            "--whitespace",
+            "ignore-change",
+            "--project",
+            &project_id,
+            "--",
+            "tracked.txt",
+        ],
+    );
+    assert_success(&relaxed_output);
+    let relaxed = json_output(&relaxed_output)["data"]["files"][0].clone();
+    assert_eq!(
+        (
+            &relaxed["hunks"][0]["old_start"],
+            &relaxed["hunks"][0]["old_lines"],
+            &relaxed["hunks"][0]["new_start"],
+            &relaxed["hunks"][0]["new_lines"],
+        ),
+        (
+            &exact["hunks"][0]["old_start"],
+            &exact["hunks"][0]["old_lines"],
+            &exact["hunks"][0]["new_start"],
+            &exact["hunks"][0]["new_lines"],
+        ),
+        "the fixture must produce colliding coordinates or it proves nothing"
+    );
+
+    // Transcribing the relaxed record carries its mode across, so the collision
+    // is refused rather than applied.
+    let refused = harkness(
+        &data_dir,
+        &hunk_arguments("stage", &project_id, &relaxed, 0),
+    );
+    assert_eq!(refused.status.code(), Some(3));
+    assert_eq!(
+        json_output(&refused)["error"]["kind"],
+        "whitespace_insensitive_selection"
+    );
+    let staged = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--staged",
+            "--project",
+            &project_id,
+        ],
+    );
+    assert!(
+        json_output(&staged)["data"]["files"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a refused selection reached the index"
+    );
+
+    // The mode cannot be left out either: it describes where the coordinates
+    // came from, so omitting it is a usage error rather than a quiet `exact`.
+    let mut without_mode = hunk_arguments("stage", &project_id, &exact, 0);
+    let mode = without_mode
+        .iter()
+        .position(|argument| argument == "--whitespace")
+        .expect("the helper passes the mode");
+    without_mode.drain(mode..=mode + 1);
+    let incomplete = harkness(&data_dir, &without_mode);
+    assert_eq!(incomplete.status.code(), Some(2));
+
+    // And the exact record, transcribed whole, still stages.
+    assert_success(&harkness(
+        &data_dir,
+        &hunk_arguments("stage", &project_id, &exact, 0),
+    ));
+}
+
 /// The single record for `path` on `target`.
 ///
 /// The length and target are asserted rather than assumed: taking the first
@@ -3965,6 +4082,14 @@ fn hunk_arguments(command: &str, project_id: &str, file: &Value, hunk_index: usi
         if let Some(value) = value.as_str() {
             arguments.extend([flag.to_owned(), value.to_owned()]);
         }
+    }
+    // The mode is copied verbatim from the record's own spelling, which is what
+    // the flag has to accept if transcribing a record is to be mechanical.
+    if let Some(mode) = file["whitespace"]["mode"].as_str() {
+        arguments.extend(["--whitespace".to_owned(), mode.to_owned()]);
+    }
+    if file["whitespace"]["ignore_blank_lines"] == json!(true) {
+        arguments.push("--ignore-blank-lines".to_owned());
     }
     for (flag, value) in [
         ("--old-blob-id", &file["old_blob_id"]),

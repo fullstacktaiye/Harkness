@@ -606,6 +606,15 @@ ColumnLayout {
             Controls.ComboBox {
                 id: whitespacePicker
 
+                // The backend owns the value: it survives a refresh, a new
+                // target and a failed request. Selecting an entry writes
+                // `currentIndex` imperatively and would destroy a declarative
+                // binding on it for good, so the state is tracked through a
+                // property of our own and pushed into the control instead.
+                property string activeMode: String(
+                    reviewSurface.reviewState.whitespace || "exact"
+                )
+
                 Accessible.name: qsTr("Whitespace handling")
                 Controls.ToolTip.text: qsTr("Anything but Exact hides differences that are only whitespace. The diff becomes read-only: discarding a hunk then recomputes the file exactly first, and refuses if that turns up changes this view is hiding.")
                 Controls.ToolTip.visible: hovered
@@ -620,12 +629,8 @@ ColumnLayout {
                 textRole: "label"
                 valueRole: "value"
 
-                // The backend owns this value: it survives a refresh, a new
-                // target and a failed request, so the control follows the state
-                // rather than remembering a choice of its own.
-                currentIndex: Math.max(0, indexOfValue(
-                    String(reviewSurface.reviewState.whitespace || "exact")
-                ))
+                onActiveModeChanged: currentIndex = Math.max(0, indexOfValue(activeMode))
+                Component.onCompleted: currentIndex = Math.max(0, indexOfValue(activeMode))
 
                 onActivated: backend.setReviewWhitespace(
                     project.id,
@@ -638,18 +643,22 @@ ColumnLayout {
                 }
             }
 
+            // Deliberately not `checkable`: a checkable button toggles its own
+            // `checked` on click, which would break the binding below the first
+            // time it is pressed and leave the button showing a setting the
+            // diff was never computed under. Clicking asks for the opposite of
+            // what the backend currently reports and waits to be told.
             Controls.ToolButton {
                 Accessible.name: text
                 Controls.ToolTip.text: qsTr("Leave lines that are blank on both sides out of the comparison")
                 Controls.ToolTip.visible: hovered
-                checkable: true
                 checked: reviewSurface.reviewState.ignoreBlankLines === true
                 enabled: reviewSurface.reviewState.loading !== true
                 text: qsTr("Blank lines")
                 onClicked: backend.setReviewWhitespace(
                     project.id,
                     String(reviewSurface.reviewState.whitespace || "exact"),
-                    checked
+                    !checked
                 )
             }
 

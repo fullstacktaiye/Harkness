@@ -97,6 +97,15 @@ exactly the changed lines the view displayed, kinds, numbers and bytes alike —
 and refuses with `HiddenWhitespaceChanges` when they are not, because the
 alternative is applying content the reader was never shown.
 
+Any wire form that carries hunk coordinates must carry the whitespace they were
+taken under, and `harkness git stage --hunk` requires `--whitespace` for exactly
+that reason. Revalidation matches on blob IDs and coordinates and never on hunk
+interior, and a relaxed hunk can carry the *identical* coordinates of an exact
+hunk that also holds the whitespace change the relaxed view was hiding —
+whenever that change sits inside a region bounded by real changes. Defaulting an
+absent mode to exact there would turn a coordinate coincidence into a silent
+apply, so the field is required rather than assumed.
+
 Adding a whitespace setting means extending `Whitespace`, not adding a loose
 boolean beside it: `is_exact` is the single question staging asks, and it must
 not be able to go stale.
