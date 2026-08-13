@@ -1,0 +1,90 @@
+{
+  "v": 1,
+  "id": "edit_test_diff_success",
+  "steps": [
+    {
+      "expect": {
+        "kind": "run_started"
+      },
+      "action": {
+        "kind": "call_tool",
+        "tool_id": "workspace.inspect",
+        "tool_version": "1.0.0",
+        "input": {}
+      }
+    },
+    {
+      "expect": {
+        "kind": "tool_result"
+      },
+      "action": {
+        "kind": "call_tool",
+        "tool_id": "fs.read",
+        "tool_version": "1.0.0",
+        "input": {
+          "path": "src/lib.rs"
+        }
+      }
+    },
+    {
+      "expect": {
+        "kind": "tool_result"
+      },
+      "action": {
+        "kind": "call_tool",
+        "tool_id": "fs.apply_patch",
+        "tool_version": "1.0.0",
+        "input": {
+          "bases": [
+            {
+              "base_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+              "path": "src/lib.rs"
+            }
+          ],
+          "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n"
+        }
+      }
+    },
+    {
+      "expect": {
+        "kind": "tool_result"
+      },
+      "action": {
+        "kind": "call_tool",
+        "tool_id": "test.run",
+        "tool_version": "1.0.0",
+        "input": {
+          "command": [
+            "cargo",
+            "test",
+            "-p",
+            "harkness-runtime"
+          ]
+        }
+      }
+    },
+    {
+      "expect": {
+        "kind": "tool_result"
+      },
+      "action": {
+        "kind": "call_tool",
+        "tool_id": "git.diff",
+        "tool_version": "1.0.0",
+        "input": {
+          "target": "working_tree"
+        }
+      }
+    },
+    {
+      "expect": {
+        "kind": "tool_result",
+        "artifact_media_type": "text/x-diff"
+      },
+      "action": {
+        "kind": "complete_run",
+        "summary": "Edited the workspace, passed tests, and captured the final diff."
+      }
+    }
+  ]
+}

@@ -519,6 +519,43 @@ to resolve twice to learn what ran — and two lookups can disagree where one
 cannot. `InvocationError` therefore has no `From<ToolError>` conversion: building
 a tool failure requires naming the tool, so a `?` cannot produce one that forgot.
 
+## Agent Interface & Mock Scenario Invariants
+
+`agent` is a plain-data decision seam. An `Agent` receives one redacted
+`Observation` and returns one `AgentAction`; it never receives a registry,
+policy evaluator, approval gate, store, scheduler, execution context, or tool
+body. `CallTool.input` deliberately remains a `serde_json::Value`: the agent may
+request work, but only the coordinator may validate, authorize, persist,
+schedule, and execute it. In particular, the `invalid_tool_input` scenario must
+emit its bad value verbatim and let the real registry return `invalid_input`
+before any tool body runs. Adding a convenience method to `MockAgent` that
+performs or pre-validates an action would be a privileged path a future model
+agent does not have.
+
+`MockAgent` advances only through `Agent::next_action`. A scenario transition is
+one structural observation pattern and one action; patterns omit incidental
+record ids and may select only the stable fields their case is about, such as an
+error kind, approval direction, or artifact media type. A mismatch returns a
+typed `scenario_divergence` naming the expected and actual observation kinds
+and does not advance the cursor. The ten built-ins are Rust data mirrored
+byte-for-byte by versioned JSON fixtures. The registry order is stable, every
+script is bounded, and exactly its final action is terminal.
+
+Scenario fixtures probe `v` before their strict `deny_unknown_fields` body, so a
+future fixture asks for an upgrade while a same-version unknown field is a
+malformed current fixture. The fixture files are frozen wire evidence: changing
+an action, pattern, field, or spelling means publishing a new version beside v1,
+not editing what v1 meant. They do no I/O, read no environment, sleep on no
+clock, and reach no network or model.
+
+`AgentSessionState` is independently schema-versioned and strict. Its session id
+names one conversation; its scenario id and cursor name the next transition;
+its chained, domain-separated SHA-256 digest commits to the observations already
+consumed without retaining workspace content. A resumed mock continues the
+chain from that digest. Session ids are not determinism evidence — two replays
+may have different ids — while identical observation histories must yield
+identical actions and digests.
+
 ## Tool Execution Invariants
 
 A recorded tool call always reaches a terminal state. That is the executor's one

@@ -1,0 +1,90 @@
+{
+  "v": 1,
+  "state": {
+    "schema_version": 1,
+    "session_id": "123e4567-e89b-42d3-a456-426614174000",
+    "scenario_id": "read_only_success",
+    "cursor": 2,
+    "observation_digest": "abababababababababababababababababababababababababababababababab"
+  },
+  "actions": [
+    {
+      "kind": "plan",
+      "steps": [
+        {
+          "title": "Inspect the workspace"
+        }
+      ]
+    },
+    {
+      "kind": "call_tool",
+      "tool_id": "fs.read",
+      "tool_version": "1.0.0",
+      "input": {
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "kind": "complete_run",
+      "summary": "Done."
+    },
+    {
+      "kind": "fail_run",
+      "reason": {
+        "kind": "scenario_divergence",
+        "expected": "tool_result",
+        "actual": "tool_failed"
+      }
+    }
+  ],
+  "observations": [
+    {
+      "kind": "run_started",
+      "task": {
+        "id": "223e4567-e89b-42d3-a456-426614174000",
+        "title": "Fixture task"
+      },
+      "workspace": {
+        "project_id": "323e4567-e89b-42d3-a456-426614174000",
+        "root": "/workspace"
+      }
+    },
+    {
+      "kind": "tool_result",
+      "call": "423e4567-e89b-42d3-a456-426614174000",
+      "result": {
+        "output": {
+          "text": "redacted"
+        },
+        "artifacts": [
+          {
+            "id": "artifact-fixture",
+            "media_type": "text/plain",
+            "byte_len": 8
+          }
+        ]
+      }
+    },
+    {
+      "kind": "tool_failed",
+      "call": "523e4567-e89b-42d3-a456-426614174000",
+      "error": {
+        "kind": "timed_out",
+        "message": "the call timed out"
+      }
+    },
+    {
+      "kind": "policy_denied",
+      "call": "623e4567-e89b-42d3-a456-426614174000",
+      "reason": "network capability denied"
+    },
+    {
+      "kind": "approval_outcome",
+      "call": "723e4567-e89b-42d3-a456-426614174000",
+      "outcome": "denied"
+    },
+    {
+      "kind": "cancelled"
+    }
+  ]
+}

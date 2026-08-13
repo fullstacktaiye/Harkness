@@ -1,0 +1,38 @@
+{
+  "v": 1,
+  "id": "approval_denied",
+  "steps": [
+    {
+      "expect": {
+        "kind": "run_started"
+      },
+      "action": {
+        "kind": "call_tool",
+        "tool_id": "fs.apply_patch",
+        "tool_version": "1.0.0",
+        "input": {
+          "bases": [
+            {
+              "base_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+              "path": "src/lib.rs"
+            }
+          ],
+          "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n"
+        }
+      }
+    },
+    {
+      "expect": {
+        "kind": "approval_outcome",
+        "outcome": "denied"
+      },
+      "action": {
+        "kind": "fail_run",
+        "reason": {
+          "kind": "approval_denied",
+          "reason": "The requested workspace edit was denied."
+        }
+      }
+    }
+  ]
+}
