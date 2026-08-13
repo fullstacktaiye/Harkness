@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -194,6 +194,16 @@ struct Workspace {
 struct WorkspaceState {
     queue: VecDeque<Waiting>,
     running: BTreeMap<Dispatch, Running>,
+    /// Submitters parked on a full queue, waiting to join it.
+    ///
+    /// Counted because a parked producer holds *neither* lock —
+    /// [`Condvar::wait_timeout`] releases the workspace mutex for the duration
+    /// of the wait — so without this it is invisible, and a workspace it is
+    /// about to enqueue into looks idle to [`Inner::forget_idle`]. Evicting one
+    /// there would let the producer wake and push into an orphan: the next
+    /// submission for the same key would build a *second* `Workspace` with an
+    /// empty running set, and one worktree would have two mutation slots.
+    waiting: usize,
 }
 
 impl WorkspaceState {
@@ -210,9 +220,9 @@ impl WorkspaceState {
             .count()
     }
 
-    /// Whether this workspace can be forgotten.
+    /// Whether nothing is queued, running, or waiting to be queued.
     fn is_idle(&self) -> bool {
-        self.queue.is_empty() && self.running.is_empty()
+        self.queue.is_empty() && self.running.is_empty() && self.waiting == 0
     }
 }
 
@@ -334,6 +344,8 @@ struct Inner {
     workers: Workers,
     /// Source of the sequence numbers a workspace's running set is keyed by.
     dispatched: AtomicU64,
+    /// Rotates which workspace a freed process slot is offered to first.
+    sweep: AtomicUsize,
     shutting_down: AtomicBool,
 }
 
@@ -484,6 +496,7 @@ impl Scheduler {
                 processes: ProcessLimit::new(processes),
                 workers: Workers::default(),
                 dispatched: AtomicU64::new(0),
+                sweep: AtomicUsize::new(0),
                 shutting_down: AtomicBool::new(false),
             }),
         }
@@ -539,10 +552,10 @@ impl Scheduler {
 
         // Get-or-insert and the workspace lock are taken *without releasing the
         // map lock in between*, and this is the only place anything is ever
-        // added to a workspace. That pairing is what makes `forget_idle` safe:
-        // a thread holding a workspace it is about to enqueue into always holds
-        // either this map lock or that workspace's own, so an entry the sweep
-        // can both find idle and `try_lock` has nobody about to fill it.
+        // added to a workspace. Together with `WorkspaceState::waiting`, which
+        // covers the one moment below where this thread holds neither lock,
+        // that is what makes `forget_idle` safe: an entry the sweep finds idle
+        // and can `try_lock` has nobody about to fill it.
         let mut workspaces = inner
             .workspaces
             .lock()
@@ -560,10 +573,11 @@ impl Scheduler {
             .unwrap_or_else(|error| error.into_inner());
         drop(workspaces);
 
-        while state.queue.len() >= WORKSPACE_QUEUE_CAPACITY {
-            if inner.is_shutting_down() {
-                return Err(ScheduleError::Shutdown { call: call.call });
-            }
+        // Registered before the first wait and cleared however this leaves the
+        // loop, so the workspace is never forgotten out from under a producer
+        // that is about to fill it.
+        state.waiting += 1;
+        while state.queue.len() >= WORKSPACE_QUEUE_CAPACITY && !inner.is_shutting_down() {
             // Timed rather than plain, so a producer parked at the instant
             // shutdown begins still learns about it on its own.
             state = workspace
@@ -572,6 +586,7 @@ impl Scheduler {
                 .unwrap_or_else(|error| error.into_inner())
                 .0;
         }
+        state.waiting -= 1;
         if inner.is_shutting_down() {
             return Err(ScheduleError::Shutdown { call: call.call });
         }
@@ -627,6 +642,7 @@ impl Scheduler {
                         workspace.key.clone(),
                         state.queue.len(),
                         state.running.len(),
+                        state.waiting,
                         state.mutating(),
                     )
                 })
@@ -717,6 +733,30 @@ impl std::fmt::Debug for Scheduler {
             .field("workers", &self.inner.workers.live())
             .field("shutting_down", &self.inner.is_shutting_down())
             .finish()
+    }
+}
+
+/// Releases one worker's slots however its thread ends.
+///
+/// A guard rather than two statements at the end of the closure, because the
+/// executor's panic boundary covers the *tool body* and nothing else: a panic
+/// in the pipeline around it — a poisoned store mutex, an allocation failure —
+/// unwinds the scheduler's own worker. Without this the workspace's mutation
+/// slot would be held forever, a process slot would be leaked from a global
+/// pool that never grows back, and [`Workers::live`] would never reach zero, so
+/// every later shutdown would burn its whole deadline and report an outstanding
+/// worker. The ticket still resolves: the sender drops with the thread, and its
+/// holder sees [`ScheduleError::WorkerLost`], which is what that variant is for.
+struct Completion {
+    inner: Arc<Inner>,
+    workspace: Arc<Workspace>,
+    dispatch: Dispatch,
+}
+
+impl Drop for Completion {
+    fn drop(&mut self) {
+        self.inner.complete(&self.workspace, self.dispatch);
+        self.inner.workers.leave();
     }
 }
 
@@ -855,14 +895,19 @@ impl Inner {
             let workspace = Arc::clone(workspace);
             self.workers.enter();
             let handle = thread::spawn(move || {
-                let dispatch = waiting.dispatch;
-                let settled = inner.run(&waiting);
-                // Freeing the slot and starting the next call before the
+                let completion = Completion {
+                    inner,
+                    workspace,
+                    dispatch: waiting.dispatch,
+                };
+                let settled = completion.inner.run(&waiting);
+                // Freeing the slots and starting the next call before the
                 // result is handed over: the record is already committed, so
-                // the workspace has nothing left to wait for.
-                inner.complete(&workspace, dispatch);
+                // the workspace has nothing left to wait for. Dropping the
+                // guard explicitly rather than at the end of the closure keeps
+                // that ordering visible.
+                drop(completion);
                 let _ = waiting.report.send(settled);
-                inner.workers.leave();
             });
             self.workers.track(handle);
         }
@@ -886,7 +931,7 @@ impl Inner {
 
     /// Releases what a finished call held, then starts whatever it was blocking.
     fn complete(self: &Arc<Self>, workspace: &Arc<Workspace>, dispatch: Dispatch) {
-        let (released_process, ready) = {
+        let released_process = {
             let mut state = workspace
                 .state
                 .lock()
@@ -896,34 +941,73 @@ impl Inner {
                 .remove(&dispatch)
                 .is_some_and(|running| running.holds_process);
             if released_process {
-                // Inside the workspace lock, which is the documented order —
-                // and released before anything else is admitted, so the call
-                // this one was blocking sees the slot it was waiting for.
+                // Inside the workspace lock, which is the documented order, and
+                // before anything is admitted anywhere, so whichever workspace
+                // is offered the slot next actually finds it free.
                 self.processes.release();
             }
-            let ready = self.admit(&mut state);
-            (released_process, ready)
+            released_process
         };
-        self.dispatch(workspace, ready);
 
-        // A freed process slot is global, so it can unblock a workspace this
-        // call has nothing to do with. Only then is it worth the sweep.
         if released_process {
-            for other in self.live_workspaces() {
-                if Arc::ptr_eq(&other, workspace) {
-                    continue;
-                }
-                let ready = {
-                    let mut state = other
-                        .state
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    self.admit(&mut state)
-                };
-                self.dispatch(&other, ready);
-            }
+            // A freed process slot is global, so it can unblock a workspace
+            // this call has nothing to do with — including, in the starving
+            // case, only such a workspace.
+            self.pump_in_turn(workspace);
+        } else {
+            let ready = {
+                let mut state = workspace
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                self.admit(&mut state)
+            };
+            self.dispatch(workspace, ready);
         }
         self.forget_idle();
+    }
+
+    /// Offers a freed process slot to every workspace, starting somewhere new.
+    ///
+    /// FIFO within a workspace makes starvation unrepresentable *there*, but
+    /// the global process limit is contention between workspaces and needs its
+    /// own answer. Always sweeping in map order, or letting the workspace that
+    /// released a slot re-admit before the others are asked, gives one key a
+    /// permanent advantage: two workspaces with a steady supply of
+    /// process-backed calls would see the lower-ordered one reclaim every slot
+    /// its own completions release, and the other would never start.
+    ///
+    /// The rotating start makes each workspace first in turn, so a queued call
+    /// waits for a bounded number of releases rather than for its neighbours to
+    /// run out of work. The releasing workspace takes part on the same terms as
+    /// everyone else, which is why it is not pumped separately first.
+    fn pump_in_turn(self: &Arc<Self>, released: &Arc<Workspace>) {
+        let mut workspaces = self.live_workspaces();
+        // A workspace whose last call just ended can have been forgotten by a
+        // concurrent sweep. It has no queue if so, but including it costs
+        // nothing and keeps this the only dispatch path on the released side.
+        if !workspaces
+            .iter()
+            .any(|workspace| Arc::ptr_eq(workspace, released))
+        {
+            workspaces.push(Arc::clone(released));
+        }
+        if workspaces.is_empty() {
+            return;
+        }
+
+        let start = self.sweep.fetch_add(1, Ordering::Relaxed) % workspaces.len();
+        workspaces.rotate_left(start);
+        for workspace in workspaces {
+            let ready = {
+                let mut state = workspace
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                self.admit(&mut state)
+            };
+            self.dispatch(&workspace, ready);
+        }
     }
 
     /// Cancels one run's calls, or every call when `run` is `None`.

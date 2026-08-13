@@ -393,6 +393,26 @@ pub enum ExecutionError {
         source: ToolError,
     },
 
+    /// The call cannot be cancelled undispatched, because it has already
+    /// started or already ended.
+    ///
+    /// Separate from [`NotDispatchable`](Self::NotDispatchable) rather than
+    /// borrowing it, because that variant names *one* required state and means
+    /// it: each dispatch entry point admits exactly one, which is what stops a
+    /// call being executed twice.
+    /// [`cancel_undispatched`](ToolExecutor::cancel_undispatched) admits two,
+    /// so reporting through the same shape would have to name one of them and
+    /// silently under-report the other.
+    #[error(
+        "tool call {call} is {state}, and only a call that has not started may be cancelled undispatched"
+    )]
+    NotCancellable {
+        /// Call that was handed to the executor.
+        call: ToolCallId,
+        /// State it was found in.
+        state: ToolCallState,
+    },
+
     /// A caller asked to lift a timeout the tool did not declare liftable.
     #[error("{tool} declared a {declared:?} limit, which a caller may tighten but not remove")]
     UnboundedNotDeclared {
@@ -412,6 +432,7 @@ impl ExecutionError {
         "store_failed",
         "not_dispatchable",
         "context_unavailable",
+        "not_cancellable",
         "unbounded_not_declared",
     ];
 
@@ -422,6 +443,7 @@ impl ExecutionError {
             Self::Store(_) => "store_failed",
             Self::NotDispatchable { .. } => "not_dispatchable",
             Self::Context { .. } => "context_unavailable",
+            Self::NotCancellable { .. } => "not_cancellable",
             Self::UnboundedNotDeclared { .. } => "unbounded_not_declared",
         }
     }
@@ -536,24 +558,25 @@ impl ToolExecutor {
     /// every terminal recording in the runtime is still made by one function,
     /// with its event, in one transaction.
     ///
+    /// Both states a call can be cancelled from without ever being dispatched.
+    ///
+    /// Approval-gated work waits at `awaiting_approval` rather than `pending`,
+    /// so a cancellation that admitted only the latter would be unable to stop
+    /// exactly the calls most likely to be waiting when a user gives up.
+    const CANCELLABLE_UNDISPATCHED: [ToolCallState; 2] =
+        [ToolCallState::Pending, ToolCallState::AwaitingApproval];
+
     /// # Errors
     ///
-    /// Returns [`ExecutionError::NotDispatchable`] for a call that is already
+    /// Returns [`ExecutionError::NotCancellable`] for a call that is already
     /// `running` or already terminal — a running call is stopped through its
     /// token, not by writing over it — and [`ExecutionError::Store`] when the
     /// record cannot be read or written.
     pub fn cancel_undispatched(&self, call: ToolCallId) -> Result<CompletedCall, ExecutionError> {
         let record = self.store.load_tool_call(call)?;
         let state = record.state();
-        if !matches!(
-            state,
-            ToolCallState::Pending | ToolCallState::AwaitingApproval
-        ) {
-            return Err(ExecutionError::NotDispatchable {
-                call,
-                state,
-                expected: ToolCallState::Pending,
-            });
+        if !Self::CANCELLABLE_UNDISPATCHED.contains(&state) {
+            return Err(ExecutionError::NotCancellable { call, state });
         }
         self.finish(call, record.step_id(), None, CallOutcome::Cancelled)
     }
@@ -1093,6 +1116,13 @@ mod tests {
                     source: crate::tool::ToolError::Cancelled,
                 },
                 "context_unavailable",
+            ),
+            (
+                ExecutionError::NotCancellable {
+                    call: crate::domain::ToolCallId::new(),
+                    state: crate::domain::ToolCallState::Running,
+                },
+                "not_cancellable",
             ),
             (
                 ExecutionError::UnboundedNotDeclared {

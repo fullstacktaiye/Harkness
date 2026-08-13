@@ -77,6 +77,7 @@ pub struct WorkspaceLoad {
     workspace: WorkspaceKey,
     queued: usize,
     running: usize,
+    waiting: usize,
     mutating: bool,
 }
 
@@ -85,12 +86,14 @@ impl WorkspaceLoad {
         workspace: WorkspaceKey,
         queued: usize,
         running: usize,
+        waiting: usize,
         mutating: bool,
     ) -> Self {
         Self {
             workspace,
             queued,
             running,
+            waiting,
             mutating,
         }
     }
@@ -111,6 +114,17 @@ impl WorkspaceLoad {
     #[must_use]
     pub const fn running(&self) -> usize {
         self.running
+    }
+
+    /// Submitters blocked because this workspace's queue is full.
+    ///
+    /// The visible face of backpressure, and the reason a workspace can appear
+    /// here with nothing queued and nothing running: a producer that is parked
+    /// is about to fill it, so it is not idle even for the instant in which it
+    /// looks empty.
+    #[must_use]
+    pub const fn waiting(&self) -> usize {
+        self.waiting
     }
 
     /// Whether the workspace's single mutation slot is held.

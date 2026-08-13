@@ -686,6 +686,97 @@ fn a_full_submission_queue_blocks_the_submitter_rather_than_growing() {
     assert_eq!(gate.peak(), 1);
 }
 
+/// A parked producer is registered on its workspace and keeps it from being
+/// collected out from under it.
+///
+/// The failure this guards against is narrow and, deliberately, not what the
+/// assertions below reproduce. Every path that shrinks a queue notifies the
+/// condition variable, so a parked producer is woken promptly and refills the
+/// queue before the workspace can be *seen* empty; what remains is the window
+/// between that wake-up and the producer re-acquiring the mutex, during which a
+/// completing worker can run `forget_idle`. Nothing outside the module can
+/// schedule two threads into that window on purpose, so this test pins the
+/// invariant — the producer is visible, the workspace survives, and one key
+/// never yields two mutation slots — rather than staging the race.
+#[test]
+fn a_parked_producer_keeps_its_workspace_from_being_forgotten() {
+    let fixture = Fixture::new();
+    let (filling, fill_gate) = Gated::new("fixture.filling", RiskLevel::WorkspaceWrite);
+    let (overflowing, overflow_gate) = Gated::new("fixture.overflowing", RiskLevel::WorkspaceWrite);
+    let scheduler = fixture.scheduler(vec![eraseit(filling), eraseit(overflowing)]);
+
+    // Two runs of one workspace: the first fills the queue and is then swept
+    // away wholesale, and the second is what the parked producer carries.
+    let workspace = fixture.workspace("evicted");
+    let filler = fixture.run(&workspace);
+    let overflow = fixture.run(&workspace);
+
+    let running = fixture.call(&filler, "fixture.filling");
+    submit(&scheduler, running, &workspace, RiskLevel::WorkspaceWrite);
+    fill_gate.wait_for(1);
+    for _ in 0..WORKSPACE_QUEUE_CAPACITY {
+        let call = fixture.call(&filler, "fixture.filling");
+        submit(&scheduler, call, &workspace, RiskLevel::WorkspaceWrite);
+    }
+
+    let carried = fixture.call(&overflow, "fixture.overflowing");
+    let producer = {
+        let scheduler = Arc::clone(&scheduler);
+        let workspace = workspace.clone();
+        thread::spawn(move || submit(&scheduler, carried, &workspace, RiskLevel::WorkspaceWrite))
+    };
+    until("the producer parking on the full queue", || {
+        scheduler.snapshot().workspaces()[0].waiting() == 1
+    });
+
+    // Cancelling empties the workspace in one step while the producer is still
+    // parked — and a parked producer holds neither the map lock nor the
+    // workspace's own, because the condition variable released it for the
+    // duration of the wait. This is precisely the moment the workspace looks
+    // collectable and is not.
+    scheduler.cancel_run(filler.run_id());
+    until("the cancelled run's last call ending", || {
+        fixture.state(running).is_terminal()
+    });
+
+    // An observation window rather than a wait: the claim is that the workspace
+    // is never *absent* across the interval in which it holds nothing but a
+    // parked producer, so a shorter window weakens this but cannot make it
+    // wrong.
+    let watching = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < watching {
+        assert_eq!(
+            scheduler.snapshot().workspaces().len(),
+            1,
+            "the workspace was forgotten while a producer was about to fill it"
+        );
+        thread::sleep(POLL);
+    }
+
+    // The end-to-end consequence of getting this wrong: the woken producer
+    // pushes into an orphan, the next submission builds a second `Workspace`
+    // for the same key with an empty running set, and one worktree ends up
+    // with two mutation slots.
+    let carrying = producer.join().unwrap();
+    overflow_gate.wait_for(1);
+    let following = fixture.call(&overflow, "fixture.overflowing");
+    let followed = submit(&scheduler, following, &workspace, RiskLevel::WorkspaceWrite);
+
+    assert_eq!(fixture.state(following), ToolCallState::Pending);
+    assert_eq!(scheduler.snapshot().workspaces().len(), 1);
+    assert_eq!(overflow_gate.arrivals(), 1);
+
+    overflow_gate.release();
+    assert_eq!(succeeded(carrying), ToolCallState::Succeeded);
+    assert_eq!(succeeded(followed), ToolCallState::Succeeded);
+    assert_eq!(
+        overflow_gate.peak(),
+        1,
+        "one workspace admitted two mutations at once"
+    );
+    fill_gate.release();
+}
+
 // ---------------------------------------------------------------------------
 // Cancellation
 // ---------------------------------------------------------------------------
@@ -1536,6 +1627,68 @@ mod processes {
             assert_eq!(succeeded(ticket), ToolCallState::Succeeded);
         }
         assert_eq!(ready_count(&ready), SUBMITTED);
+        assert_eq!(scheduler.snapshot().processes().in_use(), 0);
+    }
+
+    /// A shim that announces itself and exits immediately.
+    fn quick_shim(shims: &ShimFixture, index: usize, ran: &Path) -> String {
+        shims
+            .shim(
+                &format!("quick-{index}"),
+                &format!(
+                    "#!/bin/sh\n: >> '{}'\n",
+                    ran.join(index.to_string()).display()
+                ),
+            )
+            .display()
+            .to_string()
+    }
+
+    #[test]
+    fn one_process_slot_is_shared_between_workspaces_rather_than_captured() {
+        const WORKSPACES: usize = 3;
+        const EACH: usize = 6;
+
+        let fixture = Fixture::new();
+        let shims = ShimFixture::new();
+        let ran = shims.directory("ran");
+        // A single slot, so every one of these calls contends for the same
+        // global resource and nothing else can hide a scheduling bias.
+        let scheduler = fixture.scheduler_with_process_limit(vec![eraseit(RunsAShim)], 1);
+
+        let mut tickets = Vec::new();
+        for index in 0..WORKSPACES {
+            let workspace = fixture.workspace(&format!("sharing-{index}"));
+            let step = fixture.run(&workspace);
+            for attempt in 0..EACH {
+                let program = quick_shim(&shims, index * EACH + attempt, &ran);
+                let call = ToolCall::new(
+                    &step,
+                    "fixture.spawns",
+                    "",
+                    json!({"program": program}),
+                    at(3),
+                );
+                fixture.store.insert_tool_call(&call).unwrap();
+                tickets.push(submit(
+                    &scheduler,
+                    call.id(),
+                    &workspace,
+                    RiskLevel::Execute,
+                ));
+            }
+        }
+
+        // Every call completes. Without a rotating hand-off the workspace that
+        // released a slot would reclaim it before its neighbours were offered
+        // it, and a workspace with a steady supply of process-backed calls
+        // would keep the others from ever starting — so this finishing at all
+        // is the assertion, and `PATIENCE` is what makes starvation a failure
+        // rather than a hang.
+        for ticket in tickets {
+            assert_eq!(succeeded(ticket), ToolCallState::Succeeded);
+        }
+        assert_eq!(ready_count(&ran), WORKSPACES * EACH);
         assert_eq!(scheduler.snapshot().processes().in_use(), 0);
     }
 

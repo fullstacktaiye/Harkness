@@ -62,11 +62,17 @@
 //! approval flow here — a call arrives already authorized, or already decided
 //! and marked as such. It sequences nothing above a call either; run-level
 //! orchestration and step ordering belong to the coordinator that submits.
-//! There are no priorities, no deadlines, and no preemption: FIFO per workspace
-//! is the whole ordering story, and it is what makes starvation impossible to
-//! express rather than merely unlikely. And it schedules only this process's
-//! work — a second Harkness process is bounded by the repository lock and by
-//! nothing here.
+//! There are no priorities, no deadlines, and no preemption.
+//!
+//! Ordering is FIFO *within* a workspace, which is what makes starvation
+//! unrepresentable there. Between workspaces there is exactly one contended
+//! resource — the global process limit — and it needs its own answer, because
+//! a fixed sweep order would give one key a permanent advantage over its
+//! neighbours; a freed slot is therefore offered to each workspace first in
+//! turn. Nothing else here orders one workspace against another.
+//!
+//! And it schedules only this process's work: a second Harkness process is
+//! bounded by the repository lock and by nothing here.
 
 mod error;
 mod scheduler;

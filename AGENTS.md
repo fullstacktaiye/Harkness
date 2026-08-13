@@ -625,9 +625,33 @@ checkouts that may legitimately be mutated at once. A key is never built from a 
 the same reason a trust decision is never stored against one.
 
 Only the *front* of a workspace's queue is ever considered for dispatch. Nothing is scanned past
-it, and that is the whole fairness story: a queued mutation stops later reads from being admitted,
-so a continuous stream of reads cannot starve it. Adding a "run the next admissible call instead"
-optimization reintroduces starvation and must not be done.
+it, and that is the fairness story *within* a workspace: a queued mutation stops later reads from
+being admitted, so a continuous stream of reads cannot starve it. Adding a "run the next admissible
+call instead" optimization reintroduces starvation and must not be done.
+
+Between workspaces the only contended resource is the global process limit, and it has its own
+answer: a freed slot is offered to each workspace first in turn, from a rotating cursor, and the
+workspace that released it takes part on the same terms as the rest. A fixed sweep order — or
+letting the releaser re-admit before the others are asked — gives the lowest-ordered key a
+permanent advantage, and two workspaces with a steady supply of process-backed calls would leave
+one of them never starting. Nothing else here orders one workspace against another.
+
+A parked submitter is counted on its workspace (`WorkspaceState::waiting`) and keeps that workspace
+out of the idle sweep. `Condvar::wait_timeout` releases the workspace mutex for the duration of the
+wait, so a producer blocked on a full queue holds *neither* lock; without the count it is invisible
+and its workspace can be collected beneath it. The producer then wakes and pushes into an orphan,
+the next submission for the same key builds a second `Workspace` with an empty running set, and one
+worktree ends up with two mutation slots.
+
+A worker releases its slots from a `Drop` guard, not from statements at the end of its closure. The
+executor's panic boundary covers the tool body and nothing else, so a panic in the pipeline around
+it unwinds the scheduler's own worker; without the guard the mutation slot is held forever, a
+process slot is lost from a pool that never grows back, and shutdown can never reach idle again.
+
+A workspace's running set is keyed by a per-scheduler dispatch sequence rather than by
+`ToolCallId`, because only the former is unique. The executor refuses a call submitted twice, but
+it refuses it *after* dispatch, so keying by call id would let the second admission overwrite the
+first's entry and the first completion free both.
 
 At most one call above `RiskLevel::Observe` runs per workspace at a time, and it runs alone —
 reads do not overlap a mutation of the same worktree. This is a safety property, not a throughput
