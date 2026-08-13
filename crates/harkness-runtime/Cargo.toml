@@ -10,6 +10,7 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
+git2.workspace = true
 harkness-core.workspace = true
 harkness-git.workspace = true
 jsonschema.workspace = true

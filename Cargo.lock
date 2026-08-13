@@ -749,6 +749,7 @@ version = "0.1.0"
 name = "harkness-runtime"
 version = "0.1.0"
 dependencies = [
+ "git2",
  "harkness-core",
  "harkness-git",
  "harkness-test-fixtures",

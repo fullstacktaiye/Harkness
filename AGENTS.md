@@ -633,6 +633,45 @@ because only the value says what the tool actually produced. Preserving it is be
 effort — a context with no artifact store must not change the failure the caller is
 told about.
 
+## Built-In Mutation & Process Tool Invariants
+
+`fs.apply_patch`, `process.exec`, and `test.run` are registered at `1.0.0` through
+`tools::register_mutating_tools`. Their descriptor risks are the scheduling and
+policy contract: patching is `WorkspaceWrite`; both process tools are `Execute`
+and declare that they spawn processes. No caller or registry helper special-cases
+their identifiers to recover metadata the descriptors omitted.
+
+A patch names every target twice: once in the unified diff and once in its base
+precondition. The two path sets must be identical. An existing file carries the
+lowercase SHA-256 of its exact bytes and a new file carries `null`; a mismatch is
+`stale_patch`. Containment, every hash, and every hunk are checked against
+in-memory base images before the first file is written, so a `patch_conflict`
+never leaves a prefix of the call applied. Deletes, renames, copies, binary
+patches, and missing parent directories are refused rather than interpreted as a
+more destructive operation than this tool declares.
+
+Each prepared file is replaced through a temporary file in the target directory:
+write, preserve or establish permissions, sync, rename, then sync the directory.
+The `ContainedPath` is revalidated immediately before that sequence so an
+approval wait cannot turn an in-workspace target into a symlink escape. The
+result artifact is produced from libgit2's actual index-to-worktree diff over
+exactly the touched path set, not by echoing the caller's patch.
+
+`process.exec` has no shell form. `argv[0]` is the program and every later value
+is one argument even when it contains shell metacharacters. The cwd crosses the
+execution context's boundary, stdin is null, and the environment starts empty.
+An input override may replace only a fixed baseline name or an exact name the
+descriptor published; it can never enlarge that set. Both streams always go to
+artifacts and only a bounded tail enters the inline result.
+
+The child timeout defaults to 120 seconds and is clamped to 1 through 600. It is
+inside the enclosing call deadline: reaching it kills the process group and
+returns a typed result with `timed_out`, the enforced limit, duration, signal,
+tails, and both artifact references. Reaching the enclosing deadline remains a
+tool-call `timed_out` failure. `test.run` calls the same in-process supervisor —
+never nested tool dispatch — and adds only `passed = exit_code == 0 &&
+!timed_out`; a failing test is a valid test result, not a failed tool invocation.
+
 ## Runtime Scheduling Invariants
 
 Mutation serialization is keyed by `WorkspaceKey` — `ProjectId` *and* canonical root,

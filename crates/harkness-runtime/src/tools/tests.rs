@@ -1,0 +1,574 @@
+use std::collections::BTreeMap;
+use std::fs::{self, File};
+use std::io::{self, Write};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use harkness_git::Cancellation;
+use harkness_test_fixtures::{Fixture, initialize_repository};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use tempfile::TempDir;
+
+use super::{ProcessExec, TestRun, register_mutating_tools};
+use crate::domain::{RunId, StepId, ToolCallId};
+use crate::tool::{
+    ArtifactRef, ArtifactStream, ArtifactWriter, Deadline, DiscardedProgress, ExecutionContext,
+    InvocationError, RiskLevel, Tool, ToolError, ToolRegistry, invoke,
+};
+use crate::tools::{ApplyPatchInput, FileBase, FsApplyPatch};
+use crate::trust::{BASELINE_ENVIRONMENT, EnvironmentName};
+
+#[derive(Clone, Debug)]
+struct DiskArtifacts {
+    root: PathBuf,
+    records: Arc<Mutex<BTreeMap<String, PathBuf>>>,
+    next_id: Arc<AtomicUsize>,
+}
+
+impl DiskArtifacts {
+    fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            records: Arc::new(Mutex::new(BTreeMap::new())),
+            next_id: Arc::new(AtomicUsize::new(1)),
+        }
+    }
+
+    fn read(&self, name: &str) -> Vec<u8> {
+        let path = self.records.lock().unwrap()[name].clone();
+        fs::read(path).unwrap()
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.records.lock().unwrap()[name].clone()
+    }
+}
+
+impl ArtifactWriter for DiskArtifacts {
+    fn open(&mut self, name: &str, media_type: &str) -> Result<Box<dyn ArtifactStream>, ToolError> {
+        let id = format!("artifact-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
+        let path = self.root.join(&id);
+        let file = File::create(&path).map_err(ToolError::execution_failed)?;
+        Ok(Box::new(DiskStream {
+            file,
+            path,
+            name: name.to_owned(),
+            media_type: media_type.to_owned(),
+            id,
+            records: Arc::clone(&self.records),
+            bytes: 0,
+        }))
+    }
+}
+
+struct DiskStream {
+    file: File,
+    path: PathBuf,
+    name: String,
+    media_type: String,
+    id: String,
+    records: Arc<Mutex<BTreeMap<String, PathBuf>>>,
+    bytes: u64,
+}
+
+impl Write for DiskStream {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.file.write(bytes)?;
+        self.bytes += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl ArtifactStream for DiskStream {
+    fn finish(mut self: Box<Self>) -> Result<ArtifactRef, ToolError> {
+        self.file.flush().map_err(ToolError::execution_failed)?;
+        self.file.sync_all().map_err(ToolError::execution_failed)?;
+        self.records
+            .lock()
+            .unwrap()
+            .insert(self.name.clone(), self.path.clone());
+        Ok(ArtifactRef {
+            id: self.id.clone(),
+            media_type: self.media_type.clone(),
+            byte_len: self.bytes,
+        })
+    }
+}
+
+struct Harness {
+    workspace: TempDir,
+    artifacts_root: TempDir,
+    artifacts: DiskArtifacts,
+}
+
+impl Harness {
+    fn new() -> Self {
+        let workspace = tempfile::tempdir().unwrap();
+        let artifacts_root = tempfile::tempdir().unwrap();
+        let artifacts = DiskArtifacts::new(artifacts_root.path());
+        Self {
+            workspace,
+            artifacts_root,
+            artifacts,
+        }
+    }
+
+    fn context(&self) -> ExecutionContext {
+        ExecutionContext::new(
+            RunId::new(),
+            StepId::new(),
+            ToolCallId::new(),
+            self.workspace.path().to_path_buf(),
+            Cancellation::default(),
+            Box::new(DiscardedProgress),
+            Box::new(self.artifacts.clone()),
+        )
+        .unwrap()
+        .with_deadline(Deadline::starting_now(Duration::from_secs(620)).unwrap())
+    }
+
+    fn invoke<T: Tool + 'static>(&self, tool: T, input: Value) -> Result<Value, InvocationError> {
+        let mut registry = ToolRegistry::new();
+        let identity = tool.metadata().identity().clone();
+        registry.register(tool).unwrap();
+        let raw = serde_json::value::to_raw_value(&input).unwrap();
+        let mut context = self.context();
+        invoke(
+            &registry,
+            &identity.id,
+            Some(&identity.version),
+            &raw,
+            &mut context,
+        )
+        .map(|outcome| serde_json::from_str(outcome.output().get()).unwrap())
+    }
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn one_file_patch() -> &'static str {
+    "diff --git a/tracked.txt b/tracked.txt\n\
+     --- a/tracked.txt\n\
+     +++ b/tracked.txt\n\
+     @@ -1 +1 @@\n\
+     -initial\n\
+     +changed\n"
+}
+
+#[test]
+fn empty_and_malformed_patches_are_conflicts_without_writes() {
+    let harness = Harness::new();
+    initialize_repository(harness.workspace.path());
+    let before = fs::read(harness.workspace.path().join("tracked.txt")).unwrap();
+
+    for patch in ["", "this is not a unified diff"] {
+        let mut context = harness.context();
+        let error = FsApplyPatch
+            .execute(
+                ApplyPatchInput {
+                    patch: patch.to_owned(),
+                    bases: vec![FileBase {
+                        path: "tracked.txt".to_owned(),
+                        base_sha256: Some(sha256(&before)),
+                    }],
+                },
+                &mut context,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), "patch_conflict");
+        assert_eq!(
+            fs::read(harness.workspace.path().join("tracked.txt")).unwrap(),
+            before
+        );
+    }
+}
+
+#[test]
+fn a_new_file_with_spaces_unicode_and_no_final_newline_is_created_byte_exactly() {
+    let harness = Harness::new();
+    initialize_repository(harness.workspace.path());
+    let relative = "notes/a spaced 資料.txt";
+    fs::create_dir(harness.workspace.path().join("notes")).unwrap();
+    let patch = "diff --git \"a/notes/a spaced 資料.txt\" \"b/notes/a spaced 資料.txt\"\n\
+                 new file mode 100644\n\
+                 --- /dev/null\n\
+                 +++ \"b/notes/a spaced 資料.txt\"\n\
+                 @@ -0,0 +1 @@\n\
+                 +without newline\n\
+                 \\ No newline at end of file\n";
+    let output = harness
+        .invoke(
+            FsApplyPatch,
+            json!({
+                "patch": patch,
+                "bases": [{"path": relative, "base_sha256": null}]
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        fs::read(harness.workspace.path().join(relative)).unwrap(),
+        b"without newline"
+    );
+    assert_eq!(output["files"][0]["path"], relative);
+    assert_eq!(output["files"][0]["change"], "created");
+}
+
+#[test]
+fn built_ins_register_at_version_one_with_honest_risk_and_process_metadata() {
+    let mut registry = ToolRegistry::new();
+    register_mutating_tools(&mut registry).unwrap();
+    let descriptors = registry.descriptors().collect::<Vec<_>>();
+    assert_eq!(
+        descriptors
+            .iter()
+            .map(|descriptor| descriptor.identity().to_string())
+            .collect::<Vec<_>>(),
+        [
+            "fs.apply_patch@1.0.0",
+            "process.exec@1.0.0",
+            "test.run@1.0.0"
+        ]
+    );
+    assert_eq!(descriptors[0].risk(), RiskLevel::WorkspaceWrite);
+    assert!(!descriptors[0].spawns_processes());
+    for descriptor in &descriptors[1..] {
+        assert_eq!(descriptor.risk(), RiskLevel::Execute);
+        assert!(descriptor.spawns_processes());
+        assert_eq!(descriptor.capabilities()[0].as_str(), "process.spawn");
+    }
+}
+
+#[test]
+fn applying_a_matching_patch_atomically_returns_the_resulting_diff_artifact() {
+    let harness = Harness::new();
+    initialize_repository(harness.workspace.path());
+    let original = fs::read(harness.workspace.path().join("tracked.txt")).unwrap();
+    let output = harness
+        .invoke(
+            FsApplyPatch,
+            json!({
+                "patch": one_file_patch(),
+                "bases": [{"path": "tracked.txt", "base_sha256": sha256(&original)}]
+            }),
+        )
+        .unwrap();
+
+    assert_eq!(
+        fs::read(harness.workspace.path().join("tracked.txt")).unwrap(),
+        b"changed\n"
+    );
+    assert_eq!(output["files"][0]["change"], "modified");
+    assert_eq!(output["files"][0]["hunks_applied"], 1);
+    assert_eq!(output["files"][0]["byte_delta"], 0);
+    let expected =
+        harkness_test_fixtures::git(harness.workspace.path(), ["diff", "--", "tracked.txt"]);
+    assert_eq!(
+        harness.artifacts.read("applied.patch"),
+        expected.as_bytes(),
+        "the side artifact must be the actual Git worktree diff"
+    );
+}
+
+#[test]
+fn a_stale_base_refuses_before_writing_any_file() {
+    let harness = Harness::new();
+    initialize_repository(harness.workspace.path());
+    let path = harness.workspace.path().join("tracked.txt");
+    let mut context = harness.context();
+    let error = FsApplyPatch
+        .execute(
+            ApplyPatchInput {
+                patch: one_file_patch().to_owned(),
+                bases: vec![FileBase {
+                    path: "tracked.txt".to_owned(),
+                    base_sha256: Some("0".repeat(64)),
+                }],
+            },
+            &mut context,
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), "stale_patch");
+    assert_eq!(fs::read(path).unwrap(), b"initial\n");
+}
+
+#[test]
+fn one_conflicting_hunk_refuses_a_multi_file_patch_without_partial_writes() {
+    let harness = Harness::new();
+    initialize_repository(harness.workspace.path());
+    let first = harness.workspace.path().join("tracked.txt");
+    let second = harness.workspace.path().join("second.txt");
+    fs::write(&second, b"second\n").unwrap();
+    let first_base = fs::read(&first).unwrap();
+    let second_base = fs::read(&second).unwrap();
+    let patch = "diff --git a/tracked.txt b/tracked.txt\n\
+                 --- a/tracked.txt\n\
+                 +++ b/tracked.txt\n\
+                 @@ -1 +1 @@\n\
+                 -initial\n\
+                 +changed\n\
+                 diff --git a/second.txt b/second.txt\n\
+                 --- a/second.txt\n\
+                 +++ b/second.txt\n\
+                 @@ -1 +1 @@\n\
+                 -not-the-base\n\
+                 +also-changed\n";
+    let mut context = harness.context();
+    let error = FsApplyPatch
+        .execute(
+            ApplyPatchInput {
+                patch: patch.to_owned(),
+                bases: vec![
+                    FileBase {
+                        path: "tracked.txt".to_owned(),
+                        base_sha256: Some(sha256(&first_base)),
+                    },
+                    FileBase {
+                        path: "second.txt".to_owned(),
+                        base_sha256: Some(sha256(&second_base)),
+                    },
+                ],
+            },
+            &mut context,
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), "patch_conflict");
+    assert_eq!(fs::read(first).unwrap(), first_base);
+    assert_eq!(fs::read(second).unwrap(), second_base);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_patch_targeting_an_escaping_symlink_is_forbidden_without_writing() {
+    use std::os::unix::fs::symlink;
+
+    let harness = Harness::new();
+    initialize_repository(harness.workspace.path());
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("secret.txt"), b"secret\n").unwrap();
+    symlink(outside.path(), harness.workspace.path().join("escape")).unwrap();
+    let patch = "diff --git a/escape/secret.txt b/escape/secret.txt\n\
+                 --- a/escape/secret.txt\n\
+                 +++ b/escape/secret.txt\n\
+                 @@ -1 +1 @@\n\
+                 -secret\n\
+                 +leaked\n";
+    let mut context = harness.context();
+    let error = FsApplyPatch
+        .execute(
+            ApplyPatchInput {
+                patch: patch.to_owned(),
+                bases: vec![FileBase {
+                    path: "escape/secret.txt".to_owned(),
+                    base_sha256: Some(sha256(b"secret\n")),
+                }],
+            },
+            &mut context,
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), "forbidden_path");
+    assert_eq!(
+        fs::read(outside.path().join("secret.txt")).unwrap(),
+        b"secret\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn process_exec_preserves_shell_metacharacters_as_single_arguments() {
+    let harness = Harness::new();
+    let fixture = Fixture::new();
+    let shim = fixture.shim("argv", "#!/bin/sh\nprintf '<%s>\\n' \"$@\"\n");
+    let output = harness
+        .invoke(
+            ProcessExec,
+            json!({
+                "argv": [shim, "; rm -rf workspace", "$(touch impossible)"],
+                "timeout_seconds": 5
+            }),
+        )
+        .unwrap();
+    assert_eq!(output["exit_code"], 0);
+    assert!(!output["timed_out"].as_bool().unwrap());
+    assert_eq!(
+        harness.artifacts.read("process-stdout.log"),
+        b"<; rm -rf workspace>\n<$(touch impossible)>\n"
+    );
+    assert!(!harness.workspace.path().join("impossible").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn process_timeout_is_capped_and_returns_a_typed_killed_result() {
+    let harness = Harness::new();
+    let fixture = Fixture::new();
+    let shim = fixture.shim("long-running", "#!/bin/sh\nexec sleep 30\n");
+    let output = harness
+        .invoke(ProcessExec, json!({"argv": [shim], "timeout_seconds": 1}))
+        .unwrap();
+    assert_eq!(output["timed_out"], true);
+    assert_eq!(output["timeout_seconds"], 1);
+    assert!(output["exit_code"].is_null());
+    assert_eq!(output["signal"], libc::SIGKILL);
+    assert!(output["duration_ms"].as_u64().unwrap() >= 1_000);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn process_timeout_kills_a_spawned_grandchild_too() {
+    let harness = Harness::new();
+    let fixture = Fixture::new();
+    let pid_file = harness.workspace.path().join("grandchild.pid");
+    let shim = fixture.shim(
+        "spawns-grandchild",
+        "#!/bin/sh\nsleep 30 &\nprintf '%s\\n' \"$!\" > \"$1\"\n\nwait\n",
+    );
+    let output = harness
+        .invoke(
+            ProcessExec,
+            json!({"argv": [shim, pid_file], "timeout_seconds": 1}),
+        )
+        .unwrap();
+    assert_eq!(output["timed_out"], true);
+    let pid = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_millis(250);
+    while linux_process_is_live(pid) && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(
+        !linux_process_is_live(pid),
+        "grandchild {pid} survived the process-group timeout"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_is_live(pid: u32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    stat.rsplit_once(") ")
+        .and_then(|(_, fields)| fields.as_bytes().first())
+        .is_some_and(|state| *state != b'Z')
+}
+
+#[cfg(unix)]
+#[test]
+fn process_exec_does_not_inherit_an_undeclared_parent_canary() {
+    let harness = Harness::new();
+    let fixture = Fixture::new();
+    let canary = std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .find(|name| {
+            EnvironmentName::new(name)
+                .is_ok_and(|name| !BASELINE_ENVIRONMENT.contains(&name.as_str()))
+        })
+        .expect("Cargo's test process carries at least one non-baseline variable");
+    let shim = fixture.shim(
+        "env-canary",
+        &format!(
+            "#!/bin/sh\nif [ \"${{{canary}+present}}\" = present ]; then printf leaked; else printf absent; fi\n"
+        ),
+    );
+    let output = harness
+        .invoke(ProcessExec, json!({"argv": [shim]}))
+        .unwrap();
+    assert_eq!(output["exit_code"], 0);
+    assert_eq!(harness.artifacts.read("process-stdout.log"), b"absent");
+}
+
+#[cfg(unix)]
+#[test]
+fn fifty_megabytes_stream_to_disk_while_only_a_small_tail_is_returned() {
+    const BYTES: u64 = 50 * 1024 * 1024;
+    let harness = Harness::new();
+    let fixture = Fixture::new();
+    let shim = fixture.shim(
+        "large-output",
+        &format!("#!/bin/sh\nyes x | head -c {BYTES}\n"),
+    );
+    let output = harness
+        .invoke(ProcessExec, json!({"argv": [shim], "timeout_seconds": 30}))
+        .unwrap();
+    assert_eq!(output["stdout_tail"]["byte_len"], BYTES);
+    assert_eq!(output["stdout_tail"]["truncated"], true);
+    assert!(output["stdout_tail"]["text"].as_str().unwrap().len() <= 4 * 1024);
+    assert_eq!(
+        fs::metadata(harness.artifacts.path("process-stdout.log"))
+            .unwrap()
+            .len(),
+        BYTES
+    );
+    // Keep the directory owner live until after the metadata assertion.
+    assert!(harness.artifacts_root.path().exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_run_reports_pass_and_failure_without_turning_a_failed_test_into_a_tool_failure() {
+    let harness = Harness::new();
+    let fixture = Fixture::new();
+    let passing = fixture.shim("passing", "#!/bin/sh\necho passed\n");
+    let passed = harness
+        .invoke(TestRun, json!({"command": [passing]}))
+        .unwrap();
+    assert_eq!(passed["passed"], true);
+    assert_eq!(passed["exit_code"], 0);
+
+    let failing = fixture.shim("failing", "#!/bin/sh\necho failed >&2\nexit 7\n");
+    let failed = harness
+        .invoke(TestRun, json!({"command": [failing]}))
+        .unwrap();
+    assert_eq!(failed["passed"], false);
+    assert_eq!(failed["exit_code"], 7);
+    assert_eq!(harness.artifacts.read("test-stderr.log"), b"failed\n");
+}
+
+#[test]
+fn empty_argv_is_rejected_by_schema_before_the_process_body() {
+    let harness = Harness::new();
+    let error = harness
+        .invoke(ProcessExec, json!({"argv": []}))
+        .unwrap_err();
+    assert_eq!(error.kind(), "invalid_input");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_environment_override_not_published_by_the_descriptor_is_refused_before_spawn() {
+    let harness = Harness::new();
+    let fixture = Fixture::new();
+    let marker = harness.workspace.path().join("started");
+    let shim = fixture.shim(
+        "must-not-start",
+        &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    );
+    let error = harness
+        .invoke(
+            ProcessExec,
+            json!({
+                "argv": [shim],
+                "env": {"HARKNESS_SECRET_CANARY": "must-not-leak"}
+            }),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), "execution_failed");
+    assert!(
+        !marker.exists(),
+        "the child must not be spawned on env refusal"
+    );
+}

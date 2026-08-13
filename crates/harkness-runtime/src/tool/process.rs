@@ -35,9 +35,10 @@
 
 use std::ffi::OsString;
 use std::io::{self, Read};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use super::{
     ArtifactRef, ArtifactStream, ExecutionContext, POLL_INTERVAL, ProgressEvent, ToolError,
@@ -154,6 +155,9 @@ impl CapturedStream {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessOutput {
     code: Option<i32>,
+    signal: Option<i32>,
+    timed_out: bool,
+    duration: Duration,
     stdout: CapturedStream,
     stderr: CapturedStream,
 }
@@ -163,6 +167,28 @@ impl ProcessOutput {
     #[must_use]
     pub const fn code(&self) -> Option<i32> {
         self.code
+    }
+
+    /// Signal that ended the child, on platforms that expose one.
+    #[must_use]
+    pub const fn signal(&self) -> Option<i32> {
+        self.signal
+    }
+
+    /// Whether this process reached its tool-supplied local timeout.
+    ///
+    /// A call-level timeout remains [`ToolError::TimedOut`]; this flag belongs
+    /// to a shorter bound the tool deliberately placed on its child so the tool
+    /// can return a typed result describing that termination.
+    #[must_use]
+    pub const fn timed_out(&self) -> bool {
+        self.timed_out
+    }
+
+    /// Wall-clock time from immediately before spawn through output draining.
+    #[must_use]
+    pub const fn duration(&self) -> Duration {
+        self.duration
     }
 
     /// Whether the child exited zero.
@@ -218,6 +244,7 @@ pub struct ToolProcess {
     environment: AllowlistedEnv,
     stdout: Capture,
     stderr: Capture,
+    local_timeout: Option<Duration>,
 }
 
 impl ToolProcess {
@@ -232,6 +259,7 @@ impl ToolProcess {
             environment,
             stdout: Capture::Tail,
             stderr: Capture::Tail,
+            local_timeout: None,
         }
     }
 
@@ -246,6 +274,18 @@ impl ToolProcess {
     #[must_use]
     pub fn capture_stderr(mut self, capture: Capture) -> Self {
         self.stderr = capture;
+        self
+    }
+
+    /// Adds a process-local timeout inside the enclosing call's deadline.
+    ///
+    /// Reaching this bound kills the process group and returns a
+    /// [`ProcessOutput`] with [`ProcessOutput::timed_out`] set. The enclosing
+    /// execution-context deadline still wins when it is earlier and remains a
+    /// [`ToolError::TimedOut`], because that limit ends the whole tool call.
+    #[must_use]
+    pub const fn within(mut self, timeout: Duration) -> Self {
+        self.local_timeout = Some(timeout);
         self
     }
 
@@ -271,6 +311,10 @@ impl ToolProcess {
 
         let tail_bytes = context.stream_tail_bytes();
         let deadline = context.deadline();
+        let local_deadline = self
+            .local_timeout
+            .and_then(|limit| Instant::now().checked_add(limit).map(|at| (limit, at)));
+        let started = Instant::now();
 
         // Both artifact streams are opened before anything is spawned. Opening
         // one after the child is running would mean discovering that storage is
@@ -303,6 +347,20 @@ impl ToolProcess {
                 terminate(&mut child, incoming, stdout_reader, stderr_reader);
                 return Err(ToolError::TimedOut {
                     limit: deadline.limit(),
+                });
+            }
+            if let Some((_, at)) = local_deadline
+                && Instant::now() >= at
+            {
+                let (status, stdout, stderr) =
+                    terminate_and_collect(&mut child, incoming, stdout_reader, stderr_reader);
+                return Ok(ProcessOutput {
+                    code: status.as_ref().and_then(ExitStatus::code),
+                    signal: status.as_ref().and_then(exit_signal),
+                    timed_out: true,
+                    duration: started.elapsed(),
+                    stdout: stdout.finish()?,
+                    stderr: stderr.finish()?,
                 });
             }
 
@@ -349,6 +407,9 @@ impl ToolProcess {
                     drain_until_read(context, &incoming, stdout_reader, stderr_reader);
                 return Ok(ProcessOutput {
                     code: status.code(),
+                    signal: exit_signal(&status),
+                    timed_out: false,
+                    duration: started.elapsed(),
                     stdout: stdout.finish()?,
                     stderr: stderr.finish()?,
                 });
@@ -483,14 +544,37 @@ fn terminate(
     stdout_reader: JoinHandle<Drained>,
     stderr_reader: JoinHandle<Drained>,
 ) {
+    let (_, stdout, stderr) = terminate_and_collect(child, incoming, stdout_reader, stderr_reader);
+    stdout.preserve();
+    stderr.preserve();
+}
+
+/// Kills, reaps, and drains one process group without discarding captured bytes.
+fn terminate_and_collect(
+    child: &mut Child,
+    incoming: Receiver<String>,
+    stdout_reader: JoinHandle<Drained>,
+    stderr_reader: JoinHandle<Drained>,
+) -> (Option<ExitStatus>, Drained, Drained) {
     terminate_process_group(child);
+    // A reader may be blocked sending a stderr segment. Dropping the receiver
+    // releases it before either join, while artifact capture continues.
     drop(incoming);
-    let _ = child.wait();
-    for reader in [stdout_reader, stderr_reader] {
-        if let Ok(drained) = reader.join() {
-            drained.preserve();
-        }
-    }
+    let status = child.wait().ok();
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    (status, stdout, stderr)
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &ExitStatus) -> Option<i32> {
+    None
 }
 
 #[cfg(unix)]
