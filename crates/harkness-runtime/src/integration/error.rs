@@ -2,7 +2,7 @@ use thiserror::Error;
 
 use crate::domain::InvalidTransition;
 
-use super::TrustState;
+use super::{SubjectKind, TrustState};
 
 /// Invalid trust transitions, malformed identities, and impossible persisted
 /// integration records.
@@ -64,6 +64,22 @@ pub enum IntegrationDomainError {
         reason: &'static str,
     },
 
+    /// A grant was made against an identity carrying nothing its subject kind
+    /// could be recognized by.
+    ///
+    /// Every field of an identity basis is optional, because no subject has all
+    /// of them. A basis with *none* of the ones its kind is identified by would
+    /// leave [`TrustRecord::check`](super::TrustRecord::check) with nothing to
+    /// compare, so it would answer `Valid` for any observation at all — the
+    /// exact drift the record exists to catch, passing silently.
+    #[error("a {subject_kind} grant requires {required}")]
+    MissingIdentityEvidence {
+        /// Kind of subject the grant was made about.
+        subject_kind: SubjectKind,
+        /// Evidence that kind is recognized by.
+        required: &'static str,
+    },
+
     /// A wire record combines otherwise valid fields into an impossible record.
     #[error("{record} is invalid: {reason}")]
     InvalidRecord {
@@ -93,6 +109,7 @@ impl IntegrationDomainError {
         "integration_schema_version_too_new",
         "malformed_digest",
         "invalid_identity",
+        "missing_identity_evidence",
         "invalid_integration_record",
         "invalid_integration_timestamp",
     ];
@@ -106,6 +123,7 @@ impl IntegrationDomainError {
             Self::SchemaVersionTooNew { .. } => "integration_schema_version_too_new",
             Self::MalformedDigest { .. } => "malformed_digest",
             Self::InvalidIdentity { .. } => "invalid_identity",
+            Self::MissingIdentityEvidence { .. } => "missing_identity_evidence",
             Self::InvalidRecord { .. } => "invalid_integration_record",
             Self::InvalidTimestamp { .. } => "invalid_integration_timestamp",
         }
@@ -180,6 +198,13 @@ mod tests {
                     reason: "it cannot be empty",
                 },
                 "invalid_identity",
+            ),
+            (
+                IntegrationDomainError::MissingIdentityEvidence {
+                    subject_kind: crate::integration::SubjectKind::Recipe,
+                    required: "a recipe content hash",
+                },
+                "missing_identity_evidence",
             ),
             (
                 IntegrationDomainError::InvalidRecord {

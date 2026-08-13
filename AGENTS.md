@@ -743,9 +743,25 @@ Harkness policy and never replaces it. ADR-0016 records the shape.
 ## Integration Identity & Trust Invariants
 
 `harkness-runtime/src/integration` owns that model. A `TrustRecord` names a subject kind, the
-`IdentityBasis` it was granted against, a scope, and a `granted_at`; it never carries an identifier
-for the subject, because grants are keyed by `(subject kind, identity basis, scope)` and a subject
-whose basis differs is a different grant rather than the same grant in a different state.
+`IdentityBasis` it was granted against, a scope, and a `granted_at`.
+
+There is deliberately **no structural key for "the same grant"**, and none may be added. `check`
+does not compare bases for equality — it ignores the display name and the executable path, and it
+accepts a semver-compatible upgrade — so a key over those fields would be a key over a compatibility
+relation, which is not a key. A revoked record and a later grant about the same subject would also
+collide on such a key, and a store upserting on it would overwrite the revocation the state machine
+exists to preserve. The matching relation is `check` itself: find the records for a subject, then
+ask each one about the observation. A store addresses a row by its own row identity, never by a
+projection of these fields, which `regrant` deliberately moves.
+
+Every basis field is optional, because no subject has all of them — and that has one sharp edge a
+constructor must close. A basis carrying *none* of the evidence its kind is recognized by reduces
+`check` to comparing fields both sides leave empty, so it answers `Valid` for every observation ever
+made. `require_evidence` therefore refuses such a grant at construction and on load: an agent needs
+an executable, an MCP server an executable or endpoint, a tool schema a fingerprint, a recipe a
+content hash, a forge account an endpoint, a forge repository an endpoint naming the *resource* and
+not merely the host, and a workspace a workspace-scoped grant. `regrant` re-checks, so a re-grant is
+not how a record loses the field that made it checkable.
 
 `TrustRecord::check` is pure — no clock, no filesystem, no hashing — and is the only place trust is
 decided. Two basis fields are deliberately not compared, and neither exclusion may be quietly
@@ -765,7 +781,15 @@ then what it may now do and who now configures it, then the version it reports f
 wire record spelling it is refused, because absence is what untrusted means. `Revoked` is terminal:
 re-granting after a user said no is a new record, never a rewrite of the state they chose.
 `Invalidated` is not, since nobody decided it — `regrant` rebases the basis and moves `granted_at`
-on the same record. An invalidation reason is required by `Invalidated` and permitted nowhere else.
+on the same record. `Invalidated -> Revoked` exists because a re-prompt can be *declined*, and
+without that edge a refusal after drift would leave the record saying only what it already said
+before anybody was asked — collapsing the very distinction the state machine draws. An invalidation
+reason is required by `Invalidated` and permitted nowhere else, so revoking clears it.
+
+A workspace scope must name an absolute root, checked on the record rather than on
+`TrustScope::workspace`, because the variant's field is public and a constructor can be routed
+around. A relative root fails closed *silently*: the user is re-prompted forever with
+`WorkspacePathChanged` and never learns why.
 
 Identity records carry no secrets — no tokens, no credential material, no `CredentialSource` — and a
 test asserts every serialized record shape is free of fields named like one. Every text field is

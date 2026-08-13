@@ -272,10 +272,15 @@ mod tests {
         record
     }
 
+    /// The fewest fields a valid record can carry: a global grant with no
+    /// invalidation reason and only the one identity field a recipe is
+    /// recognized by.
     fn recipe_record() -> TrustRecord {
         TrustRecord::grant(
             SubjectKind::Recipe,
-            IdentityBasis::new("release", ConfigurationSource::Builtin).unwrap(),
+            IdentityBasis::new("release", ConfigurationSource::Builtin)
+                .unwrap()
+                .hashing(hash("release recipe")),
             TrustScope::Global,
             at(240),
         )
@@ -438,6 +443,39 @@ mod tests {
                 .to_string()
                 .contains("an untrusted subject is the absence of a record")
         );
+    }
+
+    /// A hand-edited row that lost the one field its kind is known by must
+    /// fail to load, not enter the process as a record that verifies anything.
+    #[test]
+    fn a_row_stripped_of_its_identity_evidence_is_refused_on_load() {
+        let fixture = include_str!("fixtures/trust-record-recipe-v1.json");
+        let mut value = serde_json::from_str::<serde_json::Value>(fixture).unwrap();
+        value["identity"]
+            .as_object_mut()
+            .unwrap()
+            .remove("content_hash");
+
+        // The strict body still parses: the field is genuinely optional.
+        let wire = serde_json::from_value::<TrustRecordWire>(value).unwrap();
+        let error = TrustRecord::try_from(wire).unwrap_err();
+        assert_eq!(error.kind(), "missing_identity_evidence");
+        assert_eq!(
+            error.to_string(),
+            "a recipe grant requires a recipe content hash"
+        );
+    }
+
+    #[test]
+    fn a_row_whose_workspace_root_is_relative_is_refused_on_load() {
+        let fixture = include_str!("fixtures/trust-record-agent-v1.json");
+        let mut value = serde_json::from_str::<serde_json::Value>(fixture).unwrap();
+        value["workspace"] = serde_json::json!("../workspace");
+
+        let wire = serde_json::from_value::<TrustRecordWire>(value).unwrap();
+        let error = TrustRecord::try_from(wire).unwrap_err();
+        assert_eq!(error.kind(), "invalid_integration_record");
+        assert!(error.to_string().contains("must name an absolute root"));
     }
 
     #[test]

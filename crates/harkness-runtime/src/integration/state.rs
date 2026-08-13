@@ -64,8 +64,9 @@ impl TrustState {
     /// revocation is a *new* record rather than a transition, because
     /// overwriting the state a user explicitly chose would erase the one
     /// decision the audit trail exists to preserve. Invalidation is not a
-    /// decision anybody made, so re-affirming the same intent against the new
-    /// identity continues the same record.
+    /// decision anybody made, so an invalidated record can go either way: it
+    /// re-affirms the same intent against the new identity, or — if the user
+    /// declines the re-prompt — it becomes a revocation like any other.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Revoked)
@@ -91,11 +92,19 @@ impl fmt::Display for TrustState {
 }
 
 /// Every legal trust state edge. An absent edge is invalid.
+///
+/// `Invalidated -> Revoked` is the answer to a re-prompt the user declined.
+/// Without it a refusal after drift would be unrecordable: the record would
+/// stay `Invalidated`, which is what it already said before anybody was asked,
+/// and the distinction this state machine exists to draw — a user said no
+/// versus a binary was swapped — would be lost in exactly the case where both
+/// happened.
 pub const TRUST_TRANSITIONS: &[(TrustState, TrustState)] = &[
     (TrustState::Untrusted, TrustState::Trusted),
     (TrustState::Trusted, TrustState::Revoked),
     (TrustState::Trusted, TrustState::Invalidated),
     (TrustState::Invalidated, TrustState::Trusted),
+    (TrustState::Invalidated, TrustState::Revoked),
 ];
 
 /// How far a grant reaches, without the workspace it may name.
@@ -402,6 +411,7 @@ mod tests {
             (TrustState::Trusted, TrustState::Revoked),
             (TrustState::Trusted, TrustState::Invalidated),
             (TrustState::Invalidated, TrustState::Trusted),
+            (TrustState::Invalidated, TrustState::Revoked),
         ];
         assert_eq!(legal.as_slice(), TRUST_TRANSITIONS);
 
@@ -495,6 +505,60 @@ mod tests {
 
         for kind in TrustScopeKind::ALL {
             assert_eq!(TrustScopeKind::from_stored(kind.as_str()), Some(*kind));
+        }
+    }
+
+    /// Guards the enumeration tables against a variant that never joins them.
+    ///
+    /// The tests above compare a hand-written fixture list against `ALL` and
+    /// `PRECEDENCE`, which is circular: a variant added to none of the three
+    /// keeps every one of those assertions green while `from_stored` — which
+    /// scans the table — starts answering `None` for a spelling this build
+    /// itself writes, and the store reads a valid row as corrupt.
+    ///
+    /// The exhaustive `match` below is not circular. It is over the *type*, so
+    /// a new variant fails to compile here until it is given a position, and
+    /// the length literal then fails until the table is extended too.
+    #[test]
+    fn every_variant_holds_a_position_in_its_enumeration_table() {
+        assert_eq!(TrustState::ALL.len(), 4);
+        for &state in TrustState::ALL {
+            let position = match state {
+                TrustState::Untrusted => 0,
+                TrustState::Trusted => 1,
+                TrustState::Revoked => 2,
+                TrustState::Invalidated => 3,
+            };
+            assert_eq!(TrustState::ALL[position], state);
+            assert_eq!(TrustState::from_stored(state.as_str()), Some(state));
+        }
+
+        assert_eq!(TrustScopeKind::ALL.len(), 2);
+        for &kind in TrustScopeKind::ALL {
+            let position = match kind {
+                TrustScopeKind::Global => 0,
+                TrustScopeKind::Workspace => 1,
+            };
+            assert_eq!(TrustScopeKind::ALL[position], kind);
+        }
+
+        assert_eq!(InvalidationReason::PRECEDENCE.len(), 8);
+        for &reason in InvalidationReason::PRECEDENCE {
+            let position = match reason {
+                InvalidationReason::WorkspacePathChanged => 0,
+                InvalidationReason::ExecutableHashChanged => 1,
+                InvalidationReason::EndpointHostChanged => 2,
+                InvalidationReason::RepositoryRemoteChanged => 3,
+                InvalidationReason::ToolSchemaFingerprintChanged => 4,
+                InvalidationReason::RecipeContentHashChanged => 5,
+                InvalidationReason::CapabilityExpansion => 6,
+                InvalidationReason::IncompatibleVersionChange => 7,
+            };
+            assert_eq!(InvalidationReason::PRECEDENCE[position], reason);
+            assert_eq!(
+                InvalidationReason::from_stored(reason.as_str()),
+                Some(reason)
+            );
         }
     }
 

@@ -558,12 +558,15 @@ impl IdentityBasis {
             let capability = capability.into();
             validate_text("capabilities", &capability)?;
             declared.insert(capability);
-        }
-        if declared.len() > MAX_CAPABILITIES {
-            return Err(invalid_identity(
-                "capabilities",
-                "more capabilities are declared than an identity may carry",
-            ));
+            // Checked inside the loop, not after it: a subject advertising a
+            // million capability strings must not be able to have them all
+            // allocated before the refusal that was always going to happen.
+            if declared.len() > MAX_CAPABILITIES {
+                return Err(invalid_identity(
+                    "capabilities",
+                    "more capabilities are declared than an identity may carry",
+                ));
+            }
         }
         self.capabilities = declared;
         Ok(self)

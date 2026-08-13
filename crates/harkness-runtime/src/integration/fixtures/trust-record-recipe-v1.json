@@ -3,6 +3,7 @@
   "subject_kind": "recipe",
   "identity": {
     "display_name": "release",
+    "content_hash": "db9ad28cf3295316a50ae3c5cc2a54134202678017ca1e9137f26bea046fb291",
     "configuration_source": "builtin"
   },
   "scope": "global",

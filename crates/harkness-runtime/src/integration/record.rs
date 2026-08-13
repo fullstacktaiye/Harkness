@@ -5,7 +5,7 @@ use time::{OffsetDateTime, UtcOffset};
 
 use crate::domain::InvalidTransition;
 
-use super::error::IntegrationDomainError;
+use super::error::{IntegrationDomainError, invalid_record};
 use super::state::{InvalidationReason, TrustCheck, TrustScope, TrustState};
 use super::subject::{IdentityBasis, SubjectKind};
 
@@ -59,11 +59,28 @@ impl ObservedIdentity {
 ///
 /// A record is created by [`grant`](Self::grant) and is therefore always a
 /// grant: [`TrustState::Untrusted`] is what a *lookup* answers when no record
-/// matches, and never the state of a record that exists. The natural key is
-/// `(subject kind, identity basis, scope)` — see
-/// [`is_same_grant_as`](Self::is_same_grant_as) — so persisting one grant twice
-/// is a no-op, and re-granting after a revocation is a new record rather than a
-/// rewrite of the one the user said no to.
+/// matches, and never the state of a record that exists.
+///
+/// # There is no structural key for "the same grant"
+///
+/// It is tempting to treat `(subject kind, identity basis, scope)` as a natural
+/// key a store can deduplicate on. It cannot be one, and the reason is worth
+/// stating because the alternative looks reasonable right up until it loses a
+/// user's decision.
+///
+/// [`check`](Self::check) does not compare bases for equality. It ignores the
+/// display name and the executable path, and it accepts a semver-compatible
+/// upgrade — so an agent trusted at `1.4.2` and observed at `1.4.3` is the same
+/// grant, while two records holding those two bases are not structurally equal.
+/// A key over a *compatibility relation* is not a key. Worse, a revoked record
+/// and a later grant about the same subject would collide on such a key, and a
+/// store upserting on it would overwrite the revocation this state machine
+/// exists to preserve.
+///
+/// The matching relation is [`check`](Self::check) itself: find the records for
+/// a subject, then ask each one about the observation in front of you. A store
+/// therefore addresses a row by its own row identity — never by a projection of
+/// these fields, which [`regrant`](Self::regrant) deliberately moves.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrustRecord {
     subject_kind: SubjectKind,
@@ -83,6 +100,11 @@ impl TrustRecord {
     /// does not carry the UTC offset. The timestamp is refused rather than
     /// converted, because a grant time written in another offset means the
     /// caller is not producing the spelling every other durable record uses.
+    ///
+    /// Returns [`IntegrationDomainError::MissingIdentityEvidence`] when the
+    /// basis carries none of the evidence its subject kind is recognized by,
+    /// and [`IntegrationDomainError::InvalidRecord`] when a workspace scope
+    /// names a root that is not absolute.
     pub fn grant(
         subject_kind: SubjectKind,
         identity_basis: IdentityBasis,
@@ -90,6 +112,8 @@ impl TrustRecord {
         granted_at: OffsetDateTime,
     ) -> Result<Self, IntegrationDomainError> {
         validate_utc("granted_at", granted_at)?;
+        validate_scope(&scope)?;
+        require_evidence(subject_kind, &identity_basis, &scope)?;
         Ok(Self {
             subject_kind,
             identity_basis,
@@ -109,6 +133,8 @@ impl TrustRecord {
         granted_at: OffsetDateTime,
     ) -> Result<Self, IntegrationDomainError> {
         validate_utc("granted_at", granted_at)?;
+        validate_scope(&scope)?;
+        require_evidence(subject_kind, &identity_basis, &scope)?;
         if state == TrustState::Untrusted {
             return Err(IntegrationDomainError::InvalidRecord {
                 record: RECORD,
@@ -171,18 +197,6 @@ impl TrustRecord {
         self.granted_at
     }
 
-    /// Whether two records are grants about the same thing.
-    ///
-    /// The natural key deliberately includes the identity basis: a subject
-    /// whose executable, endpoint, schema, capabilities or configuration source
-    /// differ is a different grant, not the same grant in a different state.
-    #[must_use]
-    pub fn is_same_grant_as(&self, other: &Self) -> bool {
-        self.subject_kind == other.subject_kind
-            && self.identity_basis == other.identity_basis
-            && self.scope == other.scope
-    }
-
     /// Decides whether this grant still describes the subject in front of you.
     ///
     /// Pure: it reads no clock, opens no file, and hashes nothing. Callers
@@ -221,12 +235,23 @@ impl TrustRecord {
 
     /// Withdraws the grant on an explicit user decision.
     ///
+    /// Legal from [`Trusted`](TrustState::Trusted) and from
+    /// [`Invalidated`](TrustState::Invalidated). The second is the re-prompt a
+    /// user declined: without it, a refusal after drift would leave the record
+    /// saying only what it already said before anybody was asked.
+    ///
+    /// Any invalidation reason is cleared, because the record now says the user
+    /// refused rather than that a check found drift — the drift is history, and
+    /// the reason field describes the state the record is *in*.
+    ///
     /// # Errors
     ///
-    /// Returns [`IntegrationDomainError::InvalidTrustTransition`] unless the
-    /// grant is currently [`Trusted`](TrustState::Trusted).
+    /// Returns [`IntegrationDomainError::InvalidTrustTransition`] when the
+    /// grant is already [`Revoked`](TrustState::Revoked).
     pub fn revoke(&mut self) -> Result<(), IntegrationDomainError> {
-        self.transition(TrustState::Revoked)
+        self.transition(TrustState::Revoked)?;
+        self.invalidation_reason = None;
+        Ok(())
     }
 
     /// Records that the subject drifted from the identity that was trusted.
@@ -260,13 +285,18 @@ impl TrustRecord {
     /// Returns [`IntegrationDomainError::InvalidTrustTransition`] unless the
     /// grant is currently [`Invalidated`](TrustState::Invalidated), and
     /// [`IntegrationDomainError::InvalidTimestamp`] when `granted_at` does not
-    /// carry the UTC offset.
+    /// carry the UTC offset, and
+    /// [`IntegrationDomainError::MissingIdentityEvidence`] when the replacement
+    /// basis carries none of the evidence the subject kind is recognized by —
+    /// a re-grant must not be the way a record loses the field that made it
+    /// checkable.
     pub fn regrant(
         &mut self,
         identity_basis: IdentityBasis,
         granted_at: OffsetDateTime,
     ) -> Result<(), IntegrationDomainError> {
         validate_utc("granted_at", granted_at)?;
+        require_evidence(self.subject_kind, &identity_basis, &self.scope)?;
         self.transition(TrustState::Trusted)?;
         self.identity_basis = identity_basis;
         self.invalidation_reason = None;
@@ -285,6 +315,91 @@ impl TrustRecord {
         self.state = to;
         Ok(())
     }
+}
+
+/// Refuses a grant whose basis holds nothing its subject kind is known by.
+///
+/// Every basis field is optional, because no subject has all of them — an MCP
+/// tool has a schema fingerprint and no executable, a recipe has a content hash
+/// and no endpoint. That flexibility has one sharp edge: a basis carrying *no*
+/// evidence at all reduces [`TrustRecord::check`] to comparing the fields both
+/// sides leave empty, which is to say it answers `Valid` for every observation
+/// ever made. A recipe registered without its content hash would then keep its
+/// grant through any edit — the precise failure the module exists to prevent,
+/// arriving silently.
+///
+/// So each kind names what it is recognized by, and a grant that cannot supply
+/// it is refused at construction rather than mis-answering forever afterwards.
+/// ADR-0016 puts it as: where an identity is genuinely unavailable, the record
+/// says so rather than substituting a name.
+fn require_evidence(
+    subject_kind: SubjectKind,
+    basis: &IdentityBasis,
+    scope: &TrustScope,
+) -> Result<(), IntegrationDomainError> {
+    let (present, required) = match subject_kind {
+        SubjectKind::AgentExecutable => (
+            basis.executable().is_some(),
+            "an executable path and content digest",
+        ),
+        // ADR-0012 fixes stdio transports, so a server is normally a local
+        // executable; an endpoint is accepted beside it rather than instead of
+        // it, so this rule does not have to be revisited to describe one.
+        SubjectKind::McpServer => (
+            basis.executable().is_some() || basis.endpoint().is_some(),
+            "an executable or an endpoint",
+        ),
+        SubjectKind::McpToolSchema => (
+            basis.schema_fingerprint().is_some(),
+            "a tool schema fingerprint",
+        ),
+        SubjectKind::Recipe => (basis.content_hash().is_some(), "a recipe content hash"),
+        SubjectKind::ForgeAccount => (basis.endpoint().is_some(), "an endpoint"),
+        SubjectKind::ForgeRepository => (
+            basis
+                .endpoint()
+                .is_some_and(|endpoint| endpoint.resource().is_some()),
+            "an endpoint naming the repository on its host",
+        ),
+        // A workspace is identified by where it is, which is the scope rather
+        // than a field of the basis.
+        SubjectKind::Workspace => (scope.root().is_some(), "a workspace-scoped grant"),
+    };
+    if present {
+        return Ok(());
+    }
+    Err(IntegrationDomainError::MissingIdentityEvidence {
+        subject_kind,
+        required,
+    })
+}
+
+/// Refuses a workspace scope that names a root no observation can match.
+///
+/// `TrustScope` is a plain data enum whose variant field is public, so a
+/// caller can build one without going through [`TrustScope::workspace`]. The
+/// check therefore belongs here, where every record passes, rather than on the
+/// constructor it could route around. A relative or empty root names a
+/// different directory from every working directory, so a grant carrying one
+/// fails closed *silently* — the user is re-prompted forever with
+/// `WorkspacePathChanged` and never learns why.
+fn validate_scope(scope: &TrustScope) -> Result<(), IntegrationDomainError> {
+    let Some(root) = scope.root() else {
+        return Ok(());
+    };
+    if root.as_os_str().is_empty() {
+        return Err(invalid_record(
+            RECORD,
+            "a workspace scope cannot name an empty root",
+        ));
+    }
+    if !root.is_absolute() {
+        return Err(invalid_record(
+            RECORD,
+            "a workspace scope must name an absolute root",
+        ));
+    }
+    Ok(())
 }
 
 /// One comparison between the identity that was trusted and the one observed.
@@ -930,34 +1045,109 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn the_natural_key_is_the_subject_kind_the_basis_and_the_scope() {
-        let record = agent_record();
-        assert!(record.is_same_grant_as(&agent_record()));
+    fn a_user_can_decline_the_re_prompt_that_followed_a_drift() {
+        let mut record = agent_record();
+        record
+            .invalidate(InvalidationReason::ExecutableHashChanged)
+            .unwrap();
+        record.revoke().unwrap();
 
-        let mut revoked = agent_record();
-        revoked.revoke().unwrap();
-        assert!(
-            record.is_same_grant_as(&revoked),
-            "state is not part of the key"
+        assert_eq!(record.state(), TrustState::Revoked);
+        assert_eq!(
+            record.invalidation_reason(),
+            None,
+            "the record now says the user refused, not that a check found drift"
         );
+        assert_eq!(
+            record.check(&observed(agent_basis())),
+            TrustCheck::NotTrusted
+        );
+        assert!(record.revoke().is_err(), "revoked is terminal");
+    }
 
-        let other_scope = TrustRecord::grant(
-            SubjectKind::AgentExecutable,
-            agent_basis(),
-            TrustScope::Global,
-            at(0),
-        )
-        .unwrap();
-        assert!(!record.is_same_grant_as(&other_scope));
+    /// A basis with none of the evidence its kind is known by would make
+    /// `check` answer `Valid` for any observation at all.
+    #[test]
+    fn a_grant_requires_the_evidence_its_subject_kind_is_recognized_by() {
+        let bare = || IdentityBasis::new("bare", ConfigurationSource::User).unwrap();
+        let missing = [
+            (SubjectKind::AgentExecutable, TrustScope::Global),
+            (SubjectKind::McpServer, TrustScope::Global),
+            (SubjectKind::McpToolSchema, TrustScope::Global),
+            (SubjectKind::Recipe, TrustScope::Global),
+            (SubjectKind::ForgeAccount, TrustScope::Global),
+            (SubjectKind::ForgeRepository, TrustScope::Global),
+            (SubjectKind::Workspace, TrustScope::Global),
+        ];
+        assert_eq!(
+            missing.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
+            SubjectKind::ALL
+        );
+        for (kind, scope) in missing {
+            let error = TrustRecord::grant(kind, bare(), scope, at(0)).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                "missing_identity_evidence",
+                "{kind} accepted a basis with nothing to compare"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .starts_with(&format!("a {kind} grant requires"))
+            );
+        }
 
-        let other_basis = TrustRecord::grant(
-            SubjectKind::AgentExecutable,
-            agent_basis().versioned("2.0.0").unwrap(),
-            TrustScope::workspace("/workspace"),
-            at(0),
-        )
-        .unwrap();
-        assert!(!record.is_same_grant_as(&other_basis));
+        // A forge repository needs the resource, not merely the host: a grant
+        // naming only `github.com` would survive being repointed at any other
+        // repository on it.
+        let host_only = IdentityBasis::new("octocat/hello", ConfigurationSource::User)
+            .unwrap()
+            .reached_at(EndpointIdentity::new("github.com", None).unwrap());
+        assert_eq!(
+            TrustRecord::grant(
+                SubjectKind::ForgeRepository,
+                host_only,
+                TrustScope::Global,
+                at(0)
+            )
+            .unwrap_err()
+            .kind(),
+            "missing_identity_evidence"
+        );
+    }
+
+    #[test]
+    fn a_regrant_cannot_drop_the_evidence_that_made_a_record_checkable() {
+        let mut record = agent_record();
+        record
+            .invalidate(InvalidationReason::ExecutableHashChanged)
+            .unwrap();
+
+        let without_executable = IdentityBasis::new("Example agent", ConfigurationSource::User)
+            .unwrap()
+            .versioned("1.4.2")
+            .unwrap();
+        let error = record.regrant(without_executable, at(60)).unwrap_err();
+        assert_eq!(error.kind(), "missing_identity_evidence");
+        assert_eq!(record.state(), TrustState::Invalidated);
+    }
+
+    #[test]
+    fn a_workspace_scope_must_name_an_absolute_root() {
+        for rejected in ["", "workspace", "../workspace"] {
+            let error = TrustRecord::grant(
+                SubjectKind::AgentExecutable,
+                agent_basis(),
+                TrustScope::workspace(rejected),
+                at(0),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                "invalid_integration_record",
+                "accepted {rejected:?} as a workspace root"
+            );
+        }
     }
 
     #[test]
@@ -1014,10 +1204,21 @@ pub(super) mod tests {
             SubjectKind::ALL
         );
         for (kind, basis) in shapes {
-            let record =
-                TrustRecord::grant(kind, basis.clone(), TrustScope::Global, at(0)).unwrap();
+            // A workspace is identified by where it is, so its grant is the one
+            // shape that has to be workspace-scoped.
+            let (scope, workspace) = if kind == SubjectKind::Workspace {
+                (TrustScope::workspace("/workspace"), Some("/workspace"))
+            } else {
+                (TrustScope::Global, None)
+            };
+            let record = TrustRecord::grant(kind, basis.clone(), scope, at(0)).unwrap();
+
+            let mut observation = ObservedIdentity::new(basis);
+            if let Some(workspace) = workspace {
+                observation = observation.in_workspace(workspace);
+            }
             assert_eq!(
-                record.check(&ObservedIdentity::new(basis)),
+                record.check(&observation),
                 TrustCheck::Valid,
                 "{kind} did not verify against its own identity"
             );

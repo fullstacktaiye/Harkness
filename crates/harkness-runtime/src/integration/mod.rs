@@ -38,13 +38,20 @@
 //! is not. Everything else takes part, and an expected field the observation
 //! *lacks* invalidates rather than passing by absence.
 //!
+//! Every basis field is optional, since no subject has all of them — and a
+//! basis carrying *none* of the ones its kind is known by would leave `check`
+//! comparing the fields both sides left empty, which answers `Valid` for
+//! anything at all. [`TrustRecord::grant`] therefore refuses such a record
+//! outright: a recipe needs its content hash, an agent its executable, a forge
+//! repository an endpoint naming the repository and not merely the host.
+//!
 //! # The state machine
 //!
 //! ```text
 //! untrusted --grant--> trusted --user says no--> revoked
-//!                         |
-//!                    drift detected
-//!                         v
+//!                         |                        ^
+//!                    drift detected                |
+//!                         v              re-prompt declined
 //!                    invalidated --re-grant--> trusted
 //! ```
 //!
@@ -55,7 +62,13 @@
 //! after a user said no is a new record, because overwriting that state would
 //! erase the one decision the audit trail exists to keep. Invalidation is not a
 //! decision anybody made, so [`TrustRecord::regrant`] continues the same record
-//! against the identity that is there now.
+//! against the identity that is there now — and a user who is re-prompted and
+//! *declines* revokes from there, which is why that edge exists.
+//!
+//! There is no structural key for "the same grant", and adding one would be a
+//! mistake: [`TrustRecord::check`] accepts a compatible upgrade and ignores two
+//! fields, so equality over these fields is not the relation it implements. See
+//! [`TrustRecord`] for what a store should key on instead.
 //!
 //! # Which reason is reported when several apply
 //!
