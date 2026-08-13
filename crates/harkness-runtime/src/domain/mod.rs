@@ -31,7 +31,7 @@
 //! borrowing `*WireRef` types to avoid cloning tool input and output values.
 
 mod error;
-mod id;
+pub(crate) mod id;
 mod record;
 mod state;
 mod wire;

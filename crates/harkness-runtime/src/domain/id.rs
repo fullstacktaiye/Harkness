@@ -1,6 +1,14 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Declares a UUID newtype with the identifier contract every Harkness
+/// identity shares: `Copy`, total ordering, transparent serde, canonical
+/// hyphenated `Display`, and a `Default` that generates a fresh value.
+///
+/// Shared with [`crate::integration`] so an external-subject identifier is the
+/// same kind of thing as a [`TaskId`] rather than a second convention. The
+/// expansion names `Uuid`, `Serialize`, and `Deserialize` unqualified, so a
+/// call site imports all three.
 macro_rules! define_id {
     ($(#[$metadata:meta])* $name:ident) => {
         $(#[$metadata])*
@@ -42,6 +50,8 @@ macro_rules! define_id {
         }
     };
 }
+
+pub(crate) use define_id;
 
 define_id!(
     /// A stable identifier for one user task.

@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "subject_kind": "recipe",
+  "identity": {
+    "display_name": "release",
+    "configuration_source": "builtin"
+  },
+  "scope": "global",
+  "state": "trusted",
+  "granted_at": "1970-01-01T00:04:00Z",
+  "superseded_by": "a field this build has never heard of"
+}

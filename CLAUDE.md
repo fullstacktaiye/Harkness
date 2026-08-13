@@ -51,15 +51,22 @@ build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing lin
   warning still: run it only when a *new* approval hash domain is published, because every stored
   `input_hash` was derived under the encoding it pins.
   `cargo test -p harkness-context -- --ignored regenerate_the_frozen_v1_fixtures` rewrites
-  `crates/harkness-context/src/fixtures/*.json` the same way, and carries the same warning: a
-  released wire form is replaced by a new versioned fixture, never edited in place.
+  `crates/harkness-context/src/fixtures/*.json` the same way, and
+  `cargo test -p harkness-runtime -- --exact --ignored
+  integration::wire::tests::regenerate_the_frozen_v1_fixtures` rewrites the four positive fixtures
+  under `crates/harkness-runtime/src/integration/fixtures/`. Both carry the same warning: a released
+  wire form is replaced by a new versioned fixture, never edited in place. The integration
+  regenerator deliberately leaves `trust-record-future-schema.json` and
+  `trust-record-unknown-field.json` alone — neither is a wire form this build can produce, so they
+  are hand-maintained beside the frozen set they probe.
 - **Latency targets** (`store/tests.rs`, `tool/tests.rs`): meaningful only under `--release`.
 
 ### Frozen fixtures
 
 `crates/harkness-core/src/catalog/fixtures/*.json`, `crates/harkness-runtime/src/domain/fixtures/*.json`,
 `crates/harkness-context/src/fixtures/*.json`,
-`crates/harkness-runtime/src/approval/fixtures/canonical-input-v1.json`, and
+`crates/harkness-runtime/src/approval/fixtures/canonical-input-v1.json`,
+`crates/harkness-runtime/src/integration/fixtures/*.json`, and
 `crates/harkness-runtime/src/store/fixtures/runtime-v{1..5}.db` pin released on-disk formats. A new
 persisted field, state spelling, or table means a version bump plus a *new* fixture, not an edit to
 an existing one.
@@ -110,6 +117,14 @@ translating between two cancellation mechanisms.
   an existing grant covers a new call, and the condvar-backed gate a parked call is woken through.
   It is the only production source of a `policy::RunGrant` — policy cannot construct one — so an
   `Ask` becomes an `Allow` only because the matcher accepted a grant.
+  `integration` is the same idea across the process boundary: identifiers, identity records, and
+  per-subject `TrustRecord`s for the external things v0.5 talks to (ACP agents, MCP servers and
+  their tool schemas, recipes, forge accounts and repositories). It is pure vocabulary — the check
+  that decides whether a grant still describes its subject reads no clock and opens no file, and
+  enforcement is #148. It lives here rather than in an adapter because trust has to compose with
+  `trust` and `policy`, which an adapter cannot see under ADR-0009. Note the two things called
+  trust: `trust::TrustState` is about running one workspace's code, `integration::TrustState` about
+  an external subject whose identity can change under a grant.
 - **`harkness-context`** owns the context engine's vocabulary and nothing that
   uses it: identifiers, `WorkspaceSnapshot` identity, `Provenance`, and
   `FileClass`. It deliberately does *not* depend on `harkness-runtime` — the

@@ -740,6 +740,45 @@ that identity, never a boolean, and it is a precondition rather than an authoriz
 agent still passes policy and approval on every action. An external permission system supplements
 Harkness policy and never replaces it. ADR-0016 records the shape.
 
+## Integration Identity & Trust Invariants
+
+`harkness-runtime/src/integration` owns that model. A `TrustRecord` names a subject kind, the
+`IdentityBasis` it was granted against, a scope, and a `granted_at`; it never carries an identifier
+for the subject, because grants are keyed by `(subject kind, identity basis, scope)` and a subject
+whose basis differs is a different grant rather than the same grant in a different state.
+
+`TrustRecord::check` is pure — no clock, no filesystem, no hashing — and is the only place trust is
+decided. Two basis fields are deliberately not compared, and neither exclusion may be quietly
+widened: a `display_name`, because ADR-0016 fixes that trust never binds to a name, and an
+executable's *path*, because an identical binary reached through another path is the same program
+while a different binary at the same path is not. Every other field is compared, and a field the
+observation *lacks* invalidates rather than passing by absence — a deleted executable, a server that
+stopped reporting its protocol revision, and an unreadable recipe are all drift, never validity.
+
+`InvalidationReason::PRECEDENCE` is the fixed order a multi-trigger observation reports, and the
+comparisons are a table in that order rather than a sequence of `if`s so the documented order and
+the applied order cannot drift. The order is: the grant's reach, then evidence a subject cannot
+misreport (executable digest, endpoint host, endpoint resource, schema fingerprint, content hash),
+then what it may now do and who now configures it, then the version it reports for itself.
+
+`Untrusted` is the initial state of the machine and what a lookup answers when no record matches; a
+wire record spelling it is refused, because absence is what untrusted means. `Revoked` is terminal:
+re-granting after a user said no is a new record, never a rewrite of the state they chose.
+`Invalidated` is not, since nobody decided it — `regrant` rebases the basis and moves `granted_at`
+on the same record. An invalidation reason is required by `Invalidated` and permitted nowhere else.
+
+Identity records carry no secrets — no tokens, no credential material, no `CredentialSource` — and a
+test asserts every serialized record shape is free of fields named like one. Every text field is
+bounded and refuses surrounding whitespace rather than trimming it, because trimming would make two
+spellings compare equal in the record and unequal everywhere the value came from. An endpoint host
+*is* lowercased, because DNS names are case-insensitive and two spellings of one host must not
+compare as two hosts.
+
+`INTEGRATION_RECORD_SCHEMA_VERSION` is independent of `RUNTIME_RECORD_SCHEMA_VERSION` so trust
+records and run records evolve without dragging each other along; the scope and its workspace are
+two flat wire fields rather than a tagged enum precisely so the strict body keeps
+`deny_unknown_fields`, which serde's `flatten` would silently disable.
+
 Pinned external versions: ACP protocol version 1 (ADR-0014), MCP revisions 2026-07-28 primary and
 2025-11-25 fallback (ADR-0013), `X-GitHub-Api-Version: 2026-03-10` on every GitHub request
 (ADR-0018), and `agent-client-protocol-schema` at a schema/v1 release with every `unstable_*`
