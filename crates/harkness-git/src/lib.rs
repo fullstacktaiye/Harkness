@@ -49,15 +49,15 @@ pub use context::{
 pub use diff::{
     DEFAULT_DIFF_CONTEXT_LINES, DEFAULT_MAX_DIFF_FILE_SIZE, DEFAULT_MAX_DIFF_FILES,
     DEFAULT_MAX_DIFF_TOTAL_BYTES, DiffLine, DiffLineKind, DiffOmission, DiffOptions, DiffTarget,
-    FileDiff, Hunk, IntraLineDegradation, IntraLineRange, MAX_INTRA_LINE_BYTES,
-    MAX_INTRA_LINE_COMPARISONS,
+    ExactFileDiff, FileDiff, Hunk, IntraLineDegradation, IntraLineRange, MAX_INTRA_LINE_BYTES,
+    MAX_INTRA_LINE_COMPARISONS, Whitespace, WhitespaceMode,
 };
 pub use discard::{
     DiscardDescription, DiscardOperation, DiscardOutcome, DiscardRecoverability, DiscardSnapshot,
     TrackedRestoreSource,
 };
 pub use history::{CommitInfo, CommitSignature, LogCursor, LogOptions, LogPage, LogRange};
-pub use hunk::{HunkSelection, HunkStageOutcome, LineSelection, LineStageOutcome};
+pub use hunk::{HunkSelection, HunkStageOutcome, LineSelection, LineStageOutcome, remap_to_exact};
 use lock::RepositoryLock;
 #[doc(hidden)]
 pub use path::canonicalize_with_missing_tail;
@@ -540,6 +540,36 @@ pub enum GitError {
     #[error("the selected hunks for '{}' are stale; refresh the diff before retrying", path.display())]
     StaleHunkSelection { path: PathBuf },
 
+    /// A selection was taken from a diff that does not describe the file.
+    ///
+    /// A whitespace-insensitive comparison omits lines that genuinely differ on
+    /// disk, so a patch rendered from its hunks would write the wrong bytes.
+    /// Refused before the repository lock is taken and before anything is
+    /// recomputed, because an exact recomputation could match these coordinates
+    /// by coincidence on a hunk whose interior differs.
+    #[error(
+        "the selection for '{}' was taken from a diff computed with {whitespace} whitespace \
+         handling, which omits lines that differ on disk; recompute the diff with exact \
+         whitespace and select from that",
+        path.display()
+    )]
+    WhitespaceInsensitiveSelection {
+        path: PathBuf,
+        whitespace: Whitespace,
+    },
+
+    /// An exact recomputation found changes the whitespace-insensitive view hid.
+    ///
+    /// Raised only by [`remap_to_exact`]. The region a caller picked in a
+    /// relaxed view maps onto exact hunks that carry additional changed lines,
+    /// so applying them would act on content the user was never shown.
+    #[error(
+        "the region selected in '{}' also contains whitespace-only differences that this view \
+         hides; switch the diff to exact whitespace to see and select them",
+        path.display()
+    )]
+    HiddenWhitespaceChanges { path: PathBuf },
+
     /// Binary content cannot be staged below path granularity.
     #[error("binary file '{}' does not support hunk staging", path.display())]
     BinaryHunkSelection { path: PathBuf },
@@ -699,6 +729,8 @@ impl GitError {
         "blob_not_found",
         "malformed_diff",
         "stale_hunk_selection",
+        "whitespace_insensitive_selection",
+        "hidden_whitespace_changes",
         "binary_hunk_selection",
         "rename_only_hunk_selection",
         "metadata_only_hunk_selection",
@@ -776,6 +808,8 @@ impl GitError {
             Self::BlobNotFound { .. } => "blob_not_found",
             Self::MalformedDiff { .. } => "malformed_diff",
             Self::StaleHunkSelection { .. } => "stale_hunk_selection",
+            Self::WhitespaceInsensitiveSelection { .. } => "whitespace_insensitive_selection",
+            Self::HiddenWhitespaceChanges { .. } => "hidden_whitespace_changes",
             Self::BinaryHunkSelection { .. } => "binary_hunk_selection",
             Self::RenameOnlyHunkSelection { .. } => "rename_only_hunk_selection",
             Self::MetadataOnlyHunkSelection { .. } => "metadata_only_hunk_selection",
@@ -1138,11 +1172,14 @@ impl GitService {
     /// Selections are recomputed and revalidated under the repository lock,
     /// then the trusted reverse patch is applied to the working tree. Untracked
     /// and unmerged content is refused rather than being deleted implicitly.
+    /// A selection taken from a whitespace-insensitive diff is refused with
+    /// [`GitError::WhitespaceInsensitiveSelection`] before the lock is taken.
     pub fn discard_hunks(
         &self,
         selections: &[HunkSelection],
         cancellation: &Cancellation,
     ) -> Result<DiscardOutcome, GitError> {
+        hunk::refuse_whitespace_insensitive(selections)?;
         let lock = self.acquire_lock(cancellation)?;
         discard::discard_hunks(
             &self.git_executable,
@@ -1157,11 +1194,14 @@ impl GitService {
     ///
     /// Each line retains its enclosing hunk identity, so the same stale-safe
     /// recomputation used for line staging protects this destructive direction.
+    /// A selection taken from a whitespace-insensitive diff is refused with
+    /// [`GitError::WhitespaceInsensitiveSelection`] before the lock is taken.
     pub fn discard_lines(
         &self,
         selections: &[LineSelection],
         cancellation: &Cancellation,
     ) -> Result<DiscardOutcome, GitError> {
+        hunk::refuse_whitespace_insensitive(selections)?;
         let lock = self.acquire_lock(cancellation)?;
         discard::discard_lines(
             &self.git_executable,
@@ -1178,6 +1218,8 @@ impl GitService {
     /// IDs and coordinates are revalidated under the repository lock before a
     /// byte-preserving patch is rebuilt and applied atomically to the index:
     /// the whole batch lands or the index is left exactly as it was.
+    /// A selection taken from a whitespace-insensitive diff is refused with
+    /// [`GitError::WhitespaceInsensitiveSelection`] before the lock is taken.
     pub fn stage_hunks(
         &self,
         selections: &[HunkSelection],
@@ -1193,6 +1235,7 @@ impl GitService {
         options: &StageOptions,
         cancellation: &Cancellation,
     ) -> Result<HunkStageOutcome, GitError> {
+        hunk::refuse_whitespace_insensitive(selections)?;
         let lock = self.acquire_lock(cancellation)?;
         hunk::stage(
             &self.git_executable,
@@ -1209,6 +1252,8 @@ impl GitService {
     /// Selections must come from a staged [`Self::diff`] result. Before the
     /// first commit, reverse application uses the empty HEAD tree in exactly
     /// the same way as the staged diff model.
+    /// A selection taken from a whitespace-insensitive diff is refused with
+    /// [`GitError::WhitespaceInsensitiveSelection`] before the lock is taken.
     pub fn unstage_hunks(
         &self,
         selections: &[HunkSelection],
@@ -1224,6 +1269,7 @@ impl GitService {
         options: &StageOptions,
         cancellation: &Cancellation,
     ) -> Result<HunkStageOutcome, GitError> {
+        hunk::refuse_whitespace_insensitive(selections)?;
         let lock = self.acquire_lock(cancellation)?;
         hunk::unstage(
             &self.git_executable,
@@ -1241,6 +1287,8 @@ impl GitService {
     /// recomputed and checked under the repository lock. Lines from the same
     /// fresh hunk are merged into one internally recounted patch hunk before
     /// the batch is applied atomically.
+    /// A selection taken from a whitespace-insensitive diff is refused with
+    /// [`GitError::WhitespaceInsensitiveSelection`] before the lock is taken.
     pub fn stage_lines(
         &self,
         selections: &[LineSelection],
@@ -1256,6 +1304,7 @@ impl GitService {
         options: &StageOptions,
         cancellation: &Cancellation,
     ) -> Result<LineStageOutcome, GitError> {
+        hunk::refuse_whitespace_insensitive(selections)?;
         let lock = self.acquire_lock(cancellation)?;
         hunk::stage_lines(
             &self.git_executable,
@@ -1268,6 +1317,8 @@ impl GitService {
     }
 
     /// Unstages selected changed lines without writing the working tree.
+    /// A selection taken from a whitespace-insensitive diff is refused with
+    /// [`GitError::WhitespaceInsensitiveSelection`] before the lock is taken.
     pub fn unstage_lines(
         &self,
         selections: &[LineSelection],
@@ -1283,6 +1334,7 @@ impl GitService {
         options: &StageOptions,
         cancellation: &Cancellation,
     ) -> Result<LineStageOutcome, GitError> {
+        hunk::refuse_whitespace_insensitive(selections)?;
         let lock = self.acquire_lock(cancellation)?;
         hunk::unstage_lines(
             &self.git_executable,
@@ -2369,6 +2421,17 @@ mod tests {
             (
                 GitError::StaleHunkSelection { path: path.clone() },
                 "stale_hunk_selection",
+            ),
+            (
+                GitError::WhitespaceInsensitiveSelection {
+                    path: path.clone(),
+                    whitespace: crate::Whitespace::new(crate::WhitespaceMode::IgnoreAll),
+                },
+                "whitespace_insensitive_selection",
+            ),
+            (
+                GitError::HiddenWhitespaceChanges { path: path.clone() },
+                "hidden_whitespace_changes",
             ),
             (
                 GitError::BinaryHunkSelection { path: path.clone() },

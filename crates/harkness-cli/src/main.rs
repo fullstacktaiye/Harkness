@@ -33,7 +33,7 @@ use harkness_git::{
     HunkSelection, IntraLineDegradation, LineSelection, LogCursor, LogOptions, LogRange,
     PendingOperation, PullOptions, PullOutcome, PullStrategy, PushOptions, PushOutcome, RefUpdate,
     StageOutcome, StagePathResult, StatusEntry, StatusRefreshOutcome, TrackedRestoreSource,
-    UpstreamStatus, WorktreeBase,
+    UpstreamStatus, Whitespace, WhitespaceMode, WorktreeBase,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -534,6 +534,46 @@ impl LogArguments {
     }
 }
 
+/// The `--whitespace` spellings, kept in step with [`WhitespaceMode`].
+///
+/// Clap renders these kebab-cased on the command line while the JSON envelope
+/// keeps the snake-cased [`WhitespaceMode::name`] spelling, so a flag value and
+/// a wire value are never mistaken for one another.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum WhitespaceArgument {
+    /// Compare bytes; every whitespace difference is a change.
+    #[default]
+    Exact,
+    /// Ignore whitespace at end of line, which is what a CRLF-to-LF pass changes.
+    IgnoreEol,
+    /// Ignore changes in the amount of whitespace, such as a re-indent.
+    IgnoreChange,
+    /// Ignore whitespace everywhere, including whitespace added to a line.
+    IgnoreAll,
+}
+
+impl From<WhitespaceArgument> for WhitespaceMode {
+    fn from(value: WhitespaceArgument) -> Self {
+        match value {
+            WhitespaceArgument::Exact => Self::Exact,
+            WhitespaceArgument::IgnoreEol => Self::IgnoreEol,
+            WhitespaceArgument::IgnoreChange => Self::IgnoreChange,
+            WhitespaceArgument::IgnoreAll => Self::IgnoreAll,
+        }
+    }
+}
+
+impl std::fmt::Display for WhitespaceArgument {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Exact => "exact",
+            Self::IgnoreEol => "ignore-eol",
+            Self::IgnoreChange => "ignore-change",
+            Self::IgnoreAll => "ignore-all",
+        })
+    }
+}
+
 #[derive(Debug, Args)]
 #[command(group(
     ArgGroup::new("diff_target")
@@ -572,6 +612,15 @@ struct DiffArguments {
         value_parser = clap::value_parser!(u32).range(0..=i64::from(MAX_DIFF_CONTEXT_LINES)),
     )]
     context_lines: u32,
+    /// How whitespace-only differences are treated. Anything but `exact`
+    /// produces a view-only diff: its hunks omit lines that differ on disk, so
+    /// `git stage --hunk-selection` refuses a selection taken from it.
+    #[arg(long, value_name = "MODE", default_value_t = WhitespaceArgument::Exact, value_enum)]
+    whitespace: WhitespaceArgument,
+    /// Leave lines that are blank on both sides out of the comparison. This is
+    /// view-only for the same reason `--whitespace` is.
+    #[arg(long)]
+    ignore_blank_lines: bool,
     /// Retrieve each hunk with this many additional lines before and after,
     /// addressed by the diff's recorded blob IDs rather than by recomputing a
     /// wider diff.
@@ -595,6 +644,8 @@ struct DiffArguments {
             "branch",
             "intra_line",
             "context_lines",
+            "whitespace",
+            "ignore_blank_lines",
             "max_files",
             "paths"
         ]
@@ -912,6 +963,13 @@ impl HunkArguments {
                 self.old_blob_id.ok_or_else(|| missing("old_blob_id"))?,
                 self.new_blob_id.ok_or_else(|| missing("new_blob_id"))?,
                 self.context_lines.ok_or_else(|| missing("context_lines"))?,
+                // The flag form names one hunk by hand and has no whitespace
+                // flags of its own: a view-only diff is exactly what it must
+                // not be spelling, and offering the flag would only let a
+                // caller write down a selection the service is going to refuse.
+                // A whitespace-insensitive document reaches the refusal through
+                // --hunk-selection, which is where such a record comes from.
+                Whitespace::EXACT,
                 (
                     self.old_start.ok_or_else(|| missing("old_start"))?,
                     self.old_lines.ok_or_else(|| missing("old_lines"))?,
@@ -1125,6 +1183,7 @@ fn file_selections(file: &Value, at: &str) -> Result<Vec<HunkSelection>, CliErro
     let old_blob_id = record_string(file, "old_blob_id", at)?;
     let new_blob_id = record_string(file, "new_blob_id", at)?;
     let context_lines = record_u32(file, "context_lines", at)?;
+    let whitespace = record_whitespace(file, at)?;
     let hunks = array(
         file.get("hunks")
             .ok_or_else(|| CliError::Usage(format!("{at} has no \"hunks\"")))?,
@@ -1141,6 +1200,7 @@ fn file_selections(file: &Value, at: &str) -> Result<Vec<HunkSelection>, CliErro
                 old_blob_id.clone(),
                 new_blob_id.clone(),
                 context_lines,
+                whitespace,
                 (
                     record_u32(hunk, "old_start", &at)?,
                     record_u32(hunk, "old_lines", &at)?,
@@ -1165,6 +1225,7 @@ fn file_line_selections(file: &Value, at: &str) -> Result<Vec<LineSelection>, Cl
     let old_blob_id = record_string(file, "old_blob_id", at)?;
     let new_blob_id = record_string(file, "new_blob_id", at)?;
     let context_lines = record_u32(file, "context_lines", at)?;
+    let whitespace = record_whitespace(file, at)?;
     let hunks = array(
         file.get("hunks")
             .ok_or_else(|| CliError::Usage(format!("{at} has no \"hunks\"")))?,
@@ -1207,6 +1268,7 @@ fn file_line_selections(file: &Value, at: &str) -> Result<Vec<LineSelection>, Cl
                 old_blob_id.clone(),
                 new_blob_id.clone(),
                 context_lines,
+                whitespace,
                 old_range,
                 new_range,
                 old_line_number,
@@ -1231,6 +1293,7 @@ fn flat_selection(selection: &Value, at: &str) -> Result<HunkSelection, CliError
         record_string(selection, "old_blob_id", at)?,
         record_string(selection, "new_blob_id", at)?,
         record_u32(selection, "context_lines", at)?,
+        record_whitespace(selection, at)?,
         (
             record_u32(selection, "old_start", at)?,
             record_u32(selection, "old_lines", at)?,
@@ -1258,6 +1321,7 @@ fn flat_line_selection(selection: &Value, at: &str) -> Result<LineSelection, Cli
         record_string(selection, "old_blob_id", at)?,
         record_string(selection, "new_blob_id", at)?,
         record_u32(selection, "context_lines", at)?,
+        record_whitespace(selection, at)?,
         (
             record_u32(selection, "old_start", at)?,
             record_u32(selection, "old_lines", at)?,
@@ -1867,9 +1931,14 @@ fn run_git(
             }
             let targets = arguments.targets()?;
             let include_intra_line = arguments.intra_line;
+            let whitespace = Whitespace {
+                mode: arguments.whitespace.into(),
+                ignore_blank_lines: arguments.ignore_blank_lines,
+            };
             let git = selected_git(&service, arguments.selection)?;
             let options = DiffOptions::default()
                 .with_context_lines(arguments.context_lines)
+                .with_whitespace(whitespace)
                 .with_intra_line_ranges(include_intra_line)
                 .with_max_file_size(max_file_size)
                 .with_max_total_bytes(max_total_bytes)
@@ -1898,6 +1967,12 @@ fn run_git(
                     Ok(json!({
                         "kind": "git_diff",
                         "targets": targets.iter().map(diff_target_value).collect::<Vec<_>>(),
+                        // Repeated on every file record as well. A consumer
+                        // that keeps one file and drops the response still
+                        // knows how that file's hunks were computed, and a
+                        // consumer reading the response as a whole does not
+                        // have to open a file record to find out.
+                        "whitespace": whitespace_value(whitespace),
                         "files": projected,
                     }))
                 },
@@ -3063,6 +3138,7 @@ fn file_diff_value(file: &FileDiff, include_intra_line: bool) -> Value {
         "old_mode": file.old_mode,
         "new_mode": file.new_mode,
         "context_lines": file.context_lines,
+        "whitespace": whitespace_value(file.whitespace),
         "old_size": file.old_size,
         "new_size": file.new_size,
         "binary": file.binary,
@@ -3095,6 +3171,62 @@ fn optional_wire_path(path: Option<&Path>) -> (Value, Value) {
 fn encoded_path(path: Option<&Path>) -> Value {
     path.and_then(path_bytes)
         .map_or(Value::Null, |bytes| json!(BASE64.encode(bytes)))
+}
+
+/// The whitespace handling a diff was computed under.
+///
+/// An object rather than one string because the two settings answer different
+/// questions and a consumer may care about only one of them. `mode` uses the
+/// same spellings [`WhitespaceMode::name`] publishes, so the value a file
+/// record carries is exactly the value `git stage --hunk-selection` reads back.
+fn whitespace_value(whitespace: Whitespace) -> Value {
+    json!({
+        "mode": whitespace.mode.name(),
+        "ignore_blank_lines": whitespace.ignore_blank_lines,
+    })
+}
+
+/// Reads the whitespace record a diff file or flat selection carries.
+///
+/// A record without one predates the setting and means exact: this is the
+/// additive rule every optional wire field here follows. An unknown mode is
+/// refused rather than folded into exact, because a build that cannot tell how
+/// a hunk was computed must not stage from it.
+fn record_whitespace(record: &Value, at: &str) -> Result<Whitespace, CliError> {
+    let Some(value) = record.get("whitespace") else {
+        return Ok(Whitespace::EXACT);
+    };
+    if value.is_null() {
+        return Ok(Whitespace::EXACT);
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| CliError::Usage(format!("{at}.whitespace is not an object")))?;
+    let mode = match object.get("mode").and_then(Value::as_str) {
+        None => WhitespaceMode::Exact,
+        Some("exact") => WhitespaceMode::Exact,
+        Some("ignore_eol") => WhitespaceMode::IgnoreEol,
+        Some("ignore_change") => WhitespaceMode::IgnoreChange,
+        Some("ignore_all") => WhitespaceMode::IgnoreAll,
+        Some(other) => {
+            return Err(CliError::Usage(format!(
+                "{at}.whitespace.mode \"{other}\" is not a whitespace mode this build knows"
+            )));
+        }
+    };
+    let ignore_blank_lines = match object.get("ignore_blank_lines") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(CliError::Usage(format!(
+                "{at}.whitespace.ignore_blank_lines is not a boolean"
+            )));
+        }
+    };
+    Ok(Whitespace {
+        mode,
+        ignore_blank_lines,
+    })
 }
 
 fn diff_omission_value(omission: &DiffOmission) -> Value {
@@ -4219,6 +4351,8 @@ fn git_exit_code(error: &GitError) -> u8 {
         | GitError::UntrackedDiscardNotFile { .. }
         | GitError::StaleDiscardSelection
         | GitError::StaleHunkSelection { .. }
+        | GitError::WhitespaceInsensitiveSelection { .. }
+        | GitError::HiddenWhitespaceChanges { .. }
         | GitError::BinaryHunkSelection { .. }
         | GitError::RenameOnlyHunkSelection { .. }
         | GitError::MetadataOnlyHunkSelection { .. }
@@ -4330,6 +4464,8 @@ const GIT_KIND_EXIT_CODES: &[(&str, u8)] = &[
     ("blob_not_found", EXIT_NOT_FOUND),
     ("malformed_diff", EXIT_OPERATION_FAILED),
     ("stale_hunk_selection", EXIT_REFUSED),
+    ("whitespace_insensitive_selection", EXIT_REFUSED),
+    ("hidden_whitespace_changes", EXIT_REFUSED),
     ("binary_hunk_selection", EXIT_REFUSED),
     ("rename_only_hunk_selection", EXIT_REFUSED),
     ("metadata_only_hunk_selection", EXIT_REFUSED),
@@ -4579,6 +4715,7 @@ fn git_error_details(error: &GitError) -> Value {
         | GitError::UntrackedDiscardNotFile { path }
         | GitError::UntrackedDiscardIo { path, .. }
         | GitError::StaleHunkSelection { path }
+        | GitError::HiddenWhitespaceChanges { path }
         | GitError::BinaryHunkSelection { path }
         | GitError::OverlappingHunkSelection { path }
         | GitError::UnrepresentableLineSelection { path }
@@ -4594,6 +4731,17 @@ fn git_error_details(error: &GitError) -> Value {
                 "path": path,
                 "path_is_lossy": path_is_lossy,
                 "detail": detail,
+            })
+        }
+        // The whitespace record travels back out with the path, so a consumer
+        // that built the selection from a document can name the setting it has
+        // to change without parsing the message.
+        GitError::WhitespaceInsensitiveSelection { path, whitespace } => {
+            let (path, path_is_lossy) = wire_path(path);
+            json!({
+                "path": path,
+                "path_is_lossy": path_is_lossy,
+                "whitespace": whitespace_value(*whitespace),
             })
         }
         // Every hunk refusal below names an alternative in its message, and the
@@ -4734,9 +4882,10 @@ mod tests {
         CLI_ERROR_KINDS, CLI_KIND_EXIT_CODES, CliError, EDITOR_KIND_EXIT_CODES, EXIT_CANCELLED,
         EXIT_CONFLICT, EXIT_NOT_FOUND, EXIT_OPERATION_FAILED, EXIT_REFUSED, EXIT_USAGE,
         EditorError, GIT_KIND_EXIT_CODES, GitError, HunkSelection, LineSelection,
-        PROJECT_KIND_EXIT_CODES, Project, ProjectError, RefusalKind, distinct_hunk_selection_count,
-        distinct_line_selection_counts, editor_exit_code, git_error_details, git_exit_code,
-        parse_selection_document, project_exit_code, project_value, requested_json, single_line,
+        PROJECT_KIND_EXIT_CODES, Project, ProjectError, RefusalKind, Whitespace, WhitespaceMode,
+        distinct_hunk_selection_count, distinct_line_selection_counts, editor_exit_code,
+        git_error_details, git_exit_code, parse_line_selection_document, parse_selection_document,
+        project_exit_code, project_value, requested_json, single_line,
     };
 
     #[test]
@@ -4785,6 +4934,7 @@ mod tests {
             "old",
             "new",
             3,
+            Whitespace::EXACT,
             (10, 4),
             (10, 5),
         );
@@ -4794,6 +4944,7 @@ mod tests {
             "old",
             "new",
             8,
+            Whitespace::EXACT,
             (10, 4),
             (10, 5),
         );
@@ -4809,6 +4960,7 @@ mod tests {
             "old",
             "new",
             3,
+            Whitespace::EXACT,
             (10, 4),
             (10, 5),
             None,
@@ -4820,6 +4972,7 @@ mod tests {
             "old",
             "new",
             3,
+            Whitespace::EXACT,
             (10, 4),
             (10, 5),
             None,
@@ -4831,6 +4984,7 @@ mod tests {
             "old",
             "new",
             8,
+            Whitespace::EXACT,
             (10, 4),
             (10, 5),
             None,
@@ -5061,6 +5215,66 @@ mod tests {
         assert_eq!(selections[0].context_lines, 3);
         assert_eq!(selections[1].new_start, 11);
         assert_eq!(selections[1].new_lines, 6);
+        // No whitespace record at all is what every document written before the
+        // setting existed looks like, and it has to mean the one handling a
+        // selection may be taken under.
+        assert!(
+            selections
+                .iter()
+                .all(|selection| selection.whitespace.is_exact())
+        );
+    }
+
+    /// The whitespace record travels with a selection at both granularities, so
+    /// the refusal lands on the service rather than on a guess made here, and a
+    /// spelling this build does not define is refused rather than read as exact.
+    #[test]
+    fn a_selection_document_carries_its_whitespace_record() {
+        let file = |whitespace: serde_json::Value| {
+            serde_json::json!({
+                "files": [{
+                    "new_path": "kept.txt",
+                    "old_path": "kept.txt",
+                    "old_blob_id": "aaaa",
+                    "new_blob_id": "bbbb",
+                    "context_lines": 3,
+                    "whitespace": whitespace,
+                    "hunks": [{
+                        "old_start": 1, "old_lines": 2, "new_start": 1, "new_lines": 2,
+                        "lines": [
+                            { "kind": "deletion", "old_line_number": 1, "new_line_number": null },
+                            { "kind": "addition", "old_line_number": null, "new_line_number": 1 },
+                        ],
+                    }],
+                }],
+            })
+            .to_string()
+        };
+
+        let relaxed = file(serde_json::json!({
+            "mode": "ignore_all",
+            "ignore_blank_lines": true,
+        }));
+        let hunks = parse_selection_document(&relaxed, "unstaged").unwrap();
+        assert_eq!(hunks[0].whitespace.mode, WhitespaceMode::IgnoreAll);
+        assert!(hunks[0].whitespace.ignore_blank_lines);
+        assert!(!hunks[0].whitespace.is_exact());
+        let lines = parse_line_selection_document(&relaxed, "unstaged").unwrap();
+        assert_eq!(lines[0].whitespace, hunks[0].whitespace);
+
+        let exact = file(serde_json::json!({ "mode": "exact" }));
+        assert_eq!(
+            parse_selection_document(&exact, "unstaged").unwrap()[0].whitespace,
+            Whitespace::EXACT
+        );
+
+        let unknown = file(serde_json::json!({ "mode": "ignore_vibes" }));
+        let error = parse_selection_document(&unknown, "unstaged").unwrap_err();
+        assert!(
+            single_line(&error.message()).contains("is not a whitespace mode this build knows"),
+            "unhelpful refusal: {}",
+            error.message()
+        );
     }
 
     /// A lossy path names a different file than the one on disk, so replaying

@@ -34,8 +34,9 @@ use git2::{ApplyLocation, ApplyOptions, AttrCheckFlags, AttrValue, Diff, Reposit
 use tempfile::NamedTempFile;
 
 use crate::{
-    Cancellation, DiffLine, DiffLineKind, DiffOptions, DiffTarget, FileChange, FileDiff, GitError,
-    Hunk, RepositoryLock, StageOptions, StatusRefreshOutcome, commit, diff,
+    Cancellation, DiffLine, DiffLineKind, DiffOptions, DiffTarget, ExactFileDiff, FileChange,
+    FileDiff, GitError, Hunk, RepositoryLock, StageOptions, StatusRefreshOutcome, Whitespace,
+    commit, diff,
     runner::{GitAccess, GitCommand},
     worktree,
 };
@@ -57,6 +58,14 @@ pub struct HunkSelection {
     pub new_blob_id: String,
     /// The context-line count the coordinates below are expressed in.
     pub context_lines: u32,
+    /// The whitespace handling the coordinates below are expressed in.
+    ///
+    /// [`Self::new`] can only produce [`Whitespace::EXACT`]; the field exists
+    /// because [`Self::from_parts`] rebuilds a selection from a front end's
+    /// wire form, where a caller can name any handling at all. Staging refuses
+    /// a non-exact one by name rather than recomputing it into something that
+    /// might match by coincidence.
+    pub whitespace: Whitespace,
     /// First old-side line covered by the selected hunk.
     pub old_start: u32,
     /// Number of old-side lines covered by the selected hunk.
@@ -69,14 +78,19 @@ pub struct HunkSelection {
 
 impl HunkSelection {
     /// Captures the stable identity and coordinates needed to select `hunk`.
+    ///
+    /// Taking [`ExactFileDiff`] rather than [`FileDiff`] is the whole point:
+    /// a whitespace-insensitive record has no `exact()` to hand over, so
+    /// building a selection from one does not compile.
     #[must_use]
-    pub fn new(file: &FileDiff, hunk: &Hunk) -> Self {
+    pub fn new(file: ExactFileDiff<'_>, hunk: &Hunk) -> Self {
         Self {
             old_path: file.old_path.clone(),
             new_path: file.new_path.clone(),
             old_blob_id: file.old_blob_id.clone(),
             new_blob_id: file.new_blob_id.clone(),
             context_lines: file.context_lines,
+            whitespace: file.whitespace,
             old_start: hunk.old_start,
             old_lines: hunk.old_lines,
             new_start: hunk.new_start,
@@ -89,13 +103,17 @@ impl HunkSelection {
     /// The values are intentionally the same identity fields emitted by a
     /// [`FileDiff`] and its [`Hunk`]. They remain untrusted until staging
     /// recomputes the diff and validates every value under the repository lock.
+    /// A wire form that carries no whitespace record predates the setting and
+    /// means [`Whitespace::EXACT`].
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         old_path: Option<PathBuf>,
         new_path: Option<PathBuf>,
         old_blob_id: impl Into<String>,
         new_blob_id: impl Into<String>,
         context_lines: u32,
+        whitespace: Whitespace,
         old_range: (u32, u32),
         new_range: (u32, u32),
     ) -> Self {
@@ -105,6 +123,7 @@ impl HunkSelection {
             old_blob_id: old_blob_id.into(),
             new_blob_id: new_blob_id.into(),
             context_lines,
+            whitespace,
             old_start: old_range.0,
             old_lines: old_range.1,
             new_start: new_range.0,
@@ -138,6 +157,13 @@ pub struct LineSelection {
     pub new_blob_id: String,
     /// The context-line count the hunk coordinates are expressed in.
     pub context_lines: u32,
+    /// The whitespace handling the hunk coordinates are expressed in.
+    ///
+    /// Carried and refused for the same reason as
+    /// [`HunkSelection::whitespace`], and it matters more at line granularity:
+    /// a whitespace-insensitive hunk can show a changed line as context, so a
+    /// line named inside one may not be the line the exact diff would apply.
+    pub whitespace: Whitespace,
     /// First old-side line covered by the selected line's hunk.
     pub old_start: u32,
     /// Number of old-side lines covered by the selected line's hunk.
@@ -156,13 +182,14 @@ impl LineSelection {
     /// Captures the stable file, hunk, and line identity needed to select
     /// `line`.
     #[must_use]
-    pub fn new(file: &FileDiff, hunk: &Hunk, line: &DiffLine) -> Self {
+    pub fn new(file: ExactFileDiff<'_>, hunk: &Hunk, line: &DiffLine) -> Self {
         Self {
             old_path: file.old_path.clone(),
             new_path: file.new_path.clone(),
             old_blob_id: file.old_blob_id.clone(),
             new_blob_id: file.new_blob_id.clone(),
             context_lines: file.context_lines,
+            whitespace: file.whitespace,
             old_start: hunk.old_start,
             old_lines: hunk.old_lines,
             new_start: hunk.new_start,
@@ -185,6 +212,7 @@ impl LineSelection {
         old_blob_id: impl Into<String>,
         new_blob_id: impl Into<String>,
         context_lines: u32,
+        whitespace: Whitespace,
         old_range: (u32, u32),
         new_range: (u32, u32),
         old_line_number: Option<u32>,
@@ -196,6 +224,7 @@ impl LineSelection {
             old_blob_id: old_blob_id.into(),
             new_blob_id: new_blob_id.into(),
             context_lines,
+            whitespace,
             old_start: old_range.0,
             old_lines: old_range.1,
             new_start: new_range.0,
@@ -513,11 +542,15 @@ fn mutate_lines(
 /// The two public selection types deliberately stay separate structs so a
 /// caller cannot pass one where the other is meant. This trait exists only so
 /// the batch-wide checks below are written once.
-trait Selection {
+pub(crate) trait Selection {
     /// The old and new paths, in that order.
     fn sides(&self) -> [Option<&PathBuf>; 2];
     /// `(old_start, old_lines, new_start, new_lines)`.
     fn hunk_coordinates(&self) -> (u32, u32, u32, u32);
+    /// The whitespace handling the coordinates above were taken under.
+    fn whitespace(&self) -> Whitespace;
+    /// The path a refusal about this selection should name.
+    fn display_path(&self) -> PathBuf;
 }
 
 impl Selection for HunkSelection {
@@ -532,6 +565,14 @@ impl Selection for HunkSelection {
             self.new_start,
             self.new_lines,
         )
+    }
+
+    fn whitespace(&self) -> Whitespace {
+        self.whitespace
+    }
+
+    fn display_path(&self) -> PathBuf {
+        display_path(self.new_path.as_deref(), self.old_path.as_deref()).to_path_buf()
     }
 }
 
@@ -548,6 +589,141 @@ impl Selection for LineSelection {
             self.new_lines,
         )
     }
+
+    fn whitespace(&self) -> Whitespace {
+        self.whitespace
+    }
+
+    fn display_path(&self) -> PathBuf {
+        display_path(self.new_path.as_deref(), self.old_path.as_deref()).to_path_buf()
+    }
+}
+
+/// Refuses a batch that names coordinates no patch can be rendered from.
+///
+/// A whitespace-insensitive diff omits lines that genuinely differ on disk, so
+/// its hunk coordinates do not describe the file. Revalidation would recompute
+/// the diff exactly — the only shape that can be applied — and could then match
+/// such a selection by coincidence on a hunk whose interior differs, writing
+/// bytes nobody selected. The refusal is therefore named here, before the
+/// repository lock is taken and before anything is recomputed at all.
+pub(crate) fn refuse_whitespace_insensitive<S: Selection>(
+    selections: &[S],
+) -> Result<(), GitError> {
+    for selection in selections {
+        let whitespace = selection.whitespace();
+        if !whitespace.is_exact() {
+            return Err(GitError::WhitespaceInsensitiveSelection {
+                path: selection.display_path(),
+                whitespace,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Re-expresses one hunk of a whitespace-insensitive view as exact selections.
+///
+/// This is the seam that makes a whitespace-insensitive review surface useful
+/// rather than merely safe. Reading a re-indented file at
+/// [`crate::WhitespaceMode::IgnoreChange`] and then wanting to stage or discard
+/// what that view showed is a legitimate thing to want, and the only sound way
+/// to serve it is to re-request the same target and path at
+/// [`Whitespace::EXACT`] and take the selection from *that* model. A front end
+/// passes the view it rendered, the hunk the user picked in it, and the
+/// re-requested exact record; what comes back are selections expressed entirely
+/// in exact coordinates, which staging revalidates in the ordinary way.
+///
+/// The mapping is intersect-then-verify rather than intersect-and-hope. Every
+/// exact hunk whose covered lines overlap the view hunk's is a candidate, and
+/// the candidates' changed lines must together be *exactly* the changed lines
+/// the view showed — same kinds, same line numbers, same bytes. When they are
+/// not, the region also carries differences this view is hiding, and applying
+/// the candidates would write bytes the user never saw. That is
+/// [`GitError::HiddenWhitespaceChanges`], and it is a refusal rather than a
+/// best effort precisely because the alternative is silent and destructive.
+///
+/// An already-exact view maps to itself, so a caller may route every selection
+/// through here without branching on the mode it happens to be showing.
+pub fn remap_to_exact(
+    view: &FileDiff,
+    view_hunk: &Hunk,
+    exact: ExactFileDiff<'_>,
+) -> Result<Vec<HunkSelection>, GitError> {
+    let path = display_path(view.new_path.as_deref(), view.old_path.as_deref()).to_path_buf();
+    if view.old_blob_id != exact.old_blob_id || view.new_blob_id != exact.new_blob_id {
+        return Err(GitError::StaleHunkSelection { path });
+    }
+
+    let wanted = changed_lines(view_hunk);
+    let candidates = exact
+        .hunks
+        .iter()
+        .filter(|hunk| overlaps(view_hunk, hunk))
+        .collect::<Vec<_>>();
+    let found = candidates
+        .iter()
+        .flat_map(|hunk| changed_lines(hunk))
+        .collect::<Vec<_>>();
+    if found.len() != wanted.len() || !wanted.iter().all(|line| found.contains(line)) {
+        return Err(GitError::HiddenWhitespaceChanges { path });
+    }
+
+    Ok(candidates
+        .into_iter()
+        .map(|hunk| HunkSelection::new(exact, hunk))
+        .collect())
+}
+
+/// What a remap compares one changed line on: its side, where it sits on both
+/// sides, and its exact bytes.
+///
+/// Content is part of the identity rather than an afterthought. Two diffs of
+/// one file can agree on the line numbers of a change and disagree on what that
+/// change is, which is precisely the case a coordinate-only comparison would
+/// wave through.
+type ChangedLine<'hunk> = (DiffLineKind, Option<u32>, Option<u32>, &'hunk [u8]);
+
+/// The changed lines of one hunk, in the identity a remap compares on.
+///
+/// Context and end-of-file markers are excluded because they carry no content
+/// decision; a line the exact model calls changed and the view calls context is
+/// exactly the disagreement this comparison exists to catch, and it shows up as
+/// an extra entry on the exact side.
+fn changed_lines(hunk: &Hunk) -> Vec<ChangedLine<'_>> {
+    hunk.lines
+        .iter()
+        .filter(|line| matches!(line.kind, DiffLineKind::Addition | DiffLineKind::Deletion))
+        .map(|line| {
+            (
+                line.kind,
+                line.old_line_number,
+                line.new_line_number,
+                line.content.as_slice(),
+            )
+        })
+        .collect()
+}
+
+/// Whether two hunks cover any line in common on either side.
+///
+/// A zero-length side is a position rather than a span — `@@ -5,0 +6,3 @@` adds
+/// after old line 5 — so it is treated as the single line it sits against,
+/// which keeps a pure insertion adjacent to a change from reading as disjoint.
+fn overlaps(left: &Hunk, right: &Hunk) -> bool {
+    let side = |start: u32, lines: u32| {
+        let start = start.max(1);
+        (start, start.saturating_add(lines.max(1)))
+    };
+    let intersects =
+        |first: (u32, u32), second: (u32, u32)| first.0 < second.1 && second.0 < first.1;
+    intersects(
+        side(left.old_start, left.old_lines),
+        side(right.old_start, right.old_lines),
+    ) || intersects(
+        side(left.new_start, left.new_lines),
+        side(right.new_start, right.new_lines),
+    )
 }
 
 /// Every distinct path a batch names, on either side.
@@ -1522,6 +1698,16 @@ fn inspection(root: &Path, source: git2::Error) -> GitError {
 
 #[cfg(test)]
 mod tests {
+    /// The exactness token every selection constructor now takes.
+    ///
+    /// Spelled once here rather than at every call site: these fixtures all
+    /// diff at the default whitespace handling, and a test that wanted a
+    /// relaxed one is asserting the refusal instead.
+    fn exact(file: &crate::FileDiff) -> crate::ExactFileDiff<'_> {
+        file.exact()
+            .expect("fixture diffs are computed at exact whitespace")
+    }
+
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -1531,7 +1717,7 @@ mod tests {
 
     use super::{
         ApplyTarget, Direction, HunkSelection, LineSelection, prepare_lines, refuse_unsupported,
-        render_patch, selection_paths,
+        remap_to_exact, render_patch, selection_paths,
     };
     use crate::{
         Cancellation, CommitOptions, DiffLine, DiffLineKind, DiffOmission, DiffOptions, DiffTarget,
@@ -1563,7 +1749,7 @@ mod tests {
         assert_eq!(file.hunks.len(), 2);
         service
             .stage_hunks(
-                &[HunkSelection::new(file, &file.hunks[0])],
+                &[HunkSelection::new(exact(file), &file.hunks[0])],
                 &Cancellation::default(),
             )
             .unwrap();
@@ -1585,7 +1771,10 @@ mod tests {
         let staged_file = named(&staged, Path::new("tracked.txt"));
         service
             .unstage_hunks(
-                &[HunkSelection::new(staged_file, &staged_file.hunks[0])],
+                &[HunkSelection::new(
+                    exact(staged_file),
+                    &staged_file.hunks[0],
+                )],
                 &Cancellation::default(),
             )
             .unwrap();
@@ -1617,7 +1806,7 @@ mod tests {
         let file = named(&unstaged, Path::new("eof.txt"));
         service
             .stage_hunks(
-                &[HunkSelection::new(file, &file.hunks[0])],
+                &[HunkSelection::new(exact(file), &file.hunks[0])],
                 &Cancellation::default(),
             )
             .unwrap();
@@ -1632,7 +1821,10 @@ mod tests {
         let staged_file = named(&staged, Path::new("eof.txt"));
         service
             .unstage_hunks(
-                &[HunkSelection::new(staged_file, &staged_file.hunks[0])],
+                &[HunkSelection::new(
+                    exact(staged_file),
+                    &staged_file.hunks[0],
+                )],
                 &Cancellation::default(),
             )
             .unwrap();
@@ -1666,7 +1858,7 @@ mod tests {
         assert_eq!(file.hunks.len(), 1, "{file:#?}");
         service
             .stage_hunks(
-                &[HunkSelection::new(file, &file.hunks[0])],
+                &[HunkSelection::new(exact(file), &file.hunks[0])],
                 &Cancellation::default(),
             )
             .unwrap();
@@ -1677,7 +1869,10 @@ mod tests {
         let staged_file = named(&staged, Path::new("tail.txt"));
         service
             .unstage_hunks(
-                &[HunkSelection::new(staged_file, &staged_file.hunks[0])],
+                &[HunkSelection::new(
+                    exact(staged_file),
+                    &staged_file.hunks[0],
+                )],
                 &Cancellation::default(),
             )
             .unwrap();
@@ -1708,8 +1903,8 @@ mod tests {
         service
             .stage_lines(
                 &[
-                    LineSelection::new(file, hunk, final_old),
-                    LineSelection::new(file, hunk, final_new),
+                    LineSelection::new(exact(file), hunk, final_old),
+                    LineSelection::new(exact(file), hunk, final_new),
                 ],
                 &Cancellation::default(),
             )
@@ -1729,8 +1924,8 @@ mod tests {
         service
             .unstage_lines(
                 &[
-                    LineSelection::new(staged_file, staged_hunk, final_old),
-                    LineSelection::new(staged_file, staged_hunk, final_new),
+                    LineSelection::new(exact(staged_file), staged_hunk, final_old),
+                    LineSelection::new(exact(staged_file), staged_hunk, final_new),
                 ],
                 &Cancellation::default(),
             )
@@ -1750,8 +1945,8 @@ mod tests {
         service
             .stage_lines(
                 &[
-                    LineSelection::new(file, hunk, earlier_old),
-                    LineSelection::new(file, hunk, earlier_new),
+                    LineSelection::new(exact(file), hunk, earlier_old),
+                    LineSelection::new(exact(file), hunk, earlier_new),
                 ],
                 &Cancellation::default(),
             )
@@ -1798,7 +1993,7 @@ mod tests {
             let selections = shape
                 .into_iter()
                 .map(|(kind, content)| {
-                    LineSelection::new(file, hunk, changed_line(hunk, kind, content))
+                    LineSelection::new(exact(file), hunk, changed_line(hunk, kind, content))
                 })
                 .collect::<Vec<_>>();
             let paths = selection_paths(&selections);
@@ -1852,7 +2047,7 @@ mod tests {
         let file = named(&files, Path::new("secret.txt"));
         let error = service
             .stage_hunks(
-                &[HunkSelection::new(file, &file.hunks[0])],
+                &[HunkSelection::new(exact(file), &file.hunks[0])],
                 &Cancellation::default(),
             )
             .unwrap_err();
@@ -1874,7 +2069,7 @@ mod tests {
             .unwrap();
         let error = service
             .stage_lines(
-                &[LineSelection::new(file, &file.hunks[0], line)],
+                &[LineSelection::new(exact(file), &file.hunks[0], line)],
                 &Cancellation::default(),
             )
             .unwrap_err();
@@ -1905,7 +2100,7 @@ mod tests {
         let file = named(&files, Path::new("tracked.txt"));
         service
             .stage_hunks(
-                &[HunkSelection::new(file, &file.hunks[0])],
+                &[HunkSelection::new(exact(file), &file.hunks[0])],
                 &Cancellation::default(),
             )
             .unwrap();
@@ -1955,7 +2150,7 @@ mod tests {
 
         let outcome = service
             .stage_lines(
-                &[LineSelection::new(file, hunk, selected)],
+                &[LineSelection::new(exact(file), hunk, selected)],
                 &Cancellation::default(),
             )
             .unwrap();
@@ -2020,8 +2215,8 @@ mod tests {
         let outcome = service
             .stage_lines(
                 &[
-                    LineSelection::new(file, hunk, addition),
-                    LineSelection::new(file, hunk, deletion),
+                    LineSelection::new(exact(file), hunk, addition),
+                    LineSelection::new(exact(file), hunk, deletion),
                 ],
                 &Cancellation::default(),
             )
@@ -2062,7 +2257,7 @@ mod tests {
 
         service
             .unstage_lines(
-                &[LineSelection::new(file, hunk, first)],
+                &[LineSelection::new(exact(file), hunk, first)],
                 &Cancellation::default(),
             )
             .unwrap();
@@ -2116,7 +2311,7 @@ mod tests {
         let late = changed_line(&file.hunks[1], DiffLineKind::Addition, b"late added\n");
         service
             .stage_lines(
-                &[LineSelection::new(file, &file.hunks[1], late)],
+                &[LineSelection::new(exact(file), &file.hunks[1], late)],
                 &Cancellation::default(),
             )
             .unwrap();
@@ -2137,7 +2332,7 @@ mod tests {
         let first = changed_line(&file.hunks[0], DiffLineKind::Addition, b"added a\n");
         let outcome = service
             .stage_lines(
-                &[LineSelection::new(file, &file.hunks[0], first)],
+                &[LineSelection::new(exact(file), &file.hunks[0], first)],
                 &Cancellation::default(),
             )
             .unwrap();
@@ -2187,8 +2382,8 @@ mod tests {
         service
             .unstage_lines(
                 &[
-                    LineSelection::new(file, &file.hunks[0], first),
-                    LineSelection::new(file, &file.hunks[1], late),
+                    LineSelection::new(exact(file), &file.hunks[0], first),
+                    LineSelection::new(exact(file), &file.hunks[1], late),
                 ],
                 &Cancellation::default(),
             )
@@ -2225,7 +2420,7 @@ mod tests {
 
         assert!(matches!(
             service.stage_lines(
-                &[LineSelection::new(file, hunk, addition)],
+                &[LineSelection::new(exact(file), hunk, addition)],
                 &Cancellation::default(),
             ),
             Err(GitError::UnrepresentableLineSelection { .. })
@@ -2241,7 +2436,7 @@ mod tests {
         let deletion = changed_line(hunk, DiffLineKind::Deletion, b"last");
         service
             .stage_lines(
-                &[LineSelection::new(file, hunk, deletion)],
+                &[LineSelection::new(exact(file), hunk, deletion)],
                 &Cancellation::default(),
             )
             .unwrap();
@@ -2274,7 +2469,7 @@ mod tests {
 
         assert!(matches!(
             service.unstage_lines(
-                &[LineSelection::new(file, hunk, deletion)],
+                &[LineSelection::new(exact(file), hunk, deletion)],
                 &Cancellation::default(),
             ),
             Err(GitError::UnrepresentableLineSelection { .. })
@@ -2307,12 +2502,12 @@ mod tests {
         let hunk = &file.hunks[0];
         let selections = [
             LineSelection::new(
-                file,
+                exact(file),
                 hunk,
                 changed_line(hunk, DiffLineKind::Deletion, b"first\n"),
             ),
             LineSelection::new(
-                file,
+                exact(file),
                 hunk,
                 changed_line(hunk, DiffLineKind::Addition, b"FIRST\n"),
             ),
@@ -2357,7 +2552,7 @@ mod tests {
             .diff(DiffTarget::Unstaged, &DiffOptions::default())
             .unwrap();
         let file = named(&files, Path::new("tracked.txt"));
-        let selection = HunkSelection::new(file, &file.hunks[0]);
+        let selection = HunkSelection::new(exact(file), &file.hunks[0]);
 
         let mut missing = selection.clone();
         missing.old_start += 1;
@@ -2404,14 +2599,14 @@ mod tests {
         let index_before = fs::read(binary_repository.path().join("index")).unwrap();
         assert!(matches!(
             binary_service.stage_hunks(
-                &[HunkSelection::new(binary, &fake)],
+                &[HunkSelection::new(exact(binary), &fake)],
                 &Cancellation::default()
             ),
             Err(GitError::BinaryHunkSelection { .. })
         ));
         assert!(matches!(
             binary_service.stage_lines(
-                &[LineSelection::new(binary, &fake, &fake_line())],
+                &[LineSelection::new(exact(binary), &fake, &fake_line())],
                 &Cancellation::default()
             ),
             Err(GitError::BinaryHunkSelection { .. })
@@ -2440,14 +2635,14 @@ mod tests {
         let index_before = fs::read(rename_repository.path().join("index")).unwrap();
         assert!(matches!(
             rename_service.stage_hunks(
-                &[HunkSelection::new(rename, &fake)],
+                &[HunkSelection::new(exact(rename), &fake)],
                 &Cancellation::default()
             ),
             Err(GitError::RenameOnlyHunkSelection { .. })
         ));
         assert!(matches!(
             rename_service.stage_lines(
-                &[LineSelection::new(rename, &fake, &fake_line())],
+                &[LineSelection::new(exact(rename), &fake, &fake_line())],
                 &Cancellation::default()
             ),
             Err(GitError::RenameOnlyHunkSelection { .. })
@@ -2485,7 +2680,10 @@ mod tests {
         let mode = named(&files, Path::new("mode.txt"));
         assert!(mode.hunks.is_empty(), "{mode:#?}");
         let error = service
-            .stage_hunks(&[HunkSelection::new(mode, &fake)], &Cancellation::default())
+            .stage_hunks(
+                &[HunkSelection::new(exact(mode), &fake)],
+                &Cancellation::default(),
+            )
             .unwrap_err();
         assert!(
             matches!(error, GitError::MetadataOnlyHunkSelection { ref path, old_mode, new_mode }
@@ -2497,7 +2695,7 @@ mod tests {
         assert_eq!(typechange.change, FileChange::TypeChanged);
         let error = service
             .stage_hunks(
-                &[HunkSelection::new(typechange, &fake)],
+                &[HunkSelection::new(exact(typechange), &fake)],
                 &Cancellation::default(),
             )
             .unwrap_err();
@@ -2552,7 +2750,7 @@ mod tests {
             .diff(DiffTarget::Unstaged, &DiffOptions::default())
             .unwrap();
         let file = named(&files, Path::new("first.txt"));
-        let selection = HunkSelection::new(file, &file.hunks[0]);
+        let selection = HunkSelection::new(exact(file), &file.hunks[0]);
 
         service
             .stage_hunks(std::slice::from_ref(&selection), &Cancellation::default())
@@ -2585,7 +2783,7 @@ mod tests {
 
         service
             .stage_hunks(
-                &[HunkSelection::new(file, &file.hunks[0])],
+                &[HunkSelection::new(exact(file), &file.hunks[0])],
                 &Cancellation::default(),
             )
             .unwrap();
@@ -2620,8 +2818,8 @@ mod tests {
         let zero = named(&zero_context, Path::new("tracked.txt"));
         let default = named(&default_context, Path::new("tracked.txt"));
         let selections = [
-            HunkSelection::new(zero, &zero.hunks[0]),
-            HunkSelection::new(default, &default.hunks[0]),
+            HunkSelection::new(exact(zero), &zero.hunks[0]),
+            HunkSelection::new(exact(default), &default.hunks[0]),
         ];
         let index_before = fs::read(repository.path().join("index")).unwrap();
         let worktree_before = fs::read(root.join("tracked.txt")).unwrap();
@@ -2669,8 +2867,8 @@ mod tests {
         let error = service
             .stage_lines(
                 &[
-                    LineSelection::new(zero, &zero.hunks[0], zero_line),
-                    LineSelection::new(default, &default.hunks[0], default_line),
+                    LineSelection::new(exact(zero), &zero.hunks[0], zero_line),
+                    LineSelection::new(exact(default), &default.hunks[0], default_line),
                 ],
                 &Cancellation::default(),
             )
@@ -2701,7 +2899,7 @@ mod tests {
             .unwrap();
         let file = named(&files, Path::new("tracked.txt"));
         let line = changed_line(&file.hunks[0], DiffLineKind::Addition, b"TWO\n");
-        let selection = LineSelection::new(file, &file.hunks[0], line);
+        let selection = LineSelection::new(exact(file), &file.hunks[0], line);
         fs::write(root.join("tracked.txt"), b"one\nTWO AGAIN\nthree\n").unwrap();
         let index_before = fs::read(repository.path().join("index")).unwrap();
 
@@ -2733,15 +2931,15 @@ mod tests {
             .unwrap();
         let first = named(&files, Path::new("first.txt"));
         let second = named(&files, Path::new("second.txt"));
-        let mut stale = HunkSelection::new(second, &second.hunks[0]);
+        let mut stale = HunkSelection::new(exact(second), &second.hunks[0]);
         stale.new_blob_id = "0".repeat(stale.new_blob_id.len());
         let index_before = fs::read(repository.path().join("index")).unwrap();
 
         assert!(matches!(
             service.stage_hunks(
                 &[
-                    HunkSelection::new(first, &first.hunks[0]),
-                    HunkSelection::new(first, &first.hunks[1]),
+                    HunkSelection::new(exact(first), &first.hunks[0]),
+                    HunkSelection::new(exact(first), &first.hunks[1]),
                     stale,
                 ],
                 &Cancellation::default(),
@@ -2757,9 +2955,9 @@ mod tests {
         service
             .stage_hunks(
                 &[
-                    HunkSelection::new(first, &first.hunks[0]),
-                    HunkSelection::new(first, &first.hunks[1]),
-                    HunkSelection::new(second, &second.hunks[1]),
+                    HunkSelection::new(exact(first), &first.hunks[0]),
+                    HunkSelection::new(exact(first), &first.hunks[1]),
+                    HunkSelection::new(exact(second), &second.hunks[1]),
                 ],
                 &Cancellation::default(),
             )
@@ -2799,7 +2997,7 @@ mod tests {
 
         service
             .stage_hunks(
-                &[HunkSelection::new(file, &file.hunks[0])],
+                &[HunkSelection::new(exact(file), &file.hunks[0])],
                 &Cancellation::default(),
             )
             .unwrap();
@@ -2840,8 +3038,8 @@ mod tests {
         service
             .stage_hunks(
                 &[
-                    HunkSelection::new(gone, &gone.hunks[0]),
-                    HunkSelection::new(fresh, &fresh.hunks[0]),
+                    HunkSelection::new(exact(gone), &gone.hunks[0]),
+                    HunkSelection::new(exact(fresh), &fresh.hunks[0]),
                 ],
                 &Cancellation::default(),
             )
@@ -2859,7 +3057,10 @@ mod tests {
         let staged_fresh = named(&staged, Path::new("fresh.txt"));
         service
             .unstage_hunks(
-                &[HunkSelection::new(staged_fresh, &staged_fresh.hunks[0])],
+                &[HunkSelection::new(
+                    exact(staged_fresh),
+                    &staged_fresh.hunks[0],
+                )],
                 &Cancellation::default(),
             )
             .unwrap();
@@ -2892,8 +3093,8 @@ mod tests {
         service
             .stage_lines(
                 &[
-                    LineSelection::new(gone, &gone.hunks[0], gone_line),
-                    LineSelection::new(fresh, &fresh.hunks[0], fresh_line),
+                    LineSelection::new(exact(gone), &gone.hunks[0], gone_line),
+                    LineSelection::new(exact(fresh), &fresh.hunks[0], fresh_line),
                 ],
                 &Cancellation::default(),
             )
@@ -2936,8 +3137,8 @@ mod tests {
         service
             .unstage_lines(
                 &[
-                    LineSelection::new(gone, &gone.hunks[0], gone_line),
-                    LineSelection::new(fresh, &fresh.hunks[0], fresh_line),
+                    LineSelection::new(exact(gone), &gone.hunks[0], gone_line),
+                    LineSelection::new(exact(fresh), &fresh.hunks[0], fresh_line),
                 ],
                 &Cancellation::default(),
             )
@@ -2988,7 +3189,7 @@ mod tests {
 
         service
             .stage_hunks(
-                &[HunkSelection::new(file, &file.hunks[0])],
+                &[HunkSelection::new(exact(file), &file.hunks[0])],
                 &Cancellation::default(),
             )
             .unwrap();
@@ -3025,7 +3226,7 @@ mod tests {
         assert_eq!(rename.change, FileChange::Renamed);
         service
             .stage_hunks(
-                &[HunkSelection::new(rename, &rename.hunks[0])],
+                &[HunkSelection::new(exact(rename), &rename.hunks[0])],
                 &Cancellation::default(),
             )
             .unwrap();
@@ -3045,7 +3246,10 @@ mod tests {
 
         service
             .unstage_hunks(
-                &[HunkSelection::new(staged_rename, &staged_rename.hunks[0])],
+                &[HunkSelection::new(
+                    exact(staged_rename),
+                    &staged_rename.hunks[0],
+                )],
                 &Cancellation::default(),
             )
             .unwrap();
@@ -3082,7 +3286,7 @@ mod tests {
 
         service
             .stage_hunks(
-                &[HunkSelection::new(edited, &edited.hunks[0])],
+                &[HunkSelection::new(exact(edited), &edited.hunks[0])],
                 &Cancellation::default(),
             )
             .unwrap();
@@ -3118,7 +3322,7 @@ mod tests {
 
         let outcome = service
             .stage_hunks(
-                &[HunkSelection::new(file, &file.hunks[0])],
+                &[HunkSelection::new(exact(file), &file.hunks[0])],
                 &Cancellation::default(),
             )
             .unwrap();
@@ -3168,7 +3372,7 @@ mod tests {
 
         service
             .stage_hunks(
-                &[HunkSelection::new(file, &file.hunks[0])],
+                &[HunkSelection::new(exact(file), &file.hunks[0])],
                 &Cancellation::default(),
             )
             .unwrap();
@@ -3204,13 +3408,231 @@ mod tests {
 
         service
             .stage_hunks(
-                &[HunkSelection::new(file, &file.hunks[0])],
+                &[HunkSelection::new(exact(file), &file.hunks[0])],
                 &Cancellation::default(),
             )
             .unwrap();
 
         assert_eq!(index_bytes(&repository, &path).unwrap(), FIRST_ONLY);
         assert_eq!(fs::read(root.join(&path)).unwrap(), worktree_before);
+    }
+
+    /// A whitespace-insensitive selection can only arrive over a wire form, so
+    /// the refusal is proved through the reconstruction path a front end uses.
+    /// Every granularity and every direction is checked, because the invariant
+    /// is about the coordinates rather than about which verb consumes them.
+    #[test]
+    fn a_whitespace_insensitive_selection_is_refused_before_anything_is_touched() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("view-only-refusal");
+        let repository = initialize_repository(&root);
+        fs::write(root.join("tracked.txt"), b"    alpha\n    beta\n").unwrap();
+        commit_all(&repository, "prepare a view-only selection");
+        fs::write(root.join("tracked.txt"), b"\t\talpha\n    beta changed\n").unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+
+        let path = PathBuf::from("tracked.txt");
+        let index_before = index_bytes(&repository, &path).unwrap();
+        let worktree_before = fs::read(root.join(&path)).unwrap();
+        let view = service
+            .diff(
+                DiffTarget::Unstaged,
+                &DiffOptions::default()
+                    .with_whitespace(crate::Whitespace::new(crate::WhitespaceMode::IgnoreChange)),
+            )
+            .unwrap();
+        let file = named(&view, &path);
+        let hunk = &file.hunks[0];
+        assert!(
+            file.exact().is_none(),
+            "the fixture must produce a view-only record"
+        );
+
+        let hunk_selection = HunkSelection::from_parts(
+            file.old_path.clone(),
+            file.new_path.clone(),
+            file.old_blob_id.clone(),
+            file.new_blob_id.clone(),
+            file.context_lines,
+            file.whitespace,
+            (hunk.old_start, hunk.old_lines),
+            (hunk.new_start, hunk.new_lines),
+        );
+        let line = hunk
+            .lines
+            .iter()
+            .find(|line| line.kind == DiffLineKind::Addition)
+            .unwrap();
+        let line_selection = LineSelection::from_parts(
+            file.old_path.clone(),
+            file.new_path.clone(),
+            file.old_blob_id.clone(),
+            file.new_blob_id.clone(),
+            file.context_lines,
+            file.whitespace,
+            (hunk.old_start, hunk.old_lines),
+            (hunk.new_start, hunk.new_lines),
+            line.old_line_number,
+            line.new_line_number,
+        );
+
+        let hunks = std::slice::from_ref(&hunk_selection);
+        let lines = std::slice::from_ref(&line_selection);
+        let cancellation = Cancellation::default();
+        let refusals: Vec<GitError> = vec![
+            service.stage_hunks(hunks, &cancellation).unwrap_err(),
+            service.unstage_hunks(hunks, &cancellation).unwrap_err(),
+            service.discard_hunks(hunks, &cancellation).unwrap_err(),
+            service.stage_lines(lines, &cancellation).unwrap_err(),
+            service.unstage_lines(lines, &cancellation).unwrap_err(),
+            service.discard_lines(lines, &cancellation).unwrap_err(),
+        ];
+        for refusal in &refusals {
+            assert!(
+                matches!(
+                    refusal,
+                    GitError::WhitespaceInsensitiveSelection { path: named, whitespace }
+                        if named == &path
+                            && whitespace.mode == crate::WhitespaceMode::IgnoreChange
+                ),
+                "expected a named whitespace refusal, got {refusal:?}"
+            );
+        }
+        assert_eq!(
+            index_bytes(&repository, &path).unwrap(),
+            index_before,
+            "a refused selection reached the index"
+        );
+        assert_eq!(
+            fs::read(root.join(&path)).unwrap(),
+            worktree_before,
+            "a refused selection reached the working tree"
+        );
+        assert!(
+            !fixture.data_dir.exists(),
+            "the refusal was raised after taking the repository lock"
+        );
+    }
+
+    /// The seam #80 requires: a region picked in a relaxed view is re-expressed
+    /// against a freshly requested exact diff, and staging it writes the bytes
+    /// the reader was actually looking at.
+    #[test]
+    fn a_view_region_remaps_onto_the_exact_hunk_it_was_showing() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("remap-exact");
+        let repository = initialize_repository(&root);
+        // Two changes far apart: a real edit near the top and a re-indent near
+        // the bottom, so the relaxed view has exactly one hunk and the exact
+        // diff has two.
+        let original = (1..=40)
+            .map(|line| format!("    line {line}\n"))
+            .collect::<String>();
+        fs::write(root.join("tracked.txt"), original.as_bytes()).unwrap();
+        commit_all(&repository, "prepare a remap fixture");
+        let edited = original
+            .replace("    line 5\n", "    line five\n")
+            .replace("    line 35\n", "\t\tline 35\n");
+        fs::write(root.join("tracked.txt"), edited.as_bytes()).unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+
+        let path = PathBuf::from("tracked.txt");
+        let relaxed = DiffOptions::default()
+            .with_whitespace(crate::Whitespace::new(crate::WhitespaceMode::IgnoreChange));
+        let view = service.diff(DiffTarget::Unstaged, &relaxed).unwrap();
+        let view_file = named(&view, &path).clone();
+        assert_eq!(view_file.hunks.len(), 1, "the view hides the re-indent");
+
+        let exact_files = service
+            .diff(DiffTarget::Unstaged, &DiffOptions::unbounded())
+            .unwrap();
+        let exact_file = named(&exact_files, &path);
+        assert_eq!(
+            exact_file.hunks.len(),
+            2,
+            "the exact diff sees both changes"
+        );
+
+        let selections =
+            remap_to_exact(&view_file, &view_file.hunks[0], exact(exact_file)).unwrap();
+        assert_eq!(selections.len(), 1);
+        assert!(selections[0].whitespace.is_exact());
+
+        service
+            .stage_hunks(&selections, &Cancellation::default())
+            .unwrap();
+        assert_eq!(
+            index_bytes(&repository, &path).unwrap(),
+            original
+                .replace("    line 5\n", "    line five\n")
+                .as_bytes(),
+            "the remapped selection staged the edit the view showed and nothing else"
+        );
+    }
+
+    /// The refusal that makes the seam safe. When the exact diff calls a line
+    /// changed that the view rendered as context, the two do not describe the
+    /// same region and applying the exact hunk would act on hidden content.
+    #[test]
+    fn a_region_hiding_a_whitespace_change_refuses_to_remap() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("remap-hidden");
+        let repository = initialize_repository(&root);
+        let original = (1..=10)
+            .map(|line| format!("    line {line}\n"))
+            .collect::<String>();
+        fs::write(root.join("tracked.txt"), original.as_bytes()).unwrap();
+        commit_all(&repository, "prepare a hidden change");
+        // Adjacent lines: one re-indent the view hides, one real edit it shows.
+        let edited = original
+            .replace("    line 5\n", "\t\tline 5\n")
+            .replace("    line 6\n", "    line six\n");
+        fs::write(root.join("tracked.txt"), edited.as_bytes()).unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+
+        let path = PathBuf::from("tracked.txt");
+        let view = service
+            .diff(
+                DiffTarget::Unstaged,
+                &DiffOptions::default()
+                    .with_whitespace(crate::Whitespace::new(crate::WhitespaceMode::IgnoreChange)),
+            )
+            .unwrap();
+        let view_file = named(&view, &path).clone();
+        let exact_files = service
+            .diff(DiffTarget::Unstaged, &DiffOptions::unbounded())
+            .unwrap();
+        let exact_file = named(&exact_files, &path);
+
+        let refusal =
+            remap_to_exact(&view_file, &view_file.hunks[0], exact(exact_file)).unwrap_err();
+        assert!(
+            matches!(refusal, GitError::HiddenWhitespaceChanges { path: ref named } if named == &path),
+            "expected a named hidden-change refusal, got {refusal:?}"
+        );
+    }
+
+    /// An exact view is its own remap, so a caller never has to branch on the
+    /// mode it happens to be showing before it can act.
+    #[test]
+    fn an_exact_view_remaps_to_the_selection_it_already_describes() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("remap-identity");
+        let repository = initialize_repository(&root);
+        fs::write(root.join("tracked.txt"), b"alpha\nbeta\n").unwrap();
+        commit_all(&repository, "prepare an identity remap");
+        fs::write(root.join("tracked.txt"), b"alpha changed\nbeta\n").unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+
+        let files = service
+            .diff(DiffTarget::Unstaged, &DiffOptions::default())
+            .unwrap();
+        let file = named(&files, Path::new("tracked.txt"));
+        let remapped = remap_to_exact(file, &file.hunks[0], exact(file)).unwrap();
+        assert_eq!(
+            remapped,
+            vec![HunkSelection::new(exact(file), &file.hunks[0])]
+        );
     }
 
     fn named<'a>(files: &'a [FileDiff], path: &Path) -> &'a FileDiff {
@@ -3311,6 +3733,7 @@ mod tests {
             old_mode: 0o100_644,
             new_mode: 0o100_644,
             context_lines: 3,
+            whitespace: crate::Whitespace::EXACT,
             old_size: 1,
             new_size: 1,
             binary: false,

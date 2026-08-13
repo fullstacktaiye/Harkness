@@ -594,6 +594,65 @@ ColumnLayout {
                 }
             }
 
+            Controls.Label {
+                color: Kirigami.Theme.disabledTextColor
+                font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                text: qsTr("Whitespace")
+            }
+
+            // The value is sent as the backend's own spelling rather than an
+            // index, so adding a mode is a change in one place and a stale
+            // index can never select the wrong comparison.
+            Controls.ComboBox {
+                id: whitespacePicker
+
+                Accessible.name: qsTr("Whitespace handling")
+                Controls.ToolTip.text: qsTr("Anything but Exact hides differences that are only whitespace. The diff becomes read-only: discarding a hunk then recomputes the file exactly first, and refuses if that turns up changes this view is hiding.")
+                Controls.ToolTip.visible: hovered
+                Layout.preferredWidth: Kirigami.Units.gridUnit * 11
+                enabled: reviewSurface.reviewState.loading !== true
+                model: [
+                    { label: qsTr("Exact"), value: "exact" },
+                    { label: qsTr("Ignore line endings"), value: "ignore_eol" },
+                    { label: qsTr("Ignore indentation"), value: "ignore_change" },
+                    { label: qsTr("Ignore all whitespace"), value: "ignore_all" }
+                ]
+                textRole: "label"
+                valueRole: "value"
+
+                // The backend owns this value: it survives a refresh, a new
+                // target and a failed request, so the control follows the state
+                // rather than remembering a choice of its own.
+                currentIndex: Math.max(0, indexOfValue(
+                    String(reviewSurface.reviewState.whitespace || "exact")
+                ))
+
+                onActivated: backend.setReviewWhitespace(
+                    project.id,
+                    String(currentValue),
+                    reviewSurface.reviewState.ignoreBlankLines === true
+                )
+
+                background: FieldSurface {
+                    field: whitespacePicker
+                }
+            }
+
+            Controls.ToolButton {
+                Accessible.name: text
+                Controls.ToolTip.text: qsTr("Leave lines that are blank on both sides out of the comparison")
+                Controls.ToolTip.visible: hovered
+                checkable: true
+                checked: reviewSurface.reviewState.ignoreBlankLines === true
+                enabled: reviewSurface.reviewState.loading !== true
+                text: qsTr("Blank lines")
+                onClicked: backend.setReviewWhitespace(
+                    project.id,
+                    String(reviewSurface.reviewState.whitespace || "exact"),
+                    checked
+                )
+            }
+
             Controls.BusyIndicator {
                 Layout.preferredHeight: Kirigami.Units.iconSizes.small
                 Layout.preferredWidth: Kirigami.Units.iconSizes.small
@@ -602,6 +661,16 @@ ColumnLayout {
                     || reviewSurface.job("review_context") !== null
                 visible: running
             }
+        }
+
+        // Said once, at the top, rather than on every hunk: while this is
+        // showing, what is on screen is not what is on disk.
+        Kirigami.InlineMessage {
+            Layout.fillWidth: true
+            text: qsTr("This diff hides whitespace-only differences, so it does not describe the file byte for byte. Discarding a hunk recomputes it exactly first.")
+            type: Kirigami.MessageType.Information
+            visible: reviewSurface.reviewReady
+                && reviewSurface.reviewState.appliable === false
         }
 
         Kirigami.InlineMessage {

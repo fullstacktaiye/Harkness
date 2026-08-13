@@ -70,6 +70,37 @@ potentially long operation. Remove worktrees only through Git so the checkout
 and `.git/worktrees` administration disappear together; reconciliation must be
 selective and must not prune external worktree records.
 
+## Diff Whitespace & Selection Invariants
+
+A diff computed with anything other than `Whitespace::EXACT` is a view and
+never a source of truth. Its hunks omit lines that genuinely differ on disk, so
+a patch rendered from them describes a file nobody has. `FileDiff::exact` is the
+only way to obtain the `ExactFileDiff` token `HunkSelection::new` and
+`LineSelection::new` accept, which makes building a selection from a relaxed
+record a compile error rather than a wrong-bytes apply found later. A selection
+rebuilt from a wire form carries its own `whitespace`, and every staging,
+unstaging and discard entry point refuses a non-exact one by name *before* it
+takes the repository lock — never after recomputing, because an exact
+recomputation can match relaxed coordinates by coincidence on a hunk whose
+interior differs.
+
+Whitespace handling is recorded per file for the same reason `context_lines` is:
+hunk coordinates mean nothing without both. Every revalidation under the lock
+goes through `DiffOptions::unbounded`, which is exact by construction and must
+stay that way.
+
+Staging from a relaxed *view* is still legitimate, and `remap_to_exact` is the
+one seam that serves it: the caller re-requests the same target and path at
+`Whitespace::EXACT` and the region is re-expressed in that model. The mapping
+verifies rather than assumes — the candidate exact hunks' changed lines must be
+exactly the changed lines the view displayed, kinds, numbers and bytes alike —
+and refuses with `HiddenWhitespaceChanges` when they are not, because the
+alternative is applying content the reader was never shown.
+
+Adding a whitespace setting means extending `Whitespace`, not adding a loose
+boolean beside it: `is_exact` is the single question staging asks, and it must
+not be able to go stale.
+
 ## Run Store Schema & Connection Invariants
 
 Run history lives in `runtime.db` beside `projects.json`, never inside it. The

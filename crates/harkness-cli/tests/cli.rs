@@ -1689,6 +1689,8 @@ fn new_command_help_offers_every_diff_and_hunk_flag() {
         "--full-file-context",
         "--context-from",
         "--intra-line",
+        "--whitespace",
+        "--ignore-blank-lines",
         "--max-file-size",
         "--max-total-bytes",
         "--max-files",
@@ -3803,6 +3805,116 @@ fn ctrl_c_cancels_fetch_with_exit_130_and_kills_its_process_group() {
         activity_after_cancel,
         "a helper survived fetch cancellation"
     );
+}
+
+/// Whitespace handling is opt-in, reported in both places a consumer might
+/// look, and carried back through a selection document so a view-only record
+/// cannot be staged from without a named refusal.
+#[test]
+fn whitespace_handling_is_reported_and_refuses_to_feed_a_selection() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("whitespace-project");
+    initialize_repository(&root);
+    let repository = Repository::open(&root).unwrap();
+    let original = (1..=30)
+        .map(|line| format!("    line {line}\n"))
+        .collect::<String>();
+    fs::write(root.join("tracked.txt"), original.as_bytes()).unwrap();
+    commit_all(&repository, "prepare whitespace fixture");
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+    // One re-indent and one real edit, far enough apart to be separate hunks.
+    fs::write(
+        root.join("tracked.txt"),
+        original
+            .replace("    line 2\n", "\t\tline 2\n")
+            .replace("    line 25\n", "    line twenty-five\n")
+            .as_bytes(),
+    )
+    .unwrap();
+
+    let exact = diff_file(&data_dir, &project_id, "--unstaged", "tracked.txt");
+    assert_eq!(exact["whitespace"]["mode"], "exact");
+    assert_eq!(exact["whitespace"]["ignore_blank_lines"], false);
+    assert_eq!(exact["hunks"].as_array().unwrap().len(), 2);
+
+    let relaxed_output = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--unstaged",
+            "--whitespace",
+            "ignore-change",
+            "--project",
+            &project_id,
+            "--",
+            "tracked.txt",
+        ],
+    );
+    assert_success(&relaxed_output);
+    let relaxed_body = json_output(&relaxed_output);
+    // Reported once for the response and again on the record, because a
+    // consumer that keeps a file and drops the envelope still has to know.
+    assert_eq!(relaxed_body["data"]["whitespace"]["mode"], "ignore_change");
+    let relaxed = relaxed_body["data"]["files"][0].clone();
+    assert_eq!(relaxed["whitespace"]["mode"], "ignore_change");
+    assert_eq!(
+        relaxed["hunks"].as_array().unwrap().len(),
+        1,
+        "the re-indent must be hidden: {relaxed:#?}"
+    );
+
+    // The document round-trip is the only way a front end can hand back a
+    // view-only selection, and it has to be refused by name.
+    let document = json!({ "files": [relaxed] }).to_string();
+    let refused = harkness_with_stdin(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "stage",
+            "--hunk-selection",
+            "-",
+            "--project",
+            &project_id,
+        ],
+        &document,
+    );
+    assert_eq!(refused.status.code(), Some(3));
+    let refusal = json_output(&refused);
+    assert_eq!(refusal["error"]["kind"], "whitespace_insensitive_selection");
+    assert_eq!(refusal["error"]["details"]["path"], "tracked.txt");
+    assert_eq!(
+        refusal["error"]["details"]["whitespace"]["mode"],
+        "ignore_change"
+    );
+
+    // Nothing reached the index: the same file at exact whitespace still shows
+    // both changes as unstaged.
+    let after = diff_file(&data_dir, &project_id, "--unstaged", "tracked.txt");
+    assert_eq!(after["hunks"].as_array().unwrap().len(), 2);
+
+    // And the exact document that the panel would re-request instead stages.
+    let accepted = harkness_with_stdin(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "stage",
+            "--hunk-selection",
+            "-",
+            "--project",
+            &project_id,
+        ],
+        &json!({ "files": [after] }).to_string(),
+    );
+    assert_success(&accepted);
 }
 
 /// The single record for `path` on `target`.

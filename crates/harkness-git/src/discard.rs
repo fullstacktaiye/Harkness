@@ -586,6 +586,13 @@ fn head_or_empty_tree(repository: &Repository, root: &Path) -> Result<git2::Oid,
 
 #[cfg(test)]
 mod tests {
+    /// The exactness token every selection constructor now takes; see the note
+    /// beside the identical helper in [`crate::hunk`]'s tests.
+    fn exact(file: &crate::FileDiff) -> crate::ExactFileDiff<'_> {
+        file.exact()
+            .expect("fixture diffs are computed at exact whitespace")
+    }
+
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -844,7 +851,7 @@ mod tests {
             .diff(DiffTarget::Unstaged, &DiffOptions::default())
             .unwrap();
         assert_eq!(files[0].hunks.len(), 2);
-        let selection = HunkSelection::new(&files[0], &files[0].hunks[0]);
+        let selection = HunkSelection::new(exact(&files[0]), &files[0].hunks[0]);
 
         let outcome = service
             .discard_hunks(&[selection], &Cancellation::default())
@@ -894,7 +901,7 @@ mod tests {
         let files = service
             .diff(DiffTarget::Unstaged, &DiffOptions::default())
             .unwrap();
-        let selection = HunkSelection::new(&files[0], &files[0].hunks[0]);
+        let selection = HunkSelection::new(exact(&files[0]), &files[0].hunks[0]);
 
         service
             .discard_hunks(&[selection], &Cancellation::default())
@@ -926,7 +933,7 @@ mod tests {
             .iter()
             .find(|line| line.kind == DiffLineKind::Addition && line.content == b"first\n")
             .unwrap();
-        let selection = LineSelection::new(&files[0], hunk, first);
+        let selection = LineSelection::new(exact(&files[0]), hunk, first);
 
         let outcome = service
             .discard_lines(&[selection], &Cancellation::default())
@@ -958,7 +965,7 @@ mod tests {
         let files = service
             .diff(DiffTarget::Unstaged, &DiffOptions::default())
             .unwrap();
-        let selection = HunkSelection::new(&files[0], &files[0].hunks[0]);
+        let selection = HunkSelection::new(exact(&files[0]), &files[0].hunks[0]);
         fs::write(root.join("tracked.txt"), "newer edit\n").unwrap();
         assert!(matches!(
             service.discard_hunks(&[selection], &Cancellation::default()),
@@ -1008,6 +1015,7 @@ mod tests {
             conflicted_file.old_blob_id,
             conflicted_file.new_blob_id,
             conflicted_file.context_lines,
+            conflicted_file.whitespace,
             (1, 1),
             (1, 1),
         );
@@ -1056,7 +1064,7 @@ mod tests {
             .into_iter()
             .find(|file| file.new_path.as_deref() == Some(Path::new("tracked.txt")))
             .unwrap();
-        let selection = HunkSelection::new(&file, &file.hunks[0]);
+        let selection = HunkSelection::new(exact(&file), &file.hunks[0]);
 
         assert!(matches!(
             service.restore_tracked(
