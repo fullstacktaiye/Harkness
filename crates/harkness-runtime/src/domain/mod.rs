@@ -37,7 +37,7 @@ mod state;
 mod wire;
 
 pub use error::{InvalidTransition, RunDomainError};
-pub use id::{ArtifactId, RunId, StepId, TaskId, ToolCallId};
+pub use id::{ApprovalId, ArtifactId, RunId, StepId, TaskId, ToolCallId};
 pub use record::{Approval, ApprovalDecision, Failure, Run, Step, Task, ToolCall};
 pub use state::{EXECUTION_TRANSITIONS, ExecutionState, TOOL_CALL_TRANSITIONS, ToolCallState};
 pub use wire::{

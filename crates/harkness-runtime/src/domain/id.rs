@@ -68,6 +68,17 @@ define_id!(
     ToolCallId
 );
 define_id!(
+    /// A stable identifier for one durable approval request.
+    ///
+    /// It names the question a human was asked, the answer that resolved it, and
+    /// the grant that answer produced, so a timeline entry, a front end's prompt,
+    /// and a matched grant all refer to the same record rather than to three
+    /// separately-derived descriptions of one pause.
+    ///
+    /// [`Default`] generates a fresh random identity rather than an empty value.
+    ApprovalId
+);
+define_id!(
     /// A stable identifier for one stored artifact.
     ///
     /// An artifact is content too large to live in a row: a build log, a diff,
@@ -84,7 +95,7 @@ mod tests {
 
     use serde::{Serialize, de::DeserializeOwned};
 
-    use super::{ArtifactId, RunId, StepId, TaskId, ToolCallId};
+    use super::{ApprovalId, ArtifactId, RunId, StepId, TaskId, ToolCallId};
 
     const FIXTURE_ID: &str = "123e4567-e89b-42d3-a456-426614174000";
 
@@ -112,6 +123,7 @@ mod tests {
         assert_id_contract::<StepId>();
         assert_id_contract::<ToolCallId>();
         assert_id_contract::<ArtifactId>();
+        assert_id_contract::<ApprovalId>();
     }
 
     #[test]

@@ -18,12 +18,17 @@ use tempfile::TempDir;
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
 
+use crate::approval::{
+    ApprovalDecision, ApprovalGate, ApprovalObservation, ApprovalRequest, ApprovalScope,
+    ApprovalState, CandidateCall, DecidedVia, PendingApproval, WorkspaceBinding,
+    canonical_input_hash, matching_grants,
+};
 use crate::domain::{
     ArtifactId, ExecutionState, Failure, Run, RunId, Step, StepId, Task, TaskId, ToolCall,
     ToolCallId, ToolCallState, ToolCallWire,
 };
 use crate::policy::{PolicyDecision, PolicyVerdict};
-use crate::tool::ArtifactWriter;
+use crate::tool::{ArtifactWriter, Capability, RiskLevel, ToolIdentity};
 use crate::trust::{TrustState, WorkspaceTrust};
 
 use super::artifact::artifact_path;
@@ -32,7 +37,7 @@ use super::redaction::tests::{MASK, Masking, SECRET, Shouting};
 use super::{
     ARTIFACTS_DIRECTORY, Artifact, Availability, DATABASE_FILE, EventKind, EventSeq,
     MAX_EVENT_PAGE_LIMIT, MAX_INLINE_PAYLOAD_BYTES, Redactor, RunCursor, RunEvent, RunPage, Store,
-    StoreArtifacts, guard,
+    StoreArtifacts, StoreError, guard,
 };
 
 /// Text one byte past the largest value any column will hold.
@@ -2896,6 +2901,826 @@ fn the_data_directory_override_redirects_the_default_store() {
     );
 }
 
+// -- approvals ---------------------------------------------------------------
+
+/// A store with a task, a run, a step, and one recorded tool call.
+struct Held {
+    fixture: Fixture,
+    run: Run,
+    call: ToolCall,
+}
+
+impl Held {
+    fn new() -> Self {
+        Self::with(Fixture::new())
+    }
+
+    fn with(fixture: Fixture) -> Self {
+        let task = stored_task(&fixture.store);
+        let run = stored_run(&fixture.store, &task);
+        let step = stored_step(&fixture.store, &run);
+        let call = stored_tool_call(&fixture.store, &step);
+        Self { fixture, run, call }
+    }
+
+    fn store(&self) -> &Store {
+        &self.fixture.store
+    }
+
+    fn pending(&self, risk: RiskLevel) -> PendingApproval {
+        PendingApproval::new(
+            self.run.id(),
+            self.call.id(),
+            ToolIdentity::parse("fs.write", "1.2.0").unwrap(),
+            canonical_input_hash(&approval_input()).unwrap(),
+            approval_workspace(),
+            risk,
+            at(4),
+        )
+        .with_capabilities([Capability::new("fs.write").unwrap()])
+        .summarized_as("write 12 lines to src/lib.rs")
+    }
+
+    /// Persists one pending request together with the event announcing it.
+    fn open(&self, pending: PendingApproval) -> ApprovalRequest {
+        self.store()
+            .open_approval(ApprovalRequest::open(pending).unwrap())
+            .unwrap()
+            .0
+    }
+}
+
+fn approval_input() -> Value {
+    json!({"path": "src/lib.rs", "contents": "fn main() {}"})
+}
+
+fn approval_workspace() -> WorkspaceBinding {
+    WorkspaceBinding::new(
+        Some(harkness_core::ProjectId::from_str("55555555-5555-4555-8555-555555555555").unwrap()),
+        "/workspace/harkness",
+    )
+}
+
+#[test]
+fn an_approval_row_exists_before_the_event_that_announces_it_is_visible() {
+    let held = Held::new();
+    let request = ApprovalRequest::open(held.pending(RiskLevel::WorkspaceWrite)).unwrap();
+    let id = request.id();
+
+    // Nothing is observable before the write.
+    assert_eq!(held.store().approval(id).unwrap_err().kind(), "not_found");
+    assert!(
+        held.store()
+            .events(held.run.id(), None, 10)
+            .unwrap()
+            .is_empty()
+    );
+
+    held.store().open_approval(request).unwrap();
+
+    // Afterwards both are, and they arrived in one transaction: an observer can
+    // never see the announcement without the question behind it.
+    let events = held.store().events(held.run.id(), None, 10).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event.kind().as_str(), "approval_requested");
+    assert_eq!(
+        held.store().approval(id).unwrap().state(),
+        ApprovalState::Pending
+    );
+}
+
+#[test]
+fn an_approval_event_carries_the_summary_and_never_the_input() {
+    let held = Held::new();
+    let request = held.open(
+        held.pending(RiskLevel::RemoteWrite)
+            .requesting(ApprovalScope::ToolForRun),
+    );
+    let events = held.store().events(held.run.id(), None, 10).unwrap();
+
+    let payload = events[0].event.payload();
+    assert_eq!(payload["summary"], json!("write 12 lines to src/lib.rs"));
+    assert_eq!(payload["approval_id"], json!(request.id().to_string()));
+    assert_eq!(payload["tool"], json!("fs.write@1.2.0"));
+    assert_eq!(payload["risk"], json!("remote_write"));
+    // Both spellings, so a reader of the timeline alone can see the downgrade.
+    assert_eq!(payload["requested_scope"], json!("tool_for_run"));
+    assert_eq!(payload["effective_scope"], json!("exact_call"));
+    assert_eq!(events[0].event.tool_call_id(), Some(held.call.id()));
+
+    // The event is derived from the record, so there is no route by which the
+    // raw input reaches the hot event stream at all.
+    let rendered = payload.to_string();
+    assert!(
+        !rendered.contains("fn main"),
+        "the tool input must not reach the timeline: {rendered}"
+    );
+
+    held.store()
+        .decide_approval(
+            request.id(),
+            ApprovalDecision::grant(
+                request.id(),
+                ApprovalScope::ExactCall,
+                DecidedVia::Cli,
+                at(6),
+            )
+            .because("reviewed"),
+        )
+        .unwrap();
+    let events = held.store().events(held.run.id(), None, 10).unwrap();
+    assert_eq!(events[1].event.kind().as_str(), "approval_decided");
+    assert_eq!(events[1].event.payload()["state"], json!("granted"));
+    assert_eq!(events[1].event.payload()["verdict"], json!("granted"));
+    assert_eq!(events[1].event.payload()["scope"], json!("exact_call"));
+    assert_eq!(events[1].event.payload()["decided_via"], json!("cli"));
+    assert_eq!(events[1].event.payload()["reason"], json!("reviewed"));
+}
+
+#[test]
+fn an_unanswered_resolution_records_no_verdict_in_the_timeline() {
+    let held = Held::new();
+    let request = held.open(held.pending(RiskLevel::Execute));
+
+    held.store()
+        .resolve_approval(request.id(), ApprovalState::Cancelled, at(8))
+        .unwrap();
+
+    let events = held.store().events(held.run.id(), None, 10).unwrap();
+    let payload = events[1].event.payload();
+    assert_eq!(payload["state"], json!("cancelled"));
+    assert_eq!(
+        payload.get("verdict"),
+        None,
+        "nobody answered, so the timeline must not report a verdict"
+    );
+}
+
+#[test]
+fn an_approval_may_only_hold_a_tool_call_of_its_own_run() {
+    let held = Held::new();
+
+    // A second run of the same task, with its own step and call.
+    let sibling = queued_run(
+        held.store(),
+        &held.store().load_task(held.run.task_id()).unwrap(),
+        40,
+    );
+    let sibling_step = Step::new(sibling.id(), 0, "Sibling step", at(41));
+    held.store().insert_step(&sibling_step).unwrap();
+    let sibling_call = ToolCall::new(&sibling_step, "fs.write", "1.2.0", approval_input(), at(42));
+    held.store().insert_tool_call(&sibling_call).unwrap();
+
+    for (run_id, tool_call_id) in [
+        // A call of a different run, claimed by this one.
+        (held.run.id(), sibling_call.id()),
+        // A call that was never stored at all.
+        (held.run.id(), ToolCallId::new()),
+    ] {
+        let request = ApprovalRequest::open(PendingApproval::new(
+            run_id,
+            tool_call_id,
+            ToolIdentity::parse("fs.write", "1.2.0").unwrap(),
+            canonical_input_hash(&approval_input()).unwrap(),
+            approval_workspace(),
+            RiskLevel::Execute,
+            at(4),
+        ))
+        .unwrap();
+
+        let error = held.store().open_approval(request).unwrap_err();
+        assert_eq!(error.kind(), "missing_parent", "{run_id}/{tool_call_id}");
+    }
+}
+
+#[test]
+fn either_front_end_resolves_the_same_pending_request() {
+    for via in [DecidedVia::Cli, DecidedVia::Gui] {
+        let held = Held::new();
+        let request = held.open(held.pending(RiskLevel::WorkspaceWrite));
+
+        let (resolved, seq) = held
+            .store()
+            .decide_approval(
+                request.id(),
+                ApprovalDecision::grant(request.id(), ApprovalScope::ExactCall, via, at(6))
+                    .because("looks right"),
+            )
+            .unwrap();
+
+        assert_eq!(resolved.state(), ApprovalState::Granted, "{via}");
+        assert_eq!(resolved.decision().unwrap().decided_via(), via);
+        assert_eq!(seq, EventSeq::new(2));
+        // Reloading proves the decision is durable rather than only returned.
+        let reloaded = held.store().approval(request.id()).unwrap();
+        assert_eq!(reloaded, resolved);
+        assert_eq!(reloaded.decision().unwrap().reason(), Some("looks right"));
+    }
+}
+
+#[test]
+fn the_second_decision_on_a_resolved_request_is_refused_by_name() {
+    let held = Held::new();
+    let request = held.open(held.pending(RiskLevel::WorkspaceWrite));
+    held.store()
+        .decide_approval(
+            request.id(),
+            ApprovalDecision::deny(request.id(), DecidedVia::Gui, at(6)),
+        )
+        .unwrap();
+
+    let error = held
+        .store()
+        .decide_approval(
+            request.id(),
+            ApprovalDecision::grant(
+                request.id(),
+                ApprovalScope::ExactCall,
+                DecidedVia::Cli,
+                at(7),
+            ),
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "approval_refused");
+    assert!(
+        matches!(&error, StoreError::Approval(inner)
+            if inner.kind() == "approval_already_resolved"),
+        "unexpected refusal: {error}"
+    );
+    // The refused write left neither a changed state nor a second event.
+    let reloaded = held.store().approval(request.id()).unwrap();
+    assert_eq!(reloaded.state(), ApprovalState::Denied);
+    assert_eq!(
+        held.store().events(held.run.id(), None, 10).unwrap().len(),
+        2
+    );
+}
+
+#[test]
+fn two_threads_deciding_one_request_produce_exactly_one_winner() {
+    let held = Arc::new(Held::new());
+    let request = held.open(held.pending(RiskLevel::Execute));
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+
+    let deciders = [DecidedVia::Cli, DecidedVia::Gui].map(|via| {
+        let held = Arc::clone(&held);
+        let barrier = Arc::clone(&barrier);
+        let id = request.id();
+        thread::spawn(move || {
+            barrier.wait();
+            held.store().decide_approval(
+                id,
+                ApprovalDecision::grant(id, ApprovalScope::ExactCall, via, at(6)),
+            )
+        })
+    });
+
+    let outcomes = deciders.map(|decider| decider.join().unwrap());
+    let winners = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+    assert_eq!(winners, 1, "exactly one decision may resolve a request");
+    let loser = outcomes
+        .into_iter()
+        .find_map(Result::err)
+        .expect("the other decision must be refused");
+    assert_eq!(loser.kind(), "approval_refused");
+    assert_eq!(
+        held.store().events(held.run.id(), None, 10).unwrap().len(),
+        2,
+        "the losing decision must not have appended its event either"
+    );
+}
+
+#[test]
+fn a_timeout_and_a_cancellation_resolve_a_request_without_a_decision() {
+    for (state, offset) in [
+        (ApprovalState::Expired, 8),
+        (ApprovalState::Cancelled, 9),
+        (ApprovalState::Superseded, 10),
+    ] {
+        let held = Held::new();
+        let request = held.open(held.pending(RiskLevel::Execute));
+
+        let (resolved, _) = held
+            .store()
+            .resolve_approval(request.id(), state, at(offset))
+            .unwrap();
+
+        assert_eq!(resolved.state(), state);
+        assert_eq!(resolved.resolved_at(), Some(at(offset)));
+        assert!(
+            resolved.decision().is_none(),
+            "nobody answered, so no decision may be recorded"
+        );
+        assert_eq!(held.store().approval(request.id()).unwrap(), resolved);
+
+        // The waiting call observes a denial rather than hanging.
+        let observation = ApprovalObservation::of(&resolved).unwrap();
+        assert!(!observation.is_granted());
+        assert_eq!(observation.state(), state);
+    }
+}
+
+#[test]
+fn a_resolved_request_cannot_be_resolved_a_second_time() {
+    let held = Held::new();
+    let request = held.open(held.pending(RiskLevel::Execute));
+    held.store()
+        .resolve_approval(request.id(), ApprovalState::Cancelled, at(8))
+        .unwrap();
+
+    let error = held
+        .store()
+        .resolve_approval(request.id(), ApprovalState::Expired, at(9))
+        .unwrap_err();
+
+    assert!(
+        matches!(&error, StoreError::Approval(inner)
+            if inner.kind() == "approval_invalid_transition"),
+        "unexpected refusal: {error}"
+    );
+}
+
+#[test]
+fn no_transaction_spans_the_period_a_request_is_pending() {
+    let held = Held::new();
+    let request = held.open(held.pending(RiskLevel::Execute));
+    let gate = Arc::new(ApprovalGate::new());
+    let ticket = gate.ticket(request.id());
+
+    // The call is parked. If `open_approval` had left a transaction open, this
+    // unrelated write would block until the busy timeout and fail.
+    let started = std::time::Instant::now();
+    held.store()
+        .append_event(
+            held.run.id(),
+            RunEvent::new(EventKind::Diagnostic, at(6)).with_payload(json!({"note": "unrelated"})),
+        )
+        .unwrap();
+    held.store()
+        .transition_run(held.run.id(), ExecutionState::Running, at(6))
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "a concurrent writer waited {elapsed:?}, so a transaction was held across the wait"
+    );
+
+    // A second connection to the same file commits too, so the claim holds
+    // between processes and not merely within this one.
+    let separate = held.fixture.reopen();
+    separate
+        .append_event(
+            held.run.id(),
+            RunEvent::new(EventKind::Diagnostic, at(7)).with_payload(json!({"note": "another"})),
+        )
+        .unwrap();
+
+    let (resolved, _) = held
+        .store()
+        .decide_approval(
+            request.id(),
+            ApprovalDecision::grant(
+                request.id(),
+                ApprovalScope::ExactCall,
+                DecidedVia::Cli,
+                at(8),
+            ),
+        )
+        .unwrap();
+    gate.resolve_from(&resolved);
+    assert!(ticket.wait().is_granted());
+}
+
+#[test]
+fn a_pending_request_survives_a_crash_with_every_binding_field_intact() {
+    let held = Held::new();
+    let request = held.open(
+        held.pending(RiskLevel::Network)
+            .requesting(ApprovalScope::ToolForRun)
+            .expiring_at(at(600)),
+    );
+
+    // Reopening the database is what a restart does; nothing closed the store
+    // cleanly, and the pending row is simply still there.
+    let reopened = held.fixture.reopen();
+
+    let pending = reopened.pending_approvals().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0], request);
+    assert_eq!(pending[0].state(), ApprovalState::Pending);
+    assert_eq!(pending[0].run_id(), held.run.id());
+    assert_eq!(pending[0].tool_call_id(), held.call.id());
+    assert_eq!(pending[0].tool().id.as_str(), "fs.write");
+    assert_eq!(pending[0].tool().version.to_string(), "1.2.0");
+    assert_eq!(
+        pending[0].input_hash(),
+        canonical_input_hash(&approval_input()).unwrap()
+    );
+    assert_eq!(pending[0].workspace(), &approval_workspace());
+    assert_eq!(pending[0].risk(), RiskLevel::Network);
+    assert_eq!(pending[0].requested_scope(), ApprovalScope::ToolForRun);
+    assert_eq!(pending[0].effective_scope(), ApprovalScope::ToolForRun);
+    assert_eq!(pending[0].expires_at(), Some(at(600)));
+    assert_eq!(
+        pending[0]
+            .capabilities()
+            .iter()
+            .map(Capability::as_str)
+            .collect::<Vec<_>>(),
+        ["fs.write"]
+    );
+
+    // Answering it after the restart is an ordinary decision.
+    reopened
+        .decide_approval(
+            request.id(),
+            ApprovalDecision::grant(
+                request.id(),
+                ApprovalScope::ToolForRun,
+                DecidedVia::Cli,
+                at(11),
+            ),
+        )
+        .unwrap();
+    assert!(reopened.pending_approvals().unwrap().is_empty());
+}
+
+#[test]
+fn a_downgraded_remote_write_request_is_stored_and_granted_as_one_call() {
+    let held = Held::new();
+    let request = held.open(
+        held.pending(RiskLevel::RemoteWrite)
+            .requesting(ApprovalScope::ToolForRun),
+    );
+
+    let stored = held.store().approval(request.id()).unwrap();
+    assert_eq!(stored.requested_scope(), ApprovalScope::ToolForRun);
+    assert_eq!(stored.effective_scope(), ApprovalScope::ExactCall);
+    assert!(stored.was_downgraded());
+
+    // The surface cannot restore the breadth the ceiling removed.
+    let error = held
+        .store()
+        .decide_approval(
+            request.id(),
+            ApprovalDecision::grant(
+                request.id(),
+                ApprovalScope::ToolForRun,
+                DecidedVia::Gui,
+                at(6),
+            ),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&error, StoreError::Approval(inner)
+            if inner.kind() == "approval_scope_exceeds_request"),
+        "unexpected refusal: {error}"
+    );
+
+    let (granted, _) = held
+        .store()
+        .decide_approval(
+            request.id(),
+            ApprovalDecision::grant(
+                request.id(),
+                ApprovalScope::ExactCall,
+                DecidedVia::Gui,
+                at(7),
+            ),
+        )
+        .unwrap();
+    assert_eq!(granted.state(), ApprovalState::Granted);
+    assert_eq!(
+        held.store().run_grants(held.run.id()).unwrap().len(),
+        1,
+        "the one-call grant is still a grant"
+    );
+}
+
+#[test]
+fn only_granted_requests_become_grants_and_they_bind_to_their_own_call() {
+    let held = Held::new();
+    let request = held.open(
+        held.pending(RiskLevel::WorkspaceWrite)
+            .requesting(ApprovalScope::ExactCall),
+    );
+    assert!(held.store().run_grants(held.run.id()).unwrap().is_empty());
+
+    held.store()
+        .decide_approval(
+            request.id(),
+            ApprovalDecision::grant(
+                request.id(),
+                ApprovalScope::ExactCall,
+                DecidedVia::Cli,
+                at(6),
+            ),
+        )
+        .unwrap();
+
+    let grants = held.store().run_grants(held.run.id()).unwrap();
+    assert_eq!(grants.len(), 1);
+    let tool = ToolIdentity::parse("fs.write", "1.2.0").unwrap();
+    let workspace = approval_workspace();
+
+    // The call the human actually approved.
+    let approved = CandidateCall::new(
+        held.run.id(),
+        &workspace,
+        &tool,
+        canonical_input_hash(&approval_input()).unwrap(),
+        at(7),
+    );
+    assert_eq!(matching_grants(&grants, &approved).len(), 1);
+
+    // The same tool, one byte of input different.
+    let altered = CandidateCall::new(
+        held.run.id(),
+        &workspace,
+        &tool,
+        canonical_input_hash(&json!({"path": "src/lib.rs", "contents": "fn main() { rm() }"}))
+            .unwrap(),
+        at(7),
+    );
+    assert!(matching_grants(&grants, &altered).is_empty());
+
+    // The same call, in a later run.
+    let replayed = CandidateCall::new(
+        RunId::new(),
+        &workspace,
+        &tool,
+        canonical_input_hash(&approval_input()).unwrap(),
+        at(7),
+    );
+    assert!(matching_grants(&grants, &replayed).is_empty());
+}
+
+#[test]
+fn a_cancelled_grant_stops_covering_the_call_it_covered() {
+    let held = Held::new();
+    let request = held.open(
+        held.pending(RiskLevel::Execute)
+            .requesting(ApprovalScope::ToolForRun),
+    );
+    held.store()
+        .decide_approval(
+            request.id(),
+            ApprovalDecision::grant(
+                request.id(),
+                ApprovalScope::ToolForRun,
+                DecidedVia::Cli,
+                at(6),
+            ),
+        )
+        .unwrap();
+    assert_eq!(held.store().run_grants(held.run.id()).unwrap().len(), 1);
+
+    // A granted request is terminal, so the grant dies with its run rather than
+    // by being revoked: the listing is what stops returning it.
+    let second = held.open(held.pending(RiskLevel::Execute));
+    held.store()
+        .resolve_approval(second.id(), ApprovalState::Cancelled, at(8))
+        .unwrap();
+
+    let grants = held.store().run_grants(held.run.id()).unwrap();
+    assert_eq!(grants.len(), 1, "only the granted request is a grant");
+    assert_eq!(held.store().run_approvals(held.run.id()).unwrap().len(), 2);
+}
+
+#[test]
+fn an_approval_summary_and_reason_pass_through_the_redactor() {
+    let held = Held::with(Fixture::redacting(Arc::new(Masking)));
+    let request = held.open(
+        held.pending(RiskLevel::Execute)
+            .summarized_as(format!("push using {SECRET}")),
+    );
+
+    assert_eq!(request.input_summary(), format!("push using {MASK}"));
+    assert_eq!(
+        held.store().approval(request.id()).unwrap().input_summary(),
+        format!("push using {MASK}")
+    );
+
+    let (decided, _) = held
+        .store()
+        .decide_approval(
+            request.id(),
+            ApprovalDecision::deny(request.id(), DecidedVia::Cli, at(6))
+                .because(format!("the token {SECRET} must not leave this machine")),
+        )
+        .unwrap();
+    assert_eq!(
+        decided.decision().unwrap().reason(),
+        Some(format!("the token {MASK} must not leave this machine").as_str())
+    );
+    assert_eq!(
+        held.store()
+            .approval(request.id())
+            .unwrap()
+            .decision()
+            .unwrap()
+            .reason(),
+        decided.decision().unwrap().reason()
+    );
+}
+
+#[test]
+fn an_oversized_approval_summary_is_refused_and_records_nothing() {
+    let held = Held::new();
+    let request = ApprovalRequest::open(
+        held.pending(RiskLevel::Execute)
+            .summarized_as(oversized_text()),
+    )
+    .unwrap();
+    let id = request.id();
+
+    let error = held.store().open_approval(request).unwrap_err();
+
+    assert_eq!(error.kind(), "payload_too_large");
+    assert_eq!(held.store().approval(id).unwrap_err().kind(), "not_found");
+    assert!(
+        held.store()
+            .events(held.run.id(), None, 10)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_hand_edited_approval_row_fails_to_load_instead_of_becoming_a_grant() {
+    for (column, value, field) in [
+        // A verdict with no surface beside it: half a decision, which is a
+        // corrupt row rather than a partial answer.
+        ("decision_verdict", "granted", "decision_verdict"),
+        ("risk", "catastrophic", "risk"),
+        ("effective_scope", "everything", "effective_scope"),
+        ("state", "approved", "state"),
+        ("input_hash", "not-a-hash", "input_hash"),
+        // Exactly 64 *bytes*, but not 64 characters. The length check counts
+        // bytes and hexadecimal pairs are read as bytes, so this is a refusal
+        // rather than a slice boundary landing inside a character.
+        (
+            "input_hash",
+            "aé000000000000000000000000000000000000000000000000000000000000",
+            "input_hash",
+        ),
+        ("tool_version", "one point two", "tool"),
+        ("capabilities_json", "fs.write", "capabilities_json"),
+    ] {
+        let held = Held::new();
+        let request = held.open(held.pending(RiskLevel::Execute));
+        guard(&held.store().writer)
+            .execute(
+                &format!("UPDATE approvals SET {column} = ?1 WHERE id = ?2"),
+                rusqlite::params![value, request.id().to_string()],
+            )
+            .unwrap();
+
+        let error = held.store().approval(request.id()).unwrap_err();
+        assert_eq!(error.kind(), "column_encoding", "{column} = {value}");
+        assert!(
+            error.to_string().contains(field),
+            "the refusal should name {field}: {error}"
+        );
+        // The listing refuses the row rather than quietly skipping it, so a
+        // tampered row can never reach the matcher as a grant either way.
+        assert!(
+            !matches!(held.store().run_grants(held.run.id()), Ok(grants) if !grants.is_empty()),
+            "{column} = {value} produced a grant"
+        );
+    }
+}
+
+#[test]
+fn a_row_edited_to_widen_its_scope_or_forge_a_decision_fails_to_load() {
+    // These edits all use spellings this build understands, so nothing catches
+    // them at the column level. They are refused because the record they
+    // describe cannot be true — and `effective_scope` in particular is what the
+    // matcher grants, so nothing downstream would re-derive it.
+    for (risk, requested, edits, reason) in [
+        (
+            RiskLevel::RemoteWrite,
+            ApprovalScope::ToolForRun,
+            vec![("effective_scope", "tool_for_run")],
+            "broader than its requested scope and risk",
+        ),
+        (
+            RiskLevel::WorkspaceWrite,
+            ApprovalScope::ExactCall,
+            vec![("effective_scope", "tool_for_run")],
+            "broader than its requested scope and risk",
+        ),
+        (
+            RiskLevel::Execute,
+            ApprovalScope::ExactCall,
+            vec![("state", "granted"), ("resolved_at", RESOLVED_AT)],
+            "records the decision that resolved it",
+        ),
+        (
+            RiskLevel::Execute,
+            ApprovalScope::ExactCall,
+            vec![
+                ("state", "granted"),
+                ("resolved_at", RESOLVED_AT),
+                ("decision_verdict", "denied"),
+                ("decided_via", "cli"),
+            ],
+            "disagrees with the verdict",
+        ),
+        (
+            RiskLevel::Execute,
+            ApprovalScope::ExactCall,
+            vec![("resolved_at", RESOLVED_AT)],
+            "records when it was resolved",
+        ),
+    ] {
+        let held = Held::new();
+        let request = held.open(held.pending(risk).requesting(requested));
+        for (column, value) in &edits {
+            guard(&held.store().writer)
+                .execute(
+                    &format!("UPDATE approvals SET {column} = ?1 WHERE id = ?2"),
+                    rusqlite::params![value, request.id().to_string()],
+                )
+                .unwrap();
+        }
+
+        let error = held.store().approval(request.id()).unwrap_err();
+        assert_eq!(error.kind(), "approval_refused", "{edits:?}");
+        assert!(
+            error.to_string().contains(reason),
+            "the refusal should name the rule broken by {edits:?}: {error}"
+        );
+        assert!(
+            !matches!(held.store().run_grants(held.run.id()), Ok(grants) if !grants.is_empty()),
+            "{edits:?} produced a grant"
+        );
+    }
+}
+
+/// The canonical spelling of `at(9)`, for a hand-edited `resolved_at`.
+const RESOLVED_AT: &str = "2023-11-14T22:13:29.000000000Z";
+
+#[test]
+fn a_granted_row_may_not_claim_a_breadth_its_decision_did_not_authorize() {
+    let held = Held::new();
+    let request = held.open(
+        held.pending(RiskLevel::Execute)
+            .requesting(ApprovalScope::ToolForRun),
+    );
+    held.store()
+        .decide_approval(
+            request.id(),
+            // The human narrowed to one call, so the record and its grant are
+            // exact-call.
+            ApprovalDecision::grant(
+                request.id(),
+                ApprovalScope::ExactCall,
+                DecidedVia::Gui,
+                at(6),
+            ),
+        )
+        .unwrap();
+    assert_eq!(held.store().run_grants(held.run.id()).unwrap().len(), 1);
+
+    // Widening the record back to what was *asked for* is exactly the edit the
+    // ceiling check alone would allow, because `tool_for_run` is what the
+    // request wanted. The decision is what refuses it.
+    guard(&held.store().writer)
+        .execute(
+            "UPDATE approvals SET effective_scope = 'tool_for_run' WHERE id = ?1",
+            rusqlite::params![request.id().to_string()],
+        )
+        .unwrap();
+
+    let error = held.store().approval(request.id()).unwrap_err();
+    assert_eq!(error.kind(), "approval_refused");
+    assert!(
+        error.to_string().contains("its decision authorized"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_future_approval_row_reads_as_an_upgrade_request() {
+    let held = Held::new();
+    let request = held.open(held.pending(RiskLevel::Execute));
+    guard(&held.store().writer)
+        .execute(
+            "UPDATE approvals SET schema_version = ?1 WHERE id = ?2",
+            rusqlite::params![
+                i64::from(crate::domain::RUNTIME_RECORD_SCHEMA_VERSION) + 1,
+                request.id().to_string()
+            ],
+        )
+        .unwrap();
+
+    let error = held.store().approval(request.id()).unwrap_err();
+    assert_eq!(error.kind(), "invalid_record");
+    assert!(error.to_string().contains("upgrade Harkness"), "{error}");
+}
+
 // -- migration from a frozen database ---------------------------------------
 
 /// The frozen v2 database committed beside this module.
@@ -2910,6 +3735,13 @@ const FROZEN_V3_DATABASE: &[u8] = include_bytes!("fixtures/runtime-v3.db");
 
 /// The frozen v4 database carrying one binding policy decision.
 const FROZEN_V4_DATABASE: &[u8] = include_bytes!("fixtures/runtime-v4.db");
+
+/// The frozen v5 database carrying one pending approval and one grant.
+const FROZEN_V5_DATABASE: &[u8] = include_bytes!("fixtures/runtime-v5.db");
+
+/// The approval identities the v5 fixture was written with.
+const FIXTURE_PENDING_APPROVAL_ID: &str = "77777777-7777-4777-8777-777777777777";
+const FIXTURE_GRANTED_APPROVAL_ID: &str = "88888888-8888-4888-8888-888888888888";
 
 /// A later migration, standing in for a future store feature.
 const LATER_MIGRATIONS: &[Migration] = &[
@@ -2931,6 +3763,10 @@ const LATER_MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 5,
+        statements: include_str!("migrations/005_approvals.sql"),
+    },
+    Migration {
+        version: 6,
         statements: "ALTER TABLE runs ADD COLUMN cancelled_by TEXT;",
     },
 ];
@@ -3060,6 +3896,58 @@ fn a_frozen_v4_database_opens_and_reads_its_policy_decision() {
 }
 
 #[test]
+fn a_frozen_v5_database_opens_and_reads_its_approvals() {
+    let data_dir = restore_frozen_database(FROZEN_V5_DATABASE);
+    let store = Store::open(data_dir.path()).unwrap();
+
+    assert_eq!(
+        recorded_version(&guard(&store.writer)).unwrap(),
+        SCHEMA_VERSION
+    );
+
+    // The pending question survived, with the binding fields a grant is matched
+    // on. This is the shape a restart finds.
+    let pending = store.pending_approvals().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id().to_string(), FIXTURE_PENDING_APPROVAL_ID);
+    assert_eq!(pending[0].state(), ApprovalState::Pending);
+    assert_eq!(pending[0].risk(), RiskLevel::RemoteWrite);
+    assert_eq!(pending[0].requested_scope(), ApprovalScope::ToolForRun);
+    assert_eq!(
+        pending[0].effective_scope(),
+        ApprovalScope::ExactCall,
+        "the stored record must still show the risk ceiling's downgrade"
+    );
+    assert!(pending[0].decision().is_none());
+
+    let run_id = RunId::from_str(FIXTURE_RUN_ID).unwrap();
+    let granted = store
+        .approval(FIXTURE_GRANTED_APPROVAL_ID.parse().unwrap())
+        .unwrap();
+    assert_eq!(granted.state(), ApprovalState::Granted);
+    assert_eq!(granted.decision().unwrap().decided_via(), DecidedVia::Gui);
+    assert_eq!(
+        granted.decision().unwrap().reason(),
+        Some("frozen fixture grant")
+    );
+
+    // The grant still covers exactly the call it was given for.
+    let grants = store.run_grants(run_id).unwrap();
+    assert_eq!(grants.len(), 1);
+    let tool = ToolIdentity::parse("fs.write", "1.2.0").unwrap();
+    let workspace = approval_workspace();
+    let covered = CandidateCall::new(
+        run_id,
+        &workspace,
+        &tool,
+        canonical_input_hash(&approval_input()).unwrap(),
+        at(100),
+    );
+    assert_eq!(matching_grants(&grants, &covered).len(), 1);
+    assert_eq!(store.run_approvals(run_id).unwrap().len(), 2);
+}
+
+#[test]
 fn a_frozen_v2_database_opens_after_future_migrations() {
     let data_dir = restore_frozen_database(FROZEN_V2_DATABASE);
     let path = data_dir.path().join(DATABASE_FILE);
@@ -3070,7 +3958,7 @@ fn a_frozen_v2_database_opens_after_future_migrations() {
 
     apply(&mut connection, LATER_MIGRATIONS).unwrap();
 
-    assert_eq!(recorded_version(&connection).unwrap(), 5);
+    assert_eq!(recorded_version(&connection).unwrap(), 6);
     let run =
         super::repository::load_run(&connection, RunId::from_str(FIXTURE_RUN_ID).unwrap()).unwrap();
     assert_eq!(run.state(), ExecutionState::Running);
@@ -3239,6 +4127,71 @@ fn regenerate_the_frozen_v4_fixture() {
     freeze(&guard(&store.writer), "runtime-v4.db");
 }
 
+/// Writes the frozen v5 fixture: one pending approval and one live grant.
+///
+/// Run deliberately, and only when migration 5 changes:
+/// `cargo test -p harkness-runtime regenerate_the_frozen_v5_fixture -- --ignored`.
+#[test]
+#[ignore = "rewrites a committed fixture; run only when migration 5 changes"]
+fn regenerate_the_frozen_v5_fixture() {
+    let data_dir = TempDir::new().unwrap();
+    let store = store_with_migrations(data_dir.path(), &MIGRATIONS[..5]);
+    let task = stored_task(&store);
+    let run = stored_run(&store, &task);
+    let step = stored_step(&store, &run);
+    let call = stored_tool_call(&store, &step);
+
+    let held = |id: &str, risk, scope| {
+        ApprovalRequest::open_with_id(
+            id.parse().unwrap(),
+            PendingApproval::new(
+                run.id(),
+                call.id(),
+                ToolIdentity::parse("fs.write", "1.2.0").unwrap(),
+                canonical_input_hash(&approval_input()).unwrap(),
+                approval_workspace(),
+                risk,
+                at(4),
+            )
+            .requesting(scope)
+            .with_capabilities([Capability::new("fs.write").unwrap()])
+            .summarized_as("write 12 lines to src/lib.rs"),
+        )
+        .unwrap()
+    };
+
+    // A remote write that asked for a run-wide scope, so the fixture pins the
+    // ceiling's downgrade as well as the pending state.
+    store
+        .open_approval(held(
+            FIXTURE_PENDING_APPROVAL_ID,
+            RiskLevel::RemoteWrite,
+            ApprovalScope::ToolForRun,
+        ))
+        .unwrap();
+
+    let granted = held(
+        FIXTURE_GRANTED_APPROVAL_ID,
+        RiskLevel::WorkspaceWrite,
+        ApprovalScope::ExactCall,
+    );
+    store.open_approval(granted.clone()).unwrap();
+    store
+        .decide_approval(
+            granted.id(),
+            ApprovalDecision::grant(
+                granted.id(),
+                ApprovalScope::ExactCall,
+                DecidedVia::Gui,
+                at(7),
+            )
+            .because("frozen fixture grant"),
+        )
+        .unwrap();
+
+    freeze(&guard(&store.writer), "runtime-v5.db");
+}
+
 /// Builds a store stopped at an older migration for fixture regeneration.
 fn store_with_migrations(data_dir: &std::path::Path, migrations: &[Migration]) -> Store {
     std::fs::create_dir_all(data_dir).unwrap();
@@ -3269,8 +4222,8 @@ fn freeze(connection: &Connection, name: &str) {
 
 #[test]
 fn every_migration_in_this_build_is_recorded_in_order() {
-    assert_eq!(MIGRATIONS.len(), 4, "add coverage for a new migration");
-    assert_eq!(SCHEMA_VERSION, 4);
+    assert_eq!(MIGRATIONS.len(), 5, "add coverage for a new migration");
+    assert_eq!(SCHEMA_VERSION, 5);
 }
 
 // -- performance -------------------------------------------------------------

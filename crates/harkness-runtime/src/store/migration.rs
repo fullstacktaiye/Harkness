@@ -48,6 +48,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: 4,
         statements: include_str!("migrations/004_policy_decisions.sql"),
     },
+    Migration {
+        version: 5,
+        statements: include_str!("migrations/005_approvals.sql"),
+    },
 ];
 
 /// Newest schema version this build understands.
@@ -170,6 +174,7 @@ mod tests {
         assert_eq!(
             tables,
             [
+                "approvals",
                 "artifacts",
                 "run_events",
                 "runs",

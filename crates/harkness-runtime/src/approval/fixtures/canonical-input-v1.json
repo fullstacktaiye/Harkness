@@ -1,0 +1,23 @@
+{
+  "canonical": "{\"Capitalized\":\"byte order puts this before every lowercase key\",\"author\":\"Ada Lovelace — 愛\",\"contents\":\"fn main() {\\n\\t\\\"quoted\\\\\\\\\\\"\\n}\",\"empty_array\":[],\"empty_object\":{},\"flags\":[true,false,null],\"path\":\"crates/harkness-runtime/src/store/mod.rs\",\"range\":{\"end\":-40,\"start\":1},\"ratio\":0.5}",
+  "domain": "harkness.approval.canonical-input.v1",
+  "hash": "97bb2c49ea478a05f9d6ce4b3dd8bbe65253f05fb9507ea2810317ea6a80fccf",
+  "input": {
+    "Capitalized": "byte order puts this before every lowercase key",
+    "author": "Ada Lovelace — 愛",
+    "contents": "fn main() {\n\t\"quoted\\\\\"\n}",
+    "empty_array": [],
+    "empty_object": {},
+    "flags": [
+      true,
+      false,
+      null
+    ],
+    "path": "crates/harkness-runtime/src/store/mod.rs",
+    "range": {
+      "end": -40,
+      "start": 1
+    },
+    "ratio": 0.5
+  }
+}

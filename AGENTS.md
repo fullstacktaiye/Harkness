@@ -564,6 +564,79 @@ because only the value says what the tool actually produced. Preserving it is be
 effort — a context with no artifact store must not change the failure the caller is
 told about.
 
+## Approval Invariants
+
+An approval is persisted and committed *before* any surface is notified, and the
+row and its `approval_requested` event share one transaction. There is no
+event-free way to record one: a question nobody is told about is a run that
+stopped for no visible reason, and a timeline entry with no row behind it is a
+question nobody can answer. Restarting lists the pending requests with every
+binding field intact, which is what makes answering one after a restart safe
+rather than a guess about what was being asked.
+
+No transaction spans the wait. The request is committed, the calling thread parks
+on a condition variable keyed by `ApprovalId`, and the decision is a second short
+write. A decision that arrives before the waiter parks is recorded rather than
+signalled away, because persisting, notifying and parking are three steps and a
+fast answer lands between them; a gate that only woke live waiters would hang
+exactly the runs answered quickest.
+
+`grant_applies` is the security core and admits no partial application. The run,
+the workspace identity, the tool id, the tool version, and a live lifecycle must
+all agree; `ExactCall` additionally requires the canonical input hash and
+`CapabilityForRun` swaps the tool id for a subset test over declared
+capabilities. Subset, not overlap: a tool needing `{network, fs.write}` must not
+run under a grant for `network` alone. A candidate declaring no capabilities
+matches no capability grant, or that scope would silently be the broadest in the
+system. The tool *version* binds even there, because a capability says what a
+tool may do and a new version is code the approver never saw.
+
+The matcher reads no clock and opens no transaction. Liveness is decided against
+an instant the candidate carries, exactly as `PolicyEngine::evaluate` decides
+everything else, so one call's verdict never depends on when it was evaluated.
+
+An `ApprovalGrant` is projected from a granted request and has no constructor and
+no lifecycle field. `granted` is terminal, so a request that reached it cannot
+leave and every other state yields no grant at all — "a dead approval authorizes
+nothing" is a shape the types hold rather than a check to remember. It is also
+the only production source of a `policy::RunGrant`; policy cannot mint one, so an
+`Ask` becomes an `Allow` only because the matcher accepted a grant.
+
+Scope ceilings are enforced when a request is *created*, not when a grant is
+matched, so a `RemoteWrite` or `Destructive` request that asked for a run-wide
+scope is stored as an exact call and keeps both spellings. A record claiming a
+breadth the matcher would never honor is a lie in the audit trail, not defence in
+depth. A decision may narrow to the single call in front of a human and may never
+widen, which is re-checked against the stored request rather than trusted from
+the surface.
+
+Absence of an answer is never consent, and never a resolution either. Closing a
+window, dismissing a dialog, and losing a surface all leave the request pending.
+Only an explicit decision, an expiry, or a run cancellation resolves one, and the
+last two record `Expired` or `Cancelled` with **no** decision attached — the
+waiter still observes a denial, and the record still says no human answered.
+Synthesizing a decision there would make the audit claim one that was never made.
+
+`canonical_input_hash` is frozen and versioned by its domain constant. Object
+keys sort by UTF-8 bytes, arrays keep their order, integers and doubles have
+disjoint spellings, strings escape only what JSON requires, and there is no
+insignificant whitespace. A non-finite number is refused rather than encoded,
+because it serializes as `null` and would fold two different inputs onto one
+hash; no such `Value` is constructible today, but `serde_json`'s
+`arbitrary_precision` is a feature Cargo would unify workspace-wide, so the guard
+is load-bearing. Changing the encoding means a new domain constant and a new
+committed fixture, never an edit to the existing one — every stored `input_hash`
+was derived under it.
+
+The `approvals` table is the request *queue* and is deliberately not the
+per-record `approvals_json` audit history. That column is a bounded, ordered
+trail of decisions already made about one record; this table is a question with
+an identity, a lifecycle, an expiry, and the binding fields a grant is matched
+on, which has to be listed across runs and answered from either front end. Its
+update statement names none of the binding columns, so a resolution cannot
+re-target the approval a human answered; the only one it may move is
+`effective_scope`, and only downwards.
+
 ## Commit & Pull Request Guidelines
 
 Write short, imperative commit subjects, matching history such as `Prevent concurrent imports from orphaning managed checkouts`. Keep each commit focused; append the PR number only when added by the merge workflow. Pull requests should explain the behavior change, testing performed, and relevant issue. Include screenshots for visible QML changes and call out platform or Qt/KDE dependency assumptions.

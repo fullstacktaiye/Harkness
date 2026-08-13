@@ -43,7 +43,11 @@ build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing lin
   `.github/workflows/network-integration.yml`.
 - **Fixture regeneration**: `cargo test -p harkness-runtime regenerate_the_frozen_v1_fixture --
   --ignored` rewrites `crates/harkness-runtime/src/store/fixtures/runtime-v1.db`, and
-  `regenerate_the_frozen_v2_fixture` rewrites `runtime-v2.db`. Run only when that migration itself
+  `regenerate_the_frozen_v2_fixture` (through `v5`) rewrites the corresponding `runtime-v*.db`.
+  `regenerate_the_frozen_canonicalization_fixture` rewrites
+  `crates/harkness-runtime/src/approval/fixtures/canonical-input-v1.json` and must be run only when
+  a *new* approval hash domain is published — every stored `input_hash` was derived under the old
+  one. Run only when that migration itself
   changes; a released migration is otherwise never edited. The v1 regenerator applies a truncated
   ladder rather than opening a `Store`, because opening one now climbs to the newest schema.
   `cargo test -p harkness-context -- --ignored regenerate_the_frozen_v1_fixtures` rewrites
@@ -54,8 +58,9 @@ build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing lin
 ### Frozen fixtures
 
 `crates/harkness-core/src/catalog/fixtures/*.json`, `crates/harkness-runtime/src/domain/fixtures/*.json`,
-`crates/harkness-context/src/fixtures/*.json`, and
-`crates/harkness-runtime/src/store/fixtures/runtime-v{1,2}.db` pin released on-disk formats. A new
+`crates/harkness-context/src/fixtures/*.json`,
+`crates/harkness-runtime/src/approval/fixtures/canonical-input-v1.json`, and
+`crates/harkness-runtime/src/store/fixtures/runtime-v{1..5}.db` pin released on-disk formats. A new
 persisted field, state spelling, or table means a version bump plus a *new* fixture, not an edit to
 an existing one.
 
@@ -92,6 +97,11 @@ translating between two cancellation mechanisms.
   enter the process. `domain::ToolCall` records *that* a tool ran; `tool` is what defines and
   executes one. `store` and `tool` both build on `domain` but not on each other, so persistence and
   execution can be reasoned about — and tested — separately.
+  `approval` sits above `policy` and `store`: it owns the durable approval record and its
+  lifecycle, the frozen canonical input hash a grant is bound to, the matcher that decides whether
+  an existing grant covers a new call, and the condvar-backed gate a parked call is woken through.
+  It is the only production source of a `policy::RunGrant` — policy cannot construct one — so an
+  `Ask` becomes an `Allow` only because the matcher accepted a grant.
 - **`harkness-context`** owns the context engine's vocabulary and nothing that
   uses it: identifiers, `WorkspaceSnapshot` identity, `Provenance`, and
   `FileClass`. It deliberately does *not* depend on `harkness-runtime` — the
