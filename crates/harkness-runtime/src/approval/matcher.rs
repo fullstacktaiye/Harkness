@@ -22,6 +22,7 @@
 //! evaluated rather than on what it is.
 
 use crate::domain::{ApprovalId, RunId, ToolCallId};
+use crate::integration::IntegrationIdentity;
 use crate::policy::{RunGrant, RunGrantScope};
 use crate::tool::{Capability, ToolIdentity};
 
@@ -43,6 +44,7 @@ pub struct ApprovalGrant {
     workspace: WorkspaceBinding,
     tool: ToolIdentity,
     capabilities: Vec<Capability>,
+    integration_identity: IntegrationIdentity,
     input_hash: InputHash,
     scope: ApprovalScope,
 }
@@ -64,6 +66,7 @@ impl ApprovalGrant {
             workspace: request.workspace().clone(),
             tool: request.tool().clone(),
             capabilities: request.capabilities().to_vec(),
+            integration_identity: request.integration_identity(),
             input_hash: request.input_hash(),
             // The *effective* scope, which a decision narrowing to one call has
             // already rewritten: a grant reaches as far as what was allowed, not
@@ -119,6 +122,7 @@ pub struct CandidateCall<'a> {
     workspace: &'a WorkspaceBinding,
     tool: &'a ToolIdentity,
     capabilities: &'a [Capability],
+    integration_identity: IntegrationIdentity,
     input_hash: InputHash,
 }
 
@@ -138,6 +142,7 @@ impl<'a> CandidateCall<'a> {
             workspace,
             tool,
             capabilities: &[],
+            integration_identity: IntegrationIdentity::none(),
             input_hash,
         }
     }
@@ -146,6 +151,13 @@ impl<'a> CandidateCall<'a> {
     #[must_use]
     pub const fn with_capabilities(mut self, capabilities: &'a [Capability]) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    /// Attaches the external identities observed for the candidate call.
+    #[must_use]
+    pub const fn with_integration_identity(mut self, identity: IntegrationIdentity) -> Self {
+        self.integration_identity = identity;
         self
     }
 
@@ -206,6 +218,7 @@ impl<'a> CandidateCall<'a> {
 pub fn grant_applies(grant: &ApprovalGrant, candidate: &CandidateCall<'_>) -> bool {
     grant.run_id == candidate.run_id
         && grant.workspace == *candidate.workspace
+        && grant.integration_identity == candidate.integration_identity
         && match grant.scope {
             ApprovalScope::ExactCall => {
                 grant.tool_call_id == candidate.tool_call_id
@@ -253,6 +266,7 @@ mod tests {
         ApprovalDecision, ApprovalRequest, DecidedVia, PendingApproval, canonical_input_hash,
     };
     use crate::domain::{RunId, ToolCallId};
+    use crate::integration::{IntegrationIdentity, Sha256Hash};
     use crate::policy::{
         PolicyEngine, PolicyRequest, PolicyVerdict, RunGrant, RunGrantScope, UserPolicy,
     };
@@ -640,6 +654,63 @@ mod tests {
             }))
             .unwrap();
             assert_eq!(pair.applies(), scope != ApprovalScope::ExactCall, "{scope}");
+        }
+    }
+
+    #[test]
+    fn every_external_identity_hash_is_bound_at_every_scope() {
+        let identities = [
+            IntegrationIdentity::none().with_agent_executable_sha256(Sha256Hash::of("agent-v1")),
+            IntegrationIdentity::none()
+                .with_mcp_tool_schema_fingerprint(Sha256Hash::of("schema-v1")),
+            IntegrationIdentity::none().with_recipe_content_hash(Sha256Hash::of("recipe-v1")),
+        ];
+        let changed = [
+            IntegrationIdentity::none().with_agent_executable_sha256(Sha256Hash::of("agent-v2")),
+            IntegrationIdentity::none()
+                .with_mcp_tool_schema_fingerprint(Sha256Hash::of("schema-v2")),
+            IntegrationIdentity::none().with_recipe_content_hash(Sha256Hash::of("recipe-v2")),
+        ];
+
+        for scope in ApprovalScope::ALL.iter().copied() {
+            for (approved, different) in identities.into_iter().zip(changed) {
+                let pair = Pair::new(scope);
+                let mut request = ApprovalRequest::open(
+                    request_for(
+                        pair.run_id,
+                        pair.tool_call_id,
+                        &pair.workspace,
+                        &pair.tool,
+                        &pair.capabilities,
+                        pair.input_hash,
+                        scope,
+                    )
+                    .with_integration_identity(approved),
+                )
+                .unwrap();
+                request
+                    .decide(ApprovalDecision::grant(
+                        request.id(),
+                        scope,
+                        DecidedVia::Cli,
+                        at(1),
+                    ))
+                    .unwrap();
+                let grant = request.grant().unwrap();
+                let candidate = pair.candidate().with_integration_identity(approved);
+                assert!(grant_applies(&grant, &candidate), "{scope}/{approved:?}");
+                assert!(
+                    !grant_applies(
+                        &grant,
+                        &pair.candidate().with_integration_identity(different)
+                    ),
+                    "{scope}/{different:?}"
+                );
+                assert!(
+                    !grant_applies(&grant, &pair.candidate()),
+                    "present versus absent must not match at {scope}"
+                );
+            }
         }
     }
 

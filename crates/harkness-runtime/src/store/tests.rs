@@ -27,6 +27,7 @@ use crate::domain::{
     ArtifactId, ExecutionState, Failure, Run, RunId, Step, StepId, Task, TaskId, ToolCall,
     ToolCallId, ToolCallState, ToolCallWire,
 };
+use crate::integration::{IntegrationIdentity, Sha256Hash};
 use crate::policy::{PolicyDecision, PolicyVerdict};
 use crate::tool::{ArtifactWriter, Capability, RiskLevel, ToolIdentity};
 use crate::trust::{TrustState, WorkspaceTrust};
@@ -3778,6 +3779,9 @@ const FROZEN_V4_DATABASE: &[u8] = include_bytes!("fixtures/runtime-v4.db");
 /// The frozen v5 database carrying one pending approval and one grant.
 const FROZEN_V5_DATABASE: &[u8] = include_bytes!("fixtures/runtime-v5.db");
 
+/// The frozen v6 database carrying an external identity-bound approval.
+const FROZEN_V6_DATABASE: &[u8] = include_bytes!("fixtures/runtime-v6.db");
+
 /// The approval identities the v5 fixture was written with.
 const FIXTURE_PENDING_APPROVAL_ID: &str = "77777777-7777-4777-8777-777777777777";
 const FIXTURE_GRANTED_APPROVAL_ID: &str = "88888888-8888-4888-8888-888888888888";
@@ -3806,6 +3810,10 @@ const LATER_MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 6,
+        statements: include_str!("migrations/006_approval_integration_identity.sql"),
+    },
+    Migration {
+        version: 7,
         statements: "ALTER TABLE runs ADD COLUMN cancelled_by TEXT;",
     },
 ];
@@ -3987,6 +3995,46 @@ fn a_frozen_v5_database_opens_and_reads_its_approvals() {
 }
 
 #[test]
+fn a_frozen_v6_database_opens_and_reads_its_external_identity_binding() {
+    let data_dir = restore_frozen_database(FROZEN_V6_DATABASE);
+    let store = Store::open(data_dir.path()).unwrap();
+    assert_eq!(
+        recorded_version(&guard(&store.writer)).unwrap(),
+        SCHEMA_VERSION
+    );
+
+    let request = store
+        .approval(FIXTURE_GRANTED_APPROVAL_ID.parse().unwrap())
+        .unwrap();
+    let identity = IntegrationIdentity::none()
+        .with_mcp_tool_schema_fingerprint(Sha256Hash::of("frozen schema"));
+    assert_eq!(request.integration_identity(), identity);
+
+    let grants = store.run_grants(request.run_id()).unwrap();
+    let workspace = approval_workspace();
+    let tool = ToolIdentity::parse("fs.write", "1.2.0").unwrap();
+    let candidate = CandidateCall::new(
+        request.run_id(),
+        request.tool_call_id(),
+        &workspace,
+        &tool,
+        canonical_input_hash(&approval_input()).unwrap(),
+    )
+    .with_integration_identity(identity);
+    assert_eq!(matching_grants(&grants, &candidate).len(), 1);
+    assert!(
+        matching_grants(
+            &grants,
+            &candidate.with_integration_identity(
+                IntegrationIdentity::none()
+                    .with_mcp_tool_schema_fingerprint(Sha256Hash::of("changed schema")),
+            ),
+        )
+        .is_empty()
+    );
+}
+
+#[test]
 fn a_frozen_v2_database_opens_after_future_migrations() {
     let data_dir = restore_frozen_database(FROZEN_V2_DATABASE);
     let path = data_dir.path().join(DATABASE_FILE);
@@ -3997,7 +4045,7 @@ fn a_frozen_v2_database_opens_after_future_migrations() {
 
     apply(&mut connection, LATER_MIGRATIONS).unwrap();
 
-    assert_eq!(recorded_version(&connection).unwrap(), 6);
+    assert_eq!(recorded_version(&connection).unwrap(), 7);
     let run =
         super::repository::load_run(&connection, RunId::from_str(FIXTURE_RUN_ID).unwrap()).unwrap();
     assert_eq!(run.state(), ExecutionState::Running);
@@ -4231,6 +4279,48 @@ fn regenerate_the_frozen_v5_fixture() {
     freeze(&guard(&store.writer), "runtime-v5.db");
 }
 
+/// Writes the frozen v6 fixture with an MCP schema-bound grant.
+#[test]
+#[ignore = "rewrites a committed fixture; run only when migration 6 changes"]
+fn regenerate_the_frozen_v6_fixture() {
+    let data_dir = TempDir::new().unwrap();
+    let store = store_with_migrations(data_dir.path(), &MIGRATIONS[..6]);
+    let task = stored_task(&store);
+    let run = stored_run(&store, &task);
+    let step = stored_step(&store, &run);
+    let call = stored_tool_call(&store, &step);
+    let identity = IntegrationIdentity::none()
+        .with_mcp_tool_schema_fingerprint(Sha256Hash::of("frozen schema"));
+    let request = ApprovalRequest::open_with_id(
+        FIXTURE_GRANTED_APPROVAL_ID.parse().unwrap(),
+        PendingApproval::new(
+            run.id(),
+            call.id(),
+            ToolIdentity::parse("fs.write", "1.2.0").unwrap(),
+            canonical_input_hash(&approval_input()).unwrap(),
+            approval_workspace(),
+            RiskLevel::Execute,
+            at(4),
+        )
+        .with_integration_identity(identity)
+        .summarized_as("invoke an imported MCP tool"),
+    )
+    .unwrap();
+    store.open_approval(request.clone()).unwrap();
+    store
+        .decide_approval(
+            request.id(),
+            ApprovalDecision::grant(
+                request.id(),
+                ApprovalScope::ExactCall,
+                DecidedVia::Gui,
+                at(7),
+            ),
+        )
+        .unwrap();
+    freeze(&guard(&store.writer), "runtime-v6.db");
+}
+
 /// Builds a store stopped at an older migration for fixture regeneration.
 fn store_with_migrations(data_dir: &std::path::Path, migrations: &[Migration]) -> Store {
     std::fs::create_dir_all(data_dir).unwrap();
@@ -4261,8 +4351,8 @@ fn freeze(connection: &Connection, name: &str) {
 
 #[test]
 fn every_migration_in_this_build_is_recorded_in_order() {
-    assert_eq!(MIGRATIONS.len(), 5, "add coverage for a new migration");
-    assert_eq!(SCHEMA_VERSION, 5);
+    assert_eq!(MIGRATIONS.len(), 6, "add coverage for a new migration");
+    assert_eq!(SCHEMA_VERSION, 6);
 }
 
 // -- performance -------------------------------------------------------------

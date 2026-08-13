@@ -820,6 +820,44 @@ update statement names none of the binding columns, so a resolution cannot
 re-target the approval a human answered; the only one it may move is
 `effective_scope`, and only downwards.
 
+## External-Integration Policy & Approval Invariants
+
+The eight v0.5 operations are typed by `ExternalCapability` and projected into the existing open
+`Capability` vocabulary with these stable spellings: `launch_external_agent`,
+`connect_mcp_server`, `invoke_mcp_tool`, `read_forge_resource`, `push_remote_branch`,
+`create_pull_request`, `modify_forge_resource`, and `execute_workflow_recipe`. Do not add a loose
+boolean beside them or duplicate their spellings in an adapter. An adapter declares the projected
+capability; runtime policy owns its meaning.
+
+Risk mappings are floors, never suggestions. Agent launch, MCP connection, and imported MCP tool
+invocation are at least `Execute`; forge reads are at least `Network`; branch pushes, pull-request
+creation, and forge mutation are at least `RemoteWrite`; a recipe is no lower than the maximum risk
+of its compiled steps. A classifier may raise a floor and may never lower it. The three remote-write
+operations remain exact-call approvals through the existing `RemoteWrite` scope ceiling.
+
+Policy context binds an agent or MCP-server launch to its executable SHA-256, an MCP tool invocation
+to its schema fingerprint, and a recipe execution to its content hash. A required hash that is
+absent is a typed denial, not an unbound prompt. `IntegrationIdentity` is also copied into the
+approval request and compared as one whole value for **every** scope; a changed hash, present versus
+absent, or absent versus present defeats the grant. This comparison stays outside the scope match so
+neither `ToolForRun` nor `CapabilityForRun` can bypass identity drift.
+
+ACP permission options and MCP annotations are advisory audit context only. They are persisted in
+the external policy context and never read to choose risk, verdict, scope, or grant applicability.
+Repository policy may tighten an external capability to `Ask` or `Deny` and may never grant
+`Allow`; an attempted repository grant invalidates the whole file and fails closed.
+
+Every noninteractive external `Ask` becomes `Deny` with its capability-specific stable kind in the
+CLI exit-code-3 family. The eight noninteractive kinds and the missing-identity kinds are published
+by `harkness contract`; adding one means extending the shared table and its completeness tests, not
+adding a front-end-only spelling.
+
+`ExternalPolicyContext` is an explicitly versioned strict JSON value embedded in the existing
+policy decision. Optional fields are omitted, same-version unknown fields are refused, and the
+frozen request and decision fixtures pin its wire form. Approval identity columns were added by
+runtime database migration 6 and are nullable so v5 rows retain their exact meaning; never edit the
+released migration or v6 fixture.
+
 ## External-Integration Boundary Invariants
 
 `harkness-acp`, `harkness-mcp`, `harkness-forge`, and `harkness-recipe` sit strictly below

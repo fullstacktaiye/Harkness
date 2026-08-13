@@ -31,6 +31,13 @@ use crate::trust::{
     ContainedPath, ExecutionMode, ForcePush, PathBoundary, RequestClassification, TrustState,
 };
 
+mod integration;
+
+pub use integration::{
+    AcpPermissionOption, EXTERNAL_POLICY_CONTEXT_SCHEMA_VERSION, EXTERNAL_POLICY_DENIAL_KINDS,
+    ExternalCapability, ExternalPermissionContext, ExternalPolicyContext, McpToolAnnotations,
+};
+
 /// Current version of `policy.json`.
 pub const POLICY_SCHEMA_VERSION: u32 = 1;
 /// Name of the global policy file below the Harkness data directory.
@@ -103,6 +110,12 @@ pub struct PolicyDecision {
     source: PolicySource,
     #[serde(default, skip_serializing_if = "is_false")]
     one_call_only: bool,
+    /// External request facts evaluated, absent for pre-v0.5 and local tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    external_request: Option<ExternalPolicyContext>,
+    /// Stable machine-readable refusal, present for typed external denials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    denial_kind: Option<String>,
 }
 
 impl PolicyDecision {
@@ -119,7 +132,20 @@ impl PolicyDecision {
             reason,
             source,
             one_call_only,
+            external_request: None,
+            denial_kind: None,
         }
+    }
+
+    fn for_request(mut self, request: &PolicyRequest<'_>) -> Self {
+        self.external_request = request.external;
+        self
+    }
+
+    fn denied_as(mut self, kind: &'static str) -> Self {
+        debug_assert_eq!(self.verdict, PolicyVerdict::Deny);
+        self.denial_kind = Some(kind.to_owned());
+        self
     }
 
     /// Binding verdict.
@@ -146,6 +172,18 @@ impl PolicyDecision {
         self.one_call_only
     }
 
+    /// External-integration facts evaluated, when this was an external request.
+    #[must_use]
+    pub const fn external_request(&self) -> Option<&ExternalPolicyContext> {
+        self.external_request.as_ref()
+    }
+
+    /// Stable refusal kind for a typed external denial.
+    #[must_use]
+    pub fn denial_kind(&self) -> Option<&str> {
+        self.denial_kind.as_deref()
+    }
+
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
         if self.reason.trim().is_empty() {
             return Err("policy decisions require a non-empty reason");
@@ -155,6 +193,22 @@ impl PolicyDecision {
         }
         if self.source == PolicySource::RunGrant && self.verdict != PolicyVerdict::Allow {
             return Err("a run grant may only produce an allow decision");
+        }
+        if self.denial_kind.is_some() && self.verdict != PolicyVerdict::Deny {
+            return Err("only a denial may carry a denial kind");
+        }
+        if let Some(kind) = self.denial_kind.as_deref()
+            && !EXTERNAL_POLICY_DENIAL_KINDS.contains(&kind)
+        {
+            return Err("policy decision carries an unknown external denial kind");
+        }
+        if let Some(external) = self.external_request {
+            if external.schema_version() != EXTERNAL_POLICY_CONTEXT_SCHEMA_VERSION {
+                return Err("external policy context was written by a newer Harkness build");
+            }
+            external.validate_identity_shape()?;
+        } else if self.denial_kind.is_some() {
+            return Err("an external denial kind requires an external request context");
         }
         Ok(())
     }
@@ -224,6 +278,7 @@ pub struct PolicyRequest<'a> {
     mode: ExecutionMode,
     paths: &'a [ContainedPath],
     grants: &'a [RunGrant],
+    external: Option<ExternalPolicyContext>,
 }
 
 impl<'a> PolicyRequest<'a> {
@@ -245,6 +300,7 @@ impl<'a> PolicyRequest<'a> {
             mode,
             paths: &[],
             grants: &[],
+            external: None,
         }
     }
 
@@ -262,6 +318,13 @@ impl<'a> PolicyRequest<'a> {
         self
     }
 
+    /// Attaches the external-integration subject and identity being evaluated.
+    #[must_use]
+    pub const fn with_external_context(mut self, external: ExternalPolicyContext) -> Self {
+        self.external = Some(external);
+        self
+    }
+
     /// Immutable published tool contract.
     #[must_use]
     pub const fn descriptor(&self) -> &'a ToolDescriptor {
@@ -274,7 +337,9 @@ impl<'a> PolicyRequest<'a> {
     /// so an understated classification raises no privilege.
     #[must_use]
     pub fn risk(&self) -> RiskLevel {
-        self.classification.risk().max(self.descriptor.risk())
+        let base = self.classification.risk().max(self.descriptor.risk());
+        self.external
+            .map_or(base, |external| base.max(external.risk_floor()))
     }
 
     /// Force variant the validated input selected, if any.
@@ -306,6 +371,12 @@ impl<'a> PolicyRequest<'a> {
     pub const fn grants(&self) -> &'a [RunGrant] {
         self.grants
     }
+
+    /// External-integration context, when this call crosses that boundary.
+    #[must_use]
+    pub const fn external(&self) -> Option<ExternalPolicyContext> {
+        self.external
+    }
 }
 
 /// Versioned policy rules shared by global and repository files.
@@ -317,6 +388,8 @@ struct PolicyFile {
     risks: BTreeMap<RiskLevel, PolicyVerdict>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     tools: BTreeMap<String, PolicyVerdict>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    external_capabilities: BTreeMap<ExternalCapability, PolicyVerdict>,
 }
 
 impl PolicyFile {
@@ -325,6 +398,7 @@ impl PolicyFile {
             version: POLICY_SCHEMA_VERSION,
             risks: BTreeMap::new(),
             tools: BTreeMap::new(),
+            external_capabilities: BTreeMap::new(),
         }
     }
 
@@ -351,11 +425,21 @@ impl PolicyFile {
             .get(&risk)
             .copied()
             .map(|verdict| (verdict, format!("risk {}", risk.as_str())));
-        match (tool, risk) {
-            (Some(tool), Some(risk)) => Some(if tool.0 >= risk.0 { tool } else { risk }),
-            (Some(only), None) | (None, Some(only)) => Some(only),
-            (None, None) => None,
-        }
+        let external = request.external().and_then(|context| {
+            self.external_capabilities
+                .get(&context.capability())
+                .copied()
+                .map(|verdict| {
+                    (
+                        verdict,
+                        format!("external capability {}", context.capability().as_str()),
+                    )
+                })
+        });
+        [tool, risk, external]
+            .into_iter()
+            .flatten()
+            .max_by_key(|selected| selected.0)
     }
 
     fn validate(&self, path: &Path) -> Result<(), PolicyLoadError> {
@@ -374,6 +458,23 @@ impl PolicyFile {
                     path: path.to_path_buf(),
                     reason: format!("invalid tool policy key {id:?}: {error}"),
                 })?;
+        }
+        Ok(())
+    }
+
+    fn validate_repository(&self, path: &Path) -> Result<(), PolicyLoadError> {
+        if let Some((capability, _)) = self
+            .external_capabilities
+            .iter()
+            .find(|(_, verdict)| **verdict == PolicyVerdict::Allow)
+        {
+            return Err(PolicyLoadError::Malformed {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "repository policy may not grant allow for external capability {}",
+                    capability.as_str()
+                ),
+            });
         }
         Ok(())
     }
@@ -401,6 +502,17 @@ impl UserPolicy {
     #[must_use]
     pub fn with_tool(mut self, tool: &ToolId, verdict: PolicyVerdict) -> Self {
         self.0.tools.insert(tool.to_string(), verdict);
+        self
+    }
+
+    /// Adds or replaces a rule for one typed external capability.
+    #[must_use]
+    pub fn with_external_capability(
+        mut self,
+        capability: ExternalCapability,
+        verdict: PolicyVerdict,
+    ) -> Self {
+        self.0.external_capabilities.insert(capability, verdict);
         self
     }
 
@@ -442,12 +554,17 @@ impl RepositoryPolicy {
 
     /// Loads a strict v1 file. Absence means no repository policy.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, PolicyLoadError> {
-        load_file(path.as_ref()).map(Self)
+        let path = path.as_ref();
+        let policy = load_file(path)?;
+        policy.validate_repository(path)?;
+        Ok(Self(policy))
     }
 
     /// Atomically replaces the file with this policy.
     pub fn persist(&self, path: impl AsRef<Path>) -> Result<(), PolicyLoadError> {
-        persist_file(path.as_ref(), &self.0)
+        let path = path.as_ref();
+        self.0.validate_repository(path)?;
+        persist_file(path, &self.0)
     }
 }
 
@@ -511,6 +628,32 @@ impl PolicyEngine {
     /// something milder.
     #[must_use]
     pub fn evaluate(&self, request: &PolicyRequest<'_>) -> PolicyDecision {
+        if let Some(external) = request.external() {
+            if let Some(kind) = external.identity_denial_kind() {
+                return PolicyDecision::new(
+                    PolicyVerdict::Deny,
+                    format!(
+                        "denied: {} requires observed identity evidence before evaluation",
+                        external.capability().as_str()
+                    ),
+                    PolicySource::BuiltIn,
+                    false,
+                )
+                .for_request(request)
+                .denied_as(kind);
+            }
+            if let Err(reason) = external.validate(request.descriptor().capabilities()) {
+                return PolicyDecision::new(
+                    PolicyVerdict::Deny,
+                    format!("denied: {reason}"),
+                    PolicySource::BuiltIn,
+                    false,
+                )
+                .for_request(request)
+                .denied_as("external_identity_context_invalid");
+            }
+        }
+
         let force_push = request.force_push();
         if force_push.is_forcing() {
             return PolicyDecision::new(
@@ -521,17 +664,20 @@ impl PolicyEngine {
                 ),
                 PolicySource::BuiltIn,
                 false,
-            );
+            )
+            .for_request(request);
         }
 
         let user = match &self.user {
             LoadedPolicy::Loaded(policy) => policy,
-            LoadedPolicy::Failed(error) => return load_failure(error, PolicySource::UserPolicy),
+            LoadedPolicy::Failed(error) => {
+                return load_failure(error, PolicySource::UserPolicy).for_request(request);
+            }
         };
         let repository = match &self.repository {
             LoadedPolicy::Loaded(policy) => policy.as_ref(),
             LoadedPolicy::Failed(error) => {
-                return load_failure(error, PolicySource::RepositoryPolicy);
+                return load_failure(error, PolicySource::RepositoryPolicy).for_request(request);
             }
         };
 
@@ -567,15 +713,20 @@ impl PolicyEngine {
                 "allowed: a live run-scoped grant matches this request",
                 PolicySource::RunGrant,
                 false,
-            );
+            )
+            .for_request(request);
         }
         if verdict == PolicyVerdict::Ask && request.mode() == ExecutionMode::NonInteractive {
-            return PolicyDecision::new(
+            let decision = PolicyDecision::new(
                 PolicyVerdict::Deny,
                 format!("denied: noninteractive execution cannot answer approval; {reason}"),
                 source,
                 false,
-            );
+            )
+            .for_request(request);
+            return request.external().map_or(decision.clone(), |external| {
+                decision.denied_as(external.capability().noninteractive_denial_kind())
+            });
         }
 
         PolicyDecision::new(
@@ -584,6 +735,7 @@ impl PolicyEngine {
             source,
             verdict == PolicyVerdict::Ask && exact_only,
         )
+        .for_request(request)
     }
 }
 
@@ -686,7 +838,11 @@ fn load_repository_policy(workspace: &Path) -> Result<Option<PolicyFile>, Policy
                 path: nominal,
                 reason: error.to_string(),
             })?;
-    load_optional_file(contained.as_path())
+    let policy = load_optional_file(contained.as_path())?;
+    if let Some(policy) = policy.as_ref() {
+        policy.validate_repository(contained.as_path())?;
+    }
+    Ok(policy)
 }
 
 fn load_optional_file(path: &Path) -> Result<Option<PolicyFile>, PolicyLoadError> {
@@ -861,6 +1017,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::integration::{IntegrationIdentity, Sha256Hash};
     use crate::tool::{ExecutionContext, Tool, ToolError, ToolIdentity, ToolMetadata, erase};
     use crate::trust::{RequestFlags, classify_request};
 
@@ -895,12 +1052,64 @@ mod tests {
         }
     }
 
+    struct ExternalFixtureTool(ExternalCapability, RiskLevel);
+
+    impl Tool for ExternalFixtureTool {
+        type Input = EmptyInput;
+        type Output = EmptyOutput;
+
+        fn metadata(&self) -> ToolMetadata {
+            ToolMetadata::new(
+                ToolIdentity::parse("fixture.external", "1.0.0").unwrap(),
+                "External policy fixture",
+                "Provides an external descriptor for policy evaluator tests.",
+                self.1,
+            )
+            .with_capabilities([self.0.capability().unwrap()])
+        }
+
+        fn execute(
+            &self,
+            _input: Self::Input,
+            _context: &mut ExecutionContext,
+        ) -> Result<Self::Output, ToolError> {
+            Ok(EmptyOutput {})
+        }
+    }
+
     /// Enough of the repository policy path to identify it in a reason on any
     /// platform, since canonical spellings differ between them.
     const REPOSITORY_POLICY_FILE_NAME: &str = "policy.json";
 
     fn descriptor(risk: RiskLevel) -> ToolDescriptor {
         erase(FixtureTool(risk)).unwrap().descriptor().clone()
+    }
+
+    fn external_descriptor(capability: ExternalCapability, risk: RiskLevel) -> ToolDescriptor {
+        erase(ExternalFixtureTool(capability, risk))
+            .unwrap()
+            .descriptor()
+            .clone()
+    }
+
+    fn identity_for(capability: ExternalCapability) -> IntegrationIdentity {
+        match capability {
+            ExternalCapability::LaunchExternalAgent | ExternalCapability::ConnectMcpServer => {
+                IntegrationIdentity::none()
+                    .with_agent_executable_sha256(Sha256Hash::of("executable"))
+            }
+            ExternalCapability::InvokeMcpTool => IntegrationIdentity::none()
+                .with_mcp_tool_schema_fingerprint(Sha256Hash::of("schema")),
+            ExternalCapability::ExecuteWorkflowRecipe => {
+                IntegrationIdentity::none().with_recipe_content_hash(Sha256Hash::of("recipe"))
+            }
+            _ => IntegrationIdentity::none(),
+        }
+    }
+
+    fn external_context(capability: ExternalCapability) -> ExternalPolicyContext {
+        ExternalPolicyContext::new(capability, RiskLevel::Observe)
+            .with_identity(identity_for(capability))
     }
 
     /// The classification a request with no extra paths or flags produces.
@@ -1268,6 +1477,236 @@ mod tests {
         assert_eq!(decision.verdict(), PolicyVerdict::Deny);
         assert_eq!(decision.source(), PolicySource::BuiltIn);
         assert!(decision.reason().contains("force push"));
+    }
+
+    // -- external-integration contracts --------------------------------------
+
+    #[test]
+    fn every_external_capability_has_the_normative_risk_floor() {
+        for capability in ExternalCapability::ALL.iter().copied() {
+            let descriptor = external_descriptor(capability, RiskLevel::Observe);
+            let context = external_context(capability);
+            let request = PolicyRequest::new(
+                &descriptor,
+                declared(&descriptor),
+                TrustState::Trusted,
+                ExecutionMode::Interactive,
+            )
+            .with_external_context(context);
+            let expected = match capability {
+                ExternalCapability::LaunchExternalAgent
+                | ExternalCapability::ConnectMcpServer
+                | ExternalCapability::InvokeMcpTool => RiskLevel::Execute,
+                ExternalCapability::ReadForgeResource => RiskLevel::Network,
+                ExternalCapability::PushRemoteBranch
+                | ExternalCapability::CreatePullRequest
+                | ExternalCapability::ModifyForgeResource => RiskLevel::RemoteWrite,
+                ExternalCapability::ExecuteWorkflowRecipe => RiskLevel::Observe,
+            };
+            assert_eq!(request.risk(), expected, "{capability:?}");
+
+            let decision = PolicyEngine::new(UserPolicy::default(), None).evaluate(&request);
+            assert_eq!(decision.external_request(), Some(&context));
+            assert_eq!(
+                decision.one_call_only(),
+                matches!(
+                    capability,
+                    ExternalCapability::PushRemoteBranch
+                        | ExternalCapability::CreatePullRequest
+                        | ExternalCapability::ModifyForgeResource
+                ),
+                "{capability:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recipe_risk_is_the_maximum_compiled_step_risk() {
+        let capability = ExternalCapability::ExecuteWorkflowRecipe;
+        let descriptor = external_descriptor(capability, RiskLevel::Observe);
+        for risk in RiskLevel::ALL.iter().copied() {
+            let request = PolicyRequest::new(
+                &descriptor,
+                declared(&descriptor),
+                TrustState::Trusted,
+                ExecutionMode::Interactive,
+            )
+            .with_external_context(
+                ExternalPolicyContext::new(capability, risk)
+                    .with_identity(identity_for(capability)),
+            );
+            assert_eq!(request.risk(), risk);
+        }
+    }
+
+    #[test]
+    fn required_external_identity_is_fail_closed_by_kind() {
+        for (capability, kind) in [
+            (
+                ExternalCapability::LaunchExternalAgent,
+                "agent_executable_identity_required",
+            ),
+            (
+                ExternalCapability::ConnectMcpServer,
+                "agent_executable_identity_required",
+            ),
+            (
+                ExternalCapability::InvokeMcpTool,
+                "mcp_tool_schema_identity_required",
+            ),
+            (
+                ExternalCapability::ExecuteWorkflowRecipe,
+                "recipe_content_identity_required",
+            ),
+        ] {
+            let descriptor = external_descriptor(capability, RiskLevel::Observe);
+            let decision = PolicyEngine::new(UserPolicy::default(), None).evaluate(
+                &PolicyRequest::new(
+                    &descriptor,
+                    declared(&descriptor),
+                    TrustState::Trusted,
+                    ExecutionMode::Interactive,
+                )
+                .with_external_context(ExternalPolicyContext::new(capability, RiskLevel::Observe)),
+            );
+            assert_eq!(decision.verdict(), PolicyVerdict::Deny);
+            assert_eq!(decision.denial_kind(), Some(kind));
+        }
+    }
+
+    #[test]
+    fn external_permission_context_is_advisory_and_non_decisive() {
+        let capability = ExternalCapability::InvokeMcpTool;
+        let descriptor = external_descriptor(capability, RiskLevel::Observe);
+        let decide = |context| {
+            PolicyEngine::new(UserPolicy::default(), None).evaluate(
+                &PolicyRequest::new(
+                    &descriptor,
+                    declared(&descriptor),
+                    TrustState::Trusted,
+                    ExecutionMode::Interactive,
+                )
+                .with_external_context(
+                    external_context(capability).with_permission_context(context),
+                ),
+            )
+        };
+        let allow = decide(ExternalPermissionContext {
+            acp_option: Some(AcpPermissionOption::AllowAlways),
+            mcp_annotations: Some(McpToolAnnotations {
+                read_only_hint: Some(true),
+                destructive_hint: Some(false),
+                idempotent_hint: Some(true),
+                open_world_hint: Some(false),
+            }),
+        });
+        let reject = decide(ExternalPermissionContext {
+            acp_option: Some(AcpPermissionOption::RejectAlways),
+            mcp_annotations: Some(McpToolAnnotations {
+                read_only_hint: Some(false),
+                destructive_hint: Some(true),
+                idempotent_hint: Some(false),
+                open_world_hint: Some(true),
+            }),
+        });
+        assert_eq!(allow.verdict(), reject.verdict());
+        assert_eq!(allow.source(), reject.source());
+        assert_eq!(allow.reason(), reject.reason());
+        assert_ne!(allow.external_request(), reject.external_request());
+    }
+
+    #[test]
+    fn every_external_noninteractive_ask_has_a_registered_denial_kind() {
+        for capability in ExternalCapability::ALL.iter().copied() {
+            let descriptor = external_descriptor(capability, RiskLevel::Observe);
+            let context = ExternalPolicyContext::new(capability, RiskLevel::WorkspaceWrite)
+                .with_identity(identity_for(capability));
+            let decision = PolicyEngine::new(UserPolicy::default(), None).evaluate(
+                &PolicyRequest::new(
+                    &descriptor,
+                    declared(&descriptor),
+                    TrustState::Trusted,
+                    ExecutionMode::NonInteractive,
+                )
+                .with_external_context(context),
+            );
+            assert_eq!(decision.verdict(), PolicyVerdict::Deny, "{capability:?}");
+            assert_eq!(
+                decision.denial_kind(),
+                Some(capability.noninteractive_denial_kind())
+            );
+            assert!(
+                EXTERNAL_POLICY_DENIAL_KINDS.contains(&decision.denial_kind().unwrap()),
+                "{capability:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn repository_configuration_cannot_grant_external_execution() {
+        let workspace = TempDir::new().unwrap();
+        write_repository_policy(
+            workspace.path(),
+            r#"{
+  "version": 1,
+  "external_capabilities": {
+    "launch_external_agent": "allow"
+  }
+}"#,
+        );
+        let data = TempDir::new().unwrap();
+        let engine = PolicyEngine::load(data.path(), workspace.path());
+        let capability = ExternalCapability::LaunchExternalAgent;
+        let descriptor = external_descriptor(capability, RiskLevel::Observe);
+        let decision = engine.evaluate(
+            &PolicyRequest::new(
+                &descriptor,
+                declared(&descriptor),
+                TrustState::Trusted,
+                ExecutionMode::Interactive,
+            )
+            .with_external_context(external_context(capability)),
+        );
+        assert_eq!(decision.verdict(), PolicyVerdict::Deny);
+        assert_eq!(decision.source(), PolicySource::RepositoryPolicy);
+        assert!(decision.reason().contains("may not grant allow"));
+    }
+
+    #[test]
+    fn external_policy_context_wire_is_strict_and_omits_absent_optional_fields() {
+        let context = external_context(ExternalCapability::InvokeMcpTool);
+        let encoded = serde_json::to_value(context).unwrap();
+        assert_eq!(encoded["schema_version"], 1);
+        assert!(encoded.get("external_permission_context").is_none());
+        let mut unknown = encoded;
+        unknown["future"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<ExternalPolicyContext>(unknown).is_err());
+    }
+
+    #[test]
+    fn external_request_and_decision_fixtures_are_frozen() {
+        let context = external_context(ExternalCapability::InvokeMcpTool);
+        let request = format!("{}\n", serde_json::to_string_pretty(&context).unwrap());
+        assert_eq!(
+            request,
+            include_str!("policy/fixtures/external-request-v1.json")
+        );
+
+        let descriptor = external_descriptor(ExternalCapability::InvokeMcpTool, RiskLevel::Observe);
+        let decision = PolicyEngine::new(UserPolicy::default(), None).evaluate(
+            &PolicyRequest::new(
+                &descriptor,
+                declared(&descriptor),
+                TrustState::Trusted,
+                ExecutionMode::Interactive,
+            )
+            .with_external_context(context),
+        );
+        let decision = format!("{}\n", serde_json::to_string_pretty(&decision).unwrap());
+        assert_eq!(
+            decision,
+            include_str!("policy/fixtures/external-decision-v1.json")
+        );
     }
 
     // -- grants and noninteractive resolution --------------------------------

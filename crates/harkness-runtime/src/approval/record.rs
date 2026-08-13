@@ -7,6 +7,7 @@ use harkness_core::ProjectId;
 use time::{OffsetDateTime, UtcOffset};
 
 use crate::domain::{ApprovalId, RunId, ToolCallId};
+use crate::integration::IntegrationIdentity;
 use crate::tool::{Capability, RiskLevel, ToolIdentity};
 
 use super::{ApprovalError, ApprovalGrant, InputHash};
@@ -423,6 +424,7 @@ pub struct PendingApproval {
     tool_call_id: ToolCallId,
     tool: ToolIdentity,
     capabilities: Vec<Capability>,
+    integration_identity: IntegrationIdentity,
     input_hash: InputHash,
     input_summary: String,
     workspace: WorkspaceBinding,
@@ -455,6 +457,7 @@ impl PendingApproval {
             tool_call_id,
             tool,
             capabilities: Vec::new(),
+            integration_identity: IntegrationIdentity::none(),
             input_hash,
             input_summary: String::new(),
             workspace,
@@ -483,6 +486,17 @@ impl PendingApproval {
         self.capabilities.extend(capabilities);
         self.capabilities.sort_unstable();
         self.capabilities.dedup();
+        self
+    }
+
+    /// Binds the external subject identities observed for this operation.
+    ///
+    /// The matcher compares the complete value for every scope, including
+    /// absence, so an executable, schema, or recipe change always defeats a
+    /// previously granted approval.
+    #[must_use]
+    pub const fn with_integration_identity(mut self, identity: IntegrationIdentity) -> Self {
+        self.integration_identity = identity;
         self
     }
 
@@ -703,6 +717,12 @@ impl ApprovalRequest {
     #[must_use]
     pub fn capabilities(&self) -> &[Capability] {
         &self.pending.capabilities
+    }
+
+    /// External identity hashes this request and any resulting grant bind to.
+    #[must_use]
+    pub const fn integration_identity(&self) -> IntegrationIdentity {
+        self.pending.integration_identity
     }
 
     /// Canonical hash of the validated input.
