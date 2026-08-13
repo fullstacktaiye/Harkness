@@ -2042,6 +2042,242 @@ fn log_ranges_and_every_revision_diff_target_use_the_shared_git_model() {
 }
 
 #[test]
+fn diff_provenance_is_opt_in_names_every_contributor_and_says_when_it_knows_nothing() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let root = fixture.path().join("provenance-project");
+    initialize_repository(&root);
+    run_git(&root, &["checkout", "-b", "agent/demo"]);
+
+    fs::write(root.join("alpha.txt"), b"one\n").unwrap();
+    fs::write(root.join("beta.txt"), b"one\n").unwrap();
+    run_git(&root, &["add", "-A"]);
+    run_git(
+        &root,
+        &[
+            "-c",
+            "user.name=Ada",
+            "-c",
+            "user.email=ada@example.invalid",
+            "commit",
+            "-m",
+            "Add alpha and beta\n\nCo-Authored-By: Some Model <model@example.invalid>",
+        ],
+    );
+    fs::write(root.join("alpha.txt"), b"two\n").unwrap();
+    run_git(&root, &["add", "-A"]);
+    run_git(
+        &root,
+        &[
+            "-c",
+            "user.name=Grace",
+            "-c",
+            "user.email=grace@example.invalid",
+            "commit",
+            "-m",
+            "Revise alpha",
+        ],
+    );
+
+    let project = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&root)
+        .unwrap();
+    let project_id = project.id.to_string();
+
+    let output = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--branch",
+            "main...agent/demo",
+            "--project",
+            &project_id,
+            "--provenance",
+        ],
+    );
+    assert_success(&output);
+    let body = json_output(&output);
+    let blocks = body["data"]["provenance"].as_array().cloned().unwrap();
+    assert_eq!(blocks.len(), 1);
+    let block = &blocks[0];
+    assert_eq!(block["target"]["kind"], "branch_against_base");
+    assert_eq!(block["range"]["head_revision"], "agent/demo");
+    // The branch convention is read off the reference, and it is the one
+    // Harkness-specific reading the Git-derived source makes.
+    assert_eq!(block["range"]["agent_slug"], "demo");
+    assert_eq!(block["walked_commits"], 2);
+    assert_eq!(block["skipped_merges"], 0);
+    assert_eq!(block["truncation"], Value::Null);
+    assert_eq!(block["commits"].as_array().unwrap().len(), 2);
+
+    let producer_name = |index: &Value| {
+        block["producers"][index.as_u64().unwrap() as usize]["name"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let file = |path: &str| {
+        body["data"]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["new_path"] == path)
+            .cloned()
+            .unwrap_or_else(|| panic!("{path} was not reported"))
+    };
+
+    // A file two people touched in the range names both, newest first, and is
+    // never collapsed onto the most recent.
+    let alpha = file("alpha.txt")["provenance"].clone();
+    assert_eq!(alpha["target_index"], 0);
+    assert_eq!(alpha["gap"], Value::Null);
+    assert_eq!(alpha["commits"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        alpha["producers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(producer_name)
+            .collect::<Vec<_>>(),
+        vec!["Grace", "Ada", "Some Model"],
+    );
+
+    // Harkness's own commit convention names the model in a trailer.
+    let beta = file("beta.txt")["provenance"].clone();
+    assert_eq!(beta["commits"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        beta["producers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(producer_name)
+            .collect::<Vec<_>>(),
+        vec!["Ada", "Some Model"],
+    );
+    let model = block["producers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|producer| producer["name"] == "Some Model")
+        .unwrap();
+    assert_eq!(model["kind"], "co_author");
+    assert_eq!(model["email"], "model@example.invalid");
+
+    // Off by default, and absent is distinguishable from "nothing produced it".
+    let without = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--branch",
+            "main...agent/demo",
+            "--project",
+            &project_id,
+        ],
+    );
+    assert_success(&without);
+    let plain = json_output(&without);
+    assert_eq!(plain["data"]["provenance"], Value::Null);
+    assert_eq!(plain["data"]["files"][0]["provenance"], Value::Null);
+
+    // The common case: uncommitted content nothing has claimed, reported as a
+    // named answer rather than as a blank or an error.
+    fs::write(root.join("scratch.txt"), b"nobody committed this\n").unwrap();
+    let unstaged = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--unstaged",
+            "--project",
+            &project_id,
+            "--provenance",
+        ],
+    );
+    assert_success(&unstaged);
+    let working = json_output(&unstaged);
+    assert_eq!(working["data"]["provenance"][0]["range"], Value::Null);
+    assert_eq!(working["data"]["provenance"][0]["walked_commits"], 0);
+    assert_eq!(
+        working["data"]["files"][0]["provenance"]["gap"]["kind"],
+        "uncommitted"
+    );
+
+    let human = harkness(
+        &data_dir,
+        &[
+            "git",
+            "diff",
+            "--unstaged",
+            "--project",
+            &project_id,
+            "--provenance",
+        ],
+    );
+    assert_success(&human);
+    assert!(
+        String::from_utf8_lossy(&human.stdout).contains("unknown (uncommitted)"),
+        "an unattributed file must render as unknown: {}",
+        String::from_utf8_lossy(&human.stdout)
+    );
+
+    // A budget reached degrades to a named truncation rather than failing.
+    let truncated = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--branch",
+            "main...agent/demo",
+            "--project",
+            &project_id,
+            "--provenance",
+            "--provenance-max-commits",
+            "1",
+        ],
+    );
+    assert_success(&truncated);
+    let bounded = json_output(&truncated);
+    assert_eq!(
+        bounded["data"]["provenance"][0]["truncation"]["kind"],
+        "commit_budget_exhausted"
+    );
+    assert_eq!(bounded["data"]["provenance"][0]["truncation"]["limit"], 1);
+    let bounded_beta = bounded["data"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["new_path"] == "beta.txt")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        bounded_beta["provenance"]["gap"]["kind"],
+        "commit_budget_exhausted"
+    );
+
+    // The bound is a bound on the walk, not a flag that can be set alone.
+    let orphan = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "git",
+            "diff",
+            "--project",
+            &project_id,
+            "--provenance-max-commits",
+            "1",
+        ],
+    );
+    assert_eq!(orphan.status.code(), Some(2));
+}
+
+#[test]
 fn diff_context_and_intra_line_metadata_are_opt_in_and_bounded() {
     let fixture = TempDir::new().unwrap();
     let data_dir = fixture.path().join("data");

@@ -5,7 +5,7 @@
 Harkness is a Rust 2024 workspace split into eleven crates under `crates/`:
 
 - `harkness-core`: project catalog, storage layout, cross-domain project workflows, and directory-listing logic shared by front ends.
-- `harkness-git`: all production Git behavior: inspection, diffs and history, file context and hunk staging, branch and worktree mutation, commits, clone and synchronization, hermetic process execution, and repository locking.
+- `harkness-git`: all production Git behavior: inspection, diffs and history, change provenance, file context and hunk staging, branch and worktree mutation, commits, clone and synchronization, hermetic process execution, and repository locking.
 - `harkness-context`: the context engine's typed vocabulary — workspace snapshot identity, stable identifiers, provenance, and file classification.
 - `harkness-acp`, `harkness-mcp`, `harkness-forge`, `harkness-recipe`: the v0.5 external-integration adapters — the Agent Client Protocol client, the Model Context Protocol client, forge-neutral contracts with the GitHub REST adapter, and the workflow-recipe source format and compiler. Currently skeletons; see the invariants below.
 - `harkness-test-fixtures`: hermetic repository, filesystem, and process fixtures shared only by crate tests.
@@ -138,6 +138,47 @@ side-by-side alignment belongs to the model and must not become a property of a
 display setting. A line ending is carried as a name on the row rather than left
 in the segment text, so the reveal never has to decide what a carriage return
 looks like mid-run.
+
+## Change Provenance Invariants
+
+Change provenance is derived from the repository and persisted nowhere. There is
+no provenance file, table, or column, and adding one to `harkness-git` is not how
+a recorded source lands: it composes above `harkness-runtime` and enriches the
+same `ChangeProvenance` a Git-derived read already returns. ADR-0019 records why,
+and a second read interface for the panel to choose between is the outcome it
+exists to prevent.
+
+**Attribution is advisory and nothing may act on it.** No staging, discarding, or
+diffing decision may read a `FileProvenance`, a `Producer`, or a
+`ProvenanceGap`. A wrong attribution must stay a cosmetic error, and that licence
+is what pays for skipping merges and for not following renames.
+
+**One walk per range, never one per file.** The range a `DiffTarget` implies is
+walked once and each commit compared with its first parent once. Nothing may add
+a per-path history walk — `git blame` and rename following are both that — because
+a thousand-file review must open no slower than a one-file one. Reaching
+`ProvenanceOptions::max_commits` degrades to a named
+`ProvenanceTruncation`, never to a failed read.
+
+**Every requested path is reported, and absence is a named answer.** A path
+nothing could be attributed to carries a `ProvenanceGap` rather than an empty
+field, because most repositories have no Harkness runs and every working-tree
+comparison is uncommitted content. Blank is not an answer and a guess is worse
+than one.
+
+**Only what a commit records is reported.** A producer is a Git `author` or a
+`Co-Authored-By` trailer and `ProducerKind` says which; neither is classified as
+human or machine, for the reason ADR-0017 gives. The `agent/<slug>` reading is
+the one Harkness-specific inference, it is recorded on the range rather than on a
+file, and a caller that pinned a review to object ids supplies the reference it
+resolved through `ProvenanceOptions::head_reference` — which changes what the
+convention reads and never changes a walk. Commit messages and identities are
+repository content: trailer parsing is bounded by `MAX_CO_AUTHORS_PER_COMMIT`,
+and a producer name reaching a surface is plain text in the panel and passes
+through `single_line` in the CLI, so it cannot forge a column.
+
+**Provenance reads take no repository lock and spawn no process**, exactly as
+every other read on `GitService` does not.
 
 ## Run Store Schema & Connection Invariants
 

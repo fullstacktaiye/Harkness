@@ -1257,13 +1257,13 @@ fn path_selected(old: Option<&Path>, new: Option<&Path>, selected: &[PathBuf]) -
 }
 
 #[cfg(unix)]
-fn os_str_bytes(value: &OsStr) -> &[u8] {
+pub(crate) fn os_str_bytes(value: &OsStr) -> &[u8] {
     use std::os::unix::ffi::OsStrExt;
     value.as_bytes()
 }
 
 #[cfg(not(unix))]
-fn os_str_bytes(value: &OsStr) -> &[u8] {
+pub(crate) fn os_str_bytes(value: &OsStr) -> &[u8] {
     value.to_str().unwrap_or_default().as_bytes()
 }
 

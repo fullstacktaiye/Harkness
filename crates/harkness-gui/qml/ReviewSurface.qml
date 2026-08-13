@@ -31,6 +31,9 @@ ColumnLayout {
         ? reviewState.file
         : ({})
     readonly property var reviewRows: reviewFile.rows !== undefined ? reviewFile.rows : []
+    readonly property var reviewProvenance: reviewReady && reviewState.provenance !== undefined
+        ? reviewState.provenance
+        : ({})
     readonly property string repositoryLockScope: String(
         project.lockScope || project.parentId || project.id
     )
@@ -80,6 +83,81 @@ ColumnLayout {
         if (kind === "deletion")
             return Kirigami.Theme.negativeTextColor;
         return Kirigami.Theme.disabledTextColor;
+    }
+
+    // The colour that says "these two files came from the same hands".
+    //
+    // The group is an index over the review's *distinct* producer sets, so the
+    // only question the colour has to answer is same-or-different — which is
+    // why the hues are spread by the golden ratio rather than ordered along a
+    // scale a reader would try to rank. Colour is never the only signal: every
+    // row carries the names beside it, and an unattributed row is drawn with
+    // no bar at all rather than with a colour of its own.
+    function provenanceTint(group) {
+        const index = Number(group);
+        if (!(index >= 0))
+            return "transparent";
+        const dark = Kirigami.Theme.backgroundColor.hslLightness < 0.5;
+        return Qt.hsla((index * 0.6180339887498949) % 1, 0.55, dark ? 0.62 : 0.44, 1);
+    }
+
+    // What the whole review can say about where its files came from. Silence
+    // is deliberate when nothing was resolved: the rows say "unknown" for
+    // themselves, and a header repeating it for every file adds nothing.
+    function provenanceHeadline() {
+        const provenance = reviewProvenance;
+        if (provenance.resolved !== true)
+            return "";
+        const commits = Number(provenance.commitCount || 0);
+        if (commits === 0)
+            return qsTr("No commit in this comparison produced these changes");
+        const parts = [
+            qsTr("%1 commits by %2 contributors")
+                .arg(commits)
+                .arg(Number(provenance.producerCount || 0))
+        ];
+        const slug = String(provenance.agentSlug || "");
+        if (slug.length > 0)
+            parts.push(qsTr("agent %1").arg(slug));
+        const skipped = Number(provenance.skippedMerges || 0);
+        if (skipped > 0)
+            parts.push(qsTr("%1 merges left unattributed").arg(skipped));
+        if (String(provenance.truncation || "") === "commit_budget_exhausted")
+            parts.push(qsTr("older commits were not walked"));
+        return parts.join(" · ");
+    }
+
+    // Absence is a first-class answer, so an unattributed file says so in as
+    // many letters and is never left blank.
+    function provenanceLabel(row) {
+        const label = String((row || ({})).provenanceLabel || "");
+        return label.length > 0 ? label : qsTr("Unknown");
+    }
+
+    function provenanceDetail(row) {
+        const entry = row || ({});
+        const gap = String(entry.provenanceGap || "");
+        if (gap.length === 0 && String(entry.provenanceLabel || "").length > 0) {
+            return qsTr("Produced by %1, across %2 commits in this comparison")
+                .arg(entry.provenanceLabel)
+                .arg(Number(entry.provenanceCommits || 0));
+        }
+        return qsTr("Unknown: %1").arg(provenanceGapText(gap));
+    }
+
+    function provenanceGapText(gap) {
+        switch (String(gap)) {
+        case "uncommitted":
+            return qsTr("nothing has committed this content yet");
+        case "empty_range":
+            return qsTr("the two sides of this comparison name one commit");
+        case "not_in_range":
+            return qsTr("no commit in this comparison names this file");
+        case "commit_budget_exhausted":
+            return qsTr("it is beyond the commits that were walked");
+        default:
+            return qsTr("attribution is unavailable");
+        }
     }
 
     // Blends `over` into `base` and returns an opaque colour. Every tint the
@@ -845,6 +923,16 @@ ColumnLayout {
                     text: reviewSurface.reviewState.detail || ""
                     textFormat: Text.PlainText
                 }
+
+                Controls.Label {
+                    Layout.fillWidth: true
+                    color: Kirigami.Theme.disabledTextColor
+                    elide: Text.ElideRight
+                    font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                    text: reviewSurface.provenanceHeadline()
+                    textFormat: Text.PlainText
+                    visible: text.length > 0
+                }
             }
 
             Controls.Label {
@@ -1036,10 +1124,12 @@ ColumnLayout {
                             required property int index
                             required property var modelData
 
-                            Accessible.name: qsTr("%1, %2 change")
+                            Accessible.name: qsTr("%1, %2 change, %3")
                                 .arg(modelData.path)
                                 .arg(modelData.change)
+                                .arg(reviewSurface.provenanceDetail(modelData))
                             Controls.ToolTip.text: modelData.path
+                                + "\n" + reviewSurface.provenanceDetail(modelData)
                             Controls.ToolTip.visible: hovered
                             highlighted: String(reviewSurface.reviewState.selectedFileId || "")
                                 === String(modelData.fileId)
@@ -1058,12 +1148,47 @@ ColumnLayout {
                             contentItem: RowLayout {
                                 spacing: Kirigami.Units.smallSpacing
 
-                                Controls.Label {
+                                // The one mark a reader can scan a long file
+                                // list by without reading anything: files that
+                                // came from the same hands carry the same bar,
+                                // and an unattributed file carries none.
+                                Rectangle {
+                                    Layout.fillHeight: true
+                                    Layout.preferredWidth: Math.round(
+                                        Kirigami.Units.smallSpacing / 2
+                                    ) + 2
+                                    color: reviewSurface.provenanceTint(
+                                        reviewFileDelegate.modelData.provenanceGroup
+                                    )
+                                    radius: width / 2
+                                }
+
+                                ColumnLayout {
                                     Layout.fillWidth: true
-                                    elide: Text.ElideMiddle
-                                    font.family: "monospace"
-                                    text: reviewFileDelegate.modelData.path
-                                    textFormat: Text.PlainText
+                                    spacing: 0
+
+                                    Controls.Label {
+                                        Layout.fillWidth: true
+                                        elide: Text.ElideMiddle
+                                        font.family: "monospace"
+                                        text: reviewFileDelegate.modelData.path
+                                        textFormat: Text.PlainText
+                                    }
+
+                                    // Producer names come out of commit
+                                    // objects, which is repository content:
+                                    // plain text, never interpreted as markup.
+                                    Controls.Label {
+                                        Layout.fillWidth: true
+                                        color: Kirigami.Theme.disabledTextColor
+                                        elide: Text.ElideRight
+                                        font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                                        text: reviewSurface.provenanceLabel(
+                                            reviewFileDelegate.modelData
+                                        )
+                                        textFormat: Text.PlainText
+                                        visible: reviewSurface.reviewProvenance.resolved === true
+                                    }
                                 }
 
                                 Controls.Label {
@@ -1245,6 +1370,21 @@ ColumnLayout {
                         visible: reviewSurface.reviewFile.path !== undefined
                             && String(reviewSurface.reviewFile.path).length > 0
 
+                        // The same bar the row carried, so opening a file does
+                        // not lose the grouping the list just showed.
+                        Rectangle {
+                            Layout.alignment: Qt.AlignVCenter
+                            Layout.preferredHeight: Kirigami.Units.gridUnit
+                            Layout.preferredWidth: Math.round(
+                                Kirigami.Units.smallSpacing / 2
+                            ) + 2
+                            color: reviewSurface.provenanceTint(
+                                reviewSurface.reviewFile.provenanceGroup
+                            )
+                            radius: width / 2
+                            visible: reviewSurface.reviewProvenance.resolved === true
+                        }
+
                         Controls.Label {
                             Layout.fillWidth: true
                             elide: Text.ElideMiddle
@@ -1252,6 +1392,23 @@ ColumnLayout {
                             font.family: "monospace"
                             text: reviewSurface.reviewFile.path || ""
                             textFormat: Text.PlainText
+                        }
+
+                        Controls.Label {
+                            Accessible.name: text
+                            Controls.ToolTip.text: reviewSurface.provenanceDetail(
+                                reviewSurface.reviewFile
+                            )
+                            Controls.ToolTip.visible: provenanceHover.hovered
+                            color: Kirigami.Theme.disabledTextColor
+                            elide: Text.ElideRight
+                            font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                            Layout.maximumWidth: Kirigami.Units.gridUnit * 12
+                            text: reviewSurface.provenanceLabel(reviewSurface.reviewFile)
+                            textFormat: Text.PlainText
+                            visible: reviewSurface.reviewProvenance.resolved === true
+
+                            HoverHandler { id: provenanceHover }
                         }
 
                         Controls.ToolButton {
