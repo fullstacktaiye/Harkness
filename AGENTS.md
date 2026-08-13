@@ -574,26 +574,44 @@ question nobody can answer. Restarting lists the pending requests with every
 binding field intact, which is what makes answering one after a restart safe
 rather than a guess about what was being asked.
 
-No transaction spans the wait. The request is committed, the calling thread parks
-on a condition variable keyed by `ApprovalId`, and the decision is a second short
-write. A decision that arrives before the waiter parks is recorded rather than
-signalled away, because persisting, notifying and parking are three steps and a
-fast answer lands between them; a gate that only woke live waiters would hang
-exactly the runs answered quickest.
+No transaction spans the wait. The ticket is taken *before* the request is
+persisted, the request is committed, the calling thread parks on a condition
+variable keyed by `ApprovalId`, and the decision is a second short write.
+Registering first is what closes the window in which a fast decision lands
+between persisting and parking. An answer for an approval with no live ticket is
+discarded rather than kept: a restart superseding an interrupted run's requests,
+and a cancellation resolving approvals whose callers have exited, both resolve
+approvals nobody is waiting for, and a gate keyed on answers rather than on
+waiters would grow without bound in exactly those cases.
 
-`grant_applies` is the security core and admits no partial application. The run,
-the workspace identity, the tool id, the tool version, and a live lifecycle must
-all agree; `ExactCall` additionally requires the canonical input hash and
-`CapabilityForRun` swaps the tool id for a subset test over declared
-capabilities. Subset, not overlap: a tool needing `{network, fs.write}` must not
-run under a grant for `network` alone. A candidate declaring no capabilities
-matches no capability grant, or that scope would silently be the broadest in the
-system. The tool *version* binds even there, because a capability says what a
-tool may do and a new version is code the approver never saw.
+`grant_applies` is the security core and admits no partial application. The run
+and the workspace identity bind every scope — together they stop a grant
+replaying into another attempt of the same task or another checkout of the same
+project. Each scope then adds the axes that give it meaning:
 
-The matcher reads no clock and opens no transaction. Liveness is decided against
-an instant the candidate carries, exactly as `PolicyEngine::evaluate` decides
-everything else, so one call's verdict never depends on when it was evaluated.
+- `ExactCall` binds the recorded `tool_call_id`, the tool identity including its
+  version, and the canonical input hash. Binding the call is what makes it *one*
+  call, which is the whole point of reducing every remote-write and destructive
+  request to this scope: authorizing one force push must not authorize a second,
+  byte-identical one later in the same run. The input hash stays beside it rather
+  than being made redundant by it, so an authorization cannot survive the input
+  being re-derived differently.
+- `ToolForRun` binds the tool identity, version included, and ignores the call
+  and the input.
+- `CapabilityForRun` compares **no** tool identity, only that the candidate
+  declares at least one capability and that every capability it declares is
+  covered. Comparing a version here would match one tool's version string
+  against an unrelated tool's, so whether a grant covered a call would turn on
+  two tools happening to share a number. Subset, not overlap: a tool needing
+  `{network, fs.write}` must not run under a grant for `network` alone. A
+  candidate declaring nothing matches no capability grant, or that scope would
+  silently be the broadest in the system.
+
+The matcher reads no clock and opens no transaction. A grant's lifetime is its
+run; a request's `expires_at` is a deadline for a *human to answer*, so the only
+thing it can do is stop a request from ever being granted. Carrying it into the
+grant would make a `ToolForRun` approval given "for the remainder of the run"
+stop applying part-way through one.
 
 An `ApprovalGrant` is projected from a granted request and has no constructor and
 no lifecycle field. `granted` is terminal, so a request that reached it cannot

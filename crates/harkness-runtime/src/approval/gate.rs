@@ -9,14 +9,21 @@
 //! [`ApprovalId`]. The decision is a short write that commits and *then* wakes
 //! the waiter, so the wait costs no lock and the wake costs no poll interval.
 //!
-//! # A decision may arrive before anyone waits
+//! # A decision may arrive before anyone parks
 //!
 //! Persisting the request, notifying the surfaces, and parking are three
 //! separate steps, and a fast answer can land between the second and the third.
-//! [`ApprovalGate::resolve`] therefore records the observation whether or not a
-//! waiter exists, and [`ApprovalTicket::wait`] takes an already-recorded one
-//! without blocking. A gate that only signalled live waiters would hang exactly
-//! the runs whose approvals were answered fastest.
+//! The ticket is therefore taken *first*, before the request is persisted: from
+//! that moment [`ApprovalGate::resolve`] has somewhere to put the answer, and
+//! [`ApprovalTicket::wait`] takes an already-recorded one without blocking.
+//!
+//! An answer for an approval with **no live ticket is discarded**, which is what
+//! keeps the gate bounded by the calls currently waiting rather than by the
+//! approvals ever resolved. That case is common and is not a lost wake-up: a
+//! restart supersedes the requests an interrupted run left behind, and a
+//! cancellation resolves approvals whose callers have already exited. Neither
+//! has anybody to wake, and an answer kept for a waiter that will never arrive
+//! is a leak rather than a safety net.
 //!
 //! # Every way out is an observation
 //!
@@ -138,7 +145,15 @@ const fn unanswered_reason(state: ApprovalState) -> &'static str {
 /// transaction commits.
 #[derive(Debug, Default)]
 pub struct ApprovalGate {
-    resolved: Mutex<HashMap<ApprovalId, ApprovalObservation>>,
+    /// One entry per *live ticket*, holding its answer once one arrives.
+    ///
+    /// Keyed on the ticket rather than on the answer, so the map is bounded by
+    /// the calls currently waiting and not by the approvals ever resolved. A map
+    /// that recorded every answer would grow without limit in exactly the case
+    /// that has no waiter at all: a restart superseding the requests an
+    /// interrupted run left behind, or a cancellation resolving approvals whose
+    /// callers are long gone.
+    waiting: Mutex<HashMap<ApprovalId, Option<ApprovalObservation>>>,
     decided: Condvar,
 }
 
@@ -151,29 +166,46 @@ impl ApprovalGate {
 
     /// Claims the right to wait for `id`.
     ///
-    /// Take the ticket *before* persisting the request. Registering afterwards
-    /// would still be correct — [`resolve`](Self::resolve) records an answer
-    /// nobody is waiting for — but taking it first is what makes the
-    /// already-answered path a fast return rather than a lucky one.
+    /// **Take the ticket before persisting the request.** An answer for an
+    /// approval with no live ticket is discarded, so registering afterwards
+    /// leaves a window in which a fast decision is dropped and the waiter parks
+    /// forever. Taking it first closes that window and costs nothing: the
+    /// already-answered path becomes a return without blocking.
+    ///
+    /// Discarding is the right default for everything else. A restart that
+    /// supersedes the requests an interrupted run left behind, and a
+    /// cancellation that resolves approvals whose callers have exited, both
+    /// resolve approvals nobody is waiting for — and an answer kept for a waiter
+    /// that will never arrive is a leak, not a safety net.
     ///
     /// One approval has one waiter: it holds exactly one tool call, and that
     /// call is what parks. An observation is *taken* by the waiter that receives
     /// it rather than broadcast, so a second ticket for the same approval would
-    /// wait for an answer the first already consumed. Do not hand one approval's
-    /// ticket to two threads.
+    /// replace the first's registration. Do not hand one approval's ticket to
+    /// two threads.
     #[must_use]
-    pub const fn ticket(&self, id: ApprovalId) -> ApprovalTicket<'_> {
+    pub fn ticket(&self, id: ApprovalId) -> ApprovalTicket<'_> {
+        guard(&self.waiting).entry(id).or_default();
         ApprovalTicket { gate: self, id }
     }
 
     /// Records an observation and wakes whoever is waiting for it.
+    ///
+    /// Does nothing when no ticket is outstanding for the approval; see
+    /// [`ticket`](Self::ticket) for why that is the safe default and why a
+    /// waiter must register before its request is persisted.
     ///
     /// Idempotent by last write: a run cancellation racing a human decision
     /// resolves the same approval twice in memory, and the store has already
     /// decided which of the two is the real one. Waking with either is safe
     /// because the waiter re-reads the record it is resuming.
     pub fn resolve(&self, observation: ApprovalObservation) {
-        guard(&self.resolved).insert(observation.approval_id, observation);
+        let mut waiting = guard(&self.waiting);
+        let Some(slot) = waiting.get_mut(&observation.approval_id) else {
+            return;
+        };
+        *slot = Some(observation);
+        drop(waiting);
         // Every waiter checks its own key, so a broadcast costs one spurious
         // wake per unrelated waiter and needs no per-approval condition
         // variable.
@@ -188,15 +220,21 @@ impl ApprovalGate {
         }
     }
 
-    /// Whether an answer for `id` is already recorded.
+    /// Whether an answer for `id` has arrived and not yet been taken.
     #[must_use]
     pub fn is_resolved(&self, id: ApprovalId) -> bool {
-        guard(&self.resolved).contains_key(&id)
+        guard(&self.waiting).get(&id).is_some_and(Option::is_some)
     }
 
-    /// Discards a recorded answer nobody is going to wait for.
+    /// Whether a ticket for `id` is outstanding.
+    #[must_use]
+    pub fn is_waiting(&self, id: ApprovalId) -> bool {
+        guard(&self.waiting).contains_key(&id)
+    }
+
+    /// Releases a ticket's registration, with any answer it never took.
     fn forget(&self, id: ApprovalId) {
-        guard(&self.resolved).remove(&id);
+        guard(&self.waiting).remove(&id);
     }
 }
 
@@ -228,19 +266,19 @@ impl ApprovalTicket<'_> {
     /// and a run that looks like it is still asking.
     #[must_use]
     pub fn wait(self) -> ApprovalObservation {
-        let mut resolved = guard(&self.gate.resolved);
+        let mut waiting = guard(&self.gate.waiting);
         loop {
-            if let Some(observation) = resolved.remove(&self.id) {
+            if let Some(observation) = waiting.get_mut(&self.id).and_then(Option::take) {
                 // Released before the ticket's own drop runs, which takes the
                 // same lock: `Mutex` is not reentrant, so returning while
                 // holding this guard would deadlock on the way out.
-                drop(resolved);
+                drop(waiting);
                 return observation;
             }
-            resolved = self
+            waiting = self
                 .gate
                 .decided
-                .wait(resolved)
+                .wait(waiting)
                 .unwrap_or_else(PoisonError::into_inner);
         }
     }
@@ -253,20 +291,23 @@ impl ApprovalTicket<'_> {
     /// decides to keep waiting instead.
     pub fn wait_for(self, timeout: Duration) -> Result<ApprovalObservation, Self> {
         let deadline = Instant::now() + timeout;
-        let mut resolved = guard(&self.gate.resolved);
+        let mut waiting = guard(&self.gate.waiting);
         loop {
-            if let Some(observation) = resolved.remove(&self.id) {
-                drop(resolved);
+            if let Some(observation) = waiting.get_mut(&self.id).and_then(Option::take) {
+                drop(waiting);
                 return Ok(observation);
             }
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                drop(resolved);
+                drop(waiting);
+                // The registration stays, so an answer arriving while the caller
+                // decides whether to keep waiting is still delivered to the
+                // ticket it hands back.
                 return Err(self);
             };
-            resolved = self
+            waiting = self
                 .gate
                 .decided
-                .wait_timeout(resolved, remaining)
+                .wait_timeout(waiting, remaining)
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
@@ -290,7 +331,6 @@ fn guard<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
 
@@ -358,57 +398,78 @@ mod tests {
 
     #[test]
     fn a_waiter_parks_until_another_thread_decides() {
-        let gate = Arc::new(ApprovalGate::new());
+        let gate = ApprovalGate::new();
         let mut record = request();
         let id = record.id();
-        let ticket_gate = Arc::clone(&gate);
 
-        let waiter = thread::spawn(move || ticket_gate.ticket(id).wait());
+        // The ticket is taken here, on the thread that is about to persist the
+        // request, and *then* handed to the waiter — which is the order the
+        // contract requires and the reason a decision cannot outrun it.
+        let ticket = gate.ticket(id);
+        thread::scope(|scope| {
+            let waiter = scope.spawn(move || ticket.wait());
 
-        // The decision happens on this thread, after the waiter has had a
-        // chance to park; the gate is correct either way, which is what the
-        // already-answered test below covers.
-        record
-            .decide(ApprovalDecision::deny(id, DecidedVia::Cli, at(2)))
-            .unwrap();
-        gate.resolve_from(&record);
+            record
+                .decide(ApprovalDecision::deny(id, DecidedVia::Cli, at(2)))
+                .unwrap();
+            gate.resolve_from(&record);
 
-        let observation = waiter.join().unwrap();
-        assert_eq!(observation.approval_id(), id);
-        assert!(!observation.is_granted());
+            let observation = waiter.join().unwrap();
+            assert_eq!(observation.approval_id(), id);
+            assert!(!observation.is_granted());
+        });
     }
 
     #[test]
-    fn an_answer_that_arrives_before_the_wait_is_not_lost() {
+    fn an_answer_that_arrives_before_the_wait_begins_is_not_lost() {
+        // The window the registration order closes: the request is persisted and
+        // answered before its caller ever parks.
         let gate = ApprovalGate::new();
         let mut record = request();
+        let ticket = gate.ticket(record.id());
         record.cancel(at(3)).unwrap();
 
         gate.resolve_from(&record);
         assert!(gate.is_resolved(record.id()));
 
-        let observation = gate.ticket(record.id()).wait();
+        let observation = ticket.wait();
         assert_eq!(observation.state(), ApprovalState::Cancelled);
         assert!(
-            !gate.is_resolved(record.id()),
-            "a taken observation must not be delivered twice"
+            !gate.is_waiting(record.id()),
+            "taking an observation releases its registration"
         );
     }
 
     #[test]
+    fn an_answer_for_an_approval_nobody_is_waiting_for_is_discarded() {
+        // The shape a restart has: pending requests left by an interrupted run
+        // are superseded, and none of them has a caller. Keeping those answers
+        // would grow the gate for the life of the process.
+        let gate = ApprovalGate::new();
+        let mut abandoned = request();
+        abandoned.supersede(at(3)).unwrap();
+
+        gate.resolve_from(&abandoned);
+
+        assert!(!gate.is_waiting(abandoned.id()));
+        assert!(!gate.is_resolved(abandoned.id()));
+    }
+
+    #[test]
     fn a_run_cancellation_wakes_a_waiter_rather_than_leaving_it_parked() {
-        let gate = Arc::new(ApprovalGate::new());
+        let gate = ApprovalGate::new();
         let mut record = request();
-        let id = record.id();
-        let waiting = Arc::clone(&gate);
+        let ticket = gate.ticket(record.id());
 
-        let waiter = thread::spawn(move || waiting.ticket(id).wait());
-        record.cancel(at(4)).unwrap();
-        gate.resolve_from(&record);
+        thread::scope(|scope| {
+            let waiter = scope.spawn(move || ticket.wait());
+            record.cancel(at(4)).unwrap();
+            gate.resolve_from(&record);
 
-        let observation = waiter.join().unwrap();
-        assert_eq!(observation.state(), ApprovalState::Cancelled);
-        assert_eq!(observation.verdict(), ApprovalVerdict::Denied);
+            let observation = waiter.join().unwrap();
+            assert_eq!(observation.state(), ApprovalState::Cancelled);
+            assert_eq!(observation.verdict(), ApprovalVerdict::Denied);
+        });
     }
 
     #[test]
@@ -441,37 +502,41 @@ mod tests {
         let ticket = gate.ticket(id);
         record.expire(at(6)).unwrap();
         gate.resolve_from(&record);
+        assert!(gate.is_waiting(id));
         drop(ticket);
 
         assert!(!gate.is_resolved(id));
+        assert!(
+            !gate.is_waiting(id),
+            "a released ticket takes its registration with it"
+        );
     }
 
     #[test]
     fn one_gate_serves_many_approvals_without_crossing_their_answers() {
-        let gate = Arc::new(ApprovalGate::new());
+        let gate = ApprovalGate::new();
         let ids = (0..8).map(|_| ApprovalId::new()).collect::<Vec<_>>();
+        let tickets = ids.iter().map(|id| gate.ticket(*id)).collect::<Vec<_>>();
 
-        let waiters = ids
-            .iter()
-            .map(|id| {
-                let gate = Arc::clone(&gate);
-                let id = *id;
-                thread::spawn(move || gate.ticket(id).wait())
-            })
-            .collect::<Vec<_>>();
+        thread::scope(|scope| {
+            let waiters = tickets
+                .into_iter()
+                .map(|ticket| scope.spawn(move || ticket.wait()))
+                .collect::<Vec<_>>();
 
-        for id in &ids {
-            let mut record = request();
-            // Every observation names its own approval, so a waiter woken by a
-            // broadcast for somebody else must stay parked.
-            record.cancel(at(7)).unwrap();
-            let mut observation = ApprovalObservation::of(&record).unwrap();
-            observation.approval_id = *id;
-            gate.resolve(observation);
-        }
+            for id in &ids {
+                let mut record = request();
+                // Every observation names its own approval, so a waiter woken by
+                // a broadcast for somebody else must stay parked.
+                record.cancel(at(7)).unwrap();
+                let mut observation = ApprovalObservation::of(&record).unwrap();
+                observation.approval_id = *id;
+                gate.resolve(observation);
+            }
 
-        for (waiter, id) in waiters.into_iter().zip(&ids) {
-            assert_eq!(waiter.join().unwrap().approval_id(), *id);
-        }
+            for (waiter, id) in waiters.into_iter().zip(&ids) {
+                assert_eq!(waiter.join().unwrap().approval_id(), *id);
+            }
+        });
     }
 }

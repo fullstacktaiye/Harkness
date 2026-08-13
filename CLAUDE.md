@@ -43,13 +43,13 @@ build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing lin
   `.github/workflows/network-integration.yml`.
 - **Fixture regeneration**: `cargo test -p harkness-runtime regenerate_the_frozen_v1_fixture --
   --ignored` rewrites `crates/harkness-runtime/src/store/fixtures/runtime-v1.db`, and
-  `regenerate_the_frozen_v2_fixture` (through `v5`) rewrites the corresponding `runtime-v*.db`.
-  `regenerate_the_frozen_canonicalization_fixture` rewrites
-  `crates/harkness-runtime/src/approval/fixtures/canonical-input-v1.json` and must be run only when
-  a *new* approval hash domain is published — every stored `input_hash` was derived under the old
-  one. Run only when that migration itself
-  changes; a released migration is otherwise never edited. The v1 regenerator applies a truncated
-  ladder rather than opening a `Store`, because opening one now climbs to the newest schema.
+  `regenerate_the_frozen_v2_fixture` (through `v5`) rewrites the corresponding `runtime-v*.db`. Run
+  each only when that migration itself changes; a released migration is otherwise never edited. The
+  v1 regenerator applies a truncated ladder rather than opening a `Store`, because opening one now
+  climbs to the newest schema. `regenerate_the_frozen_canonicalization_fixture` rewrites
+  `crates/harkness-runtime/src/approval/fixtures/canonical-input-v1.json` and carries a stronger
+  warning still: run it only when a *new* approval hash domain is published, because every stored
+  `input_hash` was derived under the encoding it pins.
   `cargo test -p harkness-context -- --ignored regenerate_the_frozen_v1_fixtures` rewrites
   `crates/harkness-context/src/fixtures/*.json` the same way, and carries the same warning: a
   released wire form is replaced by a new versioned fixture, never edited in place.

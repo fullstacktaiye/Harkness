@@ -536,7 +536,7 @@ fn an_approved_call_runs_and_records_the_decision_beside_the_version_it_authoriz
     assert_eq!(approvals[0].decided_by(), "taiye@example.com");
     assert_eq!(
         approvals[0].decision(),
-        crate::domain::ApprovalDecision::Approved
+        crate::domain::ApprovalOutcome::Approved
     );
 
     // Both halves survive the reload, so the audit trail is durable and not a

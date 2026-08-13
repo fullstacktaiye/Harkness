@@ -282,10 +282,12 @@ impl WorkspaceBinding {
 
 /// The answer that resolves one pending approval.
 ///
-/// Distinct from [`domain::Approval`](crate::domain::Approval), which is the
-/// audit entry appended to a run, step, or tool-call record. That entry says a
-/// record was approved; this is the durable answer to a specific question,
-/// carrying the scope it authorizes and the surface it arrived from.
+/// Distinct from [`domain::Approval`](crate::domain::Approval) and its
+/// [`ApprovalOutcome`](crate::domain::ApprovalOutcome), which are the audit
+/// entry appended to a run, step, or tool-call record and the direction it went.
+/// That entry says a record was approved; this is the durable answer to a
+/// specific question, carrying the scope it authorizes and the surface it
+/// arrived from.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovalDecision {
     approval_id: ApprovalId,

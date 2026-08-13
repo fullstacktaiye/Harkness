@@ -7,23 +7,21 @@
 //!
 //! # There is no partial application
 //!
-//! Every axis must agree, whatever the scope: the run, the workspace identity,
-//! the tool id, the tool version, and a live lifecycle. `ExactCall` additionally
-//! requires the canonical input hash, and `CapabilityForRun` swaps the tool id
-//! for the declared capabilities. A single mismatch on any axis is not a weaker
-//! match, it is no match — there is no path here that returns "close enough".
+//! The run and the workspace identity must agree whatever the scope, and each
+//! scope adds the axes that give it meaning: the recorded call, the tool
+//! identity and the input hash for `ExactCall`, the tool identity for
+//! `ToolForRun`, the declared capabilities for `CapabilityForRun`. A single
+//! mismatch on any axis a scope names is not a weaker match, it is no match —
+//! there is no path here that returns "close enough".
 //!
 //! # The matcher reads no clock and touches no database
 //!
-//! Liveness is decided against an instant the *candidate* carries, so matching a
-//! run's grants is arithmetic over values the caller already has.
+//! Matching a run's grants is arithmetic over values the caller already has.
 //! [`crate::policy::PolicyEngine::evaluate`] makes the same promise, and a
 //! matcher that read a clock would make one call's verdict depend on when it was
 //! evaluated rather than on what it is.
 
-use time::OffsetDateTime;
-
-use crate::domain::{ApprovalId, RunId};
+use crate::domain::{ApprovalId, RunId, ToolCallId};
 use crate::policy::{RunGrant, RunGrantScope};
 use crate::tool::{Capability, ToolIdentity};
 
@@ -41,20 +39,28 @@ use super::{ApprovalRequest, ApprovalScope, ApprovalState, InputHash, WorkspaceB
 pub struct ApprovalGrant {
     approval_id: ApprovalId,
     run_id: RunId,
+    tool_call_id: ToolCallId,
     workspace: WorkspaceBinding,
     tool: ToolIdentity,
     capabilities: Vec<Capability>,
     input_hash: InputHash,
     scope: ApprovalScope,
-    expires_at: Option<OffsetDateTime>,
 }
 
 impl ApprovalGrant {
     /// Projects a granted request, and nothing else, into a grant.
+    ///
+    /// The request's `expires_at` is deliberately not carried across. It is a
+    /// deadline for a *human to answer*, so the only thing it can do is stop a
+    /// request from ever becoming a grant; reusing it as the grant's own
+    /// lifetime would make a `ToolForRun` approval given "for the remainder of
+    /// the run" quietly stop applying part-way through it. A grant's lifetime is
+    /// its run, which is what "every grant dies with its run" means.
     pub(super) fn of(request: &ApprovalRequest) -> Option<Self> {
         (request.state() == ApprovalState::Granted).then(|| Self {
             approval_id: request.id(),
             run_id: request.run_id(),
+            tool_call_id: request.tool_call_id(),
             workspace: request.workspace().clone(),
             tool: request.tool().clone(),
             capabilities: request.capabilities().to_vec(),
@@ -63,8 +69,13 @@ impl ApprovalGrant {
             // already rewritten: a grant reaches as far as what was allowed, not
             // as far as what was asked.
             scope: request.effective_scope(),
-            expires_at: request.expires_at(),
         })
+    }
+
+    /// Tool call this grant was raised for.
+    #[must_use]
+    pub const fn tool_call_id(&self) -> ToolCallId {
+        self.tool_call_id
     }
 
     /// Approval this grant came from.
@@ -83,17 +94,6 @@ impl ApprovalGrant {
     #[must_use]
     pub const fn scope(&self) -> ApprovalScope {
         self.scope
-    }
-
-    /// Whether this grant can still authorize anything at `at`.
-    ///
-    /// Existing at all already means the request was granted, so the only
-    /// remaining question is its expiry — read against an instant the caller
-    /// supplies rather than a clock, so one call's verdict never depends on when
-    /// it happened to be evaluated.
-    #[must_use]
-    pub fn is_live(&self, at: OffsetDateTime) -> bool {
-        self.expires_at.is_none_or(|expiry| at < expiry)
     }
 
     /// Projects this grant into policy, if and only if it covers `candidate`.
@@ -115,30 +115,30 @@ impl ApprovalGrant {
 #[derive(Clone, Copy, Debug)]
 pub struct CandidateCall<'a> {
     run_id: RunId,
+    tool_call_id: ToolCallId,
     workspace: &'a WorkspaceBinding,
     tool: &'a ToolIdentity,
     capabilities: &'a [Capability],
     input_hash: InputHash,
-    at: OffsetDateTime,
 }
 
 impl<'a> CandidateCall<'a> {
-    /// Describes one call about to be evaluated at `at`.
+    /// Describes one recorded call about to be evaluated.
     #[must_use]
     pub const fn new(
         run_id: RunId,
+        tool_call_id: ToolCallId,
         workspace: &'a WorkspaceBinding,
         tool: &'a ToolIdentity,
         input_hash: InputHash,
-        at: OffsetDateTime,
     ) -> Self {
         Self {
             run_id,
+            tool_call_id,
             workspace,
             tool,
             capabilities: &[],
             input_hash,
-            at,
         }
     }
 
@@ -155,10 +155,10 @@ impl<'a> CandidateCall<'a> {
         self.run_id
     }
 
-    /// Instant liveness is decided against.
+    /// Recorded call being evaluated.
     #[must_use]
-    pub const fn at(&self) -> OffsetDateTime {
-        self.at
+    pub const fn tool_call_id(&self) -> ToolCallId {
+        self.tool_call_id
     }
 }
 
@@ -166,41 +166,53 @@ impl<'a> CandidateCall<'a> {
 ///
 /// # The scope-independent axes
 ///
-/// A live lifecycle, the same run, the same workspace identity, and the same
-/// tool version are required by every scope. Run and workspace binding are what
-/// stop a grant replaying into another attempt or another checkout; the version
-/// is required even by `CapabilityForRun` because a capability describes what a
-/// tool may do, not what a particular build of it *does*, and a new version is
-/// new code the approver never saw.
+/// The same run and the same workspace identity are required by every scope.
+/// Together they are what stop a grant replaying into another attempt of the
+/// same task or into another checkout of the same project. Existing at all is
+/// the third: only a granted request becomes an [`ApprovalGrant`].
 ///
 /// # What each scope adds
 ///
-/// - `ExactCall` requires the tool id and the canonical input hash. Changing any
-///   byte of any input field changes the hash, so the grant cannot transfer.
-/// - `ToolForRun` requires the tool id and ignores the input, which is exactly
-///   what "allow this tool for the rest of the run" means.
-/// - `CapabilityForRun` ignores the tool id and requires that the candidate
-///   declare at least one capability and that **every** capability it declares
-///   is covered by the grant.
+/// - `ExactCall` requires the recorded tool call, the tool identity *including
+///   its version*, and the canonical input hash. Binding to the call is what
+///   makes it one call: the ceiling reduces every remote-write and destructive
+///   request to this scope precisely so that authorizing one force push does not
+///   authorize a second, byte-identical one later in the same run. The input
+///   hash is kept beside it rather than made redundant by it, so an authorization
+///   still cannot survive the input being re-derived differently.
+/// - `ToolForRun` requires the tool identity, again including the version, and
+///   ignores both the call and the input — which is exactly what "allow this
+///   tool for the rest of the run" means. A new version is new code the approver
+///   never saw, so it needs its own approval.
+/// - `CapabilityForRun` requires that the candidate declare at least one
+///   capability and that **every** capability it declares is covered by the
+///   grant. It compares no tool identity at all, because a capability grant is
+///   an answer about a *capability* and not about a tool: comparing a version
+///   here would mean matching one tool's version string against another's, so
+///   whether a grant covered a call would turn on two unrelated tools happening
+///   to share a version number.
 ///
-/// That last rule is a subset test rather than the equality a single-capability
-/// tool would suggest, and both halves of it matter. Testing for overlap instead
-/// would let a tool requiring `{network, fs.write}` run under a grant for
-/// `network` alone, handing out the capability nobody approved. Refusing a
-/// candidate that declares nothing keeps a capability grant from being the
-/// broadest scope in the system by accident: a tool with no declared
-/// capabilities has none the grant can be about.
+/// The capability rule is a subset test rather than the equality a
+/// single-capability tool would suggest, and both halves of it matter. Testing
+/// for overlap instead would let a tool requiring `{network, fs.write}` run
+/// under a grant for `network` alone, handing out the capability nobody
+/// approved. Refusing a candidate that declares nothing keeps a capability grant
+/// from being the broadest scope in the system by accident: a tool with no
+/// declared capabilities has none the grant can be about.
+///
+/// Nothing here reads a clock. A grant's lifetime is its run, and the answer
+/// deadline a request may carry can only stop one from being granted.
 #[must_use]
 pub fn grant_applies(grant: &ApprovalGrant, candidate: &CandidateCall<'_>) -> bool {
-    grant.is_live(candidate.at)
-        && grant.run_id == candidate.run_id
+    grant.run_id == candidate.run_id
         && grant.workspace == *candidate.workspace
-        && grant.tool.version == candidate.tool.version
         && match grant.scope {
             ApprovalScope::ExactCall => {
-                grant.tool.id == candidate.tool.id && grant.input_hash == candidate.input_hash
+                grant.tool_call_id == candidate.tool_call_id
+                    && grant.tool == *candidate.tool
+                    && grant.input_hash == candidate.input_hash
             }
-            ApprovalScope::ToolForRun => grant.tool.id == candidate.tool.id,
+            ApprovalScope::ToolForRun => grant.tool == *candidate.tool,
             ApprovalScope::CapabilityForRun => {
                 !candidate.capabilities.is_empty()
                     && candidate
@@ -232,7 +244,6 @@ const fn policy_scope(scope: ApprovalScope) -> RunGrantScope {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use time::OffsetDateTime;
 
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
@@ -275,21 +286,21 @@ mod tests {
     /// rather than about the ceiling.
     fn granted(
         run_id: RunId,
+        tool_call_id: ToolCallId,
         workspace: &WorkspaceBinding,
         tool: &ToolIdentity,
         capabilities: &[Capability],
         input_hash: InputHash,
         scope: ApprovalScope,
-        expires_at: Option<OffsetDateTime>,
     ) -> ApprovalGrant {
         let mut request = ApprovalRequest::open(request_for(
             run_id,
+            tool_call_id,
             workspace,
             tool,
             capabilities,
             input_hash,
             scope,
-            expires_at,
         ))
         .unwrap();
         request
@@ -305,16 +316,16 @@ mod tests {
 
     fn request_for(
         run_id: RunId,
+        tool_call_id: ToolCallId,
         workspace: &WorkspaceBinding,
         tool: &ToolIdentity,
         capabilities: &[Capability],
         input_hash: InputHash,
         scope: ApprovalScope,
-        expires_at: Option<OffsetDateTime>,
     ) -> PendingApproval {
-        let pending = PendingApproval::new(
+        PendingApproval::new(
             run_id,
-            ToolCallId::new(),
+            tool_call_id,
             tool.clone(),
             input_hash,
             workspace.clone(),
@@ -322,17 +333,14 @@ mod tests {
             at(0),
         )
         .requesting(scope)
-        .with_capabilities(capabilities.iter().cloned());
-        match expires_at {
-            Some(expiry) => pending.expiring_at(expiry),
-            None => pending,
-        }
+        .with_capabilities(capabilities.iter().cloned())
     }
 
     /// A grant and a candidate that agree on every axis.
     struct Pair {
         grant: ApprovalGrant,
         run_id: RunId,
+        tool_call_id: ToolCallId,
         workspace: WorkspaceBinding,
         tool: ToolIdentity,
         capabilities: Vec<Capability>,
@@ -340,14 +348,11 @@ mod tests {
     }
 
     impl Pair {
-        fn new(scope: ApprovalScope) -> Self {
-            Self::expiring(scope, None)
-        }
-
         /// Grants a request at `scope`, then keeps the values it was granted for
         /// so a test can vary the *candidate* alone.
-        fn expiring(scope: ApprovalScope, expires_at: Option<OffsetDateTime>) -> Self {
+        fn new(scope: ApprovalScope) -> Self {
             let run_id = RunId::new();
+            let tool_call_id = ToolCallId::new();
             let workspace = workspace();
             let tool = tool();
             let capabilities = capabilities(&["fs.write"]);
@@ -355,14 +360,15 @@ mod tests {
             Self {
                 grant: granted(
                     run_id,
+                    tool_call_id,
                     &workspace,
                     &tool,
                     &capabilities,
                     input_hash,
                     scope,
-                    expires_at,
                 ),
                 run_id,
+                tool_call_id,
                 workspace,
                 tool,
                 capabilities,
@@ -373,10 +379,10 @@ mod tests {
         fn candidate(&self) -> CandidateCall<'_> {
             CandidateCall::new(
                 self.run_id,
+                self.tool_call_id,
                 &self.workspace,
                 &self.tool,
                 self.input_hash,
-                at(10),
             )
             .with_capabilities(&self.capabilities)
         }
@@ -430,14 +436,37 @@ mod tests {
     }
 
     #[test]
-    fn one_mismatched_tool_version_defeats_every_scope() {
+    fn one_mismatched_tool_version_defeats_the_scopes_that_name_a_tool() {
         for scope in ApprovalScope::ALL.iter().copied() {
             let mut pair = Pair::new(scope);
             pair.tool = ToolIdentity::parse("fs.write", "1.3.0").unwrap();
-            assert!(
-                !pair.applies(),
-                "{scope}: a new version is code the approver never saw"
+            assert_eq!(
+                pair.applies(),
+                scope == ApprovalScope::CapabilityForRun,
+                "{scope}: a new version is code the approver never saw, but a \
+                 capability grant names no tool to have a version"
             );
+        }
+    }
+
+    #[test]
+    fn a_capability_grant_never_compares_versions_across_unrelated_tools() {
+        // Comparing the grant's tool version against a *different* tool's would
+        // make coverage turn on two unrelated tools happening to share a number:
+        // `net.fetch@1.2.0` covered and `net.fetch@2.0.0` not, for no reason the
+        // approver stated.
+        let pair = Pair::new(ApprovalScope::CapabilityForRun);
+        for version in ["1.2.0", "2.0.0", "0.1.0-rc.1"] {
+            let other = ToolIdentity::parse("net.fetch", version).unwrap();
+            let candidate = CandidateCall::new(
+                pair.run_id,
+                ToolCallId::new(),
+                &pair.workspace,
+                &other,
+                input_hash(),
+            )
+            .with_capabilities(&pair.capabilities);
+            assert!(grant_applies(&pair.grant, &candidate), "{version}");
         }
     }
 
@@ -452,12 +481,12 @@ mod tests {
                 let declared = capabilities(&["fs.write"]);
                 let mut request = ApprovalRequest::open(request_for(
                     RunId::new(),
+                    ToolCallId::new(),
                     &workspace,
                     &tool,
                     &declared,
                     input_hash(),
                     scope,
-                    None,
                 ))
                 .unwrap();
                 match state {
@@ -486,29 +515,105 @@ mod tests {
     }
 
     #[test]
-    fn an_expired_grant_defeats_every_scope_from_the_instant_it_expires() {
+    fn an_answer_deadline_never_becomes_the_lifetime_of_the_grant_it_produced() {
+        // `expires_at` is a deadline for a human to answer. Carrying it into the
+        // grant would make an approval given "for the remainder of the run" stop
+        // applying part-way through it, for a reason nobody stated.
         for scope in ApprovalScope::ALL.iter().copied() {
-            let pair = Pair::expiring(scope, Some(at(10)));
-            let candidate_at = |when: OffsetDateTime| {
-                CandidateCall::new(
-                    pair.run_id,
-                    &pair.workspace,
-                    &pair.tool,
-                    pair.input_hash,
-                    when,
+            let run_id = RunId::new();
+            let tool_call_id = ToolCallId::new();
+            let workspace = workspace();
+            let tool = tool();
+            let declared = capabilities(&["fs.write"]);
+            let mut request = ApprovalRequest::open(
+                request_for(
+                    run_id,
+                    tool_call_id,
+                    &workspace,
+                    &tool,
+                    &declared,
+                    input_hash(),
+                    scope,
                 )
-                .with_capabilities(&pair.capabilities)
-            };
+                .expiring_at(at(10)),
+            )
+            .unwrap();
+            request
+                .decide(ApprovalDecision::grant(
+                    request.id(),
+                    scope,
+                    DecidedVia::Cli,
+                    at(5),
+                ))
+                .unwrap();
 
-            assert!(grant_applies(&pair.grant, &candidate_at(at(9))), "{scope}");
+            let grant = request.grant().unwrap();
+            let candidate =
+                CandidateCall::new(run_id, tool_call_id, &workspace, &tool, input_hash())
+                    .with_capabilities(&declared);
             assert!(
-                !grant_applies(&pair.grant, &candidate_at(at(10))),
-                "{scope}"
+                grant_applies(&grant, &candidate),
+                "{scope}: the grant outlives the deadline for answering its request"
             );
-            assert!(
-                !grant_applies(&pair.grant, &candidate_at(at(11))),
-                "{scope}"
-            );
+
+            // The deadline still does the one job it has: an *unanswered*
+            // request past it can be resolved, and never becomes a grant.
+            let mut lapsed = ApprovalRequest::open(
+                request_for(
+                    run_id,
+                    tool_call_id,
+                    &workspace,
+                    &tool,
+                    &declared,
+                    input_hash(),
+                    scope,
+                )
+                .expiring_at(at(10)),
+            )
+            .unwrap();
+            assert!(lapsed.is_expired(at(10)));
+            lapsed.expire(at(10)).unwrap();
+            assert!(lapsed.grant().is_none());
+        }
+    }
+
+    #[test]
+    fn an_exact_call_grant_authorizes_only_the_call_it_was_raised_for() {
+        // The ceiling reduces every remote-write and destructive request to this
+        // scope on the strength of it being *one* call. A second, byte-identical
+        // force push later in the same run is a second call.
+        let pair = Pair::new(ApprovalScope::ExactCall);
+        let repeat = CandidateCall::new(
+            pair.run_id,
+            ToolCallId::new(),
+            &pair.workspace,
+            &pair.tool,
+            pair.input_hash,
+        )
+        .with_capabilities(&pair.capabilities);
+
+        assert!(pair.applies(), "the approved call is authorized");
+        assert!(
+            !grant_applies(&pair.grant, &repeat),
+            "an identical repeat is a second call and needs its own approval"
+        );
+    }
+
+    #[test]
+    fn a_run_wide_grant_covers_calls_other_than_the_one_that_raised_it() {
+        // The counterpart: `ToolForRun` and `CapabilityForRun` mean what they
+        // say, so binding the call must not have narrowed them too.
+        for scope in [ApprovalScope::ToolForRun, ApprovalScope::CapabilityForRun] {
+            let pair = Pair::new(scope);
+            let later = CandidateCall::new(
+                pair.run_id,
+                ToolCallId::new(),
+                &pair.workspace,
+                &pair.tool,
+                canonical_input_hash(&json!({"path": "src/other.rs"})).unwrap(),
+            )
+            .with_capabilities(&pair.capabilities);
+            assert!(grant_applies(&pair.grant, &later), "{scope}");
         }
     }
 
@@ -546,15 +651,15 @@ mod tests {
         let workspace = workspace();
         let grant = granted(
             run_id,
+            ToolCallId::new(),
             &workspace,
             &tool(),
             &capabilities(&["fs.write", "network"]),
             input_hash(),
             ApprovalScope::CapabilityForRun,
-            None,
         );
-        // A different tool of the same version, which is the point of the scope.
-        let other_tool = ToolIdentity::parse("net.fetch", "1.2.0").unwrap();
+        // A different tool entirely, which is the point of the scope.
+        let other_tool = ToolIdentity::parse("net.fetch", "3.1.4").unwrap();
 
         for (required, expected) in [
             (vec!["network"], true),
@@ -567,10 +672,10 @@ mod tests {
             let required = capabilities(&required);
             let candidate = CandidateCall::new(
                 run_id,
+                ToolCallId::new(),
                 &workspace,
                 &other_tool,
                 canonical_input_hash(&json!({"url": "https://example.invalid"})).unwrap(),
-                at(10),
             )
             .with_capabilities(&required);
             assert_eq!(
@@ -611,25 +716,25 @@ mod tests {
         // A grant that would cover this call but belongs to another run.
         let unrelated = granted(
             RunId::new(),
+            ToolCallId::new(),
             &pair.workspace,
             &pair.tool,
             &pair.capabilities,
             pair.input_hash,
             ApprovalScope::ToolForRun,
-            None,
         );
-        // A grant of this run that has already expired.
-        let expired = granted(
+        // A grant of this run, for a different checkout of the same project.
+        let elsewhere = granted(
             pair.run_id,
-            &pair.workspace,
+            ToolCallId::new(),
+            &WorkspaceBinding::new(pair.workspace.project_id(), "/workspace/other"),
             &pair.tool,
             &pair.capabilities,
             pair.input_hash,
             ApprovalScope::ToolForRun,
-            Some(at(5)),
         );
 
-        let grants = [unrelated, pair.grant.clone(), expired];
+        let grants = [unrelated, pair.grant.clone(), elsewhere];
         let matched = matching_grants(&grants, &pair.candidate());
 
         assert_eq!(matched.len(), 1);

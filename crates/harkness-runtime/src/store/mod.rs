@@ -348,14 +348,29 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::MissingParent`] when the tool call is not stored or
-    /// belongs to a different run, [`StoreError::AlreadyExists`] when the
-    /// identity is taken, and [`StoreError::PayloadTooLarge`] when the summary
-    /// exceeds [`MAX_INLINE_PAYLOAD_BYTES`].
+    /// Returns [`StoreError::Approval`] carrying
+    /// [`AlreadyResolved`](crate::approval::ApprovalError::AlreadyResolved) when
+    /// the request was answered before it was ever recorded,
+    /// [`StoreError::MissingParent`] when the tool call is not stored or belongs
+    /// to a different run, [`StoreError::AlreadyExists`] when the identity is
+    /// taken, and [`StoreError::PayloadTooLarge`] when the summary exceeds
+    /// [`MAX_INLINE_PAYLOAD_BYTES`].
     pub fn open_approval(
         &self,
         request: ApprovalRequest,
     ) -> Result<(ApprovalRequest, EventSeq), StoreError> {
+        // A record decided in memory and only then handed here would land as a
+        // live grant whose timeline says a question was asked and never
+        // answered. Approval-before-execution is a claim about what the store
+        // witnessed, so the only thing that may be opened is a question.
+        if request.state().is_terminal() {
+            return Err(StoreError::Approval(
+                crate::approval::ApprovalError::AlreadyResolved {
+                    id: request.id(),
+                    state: request.state(),
+                },
+            ));
+        }
         // Redaction happens before the transaction opens, exactly as it does for
         // an event payload: the write lock holds two inserts and nothing else.
         let request = approval::redact(&**self.redactor(), request);

@@ -2990,6 +2990,41 @@ fn an_approval_row_exists_before_the_event_that_announces_it_is_visible() {
 }
 
 #[test]
+fn a_request_answered_before_it_was_recorded_cannot_be_opened() {
+    // Deciding a record in memory and only then handing it to the store would
+    // land a live grant whose timeline says a question was asked and never
+    // answered. Approval-before-execution is a claim about what the store
+    // witnessed, so the only thing that may be opened is a question.
+    let held = Held::new();
+    let mut request = ApprovalRequest::open(held.pending(RiskLevel::Destructive)).unwrap();
+    request
+        .decide(ApprovalDecision::grant(
+            request.id(),
+            ApprovalScope::ExactCall,
+            DecidedVia::Cli,
+            at(5),
+        ))
+        .unwrap();
+    let id = request.id();
+
+    let error = held.store().open_approval(request).unwrap_err();
+
+    assert!(
+        matches!(&error, StoreError::Approval(inner)
+            if inner.kind() == "approval_already_resolved"),
+        "unexpected refusal: {error}"
+    );
+    assert_eq!(held.store().approval(id).unwrap_err().kind(), "not_found");
+    assert!(held.store().run_grants(held.run.id()).unwrap().is_empty());
+    assert!(
+        held.store()
+            .events(held.run.id(), None, 10)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn an_approval_event_carries_the_summary_and_never_the_input() {
     let held = Held::new();
     let request = held.open(
@@ -3427,31 +3462,31 @@ fn only_granted_requests_become_grants_and_they_bind_to_their_own_call() {
     // The call the human actually approved.
     let approved = CandidateCall::new(
         held.run.id(),
+        held.call.id(),
         &workspace,
         &tool,
         canonical_input_hash(&approval_input()).unwrap(),
-        at(7),
     );
     assert_eq!(matching_grants(&grants, &approved).len(), 1);
 
     // The same tool, one byte of input different.
     let altered = CandidateCall::new(
         held.run.id(),
+        held.call.id(),
         &workspace,
         &tool,
         canonical_input_hash(&json!({"path": "src/lib.rs", "contents": "fn main() { rm() }"}))
             .unwrap(),
-        at(7),
     );
     assert!(matching_grants(&grants, &altered).is_empty());
 
     // The same call, in a later run.
     let replayed = CandidateCall::new(
         RunId::new(),
+        held.call.id(),
         &workspace,
         &tool,
         canonical_input_hash(&approval_input()).unwrap(),
-        at(7),
     );
     assert!(matching_grants(&grants, &replayed).is_empty());
 }
@@ -3938,10 +3973,10 @@ fn a_frozen_v5_database_opens_and_reads_its_approvals() {
     let workspace = approval_workspace();
     let covered = CandidateCall::new(
         run_id,
+        ToolCallId::from_str(FIXTURE_TOOL_CALL_ID).unwrap(),
         &workspace,
         &tool,
         canonical_input_hash(&approval_input()).unwrap(),
-        at(100),
     );
     assert_eq!(matching_grants(&grants, &covered).len(), 1);
     assert_eq!(store.run_approvals(run_id).unwrap().len(), 2);

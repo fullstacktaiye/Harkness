@@ -41,10 +41,18 @@ impl Failure {
     }
 }
 
-/// Durable result of one approval decision.
+/// Which way one recorded approval went.
+///
+/// Named for the outcome rather than for the decision so it does not collide
+/// with [`approval::ApprovalDecision`](crate::approval::ApprovalDecision), which
+/// is a different thing entirely: the durable answer to a specific question,
+/// carrying the scope it authorized and the surface it arrived from. This is one
+/// line in a record's own audit history, and the only thing it says is which way
+/// the answer went. Two public types with one name in one crate would be
+/// mis-imported eventually, and the two compile interchangeably at the use site.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ApprovalDecision {
+pub enum ApprovalOutcome {
     /// The requested work may proceed.
     Approved,
     /// The requested work must not proceed.
@@ -56,25 +64,25 @@ pub enum ApprovalDecision {
 #[serde(deny_unknown_fields)]
 pub struct Approval {
     decided_by: String,
-    decision: ApprovalDecision,
+    decision: ApprovalOutcome,
     #[serde(with = "time::serde::rfc3339")]
     decided_at: OffsetDateTime,
 }
 
 impl Approval {
     fn approved(decided_by: impl Into<String>, decided_at: OffsetDateTime) -> Self {
-        Self::new(decided_by, ApprovalDecision::Approved, decided_at)
+        Self::new(decided_by, ApprovalOutcome::Approved, decided_at)
     }
 
     fn denied(decided_by: impl Into<String>, decided_at: OffsetDateTime) -> Self {
-        Self::new(decided_by, ApprovalDecision::Denied, decided_at)
+        Self::new(decided_by, ApprovalOutcome::Denied, decided_at)
     }
 
     /// Reconstructs a durable approval decision with a UTC-normalized timestamp.
     #[must_use]
     pub fn new(
         decided_by: impl Into<String>,
-        decision: ApprovalDecision,
+        decision: ApprovalOutcome,
         decided_at: OffsetDateTime,
     ) -> Self {
         Self {
@@ -92,7 +100,7 @@ impl Approval {
 
     /// Whether the request was approved or denied.
     #[must_use]
-    pub const fn decision(&self) -> ApprovalDecision {
+    pub const fn decision(&self) -> ApprovalOutcome {
         self.decision
     }
 
@@ -1398,7 +1406,7 @@ mod tests {
         assert_eq!(call.approvals()[0].decided_by(), "reviewer");
         assert_eq!(
             call.approvals()[0].decision(),
-            crate::domain::ApprovalDecision::Approved
+            crate::domain::ApprovalOutcome::Approved
         );
 
         // An unpinned call is pinned by the approval, which is the case the
@@ -1507,11 +1515,11 @@ mod tests {
         assert_eq!(run.approvals().len(), 2);
         assert_eq!(
             run.approvals()[0].decision(),
-            super::ApprovalDecision::Approved
+            super::ApprovalOutcome::Approved
         );
         assert_eq!(
             run.approvals()[1].decision(),
-            super::ApprovalDecision::Denied
+            super::ApprovalOutcome::Denied
         );
         assert_eq!(run.approvals()[1].decided_by(), "user:two");
     }
