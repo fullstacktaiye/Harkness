@@ -180,6 +180,13 @@ impl Whitespace {
 }
 
 impl std::fmt::Display for Whitespace {
+    /// Names every setting that is not at its exact default, so a refusal can
+    /// tell a caller which one to change.
+    ///
+    /// Blank-line suppression is spelled out rather than folded into the mode
+    /// because it is reachable with the mode already at `exact`: a message that
+    /// only named the mode there would be telling a caller to change something
+    /// that is not the problem.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.mode.name())?;
         if self.ignore_blank_lines {
@@ -487,7 +494,7 @@ pub struct IntraLineRange {
 }
 
 /// The role of one raw line in a hunk.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum DiffLineKind {
     Context,

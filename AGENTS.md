@@ -98,13 +98,24 @@ and refuses with `HiddenWhitespaceChanges` when they are not, because the
 alternative is applying content the reader was never shown.
 
 Any wire form that carries hunk coordinates must carry the whitespace they were
-taken under, and `harkness git stage --hunk` requires `--whitespace` for exactly
-that reason. Revalidation matches on blob IDs and coordinates and never on hunk
-interior, and a relaxed hunk can carry the *identical* coordinates of an exact
-hunk that also holds the whitespace change the relaxed view was hiding —
-whenever that change sits inside a region bounded by real changes. Defaulting an
-absent mode to exact there would turn a coordinate coincidence into a silent
-apply, so the field is required rather than assumed.
+taken under, and `harkness git stage --hunk` requires *both* `--whitespace` and
+`--ignore-blank-lines` for exactly that reason — the second as a written value
+rather than a bare switch, because an unstated switch cannot be told from
+`false`, and `false` is the spelling that claims the coordinates are appliable.
+Revalidation matches on blob IDs and coordinates and never on hunk interior, and
+a relaxed hunk can carry the *identical* coordinates of an exact hunk that also
+holds the change the relaxed view was hiding — whenever that change sits inside
+a region bounded by real changes. Defaulting an absent setting to its exact
+value there would turn a coordinate coincidence into a silent apply.
+
+The document form defaults an absent `whitespace` to exact and the flag form
+refuses to default one, which is a deliberate asymmetry rather than an
+oversight. A file record is copied wholesale out of `harkness git diff`, which
+has always emitted the field since it existed, so a record without one comes
+from a producer that predates it and was necessarily exact — the inference is
+sound. A missing *flag* only says the caller did not type it, which is equally
+true of a current caller reading a relaxed diff, so the same inference is not
+available. A mistyped value is refused in both, and never read as exact.
 
 Adding a whitespace setting means extending `Whitespace`, not adding a loose
 boolean beside it: `is_exact` is the single question staging asks, and it must

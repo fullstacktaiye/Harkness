@@ -26,6 +26,7 @@
 
 use std::{
     borrow::Cow,
+    collections::HashSet,
     io::Write,
     path::{Path, PathBuf},
 };
@@ -665,7 +666,22 @@ pub fn remap_to_exact(
         .iter()
         .flat_map(|hunk| changed_lines(hunk))
         .collect::<Vec<_>>();
-    if found.len() != wanted.len() || !wanted.iter().all(|line| found.contains(line)) {
+    // Compared as sets rather than by scanning one for each element of the
+    // other. Every discard the review surface performs arrives here, exact
+    // views included, and one hunk may hold every changed line of a rewritten
+    // megabyte-sized file: a nested scan over that is quadratic in tens of
+    // thousands of lines and would stall the whole operation.
+    //
+    // A set is exact here because a changed line's identity includes the line
+    // number it occupies, and hunks within one diff do not overlap, so no two
+    // changed lines on a side can collide. The length checks are what keep that
+    // assumption honest rather than assumed.
+    let wanted_lines = wanted.iter().copied().collect::<HashSet<_>>();
+    let found_lines = found.iter().copied().collect::<HashSet<_>>();
+    if wanted_lines.len() != wanted.len()
+        || found_lines.len() != found.len()
+        || wanted_lines != found_lines
+    {
         return Err(GitError::HiddenWhitespaceChanges { path });
     }
 

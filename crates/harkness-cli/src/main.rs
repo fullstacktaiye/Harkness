@@ -832,6 +832,7 @@ struct HunkArguments {
             "new_blob_id",
             "context_lines",
             "whitespace",
+            "ignore_blank_lines",
             "old_start",
             "old_lines",
             "new_start",
@@ -923,9 +924,18 @@ struct HunkArguments {
     #[arg(long, value_name = "MODE", requires = "hunk", value_enum)]
     whitespace: Option<WhitespaceArgument>,
     /// Blank-line handling from the diff file record's
-    /// "whitespace.ignore_blank_lines".
-    #[arg(long, requires = "hunk")]
-    ignore_blank_lines: bool,
+    /// "whitespace.ignore_blank_lines", written `true` or `false`.
+    ///
+    /// A value rather than the bare switch `git diff` takes, and required for
+    /// the same reason `--whitespace` is. On `git diff` the flag is a request,
+    /// and its absence means "do not". Here it states where the coordinates
+    /// came from, and its absence would mean "the caller did not say" — which a
+    /// bare switch cannot distinguish from `false`. Suppressing blank lines
+    /// hides changed lines exactly as a relaxed mode does, so reading an
+    /// unstated flag as `false` would restore the silent apply that requiring
+    /// `--whitespace` closes.
+    #[arg(long, value_name = "BOOL", requires = "hunk")]
+    ignore_blank_lines: Option<bool>,
     /// Old-side start line from the selected hunk.
     #[arg(long, value_name = "LINE", requires = "hunk")]
     old_start: Option<u32>,
@@ -994,7 +1004,9 @@ impl HunkArguments {
                 self.context_lines.ok_or_else(|| missing("context_lines"))?,
                 Whitespace {
                     mode: self.whitespace.ok_or_else(|| missing("whitespace"))?.into(),
-                    ignore_blank_lines: self.ignore_blank_lines,
+                    ignore_blank_lines: self
+                        .ignore_blank_lines
+                        .ok_or_else(|| missing("ignore_blank_lines"))?,
                 },
                 (
                     self.old_start.ok_or_else(|| missing("old_start"))?,
@@ -3228,15 +3240,27 @@ fn record_whitespace(record: &Value, at: &str) -> Result<Whitespace, CliError> {
     let object = value
         .as_object()
         .ok_or_else(|| CliError::Usage(format!("{at}.whitespace is not an object")))?;
-    let mode = match object.get("mode").and_then(Value::as_str) {
-        None => WhitespaceMode::Exact,
-        Some("exact") => WhitespaceMode::Exact,
-        Some("ignore_eol") => WhitespaceMode::IgnoreEol,
-        Some("ignore_change") => WhitespaceMode::IgnoreChange,
-        Some("ignore_all") => WhitespaceMode::IgnoreAll,
-        Some(other) => {
+    // A mistyped `mode` is refused rather than read through `as_str`, which
+    // would collapse "absent" and "present but not a string" into the same arm
+    // and hand a wrong-typed record the exact default. Absent means an older
+    // producer; a JSON array means a producer that is wrong about something,
+    // and staging on its say-so is what this whole guard exists to avoid.
+    let mode = match object.get("mode") {
+        None | Some(Value::Null) => WhitespaceMode::Exact,
+        Some(Value::String(mode)) => match mode.as_str() {
+            "exact" => WhitespaceMode::Exact,
+            "ignore_eol" => WhitespaceMode::IgnoreEol,
+            "ignore_change" => WhitespaceMode::IgnoreChange,
+            "ignore_all" => WhitespaceMode::IgnoreAll,
+            other => {
+                return Err(CliError::Usage(format!(
+                    "{at}.whitespace.mode \"{other}\" is not a whitespace mode this build knows"
+                )));
+            }
+        },
+        Some(_) => {
             return Err(CliError::Usage(format!(
-                "{at}.whitespace.mode \"{other}\" is not a whitespace mode this build knows"
+                "{at}.whitespace.mode is not a string"
             )));
         }
     };
@@ -5301,6 +5325,23 @@ mod tests {
             "unhelpful refusal: {}",
             error.message()
         );
+
+        // A producer that got the field's *type* wrong is refused too. Reading
+        // this through `as_str` would fold it into the same arm as "absent" and
+        // hand a wrong record the exact default, which is the one value that
+        // lets it be staged from.
+        let mistyped = file(serde_json::json!({ "mode": ["ignore_all"] }));
+        let error = parse_selection_document(&mistyped, "unstaged").unwrap_err();
+        assert!(
+            single_line(&error.message()).contains("whitespace.mode is not a string"),
+            "a mistyped mode was not refused: {}",
+            error.message()
+        );
+        let mistyped_toggle = file(serde_json::json!({
+            "mode": "exact",
+            "ignore_blank_lines": "yes",
+        }));
+        assert!(parse_selection_document(&mistyped_toggle, "unstaged").is_err());
     }
 
     /// A lossy path names a different file than the one on disk, so replaying

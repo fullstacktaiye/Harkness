@@ -632,11 +632,21 @@ ColumnLayout {
                 onActiveModeChanged: currentIndex = Math.max(0, indexOfValue(activeMode))
                 Component.onCompleted: currentIndex = Math.max(0, indexOfValue(activeMode))
 
-                onActivated: backend.setReviewWhitespace(
-                    project.id,
-                    String(currentValue),
-                    reviewSurface.reviewState.ignoreBlankLines === true
-                )
+                // An accepted request is adopted into the review state before
+                // this call returns, so re-reading it either re-selects what was
+                // just chosen or snaps back to what the backend refused. Without
+                // this the picker would keep displaying a mode the diff on
+                // screen was never computed under.
+                onActivated: {
+                    backend.setReviewWhitespace(
+                        project.id,
+                        String(currentValue),
+                        reviewSurface.reviewState.ignoreBlankLines === true
+                    );
+                    currentIndex = Math.max(0, indexOfValue(
+                        String(reviewSurface.reviewState.whitespace || "exact")
+                    ));
+                }
 
                 background: FieldSurface {
                     field: whitespacePicker

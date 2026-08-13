@@ -548,9 +548,9 @@ pub enum GitError {
     /// recomputed, because an exact recomputation could match these coordinates
     /// by coincidence on a hunk whose interior differs.
     #[error(
-        "the selection for '{}' was taken from a diff computed with {whitespace} whitespace \
-         handling, which omits lines that differ on disk; recompute the diff with exact \
-         whitespace and select from that",
+        "the selection for '{}' was taken from a diff whose whitespace handling was \
+         {whitespace}, which omits lines that differ on disk; recompute it with exact \
+         whitespace and blank lines included, and select from that",
         path.display()
     )]
     WhitespaceInsensitiveSelection {
