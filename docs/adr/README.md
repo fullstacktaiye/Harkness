@@ -27,9 +27,31 @@ wins as the instruction and the ADR supplies the rationale.
 | [0006](0006-repository-content-is-untrusted.md) | Repository content is untrusted data | Accepted |
 | [0007](0007-openai-compatible-tracer-bullet.md) | One OpenAI-compatible adapter as the tracer bullet | Accepted |
 | [0008](0008-workspace-snapshot-identity.md) | Workspace identity is a composite digest, never `HEAD` alone | Accepted |
+| [0009](0009-v05-adapter-crate-boundaries.md) | v0.5 adapter crate boundaries and wire-type privacy | Accepted |
+| [0010](0010-official-acp-schema-crate.md) | Adopt the official ACP schema crate rather than hand-rolled wire types | Accepted |
+| [0011](0011-blocking-http-for-the-forge-adapter.md) | Blocking `ureq` on worker threads for the forge adapter | Accepted |
+| [0012](0012-stdio-only-protocol-transports.md) | stdio-only protocol transports behind a transport seam | Accepted |
+| [0013](0013-mcp-stateless-with-legacy-fallback.md) | MCP 2026-07-28 stateless is primary; 2025-11-25 is a probe-selected fallback | Accepted |
+| [0014](0014-acp-protocol-version-one.md) | ACP protocol version 1 only; v2 is a negotiation boundary | Accepted |
+| [0015](0015-recipes-compile-to-persisted-plans.md) | A recipe is source; the compiled plan is the record | Accepted |
+| [0016](0016-per-subject-trust-records.md) | Trust is a per-subject record bound to an identity, never a boolean | Accepted |
+| [0017](0017-honest-observability-activity-classes.md) | Every activity carries an evidence class, and a claim is never shown as a fact | Accepted |
+| [0018](0018-pinned-github-rest-api.md) | Pin `X-GitHub-Api-Version: 2026-03-10`, authenticate with a fine-grained PAT | Accepted |
 
 This index is the ordering authority. If two ADRs conflict, the conflict is
 resolved before either merges; a lower number does not automatically win.
+
+ADR-0001 through ADR-0008 are the v0.4 set from
+[#108](https://github.com/fullstacktaiye/harkness/issues/108), which established
+this directory, the template below, and the numbering. ADR-0009 through ADR-0018
+are the v0.5 set from
+[#145](https://github.com/fullstacktaiye/harkness/issues/145). The two issues were
+written to proceed in parallel, with whichever merged first fixing the
+conventions and the other adopting them; [#108](https://github.com/fullstacktaiye/harkness/issues/108)
+merged first, so [#145](https://github.com/fullstacktaiye/harkness/issues/145)
+continues its numbering rather than restarting it. Milestone grouping is a fact
+about how these records happened to be written, not a structure — a later ADR
+supersedes an earlier one across milestone lines like any other.
 
 ## Status vocabulary
 

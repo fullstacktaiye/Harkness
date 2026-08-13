@@ -19,7 +19,15 @@
 //! separately asserted risk level, only a [`trust::RequestClassification`], so
 //! a caller cannot describe a request as milder than the descriptor and its
 //! validated input make it.
+//!
+//! [`approval`] is where a policy `Ask` becomes durable. It owns the request
+//! record and its lifecycle, the frozen canonical hash a grant is bound to, the
+//! matcher that decides whether an existing grant covers a new call, and the
+//! channel a parked call is woken through. It is the only production source of
+//! a [`policy::RunGrant`], which is what keeps "an approval exists for this
+//! call" a claim one module makes rather than one any caller can assert.
 
+pub mod approval;
 pub mod domain;
 pub mod policy;
 pub mod store;

@@ -85,6 +85,18 @@ jobs:
         run: cargo test --locked -p harkness-git
       - name: Test runtime
         run: cargo test --locked -p harkness-runtime
+      # The v0.5 adapter crates are skeletons, so what these run is the ADR-0009
+      # layering assertion each one makes about its own manifest. That check is
+      # worth a matrix entry now precisely because the crates are empty: the
+      # dependency direction is the only thing they currently have to get wrong.
+      - name: Test ACP adapter
+        run: cargo test --locked -p harkness-acp
+      - name: Test MCP adapter
+        run: cargo test --locked -p harkness-mcp
+      - name: Test forge adapter
+        run: cargo test --locked -p harkness-forge
+      - name: Test recipes
+        run: cargo test --locked -p harkness-recipe
       - name: Test shared fixtures
         run: cargo test --locked -p harkness-test-fixtures
       - name: Test CLI

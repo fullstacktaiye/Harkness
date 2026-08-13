@@ -684,7 +684,7 @@ fn column(record: &'static str, field: &'static str, error: rusqlite::Error) -> 
 }
 
 /// Turns SQLite's "no rows" into the store's own absence error.
-fn row_failed(
+pub(super) fn row_failed(
     record: &'static str,
     id: &dyn std::fmt::Display,
     operation: &'static str,
@@ -699,7 +699,7 @@ fn row_failed(
     query_failed(operation, error)
 }
 
-fn missing_row(
+pub(super) fn missing_row(
     record: &'static str,
     id: &dyn std::fmt::Display,
     updated: usize,

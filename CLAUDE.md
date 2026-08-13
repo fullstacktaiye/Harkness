@@ -43,9 +43,13 @@ build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing lin
   `.github/workflows/network-integration.yml`.
 - **Fixture regeneration**: `cargo test -p harkness-runtime regenerate_the_frozen_v1_fixture --
   --ignored` rewrites `crates/harkness-runtime/src/store/fixtures/runtime-v1.db`, and
-  `regenerate_the_frozen_v2_fixture` rewrites `runtime-v2.db`. Run only when that migration itself
-  changes; a released migration is otherwise never edited. The v1 regenerator applies a truncated
-  ladder rather than opening a `Store`, because opening one now climbs to the newest schema.
+  `regenerate_the_frozen_v2_fixture` (through `v5`) rewrites the corresponding `runtime-v*.db`. Run
+  each only when that migration itself changes; a released migration is otherwise never edited. The
+  v1 regenerator applies a truncated ladder rather than opening a `Store`, because opening one now
+  climbs to the newest schema. `regenerate_the_frozen_canonicalization_fixture` rewrites
+  `crates/harkness-runtime/src/approval/fixtures/canonical-input-v1.json` and carries a stronger
+  warning still: run it only when a *new* approval hash domain is published, because every stored
+  `input_hash` was derived under the encoding it pins.
   `cargo test -p harkness-context -- --ignored regenerate_the_frozen_v1_fixtures` rewrites
   `crates/harkness-context/src/fixtures/*.json` the same way, and carries the same warning: a
   released wire form is replaced by a new versioned fixture, never edited in place.
@@ -54,8 +58,9 @@ build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing lin
 ### Frozen fixtures
 
 `crates/harkness-core/src/catalog/fixtures/*.json`, `crates/harkness-runtime/src/domain/fixtures/*.json`,
-`crates/harkness-context/src/fixtures/*.json`, and
-`crates/harkness-runtime/src/store/fixtures/runtime-v{1,2}.db` pin released on-disk formats. A new
+`crates/harkness-context/src/fixtures/*.json`,
+`crates/harkness-runtime/src/approval/fixtures/canonical-input-v1.json`, and
+`crates/harkness-runtime/src/store/fixtures/runtime-v{1..5}.db` pin released on-disk formats. A new
 persisted field, state spelling, or table means a version bump plus a *new* fixture, not an edit to
 an existing one.
 
@@ -72,7 +77,15 @@ harkness-gui ──┴─> harkness-core ─────────────
                    (domain | store | tool)    │
                    harkness-context ──────────┘
                    (also depends on harkness-core, for ProjectId)
+
+harkness-acp  ──┐
+harkness-mcp  ──┤
+harkness-forge──┼─> harkness-runtime   (adapters never point back; see ADR-0009)
+harkness-recipe─┘
 ```
+
+`X ──> Y` means X depends on Y. The four adapters are depended *on* by
+`harkness-runtime` and depend on none of it — nor on each other.
 
 `harkness-runtime` depends on `harkness-git` for one thing: `Cancellation`, which `tool`'s
 `ExecutionContext` carries so a tool that shells out to Git passes the same token down instead of
@@ -92,6 +105,11 @@ translating between two cancellation mechanisms.
   enter the process. `domain::ToolCall` records *that* a tool ran; `tool` is what defines and
   executes one. `store` and `tool` both build on `domain` but not on each other, so persistence and
   execution can be reasoned about — and tested — separately.
+  `approval` sits above `policy` and `store`: it owns the durable approval record and its
+  lifecycle, the frozen canonical input hash a grant is bound to, the matcher that decides whether
+  an existing grant covers a new call, and the condvar-backed gate a parked call is woken through.
+  It is the only production source of a `policy::RunGrant` — policy cannot construct one — so an
+  `Ask` becomes an `Allow` only because the matcher accepted a grant.
 - **`harkness-context`** owns the context engine's vocabulary and nothing that
   uses it: identifiers, `WorkspaceSnapshot` identity, `Provenance`, and
   `FileClass`. It deliberately does *not* depend on `harkness-runtime` — the
@@ -99,6 +117,13 @@ translating between two cancellation mechanisms.
   database of runs in the process. Read `snapshot.rs`'s module doc before
   changing anything a digest absorbs; the wire forms are frozen by fixtures under
   `src/fixtures/` because #110 turns them into `runtime.db` columns.
+- **`harkness-acp`, `harkness-mcp`, `harkness-forge`, `harkness-recipe`** are the v0.5
+  external-integration adapters, currently compile-clean skeletons whose only code is the test each
+  one runs against its own `Cargo.toml`. They may depend on `harkness-git` and `harkness-core`,
+  never on `harkness-runtime`, a front end, or one another; protocol wire types stay private to the
+  adapter that speaks them. `docs/adr/0009` through `docs/adr/0018` decide the layering, the
+  protocol revisions, the transport seam, the trust shape, and the activity classes these crates
+  are built against — read them before adding code here.
 - **`harkness-test-fixtures`** is dev-only: hermetic temp repos, process fixtures, and the
   child-re-execution helpers. `COMMIT_EPOCH_SECONDS` is fixed so fixture repos hash identically.
 

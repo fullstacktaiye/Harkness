@@ -2,11 +2,12 @@
 
 ## Project Structure & Module Organization
 
-Harkness is a Rust 2024 workspace split into seven crates under `crates/`:
+Harkness is a Rust 2024 workspace split into eleven crates under `crates/`:
 
 - `harkness-core`: project catalog, storage layout, cross-domain project workflows, and directory-listing logic shared by front ends.
 - `harkness-git`: all production Git behavior: inspection, diffs and history, file context and hunk staging, branch and worktree mutation, commits, clone and synchronization, hermetic process execution, and repository locking.
 - `harkness-context`: the context engine's typed vocabulary — workspace snapshot identity, stable identifiers, provenance, and file classification.
+- `harkness-acp`, `harkness-mcp`, `harkness-forge`, `harkness-recipe`: the v0.5 external-integration adapters — the Agent Client Protocol client, the Model Context Protocol client, forge-neutral contracts with the GitHub REST adapter, and the workflow-recipe source format and compiler. Currently skeletons; see the invariants below.
 - `harkness-test-fixtures`: hermetic repository, filesystem, and process fixtures shared only by crate tests.
 - `harkness-runtime`: typed task, run, step, and tool-call records, the typed tool contract and registry every executable operation implements, the execution contracts shared by front ends, and the SQLite run store that makes those records durable.
 - `harkness-cli`: the `harkness` command and its integration tests in `tests/`.
@@ -614,6 +615,142 @@ away either: it is written as the `rejected-output.json` artifact of that call,
 because only the value says what the tool actually produced. Preserving it is best
 effort — a context with no artifact store must not change the failure the caller is
 told about.
+
+## Approval Invariants
+
+An approval is persisted and committed *before* any surface is notified, and the
+row and its `approval_requested` event share one transaction. There is no
+event-free way to record one: a question nobody is told about is a run that
+stopped for no visible reason, and a timeline entry with no row behind it is a
+question nobody can answer. Restarting lists the pending requests with every
+binding field intact, which is what makes answering one after a restart safe
+rather than a guess about what was being asked.
+
+No transaction spans the wait. The ticket is taken *before* the request is
+persisted, the request is committed, the calling thread parks on a condition
+variable keyed by `ApprovalId`, and the decision is a second short write.
+Registering first is what closes the window in which a fast decision lands
+between persisting and parking. An answer for an approval with no live ticket is
+discarded rather than kept: a restart superseding an interrupted run's requests,
+and a cancellation resolving approvals whose callers have exited, both resolve
+approvals nobody is waiting for, and a gate keyed on answers rather than on
+waiters would grow without bound in exactly those cases.
+
+`grant_applies` is the security core and admits no partial application. The run
+and the workspace identity bind every scope — together they stop a grant
+replaying into another attempt of the same task or another checkout of the same
+project. Each scope then adds the axes that give it meaning:
+
+- `ExactCall` binds the recorded `tool_call_id`, the tool identity including its
+  version, and the canonical input hash. Binding the call is what makes it *one*
+  call, which is the whole point of reducing every remote-write and destructive
+  request to this scope: authorizing one force push must not authorize a second,
+  byte-identical one later in the same run. The input hash stays beside it rather
+  than being made redundant by it, so an authorization cannot survive the input
+  being re-derived differently.
+- `ToolForRun` binds the tool identity, version included, and ignores the call
+  and the input.
+- `CapabilityForRun` compares **no** tool identity, only that the candidate
+  declares at least one capability and that every capability it declares is
+  covered. Comparing a version here would match one tool's version string
+  against an unrelated tool's, so whether a grant covered a call would turn on
+  two tools happening to share a number. Subset, not overlap: a tool needing
+  `{network, fs.write}` must not run under a grant for `network` alone. A
+  candidate declaring nothing matches no capability grant, or that scope would
+  silently be the broadest in the system.
+
+The matcher reads no clock and opens no transaction. A grant's lifetime is its
+run; a request's `expires_at` is a deadline for a *human to answer*, and the only
+thing it does is stop a lapsed request from being granted — enforced by
+`ApprovalRequest::decide`, because a deadline nothing checks is advice rather
+than a deadline. A lapsed request stays `pending` until something expires it, so
+a caller that sets a deadline owes it a sweeper. Carrying the deadline into the
+grant instead would make a `ToolForRun` approval given "for the remainder of the
+run" stop applying part-way through one.
+
+One approval has one waiter, and `ApprovalGate::ticket` refuses a second rather
+than issuing it. Two tickets would share one registration, so whichever dropped
+first would release it and leave the survivor parked on a key `resolve` no longer
+finds — permanently, since a wait has no timeout. A refused ticket is a mistake a
+caller can see.
+
+An `ApprovalGrant` is projected from a granted request and has no constructor and
+no lifecycle field. `granted` is terminal, so a request that reached it cannot
+leave and every other state yields no grant at all — "a dead approval authorizes
+nothing" is a shape the types hold rather than a check to remember. It is also
+the only production source of a `policy::RunGrant`; policy cannot mint one, so an
+`Ask` becomes an `Allow` only because the matcher accepted a grant.
+
+Scope ceilings are enforced when a request is *created*, not when a grant is
+matched, so a `RemoteWrite` or `Destructive` request that asked for a run-wide
+scope is stored as an exact call and keeps both spellings. A record claiming a
+breadth the matcher would never honor is a lie in the audit trail, not defence in
+depth. A decision may narrow to the single call in front of a human and may never
+widen, which is re-checked against the stored request rather than trusted from
+the surface.
+
+Absence of an answer is never consent, and never a resolution either. Closing a
+window, dismissing a dialog, and losing a surface all leave the request pending.
+Only an explicit decision, an expiry, or a run cancellation resolves one, and the
+last two record `Expired` or `Cancelled` with **no** decision attached — the
+waiter still observes a denial, and the record still says no human answered.
+Synthesizing a decision there would make the audit claim one that was never made.
+
+`canonical_input_hash` is frozen and versioned by its domain constant. Object
+keys sort by UTF-8 bytes, arrays keep their order, integers and doubles have
+disjoint spellings, strings escape only what JSON requires, and there is no
+insignificant whitespace. A non-finite number is refused rather than encoded,
+because it serializes as `null` and would fold two different inputs onto one
+hash; no such `Value` is constructible today, but `serde_json`'s
+`arbitrary_precision` is a feature Cargo would unify workspace-wide, so the guard
+is load-bearing. Changing the encoding means a new domain constant and a new
+committed fixture, never an edit to the existing one — every stored `input_hash`
+was derived under it.
+
+The `approvals` table is the request *queue* and is deliberately not the
+per-record `approvals_json` audit history. That column is a bounded, ordered
+trail of decisions already made about one record; this table is a question with
+an identity, a lifecycle, an expiry, and the binding fields a grant is matched
+on, which has to be listed across runs and answered from either front end. Its
+update statement names none of the binding columns, so a resolution cannot
+re-target the approval a human answered; the only one it may move is
+`effective_scope`, and only downwards.
+
+## External-Integration Boundary Invariants
+
+`harkness-acp`, `harkness-mcp`, `harkness-forge`, and `harkness-recipe` sit strictly below
+`harkness-runtime`. None of them may name `harkness-runtime`, `harkness-cli`, or `harkness-gui` in
+its manifest, and none may depend on another adapter — shared machinery goes below all four, not
+sideways between two of them. Each crate carries a test that reads its own `Cargo.toml` and fails
+on any of those six names, so the rule breaks the build rather than a review. The sideways rule
+needs that test most: no dependency cycle exists to catch an adapter-to-adapter edge while
+`harkness-runtime` does not yet name the adapters. ADR-0009 records why.
+
+Protocol wire types are private to their adapter. No type defined by ACP, MCP, or the GitHub REST
+API — and no type generated from their schemas — may appear in an adapter's public API, in a
+`harkness-runtime` domain record, or in anything persisted: `runtime.db` columns, event payloads,
+artifact metadata, `projects.json`, or CLI JSON output. Conversion to Harkness-owned types happens
+at the adapter's public surface, which is the only place an upstream protocol revision may break.
+A raw transcript captured as an artifact is opaque content, not a typed dependence, and is allowed.
+
+External identity and trust are `harkness-runtime` types, not adapter types, because they compose
+with workspace trust and policy. An adapter reports what it observed — a path, a hash, a version, a
+schema fingerprint — as plain data; the runtime builds the record. Trust is per subject and bound to
+that identity, never a boolean, and it is a precondition rather than an authorization: a trusted
+agent still passes policy and approval on every action. An external permission system supplements
+Harkness policy and never replaces it. ADR-0016 records the shape.
+
+Pinned external versions: ACP protocol version 1 (ADR-0014), MCP revisions 2026-07-28 primary and
+2025-11-25 fallback (ADR-0013), `X-GitHub-Api-Version: 2026-03-10` on every GitHub request
+(ADR-0018), and `agent-client-protocol-schema` at a schema/v1 release with every `unstable_*`
+feature off (ADR-0010). Targeting a newer protocol revision requires a superseding ADR, not a
+version bump. No `tokio`, `async-std`, `smol`, or `futures` enters the workspace, and no `async fn`
+appears in any crate (ADR-0003, ADR-0011).
+
+Every persisted activity row and every user-facing presentation carries exactly one activity class:
+`HarknessObserved`, `HarknessMediated`, `AcpReported`, `SnapshotInferred`, or `Unobserved`. An agent
+claim is never rendered as a verified Harkness observation, and `Unobserved` is a class rather than
+an omission — v0.5 has no OS-level sandbox and says so. ADR-0017 records why.
 
 ## Commit & Pull Request Guidelines
 

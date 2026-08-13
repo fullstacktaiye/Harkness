@@ -191,19 +191,12 @@ impl RunGrant {
     /// Deliberately crate-private: a grant is an authorization, and only the
     /// approval module's matcher may decide that one applies to a candidate
     /// request. If any caller could mint one, every `Ask` would be one line of
-    /// code away from `Allow`. #92 owns the only production constructor.
+    /// code away from `Allow`.
     ///
-    /// Until #92 lands, nothing outside this module's tests builds one. The
-    /// lint expectation keeps that visible: when the matcher starts calling
-    /// this, the expectation goes unfulfilled and has to be removed.
+    /// [`ApprovalGrant::matching`](crate::approval::ApprovalGrant::matching) is
+    /// the one production caller, and it reaches this only after every binding
+    /// axis of the durable grant matched the candidate.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "#92's approval matcher is the only production constructor"
-        )
-    )]
     pub(crate) const fn matching(scope: RunGrantScope) -> Self {
         Self { scope }
     }
