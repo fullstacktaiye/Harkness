@@ -1544,6 +1544,17 @@ const REVIEW_CONTEXT_STEP: u32 = 20;
 // subsequent page, while each GUI-thread QVariant conversion remains bounded.
 const REVIEW_ROW_PAGE_SIZE: usize = 12_000;
 const REVIEW_FILE_PAGE_SIZE: usize = 512;
+/// How far back attribution walks before a review gives up and says so.
+///
+/// This is well below `harkness_git::DEFAULT_MAX_PROVENANCE_COMMITS`, because
+/// the two are paid for differently. A caller typing `harkness git diff
+/// --provenance` asked for a walk and is waiting for its result; the panel
+/// resolves attribution on the path that opens a review, so every commit walked
+/// is a commit a reader waits through before they see a file list. A range
+/// longer than this is not a review anybody reads file by file, and reaching
+/// the bound is reported by name rather than guessed at — the header says older
+/// commits were not walked, and the files beyond it read as unknown.
+const REVIEW_PROVENANCE_MAX_COMMITS: usize = 250;
 
 #[derive(Clone, Debug)]
 struct HistoryCommitRow {
@@ -2649,7 +2660,8 @@ fn resolve_review_provenance(
     // itself resolved. `resolved: false` is reserved for an attribution that
     // could not be made, which is a different thing from one with nothing in it.
     let mut options = harkness_git::ProvenanceOptions::default()
-        .with_paths(files.iter().map(|entry| entry.path.clone()));
+        .with_paths(files.iter().map(|entry| entry.path.clone()))
+        .with_max_commits(REVIEW_PROVENANCE_MAX_COMMITS);
     // A branch review is pinned to object ids so the comparison cannot move
     // under the reader, which leaves the target with nothing a reference
     // convention could be read off. The name the reviewer actually asked for

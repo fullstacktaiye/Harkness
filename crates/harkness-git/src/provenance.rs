@@ -318,12 +318,24 @@ impl ProvenanceOptions {
     ///
     /// Pass the records of **one** target. Each target has its own attribution,
     /// and a multi-target list would ask one of them about another's paths.
+    ///
+    /// A record with a path on neither side — which
+    /// [`DiffOmission::Unrepresentable`](crate::DiffOmission::Unrepresentable)
+    /// produces — still gets an entry, asked for under the empty path. It comes
+    /// back unattributed, because nothing matches the empty path, which is the
+    /// honest answer for a delta whose paths Harkness could not read. Skipping
+    /// it would shorten the result and silently shift every later index onto
+    /// the wrong file.
     #[must_use]
     pub fn for_files(files: &[FileDiff]) -> Self {
         let paths = files
             .iter()
-            .filter_map(|file| file.new_path.as_ref().or(file.old_path.as_ref()))
-            .cloned()
+            .map(|file| {
+                file.new_path
+                    .clone()
+                    .or_else(|| file.old_path.clone())
+                    .unwrap_or_default()
+            })
             .collect();
         Self {
             paths: ProvenancePaths::Only(paths),
@@ -517,8 +529,15 @@ fn plan(
             branch,
             base_branch,
         } => {
-            // Resolve both moving names once, exactly as the diff does, so the
-            // attribution describes the snapshot its file list describes.
+            // Both moving names are resolved once here, so this record is
+            // internally coherent: its head, its base and its merge base all
+            // come from one moment. That is as far as the guarantee goes — a
+            // caller that computed its file list from a *separate* call has two
+            // resolutions, and a branch advancing between them leaves the two
+            // describing different moments. A front end that needs the pair to
+            // agree resolves the names itself and passes object ids, as the
+            // panel does, naming the branch through
+            // `ProvenanceOptions::head_reference` so the conventions still read.
             let head = history::require_commit(repository, root, branch)?;
             let base_id = history::require_commit(repository, root, base_branch)?;
             let base =
@@ -1602,6 +1621,56 @@ mod tests {
         assert_eq!(repeated.files.len(), 2);
         assert_eq!(repeated.files[0], repeated.files[1]);
         assert!(repeated.files[1].is_attributed());
+    }
+
+    /// `for_files` promises one entry per record so a caller may pair the two
+    /// by index. A record with a path on neither side has to keep its place in
+    /// that pairing: dropping it would shift every later index onto the wrong
+    /// file, which is a wrong attribution rather than a missing one.
+    #[test]
+    fn a_record_with_no_path_still_takes_its_place_in_the_pairing() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("pathless");
+        let repository = initialize_repository(&root);
+        branch_from_head(&repository, "feature");
+        checkout(&repository, "feature");
+        commit(
+            &repository,
+            &root,
+            &[("alpha.txt", "one\n"), ("beta.txt", "one\n")],
+            "add both",
+            ("Ada", "ada@example.invalid"),
+            1,
+        );
+
+        let service = GitService::new(&root, &fixture.data_dir);
+        let target = DiffTarget::BranchAgainstBase {
+            branch: "feature".to_owned(),
+            base_branch: "main".to_owned(),
+        };
+        let mut files = service
+            .diff(target.clone(), &DiffOptions::default())
+            .unwrap();
+        assert_eq!(files.len(), 2);
+        // The shape `DiffOmission::Unrepresentable` leaves behind: a record
+        // Harkness kept in the list and could name no path for.
+        files[0].old_path = None;
+        files[0].new_path = None;
+
+        let provenance = service
+            .provenance(
+                &target,
+                &ProvenanceOptions::for_files(&files),
+                &Cancellation::default(),
+            )
+            .unwrap();
+
+        assert_eq!(provenance.files.len(), files.len());
+        assert!(!provenance.files[0].is_attributed());
+        assert_eq!(provenance.files[0].gap, Some(ProvenanceGap::NotInRange));
+        // The record that does have a path is still opposite its own entry.
+        assert_eq!(provenance.files[1].path, PathBuf::from("beta.txt"));
+        assert!(provenance.files[1].is_attributed());
     }
 
     /// A front end that pins a review to object ids keeps the reference the

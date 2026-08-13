@@ -2261,6 +2261,13 @@ fn diff_provenance_is_opt_in_names_every_contributor_and_says_when_it_knows_noth
         "commit_budget_exhausted"
     );
 
+    // Every ordinary answer carries `unavailable: null`, so a consumer reading
+    // that field can tell a degraded block from an empty one. The degraded
+    // shape itself is pinned by a unit test, because producing one here would
+    // mean racing a branch update against the walk.
+    assert_eq!(body["data"]["provenance"][0]["unavailable"], Value::Null);
+    assert_eq!(working["data"]["provenance"][0]["unavailable"], Value::Null);
+
     // The bound is a bound on the walk, not a flag that can be set alone.
     let orphan = harkness(
         &data_dir,

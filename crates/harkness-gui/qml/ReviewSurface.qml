@@ -100,6 +100,25 @@ ColumnLayout {
         });
     }
 
+    // Counts with their nouns, chosen in JavaScript rather than through Qt's
+    // `%n` plural form.
+    //
+    // `%n` leaves the plural to a translation catalog, and there is none: with
+    // no translator installed, `qsTr` returns its source text and `%n commit(s)`
+    // reaches the window spelled exactly that way. Until this application ships
+    // a catalog, the English forms have to be written out.
+    function commitCount(count) {
+        return count === 1
+            ? format(qsTr("%1 commit"), [count])
+            : format(qsTr("%1 commits"), [count]);
+    }
+
+    function contributorCount(count) {
+        return count === 1
+            ? format(qsTr("%1 contributor"), [count])
+            : format(qsTr("%1 contributors"), [count]);
+    }
+
     // The colour that says "these two files came from the same hands".
     //
     // The group is an index over the review's *distinct* producer sets, so the
@@ -128,9 +147,8 @@ ColumnLayout {
             return qsTr("No commit in this comparison produced these changes");
         const parts = [
             format(qsTr("%1 by %2"), [
-                qsTr("%n commit(s)", "commits attributed to a review", commits),
-                qsTr("%n contributor(s)", "people who produced a review",
-                     Number(provenance.producerCount || 0))
+                commitCount(commits),
+                contributorCount(Number(provenance.producerCount || 0))
             ])
         ];
         const slug = String(provenance.agentSlug || "");
@@ -138,8 +156,9 @@ ColumnLayout {
             parts.push(format(qsTr("agent %1"), [slug]));
         const skipped = Number(provenance.skippedMerges || 0);
         if (skipped > 0)
-            parts.push(qsTr("%n merge(s) left unattributed",
-                            "merge commits a range skipped", skipped));
+            parts.push(skipped === 1
+                ? qsTr("1 merge left unattributed")
+                : format(qsTr("%1 merges left unattributed"), [skipped]));
         if (String(provenance.truncation || "") === "commit_budget_exhausted")
             parts.push(qsTr("older commits were not walked"));
         return parts.join(" · ");
@@ -174,8 +193,7 @@ ColumnLayout {
                           [provenanceGapText(String(entry.provenanceGap || ""))]);
         return format(qsTr("Produced by %1, across %2 in this comparison"), [
             provenanceLabel(entry),
-            qsTr("%n commit(s)", "commits attributed to one file",
-                 Number(entry.provenanceCommits || 0))
+            commitCount(Number(entry.provenanceCommits || 0))
         ]);
     }
 
@@ -194,10 +212,8 @@ ColumnLayout {
             return format(qsTr("Unknown: %1"),
                           [provenanceGapText(String(entry.provenanceGap || ""))]);
         return format(qsTr("Produced by %1 across %2 in this comparison"), [
-            qsTr("%n contributor(s)", "people who produced one file",
-                 Number(entry.provenanceProducers || 0)),
-            qsTr("%n commit(s)", "commits attributed to one file",
-                 Number(entry.provenanceCommits || 0))
+            contributorCount(Number(entry.provenanceProducers || 0)),
+            commitCount(Number(entry.provenanceCommits || 0))
         ]);
     }
 

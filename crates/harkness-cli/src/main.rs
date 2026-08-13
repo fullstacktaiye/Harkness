@@ -2057,7 +2057,10 @@ fn run_git(
                             json!(
                                 records
                                     .iter()
-                                    .map(change_provenance_value)
+                                    .zip(&targets)
+                                    .map(|(record, target)| change_provenance_value(
+                                        record, target
+                                    ))
                                     .collect::<Vec<_>>()
                             )
                         }),
@@ -3248,13 +3251,19 @@ fn file_diff_value(file: &FileDiff, include_intra_line: bool) -> Value {
 /// Each target is asked only about the paths its own file records name, so the
 /// walk is bounded by the review in front of the caller rather than by
 /// everything the range touched.
+/// A failed attribution is degraded to a named reason rather than propagated:
+/// the diff beside it already succeeded, and losing it over an advisory
+/// annotation would make provenance authoritative for whether `git diff`
+/// works. A branch force-updated between the diff and this walk is the ordinary
+/// way that happens. Cancellation is the exception and still ends the command,
+/// because a cancelled read is the caller's own decision about all of it.
 fn resolve_diff_provenance(
     git: &GitService,
     targets: &[DiffTarget],
     files: &[FileDiff],
     max_commits: usize,
     cancellation: &Cancellation,
-) -> Result<Vec<ChangeProvenance>, CliError> {
+) -> Result<Vec<Result<ChangeProvenance, GitError>>, CliError> {
     targets
         .iter()
         .map(|target| {
@@ -3271,8 +3280,10 @@ fn resolve_diff_provenance(
             let options = ProvenanceOptions::default()
                 .with_paths(paths)
                 .with_max_commits(max_commits);
-            git.provenance(target, &options, cancellation)
-                .map_err(CliError::from)
+            match git.provenance(target, &options, cancellation) {
+                Err(GitError::Cancelled) => Err(CliError::from(GitError::Cancelled)),
+                outcome => Ok(outcome),
+            }
         })
         .collect()
 }
@@ -3285,14 +3296,14 @@ fn resolve_diff_provenance(
 fn file_provenance_values(
     targets: &[DiffTarget],
     files: &[FileDiff],
-    records: &[ChangeProvenance],
+    records: &[Result<ChangeProvenance, GitError>],
 ) -> Vec<Value> {
     let by_path = records
         .iter()
         .map(|record| {
             record
-                .files
                 .iter()
+                .flat_map(|record| &record.files)
                 .map(|file| (file.path.as_path(), file))
                 .collect::<std::collections::HashMap<_, _>>()
         })
@@ -3322,7 +3333,32 @@ fn file_provenance_value(target_index: usize, file: &FileProvenance) -> Value {
     })
 }
 
-fn change_provenance_value(provenance: &ChangeProvenance) -> Value {
+/// One target's attribution, or the named reason it has none.
+///
+/// `unavailable` is null on every ordinary answer, so a consumer that ignores it
+/// reads an empty block rather than a wrong one.
+fn change_provenance_value(
+    record: &Result<ChangeProvenance, GitError>,
+    target: &DiffTarget,
+) -> Value {
+    let provenance = match record {
+        Ok(provenance) => provenance,
+        Err(error) => {
+            return json!({
+                "target": diff_target_value(target),
+                "range": Value::Null,
+                "producers": Vec::<Value>::new(),
+                "commits": Vec::<Value>::new(),
+                "walked_commits": 0,
+                "skipped_merges": 0,
+                "truncation": Value::Null,
+                "unavailable": {
+                    "kind": error.kind(),
+                    "message": single_line(&error.to_string()),
+                },
+            });
+        }
+    };
     json!({
         "target": diff_target_value(&provenance.target),
         "range": provenance
@@ -3344,6 +3380,7 @@ fn change_provenance_value(provenance: &ChangeProvenance) -> Value {
         "truncation": provenance
             .truncation
             .map_or(Value::Null, provenance_truncation_value),
+        "unavailable": Value::Null,
     })
 }
 
@@ -3913,7 +3950,7 @@ fn detailed_status_line(status: &DetailedStatus, include_paths: bool) -> String 
 fn diff_summary_line(
     files: &[FileDiff],
     targets: &[DiffTarget],
-    provenance: Option<&[ChangeProvenance]>,
+    provenance: Option<&[Result<ChangeProvenance, GitError>]>,
 ) -> String {
     let index_targets = targets
         .iter()
@@ -3961,13 +3998,15 @@ fn diff_summary_line(
 /// unattributed file says so by name and is never left blank.
 fn provenance_summary(
     targets: &[DiffTarget],
-    records: &[ChangeProvenance],
+    records: &[Result<ChangeProvenance, GitError>],
     file: &FileDiff,
 ) -> String {
     let Some(index) = targets.iter().position(|target| *target == file.target) else {
         return "unknown".to_owned();
     };
-    let record = &records[index];
+    let Ok(record) = &records[index] else {
+        return "unknown (unavailable)".to_owned();
+    };
     let path = file.new_path.as_deref().or(file.old_path.as_deref());
     let Some(entry) = path.and_then(|path| {
         record
@@ -5211,10 +5250,43 @@ mod tests {
         EXIT_CONFLICT, EXIT_NOT_FOUND, EXIT_OPERATION_FAILED, EXIT_REFUSED, EXIT_USAGE,
         EditorError, GIT_KIND_EXIT_CODES, GitError, HunkSelection, LineSelection,
         PROJECT_KIND_EXIT_CODES, Project, ProjectError, RefusalKind, Whitespace, WhitespaceMode,
-        distinct_hunk_selection_count, distinct_line_selection_counts, editor_exit_code,
-        git_error_details, git_exit_code, parse_line_selection_document, parse_selection_document,
-        project_exit_code, project_value, requested_json, single_line,
+        change_provenance_value, distinct_hunk_selection_count, distinct_line_selection_counts,
+        editor_exit_code, git_error_details, git_exit_code, parse_line_selection_document,
+        parse_selection_document, project_exit_code, project_value, requested_json, single_line,
     };
+
+    /// Attribution is advisory: a walk that could not be made degrades to a
+    /// named reason inside the block, so the diff beside it still reaches the
+    /// caller. A consumer distinguishes that from an ordinary empty answer by
+    /// `unavailable` rather than by counting what is missing.
+    #[test]
+    fn an_attribution_that_failed_degrades_to_a_named_block() {
+        let target = super::DiffTarget::BranchAgainstBase {
+            branch: "agent/demo".to_owned(),
+            base_branch: "main".to_owned(),
+        };
+        let value = change_provenance_value(
+            &Err(GitError::RevisionNotFound {
+                revision: "agent/demo".to_owned(),
+            }),
+            &target,
+        );
+
+        assert_eq!(value["target"]["kind"], "branch_against_base");
+        assert_eq!(value["unavailable"]["kind"], "revision_not_found");
+        assert!(
+            value["unavailable"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("agent/demo")
+        );
+        // Nothing is claimed about a range that was never walked.
+        assert_eq!(value["range"], serde_json::Value::Null);
+        assert_eq!(value["commits"].as_array().unwrap().len(), 0);
+        assert_eq!(value["producers"].as_array().unwrap().len(), 0);
+        assert_eq!(value["walked_commits"], 0);
+        assert_eq!(value["truncation"], serde_json::Value::Null);
+    }
 
     #[test]
     fn guardrail_and_operation_failures_have_distinct_exit_codes() {
