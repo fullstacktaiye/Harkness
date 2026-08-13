@@ -77,8 +77,11 @@ what every response is expected to contain.
 - Revocation is implemented as removing the reference and clearing account
   status. Harkness cannot revoke a token it never held.
 
-**A forge account and a forge host are trust subjects** under ADR-0016. A remote
-repointed to a different host does not inherit a grant made against the original.
+**A forge account and a forge repository are trust subjects** under ADR-0016, and
+the host is part of their identity basis rather than a subject of its own. A
+remote repointed to a different host therefore does not inherit a grant made
+against the original: it invalidates it, with `endpoint host change` as the
+reason.
 
 **Multiple accounts and hosts are modelled; only `github.com` is exercised in
 v0.5.** The enterprise base-URL seam exists in the types and is not implemented,

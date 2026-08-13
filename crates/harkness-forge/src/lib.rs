@@ -29,8 +29,9 @@
 //! becomes other people's problem. Mutations are approval-gated, idempotency-keyed,
 //! and recoverable from an unknown completion ([#167], [#168]), and what Harkness
 //! actually observed about one is recorded as such rather than inferred
-//! ([ADR-0017]). A forge account and a forge host are trust subjects
-//! ([ADR-0016]).
+//! ([ADR-0017]). A forge account and a forge repository are trust subjects, with
+//! the host part of their identity rather than a subject of its own, so a
+//! repointed remote invalidates the grant instead of inheriting it ([ADR-0016]).
 //!
 //! # What is not here yet
 //!
@@ -59,20 +60,31 @@
 
 #[cfg(test)]
 mod tests {
-    /// ADR-0009 places this crate strictly below `harkness-runtime`: the runtime
-    /// depends on the adapters and no adapter depends on the runtime or on a
-    /// front end. A manifest is the only place that rule can be broken, so the
-    /// manifest is what this reads. The check is a plain substring search rather
-    /// than a parse, which also catches the name in a `[dev-dependencies]` entry
-    /// or a comment claiming the rule no longer holds.
+    /// ADR-0009 draws two edges this crate may not have. It sits strictly below
+    /// `harkness-runtime`, so it may not depend on the runtime or on a front end;
+    /// and adapters do not depend on each other, so shared machinery goes below
+    /// all four rather than sideways between two of them. A manifest is the only
+    /// place either rule can be broken, so the manifest is what this reads — the
+    /// sideways rule especially, since nothing else would catch it: no dependency
+    /// cycle exists to trip on while the runtime does not yet name the adapters.
+    /// The check is a plain substring search rather than a parse, which also
+    /// catches a name in a `[dev-dependencies]` entry or in a comment claiming
+    /// the rule no longer holds.
     #[test]
-    fn the_manifest_names_no_crate_above_this_one() {
+    fn the_manifest_names_no_crate_above_or_beside_this_one() {
         let manifest = include_str!("../Cargo.toml");
-        for forbidden in ["harkness-runtime", "harkness-cli", "harkness-gui"] {
+        for forbidden in [
+            "harkness-runtime",
+            "harkness-cli",
+            "harkness-gui",
+            "harkness-acp",
+            "harkness-mcp",
+            "harkness-recipe",
+        ] {
             assert!(
                 !manifest.contains(forbidden),
                 "{forbidden} appears in crates/harkness-forge/Cargo.toml; ADR-0009 forbids an \
-                 adapter crate from depending on anything above it in the graph",
+                 adapter crate from depending on anything above it or beside it",
             );
         }
     }

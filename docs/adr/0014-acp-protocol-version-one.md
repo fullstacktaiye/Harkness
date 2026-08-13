@@ -33,8 +33,16 @@ explaining that the agent is too new.
 and implements the v1 method set.
 
 **No `unstable_*` feature of `agent-client-protocol-schema` may be enabled**, and
-`unstable_protocol_v2` above all. ADR-0010 pins the dependency with
-`default-features = false` so this cannot happen by inheritance.
+`unstable_protocol_v2` above all. This is a rule, not a mechanism, and the
+distinction matters: cargo features are additive from members, so a crate
+inheriting the workspace pin can still write `features = ["unstable_protocol_v2"]`
+and the workspace entry cannot veto it. ADR-0010's `default-features = false`
+guards a different hole — a future upstream *default* feature enabling something
+here silently — and 1.6.0 declares no `default` feature today, so that pin is
+insurance rather than enforcement. Enforcement is this ADR plus the manifest
+test [#149](https://github.com/fullstacktaiye/harkness/issues/149) adds for the
+`unstable_` prefix, alongside the ADR-0009 layering check the adapter crates
+already carry.
 
 **Version disagreement is a first-class outcome, not an error path.** The
 negotiation rule is:

@@ -31,8 +31,13 @@ workspace, and whether a second HTTP consumer changes the answer.
 ## Decision
 
 **`harkness-forge` uses blocking `ureq` on the caller's worker thread.** ADR-0003
-is extended, not re-decided: its scoping sentence is amended to permit exactly
-one further crate, and the no-async rule is restated as binding for v0.5.
+is extended, not re-decided. Its decision — blocking `ureq`, no async runtime,
+one cancellation token — stands exactly as written; only its scoping sentence,
+"scoped to `harkness-provider` alone … No other crate gains an HTTP dependency",
+is widened, and by exactly one crate. Because an accepted ADR is not edited to
+reflect a change of mind, ADR-0003 keeps its text and gains an **Extended by**
+pointer to this record, so a reader who arrives at the prohibition finds the
+exception rather than only the rule.
 
 **No `tokio`, `async-std`, `smol`, or `futures` enters the workspace in v0.5, and
 no `async fn` appears in any Harkness crate.** ADR-0010's prohibition on the ACP

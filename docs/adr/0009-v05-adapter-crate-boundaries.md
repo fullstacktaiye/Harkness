@@ -104,9 +104,10 @@ graph LR
 ```
 
 An arrow points from a crate to the crates that may depend on it. There is no
-arrow from `runtime` to anything below it other than the four adapters and the
-existing crates, and there are no arrows *between* the four adapters. Those
-absences are the decision.
+arrow from `runtime` to any of the four adapters, and there are no arrows
+*between* the four adapters. Those two absences are the decision: the runtime
+may name an adapter, an adapter may never name the runtime, and no adapter may
+name another.
 
 ## Consequences
 

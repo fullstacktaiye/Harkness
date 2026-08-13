@@ -571,7 +571,9 @@ told about.
 `harkness-runtime`. None of them may name `harkness-runtime`, `harkness-cli`, or `harkness-gui` in
 its manifest, and none may depend on another adapter — shared machinery goes below all four, not
 sideways between two of them. Each crate carries a test that reads its own `Cargo.toml` and fails
-on those names, so the rule breaks the build rather than a review. ADR-0009 records why.
+on any of those six names, so the rule breaks the build rather than a review. The sideways rule
+needs that test most: no dependency cycle exists to catch an adapter-to-adapter edge while
+`harkness-runtime` does not yet name the adapters. ADR-0009 records why.
 
 Protocol wire types are private to their adapter. No type defined by ACP, MCP, or the GitHub REST
 API — and no type generated from their schemas — may appear in an adapter's public API, in a

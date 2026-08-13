@@ -73,9 +73,14 @@ harkness-gui ──┴─> harkness-core ─────────────
                    harkness-context ──────────┘
                    (also depends on harkness-core, for ProjectId)
 
-harkness-acp  harkness-mcp  harkness-forge  harkness-recipe
-                   └─> all strictly below harkness-runtime; see ADR-0009
+harkness-acp  ──┐
+harkness-mcp  ──┤
+harkness-forge──┼─> harkness-runtime   (adapters never point back; see ADR-0009)
+harkness-recipe─┘
 ```
+
+`X ──> Y` means X depends on Y. The four adapters are depended *on* by
+`harkness-runtime` and depend on none of it — nor on each other.
 
 `harkness-runtime` depends on `harkness-git` for one thing: `Cancellation`, which `tool`'s
 `ExecutionContext` carries so a tool that shells out to Git passes the same token down instead of

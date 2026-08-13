@@ -1,6 +1,10 @@
 # ADR-0003: Blocking HTTP with SSE on the calling worker thread
 
 - **Status**: Accepted
+- **Extended by**: ADR-0011 — the decision below is unchanged, but its scoping
+  sentence ("scoped to `harkness-provider` alone … No other crate gains an HTTP
+  dependency") admits a second crate, `harkness-forge`, from v0.5 onward. Read
+  ADR-0011 before concluding that a forge HTTP dependency is forbidden.
 - **Date**: 2026-08-10
 - **Deciders**: Taiye Babatope
 - **Implemented by**: [#125](https://github.com/fullstacktaiye/harkness/issues/125), [#111](https://github.com/fullstacktaiye/harkness/issues/111), [#124](https://github.com/fullstacktaiye/harkness/issues/124)

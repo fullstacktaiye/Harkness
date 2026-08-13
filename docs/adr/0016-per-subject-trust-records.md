@@ -8,10 +8,13 @@
 
 ## Context
 
-v0.5 introduces five new kinds of thing a user can decide to trust, all of them
+v0.5 introduces six new kinds of thing a user can decide to trust, all of them
 controlled by someone other than Harkness: an ACP agent's executable, an MCP
-server, each tool schema that server publishes, a workflow recipe, and a forge
-account and the host it talks to. Workspace trust
+server, each tool schema that server publishes, a workflow recipe, a forge
+account, and a forge repository. A forge *host* is deliberately not a seventh:
+it is part of the identity basis of the account and repository that reach it, so
+a remote repointed at a different host invalidates those grants rather than
+needing a subject of its own. Workspace trust
 ([#90](https://github.com/fullstacktaiye/harkness/issues/90), planned) already
 exists but answers a different question — whether the user accepts running this
 workspace's code — and it is keyed to a path.
@@ -113,7 +116,7 @@ defines the types, wire formats, and frozen fixtures;
   [#159](https://github.com/fullstacktaiye/harkness/issues/159) caches it. Where
   an identity is genuinely unavailable, the record says so rather than
   substituting a name.
-- One trust model across five subject kinds means one persistence path, one
+- One trust model across every subject kind means one persistence path, one
   invalidation function, one audit view, and one GUI
   ([#176](https://github.com/fullstacktaiye/harkness/issues/176)). Five ad-hoc
   flags would have made that hub impossible to build, which is the failure this
