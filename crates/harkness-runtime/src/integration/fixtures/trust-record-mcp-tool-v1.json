@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "subject_kind": "mcp_tool_schema",
+  "identity": {
+    "display_name": "files.read",
+    "protocol_version": "2026-07-28",
+    "schema_fingerprint": "850023b88abc964b674c7c576520a77bbadd2bb1b6a50913e2e54209f75b65ca",
+    "capabilities": [
+      "resources",
+      "tools"
+    ],
+    "configuration_source": "repository"
+  },
+  "scope": "workspace",
+  "workspace": "/workspace",
+  "state": "invalidated",
+  "invalidation_reason": "tool_schema_fingerprint_changed",
+  "granted_at": "1970-01-01T00:00:00Z"
+}

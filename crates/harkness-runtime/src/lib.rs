@@ -26,9 +26,19 @@
 //! channel a parked call is woken through. It is the only production source of
 //! a [`policy::RunGrant`], which is what keeps "an approval exists for this
 //! call" a claim one module makes rather than one any caller can assert.
+//!
+//! [`integration`] carries the same idea across the process boundary. An ACP
+//! agent, an MCP server and its tool schemas, a recipe, a forge account and a
+//! forge repository are all controlled by somebody else and can change under a
+//! decision the user already made, so a grant binds to an
+//! [`integration::IdentityBasis`] — hashes, endpoints, fingerprints — and a
+//! pure check reports which of eight typed reasons made it stop applying.
+//! Trust there is a precondition and never an authorization: a trusted subject
+//! still passes [`policy`] and [`approval`] on every action it takes.
 
 pub mod approval;
 pub mod domain;
+pub mod integration;
 pub mod policy;
 pub mod store;
 pub mod tool;

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "subject_kind": "forge_repository",
+  "identity": {
+    "display_name": "octocat/hello-world",
+    "endpoint": {
+      "host": "github.com",
+      "resource": "octocat/hello-world"
+    },
+    "configuration_source": "user"
+  },
+  "scope": "global",
+  "state": "revoked",
+  "granted_at": "1970-01-01T00:02:00Z"
+}

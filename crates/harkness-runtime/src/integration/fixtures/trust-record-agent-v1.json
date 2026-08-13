@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "subject_kind": "agent_executable",
+  "identity": {
+    "display_name": "Example agent",
+    "subject_version": "1.4.2",
+    "protocol_version": "1",
+    "executable": {
+      "path": "/usr/local/bin/example-agent",
+      "sha256": "f03e279954a05b1fd253a5be7299019af3ebdf44c57e0c69eecc738601ca6d35"
+    },
+    "capabilities": [
+      "fs.read",
+      "terminal"
+    ],
+    "configuration_source": "user"
+  },
+  "scope": "workspace",
+  "workspace": "/workspace",
+  "state": "trusted",
+  "granted_at": "1970-01-01T00:00:00Z"
+}
