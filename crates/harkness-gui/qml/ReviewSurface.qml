@@ -41,6 +41,9 @@ ColumnLayout {
     // a reader who turned it on is auditing indentation, not one file's.
     property bool revealWhitespace: false
     property bool splitLayout: false
+    // Which half of a side-by-side row the open context menu was asked for,
+    // empty for a unified row.
+    property string menuCopySide: ""
     property int pendingHunkNavigation: 0
     property string pendingDiscardKind: ""
     property string pendingDiscardId: ""
@@ -113,12 +116,14 @@ ColumnLayout {
         return Kirigami.Theme.backgroundColor;
     }
 
-    // Trailing whitespace is tinted with the reveal control off, because it is
-    // the change a reader is least likely to think to look for and the one
-    // most likely to be an accident. A changed run is tinted too, so that
+    // Trailing whitespace on a line this diff touched is tinted with the
+    // reveal control off, because it is the change a reader is least likely to
+    // think to look for and the one most likely to be an accident. On a
+    // context line it is neither — it is whatever the file already had, and
+    // marking it would light up untouched code in a legacy file — so that one
+    // waits for reveal. A changed run is tinted whatever it is, so that
     // intra-line emphasis over a range that is entirely whitespace marks
     // something the eye can find rather than an apparently empty box.
-    // Everything else waits to be asked for.
     function whitespaceBackground(segment, kind) {
         if (segment.changed === true) {
             return mixColor(
@@ -127,7 +132,7 @@ ColumnLayout {
                 0.34
             ).toString();
         }
-        if (segment.zone === "trailing") {
+        if (segment.zone === "trailing" && (revealWhitespace || kind !== "context")) {
             return mixColor(
                 lineBackground(kind),
                 Kirigami.Theme.neutralTextColor,
@@ -186,19 +191,23 @@ ColumnLayout {
             + body + "</span>";
     }
 
-    // The terminator is named rather than drawn. A CRLF and an LF differ by a
-    // byte with no width, so a pair whose endings disagree says which ending
-    // it had in as many letters; revealed, every other terminator is marked
-    // with one glyph so the reader can audit a file without reading labels.
+    // The terminator is named rather than drawn: a CRLF and an LF differ by a
+    // byte with no width. A pair whose endings disagree says which ending it
+    // had in as many letters, whether or not the reveal control is on.
+    //
+    // Revealed, a plain LF is marked with a pilcrow and anything else is named
+    // too — a file with mixed terminators is exactly what a reader turns this
+    // on to find, and one mark for every kind would hide it again. The mark is
+    // Latin-1 for the reason `escapeCode` gives.
     function lineEndHtml(lineEnd, changed, kind) {
         const ending = String(lineEnd || "");
         if (ending.length === 0 || ending === "none")
             return "";
         if (changed !== true && !revealWhitespace)
             return "";
-        // The one that changed is a label and has to be read, so it is a chip
-        // in the selection colours rather than a tint; the rest are marks and
-        // must not compete with the code beside them.
+        // A changed ending is a label and has to be read, so it is a chip in
+        // the selection colours; a revealed one is an annotation and must not
+        // compete with the code beside it.
         if (changed === true) {
             return "&nbsp;<span style=\"background-color:"
                 + Kirigami.Theme.highlightColor.toString()
@@ -212,7 +221,8 @@ ColumnLayout {
                 0.16
             ).toString()
             + ";color:" + Kirigami.Theme.disabledTextColor.toString()
-            + "\">↵</span>";
+            + "\">" + (ending === "lf" ? "¶" : ending.toUpperCase())
+            + "</span>";
     }
 
     function syntaxKeywords(path) {
@@ -364,35 +374,48 @@ ColumnLayout {
 
     // What a copy takes is the content the backend read, never the glyphs
     // drawn over it: the reveal treatment lives entirely in the markup above
-    // and none of it reaches this text. Side-by-side copies the side that
-    // exists, preferring the one the reader can still edit.
-    function copyTextForRow(row) {
+    // and none of it reaches this text.
+    //
+    // `side` is the half of a side-by-side row the reader pointed at. Without
+    // one — a keyboard copy, or a unified row — the answer is the row's own
+    // line, so the same row copies the same bytes in either layout.
+    function copyTextForRow(row, side) {
         if (!row || row.type !== "line")
             return "";
-        if (splitLayout) {
-            const side = row.new && row.new.present === true
-                ? row.new
-                : row.old;
-            if (side && side.present === true)
-                return String(side.copyText || "");
+        if (side === "old" || side === "new") {
+            const half = row[side];
+            if (half && half.present === true)
+                return String(half.copyText || "");
         }
         return String((row.unified || ({})).copyText || "");
+    }
+
+    function copyReviewLine(row, side) {
+        const value = copyTextForRow(row, side);
+        if (value.length === 0)
+            return;
+        // Through the backend rather than through a TextEdit: QtQuick's own
+        // clipboard writer carries the text through a text document, which
+        // rewrites a CRLF into an LF — the very byte a diff line may have been
+        // copied to inspect.
+        backend.copyToClipboard(value);
     }
 
     function copyCurrentReviewLine() {
         const index = reviewLineView.currentIndex;
         if (index < 0 || index >= reviewRows.length)
             return;
-        const value = copyTextForRow(reviewRows[index]);
-        if (value.length === 0)
-            return;
-        // A TextEdit is the only writer QtQuick offers for the clipboard, and
-        // this one is never shown, never focused and never left holding the
-        // line it just handed over.
-        clipboardBridge.text = value;
-        clipboardBridge.selectAll();
-        clipboardBridge.copy();
-        clipboardBridge.text = "";
+        copyReviewLine(reviewRows[index], "");
+    }
+
+    // Right-clicking is the only way the surface learns which half of a
+    // side-by-side row was meant, so the menu is opened with that answer
+    // rather than guessing it back afterwards.
+    function openReviewLineMenu(rowIndex, side) {
+        reviewLineView.currentIndex = rowIndex;
+        reviewLineView.forceActiveFocus();
+        menuCopySide = side;
+        reviewLineMenu.popup();
     }
 
     function setSplitLayout(value) {
@@ -734,21 +757,20 @@ ColumnLayout {
         onActivated: reviewSurface.navigateHunk(-1)
     }
 
-    // Off screen and out of the layout: it exists to own a selection long
-    // enough to put one line on the clipboard.
-    TextEdit {
-        id: clipboardBridge
-
-        visible: false
-        width: 0
-    }
-
     Controls.Menu {
         id: reviewLineMenu
 
         Controls.MenuItem {
             text: qsTr("Copy line")
-            onTriggered: reviewSurface.copyCurrentReviewLine()
+            onTriggered: {
+                const index = reviewLineView.currentIndex;
+                if (index >= 0 && index < reviewSurface.reviewRows.length) {
+                    reviewSurface.copyReviewLine(
+                        reviewSurface.reviewRows[index],
+                        reviewSurface.menuCopySide
+                    );
+                }
+            }
         }
     }
 
@@ -1498,13 +1520,15 @@ ColumnLayout {
                 }
             }
 
+            // Side-by-side puts its own handler on each half, which takes the
+            // press before this one; what is left for this to answer is a
+            // unified row, where there is only the one line to copy.
             TapHandler {
                 acceptedButtons: Qt.RightButton
-                onTapped: {
-                    reviewLineView.currentIndex = reviewLineDelegate.rowIndex;
-                    reviewLineView.forceActiveFocus();
-                    reviewLineMenu.popup();
-                }
+                onTapped: reviewSurface.openReviewLineMenu(
+                    reviewLineDelegate.rowIndex,
+                    ""
+                )
             }
 
             Rectangle {
@@ -1588,7 +1612,10 @@ ColumnLayout {
                     delegate: Rectangle {
                         id: splitSide
 
+                        required property int index
                         required property var modelData
+
+                        readonly property string side: index === 0 ? "old" : "new"
 
                         Layout.fillWidth: true
                         border.color: reviewLineDelegate.current
@@ -1600,6 +1627,18 @@ ColumnLayout {
                             : reviewSurface.tint(Kirigami.Theme.disabledTextColor, 0.04)
                         implicitHeight: splitSideLayout.implicitHeight
                             + Kirigami.Units.smallSpacing
+
+                        // A replacement shows its deletion and its addition on
+                        // the same row, so which one a copy means is only ever
+                        // answered by which one was pointed at.
+                        TapHandler {
+                            acceptedButtons: Qt.RightButton
+                            enabled: splitSide.modelData.present === true
+                            onTapped: reviewSurface.openReviewLineMenu(
+                                reviewLineDelegate.rowIndex,
+                                splitSide.side
+                            )
+                        }
 
                         RowLayout {
                             id: splitSideLayout

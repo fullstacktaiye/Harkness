@@ -126,7 +126,10 @@ Revealing whitespace runs the other way and stays entirely inside the front end.
 A renderer may draw bytes differently — a tinted trailing run, a glyph standing
 in for a tab, the name of a line terminator — and may never alter them: no
 segment text is rewritten, no diff is recomputed, and what a copy puts on the
-clipboard is the line the model carried, terminator included. Classification
+clipboard is the line the model carried, terminator included — which is why the
+copy goes through a clipboard writer of our own rather than through QtQuick's,
+whose only one carries the text through a text document and turns every CRLF
+into an LF on the way out. Classification
 happens on the bytes the Git layer already segmented, never on a re-decoded
 string, and every run boundary lands on an ASCII space or tab, so a boundary can
 never fall inside a multi-byte character. A revealed glyph keeps the advance

@@ -11,6 +11,14 @@ pub mod ffi {
         type QList_QVariant = cxx_qt_lib::QList<QVariant>;
     }
 
+    #[namespace = "harkness"]
+    unsafe extern "C++" {
+        include!("harknessclipboard.h");
+
+        #[rust_name = "set_clipboard_text"]
+        fn setClipboardText(text: &QString);
+    }
+
     extern "RustQt" {
         /// The small Rust-backed object exposed to the Harkness QML module.
         ///
@@ -165,6 +173,15 @@ pub mod ffi {
             project_id: &QString,
             hunk_id: &QString,
         );
+
+        /// Puts one diff line on the clipboard byte for byte.
+        ///
+        /// The review surface owns what is copied — it is the only place that
+        /// knows which side of a row the reader asked for — and this owns only
+        /// the writing, because QtQuick's own writer rewrites terminators.
+        #[qinvokable]
+        #[cxx_name = "copyToClipboard"]
+        fn copy_to_clipboard(self: &HarknessBackend, text: &QString);
 
         /// Opens the loaded working-tree file at a backend-derived diff line.
         #[qinvokable]
@@ -2667,17 +2684,27 @@ fn review_content_summary(file: &harkness_git::FileDiff) -> String {
     }
 }
 
+/// Says what this hunk cannot show, and says it in full.
+///
+/// A degraded hunk has no paired lines, and the pair is what a changed line
+/// ending is read from — so the chip that would name a CRLF turning into an LF
+/// is absent here too, not merely the word emphasis. Reveal still marks every
+/// terminator it is asked to, which is what the reader is pointed at.
 fn hunk_degradation_summary(hunk: &harkness_git::Hunk) -> String {
-    match hunk.intra_line_degradation.as_ref() {
+    let limit = match hunk.intra_line_degradation.as_ref() {
         Some(harkness_git::IntraLineDegradation::LineTooLong { limit }) => {
-            format!("Word emphasis unavailable — a line exceeds the {limit}-byte pairing limit.")
+            format!("a line exceeds the {limit}-byte pairing limit")
         }
         Some(harkness_git::IntraLineDegradation::PairingTooLarge { limit }) => {
-            format!("Word emphasis unavailable — pairing exceeds the {limit}-comparison limit.")
+            format!("pairing exceeds the {limit}-comparison limit")
         }
-        Some(_) => "Word emphasis unavailable for a named Git limit.".to_owned(),
-        None => String::new(),
-    }
+        Some(_) => "a named Git limit was reached".to_owned(),
+        None => return String::new(),
+    };
+    format!(
+        "Word emphasis unavailable — {limit}. A line-ending change is not \
+         flagged here either; reveal whitespace to compare terminators."
+    )
 }
 
 fn display_line_end(bytes: &[u8]) -> usize {
@@ -6005,6 +6032,12 @@ impl ffi::HarknessBackend {
             return;
         };
         launch_hunk_discard(self, project_id, request);
+    }
+
+    /// Writes exactly what it is handed, so a copied line keeps the carriage
+    /// return the review surface only drew a label for.
+    fn copy_to_clipboard(&self, text: &QString) {
+        ffi::set_clipboard_text(text);
     }
 
     fn open_review_line(

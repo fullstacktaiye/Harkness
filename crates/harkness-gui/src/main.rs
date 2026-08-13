@@ -605,6 +605,13 @@ Kirigami.ApplicationWindow {
         { "text": "let new_word = true;", "changed": true, "whitespace": "", "zone": "" }
     ]
 
+    // Untouched surroundings that already carried a trailing run, which is
+    // what a legacy file looks like and what must stay quiet.
+    readonly property var trailingContextSegments: [
+        { "text": "let kept = true;", "changed": false, "whitespace": "", "zone": "" },
+        { "text": "  ", "changed": false, "whitespace": "space", "zone": "trailing" }
+    ]
+
     // Every entity and every drawn character is one column; the markup around
     // them is worth none. Comparing the two reveal states through this is what
     // proves a glyph never moves a column out from under the other side.
@@ -959,6 +966,8 @@ Kirigami.ApplicationWindow {
         property int nextFilePageCalls: 0
         property int previousFilePageCalls: 0
         property int openLineCalls: 0
+        property int clipboardCalls: 0
+        property string lastClipboardText: ""
         property int lastOpenLine: 0
         property string lastOpenFileId: ""
         property string lastReviewFileId: ""
@@ -1150,6 +1159,10 @@ Kirigami.ApplicationWindow {
             ++openLineCalls;
             lastOpenFileId = String(fileId);
             lastOpenLine = Number(line);
+        }
+        function copyToClipboard(text) {
+            ++clipboardCalls;
+            lastClipboardText = String(text);
         }
         function loadReviewFile(projectId, fileId) {
             ++loadReviewFileCalls;
@@ -1351,10 +1364,19 @@ Kirigami.ApplicationWindow {
         const revealedEnding = reviewFixture.highlightedLine(
             newWordSegments, "src/main.rs", "addition", "lf", false
         );
+        const revealedOtherEnding = reviewFixture.highlightedLine(
+            newWordSegments, "src/main.rs", "addition", "crlf", false
+        );
+        const revealedContext = reviewFixture.highlightedLine(
+            trailingContextSegments, "src/main.rs", "context", "lf", false
+        );
         const revealedCopy = reviewFixture.copyTextForRow(
-            fixtureBackend.review.file.rows[2]
+            fixtureBackend.review.file.rows[2], ""
         );
         reviewFixture.revealWhitespace = false;
+        const quietContext = reviewFixture.highlightedLine(
+            trailingContextSegments, "src/main.rs", "context", "lf", false
+        );
 
         whitespaceRenderDetected =
             // Off by default, and the trailing run is tinted anyway: it is
@@ -1367,27 +1389,43 @@ Kirigami.ApplicationWindow {
             // emphasis and a tint at once, rather than an empty underline.
             && quiet.indexOf("text-decoration:underline") !== -1
             && quiet.split("background-color").length - 1 >= 2
-            // An unchanged line ending says nothing until it is asked to.
-            && quietUnchangedEnding.indexOf("\u21b5") === -1
+            // An unchanged line ending says nothing until it is asked to, and
+            // trailing whitespace the diff did not touch says nothing either:
+            // a legacy file's context must not light up.
+            && quietUnchangedEnding.indexOf("\u00b6") === -1
             && quietChangedEnding.indexOf("CRLF") !== -1
+            && quietContext.indexOf("background-color") === -1
             // Revealed, both whitespace bytes are told apart, every ending is
-            // marked, and not one column has moved.
+            // marked and the ones that are not plain LF are named, context
+            // whitespace shows, and not one column has moved.
             && revealed.indexOf("\u00b7") !== -1
             && revealed.indexOf("\u00bb") !== -1
-            && revealedEnding.indexOf("\u21b5") !== -1
+            && revealedEnding.indexOf("\u00b6") !== -1
+            && revealedOtherEnding.indexOf("CRLF") !== -1
+            && revealedContext.indexOf("background-color") !== -1
             && renderedColumns(revealed) === renderedColumns(quiet);
 
         // What reaches the clipboard is the line as it was read, never the
-        // glyphs drawn over it.
+        // glyphs drawn over it; and a side-by-side row copies the half that
+        // was asked for rather than whichever one happens to be present.
         whitespaceCopyDetected = revealedCopy === "\tlet old_word = true;  \r\n"
             && reviewFixture.copyTextForRow(
-                fixtureBackend.review.file.rows[1]
+                fixtureBackend.review.file.rows[2], "old"
+            ) === "\tlet old_word = true;  \r\n"
+            && reviewFixture.copyTextForRow(
+                fixtureBackend.review.file.rows[2], "new"
+            ) === "    let new_word = true;\n"
+            && reviewFixture.copyTextForRow(
+                fixtureBackend.review.file.rows[1], ""
             ) === "";
-        // The write itself cannot be read back without a display, so this
-        // covers the call rather than the paste: a broken one raises, and a
-        // raised warning is fatal to this run.
+        // And the whole path to the clipboard, terminator included. The write
+        // goes through the backend rather than through a text document for
+        // exactly this reason: a document would hand over "...true;  \n".
         reviewFixture.reviewCurrentIndex = 2;
         reviewFixture.copyCurrentReviewLine();
+        whitespaceCopyDetected = whitespaceCopyDetected
+            && fixtureBackend.clipboardCalls === 1
+            && fixtureBackend.lastClipboardText === "\tlet old_word = true;  \r\n";
         changesFixture.selectPath("fixture-path", "added", "modified");
         fixtureBackend.jobs = [];
         const previewProbe = historyFixture.commitSummaryPreview(
