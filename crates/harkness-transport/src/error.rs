@@ -99,20 +99,35 @@ pub enum TransportError {
     #[error("the transport operation was cancelled")]
     Cancelled,
 
-    /// A message could not be handed to the peer.
+    /// A message could not be handed to the peer, and the peer is the reason.
+    ///
+    /// Terminal: the peer's standard input is broken, or it has not read a byte
+    /// of it for long enough that nothing else explains it.
     #[error("failed to write to the peer: {detail}")]
     WriteFailed {
         /// What went wrong on the way to the peer's standard input.
         detail: String,
     },
 
+    /// A message could not be handed over before *this caller's* deadline.
+    ///
+    /// Distinct from [`WriteFailed`](Self::WriteFailed), and not terminal, for
+    /// the reason a short deadline is not evidence: a caller that allowed one
+    /// second has learned that its message did not get out in one second, not
+    /// that the peer is gone. Collapsing the two would let an impatient call end
+    /// a working session — the same mistake as tearing a connection down over a
+    /// slow answer.
+    #[error("the message could not be handed to the peer before the deadline")]
+    SendTimedOut,
+
     /// A request's own deadline passed with no response.
     ///
     /// Distinct from [`Disconnected`](Self::Disconnected): the peer is still
-    /// running and may yet answer, which is exactly why the correlation entry is
-    /// dropped — a late answer to a request nobody is waiting for is an unknown
-    /// response id, and that is a desynchronization the adapter should hear
-    /// about rather than a stale value delivered to whoever asks next.
+    /// running and may yet answer. It is not a reason to tear the connection
+    /// down, and the engine holds up its end of that — the id is *retired*
+    /// rather than forgotten, so the peer's later answer is discarded quietly
+    /// instead of reading as a response to a request nobody sent. The peer did
+    /// nothing wrong; this side chose the deadline.
     #[error("the peer did not answer request {id} before its deadline")]
     RequestTimedOut {
         /// The request that went unanswered.
@@ -170,6 +185,7 @@ impl TransportError {
         "disconnected",
         "cancelled",
         "write_failed",
+        "send_timed_out",
         "request_timed_out",
         "peer_queue_full",
         "quarantined",
@@ -188,6 +204,7 @@ impl TransportError {
             Self::Disconnected { .. } => "disconnected",
             Self::Cancelled => "cancelled",
             Self::WriteFailed { .. } => "write_failed",
+            Self::SendTimedOut => "send_timed_out",
             Self::RequestTimedOut { .. } => "request_timed_out",
             Self::PeerQueueFull { .. } => "peer_queue_full",
             Self::Quarantined { .. } => "quarantined",
@@ -196,11 +213,12 @@ impl TransportError {
 
     /// Whether this failure is terminal for the connection that raised it.
     ///
-    /// Every kind here is terminal except the three that describe one *call*: a
-    /// request that ran out of time, a message that could not be framed, and a
-    /// response that unread peer messages are sitting in front of. All three
-    /// leave a working connection behind, and an adapter that tore one down for
-    /// a slow answer would restart an agent mid-session over a timeout it chose.
+    /// Every kind here is terminal except the four that describe one *call*: a
+    /// request that ran out of time, a message that could not be framed, a send
+    /// that missed its caller's deadline, and a response that unread peer
+    /// messages are sitting in front of. All four leave a working connection
+    /// behind, and an adapter that tore one down for a slow answer would restart
+    /// an agent mid-session over a timeout it chose.
     ///
     /// The engine holds up its end of that claim rather than merely asserting
     /// it: a request that gives up keeps its id retired, so the peer's later
@@ -210,6 +228,7 @@ impl TransportError {
         !matches!(
             self,
             Self::RequestTimedOut { .. }
+                | Self::SendTimedOut
                 | Self::UnencodableMessage { .. }
                 | Self::PeerQueueFull { .. }
         )
@@ -403,6 +422,7 @@ mod tests {
                 },
                 "write_failed",
             ),
+            (TransportError::SendTimedOut, "send_timed_out"),
             (
                 TransportError::RequestTimedOut {
                     id: RequestId::Number(1),
@@ -499,6 +519,14 @@ mod tests {
             .is_terminal()
         );
         assert!(!TransportError::PeerQueueFull { capacity: 4096 }.is_terminal());
+        assert!(!TransportError::SendTimedOut.is_terminal());
+        assert!(
+            TransportError::WriteFailed {
+                detail: "fixture".to_owned()
+            }
+            .is_terminal(),
+            "a broken pipe is the peer's doing, unlike a short deadline"
+        );
         assert!(TransportError::Cancelled.is_terminal());
         assert!(
             TransportError::Disconnected {

@@ -350,7 +350,7 @@ impl Inner {
 }
 
 impl JsonRpcTransport for StdioTransport {
-    fn send(&self, message: Message) -> Result<(), TransportError> {
+    fn send(&self, message: Message, deadline: Instant) -> Result<(), TransportError> {
         self.inner.check_all()?;
 
         let mut command = WriterCommand::Write(frame(&message.encode()?)?);
@@ -373,7 +373,12 @@ impl JsonRpcTransport for StdioTransport {
             }
         };
 
-        let deadline = Instant::now() + OUTBOUND_ENQUEUE_TIMEOUT;
+        // Whichever comes first. The caller's deadline is what it actually asked
+        // for; the backstop bounds a caller that named a distant one, since a
+        // peer that has stopped reading is never coming back and there is
+        // nothing to wait for.
+        let backstop = Instant::now() + OUTBOUND_ENQUEUE_TIMEOUT;
+        let give_up_at = deadline.min(backstop);
         loop {
             // Counted *before* the handover and undone if it does not happen.
             // The writer subtracts the moment it dequeues, and it routinely wins
@@ -407,11 +412,18 @@ impl JsonRpcTransport for StdioTransport {
                 }
             }
             self.inner.check_all()?;
-            if Instant::now() >= deadline {
-                let detail = format!(
-                    "the peer has not read its standard input for {} seconds",
-                    OUTBOUND_ENQUEUE_TIMEOUT.as_secs()
-                );
+            if Instant::now() >= give_up_at {
+                // Which bound ran out decides which failure this is. The
+                // backstop expiring means the peer has not read a byte for
+                // thirty seconds, which nothing but a broken peer explains, so
+                // the connection ends. The caller's own deadline expiring means
+                // only that this call was in a hurry — recording a terminal
+                // state on its behalf would end a working session over one
+                // impatient call.
+                if Instant::now() < backstop {
+                    return Err(TransportError::SendTimedOut);
+                }
+                let detail = "the peer is not reading its standard input".to_owned();
                 self.inner.record(Terminal::WriteFailed(detail.clone()));
                 return Err(TransportError::WriteFailed { detail });
             }
@@ -555,17 +567,24 @@ impl StdioTransport {
         // holding the standard-output pipe open, so the reader would never see
         // end of file either. Both rungs above can reach here with the group
         // still populated, which is why this is unconditional rather than part
-        // of the escalation. Signalling a group whose last member has already
-        // gone is a harmless `ESRCH`, and a group keeps its identifier reserved
-        // while any member is alive, so this cannot reach a recycled pid — the
-        // same reasoning `harkness-runtime` records for signalling a reaped tool
-        // child's group.
+        // of the escalation.
+        //
+        // The signal follows the child's reaping because that reaping is how the
+        // exit was detected in the first place. While any member is alive the
+        // group keeps its identifier, so the target is exact — that is the case
+        // this exists for. Where the child *was* the last member the group is
+        // already gone and the call is a harmless `ESRCH`, with a residual race
+        // that the pid was recycled as another group's leader in between: a
+        // window of microseconds against sequential pid allocation, stated here
+        // rather than argued away, and the same trade `harkness-runtime` takes
+        // when it signals a reaped tool child's group.
         reap_group(&child);
 
         // The reader can be parked on a full inbound queue, and nothing is
         // draining it now that the connection is over. Joining without draining
         // would wait for a consumer that is never coming.
         self.drain_inbound();
+        let join_deadline = Instant::now() + JOIN_TIMEOUT;
         for handle in [
             teardown.reader.take(),
             teardown.writer.take(),
@@ -574,8 +593,12 @@ impl StdioTransport {
         .into_iter()
         .flatten()
         {
-            let deadline = Instant::now() + JOIN_TIMEOUT;
-            while !handle.is_finished() && Instant::now() < deadline {
+            // One budget for all three, not one each. A per-handle deadline
+            // makes the worst case three times the constant, and a blocking
+            // `StderrSink` — which the trait only asks not to block for *long* —
+            // is enough to reach it, on whatever thread happened to drop the
+            // connection.
+            while !handle.is_finished() && Instant::now() < join_deadline {
                 self.drain_inbound();
                 thread::sleep(POLL_INTERVAL);
             }
@@ -800,8 +823,15 @@ fn write_messages(
     // Whatever is still queued will never be written, so it is no longer
     // "waiting to be written" either. Left counted, the depth a diagnostic reads
     // would stay permanently non-zero on a connection with nothing in flight.
-    while let Ok(WriterCommand::Write(_)) = commands.try_recv() {
-        counts.outbound_depth.fetch_sub(1, Ordering::Relaxed);
+    //
+    // The whole queue is drained rather than its leading run of writes: `send`
+    // clones the outbound sender and holds the clone across its retry loop, so a
+    // `Close` can end up *ahead* of a write, and stopping at the first one would
+    // leave the trailing writes counted forever.
+    while let Ok(command) = commands.try_recv() {
+        if matches!(command, WriterCommand::Write(_)) {
+            counts.outbound_depth.fetch_sub(1, Ordering::Relaxed);
+        }
     }
     // Dropping the handle closes the peer's standard input, which is what the
     // first rung of shutdown means and what tells a well-behaved peer to exit.
@@ -867,9 +897,10 @@ mod tests {
     }
 
     fn connect(program: &Path, working_dir: &Path) -> Box<StdioTransport> {
-        Box::new(
-            StdioTransport::spawn(spec(program, working_dir), Cancellation::default()).unwrap(),
-        )
+        match StdioTransport::spawn(spec(program, working_dir), Cancellation::default()) {
+            Ok(transport) => Box::new(transport),
+            Err(error) => panic!("failed to launch '{}': {error}", program.display()),
+        }
     }
 
     /// Waits for one message, failing rather than hanging.
@@ -902,11 +933,14 @@ done
         let transport = connect(&echo_peer(&fixture), &workspace);
 
         transport
-            .send(Message::request(
-                RequestId::Number(7),
-                "initialize",
-                Some(json!({"protocolVersion": 1})),
-            ))
+            .send(
+                Message::request(
+                    RequestId::Number(7),
+                    "initialize",
+                    Some(json!({"protocolVersion": 1})),
+                ),
+                Instant::now() + Duration::from_secs(5),
+            )
             .unwrap();
 
         assert_eq!(
@@ -1017,7 +1051,10 @@ while IFS= read -r line; do :; done
         ));
         assert_eq!(
             transport
-                .send(Message::notification("anything", None))
+                .send(
+                    Message::notification("anything", None),
+                    Instant::now() + Duration::from_secs(5),
+                )
                 .unwrap_err()
                 .kind(),
             "quarantined"
@@ -1370,6 +1407,67 @@ done
         );
     }
 
+    /// A peer that stops reading its own standard input fills its pipe and then
+    /// the queue behind it. The caller's deadline is what bounds the wait —
+    /// without it the enqueue would run to the transport's own 30-second
+    /// backstop, thirty times what a one-second caller asked for.
+    #[test]
+    #[cfg(unix)]
+    fn an_enqueue_gives_up_at_the_callers_deadline() {
+        let fixture = Fixture::new();
+        let workspace = fixture.directory("deaf");
+        // Never reads standard input, and holds its standard output open so the
+        // connection stays up while the pipe fills.
+        // One `sleep` rather than a loop of them: this runs beside the rest of
+        // the suite, and a peer that forks a process a second is pressure the
+        // test does not need.
+        let deaf_peer = fixture.shim(
+            "deaf-peer",
+            "#!/bin/sh\nprintf '{\"jsonrpc\":\"2.0\",\"method\":\"ready\"}\\n'\nsleep 60\n",
+        );
+        let transport = connect(&deaf_peer, &workspace);
+        assert_eq!(
+            next(&transport).unwrap(),
+            Message::notification("ready", None)
+        );
+        transport.handshake_complete();
+
+        let filler = "x".repeat(64 * 1024);
+        let started = Instant::now();
+        let error = loop {
+            let deadline = Instant::now() + Duration::from_millis(200);
+            match transport.send(
+                Message::notification("flood", Some(json!({ "text": filler }))),
+                deadline,
+            ) {
+                Ok(()) => assert!(
+                    started.elapsed() < Duration::from_secs(20),
+                    "the peer's pipe never filled"
+                ),
+                Err(error) => break error,
+            }
+        };
+
+        assert_eq!(
+            error.kind(),
+            "send_timed_out",
+            "the caller's own deadline is not evidence that the peer is gone"
+        );
+        assert!(!error.is_terminal());
+        // And the connection is still there, because nothing about a short
+        // deadline says otherwise.
+        assert_eq!(
+            transport
+                .recv_deadline(Instant::now() + Duration::from_millis(50))
+                .unwrap(),
+            None
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the enqueue ran past the caller's deadline to its own backstop"
+        );
+    }
+
     #[test]
     #[cfg(unix)]
     fn an_already_cancelled_token_launches_nothing() {
@@ -1422,8 +1520,11 @@ done
 
         assert_eq!(next(&bad).unwrap_err().kind(), "desynchronized");
 
-        good.send(Message::request(RequestId::Number(1), "ping", None))
-            .unwrap();
+        good.send(
+            Message::request(RequestId::Number(1), "ping", None),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
         assert_eq!(
             next(&good).unwrap(),
             Message::result(RequestId::Number(1), json!({"echoed": true}))

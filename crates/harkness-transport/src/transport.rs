@@ -30,17 +30,25 @@ use crate::{error::TransportError, message::Message};
 /// messages, so `send` and `recv_deadline` take `&self` and must be safe to call
 /// concurrently.
 pub trait JsonRpcTransport: Send + Sync {
-    /// Hands one message to the peer.
+    /// Hands one message to the peer, giving up at `deadline`.
     ///
     /// Returns once the message is queued for the peer, not once the peer has
     /// read it — nothing but a response tells a caller that.
     ///
+    /// The deadline is not ceremony. A peer that has stopped reading its own
+    /// standard input fills its pipe, then the queue behind it, and an enqueue
+    /// with no bound would sit there; one with a bound of the transport's own
+    /// choosing would overrun a caller that asked for an answer within a second
+    /// by however much the two numbers differ. So the caller's deadline travels
+    /// with the message, which is what ADR-0012 means by blocking calls with
+    /// explicit deadlines.
+    ///
     /// # Errors
     ///
     /// Returns [`TransportError`] when the message cannot be framed, the peer is
-    /// gone, the connection is quarantined, or the write could not be handed
-    /// over before its own deadline.
-    fn send(&self, message: Message) -> Result<(), TransportError>;
+    /// gone, the connection is quarantined, or the message could not be handed
+    /// over before `deadline`.
+    fn send(&self, message: Message, deadline: Instant) -> Result<(), TransportError>;
 
     /// Takes the next message from the peer, waiting until `deadline`.
     ///

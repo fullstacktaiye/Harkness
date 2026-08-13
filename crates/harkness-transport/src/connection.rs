@@ -67,6 +67,19 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// than a diagnosis.
 const PEER_CAPACITY: usize = 4096;
 
+/// Bytes of peer-initiated content held for an adapter that has not taken it.
+///
+/// A count is not a bound on memory, and the two have to be stated separately or
+/// the product of them is the real answer: `PEER_CAPACITY` messages each just
+/// under [`DEFAULT_MAX_MESSAGE_BYTES`] is tens of gigabytes, reached with every
+/// per-message bound respected. A peer chooses both how many messages it sends
+/// and how large each one is, so it chooses that product, which makes the
+/// aggregate exactly the kind of thing a peer must not be allowed to pick.
+/// Whichever bound is reached first stops the pump.
+///
+/// [`DEFAULT_MAX_MESSAGE_BYTES`]: crate::DEFAULT_MAX_MESSAGE_BYTES
+const PEER_BYTE_BUDGET: usize = 64 * 1024 * 1024;
+
 /// Request ids remembered after their caller is finished with them.
 ///
 /// A retired id is what tells a *late* answer — to a request whose caller gave
@@ -86,6 +99,19 @@ pub enum PeerMessage {
     Notification(Notification),
 }
 
+impl PeerMessage {
+    /// Roughly what holding this message costs, for the aggregate bound.
+    fn retained_bytes(&self) -> usize {
+        let (method, params) = match self {
+            Self::Request(request) => (&request.method, request.params.as_ref()),
+            Self::Notification(notification) => {
+                (&notification.method, notification.params.as_ref())
+            }
+        };
+        method.len() + params.map_or(0, retained_bytes)
+    }
+}
+
 /// One correlated JSON-RPC conversation.
 pub struct Connection {
     transport: Box<dyn JsonRpcTransport>,
@@ -97,8 +123,57 @@ pub struct Connection {
     pump: Mutex<()>,
     pending: Mutex<Pending>,
     answered: Condvar,
-    peers: Mutex<VecDeque<PeerMessage>>,
+    peers: Mutex<PeerQueue>,
     arrived: Condvar,
+}
+
+/// Peer-initiated messages waiting for an adapter, bounded two ways.
+#[derive(Default)]
+struct PeerQueue {
+    waiting: VecDeque<(PeerMessage, usize)>,
+    bytes: usize,
+}
+
+impl PeerQueue {
+    /// Whether the pump must stop reading.
+    fn is_full(&self) -> bool {
+        self.waiting.len() >= PEER_CAPACITY || self.bytes >= PEER_BYTE_BUDGET
+    }
+
+    fn push(&mut self, message: PeerMessage) {
+        let bytes = message.retained_bytes();
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.waiting.push_back((message, bytes));
+    }
+
+    fn pop(&mut self) -> Option<PeerMessage> {
+        let (message, bytes) = self.waiting.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(bytes);
+        Some(message)
+    }
+}
+
+/// Roughly what a parsed value costs to keep, for the aggregate bound.
+///
+/// An estimate rather than a measurement: re-serializing every message to size
+/// it would double the parsing this engine already did, and the bound only has
+/// to be the right order of magnitude to stop a peer choosing how much memory
+/// this process holds. `serde_json` caps nesting depth while parsing, so the
+/// recursion here is over a structure whose depth is already bounded.
+fn retained_bytes(value: &Value) -> usize {
+    const OVERHEAD: usize = 16;
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => OVERHEAD,
+        Value::String(text) => OVERHEAD + text.len(),
+        Value::Array(items) => OVERHEAD + items.iter().map(retained_bytes).sum::<usize>(),
+        Value::Object(fields) => {
+            OVERHEAD
+                + fields
+                    .iter()
+                    .map(|(name, value)| OVERHEAD + name.len() + retained_bytes(value))
+                    .sum::<usize>()
+        }
+    }
 }
 
 #[derive(Default)]
@@ -222,7 +297,7 @@ impl Connection {
             pump: Mutex::new(()),
             pending: Mutex::new(Pending::default()),
             answered: Condvar::new(),
-            peers: Mutex::new(VecDeque::new()),
+            peers: Mutex::new(PeerQueue::default()),
             arrived: Condvar::new(),
         }
     }
@@ -262,7 +337,7 @@ impl Connection {
 
         if let Err(error) = self
             .transport
-            .send(Message::request(id.clone(), method, params))
+            .send(Message::request(id.clone(), method, params), deadline)
         {
             self.retire(&id, false);
             return Err(error);
@@ -311,16 +386,22 @@ impl Connection {
         }
     }
 
-    /// Calls `method` and expects no answer.
+    /// Calls `method` and expects no answer, giving up at `deadline`.
     ///
     /// # Errors
     ///
     /// As [`JsonRpcTransport::send`].
-    pub fn notify(&self, method: &str, params: Option<Value>) -> Result<(), TransportError> {
-        self.transport.send(Message::notification(method, params))
+    pub fn notify(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        deadline: Instant,
+    ) -> Result<(), TransportError> {
+        self.transport
+            .send(Message::notification(method, params), deadline)
     }
 
-    /// Answers a peer-initiated request.
+    /// Answers a peer-initiated request, giving up at `deadline`.
     ///
     /// # Errors
     ///
@@ -329,9 +410,10 @@ impl Connection {
         &self,
         id: RequestId,
         outcome: Result<Value, PeerError>,
+        deadline: Instant,
     ) -> Result<(), TransportError> {
         self.transport
-            .send(Message::Response(Response { id, outcome }))
+            .send(Message::Response(Response { id, outcome }), deadline)
     }
 
     /// Takes the next peer-initiated message, waiting until `deadline`.
@@ -348,12 +430,7 @@ impl Connection {
         deadline: Instant,
     ) -> Result<Option<PeerMessage>, TransportError> {
         loop {
-            if let Some(message) = self
-                .peers
-                .lock()
-                .expect("peer queue is not poisoned")
-                .pop_front()
-            {
+            if let Some(message) = self.peers.lock().expect("peer queue is not poisoned").pop() {
                 return Ok(Some(message));
             }
             {
@@ -384,7 +461,12 @@ impl Connection {
             .lock()
             .expect("pending table is not poisoned")
             .outstanding();
-        counters.peer_depth = self.peers.lock().expect("peer queue is not poisoned").len();
+        counters.peer_depth = self
+            .peers
+            .lock()
+            .expect("peer queue is not poisoned")
+            .waiting
+            .len();
         counters
     }
 
@@ -424,7 +506,12 @@ impl Connection {
         // No implementation escapes the underlying choice: one ordered stream,
         // an application queue with a bound, and an answer behind unconsumed
         // messages leaves grow, discard, and fail as the whole of it.
-        if self.peers.lock().expect("peer queue is not poisoned").len() >= PEER_CAPACITY {
+        if self
+            .peers
+            .lock()
+            .expect("peer queue is not poisoned")
+            .is_full()
+        {
             return Err(TransportError::PeerQueueFull {
                 capacity: PEER_CAPACITY,
             });
@@ -491,7 +578,7 @@ impl Connection {
         self.peers
             .lock()
             .expect("peer queue is not poisoned")
-            .push_back(message);
+            .push(message);
         self.arrived.notify_all();
         Ok(())
     }
@@ -583,7 +670,7 @@ mod tests {
     }
 
     impl JsonRpcTransport for ScriptedTransport {
-        fn send(&self, message: Message) -> Result<(), TransportError> {
+        fn send(&self, message: Message, _deadline: Instant) -> Result<(), TransportError> {
             if self.echo
                 && let Message::Request(request) = &message
             {
@@ -772,7 +859,7 @@ mod tests {
         };
         assert_eq!(request.id, RequestId::from("peer-1"));
         connection
-            .respond(request.id, Ok(json!({"content": ""})))
+            .respond(request.id, Ok(json!({"content": ""})), soon())
             .unwrap();
     }
 
@@ -928,7 +1015,7 @@ mod tests {
         let connection = Connection::new(transport, Cancellation::default());
 
         connection
-            .notify("notifications/cancelled", Some(json!({"id": 1})))
+            .notify("notifications/cancelled", Some(json!({"id": 1})), soon())
             .unwrap();
 
         assert!(matches!(
@@ -1044,6 +1131,38 @@ mod tests {
             connection.request("second", None, soon()).unwrap(),
             Ok(json!({"ok": true})),
             "the abandoned request's late answer was discarded, not quarantined"
+        );
+    }
+
+    /// A count bounds messages, not memory. Sixteen-mebibyte notifications
+    /// reach the byte budget thousands of messages before the count bound, and
+    /// without the second bound every per-message limit would be respected while
+    /// the process held tens of gigabytes.
+    #[test]
+    fn the_peer_queue_is_bounded_by_bytes_as_well_as_by_count() {
+        let bulky = "x".repeat(4 * 1024 * 1024);
+        let scripted = (0..64)
+            .map(|_| {
+                Ok(Message::notification(
+                    "tick",
+                    Some(json!({ "text": bulky })),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let (transport, _recorded) = ScriptedTransport::with(scripted);
+        let connection = Connection::new(transport, Cancellation::default());
+
+        let error = connection.request("slow", None, soon()).unwrap_err();
+
+        assert_eq!(error.kind(), "peer_queue_full");
+        let depth = connection.counters().peer_depth;
+        assert!(
+            depth < super::PEER_CAPACITY,
+            "{depth} messages queued, so the count bound stopped it rather than the byte budget"
+        );
+        assert!(
+            connection.peers.lock().unwrap().bytes <= super::PEER_BYTE_BUDGET + bulky.len(),
+            "the budget was passed by more than the message that reached it"
         );
     }
 

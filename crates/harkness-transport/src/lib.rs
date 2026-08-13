@@ -68,8 +68,9 @@
 //! # Mapping these failures into a protocol
 //!
 //! An adapter turns a [`TransportError`] into its own vocabulary, and the useful
-//! rule is that only three of them are about one *call* —
+//! rule is that only four of them are about one *call* —
 //! [`RequestTimedOut`](TransportError::RequestTimedOut),
+//! [`SendTimedOut`](TransportError::SendTimedOut),
 //! [`UnencodableMessage`](TransportError::UnencodableMessage), and
 //! [`PeerQueueFull`](TransportError::PeerQueueFull) — which
 //! [`is_terminal`](TransportError::is_terminal) answers for. Everything else has

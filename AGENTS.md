@@ -844,6 +844,12 @@ a line is assembled is not a limit. The inbound queue, the outbound queue, the p
 and the retained stderr tail are each capped, and a full queue blocks its producer rather than
 growing. Nothing is discarded to make room.
 
+A message count is not a bound on memory, and the peer-message queue therefore carries a byte budget
+beside its count. A peer picks both how many messages it sends and how large each one is, so it picks
+their product: the count bound alone permits thousands of near-maximum messages and tens of gigabytes
+with every per-message limit respected. Whichever bound is reached first stops the pump. Any new
+queue holding peer-supplied content owes the same pair.
+
 A connection that faults is **quarantined and never resynchronized**. A non-JSON line, JSON that is
 not a JSON-RPC 2.0 message, a response to an id nobody sent, a second response to one already
 answered, and an oversized line all end the conversation. The thread that observed the fault gets the
@@ -902,6 +908,13 @@ taken while the pending table or the peer queue is held. Three OS threads per co
 reader, writer, stderr reader — is the whole cost, and a fourth must not be added to "simplify"
 reading: a dispatcher blocked pushing into a full queue stalls every response behind it, which is the
 same stall with another thread paid for.
+
+A caller's deadline bounds its *send* as well as its wait. A peer that stops reading its standard
+input fills its pipe and then the queue behind it, and an enqueue bounded only by the transport's own
+backstop overruns a one-second caller by thirty. Which bound expired decides which failure it is, and
+the distinction is load-bearing: the backstop expiring is a broken peer and is terminal, while the
+caller's own deadline expiring is `send_timed_out`, which is not — a short deadline is not evidence
+about the peer, and collapsing the two would let an impatient call end a working session.
 
 Cancellation is polled every 20 ms in every blocking phase, well inside the workspace's 250 ms
 visibility target, and an already-cancelled token launches nothing at all. `harkness_git::Cancellation`
