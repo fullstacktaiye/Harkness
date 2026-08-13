@@ -648,10 +648,22 @@ executor's panic boundary covers the tool body and nothing else, so a panic in t
 it unwinds the scheduler's own worker; without the guard the mutation slot is held forever, a
 process slot is lost from a pool that never grows back, and shutdown can never reach idle again.
 
-A workspace's running set is keyed by a per-scheduler dispatch sequence rather than by
-`ToolCallId`, because only the former is unique. The executor refuses a call submitted twice, but
-it refuses it *after* dispatch, so keying by call id would let the second admission overwrite the
-first's entry and the first completion free both.
+One recorded call has at most one claim on a scheduler at a time; a second submission is refused
+with `already_scheduled`. The executor refuses a duplicate too, but only *after* dispatch, by which
+point the loser has taken a workspace slot — and a second claim also makes
+`ToolExecutor::cancel_undispatched` racy, since it reads a call's state and writes its terminal
+state in two steps: a queued claim being swept could read `pending`, be overtaken by the other
+claim's dispatch, and record `cancelled` over a body that had just started. The claim is released
+when the call reaches a terminal state, so a genuine retry is never blocked. A workspace's running
+set is additionally keyed by a per-scheduler dispatch sequence rather than by `ToolCallId`, which
+keeps that collision unrepresentable rather than merely unreached.
+
+A worker is counted into `Workers` by `admit`, under the workspace lock, not beside the
+`thread::spawn` that follows. `stop` reads the running set under that same lock, so a call it can
+see and cancel is one `wait_until_idle` is already obliged to wait for; counting later leaves a
+window in which `shutdown` trips a token, observes no live workers, and reports a clean stop while
+a worker is still about to start. The resulting order — workspace lock → `Workers` — cannot invert,
+because nothing under `Workers` takes a workspace lock.
 
 At most one call above `RiskLevel::Observe` runs per workspace at a time, and it runs alone —
 reads do not overlap a mutation of the same worktree. This is a safety property, not a throughput

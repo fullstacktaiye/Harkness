@@ -1,6 +1,6 @@
 //! Admission, dispatch, cancellation, and shutdown.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -151,12 +151,12 @@ impl ScheduledCall {
 /// One admitted call's place in its workspace's running set.
 ///
 /// A sequence number rather than the call's own identity, because only one of
-/// the two is guaranteed unique. Nothing stops a caller submitting one recorded
-/// call twice — the executor refuses the second, which is the right answer, but
-/// it refuses it *after* dispatch. Keyed by `ToolCallId`, the second admission
-/// would overwrite the first's entry, and the first completion would then free
-/// both: a process slot released that was never taken, and a workspace reported
-/// idle while a call was still running in it.
+/// the two is unique by construction. [`Scheduler::submit`] now refuses a
+/// second claim on one recorded call, so a duplicate key should be
+/// unreachable — this keeps it *unrepresentable*. Keyed by `ToolCallId`, two
+/// admissions of one call would share an entry and the first completion would
+/// free both: a process slot released that was never taken, and a workspace
+/// reported idle while a call was still running in it.
 type Dispatch = u64;
 
 /// What one call is waiting for, and what to do when it gets it.
@@ -276,6 +276,11 @@ impl ProcessLimit {
 }
 
 /// How many worker threads are alive, so shutdown can wait for zero.
+///
+/// Both counters are leaves in the lock order: a workspace lock is held across
+/// [`enter`](Self::enter) — deliberately, so a call `stop` can see is one
+/// shutdown must wait for — but nothing here ever takes a workspace lock, so
+/// the order **workspace → workers** cannot be inverted.
 #[derive(Default)]
 struct Workers {
     live: Mutex<usize>,
@@ -346,6 +351,11 @@ struct Inner {
     dispatched: AtomicU64,
     /// Rotates which workspace a freed process slot is offered to first.
     sweep: AtomicUsize,
+    /// Every recorded call this scheduler currently has a claim on.
+    ///
+    /// A leaf in the lock order — nothing is taken while it is held — so it
+    /// composes with the rest without adding an edge to reason about.
+    claimed: Mutex<BTreeSet<ToolCallId>>,
     shutting_down: AtomicBool,
 }
 
@@ -497,6 +507,7 @@ impl Scheduler {
                 workers: Workers::default(),
                 dispatched: AtomicU64::new(0),
                 sweep: AtomicUsize::new(0),
+                claimed: Mutex::new(BTreeSet::new()),
                 shutting_down: AtomicBool::new(false),
             }),
         }
@@ -513,27 +524,42 @@ impl Scheduler {
     /// misattribute work to another run's cancellation, and cannot understate a
     /// tool's declared risk to skip a mutation slot.
     ///
+    /// One recorded call has at most one claim on it at a time. A second
+    /// submission of a call still queued or running here is refused rather than
+    /// admitted, because two claims would mean two workspace slots and two
+    /// tickets for one row — and the executor's refusal of the duplicate
+    /// arrives only *after* dispatch, by which point the loser has already
+    /// occupied a mutation slot. The claim is released as soon as the call
+    /// reaches a terminal state, so a genuine retry is never blocked.
+    ///
     /// # Errors
     ///
-    /// Returns [`ScheduleError::Shutdown`] when the scheduler is stopping, and
-    /// [`ScheduleError::Execution`] wrapping a store fault when the recorded
-    /// call cannot be read. A call naming a tool that is not registered is
-    /// *not* an error here: it is queued, dispatched, and recorded as a failed
-    /// call, because that is a fact about the run and belongs in its history.
+    /// Returns [`ScheduleError::Shutdown`] when the scheduler is stopping,
+    /// [`ScheduleError::AlreadyScheduled`] for a call this scheduler is already
+    /// carrying, and [`ScheduleError::Execution`] wrapping a store fault when
+    /// the recorded call cannot be read. A call naming a tool that is not
+    /// registered is *not* an error here: it is queued, dispatched, and
+    /// recorded as a failed call, because that is a fact about the run and
+    /// belongs in its history.
     pub fn submit(&self, call: ScheduledCall) -> Result<CallTicket, ScheduleError> {
         let inner = &self.inner;
         if inner.is_shutting_down() {
             return Err(ScheduleError::Shutdown { call: call.call });
         }
 
-        let record = inner
-            .executor
-            .store()
-            .load_tool_call(call.call)
-            .map_err(|source| ScheduleError::Execution {
-                call: call.call,
-                source: Box::new(ExecutionError::from(source)),
-            })?;
+        // Taken before anything else is done on this call's behalf, so a second
+        // claim is refused rather than admitted and then unwound.
+        inner.claim(call.call)?;
+        let record = match inner.executor.store().load_tool_call(call.call) {
+            Ok(record) => record,
+            Err(source) => {
+                inner.release(call.call);
+                return Err(ScheduleError::Execution {
+                    call: call.call,
+                    source: Box::new(ExecutionError::from(source)),
+                });
+            }
+        };
         let declared = inner.declared(record.tool_id(), record.tool_version());
         let (report, ticket) = outcome_channel(call.call);
         let waiting = Waiting {
@@ -588,6 +614,8 @@ impl Scheduler {
         }
         state.waiting -= 1;
         if inner.is_shutting_down() {
+            drop(state);
+            inner.release(call.call);
             return Err(ScheduleError::Shutdown { call: call.call });
         }
         state.queue.push_back(waiting);
@@ -751,11 +779,16 @@ struct Completion {
     inner: Arc<Inner>,
     workspace: Arc<Workspace>,
     dispatch: Dispatch,
+    call: ToolCallId,
 }
 
 impl Drop for Completion {
     fn drop(&mut self) {
         self.inner.complete(&self.workspace, self.dispatch);
+        // After the slots, because a call is only schedulable again once it is
+        // no longer occupying anything — and before `leave`, so a shutdown that
+        // observes no live workers also observes no claims.
+        self.inner.release(self.call);
         self.inner.workers.leave();
     }
 }
@@ -769,6 +802,27 @@ struct Declared {
 impl Inner {
     fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(Ordering::Acquire)
+    }
+
+    /// Takes this scheduler's one claim on `call`, or reports that it is taken.
+    fn claim(&self, call: ToolCallId) -> Result<(), ScheduleError> {
+        let mut claimed = self
+            .claimed
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if claimed.insert(call) {
+            Ok(())
+        } else {
+            Err(ScheduleError::AlreadyScheduled { call })
+        }
+    }
+
+    /// Releases the claim, so a call may be scheduled again once it has ended.
+    fn release(&self, call: ToolCallId) {
+        self.claimed
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&call);
     }
 
     /// Reads the declared risk and process demand of the tool a call names.
@@ -869,6 +923,14 @@ impl Inner {
                 .queue
                 .pop_front()
                 .expect("the queue was not empty a statement ago");
+            // Counted here, under the workspace lock, rather than beside the
+            // `thread::spawn` that follows. `stop` reads the running set under
+            // this same lock, so a call it can see and cancel is one whose
+            // worker `wait_until_idle` is already obliged to wait for.
+            // Counting it later leaves a window in which `shutdown` trips a
+            // token, observes no live workers, and reports a clean stop while
+            // a worker is still about to start.
+            self.workers.enter();
             state.running.insert(
                 waiting.dispatch,
                 Running {
@@ -890,15 +952,17 @@ impl Inner {
         }
         // The queue shrank, so anybody blocked on backpressure may proceed.
         workspace.room.notify_all();
+        // Each of these was counted into `Workers` by `admit`, under the
+        // workspace lock, and is counted out again by its `Completion` guard.
         for waiting in ready {
             let inner = Arc::clone(self);
             let workspace = Arc::clone(workspace);
-            self.workers.enter();
             let handle = thread::spawn(move || {
                 let completion = Completion {
                     inner,
                     workspace,
                     dispatch: waiting.dispatch,
+                    call: waiting.call,
                 };
                 let settled = completion.inner.run(&waiting);
                 // Freeing the slots and starting the next call before the
@@ -1059,6 +1123,9 @@ impl Inner {
                 let _ = waiting
                     .report
                     .send(self.executor.cancel_undispatched(waiting.call));
+                // This call never reached a worker, so nothing else will give
+                // its claim back.
+                self.release(waiting.call);
             }
             let ready = {
                 let mut state = workspace

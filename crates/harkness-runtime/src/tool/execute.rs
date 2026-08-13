@@ -545,6 +545,14 @@ impl ToolExecutor {
         &self.registry
     }
 
+    /// Both states a call can be cancelled from without ever being dispatched.
+    ///
+    /// Approval-gated work waits at `awaiting_approval` rather than `pending`,
+    /// so a cancellation that admitted only the latter would be unable to stop
+    /// exactly the calls most likely to be waiting when a user gives up.
+    const CANCELLABLE_UNDISPATCHED: [ToolCallState; 2] =
+        [ToolCallState::Pending, ToolCallState::AwaitingApproval];
+
     /// Records a call that will never be dispatched as `cancelled`.
     ///
     /// The third way a call reaches a terminal state, and the only one in which
@@ -558,14 +566,11 @@ impl ToolExecutor {
     /// every terminal recording in the runtime is still made by one function,
     /// with its event, in one transaction.
     ///
-    /// Both states a call can be cancelled from without ever being dispatched.
+    /// The state is read before the terminal write rather than inside it, so a
+    /// caller must not have two live claims on one recorded call — see
+    /// [`Scheduler::submit`](crate::schedule::Scheduler::submit), which refuses
+    /// the second and is what makes that hold above this layer.
     ///
-    /// Approval-gated work waits at `awaiting_approval` rather than `pending`,
-    /// so a cancellation that admitted only the latter would be unable to stop
-    /// exactly the calls most likely to be waiting when a user gives up.
-    const CANCELLABLE_UNDISPATCHED: [ToolCallState; 2] =
-        [ToolCallState::Pending, ToolCallState::AwaitingApproval];
-
     /// # Errors
     ///
     /// Returns [`ExecutionError::NotCancellable`] for a call that is already

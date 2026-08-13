@@ -31,6 +31,25 @@ pub enum ScheduleError {
         call: ToolCallId,
     },
 
+    /// The call is already queued or running in this scheduler.
+    ///
+    /// One recorded call has one claim on it at a time. Two would be two
+    /// tickets, two admissions, and two workspace slots for one row, and the
+    /// executor's refusal of the second arrives too late to prevent any of
+    /// that: it comes *after* dispatch, so the loser has already occupied a
+    /// mutation slot and possibly a process slot on the way to being told no.
+    ///
+    /// The refusal also protects the run store. A resolution that checks a
+    /// call's state and then writes its terminal state does so in two steps,
+    /// which is sound for one claim and racy for two — a queued claim being
+    /// cancelled could read `pending`, be overtaken by the other claim's
+    /// dispatch, and record `cancelled` over a body that had just started.
+    #[error("tool call {call} is already scheduled")]
+    AlreadyScheduled {
+        /// Call that was submitted twice.
+        call: ToolCallId,
+    },
+
     /// The worker carrying the call ended without reporting an outcome.
     ///
     /// The executor promises a terminal state on every path it returns from, so
@@ -67,7 +86,11 @@ impl ScheduleError {
     /// [`InvocationError`](crate::tool::InvocationError), which publishes a
     /// union for the same reason: a wrapper that renamed what it wrapped would
     /// make one refusal answer to two names.
-    pub const KINDS: &'static [&'static str] = &["scheduler_shutting_down", "worker_lost"];
+    pub const KINDS: &'static [&'static str] = &[
+        "scheduler_shutting_down",
+        "already_scheduled",
+        "worker_lost",
+    ];
 
     /// Every discriminant a `ScheduleError` can report, wrapped ones included.
     #[must_use]
@@ -84,6 +107,7 @@ impl ScheduleError {
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::Shutdown { .. } => "scheduler_shutting_down",
+            Self::AlreadyScheduled { .. } => "already_scheduled",
             Self::WorkerLost { .. } => "worker_lost",
             Self::Execution { source, .. } => source.kind(),
         }
@@ -97,9 +121,10 @@ impl ScheduleError {
     #[must_use]
     pub const fn call(&self) -> ToolCallId {
         match self {
-            Self::Shutdown { call } | Self::WorkerLost { call } | Self::Execution { call, .. } => {
-                *call
-            }
+            Self::Shutdown { call }
+            | Self::AlreadyScheduled { call }
+            | Self::WorkerLost { call }
+            | Self::Execution { call, .. } => *call,
         }
     }
 }

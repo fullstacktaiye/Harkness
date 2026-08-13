@@ -1059,47 +1059,54 @@ fn a_call_naming_an_unregistered_tool_is_recorded_rather_than_refused() {
 }
 
 #[test]
-fn submitting_one_recorded_call_twice_leaves_the_accounting_intact() {
+fn one_recorded_call_may_only_be_scheduled_once_at_a_time() {
     let fixture = Fixture::new();
-    let scheduler = fixture.scheduler_with_process_limit(
-        vec![eraseit(Immediate("fixture.twice", RiskLevel::Observe))],
-        1,
-    );
+    let (holds, gate) = Gated::new("fixture.twice", RiskLevel::WorkspaceWrite);
+    let scheduler = fixture.scheduler_with_process_limit(vec![eraseit(holds)], 1);
 
     let workspace = fixture.workspace("twice");
     let step = fixture.run(&workspace);
     let call = fixture.call(&step, "fixture.twice");
 
-    // Nothing stops a caller doing this, and the executor is what refuses it —
-    // after dispatch. The scheduler's running set is keyed by dispatch rather
-    // than by call, so the first completion frees the first admission and not
-    // both.
-    let first = submit(&scheduler, call, &workspace, RiskLevel::Observe);
-    let second = submit(&scheduler, call, &workspace, RiskLevel::Observe);
+    let first = submit(&scheduler, call, &workspace, RiskLevel::WorkspaceWrite);
+    gate.wait_for(1);
 
-    // One of the two is refused, and *which* refusal depends on which side of
-    // the dispatch transaction the race lands on — `not_dispatchable` when the
-    // executor's own pre-check sees the call already running, and the store's
-    // refusal of the second transition when both got past it. Both are the
-    // executor's business; what this test is about is that the scheduler's
-    // accounting survives either.
-    let outcomes = [settled(first), settled(second)];
-    let refused = outcomes.iter().filter(|outcome| outcome.is_err()).count();
-    assert_eq!(
-        refused, 1,
-        "exactly one of the two should have been refused"
-    );
-    assert_eq!(fixture.state(call), ToolCallState::Succeeded);
+    // Refused at submission rather than after dispatch. The executor does
+    // refuse a call handed to it twice, but only once the duplicate has taken
+    // a workspace slot on its way to being told no — and a second claim also
+    // makes the read-then-write in `cancel_undispatched` racy, which is what
+    // could record `cancelled` over a body that had just started.
+    let duplicate = scheduler
+        .submit(ScheduledCall::new(
+            call,
+            workspace.clone(),
+            RiskLevel::WorkspaceWrite,
+            Cancellation::default(),
+        ))
+        .unwrap_err();
+    assert_eq!(duplicate.kind(), "already_scheduled");
+    assert_eq!(duplicate.call(), call);
+    assert_eq!(gate.arrivals(), 1, "the duplicate reached the tool");
+
+    gate.release();
+    assert_eq!(succeeded(first), ToolCallState::Succeeded);
+
+    // The claim is released with the call, so a later submission is judged on
+    // the record's own terms — by the executor — rather than refused because
+    // the scheduler still believes it is carrying it.
+    let retried = settled(submit(
+        &scheduler,
+        call,
+        &workspace,
+        RiskLevel::WorkspaceWrite,
+    ));
+    assert_eq!(retried.unwrap_err().kind(), "not_dispatchable");
 
     until("the scheduler settling", || {
         scheduler.snapshot().workspaces().is_empty()
     });
     let processes = scheduler.snapshot().processes();
-    assert_eq!(
-        (processes.in_use(), processes.available()),
-        (0, 1),
-        "a slot was released that was never taken"
-    );
+    assert_eq!((processes.in_use(), processes.available()), (0, 1));
 }
 
 #[test]
@@ -1426,6 +1433,10 @@ fn schedule_error_kinds_round_trip_and_do_not_collide_with_the_others() {
     let call = ToolCallId::new();
     let cases = [
         (ScheduleError::Shutdown { call }, "scheduler_shutting_down"),
+        (
+            ScheduleError::AlreadyScheduled { call },
+            "already_scheduled",
+        ),
         (ScheduleError::WorkerLost { call }, "worker_lost"),
     ];
 
