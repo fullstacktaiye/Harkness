@@ -81,8 +81,17 @@
 //!
 //! # What is not here
 //!
-//! Scheduling, queueing, and concurrency limits (#93); deciding *whether* a call
-//! may run (#91, #92); and any concrete tool (#94, #95).
+//! Scheduling, queueing, and concurrency limits, which are
+//! [`schedule`](crate::schedule)'s; deciding *whether* a call may run, which is
+//! [`policy`](crate::policy)'s and [`approval`](crate::approval)'s; and any
+//! concrete tool (#94, #95).
+//!
+//! The one concession to the layer above is
+//! [`cancel_undispatched`](ToolExecutor::cancel_undispatched), which records a
+//! queued call as `cancelled` without starting it. It is here rather than in
+//! the scheduler so that every terminal state in the runtime is still written
+//! by [`finish`](ToolExecutor::finish), paired with its event in one
+//! transaction.
 //!
 //! # Two ways in, because a decision resumes the work it decided
 //!
@@ -495,6 +504,58 @@ impl ToolExecutor {
     #[must_use]
     pub const fn limits(&self) -> ExecutionLimits {
         self.limits
+    }
+
+    /// The store every call this executor runs is recorded in.
+    ///
+    /// Crate-internal so the scheduler reads a submitted call's run and step
+    /// without being handed a second store that could disagree with this one.
+    pub(crate) const fn store(&self) -> &Arc<Store> {
+        &self.store
+    }
+
+    /// The registry every call this executor resolves against.
+    ///
+    /// Crate-internal for the same reason as [`store`](Self::store): the
+    /// scheduler reads a tool's declared risk and whether it spawns processes,
+    /// and must read them from the registry that will actually run the call.
+    pub(crate) const fn registry(&self) -> &Arc<ToolRegistry> {
+        &self.registry
+    }
+
+    /// Records a call that will never be dispatched as `cancelled`.
+    ///
+    /// The third way a call reaches a terminal state, and the only one in which
+    /// no tool runs. A scheduler that cancels a run has to resolve the calls
+    /// still waiting in its queues, and "cancelled without being dispatched" is
+    /// not something [`execute`](Self::execute) can express: dispatching a call
+    /// in order to stop it would start a body, take a process slot, and write a
+    /// `running` state for work that never began.
+    ///
+    /// It goes through the executor rather than straight to the store so that
+    /// every terminal recording in the runtime is still made by one function,
+    /// with its event, in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionError::NotDispatchable`] for a call that is already
+    /// `running` or already terminal — a running call is stopped through its
+    /// token, not by writing over it — and [`ExecutionError::Store`] when the
+    /// record cannot be read or written.
+    pub fn cancel_undispatched(&self, call: ToolCallId) -> Result<CompletedCall, ExecutionError> {
+        let record = self.store.load_tool_call(call)?;
+        let state = record.state();
+        if !matches!(
+            state,
+            ToolCallState::Pending | ToolCallState::AwaitingApproval
+        ) {
+            return Err(ExecutionError::NotDispatchable {
+                call,
+                state,
+                expected: ToolCallState::Pending,
+            });
+        }
+        self.finish(call, record.step_id(), None, CallOutcome::Cancelled)
     }
 
     /// Runs one recorded call to a terminal state.

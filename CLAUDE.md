@@ -105,6 +105,11 @@ translating between two cancellation mechanisms.
   enter the process. `domain::ToolCall` records *that* a tool ran; `tool` is what defines and
   executes one. `store` and `tool` both build on `domain` but not on each other, so persistence and
   execution can be reasoned about — and tested — separately.
+  `schedule` sits above `tool` and decides *when* a call runs: per-workspace mutation
+  serialization keyed by `(ProjectId, canonical root)`, a per-workspace read cap, a global
+  child-process limit taken from the tool's own `spawns_processes` declaration, bounded queues that
+  block their producer, and a cancellation chain reaching a child's process group. Only the front
+  of a workspace's queue is ever considered, which is what makes starvation unrepresentable.
   `approval` sits above `policy` and `store`: it owns the durable approval record and its
   lifecycle, the frozen canonical input hash a grant is bound to, the matcher that decides whether
   an existing grant covers a new call, and the condvar-backed gate a parked call is woken through.
@@ -127,10 +132,15 @@ translating between two cancellation mechanisms.
 - **`harkness-test-fixtures`** is dev-only: hermetic temp repos, process fixtures, and the
   child-re-execution helpers. `COMMIT_EPOCH_SECONDS` is fixed so fixture repos hash identically.
 
-### Three independent concurrency mechanisms
+### Four independent concurrency mechanisms
 
 Getting these confused is the main source of deadlock risk:
 
+0. **Scheduler workspace slot** (`harkness-runtime/src/schedule`) — in-process only, keyed by
+   `(ProjectId, canonical root)`. At most one mutating tool call per workspace, reads capped, child
+   processes capped globally. Nests *outside* the repository lock; its own internal order is
+   workspace map → one workspace → process limit, and none of the three is ever held across an
+   executor call, a store write, or a child wait.
 1. **Repository lock** (`harkness-git/src/lock.rs`) — advisory file lock keyed by Git's *common
    directory*, so every linked worktree of one repo shares it. Taken for every mutation, never for
    a read. Held across network operations. Lives under `locks/` in the data directory, never inside
@@ -140,8 +150,9 @@ Getting these confused is the main source of deadlock risk:
 3. **Run store** (`harkness-runtime/src/store`) — one mutex-guarded writer connection plus pooled
    readers; `BEGIN IMMEDIATE` per read-modify-write.
 
-**Ordering: repository lock, then catalog lock.** The store takes neither, and no caller may hold a
-store transaction while acquiring either.
+**Ordering: scheduler workspace slot, then repository lock, then catalog lock.** The store takes
+none of them, and no caller may hold a store transaction while acquiring any. The scheduler cannot
+violate the two beneath it because it calls no catalog or Git code at all.
 
 ### The hermetic Git invocation policy
 

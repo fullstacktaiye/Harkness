@@ -329,6 +329,7 @@ pub struct ToolMetadata {
     capabilities: Vec<Capability>,
     environment: Vec<EnvironmentName>,
     timeout: ToolTimeout,
+    spawns_processes: bool,
 }
 
 impl ToolMetadata {
@@ -352,6 +353,7 @@ impl ToolMetadata {
             capabilities: Vec::new(),
             environment: Vec::new(),
             timeout: ToolTimeout::for_risk(risk),
+            spawns_processes: false,
         }
     }
 
@@ -400,6 +402,25 @@ impl ToolMetadata {
         self
     }
 
+    /// Declares that calls of this tool start child processes.
+    ///
+    /// Stated by the author rather than inferred, for the same reason the
+    /// timeout is: nothing outside the body can see whether it reaches for a
+    /// process, and [`RiskLevel`] is the wrong proxy in both directions — a
+    /// `Network` tool that shells out to Git sits above [`RiskLevel::Execute`],
+    /// and an in-process interpreter could sit at it while spawning nothing.
+    ///
+    /// The one consumer is the scheduler's global process limit
+    /// ([`schedule`](crate::schedule)), which bounds how many children Harkness
+    /// may have alive at once across every run. A tool that under-declares is
+    /// scheduled as though it spawned nothing and its children escape that
+    /// bound; over-declaring only costs it a slot it did not need.
+    #[must_use]
+    pub const fn spawning_processes(mut self) -> Self {
+        self.spawns_processes = true;
+        self
+    }
+
     /// Identity this tool is registered and recorded under.
     #[must_use]
     pub const fn identity(&self) -> &ToolIdentity {
@@ -440,6 +461,12 @@ impl ToolMetadata {
     #[must_use]
     pub const fn timeout(&self) -> ToolTimeout {
         self.timeout
+    }
+
+    /// Whether calls of this tool start child processes.
+    #[must_use]
+    pub const fn spawns_processes(&self) -> bool {
+        self.spawns_processes
     }
 
     /// Checks the fields a front end has to render.
@@ -511,6 +538,7 @@ pub struct ToolDescriptor {
     environment: Vec<EnvironmentName>,
     #[serde(rename = "default_timeout_ms")]
     timeout: ToolTimeout,
+    spawns_processes: bool,
     input_schema: Value,
     output_schema: Value,
 }
@@ -526,6 +554,7 @@ impl ToolDescriptor {
             capabilities,
             environment,
             timeout,
+            spawns_processes,
         } = metadata;
         Self {
             identity,
@@ -535,6 +564,7 @@ impl ToolDescriptor {
             capabilities,
             environment,
             timeout,
+            spawns_processes,
             input_schema,
             output_schema,
         }
@@ -592,6 +622,15 @@ impl ToolDescriptor {
     #[must_use]
     pub const fn timeout(&self) -> ToolTimeout {
         self.timeout
+    }
+
+    /// Whether calls of this tool start child processes.
+    ///
+    /// Read by the scheduler's global process limit; see
+    /// [`ToolMetadata::spawning_processes`].
+    #[must_use]
+    pub const fn spawns_processes(&self) -> bool {
+        self.spawns_processes
     }
 
     /// JSON Schema generated from the tool's `Input` associated type.
@@ -887,6 +926,20 @@ mod tests {
     }
 
     #[test]
+    fn spawning_processes_is_declared_by_the_author_and_defaults_to_false() {
+        // Defaulting the other way would give every tool a slot in the
+        // scheduler's global process limit, so a workspace full of in-process
+        // reads would throttle itself against a bound that exists for children.
+        assert!(!metadata().spawns_processes());
+        assert!(metadata().spawning_processes().spawns_processes());
+        assert!(
+            ToolDescriptor::new(metadata().spawning_processes(), json!({}), json!({}))
+                .spawns_processes(),
+            "the declaration must survive assembly into the published contract"
+        );
+    }
+
+    #[test]
     fn the_serialized_descriptor_publishes_identity_inline_in_a_fixed_order() {
         let descriptor = ToolDescriptor::new(
             metadata().with_capabilities([Capability::new("fs.read").unwrap()]),
@@ -900,6 +953,7 @@ mod tests {
                 r#"{"id":"fixture.tool","version":"1.0.0","title":"Fixture tool","#,
                 r#""description":"Echoes its input back for tests.","risk":"observe","#,
                 r#""capabilities":["fs.read"],"environment":[],"default_timeout_ms":30000,"#,
+                r#""spawns_processes":false,"#,
                 r#""input_schema":{"type":"object"},"output_schema":{"type":"string"}}"#,
             )
         );

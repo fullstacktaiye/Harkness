@@ -20,6 +20,13 @@
 //! a caller cannot describe a request as milder than the descriptor and its
 //! validated input make it.
 //!
+//! [`schedule`] sits above [`tool`] and decides *when* a call runs: mutations
+//! of one workspace are serialized against each other, reads of it run
+//! concurrently up to a cap, child processes are bounded across every run, and
+//! cancelling a run reaches every call it owns down to the child's process
+//! group. The executor promises one call reaches a terminal state; the
+//! scheduler is what says anything at all about a second one.
+//!
 //! [`approval`] is where a policy `Ask` becomes durable. It owns the request
 //! record and its lifecycle, the frozen canonical hash a grant is bound to, the
 //! matcher that decides whether an existing grant covers a new call, and the
@@ -30,6 +37,7 @@
 pub mod approval;
 pub mod domain;
 pub mod policy;
+pub mod schedule;
 pub mod store;
 pub mod tool;
 pub mod trust;

@@ -347,7 +347,7 @@ impl PathBoundary {
     }
 }
 
-fn canonical_root(root: &Path) -> Result<PathBuf, BoundaryError> {
+pub(crate) fn canonical_root(root: &Path) -> Result<PathBuf, BoundaryError> {
     let canonical = fs::canonicalize(root).map_err(|source| BoundaryError::RootUnavailable {
         root: root.to_path_buf(),
         reason: source.to_string(),

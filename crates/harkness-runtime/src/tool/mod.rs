@@ -170,9 +170,11 @@
 //! It supplies metadata and execution; it does not decide *whether* to execute.
 //! There is no policy evaluation and no approval flow here — the executor
 //! records a decision it is handed and assumes an unheld call is already
-//! authorized, but which party decides and on what grounds is #91/#92's — and no
-//! scheduling, queueing, or concurrency limiting. No concrete production tool is
-//! registered here either; this module only defines the shape they take.
+//! authorized, but which party decides and on what grounds belongs to
+//! [`policy`](crate::policy) and [`approval`](crate::approval) — and no
+//! scheduling, queueing, or concurrency limiting, which belongs to
+//! [`schedule`](crate::schedule). No concrete production tool is registered
+//! here either; this module only defines the shape they take.
 
 mod context;
 mod descriptor;
