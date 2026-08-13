@@ -521,6 +521,7 @@ Kirigami.ApplicationWindow {
         && pagingControlsDetected === true
         && crossPageNavigationDetected === true
         && terminalHunkBoundaryDetected === true
+        && historyPreviewDetected === true
         && largeModelDetected === true
         && deepScrollDetected === true
         && realBridgePassed === true
@@ -540,6 +541,7 @@ Kirigami.ApplicationWindow {
             + "-" + pagingControlsDetected
             + "-" + crossPageNavigationDetected
             + "-" + terminalHunkBoundaryDetected
+            + "-" + historyPreviewDetected
             + "-" + fixtureBackend.nextPageCalls
             + "-" + fixtureBackend.previousPageCalls
             + "-" + reviewFixture.pendingHunkNavigation
@@ -567,6 +569,7 @@ Kirigami.ApplicationWindow {
     property bool pagingControlsDetected: false
     property bool crossPageNavigationDetected: false
     property bool terminalHunkBoundaryDetected: false
+    property bool historyPreviewDetected: false
     property bool largeModelDetected: false
     property bool deepScrollDetected: false
     property bool screenshotSaved: false
@@ -1186,6 +1189,21 @@ Kirigami.ApplicationWindow {
         project: projectFixture
     }
 
+    // Instantiate the history list directly so the smoke test creates its
+    // delegates even while the main panel is exercising the review surface.
+    HistoryPanel {
+        id: historyFixture
+
+        activity: activityFixture
+        backend: fixtureBackend
+        height: 400
+        project: projectFixture
+        visible: true
+        width: 320
+        x: -1000
+        y: -1000
+    }
+
     // The tab and the header toolbar are what GitPanel hosts; instantiating
     // them here as well is what makes their functions callable by name below.
     CommitSelection {
@@ -1260,6 +1278,22 @@ Kirigami.ApplicationWindow {
         realBackend.openProject(realProjectId);
         changesFixture.selectPath("fixture-path", "added", "modified");
         fixtureBackend.jobs = [];
+        const previewProbe = historyFixture.commitSummaryPreview(
+            "A commit subject that is deliberately longer than the history row limit "
+                + "so the preview must be shortened"
+        );
+        const unicodePreview = historyFixture.commitSummaryPreview(
+            "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\uD83D\uDE00 trailing"
+        );
+        const emptySummaryPreview = historyFixture.commitSummaryPreview(
+            "",
+            "The body must not become an empty commit subject's preview"
+        );
+        historyPreviewDetected = previewProbe.length === historyFixture.commitSummaryLimit
+            && previewProbe.endsWith("\u2026");
+        historyPreviewDetected = historyPreviewDetected
+            && unicodePreview === "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\uD83D\uDE00\u2026"
+            && emptySummaryPreview === "";
 
         // The Changes list is a keyed model rather than the entry array, so
         // this is what catches the roles or the binding drifting apart from

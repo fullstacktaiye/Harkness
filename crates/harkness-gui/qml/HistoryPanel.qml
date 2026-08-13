@@ -33,6 +33,13 @@ ColumnLayout {
         ? String(backend.review.commitId || "")
         : ""
 
+    // Commit subjects are usually short, but history also contains commits
+    // written with a full sentence or a ticket description in the subject.
+    // Keep the row stable even when the delegate is narrower than the text;
+    // the original message remains available from the row tooltip.
+    readonly property int commitSummaryLimit: 50
+    readonly property int commitMessageLimit: 240
+
     /// Branch the current one is compared against. Kept here rather than in the
     /// review surface because the comparison is chosen next to the commits it
     /// sits among, and the surface only ever displays the result.
@@ -67,6 +74,36 @@ ColumnLayout {
         if (!isFinite(value))
             return "";
         return new Date(value * 1000).toLocaleString(Qt.locale(), Locale.ShortFormat);
+    }
+
+    function truncateCommitText(value, limit) {
+        const text = String(value || "").replace(/\s+/g, " ").trim();
+        if (text.length <= limit)
+            return text;
+
+        // JavaScript strings are UTF-16. Advance over a surrogate pair as one
+        // character so a supplementary-plane character cannot be split by the
+        // preview boundary.
+        let end = 0;
+        let count = 0;
+        while (end < text.length && count < limit - 1) {
+            const first = text.charCodeAt(end);
+            const second = end + 1 < text.length ? text.charCodeAt(end + 1) : 0;
+            const surrogatePair = first >= 0xD800 && first <= 0xDBFF
+                && second >= 0xDC00 && second <= 0xDFFF;
+            end += surrogatePair ? 2 : 1;
+            ++count;
+        }
+        return text.slice(0, end).replace(/\s+$/, "") + "…";
+    }
+
+    function commitSummaryPreview(summary, message) {
+        const source = summary === undefined || summary === null ? message : summary;
+        return truncateCommitText(source, commitSummaryLimit);
+    }
+
+    function commitMessagePreview(message) {
+        return truncateCommitText(message, commitMessageLimit);
     }
 
     Component.onCompleted: chooseBaseBranch()
@@ -215,6 +252,10 @@ ColumnLayout {
 
             required property int index
             required property var modelData
+            readonly property string summaryPreview: history.commitSummaryPreview(
+                modelData.summary,
+                modelData.message
+            )
 
             Accessible.name: qsTr("Commit %1: %2 by %3")
                 .arg(modelData.shortId)
@@ -222,11 +263,13 @@ ColumnLayout {
                     ? modelData.summary
                     : qsTr("no commit message"))
                 .arg(modelData.author)
-            Controls.ToolTip.text: modelData.message
+            Accessible.description: modelData.message
+            Controls.ToolTip.text: history.commitMessagePreview(modelData.message)
             Controls.ToolTip.visible: hovered && modelData.message.length > 0
             highlighted: history.reviewCommitId === String(modelData.id)
             enabled: !history.activity.repositoryMutationRunning()
                 && !history.activity.reviewReadRunning()
+            clip: true
             width: historyList.width
             onClicked: {
                 historyList.currentIndex = index;
@@ -234,16 +277,21 @@ ColumnLayout {
             }
 
             contentItem: ColumnLayout {
+                clip: true
                 spacing: 0
 
                 Controls.Label {
                     Layout.fillWidth: true
+                    Layout.maximumWidth: parent.width
+                    Layout.minimumWidth: 0
                     elide: Text.ElideRight
                     font.bold: true
-                    text: commitDelegate.modelData.summary.length > 0
-                        ? commitDelegate.modelData.summary
+                    maximumLineCount: 1
+                    text: commitDelegate.summaryPreview.length > 0
+                        ? commitDelegate.summaryPreview
                         : qsTr("(no commit message)")
                     textFormat: Text.PlainText
+                    wrapMode: Text.NoWrap
                 }
 
                 RowLayout {
@@ -260,6 +308,7 @@ ColumnLayout {
 
                     Controls.Label {
                         Layout.fillWidth: true
+                        Layout.minimumWidth: 0
                         color: Kirigami.Theme.disabledTextColor
                         elide: Text.ElideRight
                         font.pixelSize: Kirigami.Theme.smallFont.pixelSize
