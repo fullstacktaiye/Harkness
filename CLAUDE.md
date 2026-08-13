@@ -71,6 +71,13 @@ build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing lin
 persisted field, state spelling, or table means a version bump plus a *new* fixture, not an edit to
 an existing one.
 
+A **new fixture directory needs a `.gitattributes` line** — `<path>/*.json text eol=lf` — and the
+file enumerates them one directory at a time rather than by a glob. Fixture tests compare
+`include_str!` against `serde_json::to_string_pretty`, which emits `\n`; without the attribute the
+Windows runner checks the file out with `\r\n` and the byte-for-byte assertion fails there and
+nowhere else. `harkness-context`'s fixtures are absent from that list because the `core` matrix job
+does not build that crate — adding it to the matrix means adding its line too.
+
 ## Architecture
 
 ### Crate layering
