@@ -134,6 +134,7 @@ ColumnLayout {
         return label.length > 0 ? label : qsTr("Unknown");
     }
 
+    // Names the producers, for a plain-text label and for a screen reader.
     function provenanceDetail(row) {
         const entry = row || ({});
         const gap = String(entry.provenanceGap || "");
@@ -143,6 +144,25 @@ ColumnLayout {
                 .arg(Number(entry.provenanceCommits || 0));
         }
         return qsTr("Unknown: %1").arg(provenanceGapText(gap));
+    }
+
+    // The same fact with no producer name in it, for a tool tip.
+    //
+    // A tool tip's text is rendered by the style's own label, which this file
+    // cannot give `Text.PlainText` — and `Text.AutoText` treats anything that
+    // looks like markup as markup. A producer name comes out of a commit
+    // object, which is repository content a remote controls: a name shaped
+    // like an image tag would fetch a URL on hover. The names are already on
+    // the row beside the tool tip, as plain text, so counting them here costs
+    // a reader nothing.
+    function provenanceTooltip(row) {
+        const entry = row || ({});
+        const gap = String(entry.provenanceGap || "");
+        if (gap.length > 0 || String(entry.provenanceLabel || "").length === 0)
+            return qsTr("Unknown: %1").arg(provenanceGapText(gap));
+        return qsTr("Produced by %1 contributors across %2 commits in this comparison")
+            .arg(Number(entry.provenanceProducers || 0))
+            .arg(Number(entry.provenanceCommits || 0));
     }
 
     function provenanceGapText(gap) {
@@ -1129,7 +1149,7 @@ ColumnLayout {
                                 .arg(modelData.change)
                                 .arg(reviewSurface.provenanceDetail(modelData))
                             Controls.ToolTip.text: modelData.path
-                                + "\n" + reviewSurface.provenanceDetail(modelData)
+                                + "\n" + reviewSurface.provenanceTooltip(modelData)
                             Controls.ToolTip.visible: hovered
                             highlighted: String(reviewSurface.reviewState.selectedFileId || "")
                                 === String(modelData.fileId)
@@ -1396,7 +1416,7 @@ ColumnLayout {
 
                         Controls.Label {
                             Accessible.name: text
-                            Controls.ToolTip.text: reviewSurface.provenanceDetail(
+                            Controls.ToolTip.text: reviewSurface.provenanceTooltip(
                                 reviewSurface.reviewFile
                             )
                             Controls.ToolTip.visible: provenanceHover.hovered

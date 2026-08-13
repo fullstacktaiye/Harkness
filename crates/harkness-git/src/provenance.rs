@@ -249,16 +249,43 @@ impl ProvenanceTruncation {
     }
 }
 
+/// Which paths one attribution is about.
+///
+/// This is one value rather than a list whose emptiness has to be interpreted,
+/// because the two things an empty list could mean are opposites: a caller
+/// asking about a whole range and a caller narrowing to a file list that came
+/// back with nothing in it. Inferring one from the other would make a review
+/// with no changed files walk its entire range and report every path in it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ProvenancePaths {
+    /// Every path the range touched, ordered by path bytes.
+    All,
+    /// Exactly these, in this order. Empty means exactly none.
+    ///
+    /// One entry is produced per *distinct* path, so a caller pairing the
+    /// result with a file list two of whose records name one path matches on
+    /// the path rather than on the index.
+    Only(Vec<PathBuf>),
+}
+
+impl ProvenancePaths {
+    /// Whether this asks about nothing, and the walk can therefore be skipped.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Only(paths) if paths.is_empty())
+    }
+}
+
 /// Bounds and narrows one attribution.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct ProvenanceOptions {
     /// The paths to attribute, in the order the result should report them.
     ///
-    /// Pass the paths of the diff being reviewed — [`Self::for_files`] does
-    /// that — so the result zips with its file list. An empty list attributes
-    /// every path the range touched, ordered by path bytes.
-    pub paths: Vec<PathBuf>,
+    /// Pass the paths of the diff being reviewed, so the result answers about
+    /// the review in front of the caller and nothing else.
+    pub paths: ProvenancePaths,
     /// The most commits the walk will visit.
     pub max_commits: usize,
     /// The reference the caller resolved the target's head side from.
@@ -272,7 +299,7 @@ pub struct ProvenanceOptions {
 impl Default for ProvenanceOptions {
     fn default() -> Self {
         Self {
-            paths: Vec::new(),
+            paths: ProvenancePaths::All,
             max_commits: DEFAULT_MAX_PROVENANCE_COMMITS,
             head_reference: None,
         }
@@ -280,10 +307,17 @@ impl Default for ProvenanceOptions {
 }
 
 impl ProvenanceOptions {
-    /// Attributes exactly the paths one diff reported, in its own order.
+    /// Attributes the paths one diff reported, in its own order and without
+    /// repeats.
     ///
     /// A renamed or deleted file is requested under the path the diff shows it
     /// at: its new-side path where it has one, and its old-side path otherwise.
+    /// Two records naming one path therefore produce one entry, so pair the
+    /// result with the file list by path and not by index.
+    ///
+    /// Pass the records of **one** target. A multi-target file list would fold
+    /// a path each target reported into a single request, and each target has
+    /// its own attribution anyway.
     #[must_use]
     pub fn for_files(files: &[FileDiff]) -> Self {
         let mut seen = HashSet::with_capacity(files.len());
@@ -297,19 +331,22 @@ impl ProvenanceOptions {
             }
         }
         Self {
-            paths,
+            paths: ProvenancePaths::Only(paths),
             ..Self::default()
         }
     }
 
     /// Attributes only these paths, in this order.
+    ///
+    /// An empty iterator narrows to nothing and is not a request for
+    /// everything: use [`ProvenancePaths::All`] for that.
     #[must_use]
     pub fn with_paths<I, P>(mut self, paths: I) -> Self
     where
         I: IntoIterator<Item = P>,
         P: Into<PathBuf>,
     {
-        self.paths = paths.into_iter().map(Into::into).collect();
+        self.paths = ProvenancePaths::Only(paths.into_iter().map(Into::into).collect());
         self
     }
 
@@ -345,7 +382,11 @@ pub struct ChangeProvenance {
     pub range: Option<ProvenanceRange>,
     /// Every distinct identity that contributed, in order of first appearance.
     pub producers: Vec<Producer>,
-    /// Every commit that contributed, newest first.
+    /// Every commit that contributed to a requested path, newest first.
+    ///
+    /// A commit the walk visited that touched nothing being attributed is not
+    /// here, so a narrowed request never carries commits no file references.
+    /// [`Self::walked_commits`] is what says how far the walk went.
     pub commits: Vec<CommitAttribution>,
     /// One entry per requested path.
     pub files: Vec<FileProvenance>,
@@ -396,6 +437,11 @@ pub(crate) fn resolve(
     let (walk, range) = plan(&repository, root, target, options.head_reference.as_deref())?;
 
     let mut builder = Builder::new(options);
+    // Narrowed to no paths at all: there is nothing the walk could answer, so
+    // the range is still reported and not one commit is read.
+    if options.paths.is_empty() {
+        return Ok(builder.finish(target.clone(), range));
+    }
     match walk {
         Walk::Uncommitted => builder.without_range(ProvenanceGap::Uncommitted),
         Walk::Single { commit, parent } => {
@@ -530,9 +576,9 @@ fn agent_slug(revision: &str) -> Option<String> {
 /// Accumulates one attribution across a range.
 struct Builder<'options> {
     options: &'options ProvenanceOptions,
-    /// The requested paths, in caller order, when the caller narrowed the
-    /// result.
-    requested: Vec<PathBuf>,
+    /// The requested paths in caller order, or `None` when every path the range
+    /// touched was asked for.
+    requested: Option<Vec<PathBuf>>,
     /// The same set, for a delta lookup that must not scale with the file list.
     wanted: HashSet<PathBuf>,
     /// Producer index by folded identity key.
@@ -552,10 +598,14 @@ struct Builder<'options> {
 
 impl<'options> Builder<'options> {
     fn new(options: &'options ProvenanceOptions) -> Self {
+        let requested = match &options.paths {
+            ProvenancePaths::All => None,
+            ProvenancePaths::Only(paths) => Some(paths.clone()),
+        };
         Self {
             options,
-            requested: options.paths.clone(),
-            wanted: options.paths.iter().cloned().collect(),
+            wanted: requested.iter().flatten().cloned().collect(),
+            requested,
             producer_index: HashMap::new(),
             producers: Vec::new(),
             commits: Vec::new(),
@@ -683,6 +733,20 @@ impl<'options> Builder<'options> {
             .diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), Some(&mut native))
             .map_err(|source| inspection(root, source))?;
 
+        // The deltas decide whether this commit is recorded at all, so they are
+        // scanned before it is interned. A commit that touched nothing the
+        // caller asked about contributed nothing to the comparison in front of
+        // them, and recording it anyway would put commits in the result that no
+        // file references, people in the producer list whose work is not being
+        // reviewed, and a `false` in `is_empty` for a result where every file
+        // came back unknown. It still counts as walked, because it was.
+        if !diff.deltas().any(|delta| {
+            !matches!(delta.status(), Delta::Unmodified | Delta::Ignored)
+                && (self.wants(delta.new_file().path()) || self.wants(delta.old_file().path()))
+        }) {
+            return Ok(());
+        }
+
         let index = self.push_commit(commit);
         for delta in diff.deltas() {
             if matches!(delta.status(), Delta::Unmodified | Delta::Ignored) {
@@ -698,9 +762,17 @@ impl<'options> Builder<'options> {
         Ok(())
     }
 
+    /// Whether one delta side is a path this attribution is about.
+    fn wants(&self, path: Option<&Path>) -> bool {
+        let Some(path) = path else {
+            return false;
+        };
+        self.requested.is_none() || self.wanted.contains(path)
+    }
+
     /// Records one path as touched by one commit.
     fn attribute(&mut self, path: &Path, commit: usize) {
-        if !self.requested.is_empty() && !self.wanted.contains(path) {
+        if !self.wants(Some(path)) {
             return;
         }
         if let Some(entry) = self.per_path.get_mut(path) {
@@ -709,7 +781,7 @@ impl<'options> Builder<'options> {
             }
             return;
         }
-        if self.requested.is_empty() {
+        if self.requested.is_none() {
             self.discovered.push(path.to_path_buf());
         }
         self.per_path.insert(path.to_path_buf(), vec![commit]);
@@ -761,15 +833,13 @@ impl<'options> Builder<'options> {
     }
 
     fn finish(mut self, target: DiffTarget, range: Option<ProvenanceRange>) -> ChangeProvenance {
-        let paths = if self.requested.is_empty() {
+        let paths = self.requested.take().unwrap_or_else(|| {
             let mut discovered = std::mem::take(&mut self.discovered);
             discovered.sort_by(|left, right| {
                 os_str_bytes(left.as_os_str()).cmp(os_str_bytes(right.as_os_str()))
             });
             discovered
-        } else {
-            std::mem::take(&mut self.requested)
-        };
+        });
 
         let files = paths
             .into_iter()
@@ -919,7 +989,10 @@ fn inspection(path: &Path, source: git2::Error) -> GitError {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
     use git2::{Oid, Repository, Signature, Time, build::CheckoutBuilder};
 
@@ -1410,6 +1483,113 @@ mod tests {
             co_authors(flood.as_bytes()).len(),
             super::MAX_CO_AUTHORS_PER_COMMIT
         );
+    }
+
+    /// Narrowing the request narrows the whole record, not only its file list.
+    /// A commit that touched nothing being asked about contributed nothing to
+    /// the comparison in front of the reader, so it is neither reported nor
+    /// counted among the people who produced the review.
+    #[test]
+    fn a_narrowed_request_carries_only_the_commits_its_paths_name() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("narrowed");
+        let repository = initialize_repository(&root);
+        branch_from_head(&repository, "feature");
+        checkout(&repository, "feature");
+        commit(
+            &repository,
+            &root,
+            &[("alpha.txt", "one\n")],
+            "add alpha",
+            ("Ada", "ada@example.invalid"),
+            1,
+        );
+        let beta = commit(
+            &repository,
+            &root,
+            &[("beta.txt", "one\n")],
+            "add beta",
+            ("Grace", "grace@example.invalid"),
+            2,
+        );
+        commit(
+            &repository,
+            &root,
+            &[("alpha.txt", "two\n")],
+            "revise alpha",
+            ("Ada", "ada@example.invalid"),
+            3,
+        );
+
+        let provenance = GitService::new(&root, &fixture.data_dir)
+            .provenance(
+                &DiffTarget::BranchAgainstBase {
+                    branch: "feature".to_owned(),
+                    base_branch: "main".to_owned(),
+                },
+                &ProvenanceOptions::default().with_paths(["beta.txt"]),
+                &Cancellation::default(),
+            )
+            .unwrap();
+
+        // The walk still visited every commit; the record names only the one
+        // that touched what was asked about.
+        assert_eq!(provenance.walked_commits, 3);
+        assert_eq!(commits_for(&provenance, "beta.txt"), vec![beta]);
+        assert_eq!(provenance.commits.len(), 1);
+        assert_eq!(provenance.producers.len(), 1);
+        assert_eq!(provenance.producers[0].name, b"Grace");
+        assert!(!provenance.is_empty());
+    }
+
+    /// Narrowing to no paths and asking about every path are opposite requests,
+    /// and an empty list is the first rather than the second.
+    #[test]
+    fn narrowing_to_no_paths_walks_nothing_and_asking_for_all_walks_everything() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("no-paths");
+        let repository = initialize_repository(&root);
+        branch_from_head(&repository, "feature");
+        checkout(&repository, "feature");
+        commit(
+            &repository,
+            &root,
+            &[("alpha.txt", "one\n")],
+            "add alpha",
+            ("Ada", "ada@example.invalid"),
+            1,
+        );
+        let service = GitService::new(&root, &fixture.data_dir);
+        let target = DiffTarget::BranchAgainstBase {
+            branch: "feature".to_owned(),
+            base_branch: "main".to_owned(),
+        };
+
+        let none = service
+            .provenance(
+                &target,
+                &ProvenanceOptions::default().with_paths(Vec::<PathBuf>::new()),
+                &Cancellation::default(),
+            )
+            .unwrap();
+        assert_eq!(none.files, Vec::new());
+        assert_eq!(none.commits, Vec::new());
+        assert_eq!(none.producers, Vec::new());
+        assert_eq!(none.walked_commits, 0);
+        // The range is still reported: the caller asked about no paths, not
+        // about no comparison.
+        assert!(none.range.is_some());
+
+        let all = service
+            .provenance(
+                &target,
+                &ProvenanceOptions::default(),
+                &Cancellation::default(),
+            )
+            .unwrap();
+        assert_eq!(all.walked_commits, 1);
+        assert_eq!(all.files.len(), 1);
+        assert_eq!(all.files[0].path, PathBuf::from("alpha.txt"));
     }
 
     /// A front end that pins a review to object ids keeps the reference the

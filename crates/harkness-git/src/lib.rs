@@ -65,7 +65,7 @@ pub use path::canonicalize_with_missing_tail;
 pub use provenance::{
     AGENT_BRANCH_PREFIX, ChangeProvenance, CommitAttribution, DEFAULT_MAX_PROVENANCE_COMMITS,
     FileProvenance, MAX_CO_AUTHORS_PER_COMMIT, Producer, ProducerKind, ProvenanceGap,
-    ProvenanceOptions, ProvenanceRange, ProvenanceTruncation,
+    ProvenanceOptions, ProvenancePaths, ProvenanceRange, ProvenanceTruncation,
 };
 pub use runner::{Cancellation, CloneCancellation};
 pub use status::{
@@ -1034,8 +1034,12 @@ impl GitService {
     /// This answers "what produced this file" beside the diff's "what changed",
     /// and it answers it from the repository alone: the commits between the two
     /// sides of the comparison, the identities they record, and the
-    /// `agent/<slug>` branch convention. Pass the diff's own file list through
-    /// [`ProvenanceOptions::for_files`] so the result zips with it.
+    /// `agent/<slug>` branch convention. Pass one target's own file list
+    /// through [`ProvenanceOptions::for_files`], and pair the result with it by
+    /// path — one entry is produced per distinct path, so an index is only an
+    /// index. A file list that came back *empty* is not something to pass on:
+    /// an empty [`ProvenanceOptions::paths`] asks about every path in the
+    /// range, so skip the call instead.
     ///
     /// The range is walked once and each commit compared with its first parent
     /// once, so cost follows the size of the range and never the number of

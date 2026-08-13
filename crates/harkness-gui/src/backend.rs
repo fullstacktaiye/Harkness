@@ -2393,6 +2393,10 @@ struct ReviewAttribution {
     /// The named reason there is no attribution, empty when there is one.
     gap: String,
     commits: usize,
+    /// How many distinct identities [`Self::label`] names. Carried as a number
+    /// so a surface that must not render an untrusted name can still say how
+    /// many there were.
+    producers: usize,
 }
 
 /// What a review says about where its files came from.
@@ -2419,6 +2423,16 @@ impl ReviewProvenance {
     fn file(&self, index: usize) -> ReviewAttribution {
         self.files.get(index).cloned().unwrap_or_default()
     }
+}
+
+/// Folds every run of whitespace into one space and trims the ends.
+///
+/// Applied to producer names for the same reason `harkness-cli` applies it to
+/// them: they come out of commit objects, which is repository content, and a
+/// tab or a newline inside one decides how a row is laid out rather than what
+/// it says.
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[derive(Clone, Debug)]
@@ -2614,6 +2628,12 @@ fn resolve_review_provenance(
     selection: &ReviewSelection,
     files: &[ReviewFileEntry],
 ) -> ReviewProvenance {
+    if files.is_empty() {
+        // Narrowing to no paths asks nothing, and asking nothing is answered
+        // without a walk. The header reports itself unresolved, which is what
+        // a review with no changed files has to say anyway.
+        return ReviewProvenance::default();
+    }
     let mut options = harkness_git::ProvenanceOptions::default()
         .with_paths(files.iter().map(|entry| entry.path.clone()));
     // A branch review is pinned to object ids so the comparison cannot move
@@ -2632,6 +2652,13 @@ fn resolve_review_provenance(
     // one name, because "the same hands produced these two files" is the
     // question the tint answers and two files sharing only their newest
     // committer are not the same answer.
+    //
+    // The key is sorted before it is compared, and the label is built from the
+    // sorted key. `FileProvenance::producers` is ordered by first contribution
+    // from the newest commit down, so one file can list Ada then Grace while
+    // its neighbour lists Grace then Ada for the same two people — and an
+    // order-sensitive key would give them two colours and two spellings of one
+    // answer, which is precisely what the mark exists to prevent.
     let mut groups: Vec<Vec<usize>> = Vec::new();
     let attributions = record
         .files
@@ -2645,18 +2672,23 @@ fn resolve_review_provenance(
                     ..ReviewAttribution::default()
                 };
             }
+            let mut key = file.producers.clone();
+            key.sort_unstable();
             let group = groups
                 .iter()
-                .position(|existing| *existing == file.producers)
+                .position(|existing| *existing == key)
                 .unwrap_or_else(|| {
-                    groups.push(file.producers.clone());
+                    groups.push(key.clone());
                     groups.len() - 1
                 });
-            let label = file
-                .producers
+            let label = key
                 .iter()
                 .map(|producer| {
-                    String::from_utf8_lossy(&record.producers[*producer].name).into_owned()
+                    // A name is repository content, so it is collapsed to one
+                    // line exactly as the CLI collapses it: a row is one line
+                    // tall and an embedded newline would otherwise decide how
+                    // tall.
+                    collapse_whitespace(&String::from_utf8_lossy(&record.producers[*producer].name))
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -2665,6 +2697,7 @@ fn resolve_review_provenance(
                 label,
                 gap: String::new(),
                 commits: file.commits.len(),
+                producers: key.len(),
             }
         })
         .collect();
@@ -3761,10 +3794,6 @@ fn to_review_provenance(provenance: &ReviewProvenance) -> QVariant {
         QVariant::from(&QString::from(provenance.head_revision.as_str())),
     );
     value.insert(
-        QString::from("headRevision"),
-        QVariant::from(&QString::from(provenance.head_revision.as_str())),
-    );
-    value.insert(
         QString::from("commitCount"),
         QVariant::from(&bounded_usize(provenance.commits)),
     );
@@ -3811,6 +3840,10 @@ fn insert_attribution(
     value.insert(
         QString::from("provenanceCommits"),
         QVariant::from(&bounded_usize(attribution.commits)),
+    );
+    value.insert(
+        QString::from("provenanceProducers"),
+        QVariant::from(&bounded_usize(attribution.producers)),
     );
 }
 
@@ -9744,6 +9777,115 @@ mod tests {
         );
         assert_eq!(review_text(&scratch, "provenanceGap"), "uncommitted");
         assert_eq!(review_text(&scratch, "provenanceLabel"), "");
+    }
+
+    /// The mark answers "the same hands", which is a question about a set. Two
+    /// files produced by one pair of people list them in whichever order their
+    /// own newest commit fell, so an order-sensitive key would give one answer
+    /// two colours and two spellings — the exact confusion the mark exists to
+    /// remove.
+    #[test]
+    fn one_set_of_producers_is_one_group_whatever_order_a_file_lists_them_in() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("producer-order");
+        initialize_repository(&root);
+        let repository = Repository::open(&root).unwrap();
+        let base_branch = repository.head().unwrap().shorthand().unwrap().to_owned();
+        let head = repository.head().unwrap().peel_to_commit().unwrap();
+        repository.branch("feature", &head, true).unwrap();
+        drop(head);
+        repository.set_head("refs/heads/feature").unwrap();
+        drop(repository);
+
+        let ada = ("Ada", "ada@example.invalid");
+        let grace = ("Grace", "grace@example.invalid");
+        // alpha ends up [Grace, Ada] and beta [Ada, Grace]: one set, two orders.
+        commit_file_as(&root, Path::new("alpha.txt"), "one\n", "ada on alpha", ada);
+        commit_file_as(
+            &root,
+            Path::new("alpha.txt"),
+            "two\n",
+            "grace on alpha",
+            grace,
+        );
+        commit_file_as(
+            &root,
+            Path::new("beta.txt"),
+            "one\n",
+            "grace on beta",
+            grace,
+        );
+        commit_file_as(&root, Path::new("beta.txt"), "two\n", "ada on beta", ada);
+
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
+        let review = load_review_with_git(
+            &git,
+            "project-1".to_owned(),
+            ReviewSelection::Branch {
+                branch: "feature".to_owned(),
+                base_branch,
+            },
+            harkness_git::Whitespace::EXACT,
+            23,
+        )
+        .unwrap();
+
+        let alpha = review.provenance.file(0);
+        let beta = review.provenance.file(1);
+        assert_eq!(review.files[0].path, PathBuf::from("alpha.txt"));
+        assert_eq!(review.files[1].path, PathBuf::from("beta.txt"));
+        assert_eq!(alpha.producers, 2);
+        assert_eq!(beta.producers, 2);
+        assert_eq!(alpha.group, beta.group);
+        assert_eq!(alpha.label, beta.label);
+        assert_eq!(review.provenance.groups, 1);
+    }
+
+    /// A producer name is repository content and a row is one line tall.
+    ///
+    /// Git refuses a control character in a signature, so the vector is the
+    /// trailer: `Co-Authored-By` is free text inside the message body, and
+    /// whatever it holds becomes a name on a row.
+    #[test]
+    fn a_producer_name_reaches_the_panel_on_one_line() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("noisy-name");
+        initialize_repository(&root);
+        let repository = Repository::open(&root).unwrap();
+        let base_branch = repository.head().unwrap().shorthand().unwrap().to_owned();
+        let head = repository.head().unwrap().peel_to_commit().unwrap();
+        repository.branch("feature", &head, true).unwrap();
+        drop(head);
+        repository.set_head("refs/heads/feature").unwrap();
+        drop(repository);
+
+        commit_file_as(
+            &root,
+            Path::new("alpha.txt"),
+            "one\n",
+            "add alpha\n\nCo-Authored-By: Some\t\tModel   Name <model@example.invalid>\n",
+            ("Ada", "ada@example.invalid"),
+        );
+
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
+        let review = load_review_with_git(
+            &git,
+            "project-1".to_owned(),
+            ReviewSelection::Branch {
+                branch: "feature".to_owned(),
+                base_branch,
+            },
+            harkness_git::Whitespace::EXACT,
+            24,
+        )
+        .unwrap();
+
+        let label = review.provenance.file(0).label;
+        assert_eq!(label, "Ada, Some Model Name");
+        assert!(
+            !label.contains('\t'),
+            "a tab survived into a row: {label:?}"
+        );
     }
 
     fn commit_file_as(
