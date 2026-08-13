@@ -9,6 +9,12 @@
 //! is generalized here rather than wrapped, and every property is restated in
 //! terms the tool contract already has.
 //!
+//! On Unix the portable supervision boundary is the process group. A hostile
+//! descendant can deliberately create a new session and leave that boundary;
+//! it cannot be killed portably without broader operating-system authority.
+//! Output readers are nevertheless cancellable, so such a detached process can
+//! neither hold the call open nor defeat its timeout by retaining a pipe.
+//!
 //! Three things are different from the Git runner, and each follows from this
 //! being a tool rather than one hard-coded program.
 //!
@@ -36,12 +42,16 @@
 use std::ffi::OsString;
 use std::io::{self, Read};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 #[cfg(windows)]
@@ -51,6 +61,10 @@ use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
 };
 
 use super::{
@@ -249,6 +263,44 @@ struct SupervisedChild {
     job: WindowsJob,
 }
 
+#[cfg(windows)]
+const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
+
+#[cfg(windows)]
+const INVALID_HANDLE_VALUE: HANDLE = -1isize as HANDLE;
+
+#[cfg(windows)]
+#[repr(C)]
+struct ThreadEntry32 {
+    size: u32,
+    usage: u32,
+    thread_id: u32,
+    owner_process_id: u32,
+    base_priority: i32,
+    priority_delta: i32,
+    flags: u32,
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> HANDLE;
+    fn Thread32First(snapshot: HANDLE, entry: *mut ThreadEntry32) -> i32;
+    fn Thread32Next(snapshot: HANDLE, entry: *mut ThreadEntry32) -> i32;
+}
+
+#[cfg(windows)]
+struct WindowsHandle(HANDLE);
+
+#[cfg(windows)]
+impl Drop for WindowsHandle {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PollAction {
     Exited,
@@ -336,6 +388,42 @@ impl WindowsJob {
         Ok(())
     }
 
+    fn resume(&self, child: &Child) -> io::Result<()> {
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let snapshot = WindowsHandle(snapshot);
+        let mut entry = ThreadEntry32 {
+            size: u32::try_from(std::mem::size_of::<ThreadEntry32>()).unwrap_or(u32::MAX),
+            usage: 0,
+            thread_id: 0,
+            owner_process_id: 0,
+            base_priority: 0,
+            priority_delta: 0,
+            flags: 0,
+        };
+        let mut found = unsafe { Thread32First(snapshot.0, &mut entry) } != 0;
+        while found {
+            if entry.owner_process_id == child.id() {
+                let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.thread_id) };
+                if thread.is_null() {
+                    return Err(io::Error::last_os_error());
+                }
+                let thread = WindowsHandle(thread);
+                if unsafe { ResumeThread(thread.0) } == u32::MAX {
+                    return Err(io::Error::last_os_error());
+                }
+                return Ok(());
+            }
+            found = unsafe { Thread32Next(snapshot.0, &mut entry) } != 0;
+        }
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "the suspended child's primary thread was not present in the system snapshot",
+        ))
+    }
+
     fn terminate(&self) {
         unsafe {
             TerminateJobObject(self.handle, 1);
@@ -401,7 +489,7 @@ impl ToolProcess {
 
     /// Adds a process-local timeout inside the enclosing call's deadline.
     ///
-    /// Reaching this bound kills the process group and returns a
+    /// Reaching this bound kills the supervised process unit and returns a
     /// [`ProcessOutput`] with [`ProcessOutput::timed_out`] set. The enclosing
     /// execution-context deadline still wins when it is earlier and remains a
     /// [`ToolError::TimedOut`], because that limit ends the whole tool call.
@@ -414,9 +502,11 @@ impl ToolProcess {
     /// Runs the child to completion under the call's limits.
     ///
     /// Blocks until the child exits, the call is cancelled, or the call's
-    /// deadline passes. On either of the last two the child's whole *process
-    /// group* is killed, so helpers it started stop with it rather than
-    /// outliving the call that is already being reported as over.
+    /// deadline passes. On either of the last two the child's supervised unit
+    /// is killed: its process group on Unix and its Job Object on Windows. Unix
+    /// descendants that deliberately detach into another session are outside
+    /// that portable boundary, but cannot hold this call open through inherited
+    /// output pipes.
     ///
     /// # Errors
     ///
@@ -433,11 +523,6 @@ impl ToolProcess {
 
         let tail_bytes = context.stream_tail_bytes();
         let deadline = context.deadline();
-        let local_deadline = self
-            .local_timeout
-            .and_then(|limit| Instant::now().checked_add(limit).map(|at| (limit, at)));
-        let started = Instant::now();
-
         // Both artifact streams are opened before anything is spawned. Opening
         // one after the child is running would mean discovering that storage is
         // unavailable with a process already writing into a pipe nobody will
@@ -445,16 +530,45 @@ impl ToolProcess {
         let stdout_artifact = open_capture(context, &self.stdout)?;
         let stderr_artifact = open_capture(context, &self.stderr)?;
 
-        let mut child = self.spawn()?;
+        // Artifact setup is allowed to block and can be implemented by an
+        // external store. Re-check at the last point before launch so a cancel
+        // or deadline observed while opening either stream cannot start work
+        // after the executor has already decided the call is terminal.
+        context.check_still_permitted()?;
+        let local_deadline = self
+            .local_timeout
+            .and_then(|limit| Instant::now().checked_add(limit).map(|at| (limit, at)));
+        let started = Instant::now();
+        let mut child = self.spawn(context)?;
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
+        if let Err(error) =
+            set_pipe_nonblocking(&stdout).and_then(|()| set_pipe_nonblocking(&stderr))
+        {
+            terminate_process_group(&mut child);
+            drop(stdout);
+            drop(stderr);
+            let _ = child.wait();
+            return Err(error);
+        }
         let (segments, incoming) = mpsc::sync_channel(SEGMENT_CHANNEL_CAPACITY);
+        let stop_readers = Arc::new(AtomicBool::new(false));
 
         // Two readers, always. Piping both streams and draining only one
         // deadlocks the moment the child fills the pipe buffer of the other.
-        let stdout_reader = thread::spawn(move || drain(stdout, tail_bytes, stdout_artifact, None));
-        let stderr_reader =
-            thread::spawn(move || drain(stderr, tail_bytes, stderr_artifact, Some(segments)));
+        let stdout_stop = Arc::clone(&stop_readers);
+        let stderr_stop = Arc::clone(&stop_readers);
+        let stdout_reader =
+            thread::spawn(move || drain(stdout, tail_bytes, stdout_artifact, None, stdout_stop));
+        let stderr_reader = thread::spawn(move || {
+            drain(
+                stderr,
+                tail_bytes,
+                stderr_artifact,
+                Some(segments),
+                stderr_stop,
+            )
+        });
 
         loop {
             forward(context, &incoming, MAX_SEGMENTS_PER_POLL);
@@ -467,7 +581,13 @@ impl ToolProcess {
                     // its handle neither kills nor reaps it. It would outlive
                     // the call it was bounded by while that call is recorded as
                     // failed.
-                    terminate(&mut child, incoming, stdout_reader, stderr_reader);
+                    terminate(
+                        &mut child,
+                        incoming,
+                        stdout_reader,
+                        stderr_reader,
+                        &stop_readers,
+                    );
                     return Err(ToolError::execution_failed(format!(
                         "a child process could not be waited on: {error}"
                     )));
@@ -493,6 +613,7 @@ impl ToolProcess {
                 // reserved, so it cannot name anything else — and is a harmless
                 // `ESRCH` once none is.
                 terminate_process_group(&mut child);
+                stop_readers.store(true, Ordering::Release);
 
                 // The readers are then drained *while* they are waited on, never
                 // after. A child can exit with its pipe still full, and the
@@ -522,18 +643,35 @@ impl ToolProcess {
             match action {
                 PollAction::Exited => unreachable!("an observed exit returned above"),
                 PollAction::Cancelled => {
-                    terminate(&mut child, incoming, stdout_reader, stderr_reader);
+                    terminate(
+                        &mut child,
+                        incoming,
+                        stdout_reader,
+                        stderr_reader,
+                        &stop_readers,
+                    );
                     return Err(ToolError::Cancelled);
                 }
                 PollAction::Deadline => {
-                    terminate(&mut child, incoming, stdout_reader, stderr_reader);
+                    terminate(
+                        &mut child,
+                        incoming,
+                        stdout_reader,
+                        stderr_reader,
+                        &stop_readers,
+                    );
                     return Err(ToolError::TimedOut {
                         limit: deadline.expect("the action requires a deadline").limit(),
                     });
                 }
                 PollAction::LocalTimeout => {
-                    let (status, stdout, stderr) =
-                        terminate_and_collect(&mut child, incoming, stdout_reader, stderr_reader);
+                    let (status, stdout, stderr) = terminate_and_collect(
+                        &mut child,
+                        incoming,
+                        stdout_reader,
+                        stderr_reader,
+                        &stop_readers,
+                    );
                     return Ok(ProcessOutput {
                         code: status.as_ref().and_then(ExitStatus::code),
                         signal: status.as_ref().and_then(exit_signal),
@@ -551,7 +689,7 @@ impl ToolProcess {
     }
 
     /// Starts the child with the invocation policy every tool process carries.
-    fn spawn(&self) -> Result<SupervisedChild, ToolError> {
+    fn spawn(&self, context: &ExecutionContext) -> Result<SupervisedChild, ToolError> {
         // `ContainedPath` is a point-in-time proof. Re-resolve immediately
         // before launch so a symlink retargeted while a call awaited approval
         // cannot redirect the child's working directory outside its grant.
@@ -578,9 +716,12 @@ impl ToolProcess {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
+        #[cfg(windows)]
+        command.creation_flags(CREATE_SUSPENDED);
 
         #[cfg(windows)]
         let job = WindowsJob::new()?;
+        context.check_still_permitted()?;
         let child = command.spawn().map_err(|error| {
             ToolError::execution_failed(format!(
                 "{} could not be started: {error}",
@@ -595,6 +736,16 @@ impl ToolProcess {
             let _ = child.wait();
             return Err(ToolError::execution_failed(format!(
                 "{} could not be assigned to its Windows Job Object: {error}",
+                self.program.to_string_lossy()
+            )));
+        }
+        #[cfg(windows)]
+        if let Err(error) = job.resume(&child) {
+            job.terminate();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ToolError::execution_failed(format!(
+                "{} could not resume after assignment to its Windows Job Object: {error}",
                 self.program.to_string_lossy()
             )));
         }
@@ -615,6 +766,26 @@ fn open_capture(
         Capture::Tail => Ok(None),
         Capture::Artifact { name, media_type } => context.open_artifact(name, media_type).map(Some),
     }
+}
+
+#[cfg(unix)]
+fn set_pipe_nonblocking(pipe: &impl std::os::fd::AsRawFd) -> Result<(), ToolError> {
+    let descriptor = pipe.as_raw_fd();
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags == -1
+        || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+    {
+        return Err(ToolError::execution_failed(format!(
+            "a child output pipe could not be made cancellable: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_pipe_nonblocking<T>(_pipe: &T) -> Result<(), ToolError> {
+    Ok(())
 }
 
 /// Hands up to `most` queued stderr segments to the call's progress sink.
@@ -692,8 +863,10 @@ fn terminate(
     incoming: Receiver<String>,
     stdout_reader: JoinHandle<Drained>,
     stderr_reader: JoinHandle<Drained>,
+    stop_readers: &AtomicBool,
 ) {
-    let (_, stdout, stderr) = terminate_and_collect(child, incoming, stdout_reader, stderr_reader);
+    let (_, stdout, stderr) =
+        terminate_and_collect(child, incoming, stdout_reader, stderr_reader, stop_readers);
     stdout.preserve();
     stderr.preserve();
 }
@@ -704,8 +877,10 @@ fn terminate_and_collect(
     incoming: Receiver<String>,
     stdout_reader: JoinHandle<Drained>,
     stderr_reader: JoinHandle<Drained>,
+    stop_readers: &AtomicBool,
 ) -> (Option<ExitStatus>, Drained, Drained) {
     terminate_process_group(child);
+    stop_readers.store(true, Ordering::Release);
     // A reader may be blocked sending a stderr segment. Dropping the receiver
     // releases it before either join, while artifact capture continues.
     drop(incoming);
@@ -802,6 +977,7 @@ fn drain(
     tail_bytes: usize,
     artifact: Option<Box<dyn ArtifactStream>>,
     segments: Option<SyncSender<String>>,
+    stop: Arc<AtomicBool>,
 ) -> Drained {
     use std::io::Write as _;
 
@@ -817,14 +993,32 @@ fn drain(
     // stopped. Reading carries on regardless, so the artifact still receives
     // whatever the child had already written.
     let mut segments = segments;
+    // Once supervision ends, drain a generous bounded residue. A killed group
+    // leaves at most its pipe buffers behind, while an escaped session can keep
+    // producing forever; the bound preserves the former without letting the
+    // latter turn a timeout back into an unbounded join.
+    let mut reads_after_stop = 64usize;
 
     loop {
+        if stop.load(Ordering::Acquire) {
+            if reads_after_stop == 0 {
+                break;
+            }
+            reads_after_stop -= 1;
+        }
         let read = match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => read,
             // A signal arriving mid-read is not the end of the stream, and
             // treating it as one would silently shorten the artifact.
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                thread::sleep(POLL_INTERVAL);
+                continue;
+            }
             Err(error) => {
                 // Any other read failure means the recorded size and the
                 // artifact describe a prefix, while `is_truncated` would say the

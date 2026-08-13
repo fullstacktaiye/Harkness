@@ -30,6 +30,74 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// explain a failure.
 pub const DEFAULT_STREAM_TAIL_BYTES: usize = 64 * 1024;
 
+/// One call's shared relationship with the executor's abandonment boundary.
+///
+/// `Open` work may be abandoned after the ordinary termination grace. Once a
+/// tool enters `Irreversible`, however, the executor must wait for the body to
+/// report its real outcome: persisting cancellation while that body can still
+/// commit bytes would make the durable record disagree with the workspace.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ExecutionPhase {
+    #[default]
+    Open,
+    StopRequested,
+    Irreversible,
+}
+
+/// Executor-visible state for the one-way irreversible transition.
+///
+/// The mutex is held only while changing or observing the phase, never while a
+/// tool performs work or while the executor waits. Besides avoiding a lock-order
+/// edge, that makes the transition the sole synchronization point: either the
+/// stop wins and the tool refuses to enter, or the tool wins and the executor
+/// knows it may no longer abandon the worker.
+#[derive(Clone, Debug, Default)]
+pub(super) struct ExecutionControl(Arc<Mutex<ExecutionPhase>>);
+
+impl ExecutionControl {
+    fn begin_irreversible(
+        &self,
+        cancellation: &Cancellation,
+        deadline: Option<Deadline>,
+    ) -> Result<(), ToolError> {
+        let mut phase = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *phase == ExecutionPhase::StopRequested || cancellation.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        if let Some(deadline) = deadline
+            && deadline.has_passed()
+        {
+            return Err(ToolError::TimedOut {
+                limit: deadline.limit(),
+            });
+        }
+        *phase = ExecutionPhase::Irreversible;
+        Ok(())
+    }
+
+    pub(super) fn request_stop(&self, cancellation: &Cancellation) {
+        let mut phase = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *phase == ExecutionPhase::Open {
+            *phase = ExecutionPhase::StopRequested;
+        }
+        cancellation.cancel();
+    }
+
+    pub(super) fn is_irreversible(&self) -> bool {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            == ExecutionPhase::Irreversible
+    }
+}
+
 /// A unit a countable progress event is measured in.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -479,6 +547,7 @@ pub struct ExecutionContext {
     cancellation: Cancellation,
     progress: Box<dyn ProgressSink>,
     artifacts: Box<dyn ArtifactWriter>,
+    control: ExecutionControl,
     deadline: Option<Deadline>,
     stream_tail_bytes: usize,
 }
@@ -554,6 +623,7 @@ impl ExecutionContext {
             cancellation,
             progress,
             artifacts,
+            control: ExecutionControl::default(),
             deadline: None,
             stream_tail_bytes: DEFAULT_STREAM_TAIL_BYTES,
         }
@@ -698,6 +768,33 @@ impl ExecutionContext {
             });
         }
         Ok(())
+    }
+
+    /// Enters the final, irreversible phase of this tool invocation.
+    ///
+    /// The transition is one-way. After it succeeds, the executor will not
+    /// abandon this worker at the ordinary termination grace; it waits for the
+    /// body's actual outcome so no durable `cancelled` or `timed_out` record can
+    /// be written while the body is still committing side effects.
+    ///
+    /// Call this exactly once, immediately before a bounded commit phase, after
+    /// every validation and other operation that can be completed before the
+    /// first irreversible side effect. The body must not begin unbounded work
+    /// afterward: entering deliberately trades the executor's abandonment escape
+    /// hatch for an honest record of the mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Cancelled`] when the executor's stop request won the
+    /// transition, or the same cancellation/deadline error as
+    /// [`Self::check_still_permitted`] when the call was already over.
+    pub(crate) fn begin_irreversible(&self) -> Result<(), ToolError> {
+        self.control
+            .begin_irreversible(&self.cancellation, self.deadline)
+    }
+
+    pub(super) fn execution_control(&self) -> ExecutionControl {
+        self.control.clone()
     }
 
     /// Reports one progress event.

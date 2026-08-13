@@ -68,7 +68,11 @@
 //! failure of its own — is the tool's to report.
 //!
 //! A body that does not come back at all is recorded with the executor's
-//! verdict and abandoned.
+//! verdict and abandoned, unless a trusted built-in has crossed its bounded
+//! irreversible boundary. Once that transition wins its race with the stop
+//! request, persisting the inferred verdict before the body returns would allow
+//! workspace bytes to change after their call was durably declared over. The
+//! executor therefore waits for the body's real outcome in that phase.
 //!
 //! # Persist before deliver
 //!
@@ -128,6 +132,7 @@ use time::OffsetDateTime;
 use crate::domain::{Failure, RunId, StepId, ToolCall, ToolCallId, ToolCallState};
 use crate::store::{EventKind, RunEvent, Store, StoreArtifacts, StoreError};
 
+use super::context::ExecutionControl;
 use super::{
     DEFAULT_PROGRESS_CAPACITY, DEFAULT_STREAM_TAIL_BYTES, Deadline, ErasedTool, ExecutionContext,
     InvocationError, POLL_INTERVAL, ProgressReceiver, ToolError, ToolId, ToolIdentity, ToolOutcome,
@@ -150,6 +155,8 @@ const OVERSIZED_RESULT_KIND: &str = "payload_too_large";
 /// Long enough that a body checking its token between units of work returns on
 /// its own and gets to report what it did; short enough that a body which
 /// ignores the token does not hold up the record of a call that is already over.
+/// A trusted built-in in its bounded irreversible phase is the exception: its
+/// call cannot honestly be recorded as over until that phase returns.
 pub const TERMINATION_GRACE: Duration = Duration::from_millis(500);
 
 /// What bounds one call, and how much of its output is kept in memory.
@@ -490,6 +497,7 @@ struct Supervised<'a> {
     caller: &'a Cancellation,
     /// The token this call's body and children hold, cancelled to stop them.
     call_token: &'a Cancellation,
+    control: &'a ExecutionControl,
     deadline: Option<Deadline>,
 }
 
@@ -765,6 +773,7 @@ impl ToolExecutor {
         if let Some(deadline) = deadline {
             context = context.with_deadline(deadline);
         }
+        let control = context.execution_control();
 
         let input = raw_input(dispatched.input());
         let (finished, awaiting) = mpsc::sync_channel(1);
@@ -783,6 +792,7 @@ impl ToolExecutor {
             reports: &reports,
             caller: cancellation,
             call_token: &call_token,
+            control: &control,
             deadline,
         });
         self.finish(call, step, Some(identity), outcome)
@@ -818,6 +828,7 @@ impl ToolExecutor {
             reports,
             caller,
             call_token,
+            control,
             deadline,
         } = watched;
 
@@ -868,7 +879,7 @@ impl ToolExecutor {
             }
 
             if let Some((verdict, since)) = &stopping {
-                if since.elapsed() >= TERMINATION_GRACE {
+                if since.elapsed() >= TERMINATION_GRACE && !control.is_irreversible() {
                     return verdict.clone();
                 }
             } else if let Some(verdict) = Self::reason_to_stop(caller, call_token, deadline) {
@@ -877,7 +888,7 @@ impl ToolExecutor {
                 // back of it, and a cooperative body returns at its next check.
                 // The caller's token is only ever read — it latches, and
                 // cancelling it here would cancel every later call sharing it.
-                call_token.cancel();
+                control.request_stop(call_token);
                 stopping = Some((verdict, std::time::Instant::now()));
             }
         }

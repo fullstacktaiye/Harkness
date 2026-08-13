@@ -1,8 +1,22 @@
 //! Stale-safe unified-diff application within one workspace.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
+use std::ffi::{CString, OsStr};
 use std::fs::{self, File, Permissions};
-use std::io::Write;
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
 
 use harkness_git::{
@@ -12,6 +26,16 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FileRenameInfo, GetFileInformationByHandle, OPEN_EXISTING, ReOpenFile,
+    SetFileInformationByHandle,
+};
 
 use crate::tool::{
     ArtifactRef, Capability, ExecutionContext, RiskLevel, Tool, ToolError, ToolIdentity,
@@ -99,7 +123,7 @@ impl Tool for FsApplyPatch {
         input: Self::Input,
         context: &mut ExecutionContext,
     ) -> Result<Self::Output, ToolError> {
-        execute_patch(input, context, |_| {})
+        execute_patch(input, context, |_| {}, |_| {})
     }
 }
 
@@ -158,18 +182,26 @@ fn execute_patch(
     input: ApplyPatchInput,
     context: &mut ExecutionContext,
     mut after_write: impl FnMut(&Path),
+    mut before_replace: impl FnMut(&Path),
 ) -> Result<ApplyPatchOutput, ToolError> {
     context.check_still_permitted()?;
     let parsed = parse_patch(input.patch.as_bytes())?;
     let bases = resolve_bases(input.bases, context)?;
     let mut prepared = validate_all(parsed, &bases, context)?;
     prepared.sort_by(|left, right| left.relative.cmp(&right.relative));
+    // The diff is a mandatory part of a successful result. Discover storage
+    // failures while the call is still side-effect free rather than after the
+    // workspace has already been changed.
+    let mut diff_artifact = context.open_artifact("applied.patch", "text/x-diff")?;
 
     // Once the first rename commits, finishing this already-validated bounded
     // batch is the only outcome whose terminal record describes the workspace.
     context.check_still_permitted()?;
+    context.begin_irreversible()?;
     for file in &prepared {
-        write_atomically(file, context.workspace_root())?;
+        write_atomically(file, context.workspace_root(), || {
+            before_replace(&file.relative);
+        })?;
         after_write(&file.relative);
     }
 
@@ -179,7 +211,12 @@ fn execute_patch(
         .collect::<Vec<_>>();
     let diff = resulting_worktree_patch(context.workspace_root(), &touched)
         .map_err(|error| ToolError::execution_failed(format!("resulting diff failed: {error}")))?;
-    let diff_artifact = context.write_artifact("applied.patch", "text/x-diff", &diff)?;
+    diff_artifact.write_all(&diff).map_err(|error| {
+        ToolError::execution_failed(format!(
+            "resulting diff artifact could not be written: {error}"
+        ))
+    })?;
+    let diff_artifact = diff_artifact.finish()?;
     Ok(ApplyPatchOutput {
         files: prepared.iter().map(PreparedFile::summary).collect(),
         diff_artifact,
@@ -192,7 +229,16 @@ pub(super) fn execute_with_after_write(
     context: &mut ExecutionContext,
     after_write: impl FnMut(&Path),
 ) -> Result<ApplyPatchOutput, ToolError> {
-    execute_patch(input, context, after_write)
+    execute_patch(input, context, after_write, |_| {})
+}
+
+#[cfg(test)]
+pub(super) fn execute_with_before_replace(
+    input: ApplyPatchInput,
+    context: &mut ExecutionContext,
+    before_replace: impl FnMut(&Path),
+) -> Result<ApplyPatchOutput, ToolError> {
+    execute_patch(input, context, |_| {}, before_replace)
 }
 
 fn parse_patch(bytes: &[u8]) -> Result<Vec<ParsedFile>, ToolError> {
@@ -237,6 +283,7 @@ fn resolve_bases(
     context: &ExecutionContext,
 ) -> Result<BTreeMap<PathBuf, ResolvedBase>, ToolError> {
     let mut resolved = BTreeMap::new();
+    let mut targets = BTreeMap::<PlatformPathKey, PathBuf>::new();
     for base in bases {
         let relative = PathBuf::from(&base.path);
         ensure_relative_normal_path(&relative)?;
@@ -250,6 +297,17 @@ fn resolve_bases(
         let path = context
             .resolve(&relative)
             .map_err(|error| forbidden_patch_path(&relative, error))?;
+        ensure_resolved_patch_target(context.workspace_root(), path.as_path(), &relative)?;
+        let target_key = platform_path_key(path.as_path());
+        if let Some(previous) = targets.insert(target_key, relative.clone()) {
+            return Err(patch_conflict(
+                &relative,
+                format!(
+                    "this target is platform-equivalent to the already-declared path {}",
+                    previous.display()
+                ),
+            ));
+        }
         let metadata = match fs::symlink_metadata(path.as_path()) {
             Ok(metadata) if metadata.file_type().is_file() => Some(metadata),
             Ok(_) => {
@@ -303,6 +361,13 @@ fn validate_all(
     let mut prepared = Vec::new();
     for file in parsed {
         context.check_still_permitted()?;
+        #[cfg(not(unix))]
+        if file.mode == Some(PatchFileMode::Executable) {
+            return Err(patch_conflict(
+                &file.relative,
+                "executable file modes are not supported on this platform",
+            ));
+        }
         let base = bases.get(&file.relative).expect("path sets were compared");
         if file.created != base.original.is_none() {
             return Err(patch_conflict(
@@ -420,6 +485,7 @@ fn split_lines(bytes: &[u8]) -> Vec<&[u8]> {
     lines
 }
 
+#[cfg(not(unix))]
 fn read_current_target(
     path: &Path,
     relative: &Path,
@@ -440,7 +506,76 @@ fn read_current_target(
     Ok((Some(bytes), Some(metadata.permissions())))
 }
 
-fn write_atomically(file: &PreparedFile, workspace_root: &Path) -> Result<(), ToolError> {
+#[cfg(not(windows))]
+fn prepare_temporary(file: &PreparedFile, parent: &Path) -> Result<NamedTempFile, ToolError> {
+    let mut temporary = NamedTempFile::new_in(parent).map_err(|error| {
+        io_failure(
+            &file.relative,
+            "could not create an atomic temporary file",
+            error,
+        )
+    })?;
+    temporary
+        .write_all(&file.resulting)
+        .map_err(|error| io_failure(&file.relative, "could not write", error))?;
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .map_err(|error| io_failure(&file.relative, "could not sync", error))?;
+    Ok(temporary)
+}
+
+#[cfg(windows)]
+fn prepare_temporary(file: &PreparedFile, parent: &Path) -> Result<NamedTempFile, ToolError> {
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".harkness-patch-")
+        .make_in(parent, |path| {
+            fs::OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_ATTRIBUTE_NORMAL)
+                .open(path)
+        })
+        .map_err(|error| {
+            io_failure(
+                &file.relative,
+                "could not create an atomic temporary file",
+                error,
+            )
+        })?;
+    temporary
+        .write_all(&file.resulting)
+        .map_err(|error| io_failure(&file.relative, "could not write", error))?;
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .map_err(|error| io_failure(&file.relative, "could not sync", error))?;
+    Ok(temporary)
+}
+
+fn validate_current(file: &PreparedFile, current: Option<&[u8]>) -> Result<(), ToolError> {
+    if current == file.original.as_deref() {
+        return Ok(());
+    }
+    Err(ToolError::StalePatch {
+        path: file.relative.clone(),
+        expected: file
+            .original
+            .as_deref()
+            .map(sha256)
+            .unwrap_or_else(|| "new file".to_owned()),
+        actual: current.map(sha256).unwrap_or_else(|| "missing".to_owned()),
+    })
+}
+
+#[cfg(unix)]
+fn write_atomically(
+    file: &PreparedFile,
+    workspace_root: &Path,
+    before_replace: impl FnOnce(),
+) -> Result<(), ToolError> {
     ensure_safe_patch_target(workspace_root, &file.relative)?;
     let fresh = file
         .path
@@ -452,20 +587,67 @@ fn write_atomically(file: &PreparedFile, workspace_root: &Path) -> Result<(), To
             "the target resolved to a different path after validation",
         ));
     }
-    let (current, permissions) = read_current_target(fresh.as_path(), &file.relative)?;
-    if current.as_deref() != file.original.as_deref() {
-        return Err(ToolError::StalePatch {
-            path: file.relative.clone(),
-            expected: file
-                .original
-                .as_deref()
-                .map(sha256)
-                .unwrap_or_else(|| "new file".to_owned()),
-            actual: current
-                .as_deref()
-                .map(sha256)
-                .unwrap_or_else(|| "missing".to_owned()),
-        });
+    let parent = fresh
+        .as_path()
+        .parent()
+        .ok_or_else(|| patch_conflict(&file.relative, "the target has no parent directory"))?;
+    if !parent.is_dir() {
+        return Err(patch_conflict(
+            &file.relative,
+            "the target parent directory does not exist",
+        ));
+    }
+    // The potentially long write and first sync happen before the final base
+    // proof. The commit window below then consists only of bounded metadata,
+    // permission, sync, and descriptor-relative rename operations.
+    let mut temporary = prepare_temporary(file, parent)?;
+    let anchored = AnchoredParent::open(workspace_root, &file.relative, parent)?;
+
+    before_replace();
+    revalidate_anchored_target(file, workspace_root, &anchored, parent)?;
+    let (current, permissions) = anchored.read_target(&file.relative)?;
+    validate_current(file, current.as_deref())?;
+    set_result_permissions(
+        temporary.as_file_mut(),
+        &file.relative,
+        permissions,
+        file.mode,
+    )?;
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .map_err(|error| io_failure(&file.relative, "could not sync", error))?;
+    anchored.verify_temporary(&temporary, &file.relative)?;
+
+    // Re-resolve and re-read after the temp file is completely ready. This is
+    // the last userspace check possible before renameat; the retained directory
+    // descriptor makes any later ancestor swap harmless to containment.
+    revalidate_anchored_target(file, workspace_root, &anchored, parent)?;
+    let (current, _) = anchored.read_target(&file.relative)?;
+    validate_current(file, current.as_deref())?;
+    anchored.replace(&temporary, &file.relative)?;
+    // The path no longer names our file. Disable NamedTempFile's path cleanup
+    // so Drop cannot unlink an attacker-created replacement at the old name.
+    temporary.disable_cleanup(true);
+    anchored.sync(&file.relative)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn write_atomically(
+    file: &PreparedFile,
+    workspace_root: &Path,
+    before_replace: impl FnOnce(),
+) -> Result<(), ToolError> {
+    ensure_safe_patch_target(workspace_root, &file.relative)?;
+    let fresh = file
+        .path
+        .revalidate()
+        .map_err(|error| forbidden_patch_path(&file.relative, error))?;
+    if fresh.as_path() != file.path.as_path() {
+        return Err(forbidden_patch_path(
+            &file.relative,
+            "the target resolved to a different path after validation",
+        ));
     }
     let parent = fresh
         .as_path()
@@ -477,16 +659,12 @@ fn write_atomically(file: &PreparedFile, workspace_root: &Path) -> Result<(), To
             "the target parent directory does not exist",
         ));
     }
-    let mut temporary = NamedTempFile::new_in(parent).map_err(|error| {
-        io_failure(
-            &file.relative,
-            "could not create an atomic temporary file",
-            error,
-        )
-    })?;
-    temporary
-        .write_all(&file.resulting)
-        .map_err(|error| io_failure(&file.relative, "could not write", error))?;
+    let mut temporary = prepare_temporary(file, parent)?;
+
+    before_replace();
+    let fresh = revalidate_target(file, workspace_root)?;
+    let (current, permissions) = read_current_target(fresh.as_path(), &file.relative)?;
+    validate_current(file, current.as_deref())?;
     set_result_permissions(
         temporary.as_file_mut(),
         &file.relative,
@@ -497,10 +675,523 @@ fn write_atomically(file: &PreparedFile, workspace_root: &Path) -> Result<(), To
         .as_file_mut()
         .sync_all()
         .map_err(|error| io_failure(&file.relative, "could not sync", error))?;
+
+    let fresh = revalidate_target(file, workspace_root)?;
+    let (current, _) = read_current_target(fresh.as_path(), &file.relative)?;
+    validate_current(file, current.as_deref())?;
     temporary
         .persist(fresh.as_path())
         .map_err(|error| io_failure(&file.relative, "could not replace", error.error))?;
     sync_directory(parent, &file.relative)
+}
+
+#[cfg(windows)]
+fn write_atomically(
+    file: &PreparedFile,
+    workspace_root: &Path,
+    before_replace: impl FnOnce(),
+) -> Result<(), ToolError> {
+    ensure_safe_patch_target(workspace_root, &file.relative)?;
+    let fresh = file
+        .path
+        .revalidate()
+        .map_err(|error| forbidden_patch_path(&file.relative, error))?;
+    ensure_resolved_patch_target(workspace_root, fresh.as_path(), &file.relative)?;
+    if fresh.as_path() != file.path.as_path() {
+        return Err(forbidden_patch_path(
+            &file.relative,
+            "the target resolved to a different path after validation",
+        ));
+    }
+    let parent = fresh
+        .as_path()
+        .parent()
+        .ok_or_else(|| patch_conflict(&file.relative, "the target has no parent directory"))?;
+    let mut temporary = prepare_temporary(file, parent)?;
+    let anchored = WindowsAnchoredParent::open(parent, &file.relative)?;
+
+    before_replace();
+    revalidate_windows_target(file, workspace_root, &anchored, parent)?;
+    let (current, permissions) = read_current_target(fresh.as_path(), &file.relative)?;
+    validate_current(file, current.as_deref())?;
+    set_result_permissions(
+        temporary.as_file_mut(),
+        &file.relative,
+        permissions,
+        file.mode,
+    )?;
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .map_err(|error| io_failure(&file.relative, "could not sync", error))?;
+
+    revalidate_windows_target(file, workspace_root, &anchored, parent)?;
+    let (current, _) = read_current_target(fresh.as_path(), &file.relative)?;
+    validate_current(file, current.as_deref())?;
+    anchored.replace(temporary.as_file(), &file.relative, &file.relative)?;
+    temporary.disable_cleanup(true);
+    anchored.sync(&file.relative)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn revalidate_target(
+    file: &PreparedFile,
+    workspace_root: &Path,
+) -> Result<ContainedPath, ToolError> {
+    ensure_safe_patch_target(workspace_root, &file.relative)?;
+    let fresh = file
+        .path
+        .revalidate()
+        .map_err(|error| forbidden_patch_path(&file.relative, error))?;
+    ensure_resolved_patch_target(workspace_root, fresh.as_path(), &file.relative)?;
+    if fresh.as_path() != file.path.as_path() {
+        return Err(forbidden_patch_path(
+            &file.relative,
+            "the target resolved to a different path after validation",
+        ));
+    }
+    Ok(fresh)
+}
+
+#[cfg(unix)]
+struct AnchoredParent {
+    directory: File,
+    target_name: CString,
+}
+
+#[cfg(unix)]
+impl AnchoredParent {
+    fn open(
+        workspace_root: &Path,
+        relative: &Path,
+        expected_parent: &Path,
+    ) -> Result<Self, ToolError> {
+        let mut directory = open_directory(workspace_root, relative)?;
+        if let Some(parent) = relative.parent() {
+            for component in parent.components() {
+                let std::path::Component::Normal(name) = component else {
+                    return Err(forbidden_patch_path(
+                        relative,
+                        "the patch parent is not a normal relative path",
+                    ));
+                };
+                directory = open_directory_at(&directory, name, relative)?;
+            }
+        }
+        if !same_file_metadata(
+            &directory
+                .metadata()
+                .map_err(|error| io_failure(relative, "could not inspect", error))?,
+            &fs::metadata(expected_parent)
+                .map_err(|error| io_failure(relative, "could not inspect", error))?,
+        ) {
+            return Err(forbidden_patch_path(
+                relative,
+                "the target parent changed while the patch was being prepared",
+            ));
+        }
+        let target_name = path_component(
+            relative
+                .file_name()
+                .ok_or_else(|| patch_conflict(relative, "the target has no file name"))?,
+            relative,
+        )?;
+        Ok(Self {
+            directory,
+            target_name,
+        })
+    }
+
+    fn matches_path(&self, parent: &Path, relative: &Path) -> Result<bool, ToolError> {
+        let anchored = self
+            .directory
+            .metadata()
+            .map_err(|error| io_failure(relative, "could not inspect", error))?;
+        let current = fs::metadata(parent)
+            .map_err(|error| io_failure(relative, "could not inspect", error))?;
+        Ok(same_file_metadata(&anchored, &current))
+    }
+
+    fn read_target(
+        &self,
+        relative: &Path,
+    ) -> Result<(Option<Vec<u8>>, Option<Permissions>), ToolError> {
+        let descriptor = unsafe {
+            libc::openat(
+                self.directory.as_raw_fd(),
+                self.target_name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            )
+        };
+        if descriptor < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok((None, None));
+            }
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                return Err(forbidden_patch_path(
+                    relative,
+                    "the patch target became a symbolic link",
+                ));
+            }
+            return Err(io_failure(relative, "could not open", error));
+        }
+        let mut file = unsafe { File::from_raw_fd(descriptor) };
+        let metadata = file
+            .metadata()
+            .map_err(|error| io_failure(relative, "could not inspect", error))?;
+        if !metadata.file_type().is_file() {
+            return Err(patch_conflict(relative, "the target is not a regular file"));
+        }
+        let permissions = metadata.permissions();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|error| io_failure(relative, "could not read", error))?;
+        Ok((Some(bytes), Some(permissions)))
+    }
+
+    fn verify_temporary(
+        &self,
+        temporary: &NamedTempFile,
+        relative: &Path,
+    ) -> Result<(), ToolError> {
+        let name = path_component(
+            temporary
+                .path()
+                .file_name()
+                .ok_or_else(|| patch_conflict(relative, "the temporary file has no file name"))?,
+            relative,
+        )?;
+        let descriptor = unsafe {
+            libc::openat(
+                self.directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            )
+        };
+        if descriptor < 0 {
+            return Err(forbidden_patch_path(
+                relative,
+                format!(
+                    "the temporary file left the validated parent: {}",
+                    std::io::Error::last_os_error()
+                ),
+            ));
+        }
+        let named = unsafe { File::from_raw_fd(descriptor) };
+        let named_metadata = named
+            .metadata()
+            .map_err(|error| io_failure(relative, "could not inspect", error))?;
+        let held_metadata = temporary
+            .as_file()
+            .metadata()
+            .map_err(|error| io_failure(relative, "could not inspect", error))?;
+        if !same_file_metadata(&named_metadata, &held_metadata) {
+            return Err(forbidden_patch_path(
+                relative,
+                "the temporary file name was replaced during patch preparation",
+            ));
+        }
+        Ok(())
+    }
+
+    fn replace(&self, temporary: &NamedTempFile, relative: &Path) -> Result<(), ToolError> {
+        let temporary_name = path_component(
+            temporary
+                .path()
+                .file_name()
+                .ok_or_else(|| patch_conflict(relative, "the temporary file has no file name"))?,
+            relative,
+        )?;
+        let replaced = unsafe {
+            libc::renameat(
+                self.directory.as_raw_fd(),
+                temporary_name.as_ptr(),
+                self.directory.as_raw_fd(),
+                self.target_name.as_ptr(),
+            )
+        };
+        if replaced != 0 {
+            return Err(io_failure(
+                relative,
+                "could not replace",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn sync(&self, relative: &Path) -> Result<(), ToolError> {
+        self.directory
+            .sync_all()
+            .map_err(|error| io_failure(relative, "could not sync the parent of", error))
+    }
+}
+
+#[cfg(unix)]
+fn revalidate_anchored_target(
+    file: &PreparedFile,
+    workspace_root: &Path,
+    anchored: &AnchoredParent,
+    parent: &Path,
+) -> Result<(), ToolError> {
+    ensure_safe_patch_target(workspace_root, &file.relative)?;
+    let fresh = file
+        .path
+        .revalidate()
+        .map_err(|error| forbidden_patch_path(&file.relative, error))?;
+    ensure_resolved_patch_target(workspace_root, fresh.as_path(), &file.relative)?;
+    if fresh.as_path() != file.path.as_path() || !anchored.matches_path(parent, &file.relative)? {
+        return Err(forbidden_patch_path(
+            &file.relative,
+            "the target parent changed while the patch was being prepared",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_directory(path: &Path, relative: &Path) -> Result<File, ToolError> {
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| patch_conflict(relative, "the target path contains a NUL byte"))?;
+    let descriptor = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        )
+    };
+    if descriptor < 0 {
+        return Err(forbidden_patch_path(
+            relative,
+            format!(
+                "the workspace root could not be opened without following links: {}",
+                std::io::Error::last_os_error()
+            ),
+        ));
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+#[cfg(unix)]
+fn open_directory_at(parent: &File, name: &OsStr, relative: &Path) -> Result<File, ToolError> {
+    let name = path_component(name, relative)?;
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        )
+    };
+    if descriptor < 0 {
+        return Err(forbidden_patch_path(
+            relative,
+            format!(
+                "the target parent could not be opened without following links: {}",
+                std::io::Error::last_os_error()
+            ),
+        ));
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+#[cfg(unix)]
+fn path_component(name: &OsStr, relative: &Path) -> Result<CString, ToolError> {
+    CString::new(name.as_bytes())
+        .map_err(|_| patch_conflict(relative, "the target path contains a NUL byte"))
+}
+
+#[cfg(unix)]
+fn same_file_metadata(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(windows)]
+struct WindowsAnchoredParent {
+    directory: File,
+    identity: WindowsFileIdentity,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct WindowsFileIdentity {
+    volume: u32,
+    index: u64,
+}
+
+#[cfg(windows)]
+impl WindowsAnchoredParent {
+    fn open(parent: &Path, relative: &Path) -> Result<Self, ToolError> {
+        let directory = open_windows_directory(parent, relative)?;
+        let information = windows_file_information(&directory, relative)?;
+        if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(forbidden_patch_path(
+                relative,
+                "the target parent is a Windows reparse point",
+            ));
+        }
+        Ok(Self {
+            identity: windows_identity(&information),
+            directory,
+        })
+    }
+
+    fn matches_path(&self, parent: &Path, relative: &Path) -> Result<bool, ToolError> {
+        let current = open_windows_directory(parent, relative)?;
+        let information = windows_file_information(&current, relative)?;
+        Ok(
+            information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+                && windows_identity(&information) == self.identity,
+        )
+    }
+
+    fn replace(&self, temporary: &File, target: &Path, relative: &Path) -> Result<(), ToolError> {
+        let target = target
+            .file_name()
+            .ok_or_else(|| patch_conflict(relative, "the target has no file name"))?
+            .encode_wide()
+            .collect::<Vec<_>>();
+        let target_bytes = target
+            .len()
+            .checked_mul(std::mem::size_of::<u16>())
+            .ok_or_else(|| patch_conflict(relative, "the target path is too long"))?;
+        let structure_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName)
+            .checked_add(target_bytes)
+            .ok_or_else(|| patch_conflict(relative, "the target path is too long"))?;
+        let words = structure_bytes.div_ceil(std::mem::size_of::<u64>());
+        let mut storage = vec![0u64; words];
+        let rename = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        unsafe {
+            (*rename).Anonymous.ReplaceIfExists = true;
+            (*rename).RootDirectory = self.directory.as_raw_handle() as HANDLE;
+            (*rename).FileNameLength = u32::try_from(target_bytes)
+                .map_err(|_| patch_conflict(relative, "the target path is too long"))?;
+            std::ptr::copy_nonoverlapping(
+                target.as_ptr(),
+                (*rename).FileName.as_mut_ptr(),
+                target.len(),
+            );
+        }
+
+        let rename_handle = unsafe {
+            ReOpenFile(
+                temporary.as_raw_handle() as HANDLE,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+            )
+        };
+        if rename_handle == INVALID_HANDLE_VALUE {
+            return Err(io_failure(
+                relative,
+                "could not prepare the atomic replacement",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let renamed = unsafe {
+            SetFileInformationByHandle(
+                rename_handle,
+                FileRenameInfo,
+                rename.cast(),
+                u32::try_from(structure_bytes).unwrap_or(u32::MAX),
+            )
+        };
+        unsafe {
+            CloseHandle(rename_handle);
+        }
+        if renamed == 0 {
+            return Err(io_failure(
+                relative,
+                "could not replace",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn sync(&self, _relative: &Path) -> Result<(), ToolError> {
+        // Windows does not offer Unix's portable directory-fsync contract, and
+        // FlushFileBuffers commonly rejects directory handles opened only for
+        // traversal. The replacement file itself was flushed before rename;
+        // retain the established non-Unix best-effort directory semantics.
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn revalidate_windows_target(
+    file: &PreparedFile,
+    workspace_root: &Path,
+    anchored: &WindowsAnchoredParent,
+    parent: &Path,
+) -> Result<(), ToolError> {
+    ensure_safe_patch_target(workspace_root, &file.relative)?;
+    let fresh = file
+        .path
+        .revalidate()
+        .map_err(|error| forbidden_patch_path(&file.relative, error))?;
+    ensure_resolved_patch_target(workspace_root, fresh.as_path(), &file.relative)?;
+    if fresh.as_path() != file.path.as_path() || !anchored.matches_path(parent, &file.relative)? {
+        return Err(forbidden_patch_path(
+            &file.relative,
+            "the target parent changed while the patch was being prepared",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn open_windows_directory(path: &Path, relative: &Path) -> Result<File, ToolError> {
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            FILE_GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(forbidden_patch_path(
+            relative,
+            format!(
+                "the target parent could not be opened without following reparse points: {}",
+                std::io::Error::last_os_error()
+            ),
+        ));
+    }
+    Ok(unsafe { File::from_raw_handle(handle as _) })
+}
+
+#[cfg(windows)]
+fn windows_file_information(
+    file: &File,
+    relative: &Path,
+) -> Result<BY_HANDLE_FILE_INFORMATION, ToolError> {
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) } == 0
+    {
+        return Err(io_failure(
+            relative,
+            "could not inspect",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(information)
+}
+
+#[cfg(windows)]
+fn windows_identity(information: &BY_HANDLE_FILE_INFORMATION) -> WindowsFileIdentity {
+    WindowsFileIdentity {
+        volume: information.dwVolumeSerialNumber,
+        index: (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    }
 }
 
 #[cfg(unix)]
@@ -536,14 +1227,7 @@ fn set_result_permissions(
     Ok(())
 }
 
-#[cfg(unix)]
-fn sync_directory(directory: &Path, relative: &Path) -> Result<(), ToolError> {
-    File::open(directory)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| io_failure(relative, "could not sync the parent of", error))
-}
-
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn sync_directory(_directory: &Path, _relative: &Path) -> Result<(), ToolError> {
     Ok(())
 }
@@ -604,12 +1288,10 @@ fn ensure_relative_normal_path(path: &Path) -> Result<(), ToolError> {
 
 fn ensure_safe_patch_target(workspace_root: &Path, relative: &Path) -> Result<(), ToolError> {
     ensure_relative_normal_path(relative)?;
-    if relative.components().any(|component| {
-        component
-            .as_os_str()
-            .to_string_lossy()
-            .eq_ignore_ascii_case(".git")
-    }) {
+    if relative
+        .components()
+        .any(|component| is_git_administration_component(component.as_os_str()))
+    {
         return Err(forbidden_patch_path(
             relative,
             "Git administration paths are not workspace files",
@@ -635,6 +1317,64 @@ fn ensure_safe_patch_target(workspace_root: &Path, relative: &Path) -> Result<()
         }
     }
     Ok(())
+}
+
+fn ensure_resolved_patch_target(
+    workspace_root: &Path,
+    resolved: &Path,
+    relative: &Path,
+) -> Result<(), ToolError> {
+    let resolved_relative = resolved.strip_prefix(workspace_root).map_err(|_| {
+        forbidden_patch_path(
+            relative,
+            "the resolved patch target is not inside the workspace root",
+        )
+    })?;
+    if resolved_relative
+        .components()
+        .any(|component| is_git_administration_component(component.as_os_str()))
+    {
+        return Err(forbidden_patch_path(
+            relative,
+            "the patch target resolves into Git administration data",
+        ));
+    }
+    Ok(())
+}
+
+fn is_git_administration_component(component: &std::ffi::OsStr) -> bool {
+    let component = component.to_string_lossy();
+    #[cfg(windows)]
+    let component = component
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches([' ', '.']);
+    component.eq_ignore_ascii_case(".git")
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+type PlatformPathKey = String;
+
+#[cfg(any(windows, target_os = "macos"))]
+fn platform_path_key(path: &Path) -> PlatformPathKey {
+    path.components()
+        .map(|component| {
+            let component = component.as_os_str().to_string_lossy();
+            #[cfg(windows)]
+            let component = component.trim_end_matches([' ', '.']);
+            component.to_lowercase()
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+type PlatformPathKey = PathBuf;
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn platform_path_key(path: &Path) -> PlatformPathKey {
+    path.to_path_buf()
 }
 
 fn signed_delta(resulting: usize, original: usize) -> i64 {

@@ -18,7 +18,7 @@ use crate::tool::{
     ArtifactRef, ArtifactStream, ArtifactWriter, Deadline, DiscardedProgress, ExecutionContext,
     InvocationError, RiskLevel, Tool, ToolError, ToolRegistry, invoke,
 };
-use crate::tools::fs_apply_patch::execute_with_after_write;
+use crate::tools::fs_apply_patch::{execute_with_after_write, execute_with_before_replace};
 use crate::tools::{ApplyPatchInput, FileBase, FsApplyPatch};
 use crate::trust::{BASELINE_ENVIRONMENT, EnvironmentName};
 
@@ -586,6 +586,222 @@ fn a_patch_targeting_an_escaping_symlink_is_forbidden_without_writing() {
     );
 }
 
+#[test]
+fn mandatory_diff_artifact_is_opened_before_any_patch_write() {
+    struct RefusingArtifacts;
+
+    impl ArtifactWriter for RefusingArtifacts {
+        fn open(
+            &mut self,
+            _name: &str,
+            _media_type: &str,
+        ) -> Result<Box<dyn ArtifactStream>, ToolError> {
+            Err(ToolError::execution_failed("artifact storage unavailable"))
+        }
+    }
+
+    let harness = Harness::new();
+    initialize_repository(harness.workspace.path());
+    let target = harness.workspace.path().join("tracked.txt");
+    let original = fs::read(&target).unwrap();
+    let mut context = ExecutionContext::new(
+        RunId::new(),
+        StepId::new(),
+        ToolCallId::new(),
+        harness.workspace.path().to_path_buf(),
+        Cancellation::default(),
+        Box::new(DiscardedProgress),
+        Box::new(RefusingArtifacts),
+    )
+    .unwrap();
+
+    let error = FsApplyPatch
+        .execute(
+            ApplyPatchInput {
+                patch: one_file_patch().to_owned(),
+                bases: vec![FileBase {
+                    path: "tracked.txt".to_owned(),
+                    base_sha256: Some(sha256(&original)),
+                }],
+            },
+            &mut context,
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "execution_failed");
+    assert_eq!(fs::read(target).unwrap(), original);
+}
+
+#[test]
+fn a_target_changed_immediately_before_replacement_is_not_overwritten() {
+    let harness = Harness::new();
+    initialize_repository(harness.workspace.path());
+    let target = harness.workspace.path().join("tracked.txt");
+    let original = fs::read(&target).unwrap();
+    let mut context = harness.context();
+
+    let error = execute_with_before_replace(
+        ApplyPatchInput {
+            patch: one_file_patch().to_owned(),
+            bases: vec![FileBase {
+                path: "tracked.txt".to_owned(),
+                base_sha256: Some(sha256(&original)),
+            }],
+        },
+        &mut context,
+        |_| fs::write(&target, b"external edit\n").unwrap(),
+    )
+    .unwrap_err();
+
+    assert_eq!(error.kind(), "stale_patch");
+    assert_eq!(fs::read(target).unwrap(), b"external edit\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_ancestor_swapped_to_an_outside_symlink_before_replacement_is_refused() {
+    use std::os::unix::fs::symlink;
+
+    let harness = Harness::new();
+    initialize_repository(harness.workspace.path());
+    let parent = harness.workspace.path().join("nested");
+    let displaced = harness.workspace.path().join("displaced");
+    fs::create_dir(&parent).unwrap();
+    fs::write(parent.join("tracked.txt"), b"initial\n").unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("tracked.txt"), b"outside\n").unwrap();
+    let patch = one_file_patch().replace("tracked.txt", "nested/tracked.txt");
+    let mut context = harness.context();
+
+    let error = execute_with_before_replace(
+        ApplyPatchInput {
+            patch,
+            bases: vec![FileBase {
+                path: "nested/tracked.txt".to_owned(),
+                base_sha256: Some(sha256(b"initial\n")),
+            }],
+        },
+        &mut context,
+        |_| {
+            fs::rename(&parent, &displaced).unwrap();
+            symlink(outside.path(), &parent).unwrap();
+        },
+    )
+    .unwrap_err();
+
+    assert_eq!(error.kind(), "forbidden_path");
+    assert_eq!(
+        fs::read(outside.path().join("tracked.txt")).unwrap(),
+        b"outside\n"
+    );
+    assert_eq!(
+        fs::read(displaced.join("tracked.txt")).unwrap(),
+        b"initial\n"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_normalized_git_aliases_are_never_patch_targets() {
+    let harness = Harness::new();
+    initialize_repository(harness.workspace.path());
+    for alias in [".git ", ".git.", ".GIT "] {
+        let patch = one_file_patch().replace("tracked.txt", &format!("{alias}/HEAD"));
+        let mut context = harness.context();
+        let error = FsApplyPatch
+            .execute(
+                ApplyPatchInput {
+                    patch,
+                    bases: vec![FileBase {
+                        path: format!("{alias}/HEAD"),
+                        base_sha256: None,
+                    }],
+                },
+                &mut context,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), "forbidden_path", "alias {alias:?}");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_platform_equivalent_targets_are_rejected_before_writing() {
+    let harness = Harness::new();
+    initialize_repository(harness.workspace.path());
+    fs::write(harness.workspace.path().join("name.txt"), b"one\n").unwrap();
+    let patch = "diff --git a/name.txt b/name.txt\n\
+                 --- a/name.txt\n\
+                 +++ b/name.txt\n\
+                 @@ -1 +1 @@\n\
+                 -one\n\
+                 +first\n\
+                 diff --git a/NAME.TXT b/NAME.TXT\n\
+                 --- a/NAME.TXT\n\
+                 +++ b/NAME.TXT\n\
+                 @@ -1 +1 @@\n\
+                 -one\n\
+                 +second\n";
+    let mut context = harness.context();
+    let error = FsApplyPatch
+        .execute(
+            ApplyPatchInput {
+                patch: patch.to_owned(),
+                bases: vec![
+                    FileBase {
+                        path: "name.txt".to_owned(),
+                        base_sha256: Some(sha256(b"one\n")),
+                    },
+                    FileBase {
+                        path: "NAME.TXT".to_owned(),
+                        base_sha256: Some(sha256(b"one\n")),
+                    },
+                ],
+            },
+            &mut context,
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), "patch_conflict");
+    assert_eq!(
+        fs::read(harness.workspace.path().join("name.txt")).unwrap(),
+        b"one\n"
+    );
+}
+
+#[cfg(not(unix))]
+#[test]
+fn explicit_executable_mode_is_refused_where_it_cannot_be_applied() {
+    let harness = Harness::new();
+    initialize_repository(harness.workspace.path());
+    let original = fs::read(harness.workspace.path().join("tracked.txt")).unwrap();
+    let patch = "diff --git a/tracked.txt b/tracked.txt\n\
+                 old mode 100644\n\
+                 new mode 100755\n\
+                 --- a/tracked.txt\n\
+                 +++ b/tracked.txt\n\
+                 @@ -1 +1 @@\n\
+                 -initial\n\
+                 +changed\n";
+    let mut context = harness.context();
+    let error = FsApplyPatch
+        .execute(
+            ApplyPatchInput {
+                patch: patch.to_owned(),
+                bases: vec![FileBase {
+                    path: "tracked.txt".to_owned(),
+                    base_sha256: Some(sha256(&original)),
+                }],
+            },
+            &mut context,
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), "patch_conflict");
+    assert_eq!(
+        fs::read(harness.workspace.path().join("tracked.txt")).unwrap(),
+        original
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn process_exec_preserves_shell_metacharacters_as_single_arguments() {
@@ -608,6 +824,65 @@ fn process_exec_preserves_shell_metacharacters_as_single_arguments() {
         b"<; rm -rf workspace>\n<$(touch impossible)>\n"
     );
     assert!(!harness.workspace.path().join("impossible").exists());
+}
+
+#[test]
+fn cancellation_during_artifact_setup_prevents_process_launch() {
+    struct CancellingArtifacts {
+        inner: DiskArtifacts,
+        cancellation: Cancellation,
+        opened: usize,
+    }
+
+    impl ArtifactWriter for CancellingArtifacts {
+        fn open(
+            &mut self,
+            name: &str,
+            media_type: &str,
+        ) -> Result<Box<dyn ArtifactStream>, ToolError> {
+            self.opened += 1;
+            if self.opened == 2 {
+                self.cancellation.cancel();
+            }
+            self.inner.open(name, media_type)
+        }
+    }
+
+    let harness = Harness::new();
+    let cancellation = Cancellation::default();
+    let artifacts = CancellingArtifacts {
+        inner: harness.artifacts.clone(),
+        cancellation: cancellation.clone(),
+        opened: 0,
+    };
+    let mut context = ExecutionContext::new(
+        RunId::new(),
+        StepId::new(),
+        ToolCallId::new(),
+        harness.workspace.path().to_path_buf(),
+        cancellation,
+        Box::new(DiscardedProgress),
+        Box::new(artifacts),
+    )
+    .unwrap();
+    let mut registry = ToolRegistry::new();
+    let identity = ProcessExec.metadata().identity().clone();
+    registry.register(ProcessExec).unwrap();
+    let input = serde_json::value::to_raw_value(&json!({
+        "argv": ["harkness-command-that-must-never-be-spawned"]
+    }))
+    .unwrap();
+
+    let error = invoke(
+        &registry,
+        &identity.id,
+        Some(&identity.version),
+        &input,
+        &mut context,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.kind(), "cancelled");
 }
 
 #[cfg(unix)]
@@ -656,6 +931,42 @@ fn process_timeout_kills_a_spawned_grandchild_too() {
         !linux_process_is_live(pid),
         "grandchild {pid} survived the process-group timeout"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_detached_session_cannot_hold_a_timed_out_call_open() {
+    let harness = Harness::new();
+    let fixture = Fixture::new();
+    let pid_file = harness.workspace.path().join("detached.pid");
+    let shim = fixture.shim(
+        "spawns-detached-session",
+        "#!/bin/sh\nsetsid sh -c 'printf \"%s\\n\" \"$$\" > \"$1\"; sleep 30' sh \"$1\" &\nwait\n",
+    );
+    let started = std::time::Instant::now();
+    let output = harness
+        .invoke(
+            ProcessExec,
+            json!({"argv": [shim, pid_file], "timeout_seconds": 1}),
+        )
+        .unwrap();
+    assert_eq!(output["timed_out"], true);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "a detached writer kept the output readers alive"
+    );
+    let pid = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse::<libc::pid_t>()
+        .unwrap();
+    assert!(
+        linux_process_is_live(u32::try_from(pid).unwrap()),
+        "the regression must actually escape the supervised process group"
+    );
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
 }
 
 #[cfg(windows)]

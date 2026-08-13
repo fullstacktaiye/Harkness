@@ -589,8 +589,23 @@ applied twice; telling a call abandoned by a dead process from one still
 executing is a question about run ownership — the `owner_pid` column exists for
 it — and is not the executor's to answer.
 
-A supervised process tree is the unit of execution, so it is the unit that ends:
-a Unix process group or a Windows Job Object. When the direct child exits, the
+An executor may abandon an ordinary synchronous tool after the termination
+grace because Rust cannot kill its worker thread. A built-in tool with a bounded
+irreversible commit phase crosses that boundary through
+`ExecutionContext::begin_irreversible` immediately before its first commit and
+only after all validation is complete. The transition is one-way and races the
+executor's stop request under one mutex: either the stop wins and the commit is
+refused, or the commit wins and the executor waits for the body's real outcome
+instead of persisting cancellation while workspace bytes can still change.
+Third-party tools cannot enter this phase; making the hook public would let an
+untrusted body disable the executor's abandonment guarantee indefinitely.
+
+A supervised process unit is the unit of execution, so it is the unit that ends:
+a Unix process group or a Windows Job Object. A Unix descendant may deliberately
+detach into another session and outlive the portable process-group boundary; the
+supervisor makes its pipe readers stoppable so that descendant cannot hold the
+call open. A Windows child is assigned to its Job Object before it runs, so that
+platform retains a whole-descendant boundary. When the direct child exits, the
 supervisor is terminated before its output is collected: a pipe
 reaches end of file only when every write end closes, and a child that started a
 background helper leaves one open, so waiting for end of file would mean waiting
