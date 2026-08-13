@@ -533,7 +533,8 @@ on the calling thread is not a timeout. When the grace period expires the worker
 *abandoned*, not killed, since Rust cannot kill a thread; it owns its whole
 `ExecutionContext`, so nothing dangles. A tool that never polls its token therefore
 leaks a thread per call, which is why cancellation is a contract rather than a
-courtesy. A child *process* has no such caveat and is killed by process group.
+courtesy. A child *process* has no such caveat and is killed with its supervised
+process tree.
 
 A tool receives a token belonging to its own call, never the caller's.
 `Cancellation` latches and has no reset, so enforcing a deadline by cancelling the
@@ -588,15 +589,18 @@ applied twice; telling a call abandoned by a dead process from one still
 executing is a question about run ownership — the `owner_pid` column exists for
 it — and is not the executor's to answer.
 
-A process group is the unit of execution, so it is the unit that ends. When the
-direct child exits, the group is signalled before its output is collected: a pipe
+A supervised process tree is the unit of execution, so it is the unit that ends:
+a Unix process group or a Windows Job Object. When the direct child exits, the
+supervisor is terminated before its output is collected: a pipe
 reaches end of file only when every write end closes, and a child that started a
 background helper leaves one open, so waiting for end of file would mean waiting
 however long the helper runs. Signalling after the child has been reaped is sound
-while any member is alive — the group keeps the identifier reserved — and is a
-harmless `ESRCH` once none is. A captured stream is *finished* on the stop paths
-rather than dropped: an unfinished artifact deletes the bytes it staged, and a
-build log matters most when the build was killed.
+while any Unix group member is alive — the group keeps the identifier reserved —
+and is a harmless `ESRCH` once none is. Closing a Windows Job Object configured
+with `KILL_ON_JOB_CLOSE` provides the corresponding descendant guarantee. A
+captured stream is *finished* on the stop paths rather than dropped: an unfinished
+artifact deletes the bytes it staged, and a build log matters most when the build
+was killed.
 
 `tool_calls.tool_version` is the one column of a recorded request that is ever
 rewritten, and only by `ToolCall::dispatch`, which pins the resolved version in the
@@ -648,14 +652,22 @@ lowercase SHA-256 of its exact bytes and a new file carries `null`; a mismatch i
 in-memory base images before the first file is written, so a `patch_conflict`
 never leaves a prefix of the call applied. Deletes, renames, copies, binary
 patches, and missing parent directories are refused rather than interpreted as a
-more destructive operation than this tool declares.
+more destructive operation than this tool declares. Old and new patch headers
+must name the same path. Every `.git` component and every symlink component is
+refused, even when a symlink's target remains inside the workspace, so the audited
+path is always the file that is replaced. Patch parsing and repository diff
+production stay behind `harkness-git`, the owner of production Git behavior.
 
 Each prepared file is replaced through a temporary file in the target directory:
-write, preserve or establish permissions, sync, rename, then sync the directory.
-The `ContainedPath` is revalidated immediately before that sequence so an
-approval wait cannot turn an in-workspace target into a symlink escape. The
-result artifact is produced from libgit2's actual index-to-worktree diff over
-exactly the touched path set, not by echoing the caller's patch.
+write, preserve or apply the requested regular/executable mode, sync, rename,
+then sync the directory. Immediately before each replacement, the lexical target
+and `ContainedPath` are revalidated and its exact bytes or absence are compared
+with the already-approved base image. An external edit therefore becomes
+`stale_patch` rather than being overwritten. Cancellation has one final gate
+before this bounded commit phase and is not reported between replacements, so a
+partially applied call is never recorded as cancelled. The result artifact is
+produced from libgit2's actual index-to-worktree diff over exactly the touched path
+set, not by echoing the caller's patch.
 
 `process.exec` has no shell form. `argv[0]` is the program and every later value
 is one argument even when it contains shell metacharacters. The cwd crosses the
@@ -665,10 +677,10 @@ descriptor published; it can never enlarge that set. Both streams always go to
 artifacts and only a bounded tail enters the inline result.
 
 The child timeout defaults to 120 seconds and is clamped to 1 through 600. It is
-inside the enclosing call deadline: reaching it kills the process group and
-returns a typed result with `timed_out`, the enforced limit, duration, signal,
-tails, and both artifact references. Reaching the enclosing deadline remains a
-tool-call `timed_out` failure. `test.run` calls the same in-process supervisor —
+inside the enclosing call deadline: reaching it kills the supervised process
+tree and returns a typed result with `timed_out`, the enforced limit, duration,
+signal, tails, and both artifact references. Reaching the enclosing deadline
+remains a tool-call `timed_out` failure. `test.run` calls the same in-process supervisor —
 never nested tool dispatch — and adds only `passed = exit_code == 0 &&
 !timed_out`; a failing test is a valid test result, not a failed tool invocation.
 
@@ -755,9 +767,9 @@ decided it. `cancel_run` trips the caller's token for running calls — that is 
 stop *is* — and the executor's own rule about never writing a caller's token is unchanged, because
 the executor is not the one asking.
 
-Shutdown cancels rather than abandons and then waits for its workers, so no child process group
-outlives the application. Dropping a `Scheduler` shuts it down; a caller wanting a different
-deadline calls `shutdown` first.
+Shutdown cancels rather than abandons and then waits for its workers, so no child
+process tree outlives the application. Dropping a `Scheduler` shuts it down; a
+caller wanting a different deadline calls `shutdown` first.
 
 ## Approval Invariants
 

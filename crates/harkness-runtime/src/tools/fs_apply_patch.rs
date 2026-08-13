@@ -5,7 +5,9 @@ use std::fs::{self, File, Permissions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use git2::{Delta, Diff, DiffFormat, DiffLineType, DiffOptions, Patch, Repository};
+use harkness_git::{
+    PatchFileMode, UnifiedPatchLine, parse_unified_patch, resulting_worktree_patch,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -97,32 +99,7 @@ impl Tool for FsApplyPatch {
         input: Self::Input,
         context: &mut ExecutionContext,
     ) -> Result<Self::Output, ToolError> {
-        context.check_still_permitted()?;
-        let repository = Repository::open(context.workspace_root()).map_err(|error| {
-            ToolError::execution_failed(format!(
-                "the workspace is not an available Git repository: {error}"
-            ))
-        })?;
-        let parsed = parse_patch(input.patch.as_bytes())?;
-        let bases = resolve_bases(input.bases, context)?;
-        let mut prepared = validate_all(parsed, &bases, context)?;
-        prepared.sort_by(|left, right| left.relative.cmp(&right.relative));
-
-        for file in &prepared {
-            context.check_still_permitted()?;
-            write_atomically(file)?;
-        }
-
-        let touched = prepared
-            .iter()
-            .map(|file| file.relative.clone())
-            .collect::<Vec<_>>();
-        let diff = resulting_diff(&repository, &touched)?;
-        let diff_artifact = context.write_artifact("applied.patch", "text/x-diff", &diff)?;
-        Ok(ApplyPatchOutput {
-            files: prepared.iter().map(PreparedFile::summary).collect(),
-            diff_artifact,
-        })
+        execute_patch(input, context, |_| {})
     }
 }
 
@@ -130,6 +107,7 @@ struct ParsedFile {
     relative: PathBuf,
     hunks: Vec<ParsedHunk>,
     created: bool,
+    mode: Option<PatchFileMode>,
 }
 
 struct ParsedHunk {
@@ -148,7 +126,6 @@ struct ResolvedBase {
     relative: PathBuf,
     path: ContainedPath,
     original: Option<Vec<u8>>,
-    permissions: Option<Permissions>,
 }
 
 struct PreparedFile {
@@ -158,7 +135,8 @@ struct PreparedFile {
     resulting: Vec<u8>,
     hunks: usize,
     created: bool,
-    permissions: Option<Permissions>,
+    original: Option<Vec<u8>>,
+    mode: Option<PatchFileMode>,
 }
 
 impl PreparedFile {
@@ -176,121 +154,82 @@ impl PreparedFile {
     }
 }
 
-fn parse_patch(bytes: &[u8]) -> Result<Vec<ParsedFile>, ToolError> {
-    if bytes.is_empty() {
-        return Err(patch_conflict("<patch>", "the patch is empty"));
-    }
-    let diff = Diff::from_buffer(bytes)
-        .map_err(|error| patch_conflict("<patch>", format!("invalid unified diff: {error}")))?;
-    if diff.deltas().len() == 0 {
-        return Err(patch_conflict(
-            "<patch>",
-            "the patch contains no file changes",
-        ));
+fn execute_patch(
+    input: ApplyPatchInput,
+    context: &mut ExecutionContext,
+    mut after_write: impl FnMut(&Path),
+) -> Result<ApplyPatchOutput, ToolError> {
+    context.check_still_permitted()?;
+    let parsed = parse_patch(input.patch.as_bytes())?;
+    let bases = resolve_bases(input.bases, context)?;
+    let mut prepared = validate_all(parsed, &bases, context)?;
+    prepared.sort_by(|left, right| left.relative.cmp(&right.relative));
+
+    // Once the first rename commits, finishing this already-validated bounded
+    // batch is the only outcome whose terminal record describes the workspace.
+    context.check_still_permitted()?;
+    for file in &prepared {
+        write_atomically(file, context.workspace_root())?;
+        after_write(&file.relative);
     }
 
-    let mut files = Vec::new();
-    let mut seen = BTreeSet::new();
-    for index in 0..diff.deltas().len() {
-        let delta = diff
-            .get_delta(index)
-            .ok_or_else(|| patch_conflict("<patch>", "a parsed file delta disappeared"))?;
-        let created = match delta.status() {
-            Delta::Added => true,
-            Delta::Modified => false,
-            status => {
-                return Err(patch_conflict(
-                    delta
-                        .new_file()
-                        .path()
-                        .or_else(|| delta.old_file().path())
-                        .unwrap_or_else(|| Path::new("<patch>")),
-                    format!(
-                        "unsupported {status:?} delta; only file creation and modification are allowed"
-                    ),
-                ));
-            }
-        };
-        let relative = delta
-            .new_file()
-            .path()
-            .ok_or_else(|| patch_conflict("<patch>", "a target path is missing"))?
-            .to_path_buf();
-        ensure_relative_normal_path(&relative)?;
-        if !seen.insert(relative.clone()) {
-            return Err(patch_conflict(
-                &relative,
-                "the patch targets this path more than once",
-            ));
-        }
-        if delta.old_file().is_binary() || delta.new_file().is_binary() {
-            return Err(patch_conflict(
-                &relative,
-                "binary patches are not supported",
-            ));
-        }
-        let patch = Patch::from_diff(&diff, index)
-            .map_err(|error| patch_conflict(&relative, error))?
-            .ok_or_else(|| patch_conflict(&relative, "the patch has no textual hunks"))?;
-        let mut hunks = Vec::new();
-        for hunk_index in 0..patch.num_hunks() {
-            let (hunk, line_count) = patch
-                .hunk(hunk_index)
-                .map_err(|error| patch_conflict(&relative, error))?;
-            let mut lines = Vec::new();
-            for line_index in 0..line_count {
-                let line = patch
-                    .line_in_hunk(hunk_index, line_index)
-                    .map_err(|error| patch_conflict(&relative, error))?;
-                match line.origin_value() {
-                    DiffLineType::Context => {
-                        lines.push(ParsedLine::Context(line.content().to_vec()))
-                    }
-                    DiffLineType::Addition => {
-                        lines.push(ParsedLine::Addition(line.content().to_vec()))
-                    }
-                    DiffLineType::Deletion => {
-                        lines.push(ParsedLine::Deletion(line.content().to_vec()))
-                    }
-                    DiffLineType::ContextEOFNL
-                    | DiffLineType::AddEOFNL
-                    | DiffLineType::DeleteEOFNL => {
-                        let Some(previous) = lines.last_mut() else {
-                            return Err(patch_conflict(
-                                &relative,
-                                "a no-newline marker appears before any hunk line",
-                            ));
-                        };
-                        let bytes = match previous {
-                            ParsedLine::Context(bytes)
-                            | ParsedLine::Addition(bytes)
-                            | ParsedLine::Deletion(bytes) => bytes,
-                        };
-                        if bytes.last() == Some(&b'\n') {
-                            bytes.pop();
-                        }
-                    }
-                    kind => {
-                        return Err(patch_conflict(
-                            &relative,
-                            format!("unsupported line type {kind:?}"),
-                        ));
-                    }
-                }
-            }
-            hunks.push(ParsedHunk {
-                old_start: hunk.old_start() as usize,
-                old_lines: hunk.old_lines() as usize,
-                lines,
-            });
-        }
-        files.push(ParsedFile {
-            relative,
-            hunks,
-            created,
-        });
-    }
-    Ok(files)
+    let touched = prepared
+        .iter()
+        .map(|file| file.relative.clone())
+        .collect::<Vec<_>>();
+    let diff = resulting_worktree_patch(context.workspace_root(), &touched)
+        .map_err(|error| ToolError::execution_failed(format!("resulting diff failed: {error}")))?;
+    let diff_artifact = context.write_artifact("applied.patch", "text/x-diff", &diff)?;
+    Ok(ApplyPatchOutput {
+        files: prepared.iter().map(PreparedFile::summary).collect(),
+        diff_artifact,
+    })
+}
+
+#[cfg(test)]
+pub(super) fn execute_with_after_write(
+    input: ApplyPatchInput,
+    context: &mut ExecutionContext,
+    after_write: impl FnMut(&Path),
+) -> Result<ApplyPatchOutput, ToolError> {
+    execute_patch(input, context, after_write)
+}
+
+fn parse_patch(bytes: &[u8]) -> Result<Vec<ParsedFile>, ToolError> {
+    parse_unified_patch(bytes)
+        .map_err(|error| patch_conflict(error.path(), error.detail()))
+        .map(|patch| {
+            patch
+                .into_files()
+                .into_iter()
+                .map(|file| ParsedFile {
+                    relative: file.path,
+                    hunks: file
+                        .hunks
+                        .into_iter()
+                        .map(|hunk| ParsedHunk {
+                            old_start: hunk.old_start,
+                            old_lines: hunk.old_lines,
+                            lines: hunk
+                                .lines
+                                .into_iter()
+                                .map(|line| match line {
+                                    UnifiedPatchLine::Context(bytes) => ParsedLine::Context(bytes),
+                                    UnifiedPatchLine::Addition(bytes) => {
+                                        ParsedLine::Addition(bytes)
+                                    }
+                                    UnifiedPatchLine::Deletion(bytes) => {
+                                        ParsedLine::Deletion(bytes)
+                                    }
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                    created: file.created,
+                    mode: file.mode,
+                })
+                .collect()
+        })
 }
 
 fn resolve_bases(
@@ -301,6 +240,7 @@ fn resolve_bases(
     for base in bases {
         let relative = PathBuf::from(&base.path);
         ensure_relative_normal_path(&relative)?;
+        ensure_safe_patch_target(context.workspace_root(), &relative)?;
         if resolved.contains_key(&relative) {
             return Err(patch_conflict(
                 &relative,
@@ -333,7 +273,6 @@ fn resolve_bases(
                 relative,
                 path,
                 original,
-                permissions: metadata.map(|metadata| metadata.permissions()),
             },
         );
     }
@@ -394,7 +333,8 @@ fn validate_all(
             resulting,
             hunks: file.hunks.len(),
             created: file.created,
-            permissions: base.permissions.clone(),
+            original: base.original.clone(),
+            mode: file.mode,
         });
     }
     Ok(prepared)
@@ -480,11 +420,53 @@ fn split_lines(bytes: &[u8]) -> Vec<&[u8]> {
     lines
 }
 
-fn write_atomically(file: &PreparedFile) -> Result<(), ToolError> {
+fn read_current_target(
+    path: &Path,
+    relative: &Path,
+) -> Result<(Option<Vec<u8>>, Option<Permissions>), ToolError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(forbidden_patch_path(
+                relative,
+                "the patch target became a symbolic link",
+            ));
+        }
+        Ok(_) => return Err(patch_conflict(relative, "the target is not a regular file")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((None, None)),
+        Err(error) => return Err(io_failure(relative, "could not inspect", error)),
+    };
+    let bytes = fs::read(path).map_err(|error| io_failure(relative, "could not read", error))?;
+    Ok((Some(bytes), Some(metadata.permissions())))
+}
+
+fn write_atomically(file: &PreparedFile, workspace_root: &Path) -> Result<(), ToolError> {
+    ensure_safe_patch_target(workspace_root, &file.relative)?;
     let fresh = file
         .path
         .revalidate()
         .map_err(|error| forbidden_patch_path(&file.relative, error))?;
+    if fresh.as_path() != file.path.as_path() {
+        return Err(forbidden_patch_path(
+            &file.relative,
+            "the target resolved to a different path after validation",
+        ));
+    }
+    let (current, permissions) = read_current_target(fresh.as_path(), &file.relative)?;
+    if current.as_deref() != file.original.as_deref() {
+        return Err(ToolError::StalePatch {
+            path: file.relative.clone(),
+            expected: file
+                .original
+                .as_deref()
+                .map(sha256)
+                .unwrap_or_else(|| "new file".to_owned()),
+            actual: current
+                .as_deref()
+                .map(sha256)
+                .unwrap_or_else(|| "missing".to_owned()),
+        });
+    }
     let parent = fresh
         .as_path()
         .parent()
@@ -505,16 +487,12 @@ fn write_atomically(file: &PreparedFile) -> Result<(), ToolError> {
     temporary
         .write_all(&file.resulting)
         .map_err(|error| io_failure(&file.relative, "could not write", error))?;
-    if let Some(permissions) = &file.permissions {
-        temporary
-            .as_file_mut()
-            .set_permissions(permissions.clone())
-            .map_err(|error| {
-                io_failure(&file.relative, "could not preserve permissions for", error)
-            })?;
-    } else {
-        set_new_file_permissions(temporary.as_file_mut(), &file.relative)?;
-    }
+    set_result_permissions(
+        temporary.as_file_mut(),
+        &file.relative,
+        permissions,
+        file.mode,
+    )?;
     temporary
         .as_file_mut()
         .sync_all()
@@ -526,14 +504,35 @@ fn write_atomically(file: &PreparedFile) -> Result<(), ToolError> {
 }
 
 #[cfg(unix)]
-fn set_new_file_permissions(file: &mut File, path: &Path) -> Result<(), ToolError> {
+fn set_result_permissions(
+    file: &mut File,
+    path: &Path,
+    permissions: Option<Permissions>,
+    requested: Option<PatchFileMode>,
+) -> Result<(), ToolError> {
     use std::os::unix::fs::PermissionsExt;
-    file.set_permissions(Permissions::from_mode(0o644))
+
+    let mut mode = permissions.map_or(0o644, |permissions| permissions.mode());
+    match requested {
+        Some(PatchFileMode::Executable) => mode |= 0o111,
+        Some(PatchFileMode::Regular) => mode &= !0o111,
+        None => {}
+    }
+    file.set_permissions(Permissions::from_mode(mode))
         .map_err(|error| io_failure(path, "could not set permissions for", error))
 }
 
 #[cfg(not(unix))]
-fn set_new_file_permissions(_file: &mut File, _path: &Path) -> Result<(), ToolError> {
+fn set_result_permissions(
+    file: &mut File,
+    path: &Path,
+    permissions: Option<Permissions>,
+    _requested: Option<PatchFileMode>,
+) -> Result<(), ToolError> {
+    if let Some(permissions) = permissions {
+        file.set_permissions(permissions)
+            .map_err(|error| io_failure(path, "could not preserve permissions for", error))?;
+    }
     Ok(())
 }
 
@@ -547,31 +546,6 @@ fn sync_directory(directory: &Path, relative: &Path) -> Result<(), ToolError> {
 #[cfg(not(unix))]
 fn sync_directory(_directory: &Path, _relative: &Path) -> Result<(), ToolError> {
     Ok(())
-}
-
-fn resulting_diff(repository: &Repository, paths: &[PathBuf]) -> Result<Vec<u8>, ToolError> {
-    let mut options = DiffOptions::new();
-    options
-        .include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .show_untracked_content(true)
-        .disable_pathspec_match(true);
-    for path in paths {
-        options.pathspec(path);
-    }
-    let diff = repository
-        .diff_index_to_workdir(None, Some(&mut options))
-        .map_err(|error| ToolError::execution_failed(format!("resulting diff failed: {error}")))?;
-    let mut bytes = Vec::new();
-    diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
-        if matches!(line.origin(), ' ' | '+' | '-') {
-            bytes.push(line.origin() as u8);
-        }
-        bytes.extend_from_slice(line.content());
-        true
-    })
-    .map_err(|error| ToolError::execution_failed(format!("resulting diff failed: {error}")))?;
-    Ok(bytes)
 }
 
 fn validate_hash(
@@ -624,6 +598,41 @@ fn ensure_relative_normal_path(path: &Path) -> Result<(), ToolError> {
             reason: "patch paths must be non-empty, relative, and contain no . or .. components"
                 .to_owned(),
         });
+    }
+    Ok(())
+}
+
+fn ensure_safe_patch_target(workspace_root: &Path, relative: &Path) -> Result<(), ToolError> {
+    ensure_relative_normal_path(relative)?;
+    if relative.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(".git")
+    }) {
+        return Err(forbidden_patch_path(
+            relative,
+            "Git administration paths are not workspace files",
+        ));
+    }
+
+    let mut reached = workspace_root.to_path_buf();
+    for component in relative.components() {
+        reached.push(component.as_os_str());
+        match fs::symlink_metadata(&reached) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(forbidden_patch_path(
+                    relative,
+                    format!(
+                        "patch targets may not traverse symbolic link {}",
+                        reached.display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(io_failure(relative, "could not inspect", error)),
+        }
     }
     Ok(())
 }

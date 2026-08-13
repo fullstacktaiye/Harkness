@@ -40,6 +40,19 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+#[cfg(windows)]
+use windows_sys::Win32::System::JobObjects::CreateJobObjectW;
+#[cfg(windows)]
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, TerminateJobObject,
+};
+
 use super::{
     ArtifactRef, ArtifactStream, ExecutionContext, POLL_INTERVAL, ProgressEvent, ToolError,
 };
@@ -230,6 +243,115 @@ impl ProcessOutput {
     }
 }
 
+struct SupervisedChild {
+    child: Child,
+    #[cfg(windows)]
+    job: WindowsJob,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PollAction {
+    Exited,
+    Cancelled,
+    Deadline,
+    LocalTimeout,
+    Running,
+}
+
+fn poll_action(
+    exited: bool,
+    cancelled: bool,
+    deadline_passed: bool,
+    local_timeout_passed: bool,
+) -> PollAction {
+    if exited {
+        PollAction::Exited
+    } else if cancelled {
+        PollAction::Cancelled
+    } else if deadline_passed {
+        PollAction::Deadline
+    } else if local_timeout_passed {
+        PollAction::LocalTimeout
+    } else {
+        PollAction::Running
+    }
+}
+
+impl std::ops::Deref for SupervisedChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for SupervisedChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+#[cfg(windows)]
+struct WindowsJob {
+    handle: HANDLE,
+}
+
+#[cfg(windows)]
+impl WindowsJob {
+    fn new() -> Result<Self, ToolError> {
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return Err(ToolError::execution_failed(format!(
+                "a Windows Job Object could not be created: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&limits).cast(),
+                u32::try_from(std::mem::size_of_val(&limits)).unwrap_or(u32::MAX),
+            )
+        };
+        if configured == 0 {
+            let error = io::Error::last_os_error();
+            unsafe {
+                CloseHandle(handle);
+            }
+            return Err(ToolError::execution_failed(format!(
+                "a Windows Job Object could not be configured: {error}"
+            )));
+        }
+        Ok(Self { handle })
+    }
+
+    fn assign(&self, child: &Child) -> io::Result<()> {
+        let process = child.as_raw_handle() as HANDLE;
+        if unsafe { AssignProcessToJobObject(self.handle, process) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn terminate(&self) {
+        unsafe {
+            TerminateJobObject(self.handle, 1);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsJob {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
 /// One child process a tool runs under its call's limits.
 ///
 /// Built rather than spawned directly, so every invocation carries the same
@@ -337,33 +459,6 @@ impl ToolProcess {
         loop {
             forward(context, &incoming, MAX_SEGMENTS_PER_POLL);
 
-            if context.cancellation().is_cancelled() {
-                terminate(&mut child, incoming, stdout_reader, stderr_reader);
-                return Err(ToolError::Cancelled);
-            }
-            if let Some(deadline) = deadline
-                && deadline.has_passed()
-            {
-                terminate(&mut child, incoming, stdout_reader, stderr_reader);
-                return Err(ToolError::TimedOut {
-                    limit: deadline.limit(),
-                });
-            }
-            if let Some((_, at)) = local_deadline
-                && Instant::now() >= at
-            {
-                let (status, stdout, stderr) =
-                    terminate_and_collect(&mut child, incoming, stdout_reader, stderr_reader);
-                return Ok(ProcessOutput {
-                    code: status.as_ref().and_then(ExitStatus::code),
-                    signal: status.as_ref().and_then(exit_signal),
-                    timed_out: true,
-                    duration: started.elapsed(),
-                    stdout: stdout.finish()?,
-                    stderr: stderr.finish()?,
-                });
-            }
-
             let waited = match child.try_wait() {
                 Ok(waited) => waited,
                 Err(error) => {
@@ -378,6 +473,12 @@ impl ToolProcess {
                     )));
                 }
             };
+            let action = poll_action(
+                waited.is_some(),
+                context.cancellation().is_cancelled(),
+                deadline.is_some_and(|deadline| deadline.has_passed()),
+                local_deadline.is_some_and(|(_, at)| Instant::now() >= at),
+            );
             if let Some(status) = waited {
                 // The group is ended before its output is collected, and that
                 // ordering is the whole of what makes this return promptly. A
@@ -410,9 +511,39 @@ impl ToolProcess {
                     signal: exit_signal(&status),
                     timed_out: false,
                     duration: started.elapsed(),
-                    stdout: stdout.finish()?,
-                    stderr: stderr.finish()?,
+                    stdout: finish_stream(stdout, context)?,
+                    stderr: finish_stream(stderr, context)?,
                 });
+            }
+
+            // A status already produced belongs to the child even when this
+            // poll also observes a cancellation or deadline. Checking it first
+            // prevents a completed exit-zero process from becoming a timeout.
+            match action {
+                PollAction::Exited => unreachable!("an observed exit returned above"),
+                PollAction::Cancelled => {
+                    terminate(&mut child, incoming, stdout_reader, stderr_reader);
+                    return Err(ToolError::Cancelled);
+                }
+                PollAction::Deadline => {
+                    terminate(&mut child, incoming, stdout_reader, stderr_reader);
+                    return Err(ToolError::TimedOut {
+                        limit: deadline.expect("the action requires a deadline").limit(),
+                    });
+                }
+                PollAction::LocalTimeout => {
+                    let (status, stdout, stderr) =
+                        terminate_and_collect(&mut child, incoming, stdout_reader, stderr_reader);
+                    return Ok(ProcessOutput {
+                        code: status.as_ref().and_then(ExitStatus::code),
+                        signal: status.as_ref().and_then(exit_signal),
+                        timed_out: true,
+                        duration: started.elapsed(),
+                        stdout: finish_stream(stdout, context)?,
+                        stderr: finish_stream(stderr, context)?,
+                    });
+                }
+                PollAction::Running => {}
             }
 
             thread::sleep(POLL_INTERVAL);
@@ -420,7 +551,7 @@ impl ToolProcess {
     }
 
     /// Starts the child with the invocation policy every tool process carries.
-    fn spawn(&self) -> Result<Child, ToolError> {
+    fn spawn(&self) -> Result<SupervisedChild, ToolError> {
         // `ContainedPath` is a point-in-time proof. Re-resolve immediately
         // before launch so a symlink retargeted while a call awaited approval
         // cannot redirect the child's working directory outside its grant.
@@ -448,11 +579,29 @@ impl ToolProcess {
             command.process_group(0);
         }
 
-        command.spawn().map_err(|error| {
+        #[cfg(windows)]
+        let job = WindowsJob::new()?;
+        let child = command.spawn().map_err(|error| {
             ToolError::execution_failed(format!(
                 "{} could not be started: {error}",
                 self.program.to_string_lossy()
             ))
+        })?;
+        #[cfg(windows)]
+        let mut child = child;
+        #[cfg(windows)]
+        if let Err(error) = job.assign(&child) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ToolError::execution_failed(format!(
+                "{} could not be assigned to its Windows Job Object: {error}",
+                self.program.to_string_lossy()
+            )));
+        }
+        Ok(SupervisedChild {
+            child,
+            #[cfg(windows)]
+            job,
         })
     }
 }
@@ -539,7 +688,7 @@ fn drain_until_read(
 /// destroy the diagnostic in the one case somebody needs it. What arrived before
 /// the kill is already complete and correct; only the rest is missing.
 fn terminate(
-    child: &mut Child,
+    child: &mut SupervisedChild,
     incoming: Receiver<String>,
     stdout_reader: JoinHandle<Drained>,
     stderr_reader: JoinHandle<Drained>,
@@ -551,7 +700,7 @@ fn terminate(
 
 /// Kills, reaps, and drains one process group without discarding captured bytes.
 fn terminate_and_collect(
-    child: &mut Child,
+    child: &mut SupervisedChild,
     incoming: Receiver<String>,
     stdout_reader: JoinHandle<Drained>,
     stderr_reader: JoinHandle<Drained>,
@@ -578,7 +727,7 @@ fn exit_signal(_status: &ExitStatus) -> Option<i32> {
 }
 
 #[cfg(unix)]
-fn terminate_process_group(child: &mut Child) {
+fn terminate_process_group(child: &mut SupervisedChild) {
     // `process_group(0)` made the child's PID its process-group ID, so a
     // negative target signals it and every helper still in the group at once.
     unsafe {
@@ -586,8 +735,14 @@ fn terminate_process_group(child: &mut Child) {
     }
 }
 
-#[cfg(not(unix))]
-fn terminate_process_group(child: &mut Child) {
+#[cfg(windows)]
+fn terminate_process_group(child: &mut SupervisedChild) {
+    child.job.terminate();
+    let _ = child.kill();
+}
+
+#[cfg(not(any(unix, windows)))]
+fn terminate_process_group(child: &mut SupervisedChild) {
     let _ = child.kill();
 }
 
@@ -624,6 +779,15 @@ impl Drained {
             artifact,
         })
     }
+}
+
+fn finish_stream(
+    drained: Drained,
+    context: &ExecutionContext,
+) -> Result<CapturedStream, ToolError> {
+    let mut stream = drained.finish()?;
+    stream.tail = context.redact_text(&stream.tail);
+    Ok(stream)
 }
 
 /// Reads one stream to its end, storing every byte and retaining the last few.
@@ -795,7 +959,16 @@ impl Tail {
 mod tests {
     use std::sync::mpsc;
 
-    use super::{MAX_SEGMENT_BYTES, Tail, split_segments};
+    use super::{MAX_SEGMENT_BYTES, PollAction, Tail, poll_action, split_segments};
+
+    #[test]
+    fn an_observed_exit_outranks_every_stop_signal_from_the_same_poll() {
+        assert_eq!(poll_action(true, true, true, true), PollAction::Exited);
+        assert_eq!(
+            poll_action(false, false, false, true),
+            PollAction::LocalTimeout
+        );
+    }
 
     #[test]
     fn a_child_that_never_emits_a_separator_does_not_grow_an_unbounded_segment() {

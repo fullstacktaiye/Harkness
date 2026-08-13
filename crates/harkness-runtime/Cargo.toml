@@ -10,7 +10,6 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
-git2.workspace = true
 harkness-core.workspace = true
 harkness-git.workspace = true
 jsonschema.workspace = true
@@ -28,6 +27,9 @@ uuid.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [dev-dependencies]
 harkness-test-fixtures.workspace = true

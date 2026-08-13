@@ -341,6 +341,16 @@ pub trait ArtifactStream: Write + Send {
 
 /// Where a running tool puts content too large for its result.
 pub trait ArtifactWriter: Send {
+    /// Redacts a bounded text value that will be returned inline beside an
+    /// artifact produced by this writer.
+    ///
+    /// The default is pass-through for detached and test writers. Durable
+    /// writers that redact their streams must apply the corresponding text rule
+    /// here so an inline excerpt cannot bypass the storage policy.
+    fn redact_text(&self, text: &str) -> String {
+        text.to_owned()
+    }
+
     /// Opens a stream that stores content under `name` as `media_type`.
     ///
     /// # Errors
@@ -725,6 +735,13 @@ impl ExecutionContext {
         media_type: &str,
     ) -> Result<Box<dyn ArtifactStream>, ToolError> {
         self.artifacts.open(name, media_type)
+    }
+
+    /// Redacts bounded inline text through the same policy as this call's
+    /// artifact store.
+    #[must_use]
+    pub fn redact_text(&self, text: &str) -> String {
+        self.artifacts.redact_text(text)
     }
 
     /// Resolves a path through the call's canonical filesystem boundary.

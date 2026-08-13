@@ -20,11 +20,12 @@ already part of every arbitrary-child contract.
 
 `process.exec` and `test.run` build exclusively on this command shape and the
 runtime's `ToolProcess` supervisor. Their child timeout defaults to 120 seconds
-and is capped at 600; timeout and cancellation kill the process group rather
-than only its leader. Standard output and standard error stream to artifacts,
-with only bounded tails retained inline. `test.run` is the same supervisor with
-an explicit command input and a pass/fail projection, not a second process
-implementation or a command-discovery system.
+and is capped at 600; timeout and cancellation kill the supervised process tree
+rather than only its leader, using a process group on Unix and a Job Object on
+Windows. Standard output and standard error stream to artifacts, with only
+bounded tails retained inline. `test.run` is the same supervisor with an explicit
+command input and a pass/fail projection, not a second process implementation or
+a command-discovery system.
 
 The Git runner keeps its existing denylist model. Git is one known executable
 whose credential helpers and askpass integration depend on the caller's

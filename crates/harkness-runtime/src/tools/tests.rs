@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -18,6 +18,7 @@ use crate::tool::{
     ArtifactRef, ArtifactStream, ArtifactWriter, Deadline, DiscardedProgress, ExecutionContext,
     InvocationError, RiskLevel, Tool, ToolError, ToolRegistry, invoke,
 };
+use crate::tools::fs_apply_patch::execute_with_after_write;
 use crate::tools::{ApplyPatchInput, FileBase, FsApplyPatch};
 use crate::trust::{BASELINE_ENVIRONMENT, EnvironmentName};
 
@@ -167,6 +168,37 @@ fn one_file_patch() -> &'static str {
      +changed\n"
 }
 
+fn two_file_patch() -> &'static str {
+    "diff --git a/tracked.txt b/tracked.txt\n\
+     --- a/tracked.txt\n\
+     +++ b/tracked.txt\n\
+     @@ -1 +1 @@\n\
+     -initial\n\
+     +changed\n\
+     diff --git a/z.txt b/z.txt\n\
+     --- a/z.txt\n\
+     +++ b/z.txt\n\
+     @@ -1 +1 @@\n\
+     -second\n\
+     +also-changed\n"
+}
+
+fn two_file_input(first: &[u8], second: &[u8]) -> ApplyPatchInput {
+    ApplyPatchInput {
+        patch: two_file_patch().to_owned(),
+        bases: vec![
+            FileBase {
+                path: "tracked.txt".to_owned(),
+                base_sha256: Some(sha256(first)),
+            },
+            FileBase {
+                path: "z.txt".to_owned(),
+                base_sha256: Some(sha256(second)),
+            },
+        ],
+    }
+}
+
 #[test]
 fn empty_and_malformed_patches_are_conflicts_without_writes() {
     let harness = Harness::new();
@@ -301,6 +333,176 @@ fn a_stale_base_refuses_before_writing_any_file() {
         .unwrap_err();
     assert_eq!(error.kind(), "stale_patch");
     assert_eq!(fs::read(path).unwrap(), b"initial\n");
+}
+
+#[test]
+fn a_later_target_changed_during_commit_is_not_overwritten() {
+    let harness = Harness::new();
+    initialize_repository(harness.workspace.path());
+    let first = fs::read(harness.workspace.path().join("tracked.txt")).unwrap();
+    let second_path = harness.workspace.path().join("z.txt");
+    fs::write(&second_path, b"second\n").unwrap();
+    let second = fs::read(&second_path).unwrap();
+    let mut context = harness.context();
+
+    let error =
+        execute_with_after_write(two_file_input(&first, &second), &mut context, |written| {
+            if written == Path::new("tracked.txt") {
+                fs::write(&second_path, b"external edit\n").unwrap();
+            }
+        })
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "stale_patch");
+    assert_eq!(fs::read(second_path).unwrap(), b"external edit\n");
+}
+
+#[test]
+fn cancellation_after_commit_starts_finishes_the_validated_batch() {
+    let harness = Harness::new();
+    initialize_repository(harness.workspace.path());
+    let first = fs::read(harness.workspace.path().join("tracked.txt")).unwrap();
+    let second_path = harness.workspace.path().join("z.txt");
+    fs::write(&second_path, b"second\n").unwrap();
+    let second = fs::read(&second_path).unwrap();
+    let mut context = harness.context();
+    let cancellation = context.cancellation().clone();
+
+    let output =
+        execute_with_after_write(two_file_input(&first, &second), &mut context, |written| {
+            if written == Path::new("tracked.txt") {
+                cancellation.cancel();
+            }
+        })
+        .unwrap();
+
+    assert_eq!(output.files.len(), 2);
+    assert_eq!(fs::read(second_path).unwrap(), b"also-changed\n");
+    assert!(cancellation.is_cancelled());
+}
+
+#[test]
+fn git_administration_paths_are_never_workspace_patch_targets() {
+    let harness = Harness::new();
+    initialize_repository(harness.workspace.path());
+    let head = harness.workspace.path().join(".git/HEAD");
+    let original = fs::read(&head).unwrap();
+    let patch = "diff --git a/.git/HEAD b/.git/HEAD\n\
+                 --- a/.git/HEAD\n\
+                 +++ b/.git/HEAD\n\
+                 @@ -1 +1 @@\n\
+                 -ref: refs/heads/main\n\
+                 +ref: refs/heads/other\n";
+    let mut context = harness.context();
+    let error = FsApplyPatch
+        .execute(
+            ApplyPatchInput {
+                patch: patch.to_owned(),
+                bases: vec![FileBase {
+                    path: ".git/HEAD".to_owned(),
+                    base_sha256: Some(sha256(&original)),
+                }],
+            },
+            &mut context,
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "forbidden_path");
+    assert_eq!(fs::read(head).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_contained_symlink_is_refused_instead_of_rewriting_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let harness = Harness::new();
+    initialize_repository(harness.workspace.path());
+    let target = harness.workspace.path().join("tracked.txt");
+    symlink("tracked.txt", harness.workspace.path().join("alias.txt")).unwrap();
+    let original = fs::read(&target).unwrap();
+    let patch = one_file_patch().replace("tracked.txt", "alias.txt");
+    let mut context = harness.context();
+    let error = FsApplyPatch
+        .execute(
+            ApplyPatchInput {
+                patch,
+                bases: vec![FileBase {
+                    path: "alias.txt".to_owned(),
+                    base_sha256: Some(sha256(&original)),
+                }],
+            },
+            &mut context,
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "forbidden_path");
+    assert_eq!(fs::read(target).unwrap(), original);
+}
+
+#[test]
+fn differing_old_and_new_paths_are_rejected_as_a_rename() {
+    let harness = Harness::new();
+    initialize_repository(harness.workspace.path());
+    let target = harness.workspace.path().join("tracked.txt");
+    let original = fs::read(&target).unwrap();
+    let patch = "diff --git a/old.txt b/tracked.txt\n\
+                 --- a/old.txt\n\
+                 +++ b/tracked.txt\n\
+                 @@ -1 +1 @@\n\
+                 -initial\n\
+                 +changed\n";
+    let mut context = harness.context();
+    let error = FsApplyPatch
+        .execute(
+            ApplyPatchInput {
+                patch: patch.to_owned(),
+                bases: vec![FileBase {
+                    path: "tracked.txt".to_owned(),
+                    base_sha256: Some(sha256(&original)),
+                }],
+            },
+            &mut context,
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "patch_conflict");
+    assert_eq!(fs::read(target).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_executable_mode_change_is_applied_with_the_content() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let harness = Harness::new();
+    initialize_repository(harness.workspace.path());
+    let path = harness.workspace.path().join("tracked.txt");
+    let original = fs::read(&path).unwrap();
+    let patch = "diff --git a/tracked.txt b/tracked.txt\n\
+                 old mode 100644\n\
+                 new mode 100755\n\
+                 index e79c5e8..5ea2ed4\n\
+                 --- a/tracked.txt\n\
+                 +++ b/tracked.txt\n\
+                 @@ -1 +1 @@\n\
+                 -initial\n\
+                 +changed\n";
+    let mut context = harness.context();
+    FsApplyPatch
+        .execute(
+            ApplyPatchInput {
+                patch: patch.to_owned(),
+                bases: vec![FileBase {
+                    path: "tracked.txt".to_owned(),
+                    base_sha256: Some(sha256(&original)),
+                }],
+            },
+            &mut context,
+        )
+        .unwrap();
+
+    assert_ne!(fs::metadata(path).unwrap().permissions().mode() & 0o111, 0);
 }
 
 #[test]
@@ -454,6 +656,61 @@ fn process_timeout_kills_a_spawned_grandchild_too() {
         !linux_process_is_live(pid),
         "grandchild {pid} survived the process-group timeout"
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn process_timeout_terminates_a_windows_descendant_job() {
+    let harness = Harness::new();
+    let pid_file = harness.workspace.path().join("grandchild.pid");
+    let quoted_pid_file = pid_file.to_string_lossy().replace('\'', "''");
+    let script = format!(
+        "$child = Start-Process -FilePath powershell.exe -ArgumentList \
+         @('-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30') -PassThru; \
+         Set-Content -NoNewline -Path '{quoted_pid_file}' -Value $child.Id; \
+         Wait-Process -Id $child.Id"
+    );
+    let output = harness
+        .invoke(
+            ProcessExec,
+            json!({
+                "argv": ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                "timeout_seconds": 1
+            }),
+        )
+        .unwrap();
+    assert_eq!(output["timed_out"], true);
+    let pid = fs::read_to_string(&pid_file)
+        .unwrap()
+        .parse::<u32>()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_millis(250);
+    while windows_process_is_live(pid) && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(
+        !windows_process_is_live(pid),
+        "grandchild {pid} survived the Job Object timeout"
+    );
+}
+
+#[cfg(windows)]
+fn windows_process_is_live(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let mut exit_code = 0u32;
+    let read = unsafe { GetExitCodeProcess(handle, &mut exit_code) } != 0;
+    unsafe {
+        CloseHandle(handle);
+    }
+    read && exit_code == STILL_ACTIVE as u32
 }
 
 #[cfg(target_os = "linux")]
