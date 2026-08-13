@@ -57,6 +57,7 @@ impl IntegrationIdentity {
         self
     }
 
+    #[allow(dead_code, reason = "reserved for the MCP runtime coordinator")]
     pub(crate) const fn with_mcp_tool_schema_fingerprint_optional(
         mut self,
         hash: Option<Sha256Hash>,
@@ -72,6 +73,7 @@ impl IntegrationIdentity {
         self
     }
 
+    #[allow(dead_code, reason = "reserved for the recipe runtime coordinator")]
     pub(crate) const fn with_recipe_content_hash_optional(
         mut self,
         hash: Option<Sha256Hash>,

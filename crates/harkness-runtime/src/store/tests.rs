@@ -21,7 +21,7 @@ use time::{OffsetDateTime, UtcOffset};
 use crate::approval::{
     ApprovalDecision, ApprovalGate, ApprovalObservation, ApprovalRequest, ApprovalScope,
     ApprovalState, CandidateCall, DecidedVia, PendingApproval, WorkspaceBinding,
-    canonical_input_hash, matching_grants,
+    canonical_input_hash, matching_grants, matching_grants_detailed,
 };
 use crate::domain::{
     ArtifactId, ExecutionState, Failure, Run, RunId, Step, StepId, Task, TaskId, ToolCall,
@@ -1231,6 +1231,38 @@ fn a_missing_external_identity_denial_is_persisted_and_terminalizes_the_call() {
     assert_eq!(denied.state(), ToolCallState::Denied);
     assert_eq!(denied.policy_decision(), Some(&decision));
     assert_eq!(fixture.store.load_tool_call(call.id()).unwrap(), denied);
+}
+
+#[test]
+fn an_external_declaration_mismatch_denial_is_persisted_and_terminalizes_the_call() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = stored_step(&fixture.store, &run);
+    let call = stored_tool_call(&fixture.store, &step);
+    let decision: PolicyDecision = serde_json::from_value(json!({
+        "verdict": "deny",
+        "reason": "denied: external context does not match the declared capability",
+        "source": "built_in",
+        "external_request": {
+            "schema_version": 1,
+            "capability": "invoke_mcp_tool",
+            "classified_risk": "execute",
+            "identity": {
+                "mcp_tool_schema_fingerprint": Sha256Hash::of("schema")
+            }
+        },
+        "denial_kind": "external_identity_context_invalid"
+    }))
+    .unwrap();
+
+    let denied = fixture
+        .store
+        .apply_tool_call_policy_decision(call.id(), decision.clone(), at(10))
+        .unwrap();
+    assert_eq!(denied.state(), ToolCallState::Denied);
+    assert_eq!(denied.policy_decision(), Some(&decision));
+    assert_eq!(fixture.reopen().load_tool_call(call.id()).unwrap(), denied);
 }
 
 #[test]
@@ -3497,7 +3529,7 @@ fn only_granted_requests_become_grants_and_they_bind_to_their_own_call() {
         &tool,
         canonical_input_hash(&approval_input()).unwrap(),
     );
-    assert_eq!(matching_grants(&grants, &approved).grants().len(), 1);
+    assert_eq!(matching_grants(&grants, &approved).len(), 1);
 
     // The same tool, one byte of input different.
     let altered = CandidateCall::new(
@@ -3508,7 +3540,7 @@ fn only_granted_requests_become_grants_and_they_bind_to_their_own_call() {
         canonical_input_hash(&json!({"path": "src/lib.rs", "contents": "fn main() { rm() }"}))
             .unwrap(),
     );
-    assert!(matching_grants(&grants, &altered).grants().is_empty());
+    assert!(matching_grants(&grants, &altered).is_empty());
 
     // The same call, in a later run.
     let replayed = CandidateCall::new(
@@ -3518,7 +3550,7 @@ fn only_granted_requests_become_grants_and_they_bind_to_their_own_call() {
         &tool,
         canonical_input_hash(&approval_input()).unwrap(),
     );
-    assert!(matching_grants(&grants, &replayed).grants().is_empty());
+    assert!(matching_grants(&grants, &replayed).is_empty());
 }
 
 #[test]
@@ -3790,6 +3822,35 @@ fn a_future_approval_row_reads_as_an_upgrade_request() {
     assert!(error.to_string().contains("upgrade Harkness"), "{error}");
 }
 
+#[test]
+fn a_v2_approval_row_cannot_claim_v3_external_identity_fields() {
+    let held = Held::new();
+    let request = held.open(
+        held.pending(RiskLevel::Execute)
+            .with_capabilities([Capability::new("invoke_mcp_tool").unwrap()])
+            .with_integration_identity(
+                IntegrationIdentity::none()
+                    .with_mcp_tool_schema_fingerprint(Sha256Hash::of("schema")),
+            ),
+    );
+    guard(&held.store().writer)
+        .execute(
+            "UPDATE approvals SET schema_version = 2 WHERE id = ?1",
+            rusqlite::params![request.id().to_string()],
+        )
+        .unwrap();
+
+    let error = held.store().approval(request.id()).unwrap_err();
+    assert_eq!(error.kind(), "approval_refused");
+    assert!(
+        error
+            .to_string()
+            .contains("schema versions before 3 cannot carry external integration identity"),
+        "{error}"
+    );
+    assert!(!matches!(held.store().run_grants(held.run.id()), Ok(grants) if !grants.is_empty()));
+}
+
 // -- migration from a frozen database ---------------------------------------
 
 /// The frozen v2 database committed beside this module.
@@ -4019,7 +4080,7 @@ fn a_frozen_v5_database_opens_and_reads_its_approvals() {
         &tool,
         canonical_input_hash(&approval_input()).unwrap(),
     );
-    assert_eq!(matching_grants(&grants, &covered).grants().len(), 1);
+    assert_eq!(matching_grants(&grants, &covered).len(), 1);
     assert_eq!(store.run_approvals(run_id).unwrap().len(), 2);
 }
 
@@ -4052,8 +4113,8 @@ fn a_frozen_v6_database_opens_and_reads_its_external_identity_binding() {
     )
     .with_capabilities(&capabilities)
     .with_integration_identity(identity);
-    assert_eq!(matching_grants(&grants, &candidate).grants().len(), 1);
-    let drifted = matching_grants(
+    assert_eq!(matching_grants(&grants, &candidate).len(), 1);
+    let drifted = matching_grants_detailed(
         &grants,
         &candidate.with_integration_identity(
             IntegrationIdentity::none()

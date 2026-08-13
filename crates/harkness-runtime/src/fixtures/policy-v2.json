@@ -5,5 +5,8 @@
   },
   "tools": {
     "fixture.policy": "deny"
+  },
+  "external_capabilities": {
+    "invoke_mcp_tool": "deny"
   }
 }

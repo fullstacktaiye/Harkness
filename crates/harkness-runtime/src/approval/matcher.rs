@@ -366,9 +366,22 @@ fn scope_applies_except_identity(grant: &ApprovalGrant, candidate: &CandidateCal
         }
 }
 
+/// Every applicable grant for `candidate`.
+///
+/// This retains the v0.4 return type. Callers coordinating external identity
+/// changes can use [`matching_grants_detailed`] to receive drift diagnostics as
+/// well as the policy projections.
+#[must_use]
+pub fn matching_grants(grants: &[ApprovalGrant], candidate: &CandidateCall<'_>) -> Vec<RunGrant> {
+    matching_grants_detailed(grants, candidate).grants
+}
+
 /// Every applicable grant and every identity drift observed for `candidate`.
 #[must_use]
-pub fn matching_grants(grants: &[ApprovalGrant], candidate: &CandidateCall<'_>) -> GrantMatches {
+pub fn matching_grants_detailed(
+    grants: &[ApprovalGrant],
+    candidate: &CandidateCall<'_>,
+) -> GrantMatches {
     let mut matches = GrantMatches::default();
     for grant in grants {
         match grant.match_candidate(candidate) {
@@ -413,7 +426,7 @@ mod tests {
     use super::super::{ApprovalScope, ApprovalState, InputHash, WorkspaceBinding};
     use super::{
         ApprovalGrant, CandidateCall, GrantMatch, IntegrationIdentityField, grant_applies,
-        matching_grants,
+        matching_grants, matching_grants_detailed,
     };
 
     fn tool() -> ToolIdentity {
@@ -965,7 +978,7 @@ mod tests {
         );
 
         let grants = [unrelated, pair.grant.clone(), elsewhere];
-        let matched = matching_grants(&grants, &pair.candidate());
+        let matched = matching_grants_detailed(&grants, &pair.candidate());
 
         assert_eq!(matched.grants().len(), 1);
         assert_eq!(matched.grants()[0].scope(), RunGrantScope::ExactCall);
@@ -1033,9 +1046,10 @@ mod tests {
 
         let pair = Pair::new(ApprovalScope::ToolForRun);
         assert_eq!(
-            evaluate(
-                matching_grants(std::slice::from_ref(&pair.grant), &pair.candidate()).grants()
-            ),
+            evaluate(&matching_grants(
+                std::slice::from_ref(&pair.grant),
+                &pair.candidate()
+            )),
             PolicyVerdict::Allow
         );
 
@@ -1044,13 +1058,10 @@ mod tests {
         let mut other_run = Pair::new(ApprovalScope::ToolForRun);
         other_run.run_id = RunId::new();
         assert_eq!(
-            evaluate(
-                matching_grants(
-                    std::slice::from_ref(&other_run.grant),
-                    &other_run.candidate(),
-                )
-                .grants(),
-            ),
+            evaluate(&matching_grants(
+                std::slice::from_ref(&other_run.grant),
+                &other_run.candidate(),
+            ),),
             PolicyVerdict::Deny
         );
     }

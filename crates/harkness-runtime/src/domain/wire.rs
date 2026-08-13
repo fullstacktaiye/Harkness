@@ -1097,6 +1097,10 @@ mod tests {
         .unwrap()
     }
 
+    fn external_denial_decision() -> PolicyDecision {
+        serde_json::from_str(include_str!("../policy/fixtures/external-decision-v1.json")).unwrap()
+    }
+
     fn task_wire() -> TaskWire {
         TaskWire {
             schema_version: RUNTIME_RECORD_SCHEMA_VERSION,
@@ -1282,9 +1286,8 @@ mod tests {
             json!({"include_untracked": true}),
             at(0),
         );
-        call.apply_policy_decision(ask_decision(), at(1)).unwrap();
-        call.approve("user:42", at(2)).unwrap();
-        call.succeed(json!({"clean": true}), at(3)).unwrap();
+        call.apply_policy_decision(external_denial_decision(), at(1))
+            .unwrap();
 
         assert_fixture(
             TaskWireRef::from(&task),

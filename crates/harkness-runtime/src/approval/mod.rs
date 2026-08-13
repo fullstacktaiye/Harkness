@@ -72,7 +72,7 @@ pub use error::ApprovalError;
 pub use gate::{ApprovalGate, ApprovalObservation, ApprovalTicket};
 pub use matcher::{
     ApprovalGrant, CandidateCall, GrantMatch, GrantMatches, IntegrationIdentityDrift,
-    IntegrationIdentityField, grant_applies, matching_grants,
+    IntegrationIdentityField, grant_applies, matching_grants, matching_grants_detailed,
 };
 pub use record::{
     APPROVAL_TRANSITIONS, ApprovalDecision, ApprovalRequest, ApprovalScope, ApprovalState,

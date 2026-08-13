@@ -246,7 +246,8 @@ impl ExternalPolicyContext {
     /// request classifier, so a caller cannot replace a destructive result with
     /// an asserted lower risk.
     #[must_use]
-    pub const fn invoke_mcp_tool(
+    #[allow(dead_code, reason = "reserved for the MCP runtime coordinator")]
+    pub(super) const fn invoke_mcp_tool(
         classification: RequestClassification,
         schema: Option<Sha256Hash>,
     ) -> Self {
@@ -299,7 +300,8 @@ impl ExternalPolicyContext {
     /// compiled steps. An empty recipe is observational; fixed policy floors
     /// are applied separately by [`Self::risk_floor`].
     #[must_use]
-    pub fn execute_workflow_recipe(
+    #[allow(dead_code, reason = "reserved for the recipe runtime coordinator")]
+    pub(super) fn execute_workflow_recipe(
         step_risks: impl IntoIterator<Item = RiskLevel>,
         content: Option<Sha256Hash>,
     ) -> Self {
@@ -348,39 +350,39 @@ impl ExternalPolicyContext {
 
     /// External capability being evaluated.
     #[must_use]
-    pub const fn capability(self) -> ExternalCapability {
+    pub const fn capability(&self) -> ExternalCapability {
         self.capability
     }
 
     /// Risk assigned by classification or by the compiled recipe plan.
     #[must_use]
-    pub const fn classified_risk(self) -> RiskLevel {
+    pub const fn classified_risk(&self) -> RiskLevel {
         self.classified_risk
     }
 
     /// Effective external risk after applying the fixed capability floor.
     #[must_use]
-    pub fn risk_floor(self) -> RiskLevel {
+    pub fn risk_floor(&self) -> RiskLevel {
         self.capability.risk_floor(self.classified_risk)
     }
 
-    pub(super) const fn schema_version(self) -> u32 {
+    pub(super) const fn schema_version(&self) -> u32 {
         self.schema_version
     }
 
     /// Identity evidence that approvals must bind exactly.
     #[must_use]
-    pub const fn identity(self) -> IntegrationIdentity {
+    pub const fn identity(&self) -> IntegrationIdentity {
         self.identity
     }
 
     /// Advisory context retained in the audit record.
     #[must_use]
-    pub const fn permission_context(self) -> Option<ExternalPermissionContext> {
+    pub const fn permission_context(&self) -> Option<ExternalPermissionContext> {
         self.external_permission_context
     }
 
-    pub(super) fn validate_declaration(self, declared: &[Capability]) -> Result<(), &'static str> {
+    pub(super) fn validate_declaration(&self, declared: &[Capability]) -> Result<(), &'static str> {
         if !declared
             .iter()
             .any(|capability| capability.as_str() == self.capability.as_str())
@@ -390,13 +392,13 @@ impl ExternalPolicyContext {
         Ok(())
     }
 
-    pub(super) fn validate_identity_shape(self) -> Result<(), &'static str> {
+    pub(super) fn validate_identity_shape(&self) -> Result<(), &'static str> {
         self.capability.validate_identity_shape(self.identity)
     }
 
     /// Stable denial kind for the context's exact invalid identity shape.
     #[must_use]
-    pub(super) const fn invalid_identity_denial_kind(self) -> Option<&'static str> {
+    pub(super) const fn invalid_identity_denial_kind(&self) -> Option<&'static str> {
         let executable = self.identity.agent_executable_sha256().is_some();
         let schema = self.identity.mcp_tool_schema_fingerprint().is_some();
         let recipe = self.identity.recipe_content_hash().is_some();
@@ -420,7 +422,7 @@ impl ExternalPolicyContext {
 
     /// Stable refusal for a required identity that is absent.
     #[must_use]
-    pub(super) const fn identity_denial_kind(self) -> Option<&'static str> {
+    pub(super) const fn identity_denial_kind(&self) -> Option<&'static str> {
         match self.capability {
             ExternalCapability::LaunchExternalAgent | ExternalCapability::ConnectMcpServer
                 if self.identity.agent_executable_sha256().is_none() =>
@@ -471,7 +473,12 @@ impl From<ExternalPolicyContextStrict> for ExternalPolicyContext {
     }
 }
 
-impl<'de> Deserialize<'de> for ExternalPolicyContext {
+/// Private deserialization seam used only while rebuilding a durable policy
+/// decision. Keeping it off `ExternalPolicyContext` prevents untrusted callers
+/// from manufacturing classifications from JSON.
+pub(super) struct ExternalPolicyContextWire(pub(super) ExternalPolicyContext);
+
+impl<'de> Deserialize<'de> for ExternalPolicyContextWire {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -485,7 +492,8 @@ impl<'de> Deserialize<'de> for ExternalPolicyContext {
             ));
         }
         ExternalPolicyContextStrict::deserialize(value)
-            .map(Into::into)
+            .map(ExternalPolicyContext::from)
+            .map(Self)
             .map_err(de::Error::custom)
     }
 }

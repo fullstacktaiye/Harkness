@@ -14,7 +14,7 @@ use serde_json::json;
 use time::OffsetDateTime;
 
 use crate::approval::{
-    ApprovalDecision, ApprovalGrant, ApprovalRequest, ApprovalScope, ApprovalState,
+    ApprovalDecision, ApprovalError, ApprovalGrant, ApprovalRequest, ApprovalScope, ApprovalState,
     ApprovalVerdict, DecidedVia, InputHash, PendingApproval, WorkspaceBinding,
 };
 use crate::domain::{ApprovalId, RUNTIME_RECORD_SCHEMA_VERSION, RunId};
@@ -30,6 +30,7 @@ use super::repository::{missing_row, optional_text, row_failed, schema_version, 
 use super::{EventKind, Redactor, RunEvent};
 
 const APPROVAL: &str = "approval";
+const APPROVAL_INTEGRATION_IDENTITY_SCHEMA_VERSION: u32 = 3;
 
 const APPROVAL_COLUMNS: &str = "schema_version, id, run_id, tool_call_id, tool_id, tool_version, \
      capabilities_json, agent_executable_sha256, mcp_tool_schema_fingerprint, recipe_content_hash, \
@@ -359,7 +360,7 @@ fn list(
 fn decode(row: &Row<'_>) -> Result<ApprovalRequest, StoreError> {
     // Probe first: a future row may spell a state, a scope, or a surface in a
     // way this build cannot decode, and the caller needs to be told to upgrade.
-    schema_version(row, APPROVAL)?;
+    let record_schema_version = schema_version(row, APPROVAL)?;
 
     let id: ApprovalId = decode_id(APPROVAL, "id", &text(row, APPROVAL, "id")?)?;
     let tool = ToolIdentity::parse(
@@ -373,6 +374,16 @@ fn decode(row: &Row<'_>) -> Result<ApprovalRequest, StoreError> {
             .transpose()?,
         PathBuf::from(text(row, APPROVAL, "canonical_root")?),
     );
+
+    let integration_identity = decode_integration_identity(row)?;
+    if record_schema_version < APPROVAL_INTEGRATION_IDENTITY_SCHEMA_VERSION
+        && !integration_identity.is_empty()
+    {
+        return Err(StoreError::Approval(ApprovalError::InconsistentRecord {
+            id,
+            reason: "schema versions before 3 cannot carry external integration identity",
+        }));
+    }
 
     let pending = PendingApproval::new(
         decode_id(APPROVAL, "run_id", &text(row, APPROVAL, "run_id")?)?,
@@ -399,7 +410,7 @@ fn decode(row: &Row<'_>) -> Result<ApprovalRequest, StoreError> {
         APPROVAL,
         "capabilities_json",
     )?)?)
-    .with_integration_identity(decode_integration_identity(row)?)
+    .with_integration_identity(integration_identity)
     .summarized_as(text(row, APPROVAL, "input_summary")?);
     let pending = match decode_optional_timestamp(
         APPROVAL,

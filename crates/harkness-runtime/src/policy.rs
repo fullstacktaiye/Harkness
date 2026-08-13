@@ -34,6 +34,8 @@ use crate::trust::{
 
 mod integration;
 
+use integration::ExternalPolicyContextWire;
+
 pub use integration::{
     AcpPermissionOption, EXTERNAL_POLICY_CONTEXT_SCHEMA_VERSION, EXTERNAL_POLICY_DENIAL_KINDS,
     ExternalCapability, ExternalPermissionContext, ExternalPolicyContext, McpToolAnnotations,
@@ -105,7 +107,7 @@ impl PolicySource {
 }
 
 /// Complete inspectable result of one policy evaluation.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyDecision {
     verdict: PolicyVerdict,
@@ -119,6 +121,37 @@ pub struct PolicyDecision {
     /// Stable machine-readable refusal, present for typed external denials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     denial_kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyDecisionStrict {
+    verdict: PolicyVerdict,
+    reason: String,
+    source: PolicySource,
+    #[serde(default)]
+    one_call_only: bool,
+    #[serde(default)]
+    external_request: Option<ExternalPolicyContextWire>,
+    #[serde(default)]
+    denial_kind: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for PolicyDecision {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let decision = PolicyDecisionStrict::deserialize(deserializer)?;
+        Ok(Self {
+            verdict: decision.verdict,
+            reason: decision.reason,
+            source: decision.source,
+            one_call_only: decision.one_call_only,
+            external_request: decision.external_request.map(|context| context.0),
+            denial_kind: decision.denial_kind,
+        })
+    }
 }
 
 impl PolicyDecision {
@@ -205,7 +238,7 @@ impl PolicyDecision {
         {
             return Err("policy decision carries an unknown external denial kind");
         }
-        if let Some(external) = self.external_request {
+        if let Some(external) = self.external_request.as_ref() {
             if external.schema_version() != EXTERNAL_POLICY_CONTEXT_SCHEMA_VERSION {
                 return Err("external policy context was written by a newer Harkness build");
             }
@@ -219,6 +252,7 @@ impl PolicyDecision {
                 }
             } else if let Some(kind) = self.denial_kind.as_deref()
                 && kind != external.capability().noninteractive_denial_kind()
+                && kind != "external_identity_context_invalid"
             {
                 return Err("external denial kind does not match the evaluated request");
             }
@@ -350,7 +384,11 @@ impl<'a> PolicyRequest<'a> {
 
     /// Attaches the external-integration subject and identity being evaluated.
     #[must_use]
-    pub const fn with_external_context(mut self, external: ExternalPolicyContext) -> Self {
+    #[allow(
+        dead_code,
+        reason = "reserved for runtime-owned integration coordination"
+    )]
+    pub(super) const fn with_external_context(mut self, external: ExternalPolicyContext) -> Self {
         self.external = Some(external);
         self
     }
@@ -1693,6 +1731,32 @@ mod tests {
     }
 
     #[test]
+    fn a_mismatched_external_declaration_produces_a_valid_durable_denial() {
+        let descriptor =
+            external_descriptor(ExternalCapability::LaunchExternalAgent, RiskLevel::Observe);
+        let decision = PolicyEngine::new(UserPolicy::default(), None).evaluate(
+            &PolicyRequest::new(
+                &descriptor,
+                declared(&descriptor),
+                TrustState::Trusted,
+                ExecutionMode::Interactive,
+            )
+            .with_external_context(external_context(ExternalCapability::InvokeMcpTool)),
+        );
+
+        assert_eq!(decision.verdict(), PolicyVerdict::Deny);
+        assert_eq!(
+            decision.denial_kind(),
+            Some("external_identity_context_invalid")
+        );
+        assert!(decision.validate().is_ok());
+        let round_trip: PolicyDecision =
+            serde_json::from_value(serde_json::to_value(&decision).unwrap()).unwrap();
+        assert_eq!(round_trip, decision);
+        assert!(round_trip.validate().is_ok());
+    }
+
+    #[test]
     fn declaring_an_external_capability_requires_external_context() {
         let capability = ExternalCapability::LaunchExternalAgent;
         let descriptor = external_descriptor(capability, RiskLevel::Observe);
@@ -1849,7 +1913,13 @@ mod tests {
         assert!(encoded.get("external_permission_context").is_none());
         let mut unknown = encoded;
         unknown["future"] = serde_json::json!(true);
-        assert!(serde_json::from_value::<ExternalPolicyContext>(unknown).is_err());
+        let wrapped = serde_json::json!({
+            "verdict": "ask",
+            "reason": "fixture",
+            "source": "built_in",
+            "external_request": unknown
+        });
+        assert!(serde_json::from_value::<PolicyDecision>(wrapped).is_err());
 
         let future = serde_json::json!({
             "schema_version": 2,
@@ -1857,7 +1927,13 @@ mod tests {
             "classified_risk": "execute",
             "future": true
         });
-        let error = serde_json::from_value::<ExternalPolicyContext>(future).unwrap_err();
+        let wrapped = serde_json::json!({
+            "verdict": "ask",
+            "reason": "fixture",
+            "source": "built_in",
+            "external_request": future
+        });
+        let error = serde_json::from_value::<PolicyDecision>(wrapped).unwrap_err();
         assert!(error.to_string().contains("newer Harkness build"));
         assert!(!error.to_string().contains("unknown field"));
     }
@@ -1877,7 +1953,7 @@ mod tests {
                 &descriptor,
                 declared(&descriptor),
                 TrustState::Trusted,
-                ExecutionMode::Interactive,
+                ExecutionMode::NonInteractive,
             )
             .with_external_context(context),
         );
@@ -1994,7 +2070,8 @@ mod tests {
         let tool = "fixture.policy".parse::<ToolId>().unwrap();
         let policy = UserPolicy::default()
             .with_risk(RiskLevel::Observe, PolicyVerdict::Ask)
-            .with_tool(&tool, PolicyVerdict::Deny);
+            .with_tool(&tool, PolicyVerdict::Deny)
+            .with_external_capability(ExternalCapability::InvokeMcpTool, PolicyVerdict::Deny);
         policy.persist(&path).unwrap();
         assert_eq!(UserPolicy::load(&path).unwrap(), policy);
         assert_eq!(
