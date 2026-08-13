@@ -1,4 +1,5 @@
 mod backend;
+mod changes_model;
 mod file_tree_model;
 pub(crate) mod hotreload;
 
@@ -415,8 +416,15 @@ Kirigami.ApplicationWindow {
 
         check("availableForGitProject", issues.viewAvailable);
         check("refreshesOnceOnInitialization", fixtureBackend.refreshCallCount === 1);
+        // Every local mutation hands the panel a rewritten project map. An
+        // issue fetch is a network round trip, so an equal map must not buy
+        // one; only a different repository is worth reloading for.
         window.projectFixture = JSON.parse(JSON.stringify(window.projectFixture));
-        check("refreshesAfterProjectReplacement", fixtureBackend.refreshCallCount === 2);
+        check("ignoresEqualProjectReplacement", fixtureBackend.refreshCallCount === 1);
+        const otherProject = JSON.parse(JSON.stringify(window.projectFixture));
+        otherProject.id = "11111111-1111-1111-1111-111111111111";
+        window.projectFixture = otherProject;
+        check("refreshesForAnotherProject", fixtureBackend.refreshCallCount === 2);
         check("countsOpenRows", issues.openIssueCount === 2);
         check("countsClosedRows", issues.closedIssueCount === 1);
         check("defaultsToOpen", issues.visibleIssueCount === 2);
@@ -499,6 +507,7 @@ Kirigami.ApplicationWindow {
         && fixtureBackend.lastReviewPath === "fixture-path"
         && reviewFixture.splitLayout === true
         && selectionDetected === true
+        && changesModelDetected === true
         && commitScopeDetected === true
         && amendGatingDetected === true
         && pairedRowsDetected === true
@@ -517,6 +526,7 @@ Kirigami.ApplicationWindow {
         && realBridgePassed === true
         ? "GitPanelSmokePassed"
         : "GitPanelSmokeFailed-" + selectionDetected
+            + "-" + changesModelDetected
             + "-" + commitScopeDetected
             + "-" + amendGatingDetected
             + "-" + pairedRowsDetected
@@ -544,6 +554,7 @@ Kirigami.ApplicationWindow {
 
     property bool reviewBusyDetected: false
     property bool selectionDetected: false
+    property bool changesModelDetected: false
     property bool commitScopeDetected: false
     property bool amendGatingDetected: false
     property bool pairedRowsDetected: false
@@ -1249,6 +1260,19 @@ Kirigami.ApplicationWindow {
         realBackend.openProject(realProjectId);
         changesFixture.selectPath("fixture-path", "added", "modified");
         fixtureBackend.jobs = [];
+
+        // The Changes list is a keyed model rather than the entry array, so
+        // this is what catches the roles or the binding drifting apart from
+        // the delegate. Dropping one entry must leave the list at the rows the
+        // projection still holds.
+        const wholeStatus = fixtureBackend.git;
+        changesModelDetected = changesFixture.rowCount === 2;
+        fixtureBackend.git = Object.assign({}, wholeStatus, {
+            "entries": [wholeStatus.entries[1]]
+        });
+        changesModelDetected = changesModelDetected && changesFixture.rowCount === 1;
+        fixtureBackend.git = wholeStatus;
+        changesModelDetected = changesModelDetected && changesFixture.rowCount === 2;
 
         // Everything starts included, and a file is dropped from the commit by
         // unchecking it rather than by moving it across the index.

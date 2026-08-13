@@ -32,6 +32,7 @@ fn main() {
     .include_dir("cxx")
     .files([
         "src/backend.rs",
+        "src/changes_model.rs",
         "src/file_tree_model.rs",
         "src/hotreload.rs",
     ])

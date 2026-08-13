@@ -17,9 +17,10 @@ QtObject {
 
     /// Paths the user has unchecked, as a set keyed by path.
     ///
-    /// Path, never `pathId`: the identity tokens are re-minted on every status
-    /// refresh, so keying on them would drop the whole selection each time Git
-    /// state was re-read.
+    /// Path, never `pathId`: a token survives a status refresh only while the
+    /// row behind it is unchanged, and is re-minted the moment the file is
+    /// edited. Keying on one would silently re-include a file the user had
+    /// unchecked and then saved again.
     property var excluded: ({})
 
     /// True when every changed file is included, which is the initial state.

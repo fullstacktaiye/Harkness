@@ -700,6 +700,28 @@ struct PathSelectionKey {
 }
 
 impl PathSelectionKey {
+    /// The identity of one status row, with the rename sources that belong to
+    /// it. A rename source is part of the key only on the side that reported
+    /// the rename, so the two sides stay independently addressable.
+    fn new(
+        project_id: &str,
+        path: &Path,
+        rename_source: Option<&Path>,
+        staged_rename: bool,
+        unstaged_rename: bool,
+    ) -> Self {
+        Self {
+            project_id: project_id.to_owned(),
+            path: path.to_path_buf(),
+            staged_rename_source: staged_rename
+                .then(|| rename_source.map(Path::to_path_buf))
+                .flatten(),
+            unstaged_rename_source: unstaged_rename
+                .then(|| rename_source.map(Path::to_path_buf))
+                .flatten(),
+        }
+    }
+
     /// Every native path a commit of this one row has to name.
     ///
     /// A rename is one row but two paths. Naming only the destination would
@@ -1019,20 +1041,13 @@ fn register_path_selection(
     staged_rename: bool,
     unstaged_rename: bool,
 ) -> String {
-    let key = PathSelectionKey {
-        project_id: project_id.to_owned(),
-        path: path.to_path_buf(),
-        staged_rename_source: if staged_rename {
-            rename_source.map(Path::to_path_buf)
-        } else {
-            None
-        },
-        unstaged_rename_source: if unstaged_rename {
-            rename_source.map(Path::to_path_buf)
-        } else {
-            None
-        },
-    };
+    let key = PathSelectionKey::new(
+        project_id,
+        path,
+        rename_source,
+        staged_rename,
+        unstaged_rename,
+    );
     if let Some(selection_id) = backend.path_selection_ids.get(&key) {
         return selection_id.clone();
     }
@@ -1321,8 +1336,41 @@ fn replace_status_path_selections(
     // sides of a rename. Replace the capability set atomically with the status
     // projection so a cached token can never authorize paths from an older
     // repository state.
-    backend.path_selections.clear();
-    backend.path_selection_ids.clear();
+    //
+    // A key whose row is unchanged keeps the token it already has. The
+    // capability is the same one — same project, same path, same rename sides
+    // — and the stability is what lets an unchanged status project
+    // byte-identically, so QML is told the working tree changed only when it
+    // did. Minting fresh tokens every read made every poll look like a change
+    // and rebuilt the whole Changes list on a timer.
+    //
+    // "Unchanged" has to include the discard snapshot, not just the key. A
+    // confirmation the user is looking at was shown against the snapshot
+    // recorded under this token, and a poll recaptures that snapshot as soon
+    // as the file's metadata moves. Re-minting when it does is what makes the
+    // pending prompt refuse instead of silently applying an unrecoverable
+    // delete to content the user never saw.
+    let surviving = row
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            let key = PathSelectionKey::new(
+                &row.project_id,
+                &entry.path,
+                entry.rename_source_path.as_deref(),
+                entry.staged_rename,
+                entry.unstaged_rename,
+            );
+            let token = backend.path_selection_ids.get(&key)?;
+            (backend.path_discard_snapshots.get(token) == entry.discard_snapshot.as_ref())
+                .then(|| (key, token.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    backend.path_selections = surviving
+        .iter()
+        .map(|(key, token)| (token.clone(), key.clone()))
+        .collect();
+    backend.path_selection_ids = surviving;
     backend.path_discard_operations.clear();
     backend.path_discard_snapshots.clear();
     row.entries
@@ -3902,7 +3950,12 @@ fn launch_path_discard(
             },
         );
         let _ = qt_thread.queue(move |mut backend| {
-            apply_git_result(backend.as_mut(), &job_id, result, true, false, false, true);
+            apply_git_result(
+                backend.as_mut(),
+                &job_id,
+                result,
+                GitResultFollowUp::WORKING_TREE,
+            );
         });
     });
 }
@@ -3936,24 +3989,150 @@ fn launch_hunk_discard(
             },
         );
         let _ = qt_thread.queue(move |mut backend| {
-            apply_git_result(backend.as_mut(), &job_id, result, true, false, false, true);
+            apply_git_result(
+                backend.as_mut(),
+                &job_id,
+                result,
+                GitResultFollowUp::WORKING_TREE,
+            );
         });
     });
+}
+
+/// The catalog fields a mutation's own status read already answers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CatalogGitProjection {
+    branch: String,
+    dirty: bool,
+}
+
+impl CatalogGitProjection {
+    fn from_state(state: &GitStateRow) -> Self {
+        Self {
+            // Both projections spell a detached head as an empty branch. An
+            // unborn one has to be spelled that way too: this row carries the
+            // branch a first commit would create, but the catalog's inspection
+            // reports no branch at all until that commit exists, and writing
+            // the name here would be silently undone by the next full reload.
+            branch: if state.unborn {
+                String::new()
+            } else {
+                state.branch.clone()
+            },
+            // The catalog derives `dirty` from the same walk these entries
+            // come from — any changed, untracked or conflicted path — so an
+            // empty entry list is exactly a clean working tree.
+            dirty: !state.entries.is_empty(),
+        }
+    }
+
+    /// Returns `map` with this projection applied, or `None` when `map` is not
+    /// a project map for `project_id`.
+    fn applied_to(&self, map: &QVariant, project_id: &str) -> Option<QVariant> {
+        let mut entry = map.value::<QMap<QMapPair_QString_QVariant>>()?;
+        if entry
+            .get(&QString::from("id"))?
+            .value::<QString>()?
+            .to_string()
+            != project_id
+        {
+            return None;
+        }
+        entry.insert(
+            QString::from("branch"),
+            QVariant::from(&QString::from(self.branch.as_str())),
+        );
+        entry.insert(QString::from("dirty"), QVariant::from(&self.dirty));
+        Some(QVariant::from(&entry))
+    }
+}
+
+/// Brings the catalog projection in line with a mutation's own status read.
+///
+/// A commit, a checkout or a pull changes exactly two derived fields of the
+/// acting project: the branch it is on, and whether its working tree is
+/// dirty. The status the mutation already read answers both. Reloading the
+/// whole catalog to learn them cost one Git inspection, one repository
+/// identity read and one remote read *per catalogued project*, and handed
+/// `opened` a freshly built map — which invalidated every binding in the
+/// shell and made both side panels reload as though a different project had
+/// been opened.
+///
+/// A mutation whose status could not be read falls back to the full reload:
+/// nothing local is known to be true any more, including whether the project
+/// is still on disk.
+fn sync_catalog_projection(
+    mut backend: Pin<&mut ffi::HarknessBackend>,
+    project_id: &str,
+    state: Option<&GitStateRow>,
+) {
+    let Some(projection) = state.map(CatalogGitProjection::from_state) else {
+        backend.as_mut().refresh();
+        return;
+    };
+    // This projection is newer than any catalog reload already in flight, and
+    // those reloads carry the pre-mutation branch and dirty state. Claim the
+    // generation the reload replies are gated on so a listing that started
+    // before the mutation cannot land after it and undo this.
+    backend.as_mut().rust_mut().get_mut().next_catalog_request += 1;
+    if let Some(opened) = projection.applied_to(backend.as_ref().opened(), project_id) {
+        backend.as_mut().set_opened(opened);
+    }
+    let projects = backend
+        .as_ref()
+        .projects()
+        .iter()
+        .map(|entry| {
+            projection
+                .applied_to(entry, project_id)
+                .unwrap_or_else(|| entry.clone())
+        })
+        .collect::<QList<QVariant>>();
+    backend.as_mut().set_projects(projects);
+}
+
+/// What a finished Git operation brings up to date beyond its own status.
+///
+/// Named rather than positional: every one of these is a reload the user did
+/// not ask for, and a call site has to be able to say why it wants each. Only
+/// what the operation can actually have invalidated belongs here — a status
+/// poll that restarts the commit walk resets whatever History had scrolled to.
+#[derive(Clone, Copy, Debug)]
+struct GitResultFollowUp {
+    /// Re-project the acting project's catalog row from the fresh status.
+    catalog: bool,
+    /// Reload the branch picker, for an operation that changes what exists.
+    branches: bool,
+    /// Restart the commit walk, for an operation that can move `HEAD`.
+    history: bool,
+    /// Reload the working-tree diff the review surface is showing.
+    review: bool,
+    /// Suppress the success line, for work the user did not ask for.
+    quiet: bool,
+}
+
+impl GitResultFollowUp {
+    /// A working-tree mutation: the catalog row it changed and the diff on
+    /// screen. `HEAD` and the set of branches are where they were.
+    const WORKING_TREE: Self = Self {
+        catalog: true,
+        branches: false,
+        history: false,
+        review: true,
+        quiet: false,
+    };
 }
 
 fn apply_git_result(
     mut backend: Pin<&mut ffi::HarknessBackend>,
     job_id: &str,
     result: GitWorkerResult,
-    refresh_catalog: bool,
-    refresh_branches: bool,
-    quiet_success: bool,
-    refresh_review: bool,
+    follow_up: GitResultFollowUp,
 ) {
     finish_job(backend.as_mut(), job_id);
     let is_open =
         opened_project_id(backend.as_ref().opened()).as_deref() == Some(result.project_id.as_str());
-    let should_refresh_review = refresh_review && is_open && result.state.is_some();
+    let should_refresh_review = follow_up.review && is_open && result.state.is_some();
     let project_id = result.project_id.clone();
     if is_open {
         if let Some(state) = &result.state {
@@ -3964,18 +4143,23 @@ fn apply_git_result(
             clear_git_state(backend.as_mut());
         }
         match result.message {
-            Ok(message) if !quiet_success => backend.as_mut().set_status(message.into()),
+            Ok(message) if !follow_up.quiet => backend.as_mut().set_status(message.into()),
             Ok(_) => {}
             Err(failure) => backend.as_mut().set_status(failure.message.into()),
         }
-        if refresh_branches {
+        if follow_up.branches {
             backend
                 .as_mut()
                 .refresh_branches(&QString::from(result.project_id.as_str()));
         }
+        if follow_up.history {
+            backend
+                .as_mut()
+                .refresh_history(&QString::from(result.project_id.as_str()));
+        }
     }
-    if refresh_catalog {
-        backend.as_mut().refresh();
+    if follow_up.catalog {
+        sync_catalog_projection(backend.as_mut(), &project_id, result.state.as_ref());
     }
     if should_refresh_review {
         refresh_current_working_review(backend.as_mut(), &project_id);
@@ -4921,7 +5105,16 @@ impl ffi::HarknessBackend {
         std::thread::spawn(move || {
             let result = run_git_status(project_id, &cancellation, &discard_snapshot_cache);
             let _ = qt_thread.queue(move |mut backend| {
-                apply_git_result(backend.as_mut(), &job_id, result, false, false, true, true);
+                apply_git_result(
+                    backend.as_mut(),
+                    &job_id,
+                    result,
+                    GitResultFollowUp {
+                        catalog: false,
+                        quiet: true,
+                        ..GitResultFollowUp::WORKING_TREE
+                    },
+                );
             });
         });
     }
@@ -5807,7 +6000,15 @@ impl ffi::HarknessBackend {
                 },
             );
             let _ = qt_thread.queue(move |mut backend| {
-                apply_git_result(backend.as_mut(), &job_id, result, true, false, false, true);
+                apply_git_result(
+                    backend.as_mut(),
+                    &job_id,
+                    result,
+                    GitResultFollowUp {
+                        history: true,
+                        ..GitResultFollowUp::WORKING_TREE
+                    },
+                );
             });
         });
     }
@@ -5849,7 +6050,15 @@ impl ffi::HarknessBackend {
                 },
             );
             let _ = qt_thread.queue(move |mut backend| {
-                apply_git_result(backend.as_mut(), &job_id, result, true, false, quiet, true);
+                apply_git_result(
+                    backend.as_mut(),
+                    &job_id,
+                    result,
+                    GitResultFollowUp {
+                        quiet,
+                        ..GitResultFollowUp::WORKING_TREE
+                    },
+                );
             });
         });
     }
@@ -5891,7 +6100,15 @@ impl ffi::HarknessBackend {
                 },
             );
             let _ = qt_thread.queue(move |mut backend| {
-                apply_git_result(backend.as_mut(), &job_id, result, true, false, false, true);
+                apply_git_result(
+                    backend.as_mut(),
+                    &job_id,
+                    result,
+                    GitResultFollowUp {
+                        history: true,
+                        ..GitResultFollowUp::WORKING_TREE
+                    },
+                );
             });
         });
     }
@@ -5937,7 +6154,12 @@ impl ffi::HarknessBackend {
                 },
             );
             let _ = qt_thread.queue(move |mut backend| {
-                apply_git_result(backend.as_mut(), &job_id, result, true, false, false, true);
+                apply_git_result(
+                    backend.as_mut(),
+                    &job_id,
+                    result,
+                    GitResultFollowUp::WORKING_TREE,
+                );
             });
         });
     }
@@ -6016,7 +6238,16 @@ impl ffi::HarknessBackend {
                 },
             );
             let _ = qt_thread.queue(move |mut backend| {
-                apply_git_result(backend.as_mut(), &job_id, result, true, true, false, true);
+                apply_git_result(
+                    backend.as_mut(),
+                    &job_id,
+                    result,
+                    GitResultFollowUp {
+                        branches: true,
+                        history: true,
+                        ..GitResultFollowUp::WORKING_TREE
+                    },
+                );
             });
         });
     }
@@ -6064,7 +6295,16 @@ impl ffi::HarknessBackend {
                 },
             );
             let _ = qt_thread.queue(move |mut backend| {
-                apply_git_result(backend.as_mut(), &job_id, result, true, true, false, true);
+                apply_git_result(
+                    backend.as_mut(),
+                    &job_id,
+                    result,
+                    GitResultFollowUp {
+                        branches: true,
+                        history: true,
+                        ..GitResultFollowUp::WORKING_TREE
+                    },
+                );
             });
         });
     }
@@ -6388,19 +6628,19 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        BranchRow, GITHUB_CLI_REMOVED_ENV, GitFailure, GitStateRow, HarknessBackendRust,
-        OpenedUpdate, ProjectRow, REVIEW_FILE_PAGE_SIZE, REVIEW_ROW_PAGE_SIZE,
+        BranchRow, CatalogGitProjection, GITHUB_CLI_REMOVED_ENV, GitFailure, GitStateRow,
+        HarknessBackendRust, OpenedUpdate, ProjectRow, REVIEW_FILE_PAGE_SIZE, REVIEW_ROW_PAGE_SIZE,
         ReviewContextDirection, ReviewContextOutcome, ReviewSelection, WorktreeLockAction,
         accept_current_catalog_refresh, advance_review_file_window, advance_review_row_window,
-        attach_discard_snapshots_with, begin_job, begin_job_in_scope, best_working_tree_line,
-        cancel_issue_jobs, change_worktree_lock_with_service, conflicting_repository_job,
-        display_diff_path, empty_opened, end_job, expand_review_context_with_git,
-        github_cli_command, github_cli_output_with_executable, github_graphql_arguments,
-        hidden_before, jobs_conflict, load_history_page_with_git, load_review_file_with_git,
-        load_review_with_git, load_review_with_initial_file_with_git, move_worktree_with_service,
-        operation_outcome, parse_github_issues, project_repository_lock_scopes, project_rows,
-        project_worktree_lifecycle_lock_scopes, register_path_selection,
-        register_review_path_identity, remove_worktree_with_service,
+        attach_discard_snapshots, attach_discard_snapshots_with, begin_job, begin_job_in_scope,
+        best_working_tree_line, cancel_issue_jobs, change_worktree_lock_with_service,
+        conflicting_repository_job, display_diff_path, empty_opened, end_job,
+        expand_review_context_with_git, github_cli_command, github_cli_output_with_executable,
+        github_graphql_arguments, hidden_before, jobs_conflict, load_history_page_with_git,
+        load_review_file_with_git, load_review_with_git, load_review_with_initial_file_with_git,
+        move_worktree_with_service, operation_outcome, parse_github_issues,
+        project_repository_lock_scopes, project_rows, project_worktree_lifecycle_lock_scopes,
+        register_path_selection, register_review_path_identity, remove_worktree_with_service,
         replace_status_path_selections, resolve_commit_scope, resolve_path_selection,
         retreat_review_file_window, retreat_review_row_window, review_content_summary,
         review_file_discard_description, review_file_window, review_hunk_exists_where, review_path,
@@ -7408,6 +7648,150 @@ mod tests {
             2,
             "a metadata change must refresh the snapshot"
         );
+    }
+
+    #[test]
+    fn an_unchanged_status_read_projects_identically() {
+        let mut backend = HarknessBackendRust::default();
+        let row = status_row(&[("first.txt", None, false), ("second.txt", None, false)]);
+
+        let first = replace_status_path_selections(&mut backend, &row);
+        let second = replace_status_path_selections(&mut backend, &row);
+
+        // Minting fresh tokens per read made every poll a change, which rebuilt
+        // the whole Changes list on a timer.
+        assert_eq!(first, second);
+        assert_eq!(to_git(&row, &first), to_git(&row, &second));
+    }
+
+    #[test]
+    fn a_path_that_leaves_the_status_takes_its_token_with_it() {
+        let mut backend = HarknessBackendRust::default();
+        let tokens = replace_status_path_selections(
+            &mut backend,
+            &status_row(&[("first.txt", None, false), ("second.txt", None, false)]),
+        );
+
+        let remaining = replace_status_path_selections(
+            &mut backend,
+            &status_row(&[("second.txt", None, false)]),
+        );
+
+        // The survivor keeps the identity the list already scrolled to, and
+        // the committed path's token stops authorizing anything.
+        assert_eq!(remaining, vec![tokens[1].clone()]);
+        assert!(resolve_path_selection(&backend, "project-1", &tokens[0]).is_err());
+    }
+
+    #[test]
+    fn an_edited_file_is_re_minted_so_a_pending_confirmation_refuses() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("re-mint-repository");
+        initialize_repository(&root);
+        let path = Path::new("confirmed.txt");
+        commit_file(&root, path, "original\n", "add confirmation fixture");
+        fs::write(root.join(path), "what the user confirmed\n").unwrap();
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
+        let cache = super::DiscardSnapshotCache::default();
+        let read = || {
+            let status = git
+                .detailed_status(&harkness_git::Cancellation::default())
+                .unwrap();
+            let mut state = GitStateRow::from_status("project-1".to_owned(), status);
+            attach_discard_snapshots(&git, &mut state, &cache);
+            state
+        };
+        let mut backend = HarknessBackendRust::default();
+
+        let confirmed = replace_status_path_selections(&mut backend, &read());
+        let unchanged = replace_status_path_selections(&mut backend, &read());
+        fs::write(root.join(path), "content the user never saw\n").unwrap();
+        let edited = replace_status_path_selections(&mut backend, &read());
+
+        // An idle poll leaves the row alone, so the list does not churn.
+        assert_eq!(confirmed, unchanged);
+        // An edit under an open discard prompt does not: the token the prompt
+        // was opened with must stop resolving, or confirming it would apply an
+        // unrecoverable operation to content that arrived afterwards.
+        assert_ne!(confirmed, edited);
+        assert!(resolve_path_selection(&backend, "project-1", &confirmed[0]).is_err());
+    }
+
+    #[test]
+    fn a_mutation_projects_its_own_status_onto_the_catalog_row() {
+        let row = ProjectRow {
+            id: "project-1".to_owned(),
+            lock_scope: "scope".to_owned(),
+            lock_scope_resolved: true,
+            display_name: "sample".to_owned(),
+            root: "/tmp/sample".to_owned(),
+            remote: String::new(),
+            github_remote: String::new(),
+            branch: "main".to_owned(),
+            managed: false,
+            worktree: false,
+            parent_id: String::new(),
+            parent_name: String::new(),
+            created_branch: String::new(),
+            available: true,
+            is_git: true,
+            dirty: true,
+        };
+        let projection = CatalogGitProjection::from_state(&status_row(&[]));
+
+        let updated = projection
+            .applied_to(&to_map(&row), "project-1")
+            .expect("the row is the acting project");
+
+        assert_eq!(projection.branch, "topic");
+        // An empty status entry list is exactly a clean working tree.
+        assert!(!projection.dirty);
+        let map = updated
+            .value::<QMap<QMapPair_QString_QVariant>>()
+            .expect("a project map");
+        assert_eq!(
+            map.get(&QString::from("branch"))
+                .and_then(|value| value.value::<QString>())
+                .map(|branch| branch.to_string()),
+            Some("topic".to_owned())
+        );
+        assert_eq!(
+            map.get(&QString::from("dirty"))
+                .and_then(|value| value.value::<bool>()),
+            Some(false)
+        );
+        // Nothing a status read cannot answer is touched.
+        assert_eq!(
+            map.get(&QString::from("displayName")),
+            to_map(&row)
+                .value::<QMap<QMapPair_QString_QVariant>>()
+                .and_then(|original| original.get(&QString::from("displayName")))
+        );
+        assert!(projection.applied_to(&to_map(&row), "project-2").is_none());
+    }
+
+    #[test]
+    fn an_unborn_head_projects_no_branch_the_catalog_would_contradict() {
+        let unborn = GitStateRow::from_status(
+            "project-1".to_owned(),
+            harkness_git::DetailedStatus {
+                head: harkness_git::HeadState::Unborn {
+                    branch: Some("main".to_owned()),
+                },
+                upstream: None,
+                pending: None,
+                entries: Vec::new(),
+            },
+        );
+
+        let projection = CatalogGitProjection::from_state(&unborn);
+
+        // The Git state names the branch a first commit would create, and the
+        // panel header says so. The catalog reports no branch until that
+        // commit exists, so writing the name would be undone by the next full
+        // reload and read as the branch changing on its own.
+        assert_eq!(unborn.branch, "main");
+        assert!(projection.branch.is_empty());
     }
 
     #[test]
