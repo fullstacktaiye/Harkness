@@ -486,11 +486,11 @@ impl Store {
 
     /// Loads the grants of one run, for the approval matcher to evaluate.
     ///
-    /// Every grant this returns was granted; whether one is still *live* and
-    /// whether it covers a particular call are decided by
-    /// [`grant_applies`](crate::approval::grant_applies) against an instant the
-    /// caller supplies, because neither question is one a query should answer
-    /// from the database's idea of now.
+    /// Every grant this returns is live by construction — only a granted
+    /// request becomes one, and `granted` is terminal. Whether one *covers* a
+    /// particular call is decided by
+    /// [`grant_applies`](crate::approval::grant_applies), which reads no clock
+    /// and touches no database, so a listing is grants and not verdicts.
     ///
     /// # Errors
     ///

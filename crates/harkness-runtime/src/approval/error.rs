@@ -1,4 +1,5 @@
 use thiserror::Error;
+use time::OffsetDateTime;
 
 use crate::domain::ApprovalId;
 
@@ -64,6 +65,18 @@ pub enum ApprovalError {
         requested: ApprovalScope,
     },
 
+    /// An answer arrived after the request's deadline for answering it.
+    ///
+    /// A lapsed request is a question that is over. Granting one would make the
+    /// deadline advisory, and it is the only thing `expires_at` is for.
+    #[error("approval {id} lapsed at {expires_at} and can no longer be decided")]
+    Expired {
+        /// Approval whose deadline had passed.
+        id: ApprovalId,
+        /// Deadline the request carried.
+        expires_at: OffsetDateTime,
+    },
+
     /// A capability-scoped request named no capability to scope to.
     #[error("a {scope} request must name at least one capability to grant")]
     ScopeRequiresCapability {
@@ -117,6 +130,7 @@ impl ApprovalError {
         "approval_already_resolved",
         "approval_decision_identity_mismatch",
         "approval_scope_exceeds_request",
+        "approval_expired",
         "approval_scope_requires_capability",
         "approval_uncanonicalizable_input",
         "approval_inconsistent_record",
@@ -131,16 +145,19 @@ impl ApprovalError {
             Self::AlreadyResolved { .. } => Self::KINDS[1],
             Self::DecisionIdentityMismatch { .. } => Self::KINDS[2],
             Self::ScopeExceedsRequest { .. } => Self::KINDS[3],
-            Self::ScopeRequiresCapability { .. } => Self::KINDS[4],
-            Self::UncanonicalizableInput { .. } => Self::KINDS[5],
-            Self::InconsistentRecord { .. } => Self::KINDS[6],
-            Self::MalformedInputHash { .. } => Self::KINDS[7],
+            Self::Expired { .. } => Self::KINDS[4],
+            Self::ScopeRequiresCapability { .. } => Self::KINDS[5],
+            Self::UncanonicalizableInput { .. } => Self::KINDS[6],
+            Self::InconsistentRecord { .. } => Self::KINDS[7],
+            Self::MalformedInputHash { .. } => Self::KINDS[8],
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use time::OffsetDateTime;
+
     use crate::domain::ApprovalId;
 
     use super::super::{ApprovalScope, ApprovalState};
@@ -167,6 +184,10 @@ mod tests {
                 id,
                 effective: ApprovalScope::ExactCall,
                 requested: ApprovalScope::ToolForRun,
+            },
+            ApprovalError::Expired {
+                id,
+                expires_at: OffsetDateTime::UNIX_EPOCH,
             },
             ApprovalError::ScopeRequiresCapability {
                 scope: ApprovalScope::CapabilityForRun,

@@ -608,10 +608,19 @@ project. Each scope then adds the axes that give it meaning:
   silently be the broadest in the system.
 
 The matcher reads no clock and opens no transaction. A grant's lifetime is its
-run; a request's `expires_at` is a deadline for a *human to answer*, so the only
-thing it can do is stop a request from ever being granted. Carrying it into the
-grant would make a `ToolForRun` approval given "for the remainder of the run"
-stop applying part-way through one.
+run; a request's `expires_at` is a deadline for a *human to answer*, and the only
+thing it does is stop a lapsed request from being granted — enforced by
+`ApprovalRequest::decide`, because a deadline nothing checks is advice rather
+than a deadline. A lapsed request stays `pending` until something expires it, so
+a caller that sets a deadline owes it a sweeper. Carrying the deadline into the
+grant instead would make a `ToolForRun` approval given "for the remainder of the
+run" stop applying part-way through one.
+
+One approval has one waiter, and `ApprovalGate::ticket` refuses a second rather
+than issuing it. Two tickets would share one registration, so whichever dropped
+first would release it and leave the survivor parked on a key `resolve` no longer
+finds — permanently, since a wait has no timeout. A refused ticket is a mistake a
+caller can see.
 
 An `ApprovalGrant` is projected from a granted request and has no constructor and
 no lifecycle field. `granted` is terminal, so a request that reached it cannot

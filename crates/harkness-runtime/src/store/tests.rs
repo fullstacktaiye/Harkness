@@ -3281,7 +3281,7 @@ fn no_transaction_spans_the_period_a_request_is_pending() {
     let held = Held::new();
     let request = held.open(held.pending(RiskLevel::Execute));
     let gate = Arc::new(ApprovalGate::new());
-    let ticket = gate.ticket(request.id());
+    let ticket = gate.ticket(request.id()).unwrap();
 
     // The call is parked. If `open_approval` had left a transaction open, this
     // unrelated write would block until the busy timeout and fail.
@@ -3591,6 +3591,10 @@ fn a_hand_edited_approval_row_fails_to_load_instead_of_becoming_a_grant() {
         ("risk", "catastrophic", "risk"),
         ("effective_scope", "everything", "effective_scope"),
         ("state", "approved", "state"),
+        // A decision cleared down to its remnants: the request would otherwise
+        // read as unanswered while the decider's words sat in the next column.
+        ("decision_reason", "I said yes", "decision_verdict"),
+        ("decision_scope", "exact_call", "decision_verdict"),
         ("input_hash", "not-a-hash", "input_hash"),
         // Exactly 64 *bytes*, but not 64 characters. The length check counts
         // bytes and hexadecimal pairs are read as bytes, so this is a refusal

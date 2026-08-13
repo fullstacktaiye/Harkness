@@ -179,14 +179,23 @@ impl ApprovalGate {
     /// that will never arrive is a leak, not a safety net.
     ///
     /// One approval has one waiter: it holds exactly one tool call, and that
-    /// call is what parks. An observation is *taken* by the waiter that receives
-    /// it rather than broadcast, so a second ticket for the same approval would
-    /// replace the first's registration. Do not hand one approval's ticket to
-    /// two threads.
+    /// call is what parks. `None` therefore means a ticket is already
+    /// outstanding, which is a caller bug rather than contention.
+    ///
+    /// Refusing rather than handing out a second ticket is what keeps that bug
+    /// from becoming a hang. Two tickets would share one map entry, so whichever
+    /// dropped first would release the registration, and the survivor's `wait`
+    /// would park on a key `resolve` no longer finds — forever, since a wait has
+    /// no timeout. A returned `None` is a mistake a caller can see.
     #[must_use]
-    pub fn ticket(&self, id: ApprovalId) -> ApprovalTicket<'_> {
-        guard(&self.waiting).entry(id).or_default();
-        ApprovalTicket { gate: self, id }
+    pub fn ticket(&self, id: ApprovalId) -> Option<ApprovalTicket<'_>> {
+        let mut waiting = guard(&self.waiting);
+        if waiting.contains_key(&id) {
+            return None;
+        }
+        waiting.insert(id, None);
+        drop(waiting);
+        Some(ApprovalTicket { gate: self, id })
     }
 
     /// Records an observation and wakes whoever is waiting for it.
@@ -405,7 +414,7 @@ mod tests {
         // The ticket is taken here, on the thread that is about to persist the
         // request, and *then* handed to the waiter — which is the order the
         // contract requires and the reason a decision cannot outrun it.
-        let ticket = gate.ticket(id);
+        let ticket = gate.ticket(id).unwrap();
         thread::scope(|scope| {
             let waiter = scope.spawn(move || ticket.wait());
 
@@ -426,7 +435,7 @@ mod tests {
         // answered before its caller ever parks.
         let gate = ApprovalGate::new();
         let mut record = request();
-        let ticket = gate.ticket(record.id());
+        let ticket = gate.ticket(record.id()).unwrap();
         record.cancel(at(3)).unwrap();
 
         gate.resolve_from(&record);
@@ -438,6 +447,27 @@ mod tests {
             !gate.is_waiting(record.id()),
             "taking an observation releases its registration"
         );
+    }
+
+    #[test]
+    fn a_second_ticket_is_refused_rather_than_stranding_the_first() {
+        // Two tickets would share one registration, so whichever dropped first
+        // would release it and leave the survivor parked on a key `resolve` no
+        // longer finds — forever, since a wait has no timeout.
+        let gate = ApprovalGate::new();
+        let mut record = request();
+        let id = record.id();
+
+        let ticket = gate.ticket(id).expect("the first ticket is available");
+        assert!(gate.ticket(id).is_none(), "one approval has one waiter");
+
+        // The refusal is about this approval only, and releasing the ticket
+        // makes it available again.
+        assert!(gate.ticket(ApprovalId::new()).is_some());
+        record.cancel(at(2)).unwrap();
+        gate.resolve_from(&record);
+        assert_eq!(ticket.wait().state(), ApprovalState::Cancelled);
+        assert!(gate.ticket(id).is_some());
     }
 
     #[test]
@@ -459,7 +489,7 @@ mod tests {
     fn a_run_cancellation_wakes_a_waiter_rather_than_leaving_it_parked() {
         let gate = ApprovalGate::new();
         let mut record = request();
-        let ticket = gate.ticket(record.id());
+        let ticket = gate.ticket(record.id()).unwrap();
 
         thread::scope(|scope| {
             let waiter = scope.spawn(move || ticket.wait());
@@ -479,6 +509,7 @@ mod tests {
 
         let ticket = gate
             .ticket(record.id())
+            .unwrap()
             .wait_for(Duration::from_millis(20))
             .expect_err("nothing has answered yet");
         assert_eq!(
@@ -499,7 +530,7 @@ mod tests {
         let mut record = request();
         let id = record.id();
 
-        let ticket = gate.ticket(id);
+        let ticket = gate.ticket(id).unwrap();
         record.expire(at(6)).unwrap();
         gate.resolve_from(&record);
         assert!(gate.is_waiting(id));
@@ -516,7 +547,10 @@ mod tests {
     fn one_gate_serves_many_approvals_without_crossing_their_answers() {
         let gate = ApprovalGate::new();
         let ids = (0..8).map(|_| ApprovalId::new()).collect::<Vec<_>>();
-        let tickets = ids.iter().map(|id| gate.ticket(*id)).collect::<Vec<_>>();
+        let tickets = ids
+            .iter()
+            .map(|id| gate.ticket(*id).unwrap())
+            .collect::<Vec<_>>();
 
         thread::scope(|scope| {
             let waiters = tickets

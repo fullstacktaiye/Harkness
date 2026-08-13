@@ -434,16 +434,26 @@ fn decode_decision(
     id: ApprovalId,
     resolved_at: Option<time::OffsetDateTime>,
 ) -> Result<Option<ApprovalDecision>, StoreError> {
+    let scope = optional_text(row, APPROVAL, "decision_scope")?;
+    let reason = optional_text(row, APPROVAL, "decision_reason")?;
     let (verdict, decided_via) = match (
         optional_text(row, APPROVAL, "decision_verdict")?,
         optional_text(row, APPROVAL, "decided_via")?,
     ) {
-        (None, None) => return Ok(None),
+        // A row with no verdict and no surface carries no decision — but only
+        // if it carries no *remnant* of one either. Returning `Ok(None)` on the
+        // strength of two columns while a third still holds the decider's words
+        // would drop them on the floor and report the request as unanswered,
+        // which is the same corruption as a verdict with no surface and deserves
+        // the same refusal.
+        (None, None) if scope.is_none() && reason.is_none() => return Ok(None),
         (Some(verdict), Some(decided_via)) => (verdict, decided_via),
         _ => {
             return Err(column_encoding(
                 "decision_verdict",
-                "decision_verdict and decided_via must be stored together".to_owned(),
+                "decision_verdict, decided_via, decision_scope and decision_reason \
+                 are one decision and must be stored together"
+                    .to_owned(),
             ));
         }
     };
@@ -458,7 +468,7 @@ fn decode_decision(
         .ok_or_else(|| unknown_spelling("decision_verdict", &verdict))?;
     let decided_via = DecidedVia::from_stored(&decided_via)
         .ok_or_else(|| unknown_spelling("decided_via", &decided_via))?;
-    let scope = optional_text(row, APPROVAL, "decision_scope")?
+    let scope = scope
         .map(|stored| {
             ApprovalScope::from_stored(&stored)
                 .ok_or_else(|| unknown_spelling("decision_scope", &stored))
@@ -480,7 +490,7 @@ fn decode_decision(
         scope,
         decided_via,
         decided_at,
-        optional_text(row, APPROVAL, "decision_reason")?,
+        reason,
     )))
 }
 

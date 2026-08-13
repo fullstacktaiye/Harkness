@@ -497,12 +497,21 @@ impl PendingApproval {
         self
     }
 
-    /// Sets a wall-clock expiry.
+    /// Sets a wall-clock deadline for a human to answer.
+    ///
+    /// Past it, [`ApprovalRequest::decide`] refuses, so the deadline is enforced
+    /// by the record rather than by whoever holds the timer — a deadline nothing
+    /// checks is advice. A lapsed request stays `pending` until something closes
+    /// it with [`expire`](ApprovalRequest::expire); a caller that sets a deadline
+    /// therefore owes it a sweeper, which is the coordinator's job.
+    ///
+    /// It bounds only the *answer*. A grant given in time outlives it, because a
+    /// grant's lifetime is its run.
     ///
     /// v0.3 leaves this absent by default: runs are interactive, and a request
     /// that expires while a user is reading it is a worse failure than one that
     /// waits. A cancelled or failed run resolves its pending requests regardless
-    /// of expiry.
+    /// of any deadline.
     #[must_use]
     pub fn expiring_at(mut self, at: OffsetDateTime) -> Self {
         self.expires_at = Some(at.to_offset(UtcOffset::UTC));
@@ -629,6 +638,15 @@ impl ApprovalRequest {
                 };
                 if expected != state {
                     return refuse("its state disagrees with the verdict that produced it");
+                }
+                // A row cannot claim an answer `decide` would have refused as
+                // late, or an edited `expires_at` would resurrect the grant the
+                // deadline exists to prevent.
+                if pending
+                    .expires_at
+                    .is_some_and(|at| decision.decided_at() >= at)
+                {
+                    return refuse("it was decided after the deadline for answering it");
                 }
                 // A decision's timestamp is deliberately not checked against
                 // `resolved_at`: they are one stored column read twice, because
@@ -806,6 +824,16 @@ impl ApprovalRequest {
             return Err(ApprovalError::DecisionIdentityMismatch {
                 request: self.id,
                 decision: decision.approval_id,
+            });
+        }
+        // Enforced here rather than left to whoever owns the timer, because a
+        // deadline nothing checks is advice. Refusing keeps the record pending;
+        // closing it is [`expire`](Self::expire)'s job, and the waiter observes
+        // the expiry rather than a late grant.
+        if self.is_expired(decision.decided_at) {
+            return Err(ApprovalError::Expired {
+                id: self.id,
+                expires_at: self.pending.expires_at.unwrap_or(decision.decided_at),
             });
         }
         if let Some(scope) = decision.scope
@@ -1215,6 +1243,66 @@ pub(super) mod tests {
         assert!(!record.is_expired(at(59)));
         assert!(record.is_expired(at(60)));
         assert!(record.is_expired(at(61)));
+    }
+
+    #[test]
+    fn an_answer_after_the_deadline_cannot_grant_the_request_it_lapsed_on() {
+        // The deadline's whole job. A stale dialog answered an hour late must
+        // not produce a live grant, and enforcing it here rather than leaving it
+        // to whoever owns the timer is what stops it being advice.
+        for scope in ApprovalScope::ALL.iter().copied() {
+            let mut record = ApprovalRequest::open(
+                pending(RiskLevel::Execute)
+                    .requesting(scope)
+                    .expiring_at(at(60)),
+            )
+            .unwrap();
+
+            let error = record
+                .decide(ApprovalDecision::grant(
+                    record.id(),
+                    scope,
+                    DecidedVia::Gui,
+                    at(60),
+                ))
+                .unwrap_err();
+
+            assert_eq!(error.kind(), "approval_expired", "{scope}");
+            assert_eq!(record.state(), ApprovalState::Pending);
+            assert!(record.grant().is_none());
+
+            // A denial is refused too: the question is over either way, and the
+            // record is closed by expiring it rather than by answering it late.
+            assert_eq!(
+                record
+                    .decide(ApprovalDecision::deny(record.id(), DecidedVia::Cli, at(61)))
+                    .unwrap_err()
+                    .kind(),
+                "approval_expired"
+            );
+            record.expire(at(61)).unwrap();
+            assert_eq!(record.state(), ApprovalState::Expired);
+        }
+    }
+
+    #[test]
+    fn an_answer_inside_the_deadline_is_unaffected_by_it() {
+        let mut record =
+            ApprovalRequest::open(pending(RiskLevel::Execute).expiring_at(at(60))).unwrap();
+        record
+            .decide(ApprovalDecision::grant(
+                record.id(),
+                ApprovalScope::ExactCall,
+                DecidedVia::Gui,
+                at(59),
+            ))
+            .unwrap();
+
+        assert_eq!(record.state(), ApprovalState::Granted);
+        assert!(
+            record.grant().is_some(),
+            "a grant given in time outlives the deadline for giving it"
+        );
     }
 
     #[test]
