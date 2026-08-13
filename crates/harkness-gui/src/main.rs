@@ -1357,6 +1357,9 @@ Kirigami.ApplicationWindow {
         const quietChangedEnding = reviewFixture.highlightedLine(
             oldWordSegments, "src/main.rs", "deletion", "crlf", true
         );
+        const droppedEnding = reviewFixture.highlightedLine(
+            newWordSegments, "src/main.rs", "addition", "none", true
+        );
         reviewFixture.revealWhitespace = true;
         const revealed = reviewFixture.highlightedLine(
             oldWordSegments, "src/main.rs", "deletion", "none", false
@@ -1395,6 +1398,10 @@ Kirigami.ApplicationWindow {
             && quietUnchangedEnding.indexOf("\u00b6") === -1
             && quietChangedEnding.indexOf("CRLF") !== -1
             && quietContext.indexOf("background-color") === -1
+            // Both halves of a pair that lost its terminator say so; a line
+            // that simply has none, and always had none, does not.
+            && droppedEnding.indexOf("NO EOL") !== -1
+            && quiet.indexOf("NO EOL") === -1
             // Revealed, both whitespace bytes are told apart, every ending is
             // marked and the ones that are not plain LF are named, context
             // whitespace shows, and not one column has moved.

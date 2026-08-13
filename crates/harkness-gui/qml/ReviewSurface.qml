@@ -201,10 +201,23 @@ ColumnLayout {
     // Latin-1 for the reason `escapeCode` gives.
     function lineEndHtml(lineEnd, changed, kind) {
         const ending = String(lineEnd || "");
-        if (ending.length === 0 || ending === "none")
+        if (ending.length === 0)
             return "";
         if (changed !== true && !revealWhitespace)
             return "";
+        // A dropped terminator is half of a pair whose other half is named, so
+        // it is named too: one side saying LF and the other saying nothing
+        // reads as an annotation on the old line rather than as the change.
+        // Unchanged, a line with no terminator is simply the last one, and
+        // Git's own marker row below it already says so.
+        if (ending === "none") {
+            return changed === true
+                ? "&nbsp;<span style=\"background-color:"
+                    + Kirigami.Theme.highlightColor.toString()
+                    + ";color:" + Kirigami.Theme.highlightedTextColor.toString()
+                    + "\">" + qsTr("NO EOL") + "</span>"
+                : "";
+        }
         // A changed ending is a label and has to be read, so it is a chip in
         // the selection colours; a revealed one is an annotation and must not
         // compete with the code beside it.
@@ -356,18 +369,28 @@ ColumnLayout {
         return result + lineEndHtml(lineEnd, lineEndChanged, kind) + "</span>";
     }
 
-    // Revealing changes no row's height, but the diff is a long list and the
-    // reader was somewhere in it: the position is restored the way a layout
-    // change restores it, rather than trusted to stay put.
+    // Revealing keeps every column where it was, but it does append a mark to
+    // the end of a line that has a terminator — and these labels wrap, so a
+    // row already at the wrap boundary can gain a wrapped line and move every
+    // pixel below it. The row the reader was looking at is what survives that;
+    // a pixel offset is only the fallback for when there is no row to name.
     function setRevealWhitespace(value) {
         if (revealWhitespace === value)
             return;
+        const topIndex = reviewLineView.indexAt(1, reviewLineView.contentY + 1);
         const position = reviewLineView.contentY;
         const index = reviewLineView.currentIndex;
         revealWhitespace = value;
         Qt.callLater(function() {
-            const maximum = Math.max(0, reviewLineView.contentHeight - reviewLineView.height);
-            reviewLineView.contentY = Math.min(position, maximum);
+            if (topIndex >= 0) {
+                reviewLineView.positionViewAtIndex(topIndex, ListView.Beginning);
+            } else {
+                const maximum = Math.max(
+                    0,
+                    reviewLineView.contentHeight - reviewLineView.height
+                );
+                reviewLineView.contentY = Math.min(position, maximum);
+            }
             reviewLineView.currentIndex = index;
         });
     }
@@ -1520,11 +1543,13 @@ ColumnLayout {
                 }
             }
 
-            // Side-by-side puts its own handler on each half, which takes the
-            // press before this one; what is left for this to answer is a
-            // unified row, where there is only the one line to copy.
+            // Off in side-by-side, where each half carries its own. A tap
+            // handler takes a passive grab and does not consume the press, so
+            // leaving this one on would let it run *after* the half's and
+            // overwrite the side the reader pointed at with no side at all.
             TapHandler {
                 acceptedButtons: Qt.RightButton
+                enabled: !reviewSurface.splitLayout
                 onTapped: reviewSurface.openReviewLineMenu(
                     reviewLineDelegate.rowIndex,
                     ""
@@ -1630,13 +1655,16 @@ ColumnLayout {
 
                         // A replacement shows its deletion and its addition on
                         // the same row, so which one a copy means is only ever
-                        // answered by which one was pointed at.
+                        // answered by which one was pointed at. A half with
+                        // nothing in it still answers, with the row's own
+                        // line, rather than leaving a dead area.
                         TapHandler {
                             acceptedButtons: Qt.RightButton
-                            enabled: splitSide.modelData.present === true
                             onTapped: reviewSurface.openReviewLineMenu(
                                 reviewLineDelegate.rowIndex,
-                                splitSide.side
+                                splitSide.modelData.present === true
+                                    ? splitSide.side
+                                    : ""
                             )
                         }
 

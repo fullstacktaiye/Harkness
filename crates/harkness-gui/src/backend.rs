@@ -2949,6 +2949,23 @@ fn empty_review_side() -> QVariant {
     QVariant::from(&side)
 }
 
+/// Whether this row is Git's own annotation rather than a line of the file.
+///
+/// `\ No newline at end of file` arrives as a `DiffLine` like any other, and
+/// its `content` is the sentence libgit2 wrote plus newlines that exist
+/// nowhere on disk. It is shown, because it is what tells the reader the file
+/// is unterminated — but it has no terminator to name and nothing to copy, and
+/// treating its bytes as content would put that sentence on the clipboard as
+/// though the file contained it.
+fn is_eof_marker(kind: harkness_git::DiffLineKind) -> bool {
+    matches!(
+        kind,
+        harkness_git::DiffLineKind::BothEofNoNewline
+            | harkness_git::DiffLineKind::OldEofNoNewline
+            | harkness_git::DiffLineKind::NewEofNoNewline
+    )
+}
+
 /// The line exactly as it exists, for the clipboard.
 ///
 /// What the reader copies is the content bytes, never the glyphs a revealing
@@ -2956,6 +2973,23 @@ fn empty_review_side() -> QVariant {
 /// names.
 fn to_copy_text(bytes: &[u8]) -> QVariant {
     QVariant::from(&QString::from(String::from_utf8_lossy(bytes).as_ref()))
+}
+
+/// As `to_copy_text`, except that an annotation row copies nothing.
+fn diff_line_copy_text(line: &harkness_git::DiffLine) -> QVariant {
+    if is_eof_marker(line.kind) {
+        return to_copy_text(b"");
+    }
+    to_copy_text(&line.content)
+}
+
+/// The terminator to name on a row, which an annotation row does not have.
+fn diff_line_ending(line: &harkness_git::DiffLine) -> &'static str {
+    if is_eof_marker(line.kind) {
+        "none"
+    } else {
+        line_ending_name(&line.content)
+    }
 }
 
 fn to_review_side(line: &harkness_git::DiffLine, number: Option<u32>) -> QVariant {
@@ -2980,9 +3014,9 @@ fn to_review_side(line: &harkness_git::DiffLine, number: Option<u32>) -> QVarian
     );
     side.insert(
         QString::from("lineEnd"),
-        QVariant::from(&QString::from(line_ending_name(&line.content))),
+        QVariant::from(&QString::from(diff_line_ending(line))),
     );
-    side.insert(QString::from("copyText"), to_copy_text(&line.content));
+    side.insert(QString::from("copyText"), diff_line_copy_text(line));
     QVariant::from(&side)
 }
 
@@ -3011,9 +3045,9 @@ fn to_unified_review_line(line: &harkness_git::DiffLine) -> QVariant {
     );
     value.insert(
         QString::from("lineEnd"),
-        QVariant::from(&QString::from(line_ending_name(&line.content))),
+        QVariant::from(&QString::from(diff_line_ending(line))),
     );
-    value.insert(QString::from("copyText"), to_copy_text(&line.content));
+    value.insert(QString::from("copyText"), diff_line_copy_text(line));
     QVariant::from(&value)
 }
 
@@ -9493,6 +9527,59 @@ mod tests {
                 "copyText"
             ),
             "windows\r\n"
+        );
+    }
+
+    #[test]
+    fn the_no_newline_marker_is_an_annotation_and_not_a_line() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("unterminated-review-repository");
+        initialize_repository(&root);
+        let path = Path::new("unterminated.txt");
+        commit_file(&root, path, "alpha\nbeta\n", "add terminated lines");
+        fs::write(root.join(path), "alpha\nbeta").unwrap();
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
+        let files = git
+            .diff(
+                harkness_git::DiffTarget::Unstaged,
+                &harkness_git::DiffOptions::default().with_intra_line_ranges(true),
+            )
+            .unwrap();
+        let hunk = &files[0].hunks[0];
+        let marker_index = hunk
+            .lines
+            .iter()
+            .position(|line| super::is_eof_marker(line.kind))
+            .expect("dropping the final newline should produce Git's marker");
+
+        // Its content is the sentence libgit2 wrote plus newlines that are in
+        // no file, so the row carries no terminator to mark and nothing to
+        // copy — the reader would otherwise paste the annotation as content.
+        let marker = review_map(&to_review_line_row("hunk-1", hunk, marker_index));
+        let unified = review_map(&review_field(&marker, "unified"));
+        assert_eq!(review_text(&unified, "kind"), "eof");
+        assert_eq!(review_text(&unified, "lineEnd"), "none");
+        assert_eq!(review_text(&unified, "copyText"), "");
+        assert!(!review_flag(&marker, "lineEndChanged"));
+
+        // The line that lost its terminator still reports the pair, so the
+        // surface can name what each side ended with.
+        let dropped = review_map(&to_review_line_row(
+            "hunk-1",
+            hunk,
+            hunk.lines
+                .iter()
+                .position(|line| matches!(line.kind, harkness_git::DiffLineKind::Deletion))
+                .expect("the final line is rewritten without its newline"),
+        ));
+        assert!(review_flag(&dropped, "lineEndChanged"));
+        assert_eq!(
+            review_text(&review_map(&review_field(&dropped, "old")), "lineEnd"),
+            "lf"
+        );
+        assert_eq!(
+            review_text(&review_map(&review_field(&dropped, "new")), "lineEnd"),
+            "none"
         );
     }
 
