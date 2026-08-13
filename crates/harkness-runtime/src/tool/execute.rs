@@ -81,8 +81,17 @@
 //!
 //! # What is not here
 //!
-//! Scheduling, queueing, and concurrency limits (#93); deciding *whether* a call
-//! may run (#91, #92); and any concrete tool (#94, #95).
+//! Scheduling, queueing, and concurrency limits, which are
+//! [`schedule`](crate::schedule)'s; deciding *whether* a call may run, which is
+//! [`policy`](crate::policy)'s and [`approval`](crate::approval)'s; and any
+//! concrete tool (#94, #95).
+//!
+//! The one concession to the layer above is
+//! [`cancel_undispatched`](ToolExecutor::cancel_undispatched), which records a
+//! queued call as `cancelled` without starting it. It is here rather than in
+//! the scheduler so that every terminal state in the runtime is still written
+//! by [`finish`](ToolExecutor::finish), paired with its event in one
+//! transaction.
 //!
 //! # Two ways in, because a decision resumes the work it decided
 //!
@@ -384,6 +393,26 @@ pub enum ExecutionError {
         source: ToolError,
     },
 
+    /// The call cannot be cancelled undispatched, because it has already
+    /// started or already ended.
+    ///
+    /// Separate from [`NotDispatchable`](Self::NotDispatchable) rather than
+    /// borrowing it, because that variant names *one* required state and means
+    /// it: each dispatch entry point admits exactly one, which is what stops a
+    /// call being executed twice.
+    /// [`cancel_undispatched`](ToolExecutor::cancel_undispatched) admits two,
+    /// so reporting through the same shape would have to name one of them and
+    /// silently under-report the other.
+    #[error(
+        "tool call {call} is {state}, and only a call that has not started may be cancelled undispatched"
+    )]
+    NotCancellable {
+        /// Call that was handed to the executor.
+        call: ToolCallId,
+        /// State it was found in.
+        state: ToolCallState,
+    },
+
     /// A caller asked to lift a timeout the tool did not declare liftable.
     #[error("{tool} declared a {declared:?} limit, which a caller may tighten but not remove")]
     UnboundedNotDeclared {
@@ -403,6 +432,7 @@ impl ExecutionError {
         "store_failed",
         "not_dispatchable",
         "context_unavailable",
+        "not_cancellable",
         "unbounded_not_declared",
     ];
 
@@ -413,6 +443,7 @@ impl ExecutionError {
             Self::Store(_) => "store_failed",
             Self::NotDispatchable { .. } => "not_dispatchable",
             Self::Context { .. } => "context_unavailable",
+            Self::NotCancellable { .. } => "not_cancellable",
             Self::UnboundedNotDeclared { .. } => "unbounded_not_declared",
         }
     }
@@ -495,6 +526,64 @@ impl ToolExecutor {
     #[must_use]
     pub const fn limits(&self) -> ExecutionLimits {
         self.limits
+    }
+
+    /// The store every call this executor runs is recorded in.
+    ///
+    /// Crate-internal so the scheduler reads a submitted call's run and step
+    /// without being handed a second store that could disagree with this one.
+    pub(crate) const fn store(&self) -> &Arc<Store> {
+        &self.store
+    }
+
+    /// The registry every call this executor resolves against.
+    ///
+    /// Crate-internal for the same reason as [`store`](Self::store): the
+    /// scheduler reads a tool's declared risk and whether it spawns processes,
+    /// and must read them from the registry that will actually run the call.
+    pub(crate) const fn registry(&self) -> &Arc<ToolRegistry> {
+        &self.registry
+    }
+
+    /// Both states a call can be cancelled from without ever being dispatched.
+    ///
+    /// Approval-gated work waits at `awaiting_approval` rather than `pending`,
+    /// so a cancellation that admitted only the latter would be unable to stop
+    /// exactly the calls most likely to be waiting when a user gives up.
+    const CANCELLABLE_UNDISPATCHED: [ToolCallState; 2] =
+        [ToolCallState::Pending, ToolCallState::AwaitingApproval];
+
+    /// Records a call that will never be dispatched as `cancelled`.
+    ///
+    /// The third way a call reaches a terminal state, and the only one in which
+    /// no tool runs. A scheduler that cancels a run has to resolve the calls
+    /// still waiting in its queues, and "cancelled without being dispatched" is
+    /// not something [`execute`](Self::execute) can express: dispatching a call
+    /// in order to stop it would start a body, take a process slot, and write a
+    /// `running` state for work that never began.
+    ///
+    /// It goes through the executor rather than straight to the store so that
+    /// every terminal recording in the runtime is still made by one function,
+    /// with its event, in one transaction.
+    ///
+    /// The state is read before the terminal write rather than inside it, so a
+    /// caller must not have two live claims on one recorded call — see
+    /// [`Scheduler::submit`](crate::schedule::Scheduler::submit), which refuses
+    /// the second and is what makes that hold above this layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionError::NotCancellable`] for a call that is already
+    /// `running` or already terminal — a running call is stopped through its
+    /// token, not by writing over it — and [`ExecutionError::Store`] when the
+    /// record cannot be read or written.
+    pub fn cancel_undispatched(&self, call: ToolCallId) -> Result<CompletedCall, ExecutionError> {
+        let record = self.store.load_tool_call(call)?;
+        let state = record.state();
+        if !Self::CANCELLABLE_UNDISPATCHED.contains(&state) {
+            return Err(ExecutionError::NotCancellable { call, state });
+        }
+        self.finish(call, record.step_id(), None, CallOutcome::Cancelled)
     }
 
     /// Runs one recorded call to a terminal state.
@@ -1032,6 +1121,13 @@ mod tests {
                     source: crate::tool::ToolError::Cancelled,
                 },
                 "context_unavailable",
+            ),
+            (
+                ExecutionError::NotCancellable {
+                    call: crate::domain::ToolCallId::new(),
+                    state: crate::domain::ToolCallState::Running,
+                },
+                "not_cancellable",
             ),
             (
                 ExecutionError::UnboundedNotDeclared {

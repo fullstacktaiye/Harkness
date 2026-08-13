@@ -633,6 +633,93 @@ because only the value says what the tool actually produced. Preserving it is be
 effort — a context with no artifact store must not change the failure the caller is
 told about.
 
+## Runtime Scheduling Invariants
+
+Mutation serialization is keyed by `WorkspaceKey` — `ProjectId` *and* canonical root,
+canonicalized once when the key is built. Neither half alone is an identity: a path reused by
+another catalog entry is a different workspace, and one project's linked worktrees are separate
+checkouts that may legitimately be mutated at once. A key is never built from a lexical path, for
+the same reason a trust decision is never stored against one.
+
+Only the *front* of a workspace's queue is ever considered for dispatch. Nothing is scanned past
+it, and that is the fairness story *within* a workspace: a queued mutation stops later reads from
+being admitted, so a continuous stream of reads cannot starve it. Adding a "run the next admissible
+call instead" optimization reintroduces starvation and must not be done.
+
+Between workspaces the only contended resource is the global process limit, and it has its own
+answer: a freed slot is offered to each workspace first in turn, from a rotating cursor, and the
+workspace that released it takes part on the same terms as the rest. A fixed sweep order — or
+letting the releaser re-admit before the others are asked — gives the lowest-ordered key a
+permanent advantage, and two workspaces with a steady supply of process-backed calls would leave
+one of them never starting. Nothing else here orders one workspace against another.
+
+A parked submitter is counted on its workspace (`WorkspaceState::waiting`) and keeps that workspace
+out of the idle sweep. `Condvar::wait_timeout` releases the workspace mutex for the duration of the
+wait, so a producer blocked on a full queue holds *neither* lock; without the count it is invisible
+and its workspace can be collected beneath it. The producer then wakes and pushes into an orphan,
+the next submission for the same key builds a second `Workspace` with an empty running set, and one
+worktree ends up with two mutation slots.
+
+A worker releases its slots from a `Drop` guard, not from statements at the end of its closure. The
+executor's panic boundary covers the tool body and nothing else, so a panic in the pipeline around
+it unwinds the scheduler's own worker; without the guard the mutation slot is held forever, a
+process slot is lost from a pool that never grows back, and shutdown can never reach idle again.
+
+One recorded call has at most one claim on a scheduler at a time; a second submission is refused
+with `already_scheduled`. The executor refuses a duplicate too, but only *after* dispatch, by which
+point the loser has taken a workspace slot — and a second claim also makes
+`ToolExecutor::cancel_undispatched` racy, since it reads a call's state and writes its terminal
+state in two steps: a queued claim being swept could read `pending`, be overtaken by the other
+claim's dispatch, and record `cancelled` over a body that had just started. The claim is released
+when the call reaches a terminal state, so a genuine retry is never blocked. A workspace's running
+set is additionally keyed by a per-scheduler dispatch sequence rather than by `ToolCallId`, which
+keeps that collision unrepresentable rather than merely unreached.
+
+A worker is counted into `Workers` by `admit`, under the workspace lock, not beside the
+`thread::spawn` that follows. `stop` reads the running set under that same lock, so a call it can
+see and cancel is one `wait_until_idle` is already obliged to wait for; counting later leaves a
+window in which `shutdown` trips a token, observes no live workers, and reports a clean stop while
+a worker is still about to start. The resulting order — workspace lock → `Workers` — cannot invert,
+because nothing under `Workers` takes a workspace lock.
+
+At most one call above `RiskLevel::Observe` runs per workspace at a time, and it runs alone —
+reads do not overlap a mutation of the same worktree. This is a safety property, not a throughput
+choice: concurrent mutations interleave index writes, and a read taken across one describes a state
+that was never on disk. `RepositoryLock` remains the backstop beneath it and the two are not
+redundant; the repository lock is keyed by Git's common directory and so covers every linked
+worktree at once, while the scheduler's key covers one checkout.
+
+Lock order inside the scheduler is **workspace map → one workspace → process limit**, never
+reversed, and no two workspaces are locked at once. No scheduler lock is held across an executor
+call, a store write, or a child wait: admission decides under the lock and dispatch spawns outside
+it. The wider order is unchanged — **scheduler workspace slot → repository lock → catalog lock** —
+and holds by construction, because the scheduler calls no catalog or Git code at all.
+
+The process limit is global, `min(MAX_PROCESS_CONCURRENCY, available_parallelism)`, and its slot
+is acquired *last* in an admission decision, after every workspace check has passed, so a slot is
+never taken for a call that then fails one. Acquisition is a try and never a wait: a call that
+cannot have a slot stays queued rather than occupying a thread hoping for one, which is what stops
+the limit becoming a second way to deadlock. Whether a call needs a slot comes from the tool's own
+`spawns_processes` declaration — risk is not a proxy for it in either direction — and a call that
+spawns nothing takes none.
+
+Every queue has a named capacity constant and a full one blocks its producer. Nothing is discarded
+to make room: a dropped call is a run whose history omits work somebody asked for. A producer
+parked on a full queue is woken by shutdown rather than left waiting for room that will never be
+made.
+
+A queued call that is cancelled is recorded `cancelled` *without being dispatched*. Dispatching one
+in order to stop it would start a body, take a process slot, and write a `running` state for work
+that never began. The terminal state is still written by `ToolExecutor::finish`, so every terminal
+recording in the runtime is paired with its event in one transaction regardless of which layer
+decided it. `cancel_run` trips the caller's token for running calls — that is what a user asking to
+stop *is* — and the executor's own rule about never writing a caller's token is unchanged, because
+the executor is not the one asking.
+
+Shutdown cancels rather than abandons and then waits for its workers, so no child process group
+outlives the application. Dropping a `Scheduler` shuts it down; a caller wanting a different
+deadline calls `shutdown` first.
+
 ## Approval Invariants
 
 An approval is persisted and committed *before* any surface is notified, and the
