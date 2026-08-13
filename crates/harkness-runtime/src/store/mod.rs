@@ -98,6 +98,7 @@
 //! behind, which is reported as [`StoreError::IncompleteCheckpoint`] rather
 //! than by failing the statement.
 
+mod approval;
 mod artifact;
 mod column;
 mod error;
@@ -118,6 +119,9 @@ use rusqlite::{Connection, TransactionBehavior};
 use serde_json::Value;
 use time::OffsetDateTime;
 
+use crate::approval::{
+    ApprovalDecision, ApprovalGrant, ApprovalId, ApprovalRequest, ApprovalState,
+};
 use crate::domain::{
     ArtifactId, Failure, Run, RunDomainError, RunId, Step, StepId, Task, TaskId, ToolCall,
     ToolCallId,
@@ -320,6 +324,220 @@ impl Store {
             .map_or(TrustState::Untrusted, |trust| {
                 trust.resolve(project_id, root)
             }))
+    }
+
+    // -- approvals ----------------------------------------------------------
+
+    /// Records a pending approval and the event that announces it.
+    ///
+    /// The row and its `approval_requested` event share one transaction, so
+    /// "the question is durable" and "the surfaces have been told" become true
+    /// together. There is deliberately no event-free variant: a request nobody
+    /// is told about is a run that has stopped for no visible reason, and a
+    /// timeline entry with no row behind it is a question nobody can answer.
+    ///
+    /// The event is derived from the record rather than supplied, so its payload
+    /// carries the summary and the binding facts and never the raw input. The
+    /// input stays in `tool_calls.input_json` for a surface to expand on demand.
+    ///
+    /// The wait that follows this call holds nothing. The transaction commits
+    /// before the caller parks on its
+    /// [`ApprovalTicket`](crate::approval::ApprovalTicket).
+    ///
+    /// Returns the request as it was stored, whose summary is the redacted one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Approval`] carrying
+    /// [`AlreadyResolved`](crate::approval::ApprovalError::AlreadyResolved) when
+    /// the request was answered before it was ever recorded,
+    /// [`StoreError::MissingParent`] when the tool call is not stored or belongs
+    /// to a different run, [`StoreError::AlreadyExists`] when the identity is
+    /// taken, and [`StoreError::PayloadTooLarge`] when the summary exceeds
+    /// [`MAX_INLINE_PAYLOAD_BYTES`].
+    pub fn open_approval(
+        &self,
+        request: ApprovalRequest,
+    ) -> Result<(ApprovalRequest, EventSeq), StoreError> {
+        // A record decided in memory and only then handed here would land as a
+        // live grant whose timeline says a question was asked and never
+        // answered. Approval-before-execution is a claim about what the store
+        // witnessed, so the only thing that may be opened is a question.
+        if request.state().is_terminal() {
+            return Err(StoreError::Approval(
+                crate::approval::ApprovalError::AlreadyResolved {
+                    id: request.id(),
+                    state: request.state(),
+                },
+            ));
+        }
+        // Redaction happens before the transaction opens, exactly as it does for
+        // an event payload: the write lock holds two inserts and nothing else.
+        let request = approval::redact(&**self.redactor(), request);
+        let run_id = request.run_id();
+        let prepared = self.prepare_event(run_id, approval::requested_event(&request)?)?;
+        let seq = self.commit_event(
+            "recording an approval request",
+            prepared,
+            |connection, prepared| {
+                approval::insert(connection, &request)?;
+                prepared.append(connection, run_id)
+            },
+        )?;
+        Ok((request, seq))
+    }
+
+    /// Records a human decision, resolving the request it answers.
+    ///
+    /// The decision, the state change, and the `approval_decided` event share
+    /// one short transaction taken with `BEGIN IMMEDIATE`, so two surfaces
+    /// answering the same question cannot both win: the loser reads the
+    /// already-resolved record under the write lock and is refused.
+    ///
+    /// Waking the waiter is the caller's next step, not this method's — the
+    /// store owns durability and the [`ApprovalGate`](crate::approval::ApprovalGate)
+    /// owns the rendezvous, and a store that also signalled would be signalling
+    /// for decisions another process committed as well as its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Approval`] carrying
+    /// [`AlreadyResolved`](crate::approval::ApprovalError::AlreadyResolved) when
+    /// the request was already answered,
+    /// [`ScopeExceedsRequest`](crate::approval::ApprovalError::ScopeExceedsRequest)
+    /// when the grant is broader than the stored request allows, and
+    /// [`StoreError::NotFound`] when no approval has that identity.
+    pub fn decide_approval(
+        &self,
+        id: ApprovalId,
+        decision: ApprovalDecision,
+    ) -> Result<(ApprovalRequest, EventSeq), StoreError> {
+        let decision = approval::redact_decision(&**self.redactor(), decision);
+        // One clone so the event can be described before the transaction opens
+        // while the decision itself is still moved into the record it resolves.
+        let announced = decision.clone();
+        self.change_approval(
+            "deciding an approval request",
+            id,
+            move |request| approval::decided_event(request, &announced),
+            move |request| request.decide(decision),
+        )
+    }
+
+    /// Resolves a pending request that nobody answered.
+    ///
+    /// The route to [`Expired`](crate::approval::ApprovalState::Expired),
+    /// [`Cancelled`](crate::approval::ApprovalState::Cancelled), and
+    /// [`Superseded`](crate::approval::ApprovalState::Superseded), each of which
+    /// records that the question ended without a decision rather than
+    /// manufacturing a refusal nobody made.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Approval`] carrying
+    /// [`InvalidTransition`](crate::approval::ApprovalError::InvalidTransition)
+    /// when the request is already resolved or the state is a decided one, and
+    /// [`StoreError::NotFound`] when no approval has that identity.
+    pub fn resolve_approval(
+        &self,
+        id: ApprovalId,
+        to: ApprovalState,
+        at: OffsetDateTime,
+    ) -> Result<(ApprovalRequest, EventSeq), StoreError> {
+        self.change_approval(
+            "resolving an approval request",
+            id,
+            |request| approval::unanswered_event(request, to, at),
+            |request| request.resolve(to, at),
+        )
+    }
+
+    /// Loads one approval request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NotFound`] when no approval has that identity.
+    pub fn approval(&self, id: ApprovalId) -> Result<ApprovalRequest, StoreError> {
+        self.with_reader(|connection| approval::load(connection, id))
+    }
+
+    /// Lists every unanswered request across every run, oldest first.
+    ///
+    /// This is what a front end reads on start-up. A run interrupted mid-question
+    /// left its row exactly as it was, so the question survives the restart with
+    /// every binding field intact — which is what makes answering it afterwards
+    /// safe rather than a guess about what was being asked.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Query`] when the listing statement fails.
+    pub fn pending_approvals(&self) -> Result<Vec<ApprovalRequest>, StoreError> {
+        self.with_reader(approval::list_pending)
+    }
+
+    /// Lists every request of one run, oldest first, whatever its state.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::pending_approvals`].
+    pub fn run_approvals(&self, run_id: RunId) -> Result<Vec<ApprovalRequest>, StoreError> {
+        self.with_reader(|connection| approval::list_for_run(connection, run_id))
+    }
+
+    /// Loads the grants of one run, for the approval matcher to evaluate.
+    ///
+    /// Every grant this returns is live by construction — only a granted
+    /// request becomes one, and `granted` is terminal. Whether one *covers* a
+    /// particular call is decided by
+    /// [`grant_applies`](crate::approval::grant_applies), which reads no clock
+    /// and touches no database, so a listing is grants and not verdicts.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::pending_approvals`].
+    pub fn run_grants(&self, run_id: RunId) -> Result<Vec<ApprovalGrant>, StoreError> {
+        self.with_reader(|connection| approval::list_grants(connection, run_id))
+    }
+
+    /// Applies one approval change and appends its event in a single
+    /// transaction.
+    ///
+    /// The approval sibling of
+    /// [`change_tool_call_with_event`](Self::change_tool_call_with_event), and
+    /// for the same reason: keeping the pairing in one place is what stops a
+    /// later outcome being added with its event outside the transaction, which
+    /// would leave a question that was answered and a timeline that does not
+    /// say so.
+    ///
+    /// `describe` builds the event from the record as it stands *plus* the
+    /// outcome being applied, before the transaction opens, because redaction
+    /// and encoding must not happen under the write lock. Describing an outcome
+    /// in advance is safe here precisely because both halves are pure functions
+    /// of the same inputs: if the record moved underneath, `change` refuses and
+    /// the event rolls back with it.
+    fn change_approval<E, F>(
+        &self,
+        operation: &'static str,
+        id: ApprovalId,
+        describe: E,
+        change: F,
+    ) -> Result<(ApprovalRequest, EventSeq), StoreError>
+    where
+        E: FnOnce(&ApprovalRequest) -> RunEvent,
+        F: FnOnce(&mut ApprovalRequest) -> Result<(), crate::approval::ApprovalError>,
+    {
+        // The record is read before the transaction so an oversized payload can
+        // be spilled outside it: no transaction is held across filesystem work.
+        let current = self.approval(id)?;
+        let run_id = current.run_id();
+        let prepared = self.prepare_event(run_id, describe(&current))?;
+        self.commit_event(operation, prepared, |connection, prepared| {
+            let mut request = approval::load(connection, id)?;
+            change(&mut request)?;
+            approval::update_resolution(connection, &request)?;
+            let seq = prepared.append(connection, request.run_id())?;
+            Ok((request, seq))
+        })
     }
 
     // -- tasks --------------------------------------------------------------

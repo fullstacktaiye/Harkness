@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use rusqlite::ErrorCode;
 use thiserror::Error;
 
+use crate::approval::ApprovalError;
 use crate::domain::RunDomainError;
 
 use super::MAX_INLINE_PAYLOAD_BYTES;
@@ -186,6 +187,17 @@ pub enum StoreError {
     #[error(transparent)]
     InvalidTransition(RunDomainError),
 
+    /// An approval rule refused the change.
+    ///
+    /// Carried whole rather than flattened, because the specific refusal is what
+    /// a surface has to render: "somebody already answered this" and "that scope
+    /// is broader than the request allows" are the same failed write and very
+    /// different things to tell a user. Branch on
+    /// [`ApprovalError::kind`](crate::approval::ApprovalError::kind) for those;
+    /// `approval_refused` is the discriminant the store namespace publishes.
+    #[error(transparent)]
+    Approval(#[from] ApprovalError),
+
     /// A stored row could not be decoded into a valid domain record.
     #[error("a stored {record} row is not a valid record: {source}")]
     InvalidRecord {
@@ -265,6 +277,7 @@ impl StoreError {
         "forbidden_artifact_path",
         "non_utf8_path",
         "invalid_transition",
+        "approval_refused",
         "invalid_record",
         "column_encoding",
         "invalid_page_limit",
@@ -290,6 +303,7 @@ impl StoreError {
             Self::ForbiddenArtifactPath { .. } => "forbidden_artifact_path",
             Self::NonUtf8Path { .. } => "non_utf8_path",
             Self::InvalidTransition(_) => "invalid_transition",
+            Self::Approval(_) => "approval_refused",
             Self::InvalidRecord { .. } => "invalid_record",
             Self::ColumnEncoding { .. } => "column_encoding",
             Self::InvalidPageLimit { .. } => "invalid_page_limit",
@@ -371,6 +385,7 @@ pub(super) fn insert_failed(
 mod tests {
     use std::path::PathBuf;
 
+    use crate::approval::ApprovalError;
     use crate::domain::{ExecutionState, InvalidTransition, RunDomainError};
 
     use super::{OpenFailure, StoreError};
@@ -485,6 +500,13 @@ mod tests {
                     },
                 )),
                 "invalid_transition",
+            ),
+            (
+                StoreError::Approval(ApprovalError::AlreadyResolved {
+                    id: crate::domain::ApprovalId::new(),
+                    state: crate::approval::ApprovalState::Denied,
+                }),
+                "approval_refused",
             ),
             (
                 StoreError::InvalidRecord {

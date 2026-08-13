@@ -565,6 +565,106 @@ because only the value says what the tool actually produced. Preserving it is be
 effort — a context with no artifact store must not change the failure the caller is
 told about.
 
+## Approval Invariants
+
+An approval is persisted and committed *before* any surface is notified, and the
+row and its `approval_requested` event share one transaction. There is no
+event-free way to record one: a question nobody is told about is a run that
+stopped for no visible reason, and a timeline entry with no row behind it is a
+question nobody can answer. Restarting lists the pending requests with every
+binding field intact, which is what makes answering one after a restart safe
+rather than a guess about what was being asked.
+
+No transaction spans the wait. The ticket is taken *before* the request is
+persisted, the request is committed, the calling thread parks on a condition
+variable keyed by `ApprovalId`, and the decision is a second short write.
+Registering first is what closes the window in which a fast decision lands
+between persisting and parking. An answer for an approval with no live ticket is
+discarded rather than kept: a restart superseding an interrupted run's requests,
+and a cancellation resolving approvals whose callers have exited, both resolve
+approvals nobody is waiting for, and a gate keyed on answers rather than on
+waiters would grow without bound in exactly those cases.
+
+`grant_applies` is the security core and admits no partial application. The run
+and the workspace identity bind every scope — together they stop a grant
+replaying into another attempt of the same task or another checkout of the same
+project. Each scope then adds the axes that give it meaning:
+
+- `ExactCall` binds the recorded `tool_call_id`, the tool identity including its
+  version, and the canonical input hash. Binding the call is what makes it *one*
+  call, which is the whole point of reducing every remote-write and destructive
+  request to this scope: authorizing one force push must not authorize a second,
+  byte-identical one later in the same run. The input hash stays beside it rather
+  than being made redundant by it, so an authorization cannot survive the input
+  being re-derived differently.
+- `ToolForRun` binds the tool identity, version included, and ignores the call
+  and the input.
+- `CapabilityForRun` compares **no** tool identity, only that the candidate
+  declares at least one capability and that every capability it declares is
+  covered. Comparing a version here would match one tool's version string
+  against an unrelated tool's, so whether a grant covered a call would turn on
+  two tools happening to share a number. Subset, not overlap: a tool needing
+  `{network, fs.write}` must not run under a grant for `network` alone. A
+  candidate declaring nothing matches no capability grant, or that scope would
+  silently be the broadest in the system.
+
+The matcher reads no clock and opens no transaction. A grant's lifetime is its
+run; a request's `expires_at` is a deadline for a *human to answer*, and the only
+thing it does is stop a lapsed request from being granted — enforced by
+`ApprovalRequest::decide`, because a deadline nothing checks is advice rather
+than a deadline. A lapsed request stays `pending` until something expires it, so
+a caller that sets a deadline owes it a sweeper. Carrying the deadline into the
+grant instead would make a `ToolForRun` approval given "for the remainder of the
+run" stop applying part-way through one.
+
+One approval has one waiter, and `ApprovalGate::ticket` refuses a second rather
+than issuing it. Two tickets would share one registration, so whichever dropped
+first would release it and leave the survivor parked on a key `resolve` no longer
+finds — permanently, since a wait has no timeout. A refused ticket is a mistake a
+caller can see.
+
+An `ApprovalGrant` is projected from a granted request and has no constructor and
+no lifecycle field. `granted` is terminal, so a request that reached it cannot
+leave and every other state yields no grant at all — "a dead approval authorizes
+nothing" is a shape the types hold rather than a check to remember. It is also
+the only production source of a `policy::RunGrant`; policy cannot mint one, so an
+`Ask` becomes an `Allow` only because the matcher accepted a grant.
+
+Scope ceilings are enforced when a request is *created*, not when a grant is
+matched, so a `RemoteWrite` or `Destructive` request that asked for a run-wide
+scope is stored as an exact call and keeps both spellings. A record claiming a
+breadth the matcher would never honor is a lie in the audit trail, not defence in
+depth. A decision may narrow to the single call in front of a human and may never
+widen, which is re-checked against the stored request rather than trusted from
+the surface.
+
+Absence of an answer is never consent, and never a resolution either. Closing a
+window, dismissing a dialog, and losing a surface all leave the request pending.
+Only an explicit decision, an expiry, or a run cancellation resolves one, and the
+last two record `Expired` or `Cancelled` with **no** decision attached — the
+waiter still observes a denial, and the record still says no human answered.
+Synthesizing a decision there would make the audit claim one that was never made.
+
+`canonical_input_hash` is frozen and versioned by its domain constant. Object
+keys sort by UTF-8 bytes, arrays keep their order, integers and doubles have
+disjoint spellings, strings escape only what JSON requires, and there is no
+insignificant whitespace. A non-finite number is refused rather than encoded,
+because it serializes as `null` and would fold two different inputs onto one
+hash; no such `Value` is constructible today, but `serde_json`'s
+`arbitrary_precision` is a feature Cargo would unify workspace-wide, so the guard
+is load-bearing. Changing the encoding means a new domain constant and a new
+committed fixture, never an edit to the existing one — every stored `input_hash`
+was derived under it.
+
+The `approvals` table is the request *queue* and is deliberately not the
+per-record `approvals_json` audit history. That column is a bounded, ordered
+trail of decisions already made about one record; this table is a question with
+an identity, a lifecycle, an expiry, and the binding fields a grant is matched
+on, which has to be listed across runs and answered from either front end. Its
+update statement names none of the binding columns, so a resolution cannot
+re-target the approval a human answered; the only one it may move is
+`effective_scope`, and only downwards.
+
 ## External-Integration Boundary Invariants
 
 `harkness-acp`, `harkness-mcp`, `harkness-forge`, and `harkness-recipe` sit strictly below

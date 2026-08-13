@@ -7,7 +7,7 @@ use time::OffsetDateTime;
 
 use super::record::{Lifecycle, invalid_lifecycle, invalid_timestamp, validate_utc};
 use super::{
-    Approval, ApprovalDecision, ExecutionState, Failure, Run, RunDomainError, RunId, Step, StepId,
+    Approval, ApprovalOutcome, ExecutionState, Failure, Run, RunDomainError, RunId, Step, StepId,
     Task, TaskId, ToolCall, ToolCallId, ToolCallState,
 };
 use crate::policy::{PolicyDecision, PolicyVerdict};
@@ -749,7 +749,7 @@ impl ApprovalState for ToolCallState {
                 "a tool-call approval decision requires two lifecycle revisions",
             ));
         }
-        if self == Self::Denied && approval.decision() != ApprovalDecision::Denied {
+        if self == Self::Denied && approval.decision() != ApprovalOutcome::Denied {
             return Err(invalid_lifecycle(
                 record,
                 "a denied tool call cannot carry an approved decision",
@@ -808,8 +808,7 @@ where
                 "approval decisions require decided_by",
             ));
         }
-        if approval.decision() == ApprovalDecision::Denied && denied_index.replace(index).is_some()
-        {
+        if approval.decision() == ApprovalOutcome::Denied && denied_index.replace(index).is_some() {
             return Err(invalid_lifecycle(
                 record,
                 "approval history cannot contain multiple denials",
@@ -1040,7 +1039,7 @@ mod tests {
         StepWire, StepWireRef, TaskWire, TaskWireRef, ToolCallWire, ToolCallWireRef,
     };
     use crate::domain::{
-        Approval, ApprovalDecision, EXECUTION_TRANSITIONS, ExecutionState, Failure, Run,
+        Approval, ApprovalOutcome, EXECUTION_TRANSITIONS, ExecutionState, Failure, Run,
         RunDomainError, RunId, Step, StepId, TOOL_CALL_TRANSITIONS, Task, TaskId, ToolCall,
         ToolCallId, ToolCallState,
     };
@@ -1537,7 +1536,7 @@ mod tests {
     fn wire_approval_history_rejects_unreachable_shapes() {
         let mut call = call_wire(ToolCallState::Running);
         call.approvals
-            .push(Approval::new("user:42", ApprovalDecision::Approved, at(1)));
+            .push(Approval::new("user:42", ApprovalOutcome::Approved, at(1)));
         assert_eq!(
             ToolCall::try_from(call).unwrap_err(),
             RunDomainError::InvalidLifecycle {
@@ -1548,7 +1547,7 @@ mod tests {
 
         let mut run = run_wire(ExecutionState::Failed);
         run.approvals
-            .push(Approval::new("user:42", ApprovalDecision::Denied, at(1)));
+            .push(Approval::new("user:42", ApprovalOutcome::Denied, at(1)));
         assert_eq!(
             Run::try_from(run).unwrap_err(),
             RunDomainError::InvalidLifecycle {
