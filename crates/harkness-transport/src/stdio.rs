@@ -375,16 +375,29 @@ impl JsonRpcTransport for StdioTransport {
 
         let deadline = Instant::now() + OUTBOUND_ENQUEUE_TIMEOUT;
         loop {
+            // Counted *before* the handover and undone if it does not happen.
+            // The writer subtracts the moment it dequeues, and it routinely wins
+            // that race against a `fetch_add` placed after a successful send —
+            // which takes an unsigned counter below zero and makes the depth a
+            // front end shows for a stuck connection read `usize::MAX`.
+            self.inner
+                .counts
+                .outbound_depth
+                .fetch_add(1, Ordering::Relaxed);
             match sender.try_send(command) {
-                Ok(()) => {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(returned)) => {
                     self.inner
                         .counts
                         .outbound_depth
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Ok(());
+                        .fetch_sub(1, Ordering::Relaxed);
+                    command = returned;
                 }
-                Err(TrySendError::Full(returned)) => command = returned,
                 Err(TrySendError::Disconnected(_)) => {
+                    self.inner
+                        .counts
+                        .outbound_depth
+                        .fetch_sub(1, Ordering::Relaxed);
                     return Err(self.inner.terminal().map_or_else(
                         || TransportError::WriteFailed {
                             detail: "the peer's standard input is closed".to_owned(),
@@ -536,6 +549,19 @@ impl StdioTransport {
             },
         };
 
+        // The direct child being gone is not the group being gone. A peer that
+        // backgrounded a language server and then exited politely on a closed
+        // standard input leaves that helper running on the workspace *and*
+        // holding the standard-output pipe open, so the reader would never see
+        // end of file either. Both rungs above can reach here with the group
+        // still populated, which is why this is unconditional rather than part
+        // of the escalation. Signalling a group whose last member has already
+        // gone is a harmless `ESRCH`, and a group keeps its identifier reserved
+        // while any member is alive, so this cannot reach a recycled pid — the
+        // same reasoning `harkness-runtime` records for signalling a reaped tool
+        // child's group.
+        reap_group(&child);
+
         // The reader can be parked on a full inbound queue, and nothing is
         // draining it now that the connection is over. Joining without draining
         // would wait for a consumer that is never coming.
@@ -553,12 +579,13 @@ impl StdioTransport {
                 self.drain_inbound();
                 thread::sleep(POLL_INTERVAL);
             }
-            // A thread still blocked on a descriptor whose peer is dead is a
-            // situation with no good answer, and hanging teardown is the worst
-            // of them: the caller is told the connection is over and the thread
-            // is abandoned, exactly as the tool executor abandons a body that
-            // outran its deadline. Every process this connection started is
-            // already gone by here, so nothing is left running on a workspace.
+            // A thread still blocked on a descriptor is a situation with no good
+            // answer, and hanging teardown is the worst of them: the caller is
+            // told the connection is over and the thread is abandoned, exactly
+            // as the tool executor abandons a body that outran its deadline.
+            // Every process this connection started is already gone by here —
+            // `reap_group` above is what makes that true — so this bound should
+            // never be reached rather than being a routine outcome.
             if handle.is_finished() {
                 let _ = handle.join();
             }
@@ -574,17 +601,23 @@ impl StdioTransport {
     }
 
     /// Discards anything the reader has queued, so it can finish and be joined.
+    ///
+    /// Only a queued *message* was ever counted into the depth, so only a queued
+    /// message is counted back out. Subtracting for a fault or an end-of-file
+    /// marker as well would wrap the counter below zero.
     fn drain_inbound(&self) {
         let inbound = self
             .inner
             .inbound
             .lock()
             .expect("transport inbound queue is not poisoned");
-        while inbound.try_recv().is_ok() {
-            self.inner
-                .counts
-                .inbound_depth
-                .fetch_sub(1, Ordering::Relaxed);
+        while let Ok(event) = inbound.try_recv() {
+            if matches!(event, ReaderEvent::Message(_)) {
+                self.inner
+                    .counts
+                    .inbound_depth
+                    .fetch_sub(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -596,13 +629,18 @@ impl Drop for StdioTransport {
 }
 
 /// Polls for the child's exit until `grace` runs out.
+///
+/// A `try_wait` that *fails* answers `None`, the same as one that never saw the
+/// child exit, so the caller escalates. Reporting a failed wait as a clean exit
+/// would claim the peer left politely on the strength of the one call that could
+/// not find out.
 fn wait_for_exit(child: &mut Child, grace: Duration) -> Option<Option<i32>> {
     let deadline = Instant::now() + grace;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Some(status.code()),
             Ok(None) => {}
-            Err(_) => return Some(None),
+            Err(_) => return None,
         }
         if Instant::now() >= deadline {
             return None;
@@ -610,6 +648,17 @@ fn wait_for_exit(child: &mut Child, grace: Duration) -> Option<Option<i32>> {
         thread::sleep(POLL_INTERVAL);
     }
 }
+
+/// Kills whatever is left in the peer's process group once the peer is gone.
+#[cfg(unix)]
+fn reap_group(child: &Child) {
+    signal_group(child, libc::SIGKILL);
+}
+
+/// Windows has no process group here, so a peer's grandchildren are not
+/// reachable from this side. Stated rather than implied away, per ADR-0017.
+#[cfg(not(unix))]
+fn reap_group(_child: &Child) {}
 
 /// Signals the peer's process group, escalating until it exits.
 #[cfg(unix)]
@@ -747,6 +796,12 @@ fn write_messages(
                 break;
             }
         }
+    }
+    // Whatever is still queued will never be written, so it is no longer
+    // "waiting to be written" either. Left counted, the depth a diagnostic reads
+    // would stay permanently non-zero on a connection with nothing in flight.
+    while let Ok(WriterCommand::Write(_)) = commands.try_recv() {
+        counts.outbound_depth.fetch_sub(1, Ordering::Relaxed);
     }
     // Dropping the handle closes the peer's standard input, which is what the
     // first rung of shutdown means and what tells a well-behaved peer to exit.
@@ -1114,6 +1169,58 @@ wait
             std::fs::read(&activity).unwrap(),
             at_teardown,
             "a helper survived the teardown"
+        );
+    }
+
+    /// The case a stubborn peer hides: this one exits *politely* on a closed
+    /// standard input, so teardown never escalates — and the helper it
+    /// backgrounded is still holding the workspace, and the standard-output
+    /// pipe, after the direct child is reaped. The group has to be signalled on
+    /// every rung, not only on the one that reaches `SIGTERM`.
+    #[test]
+    #[cfg(unix)]
+    fn a_helper_outliving_a_polite_peer_is_still_reaped() {
+        let fixture = Fixture::new();
+        let workspace = fixture.directory("polite-helper");
+        let activity = fixture.root.path().join("polite-helper-activity");
+        let peer = fixture.shim(
+            "polite-helper-peer",
+            &format!(
+                r#"#!/bin/sh
+(while true; do printf x >> '{}'; sleep 0.01; done) 2>/dev/null &
+printf '{{"jsonrpc":"2.0","method":"ready"}}\n'
+while IFS= read -r line; do :; done
+exit 0
+"#,
+                activity.display()
+            ),
+        );
+        let transport = connect(&peer, &workspace);
+        assert_eq!(
+            next(&transport).unwrap(),
+            Message::notification("ready", None)
+        );
+        harkness_test_fixtures::wait_for_file(&activity);
+
+        let started = Instant::now();
+        let outcome = transport.shutdown(Duration::from_secs(5));
+
+        assert_eq!(
+            outcome.rung,
+            ShutdownRung::ClosedStdin,
+            "the peer itself left politely"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "teardown waited {:?}, so the helper was still holding the pipe",
+            started.elapsed()
+        );
+        let at_teardown = std::fs::read(&activity).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            std::fs::read(&activity).unwrap(),
+            at_teardown,
+            "a helper survived a peer that exited politely"
         );
     }
 

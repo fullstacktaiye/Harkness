@@ -37,7 +37,6 @@ use std::{
         Condvar, Mutex,
         atomic::{AtomicI64, Ordering},
     },
-    thread,
     time::{Duration, Instant},
 };
 
@@ -61,11 +60,21 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Peer-initiated messages held for an adapter that has not taken them yet.
 ///
-/// Bounded, like everything else a peer controls the size of. An adapter that
-/// stops consuming peer messages will eventually see its own requests time out
-/// rather than watch this grow — a peer streaming updates into a consumer that
-/// went away is a bug to surface, not memory to spend.
-const PEER_CAPACITY: usize = 1024;
+/// Bounded, like everything else a peer controls the size of, and generous
+/// enough for one streamed agent turn: a `session/prompt` that reports its work
+/// as it goes emits updates in the hundreds, and a bound an ordinary turn
+/// crossed would make [`TransportError::PeerQueueFull`] a routine event rather
+/// than a diagnosis.
+const PEER_CAPACITY: usize = 4096;
+
+/// Request ids remembered after their caller is finished with them.
+///
+/// A retired id is what tells a *late* answer — to a request whose caller gave
+/// up — apart from an answer to a request that was never sent. Bounded, because
+/// the alternative is a table that grows for the life of a long-lived server
+/// connection; an answer arriving after its id has been evicted reads as an
+/// unknown id, which is the same conclusion reached a little later.
+const RETAINED_REQUEST_IDS: usize = 1024;
 
 /// A peer-initiated message, which no correlation table can answer.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,10 +103,54 @@ pub struct Connection {
 
 #[derive(Default)]
 struct Pending {
-    slots: HashMap<RequestId, Option<Result<Value, PeerError>>>,
+    slots: HashMap<RequestId, Slot>,
+    /// Retirement order, so the retained ids stay bounded. An entry may name a
+    /// slot that is already gone; eviction tolerates that rather than paying a
+    /// linear removal to keep the two exactly in step.
+    retired: VecDeque<RequestId>,
     /// Set once the conversation ends, so a caller waiting on a slot that will
     /// never be filled is told why rather than waiting out its deadline.
     terminal: Option<TerminalFault>,
+}
+
+/// What is known about one request this connection sent.
+#[derive(Clone)]
+enum Slot {
+    /// Sent, unanswered, with a caller waiting on it.
+    Waiting,
+    /// Answered, and the answer not yet collected.
+    Answered(Result<Value, PeerError>),
+    /// The caller is gone — it collected its answer, or it gave up waiting.
+    ///
+    /// Kept rather than removed, and that is the difference between a connection
+    /// that survives a slow peer and one that does not. A request that passed
+    /// its deadline may still be answered; if its id were forgotten, that
+    /// perfectly correct late answer would read as a response to a request
+    /// nobody sent and quarantine a live session over a deadline *this* side
+    /// chose. `answered` records whether the one permitted answer has arrived,
+    /// so a genuine second answer is still a duplicate.
+    Retired { answered: bool },
+}
+
+impl Pending {
+    /// Requests that have been sent and whose caller is still waiting.
+    fn outstanding(&self) -> usize {
+        self.slots
+            .values()
+            .filter(|slot| !matches!(slot, Slot::Retired { .. }))
+            .count()
+    }
+
+    /// Marks `id` finished with, keeping it recognizable for a bounded while.
+    fn retire(&mut self, id: &RequestId, answered: bool) {
+        self.slots.insert(id.clone(), Slot::Retired { answered });
+        self.retired.push_back(id.clone());
+        while self.retired.len() > RETAINED_REQUEST_IDS {
+            if let Some(evicted) = self.retired.pop_front() {
+                self.slots.remove(&evicted);
+            }
+        }
+    }
 }
 
 /// Why the conversation ended, remembered for the callers who arrive after.
@@ -204,44 +257,46 @@ impl Connection {
             if let Some(fault) = pending.terminal.clone() {
                 return Err(fault.error(false));
             }
-            pending.slots.insert(id.clone(), None);
+            pending.slots.insert(id.clone(), Slot::Waiting);
         }
 
         if let Err(error) = self
             .transport
             .send(Message::request(id.clone(), method, params))
         {
-            self.forget(&id);
+            self.retire(&id, false);
             return Err(error);
         }
 
         loop {
             {
                 let mut pending = self.pending.lock().expect("pending table is not poisoned");
-                if let Some(Some(answer)) = pending.slots.get(&id).cloned() {
-                    pending.slots.remove(&id);
+                if let Some(Slot::Answered(answer)) = pending.slots.get(&id).cloned() {
+                    pending.retire(&id, true);
                     return Ok(answer);
                 }
                 if let Some(fault) = pending.terminal.clone() {
-                    pending.slots.remove(&id);
+                    pending.retire(&id, false);
                     return Err(fault.error(true));
                 }
             }
             if self.cancel.is_cancelled() {
-                self.forget(&id);
+                self.retire(&id, false);
                 self.give_up(&TransportError::Cancelled);
                 return Err(TransportError::Cancelled);
             }
             if Instant::now() >= deadline {
-                // The slot goes even though the peer may still answer. A late
-                // answer to a request nobody is waiting for is an unknown
-                // response id, which is a desynchronization the adapter should
-                // hear about — not a value delivered to whoever asks next.
-                self.forget(&id);
+                // Retired rather than forgotten. The peer may still answer, and
+                // it did nothing wrong — this side chose the deadline — so its
+                // late answer is dropped quietly instead of reading as a
+                // response to a request nobody sent. `request_timed_out` claims
+                // the connection is still healthy, and this is what makes that
+                // claim true.
+                self.retire(&id, false);
                 return Err(TransportError::RequestTimedOut { id });
             }
             if let Err(error) = self.pump_once(deadline, &self.answered, &self.pending) {
-                self.forget(&id);
+                self.retire(&id, false);
                 // This caller had a request outstanding, which the transport
                 // could not know when it called the exit idle.
                 return Err(match error {
@@ -304,7 +359,7 @@ impl Connection {
             {
                 let pending = self.pending.lock().expect("pending table is not poisoned");
                 if let Some(fault) = pending.terminal.clone() {
-                    let had_outstanding = !pending.slots.is_empty();
+                    let had_outstanding = pending.outstanding() > 0;
                     drop(pending);
                     return Err(fault.error(had_outstanding));
                 }
@@ -328,8 +383,7 @@ impl Connection {
             .pending
             .lock()
             .expect("pending table is not poisoned")
-            .slots
-            .len();
+            .outstanding();
         counters.peer_depth = self.peers.lock().expect("peer queue is not poisoned").len();
         counters
     }
@@ -361,16 +415,19 @@ impl Connection {
             return Ok(());
         };
 
-        // Backpressure, and the reason nothing is ever discarded here: when the
-        // peer queue is full the pump simply stops reading. The message stays in
-        // the transport's own bounded queue, which carries the stall to the
-        // peer's pipe. The cost is that an adapter which stops draining peer
-        // messages will see its own requests time out — which is the bug being
-        // surfaced, and a great deal better than a session update that silently
-        // did not happen.
+        // Nothing is ever discarded here: when the peer queue is full the pump
+        // stops reading, the message stays in the transport's own bounded queue,
+        // and the stall reaches the peer's own pipe. But a caller waiting for a
+        // *response* cannot wait that out — in-order delivery puts its answer
+        // behind the unread messages, and it is the only pump — so it is told by
+        // name rather than left to time out on a stall it could not diagnose.
+        // No implementation escapes the underlying choice: one ordered stream,
+        // an application queue with a bound, and an answer behind unconsumed
+        // messages leaves grow, discard, and fail as the whole of it.
         if self.peers.lock().expect("peer queue is not poisoned").len() >= PEER_CAPACITY {
-            thread::sleep(slice);
-            return Ok(());
+            return Err(TransportError::PeerQueueFull {
+                capacity: PEER_CAPACITY,
+            });
         }
 
         match self.transport.recv_deadline(Instant::now() + slice) {
@@ -395,16 +452,26 @@ impl Connection {
 
         let mut pending = self.pending.lock().expect("pending table is not poisoned");
         let desync = match pending.slots.get_mut(&response.id) {
-            Some(slot) if slot.is_none() => {
-                *slot = Some(response.outcome);
+            Some(slot @ Slot::Waiting) => {
+                *slot = Slot::Answered(response.outcome);
                 drop(pending);
                 self.answered.notify_all();
                 return Ok(());
             }
-            // Answering twice is not a retry: the first answer has already been
-            // taken as the truth about that call, so the stream's position is no
+            // A late answer to a request whose caller gave up. The peer did
+            // nothing wrong, so it is dropped quietly, and the id stays retired
+            // so a *second* answer is still the duplicate it would be for any
+            // other request.
+            Some(slot @ Slot::Retired { answered: false }) => {
+                *slot = Slot::Retired { answered: true };
+                return Ok(());
+            }
+            // Answering twice is not a retry: one answer has already been taken
+            // as the truth about that call, so the stream's position is no
             // longer known and there is nothing to resynchronize to.
-            Some(_) => DesyncDetail::DuplicateResponseId { id: response.id },
+            Some(Slot::Answered(_) | Slot::Retired { answered: true }) => {
+                DesyncDetail::DuplicateResponseId { id: response.id }
+            }
             None => DesyncDetail::UnknownResponseId { id: response.id },
         };
         drop(pending);
@@ -449,13 +516,12 @@ impl Connection {
         self.remember(error);
     }
 
-    /// Drops a reply slot whose caller has stopped waiting.
-    fn forget(&self, id: &RequestId) {
+    /// Marks a request whose caller has stopped waiting.
+    fn retire(&self, id: &RequestId, answered: bool) {
         self.pending
             .lock()
             .expect("pending table is not poisoned")
-            .slots
-            .remove(id);
+            .retire(id, answered);
     }
 }
 
@@ -671,9 +737,10 @@ mod tests {
             .next_peer_message(Instant::now() + Duration::from_millis(200))
             .unwrap_err();
 
-        // The second answer arrives for a slot that has been taken, which is the
-        // duplicate case; an id that was never issued is the unknown one. Both
-        // leave the stream at an unknown position.
+        // The second answer arrives for an id that has been retired *answered*,
+        // which is the duplicate case; an id that was never issued is the
+        // unknown one. Both leave the stream at an unknown position. Retiring
+        // rather than forgetting is what keeps this distinction available.
         assert_eq!(error.kind(), "desynchronized");
     }
 
@@ -896,22 +963,23 @@ mod tests {
     }
 
     /// The bound on the peer queue is enforced by *not reading*, so a peer that
-    /// outruns its consumer stalls rather than losing an update. Nothing above
-    /// the bound is discarded, and what has been taken is still in order.
+    /// outruns its consumer stalls rather than losing an update — and a request
+    /// stuck behind that stall is told exactly what happened rather than left to
+    /// discover it when its deadline runs out. Nothing above the bound is
+    /// discarded, and what was taken is still in order.
     #[test]
-    fn an_unconsumed_peer_stream_stalls_rather_than_dropping_messages() {
+    fn an_unconsumed_peer_stream_names_itself_rather_than_dropping_messages() {
         let scripted = (0..super::PEER_CAPACITY * 2)
             .map(|n| Ok(Message::notification("tick", Some(json!({ "n": n })))))
             .collect::<Vec<_>>();
         let (transport, _recorded) = ScriptedTransport::with(scripted);
         let connection = Connection::new(transport, Cancellation::default());
 
-        // Nobody is draining peer messages, so the only pump is this request —
-        // which fills the queue, stops reading, and then runs out of time.
-        let error = connection
-            .request("slow", None, Instant::now() + Duration::from_millis(500))
-            .unwrap_err();
-        assert!(matches!(error, TransportError::RequestTimedOut { .. }));
+        // Nobody is draining peer messages, so the only pump is this request,
+        // whose own answer is behind everything it is queueing.
+        let error = connection.request("slow", None, soon()).unwrap_err();
+        assert_eq!(error.kind(), "peer_queue_full");
+        assert!(!error.is_terminal(), "draining fixes it");
 
         let depth = connection.counters().peer_depth;
         assert!(
@@ -932,6 +1000,75 @@ mod tests {
                 "an update was lost or reordered"
             );
         }
+
+        // Consuming the rest empties both the queue and the script, and the
+        // connection is still there to be used: this is a diagnosis, not a
+        // death.
+        while connection
+            .next_peer_message(Instant::now() + Duration::from_millis(50))
+            .unwrap()
+            .is_some()
+        {}
+        assert_eq!(
+            connection
+                .request("after", None, Instant::now() + Duration::from_millis(100))
+                .unwrap_err()
+                .kind(),
+            "request_timed_out",
+            "the script is exhausted, but the connection is alive"
+        );
+    }
+
+    /// A peer answering after its caller gave up is a peer behaving correctly —
+    /// this side chose the deadline. Quarantining the connection over it would
+    /// make `request_timed_out` terminal in practice while claiming not to be,
+    /// and would kill a live agent session over one slow call.
+    #[test]
+    fn a_late_answer_to_an_abandoned_request_does_not_poison_the_connection() {
+        let (transport, _recorded) = ScriptedTransport::with(vec![
+            // Nothing for the first request within its deadline, then its answer
+            // arrives while the second request is the one waiting.
+            Ok(Message::result(RequestId::Number(1), json!({"late": true}))),
+            Ok(Message::result(RequestId::Number(2), json!({"ok": true}))),
+        ]);
+        let connection = Connection::new(transport, Cancellation::default());
+
+        // A deadline in the past, so the request gives up without ever pumping.
+        let timed_out = connection
+            .request("first", None, Instant::now())
+            .unwrap_err();
+        assert!(matches!(timed_out, TransportError::RequestTimedOut { .. }));
+        assert!(!timed_out.is_terminal());
+
+        assert_eq!(
+            connection.request("second", None, soon()).unwrap(),
+            Ok(json!({"ok": true})),
+            "the abandoned request's late answer was discarded, not quarantined"
+        );
+    }
+
+    /// The retained ids are bounded, so a connection whose caller times out
+    /// forever does not accumulate a table for the life of the process.
+    #[test]
+    fn retired_request_ids_stay_bounded() {
+        let (transport, _recorded) = ScriptedTransport::with(Vec::new());
+        let connection = Connection::new(transport, Cancellation::default());
+
+        for _ in 0..super::RETAINED_REQUEST_IDS + 64 {
+            let error = connection
+                .request("gone", None, Instant::now())
+                .unwrap_err();
+            assert!(matches!(error, TransportError::RequestTimedOut { .. }));
+        }
+
+        let pending = connection.pending.lock().unwrap();
+        assert_eq!(pending.outstanding(), 0);
+        assert!(
+            pending.slots.len() <= super::RETAINED_REQUEST_IDS,
+            "{} ids retained, past the {} bound",
+            pending.slots.len(),
+            super::RETAINED_REQUEST_IDS
+        );
     }
 
     /// The two layers over a real child, which is the only thing that proves

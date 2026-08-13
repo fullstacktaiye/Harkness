@@ -42,33 +42,45 @@ impl LineSplitter {
     /// Returns [`TransportError::MessageTooLarge`] as soon as the pending line
     /// crosses the bound. The splitter keeps nothing after that: the connection
     /// is quarantined, so there is no next line to read.
+    /// Copied a run at a time rather than a byte at a time: the limit is
+    /// megabytes, and a per-byte bound check would run millions of iterations
+    /// for one legitimate large message. The bound is still exact, because a run
+    /// is appended only after checking that it fits.
     pub(crate) fn feed(
         &mut self,
-        chunk: &[u8],
+        mut chunk: &[u8],
         on_line: &mut impl FnMut(&[u8]),
     ) -> Result<(), TransportError> {
-        for &byte in chunk {
-            if byte == b'\n' {
-                let end = match self.pending.last() {
-                    Some(b'\r') => self.pending.len() - 1,
-                    _ => self.pending.len(),
-                };
-                if end > 0 {
-                    on_line(&self.pending[..end]);
-                }
-                self.pending.clear();
-                continue;
+        while let Some(offset) = chunk.iter().position(|&byte| byte == b'\n') {
+            self.extend(&chunk[..offset])?;
+            let end = match self.pending.last() {
+                Some(b'\r') => self.pending.len() - 1,
+                _ => self.pending.len(),
+            };
+            if end > 0 {
+                on_line(&self.pending[..end]);
             }
-            self.pending.push(byte);
-            if self.pending.len() > self.limit {
-                let bytes = self.pending.len();
-                self.pending = Vec::new();
-                return Err(TransportError::MessageTooLarge {
-                    bytes,
-                    limit: self.limit,
-                });
-            }
+            self.pending.clear();
+            chunk = &chunk[offset + 1..];
         }
+        self.extend(chunk)
+    }
+
+    /// Appends `run` to the pending line, or refuses the line for exceeding the
+    /// bound and keeps none of it.
+    fn extend(&mut self, run: &[u8]) -> Result<(), TransportError> {
+        if self.pending.len() + run.len() > self.limit {
+            // Reported as the first size that breached the bound rather than as
+            // the whole run, so the number describes where reading stopped
+            // rather than how much happened to arrive in one read.
+            let bytes = self.limit + 1;
+            self.pending = Vec::new();
+            return Err(TransportError::MessageTooLarge {
+                bytes,
+                limit: self.limit,
+            });
+        }
+        self.pending.extend_from_slice(run);
         Ok(())
     }
 

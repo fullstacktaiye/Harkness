@@ -119,6 +119,28 @@ pub enum TransportError {
         id: RequestId,
     },
 
+    /// A request cannot be answered because unread peer messages are ahead of
+    /// its response and nothing is draining them.
+    ///
+    /// The engine delivers one ordered stream, so a response sitting behind
+    /// `capacity` unconsumed peer-initiated messages cannot arrive until they
+    /// are taken. Nothing is discarded to make room and the queue does not grow,
+    /// which leaves saying so: an adapter that streams updates has to consume
+    /// them — a thread calling
+    /// [`next_peer_message`](crate::Connection::next_peer_message), or turns
+    /// that interleave the two — and this names that omission rather than
+    /// letting the request time out on a stall it could not have diagnosed.
+    ///
+    /// Not terminal. The connection resumes the moment somebody drains.
+    #[error(
+        "{capacity} peer messages are waiting unread, so a response cannot be \
+         reached; drain them with next_peer_message"
+    )]
+    PeerQueueFull {
+        /// The bound that was reached.
+        capacity: usize,
+    },
+
     /// The connection was quarantined by an earlier fault and does no further
     /// I/O.
     ///
@@ -149,6 +171,7 @@ impl TransportError {
         "cancelled",
         "write_failed",
         "request_timed_out",
+        "peer_queue_full",
         "quarantined",
     ];
 
@@ -166,22 +189,29 @@ impl TransportError {
             Self::Cancelled => "cancelled",
             Self::WriteFailed { .. } => "write_failed",
             Self::RequestTimedOut { .. } => "request_timed_out",
+            Self::PeerQueueFull { .. } => "peer_queue_full",
             Self::Quarantined { .. } => "quarantined",
         }
     }
 
     /// Whether this failure is terminal for the connection that raised it.
     ///
-    /// Every kind here is terminal except the two that describe one *call*:
-    /// a request that ran out of time and a message that could not be framed
-    /// both leave a healthy connection behind, and an adapter that tore one down
-    /// for a slow answer would restart an agent mid-session over a timeout it
-    /// chose.
+    /// Every kind here is terminal except the three that describe one *call*: a
+    /// request that ran out of time, a message that could not be framed, and a
+    /// response that unread peer messages are sitting in front of. All three
+    /// leave a working connection behind, and an adapter that tore one down for
+    /// a slow answer would restart an agent mid-session over a timeout it chose.
+    ///
+    /// The engine holds up its end of that claim rather than merely asserting
+    /// it: a request that gives up keeps its id retired, so the peer's later
+    /// answer is discarded instead of quarantining the connection it arrives on.
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         !matches!(
             self,
-            Self::RequestTimedOut { .. } | Self::UnencodableMessage { .. }
+            Self::RequestTimedOut { .. }
+                | Self::UnencodableMessage { .. }
+                | Self::PeerQueueFull { .. }
         )
     }
 }
@@ -380,6 +410,10 @@ mod tests {
                 "request_timed_out",
             ),
             (
+                TransportError::PeerQueueFull { capacity: 4096 },
+                "peer_queue_full",
+            ),
+            (
                 TransportError::Quarantined {
                     fault_kind: "desynchronized",
                     detail: "fixture".to_owned(),
@@ -464,6 +498,7 @@ mod tests {
             }
             .is_terminal()
         );
+        assert!(!TransportError::PeerQueueFull { capacity: 4096 }.is_terminal());
         assert!(TransportError::Cancelled.is_terminal());
         assert!(
             TransportError::Disconnected {

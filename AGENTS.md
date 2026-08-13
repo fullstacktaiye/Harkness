@@ -861,18 +861,39 @@ to disturb a working conversation.
 Teardown is `close stdin → wait → SIGTERM → wait → SIGKILL` against the process *group*, it runs on
 `Drop` as well as on `shutdown`, and it is idempotent. Standard input is closed unconditionally and
 before the child's exit is inspected — the writer thread parks on its queue until every sender is
-gone, so a peer that had already exited would otherwise strand a thread teardown then waits on.
-`ShutdownOutcome` records the rung reached, because "this agent had to be killed" is a bug report
-rather than an implementation detail. Windows has no `SIGTERM` and reports `killed` rather than
-claiming an escalation that did not happen.
+gone, so a peer that had already exited would otherwise strand a thread teardown then waits on. The
+group is then killed on **every** rung, not only when the escalation is reached: the direct child
+being gone is not the group being gone, and a peer that backgrounded a helper and exited politely
+leaves that helper on the workspace *and* holding the standard-output pipe, so the reader never sees
+end of file either. Signalling a group whose last member has gone is a harmless `ESRCH`, and a group
+keeps its identifier reserved while any member is alive, so a reaped child's pid cannot have been
+recycled underneath it. `ShutdownOutcome` records the rung reached, because "this agent had to be
+killed" is a bug report rather than an implementation detail. Windows has no `SIGTERM` and reports
+`killed` rather than claiming an escalation that did not happen.
 
 Correlation lives above the transport and disconnect kinds are finished there. The transport reports
 a clean exit as `idle` because it does not know what anybody asked for; `Connection` refines that to
-`exit_before_response` when the caller had a request outstanding. A request that passes its own
-deadline drops its reply slot, so a late answer becomes an unknown response id — a desynchronization
-the adapter hears about — rather than a stale value handed to whoever asks next. Outbound ids are
-allocated and never reused within a connection, which makes a duplicate outbound id unrepresentable
-rather than guarded against.
+`exit_before_response` when the caller had a request outstanding. Outbound ids are allocated and
+never reused within a connection, which makes a duplicate outbound id unrepresentable rather than
+guarded against.
+
+A request that gives up **retires** its id rather than forgetting it, and the two must not be
+confused. A peer answering after this side's deadline passed is a peer behaving correctly — Harkness
+chose the deadline — so that late answer is discarded quietly. Forgetting the id instead would read
+it as a response to a request nobody sent, quarantine the connection, and make `request_timed_out`
+terminal in practice while `is_terminal` says it is not; an adapter trusting that and retrying would
+kill a live agent session over one slow call. A retired id records whether its one permitted answer
+has arrived, so a genuine *second* answer is still `duplicate_response_id`. Retained ids are bounded
+and evicted oldest-first; an answer arriving after eviction reads as an unknown id, which is the same
+conclusion reached later.
+
+The peer-message queue is bounded by the pump **refusing to read**, never by discarding: a dropped
+peer request is one an adapter never answers, and a dropped notification is history that silently did
+not happen. The bound therefore stalls the whole stream, and a caller waiting for a response behind
+unread messages cannot wait that out — one ordered stream, a bounded application queue, and an answer
+behind unconsumed messages leaves grow, discard, and fail as the whole of the choice. It fails, by
+name, as `peer_queue_full`. Do not "fix" that by silently dropping the overflow or by removing the
+bound; an adapter whose peer streams must consume what it sends.
 
 There is deliberately **no dispatcher thread**. Whichever caller is already blocked holds the pump,
 reads in poll-interval slices, routes what it finds, and re-offers it; a caller that is not leading

@@ -68,14 +68,28 @@
 //! # Mapping these failures into a protocol
 //!
 //! An adapter turns a [`TransportError`] into its own vocabulary, and the useful
-//! rule is that only two of them are about one *call*:
-//! [`RequestTimedOut`](TransportError::RequestTimedOut) and
-//! [`UnencodableMessage`](TransportError::UnencodableMessage), which
+//! rule is that only three of them are about one *call* —
+//! [`RequestTimedOut`](TransportError::RequestTimedOut),
+//! [`UnencodableMessage`](TransportError::UnencodableMessage), and
+//! [`PeerQueueFull`](TransportError::PeerQueueFull) — which
 //! [`is_terminal`](TransportError::is_terminal) answers for. Everything else has
 //! ended the conversation, and an adapter that retries over a quarantined
 //! connection is retrying into a stream whose position is unknown. Retry policy
 //! is the adapter's either way: this engine never retries anything, and blindly
 //! retrying a mutating call is forbidden by the milestone's idempotency rules.
+//!
+//! # Consume what the peer sends you
+//!
+//! An adapter whose peer streams — ACP session updates, MCP progress — has to
+//! take those messages off the connection. Peer-initiated messages queue behind
+//! a bound, and the engine will not discard one to make room or grow to hold
+//! it, so a response arriving after `PEER_CAPACITY` unread updates cannot be
+//! reached until they are consumed. That is reported as
+//! [`PeerQueueFull`](TransportError::PeerQueueFull) rather than left to look
+//! like a slow peer. Either run a thread on
+//! [`next_peer_message`](Connection::next_peer_message) — the ACP shape, and the
+//! one that composes with concurrent [`request`](Connection::request) calls — or
+//! interleave the two within a turn.
 //!
 //! [ADR-0012]: https://github.com/fullstacktaiye/harkness/blob/main/docs/adr/0012-stdio-only-protocol-transports.md
 //! [#149]: https://github.com/fullstacktaiye/harkness/issues/149
