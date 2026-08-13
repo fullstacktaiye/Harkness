@@ -759,9 +759,11 @@ constructor must close. A basis carrying *none* of the evidence its kind is reco
 `check` to comparing fields both sides leave empty, so it answers `Valid` for every observation ever
 made. `require_evidence` therefore refuses such a grant at construction and on load: an agent needs
 an executable, an MCP server an executable or endpoint, a tool schema a fingerprint, a recipe a
-content hash, a forge account an endpoint, a forge repository an endpoint naming the *resource* and
-not merely the host, and a workspace a workspace-scoped grant. `regrant` re-checks, so a re-grant is
-not how a record loses the field that made it checkable.
+content hash, and a workspace a workspace-scoped grant. Both forge subjects need an endpoint naming
+the *resource* and not merely the host — an account's login and a repository's path both live there,
+and `check` never compares a display name, so a grant naming only `github.com` would answer `Valid`
+for every other account or repository on it. `regrant` re-checks, so a re-grant is not how a record
+loses the field that made it checkable.
 
 `TrustRecord::check` is pure — no clock, no filesystem, no hashing — and is the only place trust is
 decided. Two basis fields are deliberately not compared, and neither exclusion may be quietly
@@ -786,10 +788,18 @@ without that edge a refusal after drift would leave the record saying only what 
 before anybody was asked — collapsing the very distinction the state machine draws. An invalidation
 reason is required by `Invalidated` and permitted nowhere else, so revoking clears it.
 
-A workspace scope must name an absolute root, checked on the record rather than on
+A workspace scope must name a rooted root, checked on the record rather than on
 `TrustScope::workspace`, because the variant's field is public and a constructor can be routed
 around. A relative root fails closed *silently*: the user is re-prompted forever with
 `WorkspacePathChanged` and never learns why.
+
+Neither that check nor `ExecutableIdentity`'s may use `Path::is_absolute` or `Path::has_root`.
+Both answer for the platform doing the asking, and these are durable records that outlive the
+machine that wrote them: on Unix `C:\agents\agent.exe` is neither absolute nor rooted, and on
+Windows `/usr/local/bin/agent` is rooted but not absolute. Either predicate alone refuses a valid
+record — the committed fixtures first, on the `windows-latest` leg of the `core` matrix job — and
+refuses it with a reason that describes the reader rather than the record. `is_rooted_anywhere`
+recognizes both conventions, which costs nothing because nothing in this module resolves a path.
 
 Identity records carry no secrets — no tokens, no credential material, no `CredentialSource` — and a
 test asserts every serialized record shape is free of fields named like one. Every text field is

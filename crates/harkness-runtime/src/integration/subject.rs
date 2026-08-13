@@ -270,8 +270,17 @@ impl<'de> Deserialize<'de> for Sha256Hash {
 /// installation changed, but ADR-0016 fixes that trust never binds to a mutable
 /// path: an identical binary reached through another path is the same program,
 /// and a different binary at the same path is not.
+///
+/// The path is an observation, not a handle. It is never opened, joined, or
+/// resolved here; anything that needs to *use* a path takes it through
+/// [`PathBoundary`](crate::trust::PathBoundary) instead.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ExecutableIdentity {
+    /// JSON serialization fails when this platform path is not valid UTF-8,
+    /// the same known Unix limitation `AGENTS.md` records for every other
+    /// path-bearing durable field. A grant for an agent installed under a
+    /// non-UTF-8 path is refused by the serializer rather than silently
+    /// recorded against a lossy spelling of somewhere else.
     path: PathBuf,
     sha256: Sha256Hash,
 }
@@ -293,10 +302,10 @@ impl ExecutableIdentity {
         if path.as_os_str().is_empty() {
             return Err(invalid_identity("executable.path", "it cannot be empty"));
         }
-        if !path.is_absolute() {
+        if !is_rooted_anywhere(&path) {
             return Err(invalid_identity(
                 "executable.path",
-                "it must be an absolute path",
+                "it must start from a filesystem root",
             ));
         }
         if path.as_os_str().len() > MAX_EXECUTABLE_PATH_LENGTH {
@@ -651,7 +660,7 @@ impl<'de> Deserialize<'de> for IdentityBasis {
             schema_fingerprint: Option<Sha256Hash>,
             #[serde(default)]
             content_hash: Option<Sha256Hash>,
-            #[serde(default)]
+            #[serde(default, deserialize_with = "deserialize_bounded_capabilities")]
             capabilities: BTreeSet<String>,
             configuration_source: ConfigurationSource,
         }
@@ -681,6 +690,90 @@ impl<'de> Deserialize<'de> for IdentityBasis {
             .declaring(strict.capabilities)
             .map_err(de::Error::custom)
     }
+}
+
+/// Reads the capability list, refusing it the moment it passes its bound.
+///
+/// Deserializing into a `BTreeSet` and checking the length afterwards would
+/// make the refusal correct and its cost unbounded: serde materializes the
+/// whole collection first, so a corrupt or hostile row carrying a million
+/// capability strings allocates all of them before being told no. Streaming the
+/// sequence and stopping at [`MAX_CAPABILITIES`] makes the load path cost what
+/// [`IdentityBasis::declaring`] already costs the construction path.
+fn deserialize_bounded_capabilities<'de, D>(deserializer: D) -> Result<BTreeSet<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedCapabilities;
+
+    impl<'de> de::Visitor<'de> for BoundedCapabilities {
+        type Value = BTreeSet<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_CAPABILITIES} declared capability names"
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            let mut declared = BTreeSet::new();
+            while let Some(capability) = sequence.next_element::<String>()? {
+                validate_text("capabilities", &capability).map_err(de::Error::custom)?;
+                declared.insert(capability);
+                if declared.len() > MAX_CAPABILITIES {
+                    return Err(de::Error::custom(invalid_identity(
+                        "capabilities",
+                        "more capabilities are declared than an identity may carry",
+                    )));
+                }
+            }
+            Ok(declared)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedCapabilities)
+}
+
+/// Whether a path starts from a filesystem root under *either* convention.
+///
+/// `Path::is_absolute` cannot be used here, and neither can `has_root`: both
+/// answer for the platform doing the asking, and this is a durable format that
+/// outlives the machine that wrote it. On Unix, `C:\agents\agent.exe` is
+/// neither absolute nor rooted; on Windows, `/usr/local/bin/agent` is rooted
+/// but not absolute, because Windows also wants a prefix. Either predicate
+/// alone would therefore refuse a perfectly good record — and refuse it with a
+/// reason ("it must be an absolute path") that says nothing about the actual
+/// problem, which is that the reader is on the other platform. The committed
+/// fixtures are the first thing it would refuse.
+///
+/// So the check is what the invariant actually means: the path is not
+/// *relative*. `workspace`, `../workspace`, and `C:workspace` name a different
+/// file from every working directory and are refused everywhere;
+/// `/usr/local/bin/agent`, `C:\agents\agent.exe`, and `\\host\share\agent.exe`
+/// are accepted everywhere. Nothing here resolves a path, so recognizing a
+/// spelling this platform cannot resolve costs nothing and keeps a record
+/// readable where it was not written.
+pub(super) fn is_rooted_anywhere(path: &Path) -> bool {
+    if path.is_absolute() || path.has_root() {
+        return true;
+    }
+    // A Windows prefix, recognized on a platform whose parser does not know
+    // about one. Non-UTF-8 paths reach `to_str` as `None` and fall through to
+    // the refusal, which is the safe direction.
+    let Some(value) = path.to_str() else {
+        return false;
+    };
+    let bytes = value.as_bytes();
+    let unc = value.starts_with(r"\\");
+    let drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\');
+    unc || drive
 }
 
 /// Applies the shared grammar every identity text field is held to.
@@ -716,7 +809,7 @@ fn validate_text(field: &'static str, value: &str) -> Result<(), IntegrationDoma
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigurationSource, EndpointIdentity, ExecutableIdentity, IdentityBasis,
+        ConfigurationSource, EndpointIdentity, ExecutableIdentity, IdentityBasis, MAX_CAPABILITIES,
         MAX_IDENTITY_FIELD_LENGTH, Sha256Hash, SubjectKind,
     };
 
@@ -816,12 +909,91 @@ mod tests {
         }
     }
 
+    /// The spellings accepted here must not depend on which platform is
+    /// asking: these records are durable, and CI runs this crate's tests on
+    /// Linux, macOS *and* Windows against the same committed fixtures.
     #[test]
-    fn an_executable_identity_requires_an_absolute_path() {
-        assert!(ExecutableIdentity::new("/usr/bin/agent", hash("bin")).is_ok());
-        for rejected in ["", "bin/agent", "./agent"] {
+    fn an_executable_identity_requires_a_rooted_path_on_every_platform() {
+        for accepted in [
+            "/usr/bin/agent",
+            r"C:\Program Files\agent.exe",
+            "C:/agents/agent.exe",
+            r"\\host\share\agent.exe",
+        ] {
+            assert!(
+                ExecutableIdentity::new(accepted, hash("bin")).is_ok(),
+                "refused {accepted}"
+            );
+        }
+        for rejected in ["", "bin/agent", "./agent", "../agent", "C:agent"] {
             let error = ExecutableIdentity::new(rejected, hash("bin")).unwrap_err();
-            assert_eq!(error.kind(), "invalid_identity");
+            assert_eq!(error.kind(), "invalid_identity", "accepted {rejected:?}");
+        }
+    }
+
+    #[test]
+    fn the_capability_bound_holds_on_the_deserialization_path_too() {
+        let within = (0..MAX_CAPABILITIES)
+            .map(|index| format!("capability.{index}"))
+            .collect::<Vec<_>>();
+        let json = serde_json::json!({
+            "display_name": "server",
+            "capabilities": within,
+            "configuration_source": "user",
+        });
+        assert!(serde_json::from_value::<IdentityBasis>(json).is_ok());
+
+        let beyond = (0..=MAX_CAPABILITIES)
+            .map(|index| format!("capability.{index}"))
+            .collect::<Vec<_>>();
+        let json = serde_json::json!({
+            "display_name": "server",
+            "capabilities": beyond,
+            "configuration_source": "user",
+        });
+        let message = serde_json::from_value::<IdentityBasis>(json)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("more capabilities are declared"),
+            "unexpected refusal: {message}"
+        );
+    }
+
+    /// Guards `ALL` the way [`super::super::state`] guards its own tables: the
+    /// fixture lists above are compared against `ALL`, which stays green when a
+    /// variant joins neither, while `from_stored` starts answering `None` for a
+    /// spelling this same build writes.
+    #[test]
+    fn every_subject_variant_holds_a_position_in_its_enumeration_table() {
+        assert_eq!(SubjectKind::ALL.len(), 7);
+        for &kind in SubjectKind::ALL {
+            let position = match kind {
+                SubjectKind::AgentExecutable => 0,
+                SubjectKind::McpServer => 1,
+                SubjectKind::McpToolSchema => 2,
+                SubjectKind::Recipe => 3,
+                SubjectKind::ForgeAccount => 4,
+                SubjectKind::ForgeRepository => 5,
+                SubjectKind::Workspace => 6,
+            };
+            assert_eq!(SubjectKind::ALL[position], kind);
+            assert_eq!(SubjectKind::from_stored(kind.as_str()), Some(kind));
+        }
+
+        assert_eq!(ConfigurationSource::ALL.len(), 4);
+        for &source in ConfigurationSource::ALL {
+            let position = match source {
+                ConfigurationSource::Builtin => 0,
+                ConfigurationSource::User => 1,
+                ConfigurationSource::Repository => 2,
+                ConfigurationSource::Imported => 3,
+            };
+            assert_eq!(ConfigurationSource::ALL[position], source);
+            assert_eq!(
+                ConfigurationSource::from_stored(source.as_str()),
+                Some(source)
+            );
         }
     }
 
@@ -931,7 +1103,11 @@ mod tests {
             r#"{"display_name":"a","configuration_source":"user","executable":{"path":"relative","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}}"#,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("must be an absolute path"));
+        assert!(
+            error
+                .to_string()
+                .contains("must start from a filesystem root")
+        );
     }
 
     #[test]

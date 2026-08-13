@@ -7,7 +7,7 @@ use crate::domain::InvalidTransition;
 
 use super::error::{IntegrationDomainError, invalid_record};
 use super::state::{InvalidationReason, TrustCheck, TrustScope, TrustState};
-use super::subject::{IdentityBasis, SubjectKind};
+use super::subject::{IdentityBasis, SubjectKind, is_rooted_anywhere};
 
 /// Record name used by this module's typed errors.
 pub(super) const RECORD: &str = "trust_record";
@@ -354,7 +354,17 @@ fn require_evidence(
             "a tool schema fingerprint",
         ),
         SubjectKind::Recipe => (basis.content_hash().is_some(), "a recipe content hash"),
-        SubjectKind::ForgeAccount => (basis.endpoint().is_some(), "an endpoint"),
+        // Both forge subjects need the resource and not merely the host, for
+        // one reason: an account's login and a repository's path live there,
+        // and `check` never compares a display name. A grant naming only
+        // `github.com` would answer `Valid` for every other account or
+        // repository on it, which is the swap this whole model exists to catch.
+        SubjectKind::ForgeAccount => (
+            basis
+                .endpoint()
+                .is_some_and(|endpoint| endpoint.resource().is_some()),
+            "an endpoint naming the account on its host",
+        ),
         SubjectKind::ForgeRepository => (
             basis
                 .endpoint()
@@ -383,6 +393,11 @@ fn require_evidence(
 /// different directory from every working directory, so a grant carrying one
 /// fails closed *silently* — the user is re-prompted forever with
 /// `WorkspacePathChanged` and never learns why.
+///
+/// Rootedness is decided by [`is_rooted_anywhere`], not by `Path::is_absolute`:
+/// this record is durable and a workspace root written on one platform must
+/// stay readable on another. See that function for why either built-in
+/// predicate alone would refuse the committed fixtures.
 fn validate_scope(scope: &TrustScope) -> Result<(), IntegrationDomainError> {
     let Some(root) = scope.root() else {
         return Ok(());
@@ -393,10 +408,10 @@ fn validate_scope(scope: &TrustScope) -> Result<(), IntegrationDomainError> {
             "a workspace scope cannot name an empty root",
         ));
     }
-    if !root.is_absolute() {
+    if !is_rooted_anywhere(root) {
         return Err(invalid_record(
             RECORD,
-            "a workspace scope must name an absolute root",
+            "a workspace scope must start from a filesystem root",
         ));
     }
     Ok(())
@@ -1182,7 +1197,9 @@ pub(super) mod tests {
                 SubjectKind::ForgeAccount,
                 IdentityBasis::new("octocat", ConfigurationSource::User)
                     .unwrap()
-                    .reached_at(EndpointIdentity::new("github.com", None).unwrap()),
+                    .reached_at(
+                        EndpointIdentity::new("github.com", Some("octocat".to_owned())).unwrap(),
+                    ),
             ),
             (
                 SubjectKind::ForgeRepository,

@@ -475,7 +475,11 @@ mod tests {
         let wire = serde_json::from_value::<TrustRecordWire>(value).unwrap();
         let error = TrustRecord::try_from(wire).unwrap_err();
         assert_eq!(error.kind(), "invalid_integration_record");
-        assert!(error.to_string().contains("must name an absolute root"));
+        assert!(
+            error
+                .to_string()
+                .contains("must start from a filesystem root")
+        );
     }
 
     #[test]
