@@ -24,16 +24,18 @@ use harkness_core::{
     ProjectError, ProjectSelector, ProjectService, ProjectSource, Worktree,
 };
 use harkness_git::{
-    Branch, BranchCheckout, BranchKind, BranchListOptions, Cancellation, CommitInfo, CommitOptions,
-    CommitOutcome, CommitSignature, CreateBranchOptions, DEFAULT_DIFF_CONTEXT_LINES,
-    DEFAULT_MAX_DIFF_FILE_SIZE, DEFAULT_MAX_DIFF_FILES, DEFAULT_MAX_DIFF_TOTAL_BYTES,
+    Branch, BranchCheckout, BranchKind, BranchListOptions, Cancellation, ChangeProvenance,
+    CommitAttribution, CommitInfo, CommitOptions, CommitOutcome, CommitSignature,
+    CreateBranchOptions, DEFAULT_DIFF_CONTEXT_LINES, DEFAULT_MAX_DIFF_FILE_SIZE,
+    DEFAULT_MAX_DIFF_FILES, DEFAULT_MAX_DIFF_TOTAL_BYTES, DEFAULT_MAX_PROVENANCE_COMMITS,
     DetailedStatus, DiffLine, DiffLineKind, DiffOmission, DiffOptions, DiffTarget, FetchOptions,
     FetchOutcome, FileChange, FileContextOmission, FileContextRange, FileContextRequest,
-    FileContextResponse, FileDiff, FileSide, GitError, GitService, GitStatus, HeadState, Hunk,
-    HunkSelection, IntraLineDegradation, LineSelection, LogCursor, LogOptions, LogRange,
-    PendingOperation, PullOptions, PullOutcome, PullStrategy, PushOptions, PushOutcome, RefUpdate,
-    StageOutcome, StagePathResult, StatusEntry, StatusRefreshOutcome, TrackedRestoreSource,
-    UpstreamStatus, Whitespace, WhitespaceMode, WorktreeBase,
+    FileContextResponse, FileDiff, FileProvenance, FileSide, GitError, GitService, GitStatus,
+    HeadState, Hunk, HunkSelection, IntraLineDegradation, LineSelection, LogCursor, LogOptions,
+    LogRange, PendingOperation, Producer, ProvenanceGap, ProvenanceOptions, ProvenanceRange,
+    ProvenanceTruncation, PullOptions, PullOutcome, PullStrategy, PushOptions, PushOutcome,
+    RefUpdate, StageOutcome, StagePathResult, StatusEntry, StatusRefreshOutcome,
+    TrackedRestoreSource, UpstreamStatus, Whitespace, WhitespaceMode, WorktreeBase,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -653,13 +655,29 @@ struct DiffArguments {
             "whitespace",
             "ignore_blank_lines",
             "max_files",
-            "paths"
+            "paths",
+            "provenance",
+            "provenance_max_commits"
         ]
     )]
     context_from: Option<PathBuf>,
     /// Add deterministic paired-line byte ranges and named degradations.
     #[arg(long, visible_alias = "intra-line-ranges")]
     intra_line: bool,
+    /// Attribute each file to the commits in the diff's own range, and name
+    /// the identities those commits record. It is off by default because it
+    /// walks the range, and it is advisory: nothing may act on what it says.
+    #[arg(long)]
+    provenance: bool,
+    /// The most commits one attribution walks before reporting a named
+    /// truncation.
+    #[arg(
+        long,
+        value_name = "COUNT",
+        default_value_t = DEFAULT_MAX_PROVENANCE_COMMITS,
+        requires = "provenance",
+    )]
+    provenance_max_commits: usize,
     /// Largest old or new file whose content is included.
     #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_MAX_DIFF_FILE_SIZE)]
     max_file_size: u64,
@@ -1989,7 +2007,7 @@ fn run_git(
             if cancellation.is_cancelled() {
                 return Err(GitError::Cancelled.into());
             }
-            let projected = diff_values(
+            let mut projected = diff_values(
                 &git,
                 &files,
                 context_mode,
@@ -1998,9 +2016,30 @@ fn run_git(
                 max_total_bytes,
                 cancellation,
             )?;
+            let attribution = if arguments.provenance {
+                let records = resolve_diff_provenance(
+                    &git,
+                    &targets,
+                    &files,
+                    arguments.provenance_max_commits,
+                    cancellation,
+                )?;
+                for (value, entry) in projected
+                    .iter_mut()
+                    .zip(file_provenance_values(&targets, &files, &records))
+                {
+                    value
+                        .as_object_mut()
+                        .expect("a file diff projection is an object")
+                        .insert("provenance".to_owned(), entry);
+                }
+                Some(records)
+            } else {
+                None
+            };
             command_result(
                 json_output,
-                || diff_summary_line(&files, &targets),
+                || diff_summary_line(&files, &targets, attribution.as_deref()),
                 || {
                     Ok(json!({
                         "kind": "git_diff",
@@ -2011,6 +2050,20 @@ fn run_git(
                         // consumer reading the response as a whole does not
                         // have to open a file record to find out.
                         "whitespace": whitespace_value(whitespace),
+                        // Null means attribution was not asked for. An empty
+                        // block means it was asked for and there was none,
+                        // which is a different answer and the common one.
+                        "provenance": attribution.as_ref().map_or(Value::Null, |records| {
+                            json!(
+                                records
+                                    .iter()
+                                    .zip(&targets)
+                                    .map(|(record, target)| change_provenance_value(
+                                        record, target
+                                    ))
+                                    .collect::<Vec<_>>()
+                            )
+                        }),
                         "files": projected,
                     }))
                 },
@@ -3181,12 +3234,210 @@ fn file_diff_value(file: &FileDiff, include_intra_line: bool) -> Value {
         "new_size": file.new_size,
         "binary": file.binary,
         "omission": file.omission.as_ref().map_or(Value::Null, diff_omission_value),
+        // Replaced with this file's attribution when `--provenance` was given.
+        // Null means it was not asked for, never that nothing produced the
+        // file: that answer is a named gap inside the object.
+        "provenance": Value::Null,
         "hunks": file
             .hunks
             .iter()
             .map(|hunk| hunk_value(hunk, include_intra_line))
             .collect::<Vec<_>>(),
     })
+}
+
+/// Attributes one diff response, one record per requested target.
+///
+/// Each target is asked only about the paths its own file records name, so the
+/// walk is bounded by the review in front of the caller rather than by
+/// everything the range touched.
+/// A failed attribution is degraded to a named reason rather than propagated:
+/// the diff beside it already succeeded, and losing it over an advisory
+/// annotation would make provenance authoritative for whether `git diff`
+/// works. A branch force-updated between the diff and this walk is the ordinary
+/// way that happens. Cancellation is the exception and still ends the command,
+/// because a cancelled read is the caller's own decision about all of it.
+fn resolve_diff_provenance(
+    git: &GitService,
+    targets: &[DiffTarget],
+    files: &[FileDiff],
+    max_commits: usize,
+    cancellation: &Cancellation,
+) -> Result<Vec<Result<ChangeProvenance, GitError>>, CliError> {
+    targets
+        .iter()
+        .map(|target| {
+            let mut seen = std::collections::HashSet::new();
+            let mut paths: Vec<PathBuf> = Vec::new();
+            for file in files.iter().filter(|file| file.target == *target) {
+                let Some(path) = file.new_path.as_ref().or(file.old_path.as_ref()) else {
+                    continue;
+                };
+                if seen.insert(path.as_path()) {
+                    paths.push(path.clone());
+                }
+            }
+            let options = ProvenanceOptions::default()
+                .with_paths(paths)
+                .with_max_commits(max_commits);
+            match git.provenance(target, &options, cancellation) {
+                Err(GitError::Cancelled) => Err(CliError::from(GitError::Cancelled)),
+                outcome => Ok(outcome),
+            }
+        })
+        .collect()
+}
+
+/// One attribution entry per file record, in the same order.
+///
+/// The entry indexes into the response's `provenance` array rather than
+/// repeating a commit per file: a forty-file review of one commit carries that
+/// commit once.
+fn file_provenance_values(
+    targets: &[DiffTarget],
+    files: &[FileDiff],
+    records: &[Result<ChangeProvenance, GitError>],
+) -> Vec<Value> {
+    let by_path = records
+        .iter()
+        .map(|record| {
+            record
+                .iter()
+                .flat_map(|record| &record.files)
+                .map(|file| (file.path.as_path(), file))
+                .collect::<std::collections::HashMap<_, _>>()
+        })
+        .collect::<Vec<_>>();
+
+    files
+        .iter()
+        .map(|file| {
+            let Some(index) = targets.iter().position(|target| *target == file.target) else {
+                return Value::Null;
+            };
+            let path = file.new_path.as_deref().or(file.old_path.as_deref());
+            path.and_then(|path| by_path[index].get(path))
+                .map_or(Value::Null, |entry| file_provenance_value(index, entry))
+        })
+        .collect()
+}
+
+fn file_provenance_value(target_index: usize, file: &FileProvenance) -> Value {
+    json!({
+        "target_index": target_index,
+        "commits": file.commits,
+        "producers": file.producers,
+        // Present exactly when `commits` is empty, and it is the answer rather
+        // than the absence of one.
+        "gap": file.gap.map_or(Value::Null, provenance_gap_value),
+    })
+}
+
+/// One target's attribution, or the named reason it has none.
+///
+/// `unavailable` is null on every ordinary answer, so a consumer that ignores it
+/// reads an empty block rather than a wrong one.
+fn change_provenance_value(
+    record: &Result<ChangeProvenance, GitError>,
+    target: &DiffTarget,
+) -> Value {
+    let provenance = match record {
+        Ok(provenance) => provenance,
+        Err(error) => {
+            return json!({
+                "target": diff_target_value(target),
+                "range": Value::Null,
+                "producers": Vec::<Value>::new(),
+                "commits": Vec::<Value>::new(),
+                "walked_commits": 0,
+                "skipped_merges": 0,
+                "truncation": Value::Null,
+                "unavailable": {
+                    "kind": error.kind(),
+                    "message": single_line(&error.to_string()),
+                },
+            });
+        }
+    };
+    json!({
+        "target": diff_target_value(&provenance.target),
+        "range": provenance
+            .range
+            .as_ref()
+            .map_or(Value::Null, provenance_range_value),
+        "producers": provenance
+            .producers
+            .iter()
+            .map(producer_value)
+            .collect::<Vec<_>>(),
+        "commits": provenance
+            .commits
+            .iter()
+            .map(commit_attribution_value)
+            .collect::<Vec<_>>(),
+        "walked_commits": provenance.walked_commits,
+        "skipped_merges": provenance.skipped_merges,
+        "truncation": provenance
+            .truncation
+            .map_or(Value::Null, provenance_truncation_value),
+        "unavailable": Value::Null,
+    })
+}
+
+fn provenance_range_value(range: &ProvenanceRange) -> Value {
+    json!({
+        "head": range.head.to_string(),
+        "base": range.base.map(|id| id.to_string()),
+        "head_revision": range.head_revision,
+        // Null here, and populated by a front end that resolved a branch to an
+        // object id itself and still wants the name read for its conventions.
+        "head_reference": range.head_reference,
+        // Null unless the head reference follows the `agent/<slug>`
+        // convention. It describes the branch, never one commit.
+        "agent_slug": range.agent_slug,
+    })
+}
+
+fn producer_value(producer: &Producer) -> Value {
+    let (name, name_encoding) = encoded_bytes(&producer.name);
+    let (email, email_encoding) = encoded_bytes(&producer.email);
+    json!({
+        "kind": producer.kind.name(),
+        "name": name,
+        "name_encoding": name_encoding,
+        "email": email,
+        "email_encoding": email_encoding,
+    })
+}
+
+fn commit_attribution_value(commit: &CommitAttribution) -> Value {
+    let (summary, summary_encoding) = encoded_bytes(&commit.summary);
+    json!({
+        "id": commit.id.to_string(),
+        "author": commit_signature_value(&commit.author),
+        "committer": commit_signature_value(&commit.committer),
+        "summary": summary,
+        "summary_encoding": summary_encoding,
+        "producers": commit.producers,
+    })
+}
+
+fn provenance_gap_value(gap: ProvenanceGap) -> Value {
+    match gap {
+        ProvenanceGap::CommitBudgetExhausted { limit } => {
+            json!({ "kind": gap.name(), "limit": limit })
+        }
+        _ => json!({ "kind": gap.name() }),
+    }
+}
+
+fn provenance_truncation_value(truncation: ProvenanceTruncation) -> Value {
+    match truncation {
+        ProvenanceTruncation::CommitBudgetExhausted { limit } => {
+            json!({ "kind": truncation.name(), "limit": limit })
+        }
+        _ => json!({ "kind": truncation.name() }),
+    }
 }
 
 /// A path and its lossy flag, both null when the side has no path at all.
@@ -3696,7 +3947,11 @@ fn detailed_status_line(status: &DetailedStatus, include_paths: bool) -> String 
 /// The JSON projection is the contract, but a human running this still needs to
 /// see which paths changed and which of them came back without content; a pair
 /// of totals alone answers no question worth asking.
-fn diff_summary_line(files: &[FileDiff], targets: &[DiffTarget]) -> String {
+fn diff_summary_line(
+    files: &[FileDiff],
+    targets: &[DiffTarget],
+    provenance: Option<&[Result<ChangeProvenance, GitError>]>,
+) -> String {
     let index_targets = targets
         .iter()
         .all(|target| matches!(target, DiffTarget::Staged | DiffTarget::Unstaged));
@@ -3723,13 +3978,75 @@ fn diff_summary_line(files: &[FileDiff], targets: &[DiffTarget]) -> String {
             (None, true) => "\tno content (binary)".to_owned(),
             (None, false) => format!("\t{} hunks", file.hunks.len()),
         };
+        let attribution = provenance.map_or_else(String::new, |records| {
+            format!("\t{}", provenance_summary(targets, records, file))
+        });
         format!(
-            "{}\t{}\t{path}{content}",
+            "{}\t{}\t{path}{content}{attribution}",
             diff_target_name(&file.target),
             file_change_name(file.change),
         )
     }));
     lines.join("\n")
+}
+
+/// One file's attribution as a single column.
+///
+/// Producer names come out of commit objects, which is repository content and
+/// therefore untrusted text: every one goes through [`single_line`] so a name
+/// carrying a tab or a newline cannot forge a column in this table. An
+/// unattributed file says so by name and is never left blank.
+fn provenance_summary(
+    targets: &[DiffTarget],
+    records: &[Result<ChangeProvenance, GitError>],
+    file: &FileDiff,
+) -> String {
+    let Some(index) = targets.iter().position(|target| *target == file.target) else {
+        return "unknown".to_owned();
+    };
+    let Ok(record) = &records[index] else {
+        return "unknown (unavailable)".to_owned();
+    };
+    let path = file.new_path.as_deref().or(file.old_path.as_deref());
+    let Some(entry) = path.and_then(|path| {
+        record
+            .files
+            .iter()
+            .find(|candidate| candidate.path.as_path() == path)
+    }) else {
+        return "unknown".to_owned();
+    };
+    if !entry.is_attributed() {
+        return format!(
+            "unknown ({})",
+            entry.gap.map_or("unknown", ProvenanceGap::name)
+        );
+    }
+    let names = entry
+        .producers
+        .iter()
+        .map(|producer| producer_display_name(&record.producers[*producer]))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{} commit{} by {names}",
+        entry.commits.len(),
+        if entry.commits.len() == 1 { "" } else { "s" },
+    )
+}
+
+/// What to call one producer in the human table.
+///
+/// A `Co-Authored-By` trailer may carry an address and no name, which would
+/// otherwise print as a dangling separator between two commas. Both halves go
+/// through [`single_line`] because both are repository content.
+fn producer_display_name(producer: &Producer) -> String {
+    let name = single_line(&String::from_utf8_lossy(&producer.name));
+    if name.is_empty() {
+        single_line(&String::from_utf8_lossy(&producer.email))
+    } else {
+        name
+    }
 }
 
 fn log_page_line(commits: &[CommitInfo], has_more: bool) -> String {
@@ -4933,10 +5250,43 @@ mod tests {
         EXIT_CONFLICT, EXIT_NOT_FOUND, EXIT_OPERATION_FAILED, EXIT_REFUSED, EXIT_USAGE,
         EditorError, GIT_KIND_EXIT_CODES, GitError, HunkSelection, LineSelection,
         PROJECT_KIND_EXIT_CODES, Project, ProjectError, RefusalKind, Whitespace, WhitespaceMode,
-        distinct_hunk_selection_count, distinct_line_selection_counts, editor_exit_code,
-        git_error_details, git_exit_code, parse_line_selection_document, parse_selection_document,
-        project_exit_code, project_value, requested_json, single_line,
+        change_provenance_value, distinct_hunk_selection_count, distinct_line_selection_counts,
+        editor_exit_code, git_error_details, git_exit_code, parse_line_selection_document,
+        parse_selection_document, project_exit_code, project_value, requested_json, single_line,
     };
+
+    /// Attribution is advisory: a walk that could not be made degrades to a
+    /// named reason inside the block, so the diff beside it still reaches the
+    /// caller. A consumer distinguishes that from an ordinary empty answer by
+    /// `unavailable` rather than by counting what is missing.
+    #[test]
+    fn an_attribution_that_failed_degrades_to_a_named_block() {
+        let target = super::DiffTarget::BranchAgainstBase {
+            branch: "agent/demo".to_owned(),
+            base_branch: "main".to_owned(),
+        };
+        let value = change_provenance_value(
+            &Err(GitError::RevisionNotFound {
+                revision: "agent/demo".to_owned(),
+            }),
+            &target,
+        );
+
+        assert_eq!(value["target"]["kind"], "branch_against_base");
+        assert_eq!(value["unavailable"]["kind"], "revision_not_found");
+        assert!(
+            value["unavailable"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("agent/demo")
+        );
+        // Nothing is claimed about a range that was never walked.
+        assert_eq!(value["range"], serde_json::Value::Null);
+        assert_eq!(value["commits"].as_array().unwrap().len(), 0);
+        assert_eq!(value["producers"].as_array().unwrap().len(), 0);
+        assert_eq!(value["walked_commits"], 0);
+        assert_eq!(value["truncation"], serde_json::Value::Null);
+    }
 
     #[test]
     fn guardrail_and_operation_failures_have_distinct_exit_codes() {

@@ -37,6 +37,7 @@ wins as the instruction and the ADR supplies the rationale.
 | [0016](0016-per-subject-trust-records.md) | Trust is a per-subject record bound to an identity, never a boolean | Accepted |
 | [0017](0017-honest-observability-activity-classes.md) | Every activity carries an evidence class, and a claim is never shown as a fact | Accepted |
 | [0018](0018-pinned-github-rest-api.md) | Pin `X-GitHub-Api-Version: 2026-03-10`, authenticate with a fine-grained PAT | Accepted |
+| [0019](0019-change-provenance-is-derived-from-git.md) | Change provenance is derived from Git, behind a read interface a recorded source can join | Accepted |
 
 This index is the ordering authority. If two ADRs conflict, the conflict is
 resolved before either merges; a lower number does not automatically win.

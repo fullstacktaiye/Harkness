@@ -109,6 +109,11 @@ translating between two cancellation mechanisms.
   knowledge of the project catalog, which is the mechanism that makes the lock ordering below
   impossible to violate from inside it. `GitService` is the single entry point;
   `harkness-core` re-exports the crate so front ends need only one dependency.
+  `provenance.rs` answers "what produced this file" beside `diff.rs`'s "what changed": one walk of
+  the range a `DiffTarget` implies, each commit compared with its first parent once, every
+  requested path reported whether or not anything could be attributed to it. It persists nothing
+  and decides nothing — ADR-0019 fixes both, and a recorded run source joins behind the same
+  interface above `harkness-runtime` rather than beside it.
 - **`harkness-core`** owns the project catalog (`projects.json` + `projects.lock`), the data
   directory layout, and cross-domain workflows (import, clone, worktree lifecycle, reconcile).
   `project.rs` is ~7k lines and holds `ProjectService`, the composition point for catalog + Git.
