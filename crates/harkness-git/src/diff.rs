@@ -6,6 +6,14 @@
 //! pairs into the same bounded file, hunk and line projection. This module
 //! deliberately uses libgit2 only. A diff is local, read-only inspection and
 //! must neither acquire the repository lock nor spawn system Git.
+//!
+//! [`DiffOptions::whitespace`] is the one setting here that changes what a
+//! result *means* rather than how much of it is returned. Anything other than
+//! [`Whitespace::EXACT`] omits lines that genuinely differ on disk, so the
+//! result is a view and nothing more: [`FileDiff::exact`] is the only route to
+//! the token [`super::HunkSelection::new`] accepts, and every recomputation
+//! [`super::hunk`] performs while holding the repository lock goes through
+//! [`DiffOptions::unbounded`], which is exact by construction.
 
 use std::{
     ffi::OsStr,
@@ -83,6 +91,140 @@ pub enum DiffTarget {
     BranchAgainstBase { branch: String, base_branch: String },
 }
 
+/// How a comparison treats differences that are only whitespace.
+///
+/// The four libgit2 flags are collapsed into one ordered setting because the
+/// combinations they can express are mostly meaningless: "ignore all whitespace
+/// but not at end of line" is not a thing a reviewer wants, and offering it
+/// invites a caller to construct it. Each variant is strictly weaker than the
+/// one below it, so a caller picks a point on one axis instead of a bit vector.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum WhitespaceMode {
+    /// Compare bytes. Every whitespace difference is a change.
+    #[default]
+    Exact,
+    /// Ignore whitespace at end of line, which is what a CRLF-to-LF pass
+    /// changes.
+    IgnoreEol,
+    /// Ignore changes in the amount of whitespace, so a re-indent or a
+    /// tab-to-spaces pass disappears while adding or removing whitespace
+    /// entirely still counts.
+    IgnoreChange,
+    /// Ignore whitespace everywhere, including whitespace added to or removed
+    /// from an otherwise unchanged line.
+    IgnoreAll,
+}
+
+impl WhitespaceMode {
+    /// The stable wire spelling, shared by the CLI envelope and its flags.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::IgnoreEol => "ignore_eol",
+            Self::IgnoreChange => "ignore_change",
+            Self::IgnoreAll => "ignore_all",
+            #[expect(
+                unreachable_patterns,
+                reason = "the enum is non-exhaustive for callers, not for this crate"
+            )]
+            _ => "unknown",
+        }
+    }
+}
+
+/// The complete whitespace treatment one diff was computed under.
+///
+/// [`WhitespaceMode`] and [`Self::ignore_blank_lines`] are separate because they
+/// are separate questions: blank-line suppression drops whole lines from the
+/// comparison rather than relaxing how surviving lines are compared, and it is
+/// meaningful alongside every mode including [`WhitespaceMode::Exact`].
+///
+/// The pair is one value rather than two loose fields so that the question
+/// staging actually asks — "does this diff describe the bytes on disk?" — has
+/// one answer, [`Self::is_exact`], that cannot go stale when a setting is added.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Whitespace {
+    /// How surviving lines are compared.
+    pub mode: WhitespaceMode,
+    /// Whether lines that are blank on both sides take part in the comparison.
+    pub ignore_blank_lines: bool,
+}
+
+impl Whitespace {
+    /// Byte-exact comparison: the only handling a diff can be applied from.
+    pub const EXACT: Self = Self {
+        mode: WhitespaceMode::Exact,
+        ignore_blank_lines: false,
+    };
+
+    /// The given mode, with blank lines still taking part in the comparison.
+    #[must_use]
+    pub const fn new(mode: WhitespaceMode) -> Self {
+        Self {
+            mode,
+            ignore_blank_lines: false,
+        }
+    }
+
+    /// Whether every difference on disk appears in the resulting hunks.
+    ///
+    /// This is the one question that decides whether a diff may feed a staging,
+    /// unstaging or discard selection. Anything else omits lines that genuinely
+    /// differ, so a patch rendered from it would not describe the file.
+    #[must_use]
+    pub const fn is_exact(self) -> bool {
+        matches!(self.mode, WhitespaceMode::Exact) && !self.ignore_blank_lines
+    }
+}
+
+impl std::fmt::Display for Whitespace {
+    /// Names every setting that is not at its exact default, so a refusal can
+    /// tell a caller which one to change.
+    ///
+    /// Blank-line suppression is spelled out rather than folded into the mode
+    /// because it is reachable with the mode already at `exact`: a message that
+    /// only named the mode there would be telling a caller to change something
+    /// that is not the problem.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.mode.name())?;
+        if self.ignore_blank_lines {
+            formatter.write_str(" with blank lines ignored")?;
+        }
+        Ok(())
+    }
+}
+
+/// A [`FileDiff`] that is known to describe the bytes on both sides.
+///
+/// This is a capability rather than a wrapper with behaviour: it is the only
+/// thing [`super::HunkSelection::new`] and [`super::LineSelection::new`] accept,
+/// and [`FileDiff::exact`] is the only way to obtain one. Passing a
+/// whitespace-insensitive record to either constructor is therefore a
+/// compile-time error rather than a wrong-bytes apply discovered later.
+///
+/// It derefs to the record it wraps, so a caller that has one still reads every
+/// field normally.
+#[derive(Clone, Copy, Debug)]
+pub struct ExactFileDiff<'file>(&'file FileDiff);
+
+impl<'file> ExactFileDiff<'file> {
+    /// The underlying record, whose whitespace handling is known exact.
+    #[must_use]
+    pub const fn get(self) -> &'file FileDiff {
+        self.0
+    }
+}
+
+impl std::ops::Deref for ExactFileDiff<'_> {
+    type Target = FileDiff;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
+}
+
 /// Bounds and optional path selection for one diff.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -99,6 +241,11 @@ pub struct DiffOptions {
     pub max_files: usize,
     /// The number of unchanged lines surrounding each hunk.
     pub context_lines: u32,
+    /// How whitespace-only differences are treated.
+    ///
+    /// Defaults to [`Whitespace::EXACT`], which produces exactly the model this
+    /// option was added to: anything else is opt-in and view-only.
+    pub whitespace: Whitespace,
     /// Whether paired deletion/addition lines carry intra-line byte ranges.
     /// Disabled by default so existing consumers receive the original hunk
     /// projection unchanged.
@@ -114,6 +261,7 @@ impl Default for DiffOptions {
             max_total_bytes: DEFAULT_MAX_DIFF_TOTAL_BYTES,
             max_files: DEFAULT_MAX_DIFF_FILES,
             context_lines: DEFAULT_DIFF_CONTEXT_LINES,
+            whitespace: Whitespace::EXACT,
             include_intra_line_ranges: false,
             paths: Vec::new(),
         }
@@ -126,6 +274,11 @@ impl DiffOptions {
     /// Hunk revalidation must see a superset of whatever a caller
     /// diffed, so a file the caller could legitimately select from is never
     /// omitted merely for exceeding that caller's own display budget.
+    ///
+    /// Whitespace handling is left at [`Whitespace::EXACT`] and must stay
+    /// there. This is the shape every revalidation under the repository lock
+    /// uses, and a relaxed setting would compare a selection's coordinates
+    /// against a model that omits lines the apply is about to write.
     #[must_use]
     pub fn unbounded() -> Self {
         Self::default()
@@ -159,6 +312,31 @@ impl DiffOptions {
     #[must_use]
     pub fn with_context_lines(mut self, context_lines: u32) -> Self {
         self.context_lines = context_lines;
+        self
+    }
+
+    /// Sets the whole whitespace treatment at once.
+    ///
+    /// Anything other than [`Whitespace::EXACT`] makes the result view-only:
+    /// its hunks omit lines that genuinely differ, so no selection taken from
+    /// it can be staged, unstaged or discarded.
+    #[must_use]
+    pub fn with_whitespace(mut self, whitespace: Whitespace) -> Self {
+        self.whitespace = whitespace;
+        self
+    }
+
+    /// Sets how surviving lines are compared, leaving blank-line handling alone.
+    #[must_use]
+    pub fn with_whitespace_mode(mut self, mode: WhitespaceMode) -> Self {
+        self.whitespace.mode = mode;
+        self
+    }
+
+    /// Sets whether blank lines take part in the comparison.
+    #[must_use]
+    pub fn with_ignore_blank_lines(mut self, ignore: bool) -> Self {
+        self.whitespace.ignore_blank_lines = ignore;
         self
     }
 
@@ -235,6 +413,13 @@ pub struct FileDiff {
     /// that produced them. It is recorded per file so a selection taken from
     /// one record stays self-describing after the surrounding list is dropped.
     pub context_lines: u32,
+    /// Whitespace handling used to form this file's hunks.
+    ///
+    /// Recorded for the same reason as [`Self::context_lines`], and it carries
+    /// more weight: hunk coordinates taken under a non-exact setting do not
+    /// describe the bytes on disk at all. [`Self::exact`] is what turns this
+    /// field into the guarantee a selection needs.
+    pub whitespace: Whitespace,
     /// Byte size of the old side, zero when absent.
     pub old_size: u64,
     /// Byte size of the new side, zero when absent.
@@ -246,6 +431,23 @@ pub struct FileDiff {
     pub omission: Option<DiffOmission>,
     /// Text hunks. Binary and omitted files always leave this empty.
     pub hunks: Vec<Hunk>,
+}
+
+impl FileDiff {
+    /// This record as a diff that describes the bytes on both sides, if it is
+    /// one.
+    ///
+    /// `None` means the diff was computed with a non-exact
+    /// [`Whitespace`], so its hunks omit lines that genuinely differ and a
+    /// patch rendered from them would write the wrong bytes. A caller holding
+    /// one of those and wanting to mutate the index or working tree must
+    /// re-request the same target and path at [`Whitespace::EXACT`] and take
+    /// its selection from the result — see [`crate::remap_to_exact`], which
+    /// does that mapping without silently widening what was shown.
+    #[must_use]
+    pub fn exact(&self) -> Option<ExactFileDiff<'_>> {
+        self.whitespace.is_exact().then_some(ExactFileDiff(self))
+    }
 }
 
 /// One unified-diff hunk.
@@ -292,7 +494,7 @@ pub struct IntraLineRange {
 }
 
 /// The role of one raw line in a hunk.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum DiffLineKind {
     Context,
@@ -436,6 +638,18 @@ fn collect_target(
         // Supplying the index explicitly prevents libgit2 from refreshing it.
         .update_index(false)
         .max_size(options.max_file_size.min(i64::MAX as u64) as i64);
+    // Each mode sets exactly one libgit2 flag, and `Exact` sets none, so the
+    // default request is byte-identical to the one this module made before
+    // whitespace handling existed.
+    match options.whitespace.mode {
+        WhitespaceMode::Exact => &mut native_options,
+        WhitespaceMode::IgnoreEol => native_options.ignore_whitespace_eol(true),
+        WhitespaceMode::IgnoreChange => native_options.ignore_whitespace_change(true),
+        WhitespaceMode::IgnoreAll => native_options.ignore_whitespace(true),
+    };
+    if options.whitespace.ignore_blank_lines {
+        native_options.ignore_blank_lines(true);
+    }
     if uses_worktree {
         native_options
             .include_untracked(true)
@@ -660,6 +874,7 @@ fn collect_target(
             old_mode: file_mode(old_file.mode()),
             new_mode: file_mode(new_file.mode()),
             context_lines: options.context_lines,
+            whitespace: options.whitespace,
             old_size,
             new_size,
             binary,
@@ -717,6 +932,7 @@ fn unrepresentable(
         old_mode,
         new_mode,
         context_lines: options.context_lines,
+        whitespace: options.whitespace,
         old_size: 0,
         new_size: 0,
         binary: false,
@@ -1072,7 +1288,7 @@ mod tests {
 
     use super::{
         DiffLineKind, DiffOmission, DiffOptions, DiffTarget, FileDiff, Hunk, IntraLineDegradation,
-        IntraLineRange, MAX_INTRA_LINE_BYTES,
+        IntraLineRange, MAX_INTRA_LINE_BYTES, Whitespace, WhitespaceMode,
     };
     use crate::{
         FileChange, GitError, GitService,
@@ -2020,6 +2236,364 @@ mod tests {
             fs::read(root.join("tracked.txt")).unwrap(),
             b"new without newline"
         );
+    }
+
+    #[test]
+    fn a_reindent_disappears_under_ignore_all_and_survives_under_exact() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("reindent");
+        let repository = initialize_repository(&root);
+        fs::write(
+            root.join("tracked.txt"),
+            b"fn main() {\nlet answer = 42;\nprintln!(\"{answer}\");\n}\n",
+        )
+        .unwrap();
+        commit_all(&repository, "prepare re-indent");
+        // Every body line gains four leading spaces and nothing else.
+        fs::write(
+            root.join("tracked.txt"),
+            b"fn main() {\n    let answer = 42;\n    println!(\"{answer}\");\n}\n",
+        )
+        .unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+
+        let exact = service
+            .diff(DiffTarget::Unstaged, &DiffOptions::default())
+            .unwrap();
+        assert_eq!(added_lines(&exact[0]).len(), 2);
+        assert_eq!(deleted_lines(&exact[0]).len(), 2);
+
+        let relaxed = service
+            .diff(
+                DiffTarget::Unstaged,
+                &DiffOptions::default().with_whitespace_mode(WhitespaceMode::IgnoreAll),
+            )
+            .unwrap();
+        assert!(
+            relaxed.is_empty() || relaxed[0].hunks.is_empty(),
+            "a pure re-indent must produce no hunks under IgnoreAll: {relaxed:#?}"
+        );
+    }
+
+    #[test]
+    fn ignore_change_keeps_a_real_edit_beside_the_reindented_line_next_to_it() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("adjacent-edit");
+        let repository = initialize_repository(&root);
+        // Ten indented lines. `IgnoreChange` folds a difference in the *amount*
+        // of whitespace, so the re-indent has to start from whitespace that is
+        // already there; the real edit sits on the line directly beneath it,
+        // which is where a coordinate mismatch would slip through.
+        let original = (1..=10)
+            .map(|line| format!("    line {line}\n"))
+            .collect::<String>();
+        fs::write(root.join("tracked.txt"), original.as_bytes()).unwrap();
+        commit_all(&repository, "prepare adjacent change");
+        let edited = original
+            .replace("    line 5\n", "\t\tline 5\n")
+            .replace("    line 6\n", "    line six\n");
+        fs::write(root.join("tracked.txt"), edited.as_bytes()).unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+
+        let exact = service
+            .diff(DiffTarget::Unstaged, &DiffOptions::default())
+            .unwrap();
+        assert_eq!(
+            added_lines(&exact[0]),
+            vec![b"\t\tline 5\n".to_vec(), b"    line six\n".to_vec()]
+        );
+
+        let relaxed = service
+            .diff(
+                DiffTarget::Unstaged,
+                &DiffOptions::default().with_whitespace_mode(WhitespaceMode::IgnoreChange),
+            )
+            .unwrap();
+        assert_eq!(
+            added_lines(&relaxed[0]),
+            vec![b"    line six\n".to_vec()],
+            "only the real edit survives IgnoreChange"
+        );
+        assert_eq!(deleted_lines(&relaxed[0]), vec![b"    line 6\n".to_vec()]);
+        assert_eq!(relaxed[0].hunks.len(), 1);
+    }
+
+    #[test]
+    fn a_crlf_to_lf_conversion_produces_no_hunks_under_ignore_eol() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("line-endings");
+        let repository = initialize_repository(&root);
+        // A developer or a runner with `core.autocrlf` set would otherwise have
+        // Git normalize these bytes on the way into the index, and the test
+        // would pass by comparing two identical sides. Both the configuration
+        // and the attribute are pinned so the committed bytes are the written
+        // bytes on every machine.
+        repository
+            .config()
+            .unwrap()
+            .set_bool("core.autocrlf", false)
+            .unwrap();
+        fs::write(root.join(".gitattributes"), b"* -text\n").unwrap();
+        commit_all(&repository, "pin line endings");
+        fs::write(root.join("tracked.txt"), b"alpha\r\nbeta\r\ngamma\r\n").unwrap();
+        commit_all(&repository, "prepare CRLF content");
+        fs::write(root.join("tracked.txt"), b"alpha\nbeta\ngamma\n").unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+
+        let exact = service
+            .diff(DiffTarget::Unstaged, &DiffOptions::default())
+            .unwrap();
+        assert_eq!(added_lines(&exact[0]).len(), 3);
+
+        let relaxed = service
+            .diff(
+                DiffTarget::Unstaged,
+                &DiffOptions::default().with_whitespace_mode(WhitespaceMode::IgnoreEol),
+            )
+            .unwrap();
+        assert!(
+            relaxed.is_empty() || relaxed[0].hunks.is_empty(),
+            "a line-ending conversion must produce no hunks under IgnoreEol: {relaxed:#?}"
+        );
+    }
+
+    #[test]
+    fn ignore_blank_lines_drops_a_blank_line_addition_without_touching_the_mode() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("blank-lines");
+        let repository = initialize_repository(&root);
+        fs::write(root.join("tracked.txt"), b"alpha\nbeta\n").unwrap();
+        commit_all(&repository, "prepare blank lines");
+        fs::write(root.join("tracked.txt"), b"alpha\n\n\nbeta\n").unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+
+        let exact = service
+            .diff(DiffTarget::Unstaged, &DiffOptions::default())
+            .unwrap();
+        assert_eq!(added_lines(&exact[0]), vec![b"\n".to_vec(), b"\n".to_vec()]);
+
+        let relaxed = service
+            .diff(
+                DiffTarget::Unstaged,
+                &DiffOptions::default().with_ignore_blank_lines(true),
+            )
+            .unwrap();
+        assert!(
+            relaxed.is_empty() || relaxed[0].hunks.is_empty(),
+            "blank-line additions must vanish when blank lines are ignored: {relaxed:#?}"
+        );
+        // The toggle is independent of the mode, so the recorded handling has
+        // to say both things rather than collapsing into one spelling.
+        let recorded = service
+            .diff(
+                DiffTarget::Unstaged,
+                &DiffOptions::default()
+                    .with_ignore_blank_lines(true)
+                    .with_max_total_bytes(0),
+            )
+            .unwrap();
+        assert_eq!(recorded[0].whitespace.mode, WhitespaceMode::Exact);
+        assert!(recorded[0].whitespace.ignore_blank_lines);
+        assert!(!recorded[0].whitespace.is_exact());
+    }
+
+    #[test]
+    fn exact_output_is_unchanged_for_every_target() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("exact-every-target");
+        let repository = initialize_repository(&root);
+        fs::write(root.join("tracked.txt"), b"one\ntwo\nthree\n").unwrap();
+        commit_all(&repository, "first");
+        fs::write(root.join("tracked.txt"), b"one\n\ttwo changed\nthree\n").unwrap();
+        commit_all(&repository, "second");
+        fs::write(
+            root.join("tracked.txt"),
+            b"one\n  two changed again\nthree\n",
+        )
+        .unwrap();
+        stage(&repository, Path::new("tracked.txt"));
+        fs::write(
+            root.join("tracked.txt"),
+            b"one\n\ttwo changed thrice\nthree\n",
+        )
+        .unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+
+        for target in [
+            DiffTarget::Staged,
+            DiffTarget::Unstaged,
+            DiffTarget::Commit {
+                revision: "HEAD".to_owned(),
+                parent: None,
+            },
+            DiffTarget::Revisions {
+                old_revision: "HEAD~1".to_owned(),
+                new_revision: "HEAD".to_owned(),
+            },
+            DiffTarget::RevisionAgainstWorktree {
+                revision: "HEAD".to_owned(),
+            },
+        ] {
+            let default = service
+                .diff(target.clone(), &DiffOptions::default())
+                .unwrap();
+            let spelled_out = service
+                .diff(
+                    target.clone(),
+                    &DiffOptions::default().with_whitespace(Whitespace::EXACT),
+                )
+                .unwrap();
+            assert_eq!(
+                default, spelled_out,
+                "naming the default handling changed {target:?}"
+            );
+            for file in &default {
+                assert_eq!(file.whitespace, Whitespace::EXACT);
+                assert!(
+                    file.exact().is_some(),
+                    "an exact record must yield the selection token"
+                );
+            }
+        }
+    }
+
+    /// The setting reaches libgit2 through the one options object every target
+    /// is built from, so a revision comparison honours it exactly as a
+    /// working-tree one does — including the combined target, which merges two
+    /// separately computed diffs and would otherwise be the one that forgot.
+    #[test]
+    fn whitespace_handling_reaches_every_revision_target() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("relaxed-every-target");
+        let repository = initialize_repository(&root);
+        let original = (1..=6)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        fs::write(root.join("tracked.txt"), original.as_bytes()).unwrap();
+        commit_all(&repository, "base");
+        git(&root, ["branch", "base-branch"]);
+        fs::write(
+            root.join("tracked.txt"),
+            original.replace("line 3\n", "    line 3\n").as_bytes(),
+        )
+        .unwrap();
+        commit_all(&repository, "re-indent one line");
+        let service = GitService::new(&root, &fixture.data_dir);
+        let relaxed = DiffOptions::default().with_whitespace_mode(WhitespaceMode::IgnoreAll);
+
+        for target in [
+            DiffTarget::Commit {
+                revision: "HEAD".to_owned(),
+                parent: None,
+            },
+            DiffTarget::Revisions {
+                old_revision: "HEAD~1".to_owned(),
+                new_revision: "HEAD".to_owned(),
+            },
+            DiffTarget::RevisionAgainstWorktree {
+                revision: "HEAD~1".to_owned(),
+            },
+            DiffTarget::BranchAgainstBase {
+                branch: "HEAD".to_owned(),
+                base_branch: "base-branch".to_owned(),
+            },
+        ] {
+            let exact = service
+                .diff(target.clone(), &DiffOptions::default())
+                .unwrap();
+            assert_eq!(
+                exact.len(),
+                1,
+                "the fixture must produce one changed file for {target:?}"
+            );
+            let files = service.diff(target.clone(), &relaxed).unwrap();
+            assert!(
+                files.is_empty() || files[0].hunks.is_empty(),
+                "{target:?} ignored the whitespace setting: {files:#?}"
+            );
+            for file in &files {
+                assert_eq!(file.whitespace, relaxed.whitespace);
+            }
+        }
+    }
+
+    #[test]
+    fn a_relaxed_record_refuses_to_produce_the_selection_token() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("view-only-token");
+        let repository = initialize_repository(&root);
+        fs::write(root.join("tracked.txt"), b"alpha\n").unwrap();
+        commit_all(&repository, "prepare token check");
+        fs::write(root.join("tracked.txt"), b"  alpha changed\n").unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+
+        for whitespace in [
+            Whitespace::new(WhitespaceMode::IgnoreEol),
+            Whitespace::new(WhitespaceMode::IgnoreChange),
+            Whitespace::new(WhitespaceMode::IgnoreAll),
+            Whitespace {
+                mode: WhitespaceMode::Exact,
+                ignore_blank_lines: true,
+            },
+        ] {
+            let files = service
+                .diff(
+                    DiffTarget::Unstaged,
+                    &DiffOptions::default().with_whitespace(whitespace),
+                )
+                .unwrap();
+            assert_eq!(files[0].whitespace, whitespace);
+            assert!(
+                files[0].exact().is_none(),
+                "{whitespace} produced a record that claims to describe the file"
+            );
+        }
+    }
+
+    #[test]
+    fn intra_line_ranges_stay_valid_byte_offsets_under_every_mode() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("intra-line-modes");
+        let repository = initialize_repository(&root);
+        // Non-UTF-8 on both sides, with a whitespace run beside the changed
+        // bytes so a relaxed mode has something to fold and the surviving
+        // ranges still have to address the raw line.
+        fs::write(root.join("tracked.txt"), b"value = \xff\xfe old\n").unwrap();
+        commit_all(&repository, "prepare non-utf8 pairing");
+        fs::write(root.join("tracked.txt"), b"value =  \xff\xfe new\n").unwrap();
+        let service = GitService::new(&root, &fixture.data_dir);
+
+        for whitespace in [
+            Whitespace::EXACT,
+            Whitespace::new(WhitespaceMode::IgnoreEol),
+            Whitespace::new(WhitespaceMode::IgnoreChange),
+            Whitespace::new(WhitespaceMode::IgnoreAll),
+        ] {
+            let files = service
+                .diff(
+                    DiffTarget::Unstaged,
+                    &DiffOptions::default()
+                        .with_whitespace(whitespace)
+                        .with_intra_line_ranges(true),
+                )
+                .unwrap();
+            for line in files
+                .iter()
+                .flat_map(|file| &file.hunks)
+                .flat_map(|hunk| &hunk.lines)
+            {
+                let Some(ranges) = line.intra_line_ranges.as_ref() else {
+                    continue;
+                };
+                for range in ranges {
+                    assert!(
+                        range.start <= range.end && range.end <= line.content.len(),
+                        "{whitespace} produced {range:?} outside a {}-byte line",
+                        line.content.len()
+                    );
+                }
+            }
+        }
     }
 
     fn stage(repository: &Repository, path: &Path) {

@@ -176,6 +176,25 @@ pub mod ffi {
             line: i32,
         );
 
+        /// Recomputes the open review under a named whitespace handling.
+        ///
+        /// `mode` is one of `exact`, `ignore_eol`, `ignore_change` and
+        /// `ignore_all`; anything else leaves the surface untouched and says
+        /// so. The same target, the same open file and the same scroll offset
+        /// are re-requested, so the control changes only how the diff was
+        /// computed. Anything but `exact` makes the surface view-only: hunk
+        /// discard then re-requests the file exactly before it applies
+        /// anything, and refuses when that recomputation disagrees with what
+        /// was on screen.
+        #[qinvokable]
+        #[cxx_name = "setReviewWhitespace"]
+        fn set_review_whitespace(
+            self: Pin<&mut HarknessBackend>,
+            project_id: &QString,
+            mode: &QString,
+            ignore_blank_lines: bool,
+        );
+
         /// Fetches hunk content for one backend-owned review path.
         #[qinvokable]
         #[cxx_name = "loadReviewFile"]
@@ -2345,6 +2364,17 @@ struct ReviewLaunchPosition {
 #[derive(Clone, Debug)]
 struct ReviewStateRow {
     project_id: String,
+    /// What this surface was asked to show, kept so the whitespace control can
+    /// re-request the same comparison without the QML side having to remember
+    /// which of four review entry points opened it.
+    selection: ReviewSelection,
+    /// The whitespace handling every diff in this row was computed under.
+    ///
+    /// Anything but [`harkness_git::Whitespace::EXACT`] makes the surface
+    /// view-only, which is why the one mutation it offers — hunk discard —
+    /// routes through [`harkness_git::remap_to_exact`] rather than building a
+    /// selection from what is on screen.
+    whitespace: harkness_git::Whitespace,
     target: Option<ReviewTargetRecord>,
     title: String,
     detail: String,
@@ -2359,9 +2389,17 @@ struct ReviewStateRow {
 }
 
 impl ReviewStateRow {
-    fn loading(project_id: String, title: String, detail: String) -> Self {
+    fn loading(
+        project_id: String,
+        selection: ReviewSelection,
+        whitespace: harkness_git::Whitespace,
+        title: String,
+        detail: String,
+    ) -> Self {
         Self {
             project_id,
+            selection,
+            whitespace,
             target: None,
             title,
             detail,
@@ -2457,14 +2495,17 @@ fn load_review_with_git(
     git: &harkness_git::GitService,
     project_id: String,
     selection: ReviewSelection,
+    whitespace: harkness_git::Whitespace,
     generation: u64,
 ) -> Result<ReviewStateRow, GitFailure> {
-    let target = prepare_review_target(git, selection)?;
+    let target = prepare_review_target(git, selection.clone())?;
     // A zero content budget asks the Git service for the complete identity list while
     // intentionally omitting every hunk. Opening a path makes the second,
     // path-restricted request below, so a thousand-file review never eagerly
     // builds a thousand line models.
-    let options = harkness_git::DiffOptions::default().with_max_total_bytes(0);
+    let options = harkness_git::DiffOptions::default()
+        .with_max_total_bytes(0)
+        .with_whitespace(whitespace);
     let files = git
         .diff(target.target.clone(), &options)
         .map_err(GitFailure::from)?
@@ -2478,6 +2519,8 @@ fn load_review_with_git(
         .collect();
     Ok(ReviewStateRow {
         project_id,
+        selection,
+        whitespace,
         title: target.title.clone(),
         detail: target.detail.clone(),
         target: Some(target),
@@ -2499,11 +2542,13 @@ fn load_review_with_initial_file_with_git(
     git: &harkness_git::GitService,
     project_id: String,
     selection: ReviewSelection,
+    whitespace: harkness_git::Whitespace,
     review_generation: u64,
     file_generation: u64,
     preferred_path: Option<&Path>,
 ) -> Result<ReviewStateRow, GitFailure> {
-    let mut review = load_review_with_git(git, project_id, selection, review_generation)?;
+    let mut review =
+        load_review_with_git(git, project_id, selection, whitespace, review_generation)?;
     let entry = preferred_path
         .and_then(|path| review.files.iter().position(|entry| entry.path == path))
         .or_else(|| (!review.files.is_empty()).then_some(0))
@@ -2515,7 +2560,7 @@ fn load_review_with_initial_file_with_git(
         kind: "review_target_missing".to_owned(),
         message: "The selected review target is no longer available".to_owned(),
     })?;
-    let loaded = load_review_file_with_git(git, target, &entry, file_generation)?;
+    let loaded = load_review_file_with_git(git, target, whitespace, &entry, file_generation)?;
     review.file_offset = entry_index / REVIEW_FILE_PAGE_SIZE * REVIEW_FILE_PAGE_SIZE;
     review.selected_file_id.clone_from(&entry.id);
     review.loaded_file = Some(loaded);
@@ -2541,11 +2586,13 @@ fn hunk_side_coordinates(file: &harkness_git::FileDiff, hunk: &harkness_git::Hun
 fn load_review_file_with_git(
     git: &harkness_git::GitService,
     target: &ReviewTargetRecord,
+    whitespace: harkness_git::Whitespace,
     entry: &ReviewFileEntry,
     generation: u64,
 ) -> Result<ReviewLoadedFile, GitFailure> {
     let options = harkness_git::DiffOptions::default()
         .with_paths([entry.path.as_path()])
+        .with_whitespace(whitespace)
         .with_intra_line_ranges(true);
     let mut files = git
         .diff(target.target.clone(), &options)
@@ -3301,6 +3348,18 @@ fn to_review(row: &ReviewStateRow, loaded_path_id: &str) -> QVariant {
         "totalFiles",
         QVariant::from(&i32::try_from(file_total).unwrap_or(i32::MAX)),
     );
+    insert(
+        "whitespace",
+        QVariant::from(&QString::from(row.whitespace.mode.name())),
+    );
+    insert(
+        "ignoreBlankLines",
+        QVariant::from(&row.whitespace.ignore_blank_lines),
+    );
+    // The one thing the control has to tell the reader beyond its own value:
+    // while this is false the surface is a view, and its hunk actions can only
+    // proceed by recomputing the file exactly first.
+    insert("appliable", QVariant::from(&row.whitespace.is_exact()));
     let mut files = QList::<QVariant>::default();
     for entry in &row.files[file_start..file_end] {
         let mut value = QMap::<QMapPair_QString_QVariant>::default();
@@ -3597,10 +3656,65 @@ fn expand_review_context_with_git(
     Ok(ReviewContextOutcome::Loaded(Box::new(loaded)))
 }
 
+/// Reads a QML whitespace spelling, which is the wire spelling core publishes.
+///
+/// QML sends a string rather than an enumerator because cxx-qt would otherwise
+/// need a registered Qt enum for a four-valued control, and because keeping the
+/// spelling identical to [`harkness_git::WhitespaceMode::name`] means the panel,
+/// the CLI envelope and a stored selection all say the same word.
+fn parse_whitespace_mode(mode: &str) -> Option<harkness_git::WhitespaceMode> {
+    match mode {
+        "exact" => Some(harkness_git::WhitespaceMode::Exact),
+        "ignore_eol" => Some(harkness_git::WhitespaceMode::IgnoreEol),
+        "ignore_change" => Some(harkness_git::WhitespaceMode::IgnoreChange),
+        "ignore_all" => Some(harkness_git::WhitespaceMode::IgnoreAll),
+        _ => None,
+    }
+}
+
+/// Puts a freshly loaded review back where the reader left it.
+///
+/// A refresh, a mutation and a change of whitespace handling all rebuild the
+/// row from scratch, and all three must land on the same line of the same file
+/// rather than at the top of a long diff. The offset is renormalized afterwards
+/// because the new model can be shorter than the one it replaces — which is
+/// exactly what relaxing whitespace does.
+fn resume_at(row: &mut ReviewStateRow, position: ReviewLaunchPosition) {
+    let Some(loaded) = row.loaded_file.as_mut() else {
+        return;
+    };
+    loaded.row_offset = position.row_offset;
+    loaded.row_page_origin = position.row_page_origin % REVIEW_ROW_PAGE_SIZE;
+    loaded.row_offset = normalized_review_row_offset(loaded);
+}
+
+/// The whitespace handling the open review is already using.
+///
+/// A refresh after a mutation, and opening a different target from the same
+/// shell, both keep what the reader chose. Snapping back to exact would undo
+/// the control every time Git state moved underneath it, which is exactly when
+/// a noisy diff is hardest to read. A different project starts exact.
+fn current_review_whitespace(
+    backend: Pin<&ffi::HarknessBackend>,
+    project_id: &str,
+) -> harkness_git::Whitespace {
+    backend
+        .rust()
+        .review_state
+        .as_ref()
+        .filter(|state| state.project_id == project_id)
+        .map_or(harkness_git::Whitespace::EXACT, |state| state.whitespace)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one request describes what to show, how to compute it and where to resume"
+)]
 fn launch_review_request(
     mut backend: Pin<&mut ffi::HarknessBackend>,
     project_id: String,
     selection: ReviewSelection,
+    whitespace: harkness_git::Whitespace,
     preferred_path: Option<PathBuf>,
     loading_title: String,
     loading_detail: String,
@@ -3623,24 +3737,30 @@ fn launch_review_request(
     };
     set_review_state(
         backend.as_mut(),
-        ReviewStateRow::loading(project_id.clone(), loading_title, loading_detail),
+        ReviewStateRow::loading(
+            project_id.clone(),
+            selection.clone(),
+            whitespace,
+            loading_title,
+            loading_detail,
+        ),
     );
     let qt_thread = backend.qt_thread();
+    // The failure path below rebuilds a row from scratch when there is nothing
+    // to fall back on, and that row still has to say what was being requested.
+    let requested = selection.clone();
     std::thread::spawn(move || {
         let result = load_project_git(&project_id).and_then(|git| {
             let mut row = load_review_with_initial_file_with_git(
                 &git,
                 project_id.clone(),
                 selection,
+                whitespace,
                 request_id,
                 file_request,
                 preferred_path.as_deref(),
             )?;
-            if let Some(loaded) = row.loaded_file.as_mut() {
-                loaded.row_offset = position.row_offset;
-                loaded.row_page_origin = position.row_page_origin % REVIEW_ROW_PAGE_SIZE;
-                loaded.row_offset = normalized_review_row_offset(loaded);
-            }
+            resume_at(&mut row, position);
             Ok(row)
         });
         let _ = qt_thread.queue(move |mut backend| {
@@ -3662,7 +3782,13 @@ fn launch_review_request(
                         .review_state
                         .clone()
                         .unwrap_or_else(|| {
-                            ReviewStateRow::loading(project_id, "Review".to_owned(), String::new())
+                            ReviewStateRow::loading(
+                                project_id,
+                                requested,
+                                whitespace,
+                                "Review".to_owned(),
+                                String::new(),
+                            )
                         })
                         .with_failure(&failure);
                     set_review_state(backend.as_mut(), row);
@@ -3696,6 +3822,7 @@ fn launch_working_review(
                 row_page_origin: loaded.row_page_origin,
             }
         });
+    let whitespace = current_review_whitespace(backend.as_ref(), &project_id);
     launch_review_request(
         backend,
         project_id,
@@ -3704,6 +3831,7 @@ fn launch_working_review(
         } else {
             ReviewSelection::Unstaged
         },
+        whitespace,
         preferred_path,
         if staged {
             "Staged changes".to_owned()
@@ -3960,10 +4088,54 @@ fn launch_path_discard(
     });
 }
 
+/// One hunk the reader picked, named in the coordinates it was rendered in.
+///
+/// A whitespace-insensitive view cannot yield a [`harkness_git::HunkSelection`]
+/// at all, so what travels to the worker is the view itself plus the hunk
+/// chosen inside it. The worker re-requests the same path exactly and maps the
+/// two through [`harkness_git::remap_to_exact`].
+#[derive(Clone, Debug)]
+struct ReviewHunkRequest {
+    view: harkness_git::FileDiff,
+    hunk: harkness_git::Hunk,
+}
+
+/// Turns a rendered hunk into selections that describe the bytes on disk.
+///
+/// For an already-exact view this is the identity, and the extra diff it costs
+/// is the same path-restricted request the surface makes constantly. For a
+/// relaxed one it is the seam issue #80 requires: the file is re-requested at
+/// [`harkness_git::Whitespace::EXACT`] and the chosen region is re-expressed in
+/// that model, or refused by name when the exact diff carries changed lines the
+/// view was hiding.
+fn exact_hunk_selections(
+    git: &harkness_git::GitService,
+    request: &ReviewHunkRequest,
+) -> Result<Vec<harkness_git::HunkSelection>, harkness_git::GitError> {
+    let path = review_path(&request.view);
+    let options = harkness_git::DiffOptions::unbounded()
+        .with_context_lines(request.view.context_lines)
+        .with_paths([path.as_path()]);
+    let files = git.diff(request.view.target.clone(), &options)?;
+    let exact = files
+        .iter()
+        .find(|file| {
+            file.old_path == request.view.old_path && file.new_path == request.view.new_path
+        })
+        .ok_or_else(|| harkness_git::GitError::StaleHunkSelection { path: path.clone() })?;
+    // `unbounded()` is exact by construction, so this cannot fail; it is
+    // checked rather than unwrapped because the guarantee lives in another
+    // crate and a refusal is a better answer here than a panic.
+    let exact = exact
+        .exact()
+        .ok_or(harkness_git::GitError::StaleHunkSelection { path })?;
+    harkness_git::remap_to_exact(&request.view, &request.hunk, exact)
+}
+
 fn launch_hunk_discard(
     mut backend: Pin<&mut ffi::HarknessBackend>,
     project_id: String,
-    selection: harkness_git::HunkSelection,
+    request: ReviewHunkRequest,
 ) {
     let Some((job_id, cancellation)) = start_job(
         backend.as_mut(),
@@ -3982,8 +4154,9 @@ fn launch_hunk_discard(
             &cancellation,
             &discard_snapshot_cache,
             |git, cancellation| {
+                let selections = exact_hunk_selections(git, &request).map_err(GitFailure::from)?;
                 let outcome = git
-                    .discard_hunks(std::slice::from_ref(&selection), cancellation)
+                    .discard_hunks(&selections, cancellation)
                     .map_err(GitFailure::from)?;
                 Ok(discard_success_message(&outcome.description))
             },
@@ -5382,12 +5555,14 @@ impl ffi::HarknessBackend {
             return;
         }
         let short = revision.chars().take(12).collect::<String>();
+        let whitespace = current_review_whitespace(self.as_ref(), &project_id);
         launch_review_request(
             self,
             project_id,
             ReviewSelection::Commit {
                 revision: revision.clone(),
             },
+            whitespace,
             None,
             format!("Commit {short}"),
             revision,
@@ -5409,6 +5584,7 @@ impl ffi::HarknessBackend {
                 .set_status("Choose both a branch and a base branch to review".into());
             return;
         }
+        let whitespace = current_review_whitespace(self.as_ref(), &project_id);
         launch_review_request(
             self,
             project_id,
@@ -5416,6 +5592,7 @@ impl ffi::HarknessBackend {
                 branch: branch.clone(),
                 base_branch: base_branch.clone(),
             },
+            whitespace,
             None,
             format!("{branch} against {base_branch}"),
             "Resolving the merge-base…".to_owned(),
@@ -5577,17 +5754,23 @@ impl ffi::HarknessBackend {
                     .hunks
                     .iter()
                     .position(|state| state.id == hunk_id)
-                    .map(|index| {
-                        harkness_git::HunkSelection::new(&loaded.file, &loaded.file.hunks[index])
+                    .map(|index| ReviewHunkRequest {
+                        // The view is carried whole rather than reduced to a
+                        // selection here, because a whitespace-insensitive one
+                        // has no selection to reduce to: the exact hunks it
+                        // maps onto are only knowable once the file has been
+                        // re-requested, which is worker-thread work.
+                        view: loaded.file.clone(),
+                        hunk: loaded.file.hunks[index].clone(),
                     })
             });
-        let Some(selection) = selection else {
+        let Some(request) = selection else {
             self.as_mut().set_status(
                 "The selected hunk is no longer discardable; refresh the review".into(),
             );
             return;
         };
-        launch_hunk_discard(self, project_id, selection);
+        launch_hunk_discard(self, project_id, request);
     }
 
     fn open_review_line(
@@ -5654,6 +5837,71 @@ impl ffi::HarknessBackend {
         }
     }
 
+    fn set_review_whitespace(
+        mut self: Pin<&mut Self>,
+        project_id: &QString,
+        mode: &QString,
+        ignore_blank_lines: bool,
+    ) {
+        let project_id = project_id.to_string();
+        let mode = mode.to_string();
+        let Some(mode) = parse_whitespace_mode(&mode) else {
+            self.as_mut()
+                .set_status("That whitespace setting is not one this build offers".into());
+            return;
+        };
+        let whitespace = harkness_git::Whitespace {
+            mode,
+            ignore_blank_lines,
+        };
+        let Some((selection, preferred_path, position)) = self
+            .as_ref()
+            .rust()
+            .review_state
+            .as_ref()
+            .filter(|state| state.project_id == project_id)
+            .map(|state| {
+                (
+                    state.selection.clone(),
+                    state
+                        .loaded_file
+                        .as_ref()
+                        .map(|loaded| review_path(&loaded.file)),
+                    state.loaded_file.as_ref().map_or_else(
+                        ReviewLaunchPosition::default,
+                        |loaded| ReviewLaunchPosition {
+                            row_offset: normalized_review_row_offset(loaded),
+                            row_page_origin: loaded.row_page_origin,
+                        },
+                    ),
+                )
+            })
+        else {
+            self.as_mut()
+                .set_status("Open a review before changing its whitespace handling".into());
+            return;
+        };
+        if current_review_whitespace(self.as_ref(), &project_id) == whitespace {
+            return;
+        }
+        let title = self
+            .as_ref()
+            .rust()
+            .review_state
+            .as_ref()
+            .map_or_else(|| "Review".to_owned(), |state| state.title.clone());
+        launch_review_request(
+            self,
+            project_id,
+            selection,
+            whitespace,
+            preferred_path,
+            title,
+            "Recomputing this diff…".to_owned(),
+            position,
+        );
+    }
+
     fn load_review_file(mut self: Pin<&mut Self>, project_id: &QString, file_id: &QString) {
         let project_id = project_id.to_string();
         let file_id = file_id.to_string();
@@ -5669,11 +5917,11 @@ impl ffi::HarknessBackend {
                     .iter()
                     .enumerate()
                     .find(|(_, entry)| entry.id == file_id)
-                    .map(|(index, entry)| (target, entry.clone(), index))
+                    .map(|(index, entry)| (target, state.whitespace, entry.clone(), index))
                     .ok_or("The selected review file is no longer available"),
             },
         };
-        let (target, entry, entry_index) = match selection {
+        let (target, whitespace, entry, entry_index) = match selection {
             Ok(selection) => selection,
             Err(message) => {
                 self.as_mut().set_status(message.into());
@@ -5714,8 +5962,9 @@ impl ffi::HarknessBackend {
         sync_review_state(self.as_mut());
         let qt_thread = self.qt_thread();
         std::thread::spawn(move || {
-            let result = load_project_git(&project_id)
-                .and_then(|git| load_review_file_with_git(&git, &target, &entry, file_request));
+            let result = load_project_git(&project_id).and_then(|git| {
+                load_review_file_with_git(&git, &target, whitespace, &entry, file_request)
+            });
             let _ = qt_thread.queue(move |mut backend| {
                 finish_job(backend.as_mut(), &job_id);
                 if backend.as_ref().rust().next_review_request != review_request
@@ -6617,6 +6866,16 @@ impl ffi::HarknessBackend {
 
 #[cfg(test)]
 mod tests {
+    /// The exactness token a selection constructor takes.
+    ///
+    /// Production code reaches selections through `exact_hunk_selections`,
+    /// which re-requests the file; a test that already holds an exact record
+    /// spells the check here instead of repeating it.
+    fn exact(file: &harkness_git::FileDiff) -> harkness_git::ExactFileDiff<'_> {
+        file.exact()
+            .expect("fixture diffs are computed at exact whitespace")
+    }
+
     use std::{
         collections::HashMap,
         fs,
@@ -6630,18 +6889,19 @@ mod tests {
     use super::{
         BranchRow, CatalogGitProjection, GITHUB_CLI_REMOVED_ENV, GitFailure, GitStateRow,
         HarknessBackendRust, OpenedUpdate, ProjectRow, REVIEW_FILE_PAGE_SIZE, REVIEW_ROW_PAGE_SIZE,
-        ReviewContextDirection, ReviewContextOutcome, ReviewSelection, WorktreeLockAction,
-        accept_current_catalog_refresh, advance_review_file_window, advance_review_row_window,
-        attach_discard_snapshots, attach_discard_snapshots_with, begin_job, begin_job_in_scope,
-        best_working_tree_line, cancel_issue_jobs, change_worktree_lock_with_service,
-        conflicting_repository_job, display_diff_path, empty_opened, end_job,
+        ReviewContextDirection, ReviewContextOutcome, ReviewHunkRequest, ReviewLaunchPosition,
+        ReviewSelection, WorktreeLockAction, accept_current_catalog_refresh,
+        advance_review_file_window, advance_review_row_window, attach_discard_snapshots,
+        attach_discard_snapshots_with, begin_job, begin_job_in_scope, best_working_tree_line,
+        cancel_issue_jobs, change_worktree_lock_with_service, conflicting_repository_job,
+        display_diff_path, empty_opened, end_job, exact_hunk_selections,
         expand_review_context_with_git, github_cli_command, github_cli_output_with_executable,
         github_graphql_arguments, hidden_before, jobs_conflict, load_history_page_with_git,
         load_review_file_with_git, load_review_with_git, load_review_with_initial_file_with_git,
-        move_worktree_with_service, operation_outcome, parse_github_issues,
+        move_worktree_with_service, operation_outcome, parse_github_issues, parse_whitespace_mode,
         project_repository_lock_scopes, project_rows, project_worktree_lifecycle_lock_scopes,
         register_path_selection, register_review_path_identity, remove_worktree_with_service,
-        replace_status_path_selections, resolve_commit_scope, resolve_path_selection,
+        replace_status_path_selections, resolve_commit_scope, resolve_path_selection, resume_at,
         retreat_review_file_window, retreat_review_row_window, review_content_summary,
         review_file_discard_description, review_file_window, review_hunk_exists_where, review_path,
         review_row_count, review_rows, run_git_operation_with_git, run_git_status_with_git,
@@ -6678,6 +6938,122 @@ mod tests {
         repository
             .commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
             .unwrap();
+    }
+
+    /// Everything the whitespace control promises, in the order the panel does
+    /// it: the recomputation keeps the open file and the row the reader was on,
+    /// the surface reports itself as view-only, and the one mutation it offers
+    /// still writes the bytes that were on screen by going back to an exact
+    /// diff first.
+    #[test]
+    fn the_whitespace_control_recomputes_in_place_and_still_discards_correct_bytes() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("whitespace-review");
+        initialize_repository(&root);
+        let path = Path::new("tracked.txt");
+        // Forty lines so the file is longer than one row page, a re-indent near
+        // the top and a real edit far below it.
+        let original = (1..=40)
+            .map(|line| format!("    line {line}\n"))
+            .collect::<String>();
+        commit_file(&root, path, &original, "prepare a whitespace review");
+        let edited = original
+            .replace("    line 3\n", "\t\tline 3\n")
+            .replace("    line 30\n", "    line thirty\n");
+        fs::write(root.join(path), edited.as_bytes()).unwrap();
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
+
+        let exact = load_review_with_initial_file_with_git(
+            &git,
+            "project-1".to_owned(),
+            ReviewSelection::Unstaged,
+            harkness_git::Whitespace::EXACT,
+            1,
+            2,
+            Some(path),
+        )
+        .unwrap();
+        assert_eq!(exact.loaded_file.as_ref().unwrap().file.hunks.len(), 2);
+        // A page is far larger than this diff, so what a resume can carry here
+        // is the page grid the reader was on rather than a distant offset: the
+        // point is that the recomputation resumes on that page instead of
+        // snapping back to row zero.
+        let position = ReviewLaunchPosition {
+            row_offset: 5,
+            row_page_origin: 3,
+        };
+
+        // What `setReviewWhitespace` does: same selection, same preferred path,
+        // same position, one different setting.
+        let relaxed_whitespace =
+            harkness_git::Whitespace::new(harkness_git::WhitespaceMode::IgnoreChange);
+        let mut relaxed = load_review_with_initial_file_with_git(
+            &git,
+            "project-1".to_owned(),
+            ReviewSelection::Unstaged,
+            relaxed_whitespace,
+            3,
+            4,
+            Some(path),
+        )
+        .unwrap();
+        resume_at(&mut relaxed, position);
+
+        assert_eq!(relaxed.whitespace, relaxed_whitespace);
+        assert!(!relaxed.whitespace.is_exact());
+        let loaded = relaxed.loaded_file.as_ref().unwrap();
+        // The file identity a reload preserves is the path: the `file-N-M`
+        // tokens are minted per request precisely so a stale one from the
+        // previous model cannot address the new one.
+        assert_eq!(relaxed.selected_file_id, loaded.id);
+        assert_eq!(
+            review_path(&loaded.file),
+            path,
+            "the recomputation lost the open file"
+        );
+        assert_eq!(loaded.row_page_origin, position.row_page_origin);
+        assert_eq!(
+            loaded.row_offset, position.row_page_origin,
+            "the recomputation threw the reader back to the top of the diff"
+        );
+        assert_eq!(
+            loaded.file.hunks.len(),
+            1,
+            "the re-indent must be hidden in the relaxed view"
+        );
+
+        // Discarding the one hunk this view shows goes back to an exact diff,
+        // so the re-indent it was hiding survives untouched.
+        let request = ReviewHunkRequest {
+            view: loaded.file.clone(),
+            hunk: loaded.file.hunks[0].clone(),
+        };
+        let selections = exact_hunk_selections(&git, &request).unwrap();
+        assert_eq!(selections.len(), 1);
+        assert!(selections[0].whitespace.is_exact());
+        git.discard_hunks(&selections, &harkness_git::Cancellation::default())
+            .unwrap();
+        assert_eq!(
+            fs::read(root.join(path)).unwrap(),
+            original.replace("    line 3\n", "\t\tline 3\n").as_bytes(),
+            "the discard reverted the edit the reader saw and nothing else"
+        );
+    }
+
+    #[test]
+    fn an_unknown_whitespace_spelling_is_refused_rather_than_read_as_exact() {
+        assert_eq!(
+            parse_whitespace_mode("ignore_change"),
+            Some(harkness_git::WhitespaceMode::IgnoreChange)
+        );
+        assert_eq!(
+            parse_whitespace_mode("exact"),
+            Some(harkness_git::WhitespaceMode::Exact)
+        );
+        // Neither the CLI's kebab spelling nor a made-up one may be accepted:
+        // one wire spelling is what keeps a stored selection legible.
+        assert_eq!(parse_whitespace_mode("ignore-change"), None);
+        assert_eq!(parse_whitespace_mode(""), None);
     }
 
     #[test]
@@ -7512,6 +7888,7 @@ mod tests {
             &git,
             "project-1".to_owned(),
             ReviewSelection::Unstaged,
+            harkness_git::Whitespace::EXACT,
             1,
             2,
             Some(&first),
@@ -8157,6 +8534,7 @@ mod tests {
             &git,
             "project-1".to_owned(),
             ReviewSelection::Unstaged,
+            harkness_git::Whitespace::EXACT,
             27,
             28,
             Some(new_path),
@@ -8169,7 +8547,7 @@ mod tests {
         // review path token has to keep its identity across it.
         git.stage_hunks(
             std::slice::from_ref(&harkness_git::HunkSelection::new(
-                unstaged_file,
+                exact(unstaged_file),
                 &unstaged_file.hunks[0],
             )),
             &harkness_git::Cancellation::default(),
@@ -8180,6 +8558,7 @@ mod tests {
             &git,
             "project-1".to_owned(),
             ReviewSelection::Staged,
+            harkness_git::Whitespace::EXACT,
             29,
             30,
             Some(new_path),
@@ -8213,6 +8592,7 @@ mod tests {
             &git,
             "project-1".to_owned(),
             ReviewSelection::Unstaged,
+            harkness_git::Whitespace::EXACT,
             15,
             16,
             Some(Path::new("binary.dat")),
@@ -8231,6 +8611,7 @@ mod tests {
             &git,
             "project-1".to_owned(),
             ReviewSelection::Unstaged,
+            harkness_git::Whitespace::EXACT,
             17,
             18,
             Some(Path::new("large.txt")),
@@ -8263,6 +8644,7 @@ mod tests {
             &git,
             "project-1".to_owned(),
             ReviewSelection::Unstaged,
+            harkness_git::Whitespace::EXACT,
             21,
             22,
             Some(path),
@@ -8300,6 +8682,7 @@ mod tests {
             &git,
             "project-1".to_owned(),
             ReviewSelection::Unstaged,
+            harkness_git::Whitespace::EXACT,
             23,
             24,
             Some(path),
@@ -8484,6 +8867,7 @@ mod tests {
                 branch: "topic".to_owned(),
                 base_branch,
             },
+            harkness_git::Whitespace::EXACT,
             4,
         )
         .unwrap();
@@ -8496,9 +8880,14 @@ mod tests {
             review.files[0].file.omission.as_ref(),
             Some(harkness_git::DiffOmission::ContentBudgetExhausted { limit: 0 })
         ));
-        let loaded =
-            load_review_file_with_git(&git, review.target.as_ref().unwrap(), &review.files[0], 5)
-                .unwrap();
+        let loaded = load_review_file_with_git(
+            &git,
+            review.target.as_ref().unwrap(),
+            harkness_git::Whitespace::EXACT,
+            &review.files[0],
+            5,
+        )
+        .unwrap();
         // The identity pass exhausts its budget, so the hunk only exists once
         // the file is loaded on demand with a real one.
         assert_eq!(visible_hunk_ids(&loaded).len(), 1);
@@ -8529,6 +8918,7 @@ mod tests {
             &git,
             "project-1".to_owned(),
             ReviewSelection::Commit { revision },
+            harkness_git::Whitespace::EXACT,
             5,
         )
         .unwrap();
@@ -8537,7 +8927,14 @@ mod tests {
         assert!(review.files[0].file.hunks.is_empty());
 
         let target = review.target.as_ref().unwrap();
-        let loaded = load_review_file_with_git(&git, target, &review.files[0], 6).unwrap();
+        let loaded = load_review_file_with_git(
+            &git,
+            target,
+            harkness_git::Whitespace::EXACT,
+            &review.files[0],
+            6,
+        )
+        .unwrap();
         let deletion = loaded.file.hunks[0]
             .lines
             .iter()
@@ -8661,6 +9058,7 @@ mod tests {
             &git,
             "project-1".to_owned(),
             ReviewSelection::Commit { revision },
+            harkness_git::Whitespace::EXACT,
             7,
             8,
             None,
@@ -8683,6 +9081,7 @@ mod tests {
             &git,
             "project-1".to_owned(),
             ReviewSelection::Commit { revision },
+            harkness_git::Whitespace::EXACT,
             9,
             10,
             Some(second_path),
@@ -8736,6 +9135,7 @@ mod tests {
             &git,
             "project-1".to_owned(),
             ReviewSelection::Commit { revision },
+            harkness_git::Whitespace::EXACT,
             7,
         )
         .unwrap();
@@ -8796,12 +9196,18 @@ mod tests {
             &git,
             "project-1".to_owned(),
             ReviewSelection::Commit { revision },
+            harkness_git::Whitespace::EXACT,
             8,
         )
         .unwrap();
-        let loaded =
-            load_review_file_with_git(&git, review.target.as_ref().unwrap(), &review.files[0], 9)
-                .unwrap();
+        let loaded = load_review_file_with_git(
+            &git,
+            review.target.as_ref().unwrap(),
+            harkness_git::Whitespace::EXACT,
+            &review.files[0],
+            9,
+        )
+        .unwrap();
         assert_eq!(loaded.hunks.len(), 1);
         assert!(hidden_before(&loaded, 0) > 20);
         let hunk_id = loaded.hunks[0].id.clone();
@@ -8840,12 +9246,22 @@ mod tests {
         drop(repository);
 
         let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
-        let staged =
-            load_review_with_git(&git, "project-1".to_owned(), ReviewSelection::Staged, 10)
-                .unwrap();
-        let staged_file =
-            load_review_file_with_git(&git, staged.target.as_ref().unwrap(), &staged.files[0], 11)
-                .unwrap();
+        let staged = load_review_with_git(
+            &git,
+            "project-1".to_owned(),
+            ReviewSelection::Staged,
+            harkness_git::Whitespace::EXACT,
+            10,
+        )
+        .unwrap();
+        let staged_file = load_review_file_with_git(
+            &git,
+            staged.target.as_ref().unwrap(),
+            harkness_git::Whitespace::EXACT,
+            &staged.files[0],
+            11,
+        )
+        .unwrap();
         let staged_hunk = staged_file.hunks[0].id.clone();
 
         let unstaged_content = staged_content.replace("line 60\n", "line sixty unstaged\n");
@@ -8861,12 +9277,18 @@ mod tests {
             ReviewContextOutcome::Loaded(_)
         ));
 
-        let unstaged =
-            load_review_with_git(&git, "project-1".to_owned(), ReviewSelection::Unstaged, 12)
-                .unwrap();
+        let unstaged = load_review_with_git(
+            &git,
+            "project-1".to_owned(),
+            ReviewSelection::Unstaged,
+            harkness_git::Whitespace::EXACT,
+            12,
+        )
+        .unwrap();
         let unstaged_file = load_review_file_with_git(
             &git,
             unstaged.target.as_ref().unwrap(),
+            harkness_git::Whitespace::EXACT,
             &unstaged.files[0],
             13,
         )
