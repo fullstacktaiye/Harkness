@@ -82,7 +82,17 @@ Item {
         backend.loadMoreIssues(project.id, githubRemote);
     }
 
-    onProjectChanged: {
+    /// What this panel reloads for; see GitPanel.qml's own key. Issues are
+    /// fetched over the network, so reacting to the whole `project` map spent
+    /// a GitHub round trip on every local commit.
+    readonly property string reloadKey: [
+        project && project.id !== undefined ? String(project.id) : "",
+        githubRemote,
+        project.available ? "1" : "0",
+        project.isGit ? "1" : "0"
+    ].join("/")
+
+    onReloadKeyChanged: {
         if (initialRefreshCompleted)
             refreshIssues();
     }

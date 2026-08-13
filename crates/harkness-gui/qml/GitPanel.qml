@@ -99,6 +99,20 @@ Item {
             backend.refreshWorktrees(project.id);
     }
 
+    /// What this panel reloads for.
+    ///
+    /// `project` is a whole map, and the catalog rewrites its branch and dirty
+    /// fields after every mutation. Reacting to the map itself made a commit
+    /// look identical to opening a different project: the branch list, the
+    /// history walk and the worktree list all restarted, throwing away
+    /// whatever the History tab had scrolled to. Only a different project — or
+    /// one that has become readable — is worth reloading for.
+    readonly property string reloadKey: [
+        project && project.id !== undefined ? String(project.id) : "",
+        project.available ? "1" : "0",
+        project.isGit ? "1" : "0"
+    ].join("/")
+
     function handleProjectChange() {
         const nextId = project && project.id !== undefined ? String(project.id) : "";
         if (selectedProjectId !== nextId) {
@@ -172,7 +186,7 @@ Item {
             pushOverrideDialog.open();
     }
 
-    onProjectChanged: handleProjectChange()
+    onReloadKeyChanged: handleProjectChange()
     Component.onCompleted: handleProjectChange()
 
     // The view is the source-control column plus the review surface it drives.

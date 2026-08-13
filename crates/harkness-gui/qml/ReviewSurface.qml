@@ -505,7 +505,14 @@ ColumnLayout {
         continueNavigateHunk(offset, index);
     }
 
-    onProjectChanged: pendingHunkNavigation = 0
+    /// Which project is under review; see GitPanel.qml's own reload key. The
+    /// project map is rewritten after every mutation, and a cross-page hunk
+    /// navigation already in flight must survive a commit landing under it.
+    readonly property string projectId: project && project.id !== undefined
+        ? String(project.id)
+        : ""
+
+    onProjectIdChanged: pendingHunkNavigation = 0
 
     Shortcut {
         enabled: reviewSurface.reviewReady

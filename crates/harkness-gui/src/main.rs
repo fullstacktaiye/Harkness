@@ -1,4 +1,5 @@
 mod backend;
+mod changes_model;
 mod file_tree_model;
 pub(crate) mod hotreload;
 
@@ -415,8 +416,15 @@ Kirigami.ApplicationWindow {
 
         check("availableForGitProject", issues.viewAvailable);
         check("refreshesOnceOnInitialization", fixtureBackend.refreshCallCount === 1);
+        // Every local mutation hands the panel a rewritten project map. An
+        // issue fetch is a network round trip, so an equal map must not buy
+        // one; only a different repository is worth reloading for.
         window.projectFixture = JSON.parse(JSON.stringify(window.projectFixture));
-        check("refreshesAfterProjectReplacement", fixtureBackend.refreshCallCount === 2);
+        check("ignoresEqualProjectReplacement", fixtureBackend.refreshCallCount === 1);
+        const otherProject = JSON.parse(JSON.stringify(window.projectFixture));
+        otherProject.id = "11111111-1111-1111-1111-111111111111";
+        window.projectFixture = otherProject;
+        check("refreshesForAnotherProject", fixtureBackend.refreshCallCount === 2);
         check("countsOpenRows", issues.openIssueCount === 2);
         check("countsClosedRows", issues.closedIssueCount === 1);
         check("defaultsToOpen", issues.visibleIssueCount === 2);
@@ -499,6 +507,7 @@ Kirigami.ApplicationWindow {
         && fixtureBackend.lastReviewPath === "fixture-path"
         && reviewFixture.splitLayout === true
         && selectionDetected === true
+        && changesModelDetected === true
         && commitScopeDetected === true
         && amendGatingDetected === true
         && pairedRowsDetected === true
@@ -512,11 +521,13 @@ Kirigami.ApplicationWindow {
         && pagingControlsDetected === true
         && crossPageNavigationDetected === true
         && terminalHunkBoundaryDetected === true
+        && historyPreviewDetected === true
         && largeModelDetected === true
         && deepScrollDetected === true
         && realBridgePassed === true
         ? "GitPanelSmokePassed"
         : "GitPanelSmokeFailed-" + selectionDetected
+            + "-" + changesModelDetected
             + "-" + commitScopeDetected
             + "-" + amendGatingDetected
             + "-" + pairedRowsDetected
@@ -530,6 +541,7 @@ Kirigami.ApplicationWindow {
             + "-" + pagingControlsDetected
             + "-" + crossPageNavigationDetected
             + "-" + terminalHunkBoundaryDetected
+            + "-" + historyPreviewDetected
             + "-" + fixtureBackend.nextPageCalls
             + "-" + fixtureBackend.previousPageCalls
             + "-" + reviewFixture.pendingHunkNavigation
@@ -544,6 +556,7 @@ Kirigami.ApplicationWindow {
 
     property bool reviewBusyDetected: false
     property bool selectionDetected: false
+    property bool changesModelDetected: false
     property bool commitScopeDetected: false
     property bool amendGatingDetected: false
     property bool pairedRowsDetected: false
@@ -556,6 +569,7 @@ Kirigami.ApplicationWindow {
     property bool pagingControlsDetected: false
     property bool crossPageNavigationDetected: false
     property bool terminalHunkBoundaryDetected: false
+    property bool historyPreviewDetected: false
     property bool largeModelDetected: false
     property bool deepScrollDetected: false
     property bool screenshotSaved: false
@@ -1175,6 +1189,21 @@ Kirigami.ApplicationWindow {
         project: projectFixture
     }
 
+    // Instantiate the history list directly so the smoke test creates its
+    // delegates even while the main panel is exercising the review surface.
+    HistoryPanel {
+        id: historyFixture
+
+        activity: activityFixture
+        backend: fixtureBackend
+        height: 400
+        project: projectFixture
+        visible: true
+        width: 320
+        x: -1000
+        y: -1000
+    }
+
     // The tab and the header toolbar are what GitPanel hosts; instantiating
     // them here as well is what makes their functions callable by name below.
     CommitSelection {
@@ -1249,6 +1278,35 @@ Kirigami.ApplicationWindow {
         realBackend.openProject(realProjectId);
         changesFixture.selectPath("fixture-path", "added", "modified");
         fixtureBackend.jobs = [];
+        const previewProbe = historyFixture.commitSummaryPreview(
+            "A commit subject that is deliberately longer than the history row limit "
+                + "so the preview must be shortened"
+        );
+        const unicodePreview = historyFixture.commitSummaryPreview(
+            "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\uD83D\uDE00 trailing"
+        );
+        const emptySummaryPreview = historyFixture.commitSummaryPreview(
+            "",
+            "The body must not become an empty commit subject's preview"
+        );
+        historyPreviewDetected = previewProbe.length === historyFixture.commitSummaryLimit
+            && previewProbe.endsWith("\u2026");
+        historyPreviewDetected = historyPreviewDetected
+            && unicodePreview === "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\uD83D\uDE00\u2026"
+            && emptySummaryPreview === "";
+
+        // The Changes list is a keyed model rather than the entry array, so
+        // this is what catches the roles or the binding drifting apart from
+        // the delegate. Dropping one entry must leave the list at the rows the
+        // projection still holds.
+        const wholeStatus = fixtureBackend.git;
+        changesModelDetected = changesFixture.rowCount === 2;
+        fixtureBackend.git = Object.assign({}, wholeStatus, {
+            "entries": [wholeStatus.entries[1]]
+        });
+        changesModelDetected = changesModelDetected && changesFixture.rowCount === 1;
+        fixtureBackend.git = wholeStatus;
+        changesModelDetected = changesModelDetected && changesFixture.rowCount === 2;
 
         // Everything starts included, and a file is dropped from the commit by
         // unchecking it rather than by moving it across the index.

@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls as Controls
 import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
+import io.github.fullstacktaiye.harkness
 
 /// The "Changes" tab of the source-control view: what the working tree holds
 /// right now, and the diff each entry opens beside it.
@@ -29,6 +30,10 @@ ColumnLayout {
     readonly property var gitState: activity.gitState
     readonly property var entries: activity.entries
     property string pendingDiscardPathId: ""
+
+    /// How many rows the list is showing. Read by the smoke fixture, which has
+    /// no other way to tell that the keyed model reached the view.
+    readonly property alias rowCount: entryList.count
 
     spacing: 0
 
@@ -80,6 +85,17 @@ ColumnLayout {
     // A file that is gone from the working tree must not stay excluded in
     // secret if it ever comes back.
     onEntriesChanged: selection.prune(entries)
+
+    /// Row identity for the list below. Binding a ListView straight to
+    /// `entries` gave it none: a projection of the working tree replaced the
+    /// model wholesale, so every delegate was destroyed and rebuilt even when
+    /// a single file had changed. The model keys rows by the backend's path
+    /// token and reports only what actually moved.
+    ChangesModel {
+        id: entryModel
+
+        entries: changes.entries
+    }
 
     ColumnLayout {
         Layout.fillWidth: true
@@ -212,23 +228,24 @@ ColumnLayout {
         Layout.fillWidth: true
         boundsBehavior: Flickable.StopAtBounds
         clip: true
-        model: changes.entries
+        model: entryModel
         reuseItems: true
 
         delegate: Controls.ItemDelegate {
             id: entryDelegate
 
-            required property var modelData
+            /// The whole status entry for this row; see ChangesModel.
+            required property var entry
 
-            Controls.ToolTip.text: modelData.path
+            Controls.ToolTip.text: entry.path
             Controls.ToolTip.visible: hovered
             enabled: !changes.activity.repositoryMutationRunning()
                 && !changes.activity.reviewReadRunning()
             width: entryList.width
             onClicked: changes.selectPath(
-                modelData.pathId,
-                modelData.staged,
-                modelData.unstaged
+                entry.pathId,
+                entry.staged,
+                entry.unstaged
             )
 
             contentItem: RowLayout {
@@ -236,11 +253,11 @@ ColumnLayout {
 
                 Controls.CheckBox {
                     Accessible.name: qsTr("Include %1 in the commit")
-                        .arg(entryDelegate.modelData.path)
-                    checked: changes.selection.included(entryDelegate.modelData.path)
+                        .arg(entryDelegate.entry.path)
+                    checked: changes.selection.included(entryDelegate.entry.path)
                     enabled: !changes.activity.repositoryMutationRunning()
                     onToggled: changes.selection.setIncluded(
-                        entryDelegate.modelData.path,
+                        entryDelegate.entry.path,
                         checked
                     )
                 }
@@ -253,37 +270,37 @@ ColumnLayout {
                         Layout.fillWidth: true
                         elide: Text.ElideMiddle
                         font.family: "monospace"
-                        text: entryDelegate.modelData.path
+                        text: entryDelegate.entry.path
                         textFormat: Text.PlainText
                     }
 
                     Controls.Label {
                         Layout.fillWidth: true
-                        color: entryDelegate.modelData.conflicted
+                        color: entryDelegate.entry.conflicted
                             ? Kirigami.Theme.negativeTextColor
                             : Kirigami.Theme.disabledTextColor
                         elide: Text.ElideRight
                         font.pixelSize: Kirigami.Theme.smallFont.pixelSize
-                        text: changes.changeSummary(entryDelegate.modelData)
+                        text: changes.changeSummary(entryDelegate.entry)
                         textFormat: Text.PlainText
                         visible: text.length > 0
                     }
                 }
 
                 Controls.ToolButton {
-                    Accessible.name: String((entryDelegate.modelData.discard || ({})).operation || "")
+                    Accessible.name: String((entryDelegate.entry.discard || ({})).operation || "")
                         === "delete_untracked"
-                        ? qsTr("Delete untracked file %1").arg(entryDelegate.modelData.path)
-                        : qsTr("Discard changes in %1").arg(entryDelegate.modelData.path)
+                        ? qsTr("Delete untracked file %1").arg(entryDelegate.entry.path)
+                        : qsTr("Discard changes in %1").arg(entryDelegate.entry.path)
                     Controls.ToolTip.text: Accessible.name
                     Controls.ToolTip.visible: hovered
                     display: Controls.AbstractButton.IconOnly
                     enabled: !changes.activity.repositoryMutationRunning()
                     icon.name: "edit-delete"
                     text: Accessible.name
-                    visible: entryDelegate.modelData.discard !== undefined
-                        && String(entryDelegate.modelData.discard.operation || "").length > 0
-                    onClicked: changes.confirmDiscard(entryDelegate.modelData)
+                    visible: entryDelegate.entry.discard !== undefined
+                        && String(entryDelegate.entry.discard.operation || "").length > 0
+                    onClicked: changes.confirmDiscard(entryDelegate.entry)
                 }
             }
         }
