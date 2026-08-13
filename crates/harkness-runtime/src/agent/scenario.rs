@@ -2,6 +2,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::tool::{ToolId, ToolVersion};
@@ -10,6 +11,11 @@ use super::{AgentAction, AgentFailure, ApprovalOutcomeView, Observation, Observa
 
 /// Version of the deterministic scenario fixture format.
 pub const SCENARIO_FIXTURE_VERSION: u32 = 1;
+
+const SCENARIO_DEFINITION_DIGEST_DOMAIN: &[u8] = b"harkness.agent.scenario-definition.v1";
+
+const FLAGSHIP_SOURCE_SHA256: &str =
+    "4f03383f0bbf9e30e56d77f0a1b85286436cf6df407f00ade9f115b71f382026";
 
 /// Largest scenario fixture accepted from disk or another untrusted source.
 pub const MAX_SCENARIO_BYTES: usize = 64 * 1024;
@@ -103,6 +109,14 @@ pub enum ScenarioError {
         /// Requested name.
         name: String,
     },
+    /// Registry contains the scenario name, but not the checkpoint's version.
+    #[error("mock-agent scenario {name:?} has no retained fixture version {version}")]
+    UnknownScenarioVersion {
+        /// Requested scenario name.
+        name: String,
+        /// Requested fixture version.
+        version: u32,
+    },
     /// Fixture exceeded the input bound.
     #[error("scenario fixture is {bytes} bytes; the limit is {MAX_SCENARIO_BYTES}")]
     FixtureTooLarge {
@@ -145,6 +159,22 @@ pub enum ScenarioError {
         cursor: u32,
         /// Script length.
         steps: usize,
+    },
+    /// A checkpoint names different scenario bytes than the supplied script.
+    #[error("checkpoint for scenario {scenario} v{version} does not match the supplied definition")]
+    CheckpointDefinitionMismatch {
+        /// Scenario named by the checkpoint.
+        scenario: ScenarioId,
+        /// Fixture version named by the checkpoint.
+        version: u32,
+    },
+    /// A built-in checkpoint's definition digest is not retained by this build.
+    #[error("no retained mock-agent scenario v{version} has definition digest {digest}")]
+    UnknownCheckpointDefinition {
+        /// Fixture version named by the checkpoint.
+        version: u32,
+        /// Exact definition identity the checkpoint retained.
+        digest: String,
     },
 }
 
@@ -212,9 +242,9 @@ impl ObservationPattern {
     #[must_use]
     pub fn matches(&self, observation: &Observation) -> bool {
         match (self, observation) {
-            (Self::RunStarted { task_title }, Observation::RunStarted { task, .. }) => {
-                task_title.as_ref().is_none_or(|title| task.title == *title)
-            }
+            (Self::RunStarted { task_title }, Observation::RunStarted { task, .. }) => task_title
+                .as_ref()
+                .is_none_or(|title| task.title() == title),
             (
                 Self::ToolResult {
                     artifact_media_type,
@@ -237,7 +267,7 @@ impl ObservationPattern {
             (Self::PolicyDenied { reason_contains }, Observation::PolicyDenied { reason, .. }) => {
                 reason_contains
                     .as_ref()
-                    .is_none_or(|required| reason.contains(required))
+                    .is_none_or(|required| reason.as_str().contains(required))
             }
             (
                 Self::ApprovalOutcome { outcome },
@@ -282,6 +312,7 @@ impl ScenarioStep {
 /// Ordered deterministic mock-agent script.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Scenario {
+    version: u32,
     id: ScenarioId,
     steps: Vec<ScenarioStep>,
 }
@@ -314,7 +345,15 @@ impl Scenario {
     /// Returns [`ScenarioError::InvalidDefinition`] for an empty or oversized
     /// script, a non-terminal final action, or a terminal action before the end.
     pub fn new(id: ScenarioId, steps: Vec<ScenarioStep>) -> Result<Self, ScenarioError> {
-        let scenario = Self { id, steps };
+        Self::from_parts(SCENARIO_FIXTURE_VERSION, id, steps)
+    }
+
+    fn from_parts(
+        version: u32,
+        id: ScenarioId,
+        steps: Vec<ScenarioStep>,
+    ) -> Result<Self, ScenarioError> {
+        let scenario = Self { version, id, steps };
         scenario.validate()?;
         Ok(scenario)
     }
@@ -342,7 +381,7 @@ impl Scenario {
         }
         let wire: ScenarioWire = serde_json::from_str(bytes)?;
         debug_assert_eq!(wire.v, SCENARIO_FIXTURE_VERSION);
-        Self::new(wire.id, wire.steps)
+        Self::from_parts(wire.v, wire.id, wire.steps)
     }
 
     /// Produces the canonical pretty JSON frozen by scenario fixtures.
@@ -353,7 +392,7 @@ impl Scenario {
     /// representable `serde_json::Value` data.
     pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
         let mut encoded = serde_json::to_string_pretty(&ScenarioWireRef {
-            v: SCENARIO_FIXTURE_VERSION,
+            v: self.version,
             id: &self.id,
             steps: &self.steps,
         })?;
@@ -365,6 +404,28 @@ impl Scenario {
     #[must_use]
     pub const fn id(&self) -> &ScenarioId {
         &self.id
+    }
+
+    /// Version of the frozen fixture definition this scenario represents.
+    #[must_use]
+    pub const fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// Domain-separated SHA-256 of the exact versioned scenario definition.
+    #[must_use]
+    pub fn definition_digest(&self) -> String {
+        let encoded = serde_json::to_vec(&ScenarioWireRef {
+            v: self.version,
+            id: &self.id,
+            steps: &self.steps,
+        })
+        .expect("Scenario contains only infallibly serializable JSON values");
+        let mut digest = Sha256::new();
+        digest.update(SCENARIO_DEFINITION_DIGEST_DOMAIN);
+        digest.update((encoded.len() as u64).to_be_bytes());
+        digest.update(encoded);
+        hex_sha256(digest.finalize().into())
     }
 
     /// Ordered script transitions.
@@ -405,7 +466,18 @@ impl Scenario {
         }
     }
 
-    pub(crate) fn builtin(name: &str) -> Result<Self, ScenarioError> {
+    pub(crate) fn builtin(name: &str, version: u32) -> Result<Self, ScenarioError> {
+        if version != SCENARIO_FIXTURE_VERSION {
+            if BUILTIN_SCENARIO_NAMES.contains(&name) {
+                return Err(ScenarioError::UnknownScenarioVersion {
+                    name: name.to_owned(),
+                    version,
+                });
+            }
+            return Err(ScenarioError::UnknownScenario {
+                name: name.to_owned(),
+            });
+        }
         match name {
             "read_only_success" => Ok(Self::read_only_success()),
             "edit_test_diff_success" => Ok(Self::edit_test_diff_success()),
@@ -423,6 +495,22 @@ impl Scenario {
         }
     }
 
+    pub(crate) fn builtin_by_definition(
+        version: u32,
+        definition_digest: &str,
+    ) -> Result<Self, ScenarioError> {
+        for name in BUILTIN_SCENARIO_NAMES {
+            let scenario = Self::builtin(name, version)?;
+            if scenario.definition_digest() == definition_digest {
+                return Ok(scenario);
+            }
+        }
+        Err(ScenarioError::UnknownCheckpointDefinition {
+            version,
+            digest: definition_digest.to_owned(),
+        })
+    }
+
     /// Rust-data definition of the read-only success scenario.
     #[must_use]
     pub fn read_only_success() -> Self {
@@ -436,7 +524,7 @@ impl Scenario {
                 ),
                 step(
                     tool_result(),
-                    call("git.diff", json!({"target": "working_tree"})),
+                    call("git.diff", json!({"target": "unstaged"})),
                 ),
                 step(
                     tool_result(),
@@ -462,16 +550,19 @@ impl Scenario {
                     call(
                         "fs.apply_patch",
                         json!({
-                            "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n",
+                            "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub const VALUE: &str = \"old\";\n+pub const VALUE: &str = \"new\";\n",
                             "bases": [{
                                 "path": "src/lib.rs",
-                                "base_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+                                "base_sha256": FLAGSHIP_SOURCE_SHA256
                             }]
                         }),
                     ),
                 ),
                 step(
-                    tool_result(),
+                    ObservationPattern::ToolResult {
+                        artifact_media_type: Some("text/x-diff".to_owned()),
+                        output_contains: None,
+                    },
                     call(
                         "test.run",
                         json!({"command": ["cargo", "test", "-p", "harkness-runtime"]}),
@@ -479,13 +570,10 @@ impl Scenario {
                 ),
                 step(
                     tool_result(),
-                    call("git.diff", json!({"target": "working_tree"})),
+                    call("git.diff", json!({"target": "unstaged"})),
                 ),
                 step(
-                    ObservationPattern::ToolResult {
-                        artifact_media_type: Some("text/x-diff".to_owned()),
-                        output_contains: None,
-                    },
+                    tool_result(),
                     complete("Edited the workspace, passed tests, and captured the final diff."),
                 ),
             ],
@@ -503,10 +591,10 @@ impl Scenario {
                     call(
                         "fs.apply_patch",
                         json!({
-                            "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n",
+                            "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub const VALUE: &str = \"old\";\n+pub const VALUE: &str = \"new\";\n",
                             "bases": [{
                                 "path": "src/lib.rs",
-                                "base_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+                                "base_sha256": FLAGSHIP_SOURCE_SHA256
                             }]
                         }),
                     ),
@@ -550,7 +638,10 @@ impl Scenario {
             vec![
                 step(
                     run_started(),
-                    call("test.run", json!({"command": ["false"]})),
+                    call(
+                        "test.run",
+                        json!({"command": fixture_process_command("fixture-fail")}),
+                    ),
                 ),
                 step(
                     tool_result_containing(json!({"passed": false})),
@@ -570,11 +661,14 @@ impl Scenario {
                     run_started(),
                     call(
                         "process.exec",
-                        json!({"argv": ["fixture-hang"], "timeout_seconds": 1}),
+                        json!({
+                            "argv": fixture_process_command("fixture-hang"),
+                            "timeout_seconds": 1
+                        }),
                     ),
                 ),
                 step(
-                    tool_failed("timed_out"),
+                    tool_result_containing(json!({"timed_out": true})),
                     complete("Observed and reported the tool timeout."),
                 ),
             ],
@@ -591,7 +685,10 @@ impl Scenario {
                     run_started(),
                     call(
                         "process.exec",
-                        json!({"argv": ["fixture-cancellable"], "timeout_seconds": 120}),
+                        json!({
+                            "argv": fixture_process_command("fixture-cancellable"),
+                            "timeout_seconds": 120
+                        }),
                     ),
                 ),
                 step(
@@ -654,12 +751,15 @@ impl Scenario {
                     run_started(),
                     call(
                         "process.exec",
-                        json!({"argv": ["fixture-disallowed"], "timeout_seconds": 120}),
+                        json!({
+                            "argv": fixture_process_command("fixture-disallowed"),
+                            "timeout_seconds": 120
+                        }),
                     ),
                 ),
                 step(
                     ObservationPattern::PolicyDenied {
-                        reason_contains: Some("capability".to_owned()),
+                        reason_contains: None,
                     },
                     complete("Observed and reported the disallowed capability."),
                 ),
@@ -669,8 +769,32 @@ impl Scenario {
 }
 
 fn built_in(id: &str, steps: Vec<ScenarioStep>) -> Scenario {
-    Scenario::new(ScenarioId::new(id).expect("valid built-in id"), steps)
-        .expect("valid built-in scenario")
+    Scenario::from_parts(
+        SCENARIO_FIXTURE_VERSION,
+        ScenarioId::new(id).expect("valid built-in id"),
+        steps,
+    )
+    .expect("valid built-in scenario")
+}
+
+fn fixture_process_command(program: &str) -> Vec<&str> {
+    let test = match program {
+        "fixture-fail" => "scenario_process_fixture_failure_child",
+        "fixture-hang" => "scenario_process_fixture_hang_child",
+        "fixture-cancellable" => "scenario_process_fixture_cancellable_child",
+        "fixture-disallowed" => "scenario_process_fixture_disallowed_child",
+        _ => unreachable!("built-in scenarios name only registered fixture processes"),
+    };
+    vec![program, "--exact", test, "--ignored", "--nocapture"]
+}
+
+fn hex_sha256(digest: [u8; 32]) -> String {
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
 }
 
 fn step(expect: ObservationPattern, action: AgentAction) -> ScenarioStep {
@@ -728,12 +852,11 @@ fn complete(summary: &str) -> AgentAction {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::{ObservationPattern, Scenario, ScenarioError, ScenarioId, ScenarioStep};
     use crate::{
         agent::{AgentAction, Observation, TaskRef, ToolErrorView, ToolResultView, WorkspaceRef},
         domain::{TaskId, ToolCallId},
+        store::PassThrough,
     };
 
     #[test]
@@ -744,12 +867,12 @@ mod tests {
         for call in [ToolCallId::new(), ToolCallId::new()] {
             assert!(pattern.matches(&Observation::ToolFailed {
                 call,
-                error: ToolErrorView::new("timed_out", "deadline"),
+                error: ToolErrorView::new("timed_out", "deadline", &PassThrough),
             }));
         }
         assert!(!pattern.matches(&Observation::ToolFailed {
             call: ToolCallId::new(),
-            error: ToolErrorView::new("process_failed", "exit 1"),
+            error: ToolErrorView::new("process_failed", "exit 1", &PassThrough),
         }));
 
         let failed_test = ObservationPattern::ToolResult {
@@ -758,26 +881,23 @@ mod tests {
         };
         assert!(failed_test.matches(&Observation::ToolResult {
             call: ToolCallId::new(),
-            result: ToolResultView::inline(serde_json::json!({
-                "passed": false,
-                "exit_code": 1
-            })),
+            result: ToolResultView::inline(
+                serde_json::json!({
+                    "passed": false,
+                    "exit_code": 1
+                }),
+                &PassThrough,
+            ),
         }));
         assert!(!failed_test.matches(&Observation::ToolResult {
             call: ToolCallId::new(),
-            result: ToolResultView::inline(serde_json::json!({"passed": true})),
+            result: ToolResultView::inline(serde_json::json!({"passed": true}), &PassThrough,),
         }));
 
         let any_start = ObservationPattern::RunStarted { task_title: None };
         assert!(any_start.matches(&Observation::RunStarted {
-            task: TaskRef {
-                id: TaskId::new(),
-                title: "incidental".to_owned(),
-            },
-            workspace: WorkspaceRef {
-                project_id: None,
-                root: PathBuf::from("/workspace"),
-            },
+            task: TaskRef::new(TaskId::new(), "incidental", &PassThrough),
+            workspace: WorkspaceRef::new(None, "/workspace", &PassThrough),
         }));
     }
 

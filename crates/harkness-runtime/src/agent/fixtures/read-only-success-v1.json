@@ -35,7 +35,7 @@
         "tool_id": "git.diff",
         "tool_version": "1.0.0",
         "input": {
-          "target": "working_tree"
+          "target": "unstaged"
         }
       }
     },

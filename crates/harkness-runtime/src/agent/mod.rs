@@ -12,6 +12,11 @@
 //! It has no privileged callback or testing-only execution path; a coordinator
 //! drives it through [`Agent::next_action`] exactly as it will drive a future
 //! model-backed implementation.
+//!
+//! The plain action and observation enums are also embedded inside versioned
+//! scenario definitions. When a coordinator makes one durable on its own, it
+//! uses [`AgentActionRecord`] or [`ObservationRecord`], whose schema version is
+//! probed before the strict enum body.
 
 mod mock;
 mod scenario;
@@ -25,8 +30,9 @@ pub use scenario::{
 };
 pub use session::{AGENT_SESSION_STATE_SCHEMA_VERSION, AgentSessionId, AgentSessionState};
 pub use types::{
-    AgentAction, AgentFailure, ApprovalOutcomeView, Observation, ObservationKind, PlannedStep,
-    TaskRef, ToolErrorView, ToolResultView, WorkspaceRef,
+    AGENT_TURN_RECORD_SCHEMA_VERSION, AgentAction, AgentActionRecord, AgentFailure,
+    ApprovalOutcomeView, Observation, ObservationKind, ObservationRecord, PlannedStep,
+    RedactedText, TaskRef, ToolErrorView, ToolResultView, WorkspaceRef,
 };
 
 /// A decision-maker owned and driven by one run coordinator.
@@ -41,9 +47,14 @@ pub trait Agent: Send {
     fn session_id(&self) -> AgentSessionId;
 
     /// Consumes one coordinator observation and chooses the next action.
+    ///
+    /// A coordinator persists the result through [`AgentActionRecord`], never
+    /// as an unversioned standalone enum value.
     fn next_action(&mut self, observation: Observation) -> AgentAction;
 
     /// Returns the serializable checkpoint needed to inspect or resume the
-    /// session after a process restart.
+    /// session after a process restart. When stored as a generic run-event
+    /// payload, use [`AgentSessionState::to_event_payload`] so text redaction
+    /// cannot rewrite checkpoint control fields.
     fn state(&self) -> AgentSessionState;
 }

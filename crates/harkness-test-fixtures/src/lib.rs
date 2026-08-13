@@ -1,9 +1,9 @@
 //! Hermetic filesystem, repository, and process fixtures shared by Harkness tests.
 
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
@@ -15,6 +15,14 @@ use tempfile::TempDir;
 
 /// Fixed so repository fixtures hash identically between runs.
 pub const COMMIT_EPOCH_SECONDS: i64 = 1_700_000_000;
+
+/// Bare executable names used by the deterministic mock-agent process cases.
+pub const SCENARIO_PROCESS_PROGRAMS: [&str; 4] = [
+    "fixture-fail",
+    "fixture-hang",
+    "fixture-cancellable",
+    "fixture-disallowed",
+];
 
 const FIXTURE_GIT_TIMEOUT: Duration = Duration::from_secs(120);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -49,6 +57,49 @@ pub fn park() -> ! {
     loop {
         thread::park();
     }
+}
+
+/// Emits the process-fixture readiness marker and remains alive for supervision.
+#[doc(hidden)]
+pub fn scenario_process_ready_then_park() -> ! {
+    println!("HARKNESS_SCENARIO_FIXTURE_READY");
+    std::io::stdout().flush().unwrap();
+    park()
+}
+
+/// Declares the four ignored child roles referenced by mock-agent scenarios.
+///
+/// Invoke this once in any integration-test binary that executes those
+/// scenarios, then call [`Fixture::install_scenario_process_fixtures`] so the
+/// frozen bare executable names resolve to platform-native copies of that test
+/// binary. Re-execution selects exactly one generated ignored test.
+#[macro_export]
+macro_rules! scenario_process_fixture_tests {
+    () => {
+        #[test]
+        #[ignore = "re-executed by a mock-agent process scenario"]
+        fn scenario_process_fixture_failure_child() {
+            panic!("intentional fixture process failure");
+        }
+
+        #[test]
+        #[ignore = "re-executed by a mock-agent process scenario"]
+        fn scenario_process_fixture_hang_child() {
+            $crate::scenario_process_ready_then_park();
+        }
+
+        #[test]
+        #[ignore = "re-executed by a mock-agent process scenario"]
+        fn scenario_process_fixture_cancellable_child() {
+            $crate::scenario_process_ready_then_park();
+        }
+
+        #[test]
+        #[ignore = "policy must deny this fixture before execution"]
+        fn scenario_process_fixture_disallowed_child() {
+            panic!("a policy-denied fixture process executed");
+        }
+    };
 }
 
 /// Prepares a re-execution of the current test binary in a named role.
@@ -303,6 +354,63 @@ impl Fixture {
         let path = self.root.path().join(name);
         fs::create_dir(&path).unwrap();
         path
+    }
+
+    /// Installs platform-native links to the current integration-test binary
+    /// under every deterministic mock-agent process-fixture name.
+    ///
+    /// The calling test binary must invoke
+    /// [`scenario_process_fixture_tests!`](crate::scenario_process_fixture_tests)
+    /// so re-execution can select the exact ignored child role named by the
+    /// scenario argv.
+    pub fn install_scenario_process_fixtures(&self) {
+        let executable = std::env::current_exe().unwrap();
+        let (first, remaining) = SCENARIO_PROCESS_PROGRAMS
+            .split_first()
+            .expect("the scenario process fixture set is nonempty");
+        let installed = self.scenario_process_program(first);
+        if !installed.is_file() && fs::hard_link(&executable, &installed).is_err() {
+            fs::copy(&executable, &installed).unwrap();
+        }
+        for program in remaining {
+            let alias = self.scenario_process_program(program);
+            if !alias.is_file() && fs::hard_link(&installed, &alias).is_err() {
+                fs::copy(&installed, &alias).unwrap();
+            }
+        }
+    }
+
+    /// Prepends the installed process-fixture directory to one child's `PATH`.
+    ///
+    /// The intended child is the integration-test coordinator. Its real tool
+    /// processes inherit only the allowlisted baseline `PATH`, so this scoped
+    /// environment is how the bare names frozen in scenario JSON resolve
+    /// without mutating the test runner's process-wide environment.
+    pub fn configure_scenario_process_path(&self, command: &mut Command) {
+        self.install_scenario_process_fixtures();
+        command.env("PATH", self.scenario_process_path());
+    }
+
+    /// `PATH` value that resolves installed scenario processes before host tools.
+    #[must_use]
+    pub fn scenario_process_path(&self) -> OsString {
+        let inherited = std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|value| std::env::split_paths(&value).collect::<Vec<_>>());
+        std::env::join_paths(std::iter::once(self.root.path().to_path_buf()).chain(inherited))
+            .expect("temporary fixture paths are valid PATH entries")
+    }
+
+    /// Resolves one installed scenario-process fixture beneath this root.
+    #[must_use]
+    pub fn scenario_process_program(&self, program: &str) -> PathBuf {
+        assert!(
+            SCENARIO_PROCESS_PROGRAMS.contains(&program),
+            "unknown scenario process fixture {program}"
+        );
+        self.root
+            .path()
+            .join(format!("{program}{}", std::env::consts::EXE_SUFFIX))
     }
 
     /// Writes an executable stand-in for system Git.

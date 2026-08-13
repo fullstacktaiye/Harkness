@@ -1,30 +1,107 @@
 use std::{
-    path::{Path, PathBuf},
+    borrow::Cow,
+    ffi::OsString,
+    io::{BufRead, BufReader, Write},
+    path::Path,
+    process::{Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
+        mpsc,
     },
+    thread,
+    time::Duration,
 };
 
 use harkness_runtime::{
     agent::{
         Agent, AgentAction, AgentFailure, AgentSessionState, ApprovalOutcomeView, MockAgent,
-        Observation, Scenario, TaskRef, ToolErrorView, ToolResultView, WorkspaceRef,
+        Observation, RedactedText, Scenario, TaskRef, ToolErrorView, ToolResultView, WorkspaceRef,
     },
     domain::{Run, RunId, StepId, Task, TaskId, ToolCallId},
-    store::{EventKind, RunEvent, Store},
+    store::{EventKind, PassThrough, Redactor, RunEvent, Store},
     tool::{
         ArtifactRef, ExecutionContext, RiskLevel, Tool, ToolError, ToolIdentity, ToolMetadata,
-        ToolRegistry, invoke,
+        ToolProcess, ToolRegistry, erase, invoke,
     },
+    trust::{AllowlistedEnv, CommandSpec, PathBoundary},
 };
-use harkness_test_fixtures::Fixture;
+use harkness_test_fixtures::{Fixture, child_path};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json, value::to_raw_value};
+use serde_json::{
+    Value, json,
+    value::{RawValue, to_raw_value},
+};
+use sha2::{Digest, Sha256};
 use time::macros::datetime;
 
 const WIRE_CONTRACT_FIXTURE: &str = include_str!("../src/agent/fixtures/wire-contract-v1.json");
+const SCENARIO_RUNNER_WORKSPACE: &str = "HARKNESS_SCENARIO_RUNNER_WORKSPACE";
+
+harkness_test_fixtures::scenario_process_fixture_tests!();
+
+#[test]
+#[ignore = "re-executed to verify scenario PATH through the real process supervisor"]
+fn scenario_process_real_runner_child() {
+    #[derive(Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    struct EmptyInput {}
+
+    #[derive(JsonSchema, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct EmptyOutput {}
+
+    struct ProcessFixtureDescriptor;
+
+    impl Tool for ProcessFixtureDescriptor {
+        type Input = EmptyInput;
+        type Output = EmptyOutput;
+
+        fn metadata(&self) -> ToolMetadata {
+            ToolMetadata::new(
+                ToolIdentity::parse("fixture.process", "1.0.0").unwrap(),
+                "Fixture process",
+                "Provides the descriptor whose baseline environment drives the real process path.",
+                RiskLevel::Execute,
+            )
+        }
+
+        fn execute(
+            &self,
+            _input: Self::Input,
+            _context: &mut ExecutionContext,
+        ) -> Result<Self::Output, ToolError> {
+            Ok(EmptyOutput {})
+        }
+    }
+
+    let workspace = child_path(SCENARIO_RUNNER_WORKSPACE);
+    let erased = erase(ProcessFixtureDescriptor).unwrap();
+    let environment = AllowlistedEnv::for_descriptor(erased.descriptor());
+    let boundary = PathBoundary::new(&workspace, std::iter::empty::<&Path>()).unwrap();
+    let cwd = boundary.contain(".").unwrap();
+    let spec = CommandSpec::new(
+        "fixture-fail",
+        [
+            "--exact",
+            "scenario_process_fixture_failure_child",
+            "--ignored",
+            "--nocapture",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect(),
+        cwd,
+        environment,
+    )
+    .unwrap();
+    let mut context =
+        ExecutionContext::detached(RunId::new(), StepId::new(), ToolCallId::new(), &workspace)
+            .unwrap();
+    let output = ToolProcess::new(spec).run(&mut context).unwrap();
+    assert_ne!(output.code(), Some(0));
+}
 
 const SCENARIO_FIXTURES: &[(&str, &str)] = &[
     (
@@ -120,14 +197,19 @@ fn action_observation_and_session_wire_forms_match_the_frozen_v1_fixture() {
     struct WireContract {
         v: u32,
         state: AgentSessionState,
-        actions: Vec<AgentAction>,
-        observations: Vec<Observation>,
+        event_payloads: Box<RawValue>,
+        actions: Vec<Box<RawValue>>,
+        observations: Vec<Box<RawValue>>,
     }
 
     let fixture: WireContract = serde_json::from_str(WIRE_CONTRACT_FIXTURE).unwrap();
     assert_eq!(fixture.v, 1);
-    assert_eq!(fixture.actions.len(), 4);
-    assert_eq!(fixture.observations.len(), 6);
+    assert_eq!(fixture.actions.len(), 9);
+    assert_eq!(fixture.observations.len(), 7);
+    assert_eq!(
+        fixture.state.scenario_definition_digest(),
+        Scenario::read_only_success().definition_digest()
+    );
     let mut encoded = serde_json::to_string_pretty(&fixture).unwrap();
     encoded.push('\n');
     assert_eq!(encoded, WIRE_CONTRACT_FIXTURE);
@@ -148,7 +230,7 @@ fn every_scenario_replays_its_complete_action_sequence_through_the_agent_trait()
         ),
         Case::new(
             "edit_test_diff_success",
-            vec![started(), ok(), ok(), ok(), ok(), diff_artifact()],
+            vec![started(), ok(), ok(), diff_artifact(), ok(), ok()],
             &[
                 "call:workspace.inspect",
                 "call:fs.read",
@@ -175,7 +257,7 @@ fn every_scenario_replays_its_complete_action_sequence_through_the_agent_trait()
         ),
         Case::new(
             "tool_timeout",
-            vec![started(), failed("timed_out")],
+            vec![started(), result(json!({"timed_out": true}))],
             &["call:process.exec", "complete"],
         ),
         Case::new(
@@ -195,10 +277,7 @@ fn every_scenario_replays_its_complete_action_sequence_through_the_agent_trait()
         ),
         Case::new(
             "disallowed_capability",
-            vec![
-                started(),
-                policy_denied("the execute capability is disabled"),
-            ],
+            vec![started(), policy_denied("denied: workspace is untrusted")],
             &["call:process.exec", "complete"],
         ),
     ];
@@ -233,6 +312,80 @@ fn every_scenario_replays_its_complete_action_sequence_through_the_agent_trait()
             "{} diverged from its own fixture",
             case.name
         );
+    }
+}
+
+#[test]
+fn frozen_success_actions_use_the_published_tool_inputs() {
+    let read_only = Scenario::read_only_success();
+    let read_only_diff = call_input(&read_only, "git.diff");
+    assert_eq!(read_only_diff, &json!({"target": "unstaged"}));
+
+    let flagship = Scenario::edit_test_diff_success();
+    let patch = call_input(&flagship, "fs.apply_patch");
+    assert_eq!(
+        patch["bases"][0]["base_sha256"],
+        format!(
+            "{:x}",
+            Sha256::digest(b"pub const VALUE: &str = \"old\";\n")
+        )
+    );
+    assert!(
+        patch["patch"]
+            .as_str()
+            .unwrap()
+            .contains("+pub const VALUE: &str = \"new\";")
+    );
+    assert_eq!(
+        call_input(&flagship, "git.diff"),
+        &json!({"target": "unstaged"})
+    );
+}
+
+#[test]
+fn process_scenarios_resolve_to_hermetic_cross_platform_fixture_children() {
+    let fixture = Fixture::new();
+
+    let failure = scenario_process_command("tool_process_failure", "command");
+    let status = fixture_command(&fixture, &failure)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!status.success(), "the failure fixture exited successfully");
+
+    let workspace = fixture.directory("process-workspace");
+    let mut real_runner = Command::new(std::env::current_exe().unwrap());
+    real_runner.args([
+        "--exact",
+        "scenario_process_real_runner_child",
+        "--ignored",
+        "--nocapture",
+    ]);
+    real_runner.env_clear();
+    real_runner.env(SCENARIO_RUNNER_WORKSPACE, &workspace);
+    fixture.configure_scenario_process_path(&mut real_runner);
+    assert!(real_runner.status().unwrap().success());
+
+    for scenario in ["tool_timeout", "user_cancellation"] {
+        let argv = scenario_process_command(scenario, "argv");
+        let mut child = fixture_command(&fixture, &argv)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().expect("fixture stdout is piped");
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let reader = thread::spawn(move || {
+            let ready = BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+                .any(|line| line.contains("HARKNESS_SCENARIO_FIXTURE_READY"));
+            let _ = sender.send(ready);
+        });
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(10)), Ok(true));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        reader.join().unwrap();
     }
 }
 
@@ -316,7 +469,7 @@ fn invalid_tool_input_is_rejected_by_the_real_registry_before_the_body_runs() {
 
     let terminal = agent.next_action(Observation::ToolFailed {
         call: ToolCallId::new(),
-        error: ToolErrorView::new(error.kind(), error.to_string()),
+        error: ToolErrorView::new(error.kind(), error.to_string(), &PassThrough),
     });
     assert!(matches!(terminal, AgentAction::CompleteRun { .. }));
 }
@@ -343,19 +496,67 @@ fn session_state_round_trips_through_the_real_run_event_store() {
         .append_event(
             run.id(),
             RunEvent::new(EventKind::Diagnostic, datetime!(2026-08-13 12:02 UTC))
-                .with_payload(serde_json::to_value(&state).unwrap()),
+                .with_payload(state.to_event_payload()),
         )
         .unwrap();
 
     let events = store.events(run.id(), None, 10).unwrap();
     assert_eq!(events.len(), 1);
-    let restored: AgentSessionState =
-        serde_json::from_value(events[0].event.payload().clone()).unwrap();
+    let restored =
+        AgentSessionState::from_event_payload(events[0].event.payload().clone()).unwrap();
     assert_eq!(restored, state);
 
     let resumed = MockAgent::from_state(restored).unwrap();
     assert_eq!(resumed.session_id(), agent.session_id());
     assert_eq!(resumed.state(), agent.state());
+}
+
+#[derive(Debug)]
+struct RewriteEveryString;
+
+impl Redactor for RewriteEveryString {
+    fn redact_text<'a>(&self, _text: &'a str) -> Cow<'a, str> {
+        Cow::Borrowed("[redacted]")
+    }
+
+    fn wrap_stream(&self, sink: Box<dyn Write + Send>) -> Box<dyn Write + Send> {
+        sink
+    }
+}
+
+#[test]
+fn session_state_survives_a_mutating_event_redactor() {
+    let fixture = Fixture::new();
+    let workspace = fixture.directory("redacted-workspace");
+    let store = Store::open(&fixture.data_dir)
+        .unwrap()
+        .redacting(Arc::new(RewriteEveryString));
+    let task = Task::new(
+        "agent checkpoint",
+        &workspace,
+        None,
+        datetime!(2026-08-13 13:00 UTC),
+    );
+    store.insert_task(&task).unwrap();
+    let run = Run::new(task.id(), datetime!(2026-08-13 13:01 UTC));
+    store.insert_run(&run).unwrap();
+
+    let mut agent = MockAgent::scenario("restart_recovery").unwrap();
+    let _requested_read = agent.next_action(started_at(task.id(), &workspace));
+    let state = agent.state();
+    store
+        .append_event(
+            run.id(),
+            RunEvent::new(EventKind::Diagnostic, datetime!(2026-08-13 13:02 UTC))
+                .with_payload(state.to_event_payload()),
+        )
+        .unwrap();
+
+    let events = store.events(run.id(), None, 10).unwrap();
+    let restored =
+        AgentSessionState::from_event_payload(events[0].event.payload().clone()).unwrap();
+    assert_eq!(restored, state);
+    assert_eq!(MockAgent::from_state(restored).unwrap().state(), state);
 }
 
 struct Case {
@@ -394,20 +595,46 @@ fn labels(actions: &[AgentAction]) -> Vec<String> {
         .collect()
 }
 
+fn call_input<'a>(scenario: &'a Scenario, tool: &str) -> &'a Value {
+    scenario
+        .steps()
+        .iter()
+        .find_map(|step| match step.action() {
+            AgentAction::CallTool { tool_id, input, .. } if tool_id.as_str() == tool => Some(input),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("scenario does not call {tool}"))
+}
+
+fn scenario_process_command(scenario: &str, field: &str) -> Vec<String> {
+    let mut agent = MockAgent::scenario(scenario).unwrap();
+    let AgentAction::CallTool { input, .. } = agent.next_action(started()) else {
+        panic!("{scenario} did not begin with a tool call");
+    };
+    serde_json::from_value(input[field].clone()).unwrap()
+}
+
+fn fixture_command(fixture: &Fixture, argv: &[String]) -> Command {
+    let mut command = Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    command.env_clear();
+    fixture.configure_scenario_process_path(&mut command);
+    assert!(
+        fixture.scenario_process_program(&argv[0]).is_file(),
+        "missing fixture program {}",
+        argv[0]
+    );
+    command
+}
+
 fn started() -> Observation {
     started_at(TaskId::new(), Path::new("/workspace"))
 }
 
 fn started_at(task_id: TaskId, workspace: &Path) -> Observation {
     Observation::RunStarted {
-        task: TaskRef {
-            id: task_id,
-            title: "fixture task".to_owned(),
-        },
-        workspace: WorkspaceRef {
-            project_id: None,
-            root: PathBuf::from(workspace),
-        },
+        task: TaskRef::new(task_id, "fixture task", &PassThrough),
+        workspace: WorkspaceRef::new(None, workspace, &PassThrough),
     }
 }
 
@@ -418,7 +645,7 @@ fn ok() -> Observation {
 fn result(output: Value) -> Observation {
     Observation::ToolResult {
         call: ToolCallId::new(),
-        result: ToolResultView::inline(output),
+        result: ToolResultView::inline(output, &PassThrough),
     }
 }
 
@@ -432,6 +659,7 @@ fn diff_artifact() -> Observation {
                 media_type: "text/x-diff".to_owned(),
                 byte_len: 42,
             }],
+            &PassThrough,
         ),
     }
 }
@@ -439,14 +667,14 @@ fn diff_artifact() -> Observation {
 fn failed(kind: &str) -> Observation {
     Observation::ToolFailed {
         call: ToolCallId::new(),
-        error: ToolErrorView::new(kind, format!("fixture {kind}")),
+        error: ToolErrorView::new(kind, format!("fixture {kind}"), &PassThrough),
     }
 }
 
 fn policy_denied(reason: &str) -> Observation {
     Observation::PolicyDenied {
         call: ToolCallId::new(),
-        reason: reason.to_owned(),
+        reason: RedactedText::new(reason, &PassThrough),
     }
 }
 

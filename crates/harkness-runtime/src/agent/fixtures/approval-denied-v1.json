@@ -13,11 +13,11 @@
         "input": {
           "bases": [
             {
-              "base_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+              "base_sha256": "4f03383f0bbf9e30e56d77f0a1b85286436cf6df407f00ade9f115b71f382026",
               "path": "src/lib.rs"
             }
           ],
-          "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n"
+          "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub const VALUE: &str = \"old\";\n+pub const VALUE: &str = \"new\";\n"
         }
       }
     },

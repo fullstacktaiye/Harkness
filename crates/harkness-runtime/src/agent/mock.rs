@@ -37,7 +37,18 @@ impl MockAgent {
     /// Returns [`ScenarioError::UnknownScenario`] when `name` is not in
     /// [`scenario_names`](Self::scenario_names).
     pub fn scenario(name: &str) -> Result<Self, ScenarioError> {
-        Scenario::builtin(name).map(Self::from_scenario)
+        Self::scenario_version(name, super::SCENARIO_FIXTURE_VERSION)
+    }
+
+    /// Constructs one exact retained version of a registered scenario.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScenarioError::UnknownScenario`] when `name` is not registered,
+    /// or [`ScenarioError::UnknownScenarioVersion`] when this build no longer
+    /// contains `version` for that name.
+    pub fn scenario_version(name: &str, version: u32) -> Result<Self, ScenarioError> {
+        Scenario::builtin(name, version).map(Self::from_scenario)
     }
 
     /// Constructs a mock from validated scenario data.
@@ -55,15 +66,45 @@ impl MockAgent {
     ///
     /// # Errors
     ///
-    /// Returns [`ScenarioError::UnknownScenario`] when the checkpoint names a
-    /// scenario this build does not contain, or
+    /// Returns [`ScenarioError::UnknownCheckpointDefinition`] when the exact
+    /// retained definition is not built into this version, or
     /// [`ScenarioError::InvalidCheckpoint`] when its cursor is beyond the
     /// script. The checkpoint's deserializer has already validated its digest.
     pub fn from_state(state: AgentSessionState) -> Result<Self, ScenarioError> {
-        let scenario = Scenario::builtin(state.scenario_id().as_str())?;
+        let scenario = Scenario::builtin_by_definition(
+            state.scenario_version(),
+            state.scenario_definition_digest(),
+        )?;
+        Self::from_state_with_scenario(state, scenario)
+    }
+
+    /// Restores a checkpoint using an explicitly resolved scenario definition.
+    ///
+    /// This is the recovery path for scenarios loaded from JSON rather than the
+    /// built-in registry. The fixture version and definition digest (which
+    /// commits to the id) must match the checkpoint, so a restart can never
+    /// silently switch scripts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScenarioError::CheckpointDefinitionMismatch`] when `scenario`
+    /// is not the exact definition named by `state`, or
+    /// [`ScenarioError::InvalidCheckpoint`] when the cursor is beyond it.
+    pub fn from_state_with_scenario(
+        state: AgentSessionState,
+        scenario: Scenario,
+    ) -> Result<Self, ScenarioError> {
+        if state.scenario_version() != scenario.version()
+            || state.scenario_definition_digest() != scenario.definition_digest()
+        {
+            return Err(ScenarioError::CheckpointDefinitionMismatch {
+                scenario: scenario.id().clone(),
+                version: state.scenario_version(),
+            });
+        }
         if usize::try_from(state.cursor()).unwrap_or(usize::MAX) > scenario.steps().len() {
             return Err(ScenarioError::InvalidCheckpoint {
-                scenario: state.scenario_id().clone(),
+                scenario: scenario.id().clone(),
                 cursor: state.cursor(),
                 steps: scenario.steps().len(),
             });
@@ -111,7 +152,15 @@ impl Agent for MockAgent {
             };
         }
 
-        self.observation_digest = advance_digest(self.observation_digest, &observation);
+        let Ok(observation_digest) = advance_digest(self.observation_digest, &observation) else {
+            return AgentAction::FailRun {
+                reason: AgentFailure::AgentFailed {
+                    reason: "the observation cannot be represented in the durable agent format"
+                        .to_owned(),
+                },
+            };
+        };
+        self.observation_digest = observation_digest;
         self.cursor += 1;
         step.action().clone()
     }
@@ -119,7 +168,8 @@ impl Agent for MockAgent {
     fn state(&self) -> AgentSessionState {
         AgentSessionState::new(
             self.session_id,
-            self.scenario.id().clone(),
+            self.scenario.version(),
+            self.scenario.definition_digest(),
             self.cursor,
             encode_digest(self.observation_digest),
         )
@@ -130,15 +180,17 @@ fn initial_digest() -> [u8; 32] {
     Sha256::digest(OBSERVATION_DIGEST_DOMAIN).into()
 }
 
-fn advance_digest(previous: [u8; 32], observation: &Observation) -> [u8; 32] {
-    let encoded = serde_json::to_vec(observation)
-        .expect("Observation contains only infallibly serializable JSON values");
+fn advance_digest(
+    previous: [u8; 32],
+    observation: &Observation,
+) -> Result<[u8; 32], serde_json::Error> {
+    let encoded = serde_json::to_vec(observation)?;
     let mut digest = Sha256::new();
     digest.update(OBSERVATION_DIGEST_DOMAIN);
     digest.update(previous);
     digest.update((encoded.len() as u64).to_be_bytes());
     digest.update(encoded);
-    digest.finalize().into()
+    Ok(digest.finalize().into())
 }
 
 fn encode_digest(digest: [u8; 32]) -> String {
@@ -172,19 +224,14 @@ mod tests {
             Agent, AgentAction, AgentFailure, Observation, TaskRef, ToolResultView, WorkspaceRef,
         },
         domain::{TaskId, ToolCallId},
+        store::PassThrough,
         tool::ArtifactRef,
     };
 
     fn started() -> Observation {
         Observation::RunStarted {
-            task: TaskRef {
-                id: TaskId::new(),
-                title: "test".to_owned(),
-            },
-            workspace: WorkspaceRef {
-                project_id: None,
-                root: PathBuf::from("/workspace"),
-            },
+            task: TaskRef::new(TaskId::new(), "test", &PassThrough),
+            workspace: WorkspaceRef::new(None, "/workspace", &PassThrough),
         }
     }
 
@@ -212,19 +259,19 @@ mod tests {
             started(),
             Observation::ToolResult {
                 call: ToolCallId::new(),
-                result: ToolResultView::inline(serde_json::json!({"files": 1})),
+                result: ToolResultView::inline(serde_json::json!({"files": 1}), &PassThrough),
             },
             Observation::ToolResult {
                 call: ToolCallId::new(),
-                result: ToolResultView::inline(serde_json::json!({"text": "source"})),
+                result: ToolResultView::inline(serde_json::json!({"text": "source"}), &PassThrough),
             },
             Observation::ToolResult {
                 call: ToolCallId::new(),
-                result: ToolResultView::inline(serde_json::json!({"patched": true})),
+                result: ToolResultView::inline(serde_json::json!({"patched": true}), &PassThrough),
             },
             Observation::ToolResult {
                 call: ToolCallId::new(),
-                result: ToolResultView::inline(serde_json::json!({"passed": true})),
+                result: ToolResultView::inline(serde_json::json!({"passed": true}), &PassThrough),
             },
             Observation::ToolResult {
                 call: ToolCallId::new(),
@@ -235,6 +282,7 @@ mod tests {
                         media_type: "text/x-diff".to_owned(),
                         byte_len: 8,
                     }],
+                    &PassThrough,
                 ),
             },
         ];
@@ -270,9 +318,62 @@ mod tests {
         assert_eq!(resumed.state().observation_digest(), digest);
         let next = resumed.next_action(Observation::ToolResult {
             call: ToolCallId::new(),
-            result: ToolResultView::inline(serde_json::json!({})),
+            result: ToolResultView::inline(serde_json::json!({}), &PassThrough),
         });
         assert!(matches!(next, AgentAction::CallTool { .. }));
         assert_eq!(resumed.state().cursor(), 2);
+    }
+
+    #[test]
+    fn a_checkpoint_refuses_a_different_scenario_definition() {
+        let mut agent = MockAgent::scenario("read_only_success").unwrap();
+        assert_eq!(agent.next_action(started()).kind(), "call_tool");
+        let checkpoint = agent.state();
+
+        let replacement = crate::agent::Scenario::new(
+            crate::agent::ScenarioId::new("read_only_success").unwrap(),
+            vec![crate::agent::ScenarioStep::new(
+                crate::agent::ObservationPattern::Cancelled,
+                AgentAction::FailRun {
+                    reason: AgentFailure::Cancelled,
+                },
+            )],
+        )
+        .unwrap();
+        assert!(matches!(
+            MockAgent::from_state_with_scenario(checkpoint, replacement),
+            Err(crate::agent::ScenarioError::CheckpointDefinitionMismatch { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_workspace_observation_fails_without_advancing_or_panicking() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let mut root = b"/workspace-".to_vec();
+        root.push(0xff);
+        let observation = Observation::RunStarted {
+            task: TaskRef::new(TaskId::new(), "test", &PassThrough),
+            workspace: WorkspaceRef::new(
+                None,
+                PathBuf::from(OsString::from_vec(root)),
+                &PassThrough,
+            ),
+        };
+        let mut agent = MockAgent::scenario("read_only_success").unwrap();
+        let before = agent.state();
+
+        assert!(matches!(
+            agent.next_action(observation),
+            AgentAction::FailRun {
+                reason: AgentFailure::AgentFailed { reason }
+            } if reason == "the observation cannot be represented in the durable agent format"
+        ));
+        assert_eq!(agent.state().cursor(), before.cursor());
+        assert_eq!(
+            agent.state().observation_digest(),
+            before.observation_digest()
+        );
     }
 }

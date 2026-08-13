@@ -12,7 +12,11 @@
         "tool_version": "1.0.0",
         "input": {
           "argv": [
-            "fixture-cancellable"
+            "fixture-cancellable",
+            "--exact",
+            "scenario_process_fixture_cancellable_child",
+            "--ignored",
+            "--nocapture"
           ],
           "timeout_seconds": 120
         }

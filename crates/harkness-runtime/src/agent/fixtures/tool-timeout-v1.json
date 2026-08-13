@@ -12,7 +12,11 @@
         "tool_version": "1.0.0",
         "input": {
           "argv": [
-            "fixture-hang"
+            "fixture-hang",
+            "--exact",
+            "scenario_process_fixture_hang_child",
+            "--ignored",
+            "--nocapture"
           ],
           "timeout_seconds": 1
         }
@@ -20,8 +24,10 @@
     },
     {
       "expect": {
-        "kind": "tool_failed",
-        "error_kind": "timed_out"
+        "kind": "tool_result",
+        "output_contains": {
+          "timed_out": true
+        }
       },
       "action": {
         "kind": "complete_run",

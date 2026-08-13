@@ -12,7 +12,11 @@
         "tool_version": "1.0.0",
         "input": {
           "command": [
-            "false"
+            "fixture-fail",
+            "--exact",
+            "scenario_process_fixture_failure_child",
+            "--ignored",
+            "--nocapture"
           ]
         }
       }

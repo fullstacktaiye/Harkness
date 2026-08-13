@@ -81,7 +81,7 @@ impl Redactor for PassThrough {
 /// Applying the redactor to the *encoded* JSON instead would be simpler and
 /// wrong: a rule that rewrites a quote or a backslash would produce a column
 /// that no longer parses, turning a redaction into a corrupt row.
-pub(super) fn redact_payload(redactor: &dyn Redactor, payload: &Value) -> Value {
+pub(crate) fn redact_payload(redactor: &dyn Redactor, payload: &Value) -> Value {
     match payload {
         Value::String(text) => Value::String(redactor.redact_text(text).into_owned()),
         Value::Array(items) => Value::Array(
