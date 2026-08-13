@@ -85,6 +85,21 @@ ColumnLayout {
         return Kirigami.Theme.disabledTextColor;
     }
 
+    // Fills every `%N` in one pass over the template.
+    //
+    // Qt's `arg` replaces the lowest-numbered marker still present and then
+    // hands back a string the next `arg` in the chain re-scans — so a value
+    // holding `%2` is substituted *into* by the call after it. Commit author
+    // names and paths reach these strings and are repository content, which a
+    // remote controls, so the substitution happens once and never looks at what
+    // it just wrote.
+    function format(template, values) {
+        return String(template).replace(/%(\d)/g, function(marker, index) {
+            const value = values[Number(index) - 1];
+            return value === undefined ? marker : String(value);
+        });
+    }
+
     // The colour that says "these two files came from the same hands".
     //
     // The group is an index over the review's *distinct* producer sets, so the
@@ -112,16 +127,19 @@ ColumnLayout {
         if (commits === 0)
             return qsTr("No commit in this comparison produced these changes");
         const parts = [
-            qsTr("%1 commits by %2 contributors")
-                .arg(commits)
-                .arg(Number(provenance.producerCount || 0))
+            format(qsTr("%1 by %2"), [
+                qsTr("%n commit(s)", "commits attributed to a review", commits),
+                qsTr("%n contributor(s)", "people who produced a review",
+                     Number(provenance.producerCount || 0))
+            ])
         ];
         const slug = String(provenance.agentSlug || "");
         if (slug.length > 0)
-            parts.push(qsTr("agent %1").arg(slug));
+            parts.push(format(qsTr("agent %1"), [slug]));
         const skipped = Number(provenance.skippedMerges || 0);
         if (skipped > 0)
-            parts.push(qsTr("%1 merges left unattributed").arg(skipped));
+            parts.push(qsTr("%n merge(s) left unattributed",
+                            "merge commits a range skipped", skipped));
         if (String(provenance.truncation || "") === "commit_budget_exhausted")
             parts.push(qsTr("older commits were not walked"));
         return parts.join(" · ");
@@ -129,21 +147,36 @@ ColumnLayout {
 
     // Absence is a first-class answer, so an unattributed file says so in as
     // many letters and is never left blank.
+    //
+    // Whether a file is attributed is decided by its gap and never by whether
+    // its label came out empty: a trailer carrying an address and no name is
+    // still somebody, and reading a blank label as "nothing produced this"
+    // would turn a naming gap into a wrong answer.
     function provenanceLabel(row) {
-        const label = String((row || ({})).provenanceLabel || "");
-        return label.length > 0 ? label : qsTr("Unknown");
+        const entry = row || ({});
+        const label = String(entry.provenanceLabel || "");
+        if (label.length > 0)
+            return label;
+        return provenanceAttributed(entry) ? qsTr("Unnamed") : qsTr("Unknown");
+    }
+
+    function provenanceAttributed(row) {
+        const entry = row || ({});
+        return String(entry.provenanceGap || "").length === 0
+            && Number(entry.provenanceProducers || 0) > 0;
     }
 
     // Names the producers, for a plain-text label and for a screen reader.
     function provenanceDetail(row) {
         const entry = row || ({});
-        const gap = String(entry.provenanceGap || "");
-        if (gap.length === 0 && String(entry.provenanceLabel || "").length > 0) {
-            return qsTr("Produced by %1, across %2 commits in this comparison")
-                .arg(entry.provenanceLabel)
-                .arg(Number(entry.provenanceCommits || 0));
-        }
-        return qsTr("Unknown: %1").arg(provenanceGapText(gap));
+        if (!provenanceAttributed(entry))
+            return format(qsTr("Unknown: %1"),
+                          [provenanceGapText(String(entry.provenanceGap || ""))]);
+        return format(qsTr("Produced by %1, across %2 in this comparison"), [
+            provenanceLabel(entry),
+            qsTr("%n commit(s)", "commits attributed to one file",
+                 Number(entry.provenanceCommits || 0))
+        ]);
     }
 
     // The same fact with no producer name in it, for a tool tip.
@@ -157,12 +190,15 @@ ColumnLayout {
     // a reader nothing.
     function provenanceTooltip(row) {
         const entry = row || ({});
-        const gap = String(entry.provenanceGap || "");
-        if (gap.length > 0 || String(entry.provenanceLabel || "").length === 0)
-            return qsTr("Unknown: %1").arg(provenanceGapText(gap));
-        return qsTr("Produced by %1 contributors across %2 commits in this comparison")
-            .arg(Number(entry.provenanceProducers || 0))
-            .arg(Number(entry.provenanceCommits || 0));
+        if (!provenanceAttributed(entry))
+            return format(qsTr("Unknown: %1"),
+                          [provenanceGapText(String(entry.provenanceGap || ""))]);
+        return format(qsTr("Produced by %1 across %2 in this comparison"), [
+            qsTr("%n contributor(s)", "people who produced one file",
+                 Number(entry.provenanceProducers || 0)),
+            qsTr("%n commit(s)", "commits attributed to one file",
+                 Number(entry.provenanceCommits || 0))
+        ]);
     }
 
     function provenanceGapText(gap) {
@@ -1144,10 +1180,14 @@ ColumnLayout {
                             required property int index
                             required property var modelData
 
-                            Accessible.name: qsTr("%1, %2 change, %3")
-                                .arg(modelData.path)
-                                .arg(modelData.change)
-                                .arg(reviewSurface.provenanceDetail(modelData))
+                            Accessible.name: reviewSurface.format(
+                                qsTr("%1, %2 change, %3"),
+                                [
+                                    modelData.path,
+                                    modelData.change,
+                                    reviewSurface.provenanceDetail(modelData)
+                                ]
+                            )
                             Controls.ToolTip.text: modelData.path
                                 + "\n" + reviewSurface.provenanceTooltip(modelData)
                             Controls.ToolTip.visible: hovered

@@ -2435,6 +2435,22 @@ fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// What to call one producer on a row.
+///
+/// A `Co-Authored-By` trailer may carry an address and no name — `<model@host>`
+/// is a spelling Git itself accepts — and a producer with an empty name would
+/// otherwise join into a dangling separator, or, where it is a file's only
+/// producer, into an empty label that the surface would then read back as
+/// *unattributed*. The address is what the record actually has, so it is what
+/// gets shown.
+fn producer_display_name(producer: &harkness_git::Producer) -> String {
+    let name = collapse_whitespace(&String::from_utf8_lossy(&producer.name));
+    if !name.is_empty() {
+        return name;
+    }
+    collapse_whitespace(&String::from_utf8_lossy(&producer.email))
+}
+
 #[derive(Clone, Debug)]
 struct ReviewStateRow {
     project_id: String,
@@ -2628,12 +2644,10 @@ fn resolve_review_provenance(
     selection: &ReviewSelection,
     files: &[ReviewFileEntry],
 ) -> ReviewProvenance {
-    if files.is_empty() {
-        // Narrowing to no paths asks nothing, and asking nothing is answered
-        // without a walk. The header reports itself unresolved, which is what
-        // a review with no changed files has to say anyway.
-        return ReviewProvenance::default();
-    }
+    // An empty file list is passed through rather than short-circuited: asking
+    // about no paths is answered without a walk, and the result still reports
+    // itself resolved. `resolved: false` is reserved for an attribution that
+    // could not be made, which is a different thing from one with nothing in it.
     let mut options = harkness_git::ProvenanceOptions::default()
         .with_paths(files.iter().map(|entry| entry.path.clone()));
     // A branch review is pinned to object ids so the comparison cannot move
@@ -2683,13 +2697,7 @@ fn resolve_review_provenance(
                 });
             let label = key
                 .iter()
-                .map(|producer| {
-                    // A name is repository content, so it is collapsed to one
-                    // line exactly as the CLI collapses it: a row is one line
-                    // tall and an embedded newline would otherwise decide how
-                    // tall.
-                    collapse_whitespace(&String::from_utf8_lossy(&record.producers[*producer].name))
-                })
+                .map(|producer| producer_display_name(&record.producers[*producer]))
                 .collect::<Vec<_>>()
                 .join(", ");
             ReviewAttribution {
@@ -9886,6 +9894,77 @@ mod tests {
             !label.contains('\t'),
             "a tab survived into a row: {label:?}"
         );
+    }
+
+    /// A trailer may carry an address and no name. That producer is still
+    /// somebody, so the row names the address rather than joining an empty
+    /// string into a dangling separator — or, where it is the only producer, an
+    /// empty label a surface would read back as *unattributed*.
+    #[test]
+    fn a_producer_with_no_name_is_shown_by_address_rather_than_as_unknown() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("unnamed-producer");
+        initialize_repository(&root);
+        let repository = Repository::open(&root).unwrap();
+        let base_branch = repository.head().unwrap().shorthand().unwrap().to_owned();
+        let head = repository.head().unwrap().peel_to_commit().unwrap();
+        repository.branch("feature", &head, true).unwrap();
+        drop(head);
+        repository.set_head("refs/heads/feature").unwrap();
+        drop(repository);
+
+        commit_file_as(
+            &root,
+            Path::new("alpha.txt"),
+            "one\n",
+            "add alpha\n\nCo-Authored-By: <model@example.invalid>\n",
+            ("Ada", "ada@example.invalid"),
+        );
+
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
+        let review = load_review_with_git(
+            &git,
+            "project-1".to_owned(),
+            ReviewSelection::Branch {
+                branch: "feature".to_owned(),
+                base_branch,
+            },
+            harkness_git::Whitespace::EXACT,
+            25,
+        )
+        .unwrap();
+
+        let alpha = review.provenance.file(0);
+        assert_eq!(alpha.label, "Ada, model@example.invalid");
+        assert_eq!(alpha.producers, 2);
+        assert_eq!(alpha.gap, "");
+    }
+
+    /// A review with no changed files asks about no paths, which is answered
+    /// without a walk — and *answered*, rather than reported as an attribution
+    /// that could not be made.
+    #[test]
+    fn a_review_with_no_files_resolves_to_an_empty_attribution() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("empty-review");
+        initialize_repository(&root);
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
+
+        let review = load_review_with_git(
+            &git,
+            "project-1".to_owned(),
+            ReviewSelection::Unstaged,
+            harkness_git::Whitespace::EXACT,
+            26,
+        )
+        .unwrap();
+
+        assert!(review.files.is_empty());
+        assert!(review.provenance.resolved);
+        assert_eq!(review.provenance.commits, 0);
+        assert_eq!(review.provenance.producers, 0);
+        assert_eq!(review.provenance.groups, 0);
+        assert!(review.provenance.files.is_empty());
     }
 
     fn commit_file_as(

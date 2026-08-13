@@ -1035,11 +1035,10 @@ impl GitService {
     /// and it answers it from the repository alone: the commits between the two
     /// sides of the comparison, the identities they record, and the
     /// `agent/<slug>` branch convention. Pass one target's own file list
-    /// through [`ProvenanceOptions::for_files`], and pair the result with it by
-    /// path — one entry is produced per distinct path, so an index is only an
-    /// index. A file list that came back *empty* is not something to pass on:
-    /// an empty [`ProvenanceOptions::paths`] asks about every path in the
-    /// range, so skip the call instead.
+    /// through [`ProvenanceOptions::for_files`]: the result carries one entry
+    /// per record, in the same order, so the two pair by index. A file list
+    /// that came back empty is fine to pass — [`ProvenancePaths::Only`] with
+    /// nothing in it asks about nothing, and is answered without a walk.
     ///
     /// The range is walked once and each commit compared with its first parent
     /// once, so cost follows the size of the range and never the number of

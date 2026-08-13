@@ -263,9 +263,9 @@ pub enum ProvenancePaths {
     All,
     /// Exactly these, in this order. Empty means exactly none.
     ///
-    /// One entry is produced per *distinct* path, so a caller pairing the
-    /// result with a file list two of whose records name one path matches on
-    /// the path rather than on the index.
+    /// One entry is produced per element, repeats included, so a result always
+    /// pairs with the list that asked for it by index. A repeated path answers
+    /// the same both times rather than reading as unattributed the second.
     Only(Vec<PathBuf>),
 }
 
@@ -307,29 +307,24 @@ impl Default for ProvenanceOptions {
 }
 
 impl ProvenanceOptions {
-    /// Attributes the paths one diff reported, in its own order and without
-    /// repeats.
+    /// Attributes the paths one diff reported, one entry per record and in the
+    /// diff's own order.
     ///
     /// A renamed or deleted file is requested under the path the diff shows it
     /// at: its new-side path where it has one, and its old-side path otherwise.
-    /// Two records naming one path therefore produce one entry, so pair the
-    /// result with the file list by path and not by index.
+    /// Repeats are kept rather than folded, so the result pairs with the file
+    /// list by index — which is what a front end holding both actually needs,
+    /// and a path named twice answers the same both times.
     ///
-    /// Pass the records of **one** target. A multi-target file list would fold
-    /// a path each target reported into a single request, and each target has
-    /// its own attribution anyway.
+    /// Pass the records of **one** target. Each target has its own attribution,
+    /// and a multi-target list would ask one of them about another's paths.
     #[must_use]
     pub fn for_files(files: &[FileDiff]) -> Self {
-        let mut seen = HashSet::with_capacity(files.len());
-        let mut paths = Vec::with_capacity(files.len());
-        for file in files {
-            let Some(path) = file.new_path.as_ref().or(file.old_path.as_ref()) else {
-                continue;
-            };
-            if seen.insert(path.clone()) {
-                paths.push(path.clone());
-            }
-        }
+        let paths = files
+            .iter()
+            .filter_map(|file| file.new_path.as_ref().or(file.old_path.as_ref()))
+            .cloned()
+            .collect();
         Self {
             paths: ProvenancePaths::Only(paths),
             ..Self::default()
@@ -406,10 +401,13 @@ pub struct ChangeProvenance {
 }
 
 impl ChangeProvenance {
-    /// Whether anything at all was attributed.
+    /// Whether no commit contributed to any requested path.
     ///
-    /// `true` is the ordinary answer for a repository Harkness has never run
-    /// in, and for every working-tree comparison.
+    /// This is the answer for every working-tree comparison, for an empty
+    /// range, and for a request narrowed to paths the range never touched. It
+    /// says nothing about whether Harkness produced the work: an ordinary
+    /// branch review of a repository Harkness has never run in has commits, and
+    /// answers `false`.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.commits.is_empty()
@@ -1590,6 +1588,20 @@ mod tests {
         assert_eq!(all.walked_commits, 1);
         assert_eq!(all.files.len(), 1);
         assert_eq!(all.files[0].path, PathBuf::from("alpha.txt"));
+
+        // One entry per element asked for, repeats included, so a caller
+        // holding both lists may pair them by index. A repeat answers the same
+        // as its first occurrence rather than reading as unattributed.
+        let repeated = service
+            .provenance(
+                &target,
+                &ProvenanceOptions::default().with_paths(["alpha.txt", "alpha.txt"]),
+                &Cancellation::default(),
+            )
+            .unwrap();
+        assert_eq!(repeated.files.len(), 2);
+        assert_eq!(repeated.files[0], repeated.files[1]);
+        assert!(repeated.files[1].is_attributed());
     }
 
     /// A front end that pins a review to object ids keeps the reference the

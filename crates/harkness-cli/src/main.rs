@@ -3986,7 +3986,7 @@ fn provenance_summary(
     let names = entry
         .producers
         .iter()
-        .map(|producer| single_line(&String::from_utf8_lossy(&record.producers[*producer].name)))
+        .map(|producer| producer_display_name(&record.producers[*producer]))
         .collect::<Vec<_>>()
         .join(", ");
     format!(
@@ -3994,6 +3994,20 @@ fn provenance_summary(
         entry.commits.len(),
         if entry.commits.len() == 1 { "" } else { "s" },
     )
+}
+
+/// What to call one producer in the human table.
+///
+/// A `Co-Authored-By` trailer may carry an address and no name, which would
+/// otherwise print as a dangling separator between two commas. Both halves go
+/// through [`single_line`] because both are repository content.
+fn producer_display_name(producer: &Producer) -> String {
+    let name = single_line(&String::from_utf8_lossy(&producer.name));
+    if name.is_empty() {
+        single_line(&String::from_utf8_lossy(&producer.email))
+    } else {
+        name
+    }
 }
 
 fn log_page_line(commits: &[CommitInfo], has_more: bool) -> String {
