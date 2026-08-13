@@ -1,0 +1,15 @@
+[package]
+name = "harkness-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# No dependencies yet: this crate is the boundary ADR-0009 draws, and #157 is
+# what fills it. Whatever is added here, the runtime crate and the two front
+# ends are not eligible — see the manifest test in `src/lib.rs`, which reads
+# this file and fails on their names.

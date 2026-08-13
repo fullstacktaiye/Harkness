@@ -4,6 +4,10 @@ members = [
     "crates/harkness-git",
     "crates/harkness-core",
     "crates/harkness-context",
+    "crates/harkness-acp",
+    "crates/harkness-mcp",
+    "crates/harkness-forge",
+    "crates/harkness-recipe",
     "crates/harkness-runtime",
     "crates/harkness-cli",
     "crates/harkness-gui",
@@ -17,11 +21,21 @@ license = "MIT"
 repository = "https://github.com/fullstacktaiye/harkness"
 
 [workspace.dependencies]
+# ADR-0010 adopts the official ACP schema artifacts rather than hand-rolled
+# serde, pinned to a schema/v1 release. ADR-0014 fixes protocol version 1, so
+# every `unstable_*` feature stays off — `unstable_protocol_v2` above all, which
+# is why default features are named explicitly here rather than inherited.
+# `harkness-acp` takes this up in #149; nothing depends on it yet.
+agent-client-protocol-schema = { version = "1.6", default-features = false }
 base64 = "0.22"
 clap = { version = "4.6.5", features = ["derive"] }
 dirs = "6.0"
 git2 = { version = "0.21", default-features = false }
+harkness-acp = { path = "crates/harkness-acp" }
 harkness-context = { path = "crates/harkness-context" }
+harkness-forge = { path = "crates/harkness-forge" }
+harkness-mcp = { path = "crates/harkness-mcp" }
+harkness-recipe = { path = "crates/harkness-recipe" }
 harkness-core = { path = "crates/harkness-core" }
 harkness-git = { path = "crates/harkness-git" }
 harkness-runtime = { path = "crates/harkness-runtime" }
