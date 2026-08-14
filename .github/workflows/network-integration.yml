@@ -94,9 +94,12 @@ jobs:
       - name: Test runtime
         run: cargo test --locked -p harkness-runtime
       # The shared JSON-RPC transport is where every ACP agent and MCP server
-      # gets spawned, framed, and torn down, and its process-group and signal
-      # behaviour differs per platform — so it runs on all three legs rather than
-      # only where it was written.
+      # gets spawned, framed, and torn down. Its subprocess tests are Unix-only,
+      # because `Fixture::shim` writes a `#!/bin/sh` script — the same reason
+      # `harkness-git`'s runner tests are. What the Windows leg carries is the
+      # platform-independent half plus the one check that genuinely differs
+      # there: `SpawnSpec` refuses a program that is not absolute, and
+      # `/usr/bin/agent` is rooted but *not* absolute on Windows.
       - name: Test transport
         run: cargo test --locked -p harkness-transport
       # The v0.5 adapter crates are skeletons, so what these run is the ADR-0009

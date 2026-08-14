@@ -1007,22 +1007,32 @@ mod tests {
         let (transport, _recorded) = ScriptedTransport::with(Vec::new());
         let connection = Connection::new(transport, cancellation.clone());
 
+        // Stamped before the token is tripped, so an observer that sees the
+        // cancellation finds the instant already recorded. Measuring from the
+        // start of the test instead would fold in however long a loaded runner
+        // took to schedule this thread, which is not the property under test.
+        let requested = Arc::new(Mutex::new(None));
+        let stamp = Arc::clone(&requested);
         let tripping = cancellation.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(30));
+            *stamp.lock().unwrap() = Some(Instant::now());
             tripping.cancel();
         });
 
-        let started = Instant::now();
         let error = connection
             .request("slow", None, Instant::now() + Duration::from_secs(30))
             .unwrap_err();
+        let noticed = requested
+            .lock()
+            .unwrap()
+            .expect("the token was tripped before this was observed")
+            .elapsed();
 
         assert_eq!(error.kind(), "cancelled");
         assert!(
-            started.elapsed() < Duration::from_millis(250),
-            "cancellation took {:?}",
-            started.elapsed()
+            noticed < Duration::from_millis(250),
+            "cancellation took {noticed:?} to become visible"
         );
     }
 

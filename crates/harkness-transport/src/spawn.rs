@@ -292,6 +292,24 @@ mod tests {
     use super::{DEFAULT_MAX_MESSAGE_BYTES, SpawnSpec};
     use crate::error::TransportError;
 
+    /// An absolute program path *on the platform running the test*.
+    ///
+    /// `Path::is_absolute` answers for the current platform, and that is the
+    /// right question here: unlike a durable trust record, which outlives the
+    /// machine that wrote it and must recognize both conventions, a `SpawnSpec`
+    /// describes a program this machine is about to launch. `/usr/bin/agent` is
+    /// rooted but not absolute on Windows, so the tests have to name a path the
+    /// platform would actually accept or they assert the opposite of what they
+    /// read.
+    #[cfg(unix)]
+    const PROGRAM: &str = "/usr/bin/agent";
+    #[cfg(unix)]
+    const WORKSPACE: &str = "/workspace";
+    #[cfg(windows)]
+    const PROGRAM: &str = r"C:\Program Files\agent\agent.exe";
+    #[cfg(windows)]
+    const WORKSPACE: &str = r"C:\workspace";
+
     fn detail(spec: &SpawnSpec) -> String {
         match spec.validate() {
             Err(TransportError::InvalidSpawnSpec { detail }) => detail,
@@ -301,7 +319,7 @@ mod tests {
 
     #[test]
     fn an_absolute_program_and_directory_validate() {
-        let spec = SpawnSpec::new("/usr/bin/agent", "/workspace")
+        let spec = SpawnSpec::new(PROGRAM, WORKSPACE)
             .arg("--stdio")
             .env("PATH", "/usr/bin:/bin");
 
@@ -311,42 +329,35 @@ mod tests {
 
     #[test]
     fn a_relative_program_is_refused_by_name() {
-        assert!(detail(&SpawnSpec::new("agent", "/workspace")).contains("PATH"));
+        assert!(detail(&SpawnSpec::new("agent", WORKSPACE)).contains("PATH"));
     }
 
     #[test]
     fn a_relative_working_directory_is_refused_by_name() {
-        assert!(
-            detail(&SpawnSpec::new("/usr/bin/agent", "workspace")).contains("working directory")
-        );
+        assert!(detail(&SpawnSpec::new(PROGRAM, "workspace")).contains("working directory"));
     }
 
     #[test]
     fn a_bound_that_refuses_every_message_is_refused() {
-        assert!(
-            detail(&SpawnSpec::new("/usr/bin/agent", "/workspace").max_message_bytes(0))
-                .contains("zero")
-        );
+        assert!(detail(&SpawnSpec::new(PROGRAM, WORKSPACE).max_message_bytes(0)).contains("zero"));
     }
 
     #[test]
     fn a_startup_deadline_that_has_already_passed_is_refused() {
         assert!(
-            detail(
-                &SpawnSpec::new("/usr/bin/agent", "/workspace").startup_deadline(Duration::ZERO)
-            )
-            .contains("zero")
+            detail(&SpawnSpec::new(PROGRAM, WORKSPACE).startup_deadline(Duration::ZERO))
+                .contains("zero")
         );
     }
 
     #[test]
     fn an_environment_name_the_system_cannot_carry_is_refused() {
         assert!(
-            detail(&SpawnSpec::new("/usr/bin/agent", "/workspace").env("A=B", "c"))
+            detail(&SpawnSpec::new(PROGRAM, WORKSPACE).env("A=B", "c"))
                 .contains("usable environment variable name")
         );
         assert!(
-            detail(&SpawnSpec::new("/usr/bin/agent", "/workspace").env("", "c"))
+            detail(&SpawnSpec::new(PROGRAM, WORKSPACE).env("", "c"))
                 .contains("usable environment variable name")
         );
     }
@@ -357,7 +368,7 @@ mod tests {
     fn debug_output_names_environment_keys_and_no_values() {
         let rendered = format!(
             "{:?}",
-            SpawnSpec::new("/usr/bin/agent", "/workspace").env("GITHUB_TOKEN", "ghp_secret")
+            SpawnSpec::new(PROGRAM, WORKSPACE).env("GITHUB_TOKEN", "ghp_secret")
         );
 
         assert!(rendered.contains("GITHUB_TOKEN"));

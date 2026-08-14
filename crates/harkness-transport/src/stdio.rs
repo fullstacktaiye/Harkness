@@ -76,6 +76,10 @@ const OUTBOUND_CAPACITY: usize = 256;
 const OUTBOUND_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long the peer's process group has to exit after `SIGTERM`.
+///
+/// Unix only, because the rung it bounds is: Windows has no `SIGTERM` to wait
+/// out.
+#[cfg(unix)]
 const SIGNAL_GRACE: Duration = Duration::from_secs(2);
 
 /// How long a dropped connection waits before it starts signalling.
@@ -898,7 +902,15 @@ fn drain_stderr(stderr: ChildStderr, sink: Box<dyn StderrSink>, counts: &Counts)
     sink.finish();
 }
 
+/// Every test here drives a real child process through `Fixture::shim`, which
+/// writes a `#!/bin/sh` script and marks it executable — so the module is gated
+/// rather than each of its tests, matching how `harkness-git`'s runner tests are
+/// arranged. Windows coverage of this crate is the platform-independent half:
+/// framing, correlation against a scripted transport, the error tables, and the
+/// spawn-description checks, which is where the `Path::is_absolute` difference
+/// that actually varies by platform lives.
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use std::{
         io,
@@ -975,6 +987,45 @@ mod tests {
         }
     }
 
+    /// Trips `cancellation` shortly, reporting *when* it did.
+    ///
+    /// The instant matters because the target is detection latency, not thread
+    /// scheduling. Measuring from the start of the test folds in however long a
+    /// loaded runner took to get the tripping thread onto a core, which on a
+    /// busy macOS runner is most of the budget and none of the property.
+    fn cancel_shortly(cancellation: &Cancellation) -> std::sync::Arc<Barrier> {
+        let requested = std::sync::Arc::new(Barrier::default());
+        let stamp = std::sync::Arc::clone(&requested);
+        let tripping = cancellation.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            // Stamped before the token is tripped, so an observer that sees the
+            // cancellation is guaranteed to find the instant already recorded.
+            stamp.stamp();
+            tripping.cancel();
+        });
+        requested
+    }
+
+    /// The instant a cancellation was asked for.
+    #[derive(Default)]
+    struct Barrier(std::sync::Mutex<Option<Instant>>);
+
+    impl Barrier {
+        fn stamp(&self) {
+            *self.0.lock().unwrap() = Some(Instant::now());
+        }
+
+        /// How long after the request the caller noticed.
+        fn since_request(&self) -> Duration {
+            self.0
+                .lock()
+                .unwrap()
+                .expect("the token was tripped before this was observed")
+                .elapsed()
+        }
+    }
+
     /// A peer that answers every request by echoing its parameters back.
     fn echo_peer(fixture: &Fixture) -> PathBuf {
         fixture.shim(
@@ -989,7 +1040,6 @@ done
     }
 
     #[test]
-    #[cfg(unix)]
     fn a_request_and_its_response_cross_the_connection() {
         let fixture = Fixture::new();
         let workspace = fixture.directory("echo");
@@ -1018,7 +1068,6 @@ done
     /// inherit-and-scrub, and a canary in this process's own environment is the
     /// only way to prove the child's environment was built rather than filtered.
     #[test]
-    #[cfg(unix)]
     fn nothing_reaches_the_child_that_was_not_allowlisted() {
         let fixture = Fixture::new();
         let workspace = fixture.directory("allowlist");
@@ -1053,7 +1102,6 @@ printf '{"jsonrpc":"2.0","method":"env","params":{"canary":"%s","allowed":"%s","
     }
 
     #[test]
-    #[cfg(unix)]
     fn standard_error_is_captured_and_is_not_a_failure() {
         let fixture = Fixture::new();
         let workspace = fixture.directory("chatty");
@@ -1083,7 +1131,6 @@ while IFS= read -r line; do :; done
     }
 
     #[test]
-    #[cfg(unix)]
     fn non_protocol_output_desynchronizes_and_quarantines_the_connection() {
         let fixture = Fixture::new();
         let workspace = fixture.directory("garbage");
@@ -1119,7 +1166,6 @@ while IFS= read -r line; do :; done
     }
 
     #[test]
-    #[cfg(unix)]
     fn an_oversized_line_is_refused_without_being_buffered() {
         let fixture = Fixture::new();
         let workspace = fixture.directory("oversized");
@@ -1146,7 +1192,6 @@ while IFS= read -r line; do :; done
     }
 
     #[test]
-    #[cfg(unix)]
     fn an_idle_exit_is_told_apart_from_one_mid_message() {
         let fixture = Fixture::new();
 
@@ -1178,7 +1223,6 @@ while IFS= read -r line; do :; done
     /// outcome records which rung was reached because "this agent had to be
     /// killed" is a bug report rather than an implementation detail.
     #[test]
-    #[cfg(unix)]
     fn a_peer_ignoring_sigterm_is_killed_and_the_outcome_says_so() {
         let fixture = Fixture::new();
         let workspace = fixture.directory("stubborn");
@@ -1204,7 +1248,6 @@ while true; do sleep 0.05; done
     }
 
     #[test]
-    #[cfg(unix)]
     fn a_peer_that_exits_on_a_closed_stdin_needs_no_signal() {
         let fixture = Fixture::new();
         let workspace = fixture.directory("polite");
@@ -1228,7 +1271,6 @@ while true; do sleep 0.05; done
     /// server keeps the workspace open after the connection that started it is
     /// gone. The activity file is the only evidence once the group is dead.
     #[test]
-    #[cfg(unix)]
     fn teardown_leaves_no_process_in_the_peer_group() {
         let fixture = Fixture::new();
         let workspace = fixture.directory("helpers");
@@ -1269,7 +1311,6 @@ wait
     /// pipe, after the direct child is reaped. The group has to be signalled on
     /// every rung, not only on the one that reaches `SIGTERM`.
     #[test]
-    #[cfg(unix)]
     fn a_helper_outliving_a_polite_peer_is_still_reaped() {
         let fixture = Fixture::new();
         let workspace = fixture.directory("polite-helper");
@@ -1316,7 +1357,6 @@ exit 0
     }
 
     #[test]
-    #[cfg(unix)]
     fn the_startup_deadline_expires_and_leaves_no_live_child() {
         let fixture = Fixture::new();
         let workspace = fixture.directory("slow-start");
@@ -1351,7 +1391,6 @@ exit 0
     /// A handshake that finishes stops the deadline, so a long-lived session is
     /// not torn down thirty seconds after it started working.
     #[test]
-    #[cfg(unix)]
     fn a_completed_handshake_ends_the_startup_window() {
         let fixture = Fixture::new();
         let workspace = fixture.directory("handshake");
@@ -1380,7 +1419,6 @@ exit 0
     }
 
     #[test]
-    #[cfg(unix)]
     fn cancellation_becomes_visible_while_waiting_for_a_peer() {
         let fixture = Fixture::new();
         let workspace = fixture.directory("cancellation");
@@ -1392,22 +1430,17 @@ exit 0
         let transport = launch(|| spec(&quiet_peer, &workspace), cancellation.clone());
         transport.handshake_complete();
 
-        let waiting = cancellation.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(30));
-            waiting.cancel();
-        });
+        let requested = cancel_shortly(&cancellation);
 
-        let started = Instant::now();
         let error = transport
             .recv_deadline(Instant::now() + Duration::from_secs(30))
             .unwrap_err();
+        let noticed = requested.since_request();
 
         assert_eq!(error.kind(), "cancelled");
         assert!(
-            started.elapsed() < VISIBILITY_TARGET,
-            "cancellation took {:?}",
-            started.elapsed()
+            noticed < VISIBILITY_TARGET,
+            "cancellation took {noticed:?} to become visible"
         );
     }
 
@@ -1415,7 +1448,6 @@ exit 0
     /// that only checked its token between messages would be at the mercy of the
     /// peer's pace, so the check is per poll slice rather than per message.
     #[test]
-    #[cfg(unix)]
     fn cancellation_becomes_visible_while_a_peer_is_streaming() {
         let fixture = Fixture::new();
         let workspace = fixture.directory("streaming-cancellation");
@@ -1431,13 +1463,8 @@ done
         let transport = launch(|| spec(&streaming_peer, &workspace), cancellation.clone());
         transport.handshake_complete();
 
-        let tripping = cancellation.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(30));
-            tripping.cancel();
-        });
+        let requested = cancel_shortly(&cancellation);
 
-        let started = Instant::now();
         let deadline = Instant::now() + Duration::from_secs(30);
         let error = loop {
             match transport.recv_deadline(deadline) {
@@ -1446,12 +1473,12 @@ done
                 Err(error) => break error,
             }
         };
+        let noticed = requested.since_request();
 
         assert_eq!(error.kind(), "cancelled");
         assert!(
-            started.elapsed() < VISIBILITY_TARGET,
-            "cancellation took {:?}",
-            started.elapsed()
+            noticed < VISIBILITY_TARGET,
+            "cancellation took {noticed:?} to become visible"
         );
     }
 
@@ -1460,7 +1487,6 @@ done
     /// without it the enqueue would run to the transport's own 30-second
     /// backstop, thirty times what a one-second caller asked for.
     #[test]
-    #[cfg(unix)]
     fn an_enqueue_gives_up_at_the_callers_deadline() {
         let fixture = Fixture::new();
         let workspace = fixture.directory("deaf");
@@ -1517,7 +1543,6 @@ done
     }
 
     #[test]
-    #[cfg(unix)]
     fn an_already_cancelled_token_launches_nothing() {
         let fixture = Fixture::new();
         let workspace = fixture.directory("pre-cancelled");
@@ -1536,7 +1561,6 @@ done
     }
 
     #[test]
-    #[cfg(unix)]
     fn a_missing_program_fails_before_anything_is_running() {
         let fixture = Fixture::new();
         let workspace = fixture.directory("missing");
@@ -1552,7 +1576,6 @@ done
     /// One peer's fault is one peer's problem. Quarantine is per connection, and
     /// nothing about it is shared with another.
     #[test]
-    #[cfg(unix)]
     fn quarantine_is_confined_to_the_connection_that_faulted() {
         let fixture = Fixture::new();
         let good_workspace = fixture.directory("isolated-good");
@@ -1584,7 +1607,6 @@ done
     /// number of bytes — the property is that the connection stays usable and
     /// the queue stays bounded while a chatty peer runs unread.
     #[test]
-    #[cfg(unix)]
     fn a_peer_outrunning_its_consumer_is_bounded_rather_than_buffered() {
         let fixture = Fixture::new();
         let workspace = fixture.directory("backpressure");
