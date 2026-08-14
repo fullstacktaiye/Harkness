@@ -1,0 +1,29 @@
+{
+  "v": 1,
+  "id": "forbidden_path",
+  "steps": [
+    {
+      "expect": {
+        "kind": "run_started"
+      },
+      "action": {
+        "kind": "call_tool",
+        "tool_id": "fs.read",
+        "tool_version": "1.0.0",
+        "input": {
+          "path": "../outside"
+        }
+      }
+    },
+    {
+      "expect": {
+        "kind": "tool_failed",
+        "error_kind": "forbidden_path"
+      },
+      "action": {
+        "kind": "complete_run",
+        "summary": "Observed and reported the workspace boundary refusal."
+      }
+    }
+  ]
+}

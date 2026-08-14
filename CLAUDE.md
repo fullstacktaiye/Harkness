@@ -66,6 +66,7 @@ build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing lin
 `crates/harkness-core/src/catalog/fixtures/*.json`, `crates/harkness-runtime/src/domain/fixtures/*.json`,
 `crates/harkness-context/src/fixtures/*.json`,
 `crates/harkness-runtime/src/approval/fixtures/canonical-input-v1.json`,
+`crates/harkness-runtime/src/agent/fixtures/*.json`,
 `crates/harkness-runtime/src/integration/fixtures/*.json`, and
 `crates/harkness-runtime/src/store/fixtures/runtime-v{1..5}.db` pin released on-disk formats. A new
 persisted field, state spelling, or table means a version bump plus a *new* fixture, not an edit to
@@ -134,6 +135,11 @@ translating between two cancellation mechanisms.
   an existing grant covers a new call, and the condvar-backed gate a parked call is woken through.
   It is the only production source of a `policy::RunGrant` — policy cannot construct one — so an
   `Ask` becomes an `Allow` only because the matcher accepted a grant.
+  `agent` is the plain-data decision seam above those pieces: `Agent::next_action` consumes one
+  redacted observation and returns one request. `MockAgent` replays one of ten versioned,
+  deterministic scripts with no access to the registry, policy, approvals, store, scheduler, or
+  execution context. Its checkpoint carries a scenario cursor plus a chained observation digest;
+  the JSON scenario fixtures under `src/agent/fixtures/` are frozen v1 wire evidence.
   `integration` is the same idea across the process boundary: identifiers, identity records, and
   per-subject `TrustRecord`s for the external things v0.5 talks to (ACP agents, MCP servers and
   their tool schemas, recipes, forge accounts and repositories). It is pure vocabulary — the check

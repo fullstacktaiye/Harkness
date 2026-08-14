@@ -136,6 +136,7 @@ pub use event::{
 };
 pub use listing::{DEFAULT_RUN_PAGE_LIMIT, MAX_RUN_PAGE_LIMIT, RunCursor, RunListing, RunPage};
 pub use migration::SCHEMA_VERSION;
+pub(crate) use redaction::redact_payload;
 pub use redaction::{PassThrough, Redactor};
 
 /// Name of the run database inside the Harkness data directory.
