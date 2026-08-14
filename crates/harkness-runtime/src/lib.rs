@@ -27,6 +27,13 @@
 //! group. The executor promises one call reaches a terminal state; the
 //! scheduler is what says anything at all about a second one.
 //!
+//! [`agent`] is the plain-data decision seam above those gates. An agent sees a
+//! redacted observation and may return a tool *request*, but it receives no
+//! registry, policy, approval, store, scheduler, or execution handle. The
+//! deterministic [`agent::MockAgent`] exercises that same seam from versioned
+//! scenarios, so its tests cannot bypass protections a future model-backed
+//! implementation will face.
+//!
 //! [`approval`] is where a policy `Ask` becomes durable. It owns the request
 //! record and its lifecycle, the frozen canonical hash a grant is bound to, the
 //! matcher that decides whether an existing grant covers a new call, and the
@@ -43,6 +50,7 @@
 //! Trust there is a precondition and never an authorization: a trusted subject
 //! still passes [`policy`] and [`approval`] on every action it takes.
 
+pub mod agent;
 pub mod approval;
 pub mod domain;
 pub mod integration;
@@ -50,4 +58,5 @@ pub mod policy;
 pub mod schedule;
 pub mod store;
 pub mod tool;
+pub mod tools;
 pub mod trust;

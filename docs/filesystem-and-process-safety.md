@@ -13,7 +13,21 @@ argv vector, a contained working directory, and an `AllowlistedEnv`. There is no
 shell-command form. The child environment starts empty and copies only the
 baseline `PATH`, `HOME`, `LANG`, `LC_ALL`, and `TERM` variables that exist in
 the parent, plus exact validated names published by the tool descriptor.
-Wildcard declarations are not supported.
+Wildcard declarations are not supported. A concrete process request may
+override only those same names; an input environment map cannot add a name the
+descriptor did not publish. Baseline names may be overridden because they are
+already part of every arbitrary-child contract.
+
+`process.exec` and `test.run` build exclusively on this command shape and the
+runtime's `ToolProcess` supervisor. Their child timeout defaults to 120 seconds
+and is capped at 600. Windows binds the child to a Job Object before it runs, so
+timeout and cancellation end the whole descendant tree. Unix ends the process
+group; a descendant that deliberately creates a new session can survive that
+portable boundary, but stoppable pipe readers prevent it from holding the call
+open. Standard output and standard error stream to artifacts, with only
+bounded tails retained inline. `test.run` is the same supervisor with an explicit
+command input and a pass/fail projection, not a second process implementation or
+a command-discovery system.
 
 The Git runner keeps its existing denylist model. Git is one known executable
 whose credential helpers and askpass integration depend on the caller's

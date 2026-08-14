@@ -1,0 +1,37 @@
+{
+  "v": 1,
+  "id": "user_cancellation",
+  "steps": [
+    {
+      "expect": {
+        "kind": "run_started"
+      },
+      "action": {
+        "kind": "call_tool",
+        "tool_id": "process.exec",
+        "tool_version": "1.0.0",
+        "input": {
+          "argv": [
+            "fixture-cancellable",
+            "--exact",
+            "scenario_process_fixture_cancellable_child",
+            "--ignored",
+            "--nocapture"
+          ],
+          "timeout_seconds": 120
+        }
+      }
+    },
+    {
+      "expect": {
+        "kind": "cancelled"
+      },
+      "action": {
+        "kind": "fail_run",
+        "reason": {
+          "kind": "cancelled"
+        }
+      }
+    }
+  ]
+}

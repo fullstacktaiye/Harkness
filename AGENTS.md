@@ -2,11 +2,12 @@
 
 ## Project Structure & Module Organization
 
-Harkness is a Rust 2024 workspace split into eleven crates under `crates/`:
+Harkness is a Rust 2024 workspace split into twelve crates under `crates/`:
 
 - `harkness-core`: project catalog, storage layout, cross-domain project workflows, and directory-listing logic shared by front ends.
-- `harkness-git`: all production Git behavior: inspection, diffs and history, file context and hunk staging, branch and worktree mutation, commits, clone and synchronization, hermetic process execution, and repository locking.
+- `harkness-git`: all production Git behavior: inspection, diffs and history, change provenance, file context and hunk staging, branch and worktree mutation, commits, clone and synchronization, hermetic process execution, and repository locking.
 - `harkness-context`: the context engine's typed vocabulary — workspace snapshot identity, stable identifiers, provenance, and file classification.
+- `harkness-transport`: the shared subprocess JSON-RPC engine both protocol adapters run on — hermetic allowlisted spawn, newline-delimited framing, request correlation, bounded messages, and the close-stdin/`SIGTERM`/`SIGKILL` teardown. Below every adapter and above nothing but `harkness-git`.
 - `harkness-acp`, `harkness-mcp`, `harkness-forge`, `harkness-recipe`: the v0.5 external-integration adapters — the Agent Client Protocol client, the Model Context Protocol client, forge-neutral contracts with the GitHub REST adapter, and the workflow-recipe source format and compiler. Currently skeletons; see the invariants below.
 - `harkness-test-fixtures`: hermetic repository, filesystem, and process fixtures shared only by crate tests.
 - `harkness-runtime`: typed task, run, step, and tool-call records, the typed tool contract and registry every executable operation implements, the execution contracts shared by front ends, and the SQLite run store that makes those records durable.
@@ -138,6 +139,62 @@ side-by-side alignment belongs to the model and must not become a property of a
 display setting. A line ending is carried as a name on the row rather than left
 in the segment text, so the reveal never has to decide what a carriage return
 looks like mid-run.
+
+## Change Provenance Invariants
+
+Change provenance is derived from the repository and persisted nowhere. There is
+no provenance file, table, or column, and adding one to `harkness-git` is not how
+a recorded source lands: it composes above `harkness-runtime` and enriches the
+same `ChangeProvenance` a Git-derived read already returns. ADR-0019 records why,
+and a second read interface for the panel to choose between is the outcome it
+exists to prevent.
+
+**Attribution is advisory and nothing may act on it.** No staging, discarding, or
+diffing decision may read a `FileProvenance`, a `Producer`, or a
+`ProvenanceGap`. A wrong attribution must stay a cosmetic error, and that licence
+is what pays for skipping merges and for not following renames.
+
+**One walk per range, never one per file.** The range a `DiffTarget` implies is
+walked once and each commit compared with its first parent once. Nothing may add
+a per-path history walk — `git blame` and rename following are both that — because
+a thousand-file review must open no slower than a one-file one. Reaching
+`ProvenanceOptions::max_commits` degrades to a named
+`ProvenanceTruncation`, never to a failed read.
+
+**Every requested path is reported, and absence is a named answer.** A path
+nothing could be attributed to carries a `ProvenanceGap` rather than an empty
+field, because most repositories have no Harkness runs and every working-tree
+comparison is uncommitted content. Blank is not an answer and a guess is worse
+than one.
+
+**A narrowed request narrows the whole record.** A commit that touched none of
+the requested paths is not in `commits` and its author is not in `producers`: a
+result must not carry commits no file references or count people whose work is
+not being reviewed. `walked_commits` is what says how far the walk went.
+
+**Which paths are asked about is a `ProvenancePaths`, never a list whose
+emptiness is interpreted.** `All` and `Only(vec![])` are opposite requests — a
+whole range, and nothing — and inferring one from an empty `Vec` would make a
+review with no changed files walk its entire history. Do not reintroduce a bare
+path list beside it.
+
+**Only what a commit records is reported.** A producer is a Git `author` or a
+`Co-Authored-By` trailer and `ProducerKind` says which; neither is classified as
+human or machine, for the reason ADR-0017 gives. The `agent/<slug>` reading is
+the one Harkness-specific inference, it is recorded on the range rather than on a
+file, and a caller that pinned a review to object ids supplies the reference it
+resolved through `ProvenanceOptions::head_reference` — which changes what the
+convention reads and never changes a walk. Commit messages and identities are
+repository content: trailer parsing is bounded by `MAX_CO_AUTHORS_PER_COMMIT`,
+and a producer name reaching a surface is collapsed to one line in both front
+ends — `single_line` in the CLI, `collapse_whitespace` in the panel — so it
+cannot forge a column or decide how tall a row is. In the panel a name is
+rendered only by a `Text.PlainText` label and never reaches a tool tip, whose
+style-supplied label renders `Text.AutoText` and would treat a name shaped like
+markup as markup; a tool tip reports the *number* of producers instead.
+
+**Provenance reads take no repository lock and spawn no process**, exactly as
+every other read on `GitService` does not.
 
 ## Run Store Schema & Connection Invariants
 
@@ -519,6 +576,76 @@ to resolve twice to learn what ran — and two lookups can disagree where one
 cannot. `InvocationError` therefore has no `From<ToolError>` conversion: building
 a tool failure requires naming the tool, so a `?` cannot produce one that forgot.
 
+## Agent Interface & Mock Scenario Invariants
+
+`agent` is a plain-data decision seam. An `Agent` receives one redacted
+`Observation` and returns one `AgentAction`; it never receives a registry,
+policy evaluator, approval gate, store, scheduler, execution context, or tool
+body. `CallTool.input` deliberately remains a `serde_json::Value`: the agent may
+request work, but only the coordinator may validate, authorize, persist,
+schedule, and execute it. In particular, the `invalid_tool_input` scenario must
+emit its bad value verbatim and let the real registry return `invalid_input`
+before any tool body runs. Adding a convenience method to `MockAgent` that
+performs or pre-validates an action would be a privileged path a future model
+agent does not have.
+
+Agent-facing tool results and failures are constructed only through projections
+that require the coordinator's `Redactor`; their fields stay private so raw
+executor output cannot be wrapped directly. Result projection rewrites every
+JSON string value recursively without rewriting object keys, while failure
+projection rewrites caller-controlled detail and preserves the Harkness-defined
+error-kind discriminant. Artifact references already came from the redacting
+artifact store and are carried unchanged. These live result, failure, and
+observation types do not implement public deserialization; persisted
+observations decode only through the crate-private versioned record path.
+
+`MockAgent` advances only through `Agent::next_action`. A scenario transition is
+one structural observation pattern and one action; patterns omit incidental
+record ids and may select only the stable fields their case is about, such as an
+error kind, approval direction, or artifact media type. A mismatch returns a
+typed `scenario_divergence` naming the expected and actual observation kinds
+and does not advance the cursor. The ten built-ins are Rust data mirrored
+byte-for-byte by versioned JSON fixtures. The registry order is stable, every
+script is bounded, and exactly its final action is terminal.
+
+Process scenarios name fixture executables rather than host utilities: their
+argv re-executes the hermetic integration-test binary through an exact ignored
+child test. The fixture harness installs platform-native links under those
+names and scopes a prepended `PATH` to the coordinator invocation, so the real
+cleared-environment process runner resolves the same bare name the frozen action
+contains. A built-in must never depend on a POSIX-only utility or on a program a
+test did not create explicitly.
+
+Scenario fixtures probe `v` before their strict `deny_unknown_fields` body, so a
+future fixture asks for an upgrade while a same-version unknown field is a
+malformed current fixture. The fixture files are frozen wire evidence: changing
+an action, pattern, field, or spelling means publishing a new version beside v1,
+not editing what v1 meant. They do no I/O, read no environment, sleep on no
+clock, and reach no network or model.
+
+`AgentSessionState` is independently schema-versioned and strict. Its session id
+names one conversation; its fixture version, definition digest, and cursor name
+the exact next transition; its chained, domain-separated SHA-256 digest commits
+to the observations already consumed without retaining workspace content. The
+definition digest commits to the caller-supplied scenario id too, so the raw id
+is not made durable or hidden from redaction. Recovery resolves that exact
+retained definition and refuses a same-id script whose bytes differ. A resumed
+mock continues the chain from the history digest. Session ids are not
+determinism evidence — two replays may have different ids — while identical
+observation histories must yield identical actions and digests.
+
+Standalone actions and observations are persisted only through
+`AgentActionRecord` and `ObservationRecord`, whose schema version is probed
+before their strict body. The raw enums remain serializable because they are
+embedded in the independently versioned scenario fixture. Their generic event
+payloads encode the already-redacted versioned record as numeric bytes, so the
+store's mandatory string redaction cannot rewrite enum tags, semantic versions,
+or UUID spellings; observation decoding is crate-private. Checkpoints use the
+same rule through `AgentSessionState::to_event_payload`: every machine identity
+and digest is encoded as numeric bytes, because the store correctly redacts
+every JSON string value. Decoding goes through `from_event_payload`; a raw
+checkpoint or record JSON object is not an event payload.
+
 ## Tool Execution Invariants
 
 A recorded tool call always reaches a terminal state. That is the executor's one
@@ -533,7 +660,8 @@ on the calling thread is not a timeout. When the grace period expires the worker
 *abandoned*, not killed, since Rust cannot kill a thread; it owns its whole
 `ExecutionContext`, so nothing dangles. A tool that never polls its token therefore
 leaks a thread per call, which is why cancellation is a contract rather than a
-courtesy. A child *process* has no such caveat and is killed by process group.
+courtesy. A child *process* has no such caveat and is killed with its supervised
+process tree.
 
 A tool receives a token belonging to its own call, never the caller's.
 `Cancellation` latches and has no reset, so enforcing a deadline by cancelling the
@@ -588,15 +716,33 @@ applied twice; telling a call abandoned by a dead process from one still
 executing is a question about run ownership — the `owner_pid` column exists for
 it — and is not the executor's to answer.
 
-A process group is the unit of execution, so it is the unit that ends. When the
-direct child exits, the group is signalled before its output is collected: a pipe
+An executor may abandon an ordinary synchronous tool after the termination
+grace because Rust cannot kill its worker thread. A built-in tool with a bounded
+irreversible commit phase crosses that boundary through
+`ExecutionContext::begin_irreversible` immediately before its first commit and
+only after all validation is complete. The transition is one-way and races the
+executor's stop request under one mutex: either the stop wins and the commit is
+refused, or the commit wins and the executor waits for the body's real outcome
+instead of persisting cancellation while workspace bytes can still change.
+Third-party tools cannot enter this phase; making the hook public would let an
+untrusted body disable the executor's abandonment guarantee indefinitely.
+
+A supervised process unit is the unit of execution, so it is the unit that ends:
+a Unix process group or a Windows Job Object. A Unix descendant may deliberately
+detach into another session and outlive the portable process-group boundary; the
+supervisor makes its pipe readers stoppable so that descendant cannot hold the
+call open. A Windows child is assigned to its Job Object before it runs, so that
+platform retains a whole-descendant boundary. When the direct child exits, the
+supervisor is terminated before its output is collected: a pipe
 reaches end of file only when every write end closes, and a child that started a
 background helper leaves one open, so waiting for end of file would mean waiting
 however long the helper runs. Signalling after the child has been reaped is sound
-while any member is alive — the group keeps the identifier reserved — and is a
-harmless `ESRCH` once none is. A captured stream is *finished* on the stop paths
-rather than dropped: an unfinished artifact deletes the bytes it staged, and a
-build log matters most when the build was killed.
+while any Unix group member is alive — the group keeps the identifier reserved —
+and is a harmless `ESRCH` once none is. Closing a Windows Job Object configured
+with `KILL_ON_JOB_CLOSE` provides the corresponding descendant guarantee. A
+captured stream is *finished* on the stop paths rather than dropped: an unfinished
+artifact deletes the bytes it staged, and a build log matters most when the build
+was killed.
 
 `tool_calls.tool_version` is the one column of a recorded request that is ever
 rewritten, and only by `ToolCall::dispatch`, which pins the resolved version in the
@@ -632,6 +778,53 @@ away either: it is written as the `rejected-output.json` artifact of that call,
 because only the value says what the tool actually produced. Preserving it is best
 effort — a context with no artifact store must not change the failure the caller is
 told about.
+
+## Built-In Mutation & Process Tool Invariants
+
+`fs.apply_patch`, `process.exec`, and `test.run` are registered at `1.0.0` through
+`tools::register_mutating_tools`. Their descriptor risks are the scheduling and
+policy contract: patching is `WorkspaceWrite`; both process tools are `Execute`
+and declare that they spawn processes. No caller or registry helper special-cases
+their identifiers to recover metadata the descriptors omitted.
+
+A patch names every target twice: once in the unified diff and once in its base
+precondition. The two path sets must be identical. An existing file carries the
+lowercase SHA-256 of its exact bytes and a new file carries `null`; a mismatch is
+`stale_patch`. Containment, every hash, and every hunk are checked against
+in-memory base images before the first file is written, so a `patch_conflict`
+never leaves a prefix of the call applied. Deletes, renames, copies, binary
+patches, and missing parent directories are refused rather than interpreted as a
+more destructive operation than this tool declares. Old and new patch headers
+must name the same path. Every `.git` component and every symlink component is
+refused, even when a symlink's target remains inside the workspace, so the audited
+path is always the file that is replaced. Patch parsing and repository diff
+production stay behind `harkness-git`, the owner of production Git behavior.
+
+Each prepared file is replaced through a temporary file in the target directory:
+write, preserve or apply the requested regular/executable mode, sync, rename,
+then sync the directory. Immediately before each replacement, the lexical target
+and `ContainedPath` are revalidated and its exact bytes or absence are compared
+with the already-approved base image. An external edit therefore becomes
+`stale_patch` rather than being overwritten. Cancellation has one final gate
+before this bounded commit phase and is not reported between replacements, so a
+partially applied call is never recorded as cancelled. The result artifact is
+produced from libgit2's actual index-to-worktree diff over exactly the touched path
+set, not by echoing the caller's patch.
+
+`process.exec` has no shell form. `argv[0]` is the program and every later value
+is one argument even when it contains shell metacharacters. The cwd crosses the
+execution context's boundary, stdin is null, and the environment starts empty.
+An input override may replace only a fixed baseline name or an exact name the
+descriptor published; it can never enlarge that set. Both streams always go to
+artifacts and only a bounded tail enters the inline result.
+
+The child timeout defaults to 120 seconds and is clamped to 1 through 600. It is
+inside the enclosing call deadline: reaching it kills the supervised process
+tree and returns a typed result with `timed_out`, the enforced limit, duration,
+signal, tails, and both artifact references. Reaching the enclosing deadline
+remains a tool-call `timed_out` failure. `test.run` calls the same in-process supervisor —
+never nested tool dispatch — and adds only `passed = exit_code == 0 &&
+!timed_out`; a failing test is a valid test result, not a failed tool invocation.
 
 ## Runtime Scheduling Invariants
 
@@ -716,9 +909,9 @@ decided it. `cancel_run` trips the caller's token for running calls — that is 
 stop *is* — and the executor's own rule about never writing a caller's token is unchanged, because
 the executor is not the one asking.
 
-Shutdown cancels rather than abandons and then waits for its workers, so no child process group
-outlives the application. Dropping a `Scheduler` shuts it down; a caller wanting a different
-deadline calls `shutdown` first.
+Shutdown cancels rather than abandons and then waits for its workers, so no child
+process tree outlives the application. Dropping a `Scheduler` shuts it down; a
+caller wanting a different deadline calls `shutdown` first.
 
 ## Approval Invariants
 
@@ -858,13 +1051,125 @@ frozen request and decision fixtures pin its wire form. Approval identity column
 runtime database migration 6 and are nullable so v5 rows retain their exact meaning; never edit the
 released migration or v6 fixture.
 
+## Protocol Transport Invariants
+
+`harkness-transport` is the only place in the workspace that launches a protocol peer. An adapter
+speaks to a `JsonRpcTransport`; it never calls `Command::spawn`, never holds a `ChildStdin`, and
+never sends a signal. That is what makes a future remote transport a new implementation of one trait
+rather than an edit to protocol logic, and it is why `shutdown` takes `self: Box<Self>` — teardown
+has to consume the connection, and a by-value `self` would make the trait non-object-safe.
+
+A peer's environment is **allowlisted, not scrubbed**. `SpawnSpec` starts from `env_clear` and admits
+exactly the pairs a caller named; nothing is inherited and no wildcard exists. This is stricter than
+`GitCommand`'s denylist on purpose and the two must not be reconciled: Git is one known program whose
+credential helpers are the reason its runner keeps a denylist, while an agent is a program somebody
+else wrote running on a user's workspace. The program and the working directory are absolute by
+refusal rather than by convention, spawn is argv-only, and the child leads its own process group so
+teardown reaches its helpers.
+
+Everything a peer controls the size of is bounded, and the bound is enforced *before* the bytes are
+held. The inbound line is refused the moment it crosses `max_message_bytes`, so the most this process
+holds for a peer that never writes a newline is the limit plus one read chunk; a limit checked after
+a line is assembled is not a limit. The inbound queue, the outbound queue, the peer-message queue,
+and the retained stderr tail are each capped, and a full queue blocks its producer rather than
+growing. Nothing is discarded to make room.
+
+A message count is not a bound on memory, and the peer-message queue therefore carries a byte budget
+beside its count. A peer picks both how many messages it sends and how large each one is, so it picks
+their product: the count bound alone permits thousands of near-maximum messages and tens of gigabytes
+with every per-message limit respected. Whichever bound is reached first stops the pump. Any new
+queue holding peer-supplied content owes the same pair.
+
+A connection that faults is **quarantined and never resynchronized**. A non-JSON line, JSON that is
+not a JSON-RPC 2.0 message, a response to an id nobody sent, a second response to one already
+answered, and an oversized line all end the conversation. The thread that observed the fault gets the
+fault; every later caller gets `quarantined` naming it. Guessing where the next message starts is how
+one bad line becomes a wrong answer, so there is no recovery path and none may be added. Nothing a
+peer can put on standard output may panic a reader thread.
+
+Standard error is captured and is **never** an error signal. The MCP specification reserves it for
+free-form logging a client must not read as errors, so no byte written there fails a request,
+quarantines a connection, or changes a `ShutdownOutcome`. `StderrSink` is a trait because the
+destination is the artifact store, which lives above this crate; a sink method returns no `Result`,
+because a destination that stopped accepting bytes is a reason to stop capturing and never a reason
+to disturb a working conversation.
+
+Teardown is `close stdin → wait → SIGTERM → wait → SIGKILL` against the process *group*, it runs on
+`Drop` as well as on `shutdown`, and it is idempotent. Standard input is closed unconditionally and
+before the child's exit is inspected — the writer thread parks on its queue until every sender is
+gone, so a peer that had already exited would otherwise strand a thread teardown then waits on. The
+group is then killed on **every** rung, not only when the escalation is reached: the direct child
+being gone is not the group being gone, and a peer that backgrounded a helper and exited politely
+leaves that helper on the workspace *and* holding the standard-output pipe, so the reader never sees
+end of file either. While any member is alive the group keeps its identifier, so the signal is exact
+in the case it exists for; where the reaped child was the last member the group is already gone and
+the call is a harmless `ESRCH`, with a residual race — a window of microseconds in which that pid was
+recycled as another group's leader — that is stated rather than argued away. `harkness-runtime` takes
+the same trade signalling a reaped tool child's group. `ShutdownOutcome` records the rung reached, because "this agent had to be
+killed" is a bug report rather than an implementation detail. Windows has no `SIGTERM` and reports
+`killed` rather than claiming an escalation that did not happen.
+
+Correlation lives above the transport and disconnect kinds are finished there. The transport reports
+a clean exit as `idle` because it does not know what anybody asked for; `Connection` refines that to
+`exit_before_response` when the caller had a request outstanding. Outbound ids are allocated and
+never reused within a connection, which makes a duplicate outbound id unrepresentable rather than
+guarded against.
+
+A request that gives up **retires** its id rather than forgetting it, and the two must not be
+confused. A peer answering after this side's deadline passed is a peer behaving correctly — Harkness
+chose the deadline — so that late answer is discarded quietly. Forgetting the id instead would read
+it as a response to a request nobody sent, quarantine the connection, and make `request_timed_out`
+terminal in practice while `is_terminal` says it is not; an adapter trusting that and retrying would
+kill a live agent session over one slow call. A retired id records whether its one permitted answer
+has arrived, so a genuine *second* answer is still `duplicate_response_id`. Retained ids are bounded
+and evicted oldest-first; an answer arriving after eviction reads as an unknown id, which is the same
+conclusion reached later.
+
+The peer-message queue is bounded by the pump **refusing to read**, never by discarding: a dropped
+peer request is one an adapter never answers, and a dropped notification is history that silently did
+not happen. The bound therefore stalls the whole stream, and a caller waiting for a response behind
+unread messages cannot wait that out — one ordered stream, a bounded application queue, and an answer
+behind unconsumed messages leaves grow, discard, and fail as the whole of the choice. It fails, by
+name, as `peer_queue_full`. Do not "fix" that by silently dropping the overflow or by removing the
+bound; an adapter whose peer streams must consume what it sends.
+
+There is deliberately **no dispatcher thread**. Whichever caller is already blocked holds the pump,
+reads in poll-interval slices, routes what it finds, and re-offers it; a caller that is not leading
+waits on a condition variable for the same slice. Lock order is pump → table, and the pump is never
+taken while the pending table or the peer queue is held. Three OS threads per connection — stdout
+reader, writer, stderr reader — is the whole cost, and a fourth must not be added to "simplify"
+reading: a dispatcher blocked pushing into a full queue stalls every response behind it, which is the
+same stall with another thread paid for.
+
+A send that waits without reading is half of a deadlock, so `Connection` pumps between attempts
+rather than blocking inside the transport. The other half is a peer that floods its own output and
+stops reading its input until somebody drains it: this side's reader fills the inbound queue and
+parks, the peer's pipe fills, and the two wait for each other. `try_send` therefore hands the message
+*back* instead of taking it — returning it rather than requiring a clone is what keeps retrying
+affordable for a large one — and `send` is the blocking convenience built on top. A blocking send
+that does not drain must not be reintroduced.
+
+A caller's deadline bounds its *send* as well as its wait. A peer that stops reading its standard
+input fills its pipe and then the queue behind it, and an enqueue bounded only by the transport's own
+backstop overruns a one-second caller by thirty. Which bound expired decides which failure it is, and
+the distinction is load-bearing: the backstop expiring is a broken peer and is terminal, while the
+caller's own deadline expiring is `send_timed_out`, which is not — a short deadline is not evidence
+about the peer, and collapsing the two would let an impatient call end a working session.
+
+Cancellation is polled every 20 ms in every blocking phase, well inside the workspace's 250 ms
+visibility target, and an already-cancelled token launches nothing at all. `harkness_git::Cancellation`
+is re-exported rather than wrapped, so an adapter passes down the token it already holds instead of
+translating between two cancellation mechanisms.
+
 ## External-Integration Boundary Invariants
 
 `harkness-acp`, `harkness-mcp`, `harkness-forge`, and `harkness-recipe` sit strictly below
 `harkness-runtime`. None of them may name `harkness-runtime`, `harkness-cli`, or `harkness-gui` in
 its manifest, and none may depend on another adapter — shared machinery goes below all four, not
-sideways between two of them. Each crate carries a test that reads its own `Cargo.toml` and fails
-on any of those six names, so the rule breaks the build rather than a review. The sideways rule
+sideways between two of them, which is where `harkness-transport` is. Each crate carries a test that
+reads its own `Cargo.toml` and fails on any of those six names, so the rule breaks the build rather
+than a review; `harkness-transport` carries the same test against a longer list, since everything is
+above it. The sideways rule
 needs that test most: no dependency cycle exists to catch an adapter-to-adapter edge while
 `harkness-runtime` does not yet name the adapters. ADR-0009 records why.
 

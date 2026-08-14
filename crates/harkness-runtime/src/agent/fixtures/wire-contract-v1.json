@@ -1,0 +1,196 @@
+{
+  "v": 1,
+  "state": {
+    "schema_version": 1,
+    "session_id": "123e4567-e89b-42d3-a456-426614174000",
+    "scenario_version": 1,
+    "scenario_definition_digest": "eb3ca6378e85788c934ca9b16eb79bc0ee15fbfc495f538139ff784feaecf7ee",
+    "cursor": 2,
+    "observation_digest": "abababababababababababababababababababababababababababababababab"
+  },
+  "event_payloads": {
+    "session": {
+      "schema_version": 1,
+      "session_id_bytes": [18, 62, 69, 103, 232, 155, 66, 211, 164, 86, 66, 102, 20, 23, 64, 0],
+      "scenario_version": 1,
+      "scenario_definition_digest_bytes": [235, 60, 166, 55, 142, 133, 120, 140, 147, 76, 169, 177, 110, 183, 155, 192, 238, 21, 251, 252, 73, 95, 83, 129, 57, 255, 120, 79, 234, 236, 247, 238],
+      "cursor": 2,
+      "observation_digest_bytes": [171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171]
+    },
+    "action": {
+      "encoding_version": 1,
+      "record_bytes": [123, 34, 115, 99, 104, 101, 109, 97, 95, 118, 101, 114, 115, 105, 111, 110, 34, 58, 49, 44, 34, 97, 99, 116, 105, 111, 110, 34, 58, 123, 34, 107, 105, 110, 100, 34, 58, 34, 112, 108, 97, 110, 34, 44, 34, 115, 116, 101, 112, 115, 34, 58, 91, 123, 34, 116, 105, 116, 108, 101, 34, 58, 34, 73, 110, 115, 112, 101, 99, 116, 32, 116, 104, 101, 32, 119, 111, 114, 107, 115, 112, 97, 99, 101, 34, 125, 93, 125, 125]
+    },
+    "observation": {
+      "encoding_version": 1,
+      "record_bytes": [123, 34, 115, 99, 104, 101, 109, 97, 95, 118, 101, 114, 115, 105, 111, 110, 34, 58, 49, 44, 34, 111, 98, 115, 101, 114, 118, 97, 116, 105, 111, 110, 34, 58, 123, 34, 107, 105, 110, 100, 34, 58, 34, 114, 117, 110, 95, 115, 116, 97, 114, 116, 101, 100, 34, 44, 34, 116, 97, 115, 107, 34, 58, 123, 34, 105, 100, 34, 58, 34, 50, 50, 51, 101, 52, 53, 54, 55, 45, 101, 56, 57, 98, 45, 52, 50, 100, 51, 45, 97, 52, 53, 54, 45, 52, 50, 54, 54, 49, 52, 49, 55, 52, 48, 48, 48, 34, 44, 34, 116, 105, 116, 108, 101, 34, 58, 34, 70, 105, 120, 116, 117, 114, 101, 32, 116, 97, 115, 107, 34, 125, 44, 34, 119, 111, 114, 107, 115, 112, 97, 99, 101, 34, 58, 123, 34, 112, 114, 111, 106, 101, 99, 116, 95, 105, 100, 34, 58, 34, 51, 50, 51, 101, 52, 53, 54, 55, 45, 101, 56, 57, 98, 45, 52, 50, 100, 51, 45, 97, 52, 53, 54, 45, 52, 50, 54, 54, 49, 52, 49, 55, 52, 48, 48, 48, 34, 44, 34, 114, 111, 111, 116, 34, 58, 34, 47, 119, 111, 114, 107, 115, 112, 97, 99, 101, 34, 125, 125, 125]
+    }
+  },
+  "actions": [
+    {
+      "schema_version": 1,
+      "action": {
+        "kind": "plan",
+        "steps": [
+          {
+            "title": "Inspect the workspace"
+          }
+        ]
+      }
+    },
+    {
+      "schema_version": 1,
+      "action": {
+        "kind": "call_tool",
+        "tool_id": "fs.read",
+        "tool_version": "1.0.0",
+        "input": {
+          "path": "src/lib.rs"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "action": {
+        "kind": "complete_run",
+        "summary": "Done."
+      }
+    },
+    {
+      "schema_version": 1,
+      "action": {
+        "kind": "fail_run",
+        "reason": {
+          "kind": "agent_failed",
+          "reason": "the provider stopped"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "action": {
+        "kind": "fail_run",
+        "reason": {
+          "kind": "scenario_divergence",
+          "expected": "tool_result",
+          "actual": "tool_failed"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "action": {
+        "kind": "fail_run",
+        "reason": {
+          "kind": "scenario_exhausted",
+          "scenario": "read_only_success"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "action": {
+        "kind": "fail_run",
+        "reason": {
+          "kind": "approval_denied",
+          "reason": "the user denied the request"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "action": {
+        "kind": "fail_run",
+        "reason": {
+          "kind": "cancelled"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "action": {
+        "kind": "fail_run",
+        "reason": {
+          "kind": "interrupted",
+          "reason": "the process stopped"
+        }
+      }
+    }
+  ],
+  "observations": [
+    {
+      "schema_version": 1,
+      "observation": {
+        "kind": "run_started",
+        "task": {
+          "id": "223e4567-e89b-42d3-a456-426614174000",
+          "title": "Fixture task"
+        },
+        "workspace": {
+          "project_id": "323e4567-e89b-42d3-a456-426614174000",
+          "root": "/workspace"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "observation": {
+        "kind": "tool_result",
+        "call": "423e4567-e89b-42d3-a456-426614174000",
+        "result": {
+          "output": {
+            "text": "redacted"
+          },
+          "artifacts": [
+            {
+              "id": "artifact-fixture",
+              "media_type": "text/plain",
+              "byte_len": 8
+            }
+          ]
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "observation": {
+        "kind": "tool_failed",
+        "call": "523e4567-e89b-42d3-a456-426614174000",
+        "error": {
+          "kind": "timed_out",
+          "message": "the call timed out"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "observation": {
+        "kind": "policy_denied",
+        "call": "623e4567-e89b-42d3-a456-426614174000",
+        "reason": "workspace is untrusted"
+      }
+    },
+    {
+      "schema_version": 1,
+      "observation": {
+        "kind": "approval_outcome",
+        "call": "723e4567-e89b-42d3-a456-426614174000",
+        "outcome": "approved"
+      }
+    },
+    {
+      "schema_version": 1,
+      "observation": {
+        "kind": "approval_outcome",
+        "call": "823e4567-e89b-42d3-a456-426614174000",
+        "outcome": "denied"
+      }
+    },
+    {
+      "schema_version": 1,
+      "observation": {
+        "kind": "cancelled"
+      }
+    }
+  ]
+}

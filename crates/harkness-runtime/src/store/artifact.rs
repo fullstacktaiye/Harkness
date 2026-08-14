@@ -764,6 +764,10 @@ impl StoreArtifacts {
 }
 
 impl ArtifactWriter for StoreArtifacts {
+    fn redact_text(&self, text: &str) -> String {
+        self.store.redactor().redact_text(text).into_owned()
+    }
+
     /// Opens a store-backed stream for the tool to fill.
     ///
     /// A storage failure is `execution_failed` rather than a partial success: a

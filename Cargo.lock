@@ -766,6 +766,7 @@ dependencies = [
  "thiserror 2.0.19",
  "time",
  "uuid",
+ "windows-sys",
 ]
 
 [[package]]
@@ -775,6 +776,18 @@ dependencies = [
  "git2",
  "libc",
  "tempfile",
+]
+
+[[package]]
+name = "harkness-transport"
+version = "0.1.0"
+dependencies = [
+ "harkness-git",
+ "harkness-test-fixtures",
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

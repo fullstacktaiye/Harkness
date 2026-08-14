@@ -31,6 +31,9 @@ ColumnLayout {
         ? reviewState.file
         : ({})
     readonly property var reviewRows: reviewFile.rows !== undefined ? reviewFile.rows : []
+    readonly property var reviewProvenance: reviewReady && reviewState.provenance !== undefined
+        ? reviewState.provenance
+        : ({})
     readonly property string repositoryLockScope: String(
         project.lockScope || project.parentId || project.id
     )
@@ -80,6 +83,153 @@ ColumnLayout {
         if (kind === "deletion")
             return Kirigami.Theme.negativeTextColor;
         return Kirigami.Theme.disabledTextColor;
+    }
+
+    // Fills every `%N` in one pass over the template.
+    //
+    // Qt's `arg` replaces the lowest-numbered marker still present and then
+    // hands back a string the next `arg` in the chain re-scans — so a value
+    // holding `%2` is substituted *into* by the call after it. Commit author
+    // names and paths reach these strings and are repository content, which a
+    // remote controls, so the substitution happens once and never looks at what
+    // it just wrote.
+    function format(template, values) {
+        return String(template).replace(/%(\d)/g, function(marker, index) {
+            const value = values[Number(index) - 1];
+            return value === undefined ? marker : String(value);
+        });
+    }
+
+    // Counts with their nouns, chosen in JavaScript rather than through Qt's
+    // `%n` plural form.
+    //
+    // `%n` leaves the plural to a translation catalog, and there is none: with
+    // no translator installed, `qsTr` returns its source text and `%n commit(s)`
+    // reaches the window spelled exactly that way. Until this application ships
+    // a catalog, the English forms have to be written out.
+    function commitCount(count) {
+        return count === 1
+            ? format(qsTr("%1 commit"), [count])
+            : format(qsTr("%1 commits"), [count]);
+    }
+
+    function contributorCount(count) {
+        return count === 1
+            ? format(qsTr("%1 contributor"), [count])
+            : format(qsTr("%1 contributors"), [count]);
+    }
+
+    // The colour that says "these two files came from the same hands".
+    //
+    // The group is an index over the review's *distinct* producer sets, so the
+    // only question the colour has to answer is same-or-different — which is
+    // why the hues are spread by the golden ratio rather than ordered along a
+    // scale a reader would try to rank. Colour is never the only signal: every
+    // row carries the names beside it, and an unattributed row is drawn with
+    // no bar at all rather than with a colour of its own.
+    function provenanceTint(group) {
+        const index = Number(group);
+        if (!(index >= 0))
+            return "transparent";
+        const dark = Kirigami.Theme.backgroundColor.hslLightness < 0.5;
+        return Qt.hsla((index * 0.6180339887498949) % 1, 0.55, dark ? 0.62 : 0.44, 1);
+    }
+
+    // What the whole review can say about where its files came from. Silence
+    // is deliberate when nothing was resolved: the rows say "unknown" for
+    // themselves, and a header repeating it for every file adds nothing.
+    function provenanceHeadline() {
+        const provenance = reviewProvenance;
+        if (provenance.resolved !== true)
+            return "";
+        const commits = Number(provenance.commitCount || 0);
+        if (commits === 0)
+            return qsTr("No commit in this comparison produced these changes");
+        const parts = [
+            format(qsTr("%1 by %2"), [
+                commitCount(commits),
+                contributorCount(Number(provenance.producerCount || 0))
+            ])
+        ];
+        const slug = String(provenance.agentSlug || "");
+        if (slug.length > 0)
+            parts.push(format(qsTr("agent %1"), [slug]));
+        const skipped = Number(provenance.skippedMerges || 0);
+        if (skipped > 0)
+            parts.push(skipped === 1
+                ? qsTr("1 merge left unattributed")
+                : format(qsTr("%1 merges left unattributed"), [skipped]));
+        if (String(provenance.truncation || "") === "commit_budget_exhausted")
+            parts.push(qsTr("older commits were not walked"));
+        return parts.join(" · ");
+    }
+
+    // Absence is a first-class answer, so an unattributed file says so in as
+    // many letters and is never left blank.
+    //
+    // Whether a file is attributed is decided by its gap and never by whether
+    // its label came out empty: a trailer carrying an address and no name is
+    // still somebody, and reading a blank label as "nothing produced this"
+    // would turn a naming gap into a wrong answer.
+    function provenanceLabel(row) {
+        const entry = row || ({});
+        const label = String(entry.provenanceLabel || "");
+        if (label.length > 0)
+            return label;
+        return provenanceAttributed(entry) ? qsTr("Unnamed") : qsTr("Unknown");
+    }
+
+    function provenanceAttributed(row) {
+        const entry = row || ({});
+        return String(entry.provenanceGap || "").length === 0
+            && Number(entry.provenanceProducers || 0) > 0;
+    }
+
+    // Names the producers, for a plain-text label and for a screen reader.
+    function provenanceDetail(row) {
+        const entry = row || ({});
+        if (!provenanceAttributed(entry))
+            return format(qsTr("Unknown: %1"),
+                          [provenanceGapText(String(entry.provenanceGap || ""))]);
+        return format(qsTr("Produced by %1, across %2 in this comparison"), [
+            provenanceLabel(entry),
+            commitCount(Number(entry.provenanceCommits || 0))
+        ]);
+    }
+
+    // The same fact with no producer name in it, for a tool tip.
+    //
+    // A tool tip's text is rendered by the style's own label, which this file
+    // cannot give `Text.PlainText` — and `Text.AutoText` treats anything that
+    // looks like markup as markup. A producer name comes out of a commit
+    // object, which is repository content a remote controls: a name shaped
+    // like an image tag would fetch a URL on hover. The names are already on
+    // the row beside the tool tip, as plain text, so counting them here costs
+    // a reader nothing.
+    function provenanceTooltip(row) {
+        const entry = row || ({});
+        if (!provenanceAttributed(entry))
+            return format(qsTr("Unknown: %1"),
+                          [provenanceGapText(String(entry.provenanceGap || ""))]);
+        return format(qsTr("Produced by %1 across %2 in this comparison"), [
+            contributorCount(Number(entry.provenanceProducers || 0)),
+            commitCount(Number(entry.provenanceCommits || 0))
+        ]);
+    }
+
+    function provenanceGapText(gap) {
+        switch (String(gap)) {
+        case "uncommitted":
+            return qsTr("nothing has committed this content yet");
+        case "empty_range":
+            return qsTr("the two sides of this comparison name one commit");
+        case "not_in_range":
+            return qsTr("no commit in this comparison names this file");
+        case "commit_budget_exhausted":
+            return qsTr("it is beyond the commits that were walked");
+        default:
+            return qsTr("attribution is unavailable");
+        }
     }
 
     // Blends `over` into `base` and returns an opaque colour. Every tint the
@@ -845,6 +995,16 @@ ColumnLayout {
                     text: reviewSurface.reviewState.detail || ""
                     textFormat: Text.PlainText
                 }
+
+                Controls.Label {
+                    Layout.fillWidth: true
+                    color: Kirigami.Theme.disabledTextColor
+                    elide: Text.ElideRight
+                    font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                    text: reviewSurface.provenanceHeadline()
+                    textFormat: Text.PlainText
+                    visible: text.length > 0
+                }
             }
 
             Controls.Label {
@@ -1036,10 +1196,16 @@ ColumnLayout {
                             required property int index
                             required property var modelData
 
-                            Accessible.name: qsTr("%1, %2 change")
-                                .arg(modelData.path)
-                                .arg(modelData.change)
+                            Accessible.name: reviewSurface.format(
+                                qsTr("%1, %2 change, %3"),
+                                [
+                                    modelData.path,
+                                    modelData.change,
+                                    reviewSurface.provenanceDetail(modelData)
+                                ]
+                            )
                             Controls.ToolTip.text: modelData.path
+                                + "\n" + reviewSurface.provenanceTooltip(modelData)
                             Controls.ToolTip.visible: hovered
                             highlighted: String(reviewSurface.reviewState.selectedFileId || "")
                                 === String(modelData.fileId)
@@ -1058,12 +1224,47 @@ ColumnLayout {
                             contentItem: RowLayout {
                                 spacing: Kirigami.Units.smallSpacing
 
-                                Controls.Label {
+                                // The one mark a reader can scan a long file
+                                // list by without reading anything: files that
+                                // came from the same hands carry the same bar,
+                                // and an unattributed file carries none.
+                                Rectangle {
+                                    Layout.fillHeight: true
+                                    Layout.preferredWidth: Math.round(
+                                        Kirigami.Units.smallSpacing / 2
+                                    ) + 2
+                                    color: reviewSurface.provenanceTint(
+                                        reviewFileDelegate.modelData.provenanceGroup
+                                    )
+                                    radius: width / 2
+                                }
+
+                                ColumnLayout {
                                     Layout.fillWidth: true
-                                    elide: Text.ElideMiddle
-                                    font.family: "monospace"
-                                    text: reviewFileDelegate.modelData.path
-                                    textFormat: Text.PlainText
+                                    spacing: 0
+
+                                    Controls.Label {
+                                        Layout.fillWidth: true
+                                        elide: Text.ElideMiddle
+                                        font.family: "monospace"
+                                        text: reviewFileDelegate.modelData.path
+                                        textFormat: Text.PlainText
+                                    }
+
+                                    // Producer names come out of commit
+                                    // objects, which is repository content:
+                                    // plain text, never interpreted as markup.
+                                    Controls.Label {
+                                        Layout.fillWidth: true
+                                        color: Kirigami.Theme.disabledTextColor
+                                        elide: Text.ElideRight
+                                        font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                                        text: reviewSurface.provenanceLabel(
+                                            reviewFileDelegate.modelData
+                                        )
+                                        textFormat: Text.PlainText
+                                        visible: reviewSurface.reviewProvenance.resolved === true
+                                    }
                                 }
 
                                 Controls.Label {
@@ -1245,6 +1446,21 @@ ColumnLayout {
                         visible: reviewSurface.reviewFile.path !== undefined
                             && String(reviewSurface.reviewFile.path).length > 0
 
+                        // The same bar the row carried, so opening a file does
+                        // not lose the grouping the list just showed.
+                        Rectangle {
+                            Layout.alignment: Qt.AlignVCenter
+                            Layout.preferredHeight: Kirigami.Units.gridUnit
+                            Layout.preferredWidth: Math.round(
+                                Kirigami.Units.smallSpacing / 2
+                            ) + 2
+                            color: reviewSurface.provenanceTint(
+                                reviewSurface.reviewFile.provenanceGroup
+                            )
+                            radius: width / 2
+                            visible: reviewSurface.reviewProvenance.resolved === true
+                        }
+
                         Controls.Label {
                             Layout.fillWidth: true
                             elide: Text.ElideMiddle
@@ -1252,6 +1468,23 @@ ColumnLayout {
                             font.family: "monospace"
                             text: reviewSurface.reviewFile.path || ""
                             textFormat: Text.PlainText
+                        }
+
+                        Controls.Label {
+                            Accessible.name: text
+                            Controls.ToolTip.text: reviewSurface.provenanceTooltip(
+                                reviewSurface.reviewFile
+                            )
+                            Controls.ToolTip.visible: provenanceHover.hovered
+                            color: Kirigami.Theme.disabledTextColor
+                            elide: Text.ElideRight
+                            font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                            Layout.maximumWidth: Kirigami.Units.gridUnit * 12
+                            text: reviewSurface.provenanceLabel(reviewSurface.reviewFile)
+                            textFormat: Text.PlainText
+                            visible: reviewSurface.reviewProvenance.resolved === true
+
+                            HoverHandler { id: provenanceHover }
                         }
 
                         Controls.ToolButton {

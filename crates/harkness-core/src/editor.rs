@@ -617,7 +617,14 @@ mod tests {
 
     #[cfg(unix)]
     fn recording_editor(fixture: &Fixture, log: &Path) -> EditorConfiguration {
-        let executable = fixture.shim("record-editor", "#!/bin/sh\nprintf '%s' \"$2\" > \"$1\"\n");
+        // Publish the log only after its complete contents are durable to the
+        // test process. `wait_for_file` observes existence, and a direct shell
+        // redirection creates the destination before `printf` fills it; on a
+        // sufficiently busy runner that made the assertion race an empty file.
+        let executable = fixture.shim(
+            "record-editor",
+            "#!/bin/sh\nprintf '%s' \"$2\" > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"\n",
+        );
         EditorConfiguration::new(vec![
             executable.to_string_lossy().into_owned(),
             log.to_string_lossy().into_owned(),

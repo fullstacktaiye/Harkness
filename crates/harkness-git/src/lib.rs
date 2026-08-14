@@ -16,7 +16,9 @@ mod history;
 mod hunk;
 mod intra_line;
 mod lock;
+mod patch;
 mod path;
+mod provenance;
 mod runner;
 mod status;
 mod sync;
@@ -59,8 +61,17 @@ pub use discard::{
 pub use history::{CommitInfo, CommitSignature, LogCursor, LogOptions, LogPage, LogRange};
 pub use hunk::{HunkSelection, HunkStageOutcome, LineSelection, LineStageOutcome, remap_to_exact};
 use lock::RepositoryLock;
+pub use patch::{
+    PatchFileMode, UnifiedPatch, UnifiedPatchError, UnifiedPatchFile, UnifiedPatchHunk,
+    UnifiedPatchLine, parse_unified_patch, resulting_worktree_patch,
+};
 #[doc(hidden)]
 pub use path::canonicalize_with_missing_tail;
+pub use provenance::{
+    AGENT_BRANCH_PREFIX, ChangeProvenance, CommitAttribution, DEFAULT_MAX_PROVENANCE_COMMITS,
+    FileProvenance, MAX_CO_AUTHORS_PER_COMMIT, Producer, ProducerKind, ProvenanceGap,
+    ProvenanceOptions, ProvenancePaths, ProvenanceRange, ProvenanceTruncation,
+};
 pub use runner::{Cancellation, CloneCancellation};
 pub use status::{
     DetailedStatus, FileChange, GitStatus, HeadState, PendingOperation, StatusEntry, UpstreamStatus,
@@ -1021,6 +1032,36 @@ impl GitService {
         options: &DiffOptions,
     ) -> Result<Vec<FileDiff>, GitError> {
         diff::compute_targets(&self.root, targets, options)
+    }
+
+    /// Attributes each path of one comparison to the commits that produced it.
+    ///
+    /// This answers "what produced this file" beside the diff's "what changed",
+    /// and it answers it from the repository alone: the commits between the two
+    /// sides of the comparison, the identities they record, and the
+    /// `agent/<slug>` branch convention. Pass one target's own file list
+    /// through [`ProvenanceOptions::for_files`]: the result carries one entry
+    /// per record, in the same order, so the two pair by index. A file list
+    /// that came back empty is fine to pass — [`ProvenancePaths::Only`] with
+    /// nothing in it asks about nothing, and is answered without a walk.
+    ///
+    /// The range is walked once and each commit compared with its first parent
+    /// once, so cost follows the size of the range and never the number of
+    /// files being reviewed; nothing here walks history per path. Like every
+    /// other read on this service it runs entirely in process, takes no
+    /// repository lock, and spawns no process.
+    ///
+    /// The result is total and advisory. Every requested path is reported, a
+    /// path nothing could be attributed to carries a
+    /// [`ProvenanceGap`] naming why, and nothing about staging, discarding or
+    /// diffing may change behaviour because of what it says.
+    pub fn provenance(
+        &self,
+        target: &DiffTarget,
+        options: &ProvenanceOptions,
+        cancellation: &Cancellation,
+    ) -> Result<ChangeProvenance, GitError> {
+        provenance::resolve(&self.root, target, options, cancellation)
     }
 
     /// Retrieves bounded source context without recomputing a diff.

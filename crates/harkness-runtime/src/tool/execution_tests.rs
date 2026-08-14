@@ -9,11 +9,14 @@
 //! failure it became. Silencing it would need a process-global panic hook, which
 //! tests running in parallel share — see the note at the top of `tests.rs`.
 
-use std::sync::Arc;
+use std::borrow::Cow;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, mpsc};
 use std::time::{Duration, Instant};
 
 use harkness_git::Cancellation;
+use harkness_test_fixtures::Fixture as ProcessFixture;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -21,13 +24,37 @@ use tempfile::TempDir;
 use time::OffsetDateTime;
 
 use crate::domain::{Run, RunId, Step, Task, ToolCall, ToolCallId, ToolCallState};
-use crate::store::{EventKind, Store, StoredEvent};
+use crate::store::{EventKind, Redactor, Store, StoredEvent};
+use crate::tools::ProcessExec;
 
 use super::{
     CallOutcome, CompletedCall, DEFAULT_STREAM_TAIL_BYTES, ExecutionContext, ExecutionLimits,
     ProgressEvent, ProgressUnit, REJECTED_OUTPUT_ARTIFACT, RiskLevel, TERMINATION_GRACE, Tool,
     ToolError, ToolExecutor, ToolIdentity, ToolMetadata, ToolRegistry, progress_channel,
 };
+
+#[cfg(unix)]
+#[test]
+fn process_tails_are_redacted_before_the_result_is_persisted() {
+    let fixture = Fixture::redacting(Arc::new(TailMasking));
+    let process_fixture = ProcessFixture::new();
+    let shim = process_fixture.shim("prints-secret", "#!/bin/sh\nprintf 'token=hunter2\\n'\n");
+    let mut registry = ToolRegistry::new();
+    registry.register(ProcessExec).unwrap();
+    let call = fixture.pending(
+        "process.exec",
+        json!({"argv": [shim], "timeout_seconds": 5}),
+    );
+
+    let completed = fixture
+        .executor(registry)
+        .execute(call, fixture.workspace.path(), &Cancellation::default())
+        .unwrap();
+    let persisted = completed.record().output().unwrap();
+
+    assert_eq!(persisted["stdout_tail"]["text"], "token=[redacted]\n");
+    assert!(!persisted.to_string().contains("hunter2"));
+}
 
 // ---------------------------------------------------------------------------
 // Fixture
@@ -44,8 +71,21 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::build(None)
+    }
+
+    fn redacting(redactor: Arc<dyn Redactor>) -> Self {
+        Self::build(Some(redactor))
+    }
+
+    fn build(redactor: Option<Arc<dyn Redactor>>) -> Self {
         let data_dir = TempDir::new().unwrap();
-        let store = Arc::new(Store::open(data_dir.path()).unwrap());
+        let store = Store::open(data_dir.path()).unwrap();
+        let store = match redactor {
+            Some(redactor) => store.redacting(redactor),
+            None => store,
+        };
+        let store = Arc::new(store);
         let workspace = TempDir::new().unwrap();
 
         let task = Task::new("Execute a tool", workspace.path(), None, at(0));
@@ -107,6 +147,23 @@ impl Fixture {
 
     fn run_id(&self) -> RunId {
         self.run.id()
+    }
+}
+
+#[derive(Debug)]
+struct TailMasking;
+
+impl Redactor for TailMasking {
+    fn redact_text<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        if text.contains("hunter2") {
+            Cow::Owned(text.replace("hunter2", "[redacted]"))
+        } else {
+            Cow::Borrowed(text)
+        }
+    }
+
+    fn wrap_stream(&self, sink: Box<dyn Write + Send>) -> Box<dyn Write + Send> {
+        sink
     }
 }
 
@@ -276,6 +333,68 @@ impl Tool for Unstoppable {
         std::thread::sleep(Duration::from_secs(30));
         Ok(Echoed {
             echoed: "never".to_owned(),
+        })
+    }
+}
+
+/// Enters a bounded commit phase which deliberately outlives its deadline.
+struct IrreversibleAfterDeadline {
+    entered: Arc<Barrier>,
+    release: Arc<Barrier>,
+    mutated: Arc<AtomicBool>,
+}
+
+impl Tool for IrreversibleAfterDeadline {
+    type Input = Empty;
+    type Output = Echoed;
+
+    fn metadata(&self) -> ToolMetadata {
+        metadata(
+            "fixture.irreversible_after_deadline",
+            "1.0.0",
+            RiskLevel::WorkspaceWrite,
+        )
+        .within(Duration::from_millis(80))
+    }
+
+    fn execute(&self, _input: Empty, context: &mut ExecutionContext) -> Result<Echoed, ToolError> {
+        context.begin_irreversible()?;
+        self.entered.wait();
+        self.release.wait();
+        self.mutated.store(true, Ordering::Release);
+        Ok(Echoed {
+            echoed: "committed".to_owned(),
+        })
+    }
+}
+
+/// Attempts to enter the commit phase only after the executor has stopped it.
+struct IrreversibleAfterStop {
+    started: Arc<AtomicBool>,
+    mutated: Arc<AtomicBool>,
+}
+
+impl Tool for IrreversibleAfterStop {
+    type Input = Empty;
+    type Output = Echoed;
+
+    fn metadata(&self) -> ToolMetadata {
+        metadata(
+            "fixture.irreversible_after_stop",
+            "1.0.0",
+            RiskLevel::WorkspaceWrite,
+        )
+    }
+
+    fn execute(&self, _input: Empty, context: &mut ExecutionContext) -> Result<Echoed, ToolError> {
+        self.started.store(true, Ordering::Release);
+        while !context.cancellation().is_cancelled() {
+            std::thread::yield_now();
+        }
+        context.begin_irreversible()?;
+        self.mutated.store(true, Ordering::Release);
+        Ok(Echoed {
+            echoed: "must not commit".to_owned(),
         })
     }
 }
@@ -942,6 +1061,80 @@ fn a_tool_that_ignores_its_token_is_abandoned_and_the_call_still_ends() {
         json!("timed_out")
     );
     assert_eq!(terminal.event.payload()["detail"]["timeout_ms"], json!(80));
+}
+
+#[test]
+fn an_irreversible_commit_is_not_abandoned_into_a_false_terminal_record() {
+    let fixture = Fixture::new();
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let mutated = Arc::new(AtomicBool::new(false));
+    let executor = fixture.executor(registry_of(vec![erase(IrreversibleAfterDeadline {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+        mutated: Arc::clone(&mutated),
+    })]));
+    let call = fixture.pending("fixture.irreversible_after_deadline", json!({}));
+    let workspace = fixture.workspace.path().to_path_buf();
+    let (finished, result) = mpsc::sync_channel(1);
+
+    std::thread::spawn(move || {
+        let completed = executor.execute(call, workspace, &Cancellation::default());
+        let _ = finished.send(completed);
+    });
+    entered.wait();
+
+    // The declared deadline plus the abandonment grace both pass while the
+    // commit remains active. A terminal result here would permit the body below
+    // to mutate after the store already claimed the call had timed out.
+    assert!(
+        matches!(
+            result.recv_timeout(TERMINATION_GRACE + Duration::from_millis(250)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "the executor abandoned an irreversible commit"
+    );
+    assert_eq!(
+        fixture.store.load_tool_call(call).unwrap().state(),
+        ToolCallState::Running
+    );
+    assert!(!mutated.load(Ordering::Acquire));
+
+    release.wait();
+    let completed = result
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the completed commit was not observed")
+        .unwrap();
+    assert!(mutated.load(Ordering::Acquire));
+    assert!(completed.outcome().succeeded());
+    assert_eq!(completed.state(), ToolCallState::Succeeded);
+}
+
+#[test]
+fn a_stop_request_that_wins_refuses_the_irreversible_transition() {
+    let fixture = Fixture::new();
+    let started = Arc::new(AtomicBool::new(false));
+    let mutated = Arc::new(AtomicBool::new(false));
+    let executor = fixture.executor(registry_of(vec![erase(IrreversibleAfterStop {
+        started: Arc::clone(&started),
+        mutated: Arc::clone(&mutated),
+    })]));
+    let call = fixture.pending("fixture.irreversible_after_stop", json!({}));
+    let cancellation = Cancellation::default();
+    let watcher = cancellation.clone();
+    std::thread::spawn(move || {
+        while !started.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        watcher.cancel();
+    });
+
+    let completed = executor
+        .execute(call, fixture.workspace.path(), &cancellation)
+        .unwrap();
+
+    assert_eq!(completed.outcome(), &CallOutcome::Cancelled);
+    assert!(!mutated.load(Ordering::Acquire));
 }
 
 #[test]

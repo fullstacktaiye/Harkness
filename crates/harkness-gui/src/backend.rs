@@ -1544,6 +1544,17 @@ const REVIEW_CONTEXT_STEP: u32 = 20;
 // subsequent page, while each GUI-thread QVariant conversion remains bounded.
 const REVIEW_ROW_PAGE_SIZE: usize = 12_000;
 const REVIEW_FILE_PAGE_SIZE: usize = 512;
+/// How far back attribution walks before a review gives up and says so.
+///
+/// This is well below `harkness_git::DEFAULT_MAX_PROVENANCE_COMMITS`, because
+/// the two are paid for differently. A caller typing `harkness git diff
+/// --provenance` asked for a walk and is waiting for its result; the panel
+/// resolves attribution on the path that opens a review, so every commit walked
+/// is a commit a reader waits through before they see a file list. A range
+/// longer than this is not a review anybody reads file by file, and reaching
+/// the bound is reported by name rather than guessed at — the header says older
+/// commits were not walked, and the files beyond it read as unknown.
+const REVIEW_PROVENANCE_MAX_COMMITS: usize = 250;
 
 #[derive(Clone, Debug)]
 struct HistoryCommitRow {
@@ -2378,6 +2389,79 @@ struct ReviewLaunchPosition {
     row_page_origin: usize,
 }
 
+/// What produced one file, reduced to what a row has to draw.
+///
+/// `group` is the point of the record: it is an index over the review's
+/// *distinct* producer sets, so two files that came from the same hands share
+/// one number and a reader can tell them apart from the rest without comparing
+/// names. `None` is the unknown case, which renders as unknown and never as
+/// blank.
+#[derive(Clone, Debug, Default)]
+struct ReviewAttribution {
+    group: Option<usize>,
+    /// Producer names joined for display, empty when nothing was attributed.
+    label: String,
+    /// The named reason there is no attribution, empty when there is one.
+    gap: String,
+    commits: usize,
+    /// How many distinct identities [`Self::label`] names. Carried as a number
+    /// so a surface that must not render an untrusted name can still say how
+    /// many there were.
+    producers: usize,
+}
+
+/// What a review says about where its files came from.
+///
+/// Attribution is advisory, so this is filled in on a best-effort basis: a
+/// failed or unavailable resolution leaves it unresolved and costs the reader
+/// a label rather than the review.
+#[derive(Clone, Debug, Default)]
+struct ReviewProvenance {
+    resolved: bool,
+    agent_slug: String,
+    head_revision: String,
+    commits: usize,
+    producers: usize,
+    groups: usize,
+    skipped_merges: usize,
+    /// The named truncation, empty when the whole range was walked.
+    truncation: String,
+    /// One entry per file in [`ReviewStateRow::files`], in the same order.
+    files: Vec<ReviewAttribution>,
+}
+
+impl ReviewProvenance {
+    fn file(&self, index: usize) -> ReviewAttribution {
+        self.files.get(index).cloned().unwrap_or_default()
+    }
+}
+
+/// Folds every run of whitespace into one space and trims the ends.
+///
+/// Applied to producer names for the same reason `harkness-cli` applies it to
+/// them: they come out of commit objects, which is repository content, and a
+/// tab or a newline inside one decides how a row is laid out rather than what
+/// it says.
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// What to call one producer on a row.
+///
+/// A `Co-Authored-By` trailer may carry an address and no name — `<model@host>`
+/// is a spelling Git itself accepts — and a producer with an empty name would
+/// otherwise join into a dangling separator, or, where it is a file's only
+/// producer, into an empty label that the surface would then read back as
+/// *unattributed*. The address is what the record actually has, so it is what
+/// gets shown.
+fn producer_display_name(producer: &harkness_git::Producer) -> String {
+    let name = collapse_whitespace(&String::from_utf8_lossy(&producer.name));
+    if !name.is_empty() {
+        return name;
+    }
+    collapse_whitespace(&String::from_utf8_lossy(&producer.email))
+}
+
 #[derive(Clone, Debug)]
 struct ReviewStateRow {
     project_id: String,
@@ -2396,6 +2480,9 @@ struct ReviewStateRow {
     title: String,
     detail: String,
     files: Vec<ReviewFileEntry>,
+    /// What produced each of [`Self::files`]. Advisory throughout: nothing on
+    /// this surface may act differently because of what it says.
+    provenance: ReviewProvenance,
     file_offset: usize,
     selected_file_id: String,
     loaded_file: Option<ReviewLoadedFile>,
@@ -2421,6 +2508,7 @@ impl ReviewStateRow {
             title,
             detail,
             files: Vec::new(),
+            provenance: ReviewProvenance::default(),
             file_offset: 0,
             selected_file_id: String::new(),
             loaded_file: None,
@@ -2523,7 +2611,7 @@ fn load_review_with_git(
     let options = harkness_git::DiffOptions::default()
         .with_max_total_bytes(0)
         .with_whitespace(whitespace);
-    let files = git
+    let files: Vec<ReviewFileEntry> = git
         .diff(target.target.clone(), &options)
         .map_err(GitFailure::from)?
         .into_iter()
@@ -2534,6 +2622,7 @@ fn load_review_with_git(
             file,
         })
         .collect();
+    let provenance = resolve_review_provenance(git, &target.target, &selection, &files);
     Ok(ReviewStateRow {
         project_id,
         selection,
@@ -2542,6 +2631,7 @@ fn load_review_with_git(
         detail: target.detail.clone(),
         target: Some(target),
         files,
+        provenance,
         file_offset: 0,
         selected_file_id: String::new(),
         loaded_file: None,
@@ -2550,6 +2640,109 @@ fn load_review_with_git(
         error: String::new(),
         error_kind: String::new(),
     })
+}
+
+/// Attributes the review's file list to the commits in its own range.
+///
+/// One walk of the range serves the whole list, which is what keeps opening a
+/// thousand-file review the same cost as opening a one-file one. The result is
+/// advisory in the strongest sense: a failure is swallowed into an unresolved
+/// record rather than turned into a review that will not open, because a
+/// missing label is a cosmetic loss and a missing diff is not.
+fn resolve_review_provenance(
+    git: &harkness_git::GitService,
+    target: &harkness_git::DiffTarget,
+    selection: &ReviewSelection,
+    files: &[ReviewFileEntry],
+) -> ReviewProvenance {
+    // An empty file list is passed through rather than short-circuited: asking
+    // about no paths is answered without a walk, and the result still reports
+    // itself resolved. `resolved: false` is reserved for an attribution that
+    // could not be made, which is a different thing from one with nothing in it.
+    let mut options = harkness_git::ProvenanceOptions::default()
+        .with_paths(files.iter().map(|entry| entry.path.clone()))
+        .with_max_commits(REVIEW_PROVENANCE_MAX_COMMITS);
+    // A branch review is pinned to object ids so the comparison cannot move
+    // under the reader, which leaves the target with nothing a reference
+    // convention could be read off. The name the reviewer actually asked for
+    // travels beside it for exactly that.
+    if let ReviewSelection::Branch { branch, .. } = selection {
+        options = options.with_head_reference(branch.as_str());
+    }
+    let Ok(record) = git.provenance(target, &options, &harkness_git::Cancellation::default())
+    else {
+        return ReviewProvenance::default();
+    };
+
+    // Files are grouped by the *set* of identities behind them rather than by
+    // one name, because "the same hands produced these two files" is the
+    // question the tint answers and two files sharing only their newest
+    // committer are not the same answer.
+    //
+    // The key is sorted before it is compared, and the label is built from the
+    // sorted key. `FileProvenance::producers` is ordered by first contribution
+    // from the newest commit down, so one file can list Ada then Grace while
+    // its neighbour lists Grace then Ada for the same two people — and an
+    // order-sensitive key would give them two colours and two spellings of one
+    // answer, which is precisely what the mark exists to prevent.
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let attributions = record
+        .files
+        .iter()
+        .map(|file| {
+            if !file.is_attributed() {
+                return ReviewAttribution {
+                    gap: file
+                        .gap
+                        .map_or_else(String::new, |gap| gap.name().to_owned()),
+                    ..ReviewAttribution::default()
+                };
+            }
+            let mut key = file.producers.clone();
+            key.sort_unstable();
+            let group = groups
+                .iter()
+                .position(|existing| *existing == key)
+                .unwrap_or_else(|| {
+                    groups.push(key.clone());
+                    groups.len() - 1
+                });
+            let label = key
+                .iter()
+                .map(|producer| producer_display_name(&record.producers[*producer]))
+                .collect::<Vec<_>>()
+                .join(", ");
+            ReviewAttribution {
+                group: Some(group),
+                label,
+                gap: String::new(),
+                commits: file.commits.len(),
+                producers: key.len(),
+            }
+        })
+        .collect();
+
+    ReviewProvenance {
+        resolved: true,
+        agent_slug: record
+            .range
+            .as_ref()
+            .and_then(|range| range.agent_slug.clone())
+            .unwrap_or_default(),
+        head_revision: record
+            .range
+            .as_ref()
+            .map(|range| range.head_revision.clone())
+            .unwrap_or_default(),
+        commits: record.commits.len(),
+        producers: record.producers.len(),
+        groups: groups.len(),
+        skipped_merges: record.skipped_merges,
+        truncation: record
+            .truncation
+            .map_or_else(String::new, |truncation| truncation.name().to_owned()),
+        files: attributions,
+    }
 }
 
 /// Selects the requested changed path, or the first one when no preference is
@@ -3601,6 +3794,83 @@ fn retreat_review_file_window(row: &mut ReviewStateRow) -> bool {
     true
 }
 
+/// The review-wide attribution header.
+///
+/// `resolved` is separate from every count on purpose: a review with no
+/// attribution and a review whose attribution could not be resolved are
+/// different answers, and neither may render as the other.
+fn to_review_provenance(provenance: &ReviewProvenance) -> QVariant {
+    let mut value = QMap::<QMapPair_QString_QVariant>::default();
+    value.insert(
+        QString::from("resolved"),
+        QVariant::from(&provenance.resolved),
+    );
+    value.insert(
+        QString::from("agentSlug"),
+        QVariant::from(&QString::from(provenance.agent_slug.as_str())),
+    );
+    value.insert(
+        QString::from("headRevision"),
+        QVariant::from(&QString::from(provenance.head_revision.as_str())),
+    );
+    value.insert(
+        QString::from("commitCount"),
+        QVariant::from(&bounded_usize(provenance.commits)),
+    );
+    value.insert(
+        QString::from("producerCount"),
+        QVariant::from(&bounded_usize(provenance.producers)),
+    );
+    value.insert(
+        QString::from("groupCount"),
+        QVariant::from(&bounded_usize(provenance.groups)),
+    );
+    value.insert(
+        QString::from("skippedMerges"),
+        QVariant::from(&bounded_usize(provenance.skipped_merges)),
+    );
+    value.insert(
+        QString::from("truncation"),
+        QVariant::from(&QString::from(provenance.truncation.as_str())),
+    );
+    QVariant::from(&value)
+}
+
+/// One file's attribution, on the row and on the open file's header alike.
+///
+/// `provenanceGroup` is `-1` rather than absent when nothing is known, so a
+/// delegate reads one field and gets an answer instead of having to tell a
+/// missing key from a real group.
+fn insert_attribution(
+    value: &mut QMap<QMapPair_QString_QVariant>,
+    attribution: &ReviewAttribution,
+) {
+    value.insert(
+        QString::from("provenanceGroup"),
+        QVariant::from(&attribution.group.map_or(-1, bounded_usize)),
+    );
+    value.insert(
+        QString::from("provenanceLabel"),
+        QVariant::from(&QString::from(attribution.label.as_str())),
+    );
+    value.insert(
+        QString::from("provenanceGap"),
+        QVariant::from(&QString::from(attribution.gap.as_str())),
+    );
+    value.insert(
+        QString::from("provenanceCommits"),
+        QVariant::from(&bounded_usize(attribution.commits)),
+    );
+    value.insert(
+        QString::from("provenanceProducers"),
+        QVariant::from(&bounded_usize(attribution.producers)),
+    );
+}
+
+fn bounded_usize(value: usize) -> i32 {
+    i32::try_from(value).unwrap_or(i32::MAX)
+}
+
 fn to_review(row: &ReviewStateRow, loaded_path_id: &str) -> QVariant {
     let mut state = QMap::<QMapPair_QString_QVariant>::default();
     let mut insert = |key: &str, value: QVariant| state.insert(QString::from(key), value);
@@ -3655,9 +3925,11 @@ fn to_review(row: &ReviewStateRow, loaded_path_id: &str) -> QVariant {
     // while this is false the surface is a view, and its hunk actions can only
     // proceed by recomputing the file exactly first.
     insert("appliable", QVariant::from(&row.whitespace.is_exact()));
+    insert("provenance", to_review_provenance(&row.provenance));
     let mut files = QList::<QVariant>::default();
-    for entry in &row.files[file_start..file_end] {
+    for (offset, entry) in row.files[file_start..file_end].iter().enumerate() {
         let mut value = QMap::<QMapPair_QString_QVariant>::default();
+        insert_attribution(&mut value, &row.provenance.file(file_start + offset));
         value.insert(
             QString::from("fileId"),
             QVariant::from(&QString::from(entry.id.as_str())),
@@ -3686,6 +3958,17 @@ fn to_review(row: &ReviewStateRow, loaded_path_id: &str) -> QVariant {
         || QVariant::from(&QMap::<QMapPair_QString_QVariant>::default()),
         |loaded| {
             let mut value = QMap::<QMapPair_QString_QVariant>::default();
+            // The open file carries the same attribution its row does, so the
+            // header answers "what produced this" without the reader having to
+            // look back at the list they just left.
+            let attribution = row
+                .files
+                .iter()
+                .position(|entry| entry.id == loaded.id)
+                .map_or_else(ReviewAttribution::default, |index| {
+                    row.provenance.file(index)
+                });
+            insert_attribution(&mut value, &attribution);
             value.insert(
                 QString::from("fileId"),
                 QVariant::from(&QString::from(loaded.id.as_str())),
@@ -9407,6 +9690,321 @@ mod tests {
         assert_eq!(line_ending_name(b"value\r"), "cr");
         assert_eq!(line_ending_name(b"value"), "none");
         assert_eq!(display_line_end(b"value\r\n"), "value".len());
+    }
+
+    /// The reason the panel carries attribution at all: two files from
+    /// different hands are told apart by a mark rather than by reading a name,
+    /// and a file nothing produced says so instead of going blank.
+    #[test]
+    fn review_rows_group_files_by_who_produced_them_and_name_the_unknown_ones() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("provenance-review");
+        initialize_repository(&root);
+        let repository = Repository::open(&root).unwrap();
+        let base_branch = repository.head().unwrap().shorthand().unwrap().to_owned();
+        let head = repository.head().unwrap().peel_to_commit().unwrap();
+        repository.branch("agent/demo", &head, true).unwrap();
+        drop(head);
+        repository.set_head("refs/heads/agent/demo").unwrap();
+        drop(repository);
+
+        let ada = ("Ada", "ada@example.invalid");
+        let grace = ("Grace", "grace@example.invalid");
+        commit_file_as(&root, Path::new("alpha.txt"), "one\n", "add alpha", ada);
+        commit_file_as(&root, Path::new("beta.txt"), "one\n", "add beta", grace);
+        commit_file_as(&root, Path::new("gamma.txt"), "one\n", "add gamma", ada);
+
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
+        let review = load_review_with_git(
+            &git,
+            "project-1".to_owned(),
+            ReviewSelection::Branch {
+                branch: "agent/demo".to_owned(),
+                base_branch,
+            },
+            harkness_git::Whitespace::EXACT,
+            21,
+        )
+        .unwrap();
+
+        let state = review_map(&to_review(&review, ""));
+        let provenance = review_map(&review_field(&state, "provenance"));
+        assert!(review_flag(&provenance, "resolved"));
+        // The panel pins a branch review to object ids, so the branch
+        // convention can only be read because the name travelled beside it.
+        assert_eq!(review_text(&provenance, "agentSlug"), "demo");
+
+        let rows = review_field(&state, "files")
+            .value::<QList<QVariant>>()
+            .expect("the file list should flatten to a QVariantList")
+            .iter()
+            .map(|value| {
+                let row = review_map(value);
+                (
+                    review_text(&row, "path"),
+                    review_field(&row, "provenanceGroup")
+                        .value::<i32>()
+                        .unwrap_or(-2),
+                    review_text(&row, "provenanceLabel"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 3);
+        let group = |path: &str| {
+            rows.iter()
+                .find(|row| row.0 == path)
+                .unwrap_or_else(|| panic!("{path} was not projected"))
+                .1
+        };
+        assert!(group("alpha.txt") >= 0);
+        // Same hands, same mark; different hands, a different one.
+        assert_eq!(group("alpha.txt"), group("gamma.txt"));
+        assert_ne!(group("alpha.txt"), group("beta.txt"));
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.0 == "beta.txt")
+                .map(|row| row.2.clone()),
+            Some("Grace".to_owned())
+        );
+
+        // The common case, and the one that must be calmest: content nothing
+        // has committed carries no group and a named reason, never a blank.
+        fs::write(root.join("scratch.txt"), "written by nobody\n").unwrap();
+        let working = load_review_with_git(
+            &git,
+            "project-1".to_owned(),
+            ReviewSelection::Unstaged,
+            harkness_git::Whitespace::EXACT,
+            22,
+        )
+        .unwrap();
+        let working_state = review_map(&to_review(&working, ""));
+        let working_provenance = review_map(&review_field(&working_state, "provenance"));
+        assert!(review_flag(&working_provenance, "resolved"));
+        assert_eq!(review_text(&working_provenance, "agentSlug"), "");
+        let scratch = review_field(&working_state, "files")
+            .value::<QList<QVariant>>()
+            .unwrap()
+            .iter()
+            .map(review_map)
+            .find(|row| review_text(row, "path") == "scratch.txt")
+            .expect("the untracked file should be projected");
+        assert_eq!(
+            review_field(&scratch, "provenanceGroup")
+                .value::<i32>()
+                .unwrap_or(-2),
+            -1
+        );
+        assert_eq!(review_text(&scratch, "provenanceGap"), "uncommitted");
+        assert_eq!(review_text(&scratch, "provenanceLabel"), "");
+    }
+
+    /// The mark answers "the same hands", which is a question about a set. Two
+    /// files produced by one pair of people list them in whichever order their
+    /// own newest commit fell, so an order-sensitive key would give one answer
+    /// two colours and two spellings — the exact confusion the mark exists to
+    /// remove.
+    #[test]
+    fn one_set_of_producers_is_one_group_whatever_order_a_file_lists_them_in() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("producer-order");
+        initialize_repository(&root);
+        let repository = Repository::open(&root).unwrap();
+        let base_branch = repository.head().unwrap().shorthand().unwrap().to_owned();
+        let head = repository.head().unwrap().peel_to_commit().unwrap();
+        repository.branch("feature", &head, true).unwrap();
+        drop(head);
+        repository.set_head("refs/heads/feature").unwrap();
+        drop(repository);
+
+        let ada = ("Ada", "ada@example.invalid");
+        let grace = ("Grace", "grace@example.invalid");
+        // alpha ends up [Grace, Ada] and beta [Ada, Grace]: one set, two orders.
+        commit_file_as(&root, Path::new("alpha.txt"), "one\n", "ada on alpha", ada);
+        commit_file_as(
+            &root,
+            Path::new("alpha.txt"),
+            "two\n",
+            "grace on alpha",
+            grace,
+        );
+        commit_file_as(
+            &root,
+            Path::new("beta.txt"),
+            "one\n",
+            "grace on beta",
+            grace,
+        );
+        commit_file_as(&root, Path::new("beta.txt"), "two\n", "ada on beta", ada);
+
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
+        let review = load_review_with_git(
+            &git,
+            "project-1".to_owned(),
+            ReviewSelection::Branch {
+                branch: "feature".to_owned(),
+                base_branch,
+            },
+            harkness_git::Whitespace::EXACT,
+            23,
+        )
+        .unwrap();
+
+        let alpha = review.provenance.file(0);
+        let beta = review.provenance.file(1);
+        assert_eq!(review.files[0].path, PathBuf::from("alpha.txt"));
+        assert_eq!(review.files[1].path, PathBuf::from("beta.txt"));
+        assert_eq!(alpha.producers, 2);
+        assert_eq!(beta.producers, 2);
+        assert_eq!(alpha.group, beta.group);
+        assert_eq!(alpha.label, beta.label);
+        assert_eq!(review.provenance.groups, 1);
+    }
+
+    /// A producer name is repository content and a row is one line tall.
+    ///
+    /// Git refuses a control character in a signature, so the vector is the
+    /// trailer: `Co-Authored-By` is free text inside the message body, and
+    /// whatever it holds becomes a name on a row.
+    #[test]
+    fn a_producer_name_reaches_the_panel_on_one_line() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("noisy-name");
+        initialize_repository(&root);
+        let repository = Repository::open(&root).unwrap();
+        let base_branch = repository.head().unwrap().shorthand().unwrap().to_owned();
+        let head = repository.head().unwrap().peel_to_commit().unwrap();
+        repository.branch("feature", &head, true).unwrap();
+        drop(head);
+        repository.set_head("refs/heads/feature").unwrap();
+        drop(repository);
+
+        commit_file_as(
+            &root,
+            Path::new("alpha.txt"),
+            "one\n",
+            "add alpha\n\nCo-Authored-By: Some\t\tModel   Name <model@example.invalid>\n",
+            ("Ada", "ada@example.invalid"),
+        );
+
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
+        let review = load_review_with_git(
+            &git,
+            "project-1".to_owned(),
+            ReviewSelection::Branch {
+                branch: "feature".to_owned(),
+                base_branch,
+            },
+            harkness_git::Whitespace::EXACT,
+            24,
+        )
+        .unwrap();
+
+        let label = review.provenance.file(0).label;
+        assert_eq!(label, "Ada, Some Model Name");
+        assert!(
+            !label.contains('\t'),
+            "a tab survived into a row: {label:?}"
+        );
+    }
+
+    /// A trailer may carry an address and no name. That producer is still
+    /// somebody, so the row names the address rather than joining an empty
+    /// string into a dangling separator — or, where it is the only producer, an
+    /// empty label a surface would read back as *unattributed*.
+    #[test]
+    fn a_producer_with_no_name_is_shown_by_address_rather_than_as_unknown() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("unnamed-producer");
+        initialize_repository(&root);
+        let repository = Repository::open(&root).unwrap();
+        let base_branch = repository.head().unwrap().shorthand().unwrap().to_owned();
+        let head = repository.head().unwrap().peel_to_commit().unwrap();
+        repository.branch("feature", &head, true).unwrap();
+        drop(head);
+        repository.set_head("refs/heads/feature").unwrap();
+        drop(repository);
+
+        commit_file_as(
+            &root,
+            Path::new("alpha.txt"),
+            "one\n",
+            "add alpha\n\nCo-Authored-By: <model@example.invalid>\n",
+            ("Ada", "ada@example.invalid"),
+        );
+
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
+        let review = load_review_with_git(
+            &git,
+            "project-1".to_owned(),
+            ReviewSelection::Branch {
+                branch: "feature".to_owned(),
+                base_branch,
+            },
+            harkness_git::Whitespace::EXACT,
+            25,
+        )
+        .unwrap();
+
+        let alpha = review.provenance.file(0);
+        assert_eq!(alpha.label, "Ada, model@example.invalid");
+        assert_eq!(alpha.producers, 2);
+        assert_eq!(alpha.gap, "");
+    }
+
+    /// A review with no changed files asks about no paths, which is answered
+    /// without a walk — and *answered*, rather than reported as an attribution
+    /// that could not be made.
+    #[test]
+    fn a_review_with_no_files_resolves_to_an_empty_attribution() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("empty-review");
+        initialize_repository(&root);
+        let git = harkness_git::GitService::new(&root, fixture.path().join("data"));
+
+        let review = load_review_with_git(
+            &git,
+            "project-1".to_owned(),
+            ReviewSelection::Unstaged,
+            harkness_git::Whitespace::EXACT,
+            26,
+        )
+        .unwrap();
+
+        assert!(review.files.is_empty());
+        assert!(review.provenance.resolved);
+        assert_eq!(review.provenance.commits, 0);
+        assert_eq!(review.provenance.producers, 0);
+        assert_eq!(review.provenance.groups, 0);
+        assert!(review.provenance.files.is_empty());
+    }
+
+    fn commit_file_as(
+        root: &Path,
+        path: &Path,
+        contents: &str,
+        message: &str,
+        author: (&str, &str),
+    ) {
+        fs::write(root.join(path), contents).unwrap();
+        let repository = Repository::open(root).unwrap();
+        let mut index = repository.index().unwrap();
+        index.add_path(path).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repository.find_tree(tree_id).unwrap();
+        let parent = repository.head().unwrap().peel_to_commit().unwrap();
+        let signature = Signature::now(author.0, author.1).unwrap();
+        repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                message,
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
     }
 
     fn review_map(value: &QVariant) -> QMap<QMapPair_QString_QVariant> {
