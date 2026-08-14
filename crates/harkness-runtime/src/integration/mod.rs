@@ -101,6 +101,7 @@
 //! will store: adding a field, a subject kind, or a state spelling means a
 //! version bump and a *new* fixture, never an edit to an existing one.
 
+mod binding;
 mod error;
 mod id;
 mod record;
@@ -108,6 +109,7 @@ mod state;
 mod subject;
 mod wire;
 
+pub use binding::IntegrationIdentity;
 pub use error::IntegrationDomainError;
 pub use id::{ExternalAgentId, ForgeAccountId, ForgeRepoRef, McpServerId, McpToolRef, RecipeId};
 pub use record::{ObservedIdentity, TrustRecord};

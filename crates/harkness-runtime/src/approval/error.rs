@@ -84,6 +84,14 @@ pub enum ApprovalError {
         scope: ApprovalScope,
     },
 
+    /// An external operation omitted its required identity or carried an
+    /// identity belonging to another kind of operation.
+    #[error("approval carries invalid external integration identity: {reason}")]
+    InvalidIntegrationIdentity {
+        /// Stable explanation of the identity-shape violation.
+        reason: &'static str,
+    },
+
     /// A tool input could not be reduced to its canonical form.
     ///
     /// The pointer is an RFC 6901 JSON Pointer, the same way the tool contract's
@@ -132,6 +140,7 @@ impl ApprovalError {
         "approval_scope_exceeds_request",
         "approval_expired",
         "approval_scope_requires_capability",
+        "approval_invalid_integration_identity",
         "approval_uncanonicalizable_input",
         "approval_inconsistent_record",
         "approval_malformed_input_hash",
@@ -147,9 +156,10 @@ impl ApprovalError {
             Self::ScopeExceedsRequest { .. } => Self::KINDS[3],
             Self::Expired { .. } => Self::KINDS[4],
             Self::ScopeRequiresCapability { .. } => Self::KINDS[5],
-            Self::UncanonicalizableInput { .. } => Self::KINDS[6],
-            Self::InconsistentRecord { .. } => Self::KINDS[7],
-            Self::MalformedInputHash { .. } => Self::KINDS[8],
+            Self::InvalidIntegrationIdentity { .. } => Self::KINDS[6],
+            Self::UncanonicalizableInput { .. } => Self::KINDS[7],
+            Self::InconsistentRecord { .. } => Self::KINDS[8],
+            Self::MalformedInputHash { .. } => Self::KINDS[9],
         }
     }
 }
@@ -191,6 +201,9 @@ mod tests {
             },
             ApprovalError::ScopeRequiresCapability {
                 scope: ApprovalScope::CapabilityForRun,
+            },
+            ApprovalError::InvalidIntegrationIdentity {
+                reason: "missing executable hash",
             },
             ApprovalError::UncanonicalizableInput {
                 pointer: "/limit".to_owned(),

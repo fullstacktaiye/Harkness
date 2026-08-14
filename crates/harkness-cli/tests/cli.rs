@@ -3463,7 +3463,7 @@ fn the_contract_publishes_an_exit_code_for_every_error_kind() {
     let body = json_output(&output);
     let data = &body["data"];
     let map = &data["exit_code_by_kind"];
-    for namespace in ["cli", "project", "git", "editor"] {
+    for namespace in ["cli", "project", "git", "editor", "policy"] {
         let kinds = data["error_kinds"][namespace].as_array().unwrap();
         let mapped = map[namespace].as_object().unwrap();
         assert_eq!(
@@ -3486,6 +3486,8 @@ fn the_contract_publishes_an_exit_code_for_every_error_kind() {
     assert_eq!(map["editor"]["editor_file_unavailable"], 4);
     assert_eq!(map["editor"]["editor_launch"], 1);
     assert_eq!(map["cli"]["usage_error"], 2);
+    assert_eq!(map["policy"]["noninteractive_mcp_tool_invoke_denied"], 3);
+    assert_eq!(map["policy"]["recipe_content_identity_required"], 3);
 }
 
 /// The plain-text path is secondary but still has to answer which files

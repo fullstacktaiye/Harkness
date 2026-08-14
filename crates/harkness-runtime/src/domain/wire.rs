@@ -13,7 +13,7 @@ use super::{
 use crate::policy::{PolicyDecision, PolicyVerdict};
 
 /// Newest durable runtime-record schema understood by this build.
-pub const RUNTIME_RECORD_SCHEMA_VERSION: u32 = 2;
+pub const RUNTIME_RECORD_SCHEMA_VERSION: u32 = 3;
 /// Oldest durable runtime-record schema understood by this build.
 pub const MINIMUM_RUNTIME_RECORD_SCHEMA_VERSION: u32 = 1;
 
@@ -537,6 +537,16 @@ impl TryFrom<ToolCallWire> for ToolCall {
             return Err(invalid_lifecycle(
                 "tool_call",
                 "schema version 1 cannot carry a policy decision",
+            ));
+        }
+        if wire.schema_version < 3
+            && wire.policy_decision.as_ref().is_some_and(|decision| {
+                decision.external_request().is_some() || decision.denial_kind().is_some()
+            })
+        {
+            return Err(invalid_lifecycle(
+                "tool_call",
+                "schema versions before 3 cannot carry external policy decision fields",
             ));
         }
         validate_policy_decision(
@@ -1087,6 +1097,10 @@ mod tests {
         .unwrap()
     }
 
+    fn external_denial_decision() -> PolicyDecision {
+        serde_json::from_str(include_str!("../policy/fixtures/external-decision-v1.json")).unwrap()
+    }
+
     fn task_wire() -> TaskWire {
         TaskWire {
             schema_version: RUNTIME_RECORD_SCHEMA_VERSION,
@@ -1248,7 +1262,7 @@ mod tests {
     }
 
     #[test]
-    fn frozen_v2_json_fixtures_cover_every_record_type() {
+    fn frozen_v3_json_fixtures_cover_every_record_type() {
         let task = Task::try_from(task_wire()).unwrap();
 
         let mut run = Run::with_id(run_id(), task.id(), at(0));
@@ -1272,31 +1286,34 @@ mod tests {
             json!({"include_untracked": true}),
             at(0),
         );
-        call.apply_policy_decision(ask_decision(), at(1)).unwrap();
-        call.approve("user:42", at(2)).unwrap();
-        call.succeed(json!({"clean": true}), at(3)).unwrap();
+        call.apply_policy_decision(external_denial_decision(), at(1))
+            .unwrap();
 
         assert_fixture(
             TaskWireRef::from(&task),
-            include_str!("fixtures/task-v2.json"),
+            include_str!("fixtures/task-v3.json"),
         );
-        assert_fixture(RunWireRef::from(&run), include_str!("fixtures/run-v2.json"));
+        assert_fixture(RunWireRef::from(&run), include_str!("fixtures/run-v3.json"));
         assert_fixture(
             StepWireRef::from(&step),
-            include_str!("fixtures/step-v2.json"),
+            include_str!("fixtures/step-v3.json"),
         );
         assert_fixture(
             ToolCallWireRef::from(&call),
-            include_str!("fixtures/tool-call-v2.json"),
+            include_str!("fixtures/tool-call-v3.json"),
         );
 
+        assert_owned_fixture::<TaskWire>(include_str!("fixtures/task-v3.json"));
+        assert_owned_fixture::<RunWire>(include_str!("fixtures/run-v3.json"));
+        assert_owned_fixture::<StepWire>(include_str!("fixtures/step-v3.json"));
+        assert_owned_fixture::<ToolCallWire>(include_str!("fixtures/tool-call-v3.json"));
+
+        // Previous frozen versions remain readable after the external policy
+        // decision fields and record-version bump.
         assert_owned_fixture::<TaskWire>(include_str!("fixtures/task-v2.json"));
         assert_owned_fixture::<RunWire>(include_str!("fixtures/run-v2.json"));
         assert_owned_fixture::<StepWire>(include_str!("fixtures/step-v2.json"));
         assert_owned_fixture::<ToolCallWire>(include_str!("fixtures/tool-call-v2.json"));
-
-        // The previous frozen version remains readable after the additive
-        // policy-decision field and record-version bump.
         assert_owned_fixture::<TaskWire>(include_str!("fixtures/task-v1.json"));
         assert_owned_fixture::<RunWire>(include_str!("fixtures/run-v1.json"));
         assert_owned_fixture::<StepWire>(include_str!("fixtures/step-v1.json"));
@@ -1314,6 +1331,22 @@ mod tests {
             error
                 .to_string()
                 .contains("policy decision contradicts the tool-call lifecycle")
+        );
+    }
+
+    #[test]
+    fn a_v2_tool_call_cannot_claim_v3_external_policy_fields() {
+        let mut wire = call_wire(ToolCallState::AwaitingApproval);
+        wire.schema_version = 2;
+        wire.policy_decision = Some(
+            serde_json::from_str(include_str!("../policy/fixtures/external-decision-v1.json"))
+                .unwrap(),
+        );
+        let error = ToolCall::try_from(wire).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("schema versions before 3 cannot carry external policy decision fields")
         );
     }
 

@@ -21,12 +21,13 @@ use time::{OffsetDateTime, UtcOffset};
 use crate::approval::{
     ApprovalDecision, ApprovalGate, ApprovalObservation, ApprovalRequest, ApprovalScope,
     ApprovalState, CandidateCall, DecidedVia, PendingApproval, WorkspaceBinding,
-    canonical_input_hash, matching_grants,
+    canonical_input_hash, matching_grants, matching_grants_detailed,
 };
 use crate::domain::{
     ArtifactId, ExecutionState, Failure, Run, RunId, Step, StepId, Task, TaskId, ToolCall,
     ToolCallId, ToolCallState, ToolCallWire,
 };
+use crate::integration::{IntegrationIdentity, Sha256Hash};
 use crate::policy::{PolicyDecision, PolicyVerdict};
 use crate::tool::{ArtifactWriter, Capability, RiskLevel, ToolIdentity};
 use crate::trust::{TrustState, WorkspaceTrust};
@@ -1201,6 +1202,67 @@ fn a_denied_tool_call_records_the_policy_decision() {
     let reloaded = fixture.reopen().load_tool_call(call.id()).unwrap();
     assert_eq!(reloaded, denied);
     assert_eq!(reloaded.policy_decision(), Some(&decision));
+}
+
+#[test]
+fn a_missing_external_identity_denial_is_persisted_and_terminalizes_the_call() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = stored_step(&fixture.store, &run);
+    let call = stored_tool_call(&fixture.store, &step);
+    let decision: PolicyDecision = serde_json::from_value(json!({
+        "verdict": "deny",
+        "reason": "denied: invoke_mcp_tool requires observed identity evidence",
+        "source": "built_in",
+        "external_request": {
+            "schema_version": 1,
+            "capability": "invoke_mcp_tool",
+            "classified_risk": "execute"
+        },
+        "denial_kind": "mcp_tool_schema_identity_required"
+    }))
+    .unwrap();
+
+    let denied = fixture
+        .store
+        .apply_tool_call_policy_decision(call.id(), decision.clone(), at(10))
+        .unwrap();
+    assert_eq!(denied.state(), ToolCallState::Denied);
+    assert_eq!(denied.policy_decision(), Some(&decision));
+    assert_eq!(fixture.store.load_tool_call(call.id()).unwrap(), denied);
+}
+
+#[test]
+fn an_external_declaration_mismatch_denial_is_persisted_and_terminalizes_the_call() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = stored_step(&fixture.store, &run);
+    let call = stored_tool_call(&fixture.store, &step);
+    let decision: PolicyDecision = serde_json::from_value(json!({
+        "verdict": "deny",
+        "reason": "denied: external context does not match the declared capability",
+        "source": "built_in",
+        "external_request": {
+            "schema_version": 1,
+            "capability": "invoke_mcp_tool",
+            "classified_risk": "execute",
+            "identity": {
+                "mcp_tool_schema_fingerprint": Sha256Hash::of("schema")
+            }
+        },
+        "denial_kind": "external_identity_context_invalid"
+    }))
+    .unwrap();
+
+    let denied = fixture
+        .store
+        .apply_tool_call_policy_decision(call.id(), decision.clone(), at(10))
+        .unwrap();
+    assert_eq!(denied.state(), ToolCallState::Denied);
+    assert_eq!(denied.policy_decision(), Some(&decision));
+    assert_eq!(fixture.reopen().load_tool_call(call.id()).unwrap(), denied);
 }
 
 #[test]
@@ -3760,6 +3822,35 @@ fn a_future_approval_row_reads_as_an_upgrade_request() {
     assert!(error.to_string().contains("upgrade Harkness"), "{error}");
 }
 
+#[test]
+fn a_v2_approval_row_cannot_claim_v3_external_identity_fields() {
+    let held = Held::new();
+    let request = held.open(
+        held.pending(RiskLevel::Execute)
+            .with_capabilities([Capability::new("invoke_mcp_tool").unwrap()])
+            .with_integration_identity(
+                IntegrationIdentity::none()
+                    .with_mcp_tool_schema_fingerprint(Sha256Hash::of("schema")),
+            ),
+    );
+    guard(&held.store().writer)
+        .execute(
+            "UPDATE approvals SET schema_version = 2 WHERE id = ?1",
+            rusqlite::params![request.id().to_string()],
+        )
+        .unwrap();
+
+    let error = held.store().approval(request.id()).unwrap_err();
+    assert_eq!(error.kind(), "approval_refused");
+    assert!(
+        error
+            .to_string()
+            .contains("schema versions before 3 cannot carry external integration identity"),
+        "{error}"
+    );
+    assert!(!matches!(held.store().run_grants(held.run.id()), Ok(grants) if !grants.is_empty()));
+}
+
 // -- migration from a frozen database ---------------------------------------
 
 /// The frozen v2 database committed beside this module.
@@ -3777,6 +3868,9 @@ const FROZEN_V4_DATABASE: &[u8] = include_bytes!("fixtures/runtime-v4.db");
 
 /// The frozen v5 database carrying one pending approval and one grant.
 const FROZEN_V5_DATABASE: &[u8] = include_bytes!("fixtures/runtime-v5.db");
+
+/// The frozen v6 database carrying an external identity-bound approval.
+const FROZEN_V6_DATABASE: &[u8] = include_bytes!("fixtures/runtime-v6.db");
 
 /// The approval identities the v5 fixture was written with.
 const FIXTURE_PENDING_APPROVAL_ID: &str = "77777777-7777-4777-8777-777777777777";
@@ -3806,6 +3900,10 @@ const LATER_MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 6,
+        statements: include_str!("migrations/006_approval_integration_identity.sql"),
+    },
+    Migration {
+        version: 7,
         statements: "ALTER TABLE runs ADD COLUMN cancelled_by TEXT;",
     },
 ];
@@ -3987,6 +4085,47 @@ fn a_frozen_v5_database_opens_and_reads_its_approvals() {
 }
 
 #[test]
+fn a_frozen_v6_database_opens_and_reads_its_external_identity_binding() {
+    let data_dir = restore_frozen_database(FROZEN_V6_DATABASE);
+    let store = Store::open(data_dir.path()).unwrap();
+    assert_eq!(
+        recorded_version(&guard(&store.writer)).unwrap(),
+        SCHEMA_VERSION
+    );
+
+    let request = store
+        .approval(FIXTURE_GRANTED_APPROVAL_ID.parse().unwrap())
+        .unwrap();
+    let identity = IntegrationIdentity::none()
+        .with_mcp_tool_schema_fingerprint(Sha256Hash::of("frozen schema"));
+    assert_eq!(request.integration_identity(), identity);
+
+    let grants = store.run_grants(request.run_id()).unwrap();
+    let workspace = approval_workspace();
+    let tool = ToolIdentity::parse("fs.write", "1.2.0").unwrap();
+    let capabilities = [Capability::new("invoke_mcp_tool").unwrap()];
+    let candidate = CandidateCall::new(
+        request.run_id(),
+        request.tool_call_id(),
+        &workspace,
+        &tool,
+        canonical_input_hash(&approval_input()).unwrap(),
+    )
+    .with_capabilities(&capabilities)
+    .with_integration_identity(identity);
+    assert_eq!(matching_grants(&grants, &candidate).len(), 1);
+    let drifted = matching_grants_detailed(
+        &grants,
+        &candidate.with_integration_identity(
+            IntegrationIdentity::none()
+                .with_mcp_tool_schema_fingerprint(Sha256Hash::of("changed schema")),
+        ),
+    );
+    assert!(drifted.grants().is_empty());
+    assert_eq!(drifted.identity_drifts().len(), 1);
+}
+
+#[test]
 fn a_frozen_v2_database_opens_after_future_migrations() {
     let data_dir = restore_frozen_database(FROZEN_V2_DATABASE);
     let path = data_dir.path().join(DATABASE_FILE);
@@ -3997,7 +4136,7 @@ fn a_frozen_v2_database_opens_after_future_migrations() {
 
     apply(&mut connection, LATER_MIGRATIONS).unwrap();
 
-    assert_eq!(recorded_version(&connection).unwrap(), 6);
+    assert_eq!(recorded_version(&connection).unwrap(), 7);
     let run =
         super::repository::load_run(&connection, RunId::from_str(FIXTURE_RUN_ID).unwrap()).unwrap();
     assert_eq!(run.state(), ExecutionState::Running);
@@ -4231,6 +4370,49 @@ fn regenerate_the_frozen_v5_fixture() {
     freeze(&guard(&store.writer), "runtime-v5.db");
 }
 
+/// Writes the frozen v6 fixture with an MCP schema-bound grant.
+#[test]
+#[ignore = "rewrites a committed fixture; run only when migration 6 changes"]
+fn regenerate_the_frozen_v6_fixture() {
+    let data_dir = TempDir::new().unwrap();
+    let store = store_with_migrations(data_dir.path(), &MIGRATIONS[..6]);
+    let task = stored_task(&store);
+    let run = stored_run(&store, &task);
+    let step = stored_step(&store, &run);
+    let call = stored_tool_call(&store, &step);
+    let identity = IntegrationIdentity::none()
+        .with_mcp_tool_schema_fingerprint(Sha256Hash::of("frozen schema"));
+    let request = ApprovalRequest::open_with_id(
+        FIXTURE_GRANTED_APPROVAL_ID.parse().unwrap(),
+        PendingApproval::new(
+            run.id(),
+            call.id(),
+            ToolIdentity::parse("fs.write", "1.2.0").unwrap(),
+            canonical_input_hash(&approval_input()).unwrap(),
+            approval_workspace(),
+            RiskLevel::Execute,
+            at(4),
+        )
+        .with_capabilities([Capability::new("invoke_mcp_tool").unwrap()])
+        .with_integration_identity(identity)
+        .summarized_as("invoke an imported MCP tool"),
+    )
+    .unwrap();
+    store.open_approval(request.clone()).unwrap();
+    store
+        .decide_approval(
+            request.id(),
+            ApprovalDecision::grant(
+                request.id(),
+                ApprovalScope::ExactCall,
+                DecidedVia::Gui,
+                at(7),
+            ),
+        )
+        .unwrap();
+    freeze(&guard(&store.writer), "runtime-v6.db");
+}
+
 /// Builds a store stopped at an older migration for fixture regeneration.
 fn store_with_migrations(data_dir: &std::path::Path, migrations: &[Migration]) -> Store {
     std::fs::create_dir_all(data_dir).unwrap();
@@ -4261,8 +4443,8 @@ fn freeze(connection: &Connection, name: &str) {
 
 #[test]
 fn every_migration_in_this_build_is_recorded_in_order() {
-    assert_eq!(MIGRATIONS.len(), 5, "add coverage for a new migration");
-    assert_eq!(SCHEMA_VERSION, 5);
+    assert_eq!(MIGRATIONS.len(), 6, "add coverage for a new migration");
+    assert_eq!(SCHEMA_VERSION, 6);
 }
 
 // -- performance -------------------------------------------------------------

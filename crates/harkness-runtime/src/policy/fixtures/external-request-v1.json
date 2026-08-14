@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "capability": "invoke_mcp_tool",
+  "classified_risk": "observe",
+  "identity": {
+    "mcp_tool_schema_fingerprint": "df0ad6e43880f09c90ebf95f19110178aba6890df0010ebda7485029e2b543b4"
+  }
+}

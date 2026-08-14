@@ -14,10 +14,11 @@ use serde_json::json;
 use time::OffsetDateTime;
 
 use crate::approval::{
-    ApprovalDecision, ApprovalGrant, ApprovalRequest, ApprovalScope, ApprovalState,
+    ApprovalDecision, ApprovalError, ApprovalGrant, ApprovalRequest, ApprovalScope, ApprovalState,
     ApprovalVerdict, DecidedVia, InputHash, PendingApproval, WorkspaceBinding,
 };
 use crate::domain::{ApprovalId, RUNTIME_RECORD_SCHEMA_VERSION, RunId};
+use crate::integration::{IntegrationIdentity, Sha256Hash};
 use crate::tool::{Capability, RiskLevel, ToolIdentity};
 
 use super::column::{
@@ -29,9 +30,11 @@ use super::repository::{missing_row, optional_text, row_failed, schema_version, 
 use super::{EventKind, Redactor, RunEvent};
 
 const APPROVAL: &str = "approval";
+const APPROVAL_INTEGRATION_IDENTITY_SCHEMA_VERSION: u32 = 3;
 
 const APPROVAL_COLUMNS: &str = "schema_version, id, run_id, tool_call_id, tool_id, tool_version, \
-     capabilities_json, input_hash, input_summary, project_id, canonical_root, risk, \
+     capabilities_json, agent_executable_sha256, mcp_tool_schema_fingerprint, recipe_content_hash, \
+     input_hash, input_summary, project_id, canonical_root, risk, \
      requested_scope, effective_scope, state, created_at, expires_at, resolved_at, decided_via, \
      decision_verdict, decision_scope, decision_reason";
 
@@ -70,22 +73,26 @@ pub(super) fn redact_decision(
 /// the hot event stream. A caller free to supply its own payload would be one
 /// `with_payload` away from putting the input there.
 pub(super) fn requested_event(request: &ApprovalRequest) -> Result<RunEvent, StoreError> {
+    let mut payload = json!({
+        "approval_id": request.id().to_string(),
+        "tool": request.tool().to_string(),
+        "risk": request.risk().as_str(),
+        "requested_scope": request.requested_scope().as_str(),
+        "effective_scope": request.effective_scope().as_str(),
+        "summary": request.input_summary(),
+        "expires_at": encode_optional_timestamp(
+            APPROVAL,
+            "expires_at",
+            request.expires_at(),
+        )?,
+    });
+    if !request.integration_identity().is_empty() {
+        payload["integration_identity"] = json!(request.integration_identity());
+    }
     Ok(
         RunEvent::new(EventKind::ApprovalRequested, request.created_at())
             .for_tool_call(request.tool_call_id())
-            .with_payload(json!({
-                "approval_id": request.id().to_string(),
-                "tool": request.tool().to_string(),
-                "risk": request.risk().as_str(),
-                "requested_scope": request.requested_scope().as_str(),
-                "effective_scope": request.effective_scope().as_str(),
-                "summary": request.input_summary(),
-                "expires_at": encode_optional_timestamp(
-                    APPROVAL,
-                    "expires_at",
-                    request.expires_at(),
-                )?,
-            })),
+            .with_payload(payload),
     )
 }
 
@@ -139,6 +146,7 @@ pub(super) fn insert(connection: &Connection, request: &ApprovalRequest) -> Resu
             &format!(
                 "INSERT INTO approvals ({APPROVAL_COLUMNS}) VALUES (:schema_version, :id, \
                  :run_id, :tool_call_id, :tool_id, :tool_version, :capabilities_json, \
+                 :agent_executable_sha256, :mcp_tool_schema_fingerprint, :recipe_content_hash, \
                  :input_hash, :input_summary, :project_id, :canonical_root, :risk, \
                  :requested_scope, :effective_scope, :state, :created_at, :expires_at, \
                  :resolved_at, :decided_via, :decision_verdict, :decision_scope, :decision_reason)"
@@ -155,6 +163,18 @@ pub(super) fn insert(connection: &Connection, request: &ApprovalRequest) -> Resu
                     &request.tool().version.to_string(),
                 )?,
                 ":capabilities_json": encode_capabilities(request.capabilities())?,
+                ":agent_executable_sha256": request
+                    .integration_identity()
+                    .agent_executable_sha256()
+                    .map(Sha256Hash::to_hex),
+                ":mcp_tool_schema_fingerprint": request
+                    .integration_identity()
+                    .mcp_tool_schema_fingerprint()
+                    .map(Sha256Hash::to_hex),
+                ":recipe_content_hash": request
+                    .integration_identity()
+                    .recipe_content_hash()
+                    .map(Sha256Hash::to_hex),
                 ":input_hash": request.input_hash().to_hex(),
                 ":input_summary": encode_text(
                     APPROVAL,
@@ -340,7 +360,7 @@ fn list(
 fn decode(row: &Row<'_>) -> Result<ApprovalRequest, StoreError> {
     // Probe first: a future row may spell a state, a scope, or a surface in a
     // way this build cannot decode, and the caller needs to be told to upgrade.
-    schema_version(row, APPROVAL)?;
+    let record_schema_version = schema_version(row, APPROVAL)?;
 
     let id: ApprovalId = decode_id(APPROVAL, "id", &text(row, APPROVAL, "id")?)?;
     let tool = ToolIdentity::parse(
@@ -354,6 +374,16 @@ fn decode(row: &Row<'_>) -> Result<ApprovalRequest, StoreError> {
             .transpose()?,
         PathBuf::from(text(row, APPROVAL, "canonical_root")?),
     );
+
+    let integration_identity = decode_integration_identity(row)?;
+    if record_schema_version < APPROVAL_INTEGRATION_IDENTITY_SCHEMA_VERSION
+        && !integration_identity.is_empty()
+    {
+        return Err(StoreError::Approval(ApprovalError::InconsistentRecord {
+            id,
+            reason: "schema versions before 3 cannot carry external integration identity",
+        }));
+    }
 
     let pending = PendingApproval::new(
         decode_id(APPROVAL, "run_id", &text(row, APPROVAL, "run_id")?)?,
@@ -380,6 +410,7 @@ fn decode(row: &Row<'_>) -> Result<ApprovalRequest, StoreError> {
         APPROVAL,
         "capabilities_json",
     )?)?)
+    .with_integration_identity(integration_identity)
     .summarized_as(text(row, APPROVAL, "input_summary")?);
     let pending = match decode_optional_timestamp(
         APPROVAL,
@@ -525,6 +556,25 @@ fn encode_capabilities(capabilities: &[Capability]) -> Result<String, StoreError
 
 fn decode_capabilities(stored: &str) -> Result<Vec<Capability>, StoreError> {
     serde_json::from_str(stored).map_err(|error| encoding("capabilities_json", error))
+}
+
+fn decode_integration_identity(row: &Row<'_>) -> Result<IntegrationIdentity, StoreError> {
+    let digest = |field| -> Result<Option<Sha256Hash>, StoreError> {
+        optional_text(row, APPROVAL, field)?
+            .map(|stored| Sha256Hash::parse(&stored).map_err(|error| encoding(field, error)))
+            .transpose()
+    };
+    let mut identity = IntegrationIdentity::none();
+    if let Some(hash) = digest("agent_executable_sha256")? {
+        identity = identity.with_agent_executable_sha256(hash);
+    }
+    if let Some(hash) = digest("mcp_tool_schema_fingerprint")? {
+        identity = identity.with_mcp_tool_schema_fingerprint(hash);
+    }
+    if let Some(hash) = digest("recipe_content_hash")? {
+        identity = identity.with_recipe_content_hash(hash);
+    }
+    Ok(identity)
 }
 
 fn encoding(field: &'static str, reason: impl std::fmt::Display) -> StoreError {

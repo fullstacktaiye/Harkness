@@ -157,6 +157,8 @@ pub enum EventKind {
     ApprovalRequested,
     /// A human decision was recorded.
     ApprovalDecided,
+    /// An otherwise applicable approval no longer matched external identity.
+    ApprovalIdentityDrift,
     /// Content was stored outside the log.
     ArtifactCreated,
     /// Anything a run wants to say that no other kind covers.
@@ -184,6 +186,7 @@ impl EventKind {
         "tool_progress",
         "approval_requested",
         "approval_decided",
+        "approval_identity_drift",
         "artifact_created",
         "diagnostic",
     ];
@@ -199,8 +202,9 @@ impl EventKind {
             Self::ToolProgress => Self::KINDS[4],
             Self::ApprovalRequested => Self::KINDS[5],
             Self::ApprovalDecided => Self::KINDS[6],
-            Self::ArtifactCreated => Self::KINDS[7],
-            Self::Diagnostic => Self::KINDS[8],
+            Self::ApprovalIdentityDrift => Self::KINDS[7],
+            Self::ArtifactCreated => Self::KINDS[8],
+            Self::Diagnostic => Self::KINDS[9],
             Self::Unrecognized(spelling) => spelling,
         }
     }
@@ -220,6 +224,7 @@ impl EventKind {
             "tool_progress" => Self::ToolProgress,
             "approval_requested" => Self::ApprovalRequested,
             "approval_decided" => Self::ApprovalDecided,
+            "approval_identity_drift" => Self::ApprovalIdentityDrift,
             "artifact_created" => Self::ArtifactCreated,
             "diagnostic" => Self::Diagnostic,
             other => Self::Unrecognized(other.to_owned()),
@@ -590,6 +595,7 @@ mod tests {
             EventKind::ToolProgress,
             EventKind::ApprovalRequested,
             EventKind::ApprovalDecided,
+            EventKind::ApprovalIdentityDrift,
             EventKind::ArtifactCreated,
             EventKind::Diagnostic,
         ];

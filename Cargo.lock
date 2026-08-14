@@ -659,6 +659,7 @@ dependencies = [
  "git2",
  "harkness-core",
  "harkness-git",
+ "harkness-runtime",
  "libc",
  "serde",
  "serde_json",

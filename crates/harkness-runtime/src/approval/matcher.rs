@@ -22,6 +22,7 @@
 //! evaluated rather than on what it is.
 
 use crate::domain::{ApprovalId, RunId, ToolCallId};
+use crate::integration::IntegrationIdentity;
 use crate::policy::{RunGrant, RunGrantScope};
 use crate::tool::{Capability, ToolIdentity};
 
@@ -43,6 +44,7 @@ pub struct ApprovalGrant {
     workspace: WorkspaceBinding,
     tool: ToolIdentity,
     capabilities: Vec<Capability>,
+    integration_identity: IntegrationIdentity,
     input_hash: InputHash,
     scope: ApprovalScope,
 }
@@ -64,6 +66,7 @@ impl ApprovalGrant {
             workspace: request.workspace().clone(),
             tool: request.tool().clone(),
             capabilities: request.capabilities().to_vec(),
+            integration_identity: request.integration_identity(),
             input_hash: request.input_hash(),
             // The *effective* scope, which a decision narrowing to one call has
             // already rewritten: a grant reaches as far as what was allowed, not
@@ -103,7 +106,134 @@ impl ApprovalGrant {
     /// module can make.
     #[must_use]
     pub fn matching(&self, candidate: &CandidateCall<'_>) -> Option<RunGrant> {
-        grant_applies(self, candidate).then(|| RunGrant::matching(policy_scope(self.scope)))
+        match self.match_candidate(candidate) {
+            GrantMatch::Matched(grant) => Some(grant),
+            GrantMatch::IdentityDrift(_) | GrantMatch::NotApplicable => None,
+        }
+    }
+
+    /// Explains whether this grant matches, including identity drift that must
+    /// be recorded separately from an ordinary unrelated grant.
+    #[must_use]
+    pub fn match_candidate(&self, candidate: &CandidateCall<'_>) -> GrantMatch {
+        if !scope_applies_except_identity(self, candidate) {
+            return GrantMatch::NotApplicable;
+        }
+        if self.integration_identity != candidate.integration_identity {
+            return GrantMatch::IdentityDrift(IntegrationIdentityDrift::between(
+                self.approval_id,
+                self.integration_identity,
+                candidate.integration_identity,
+            ));
+        }
+        GrantMatch::Matched(RunGrant::matching(
+            policy_scope(self.scope),
+            self.integration_identity,
+        ))
+    }
+}
+
+/// One identity component that changed after an approval was granted.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum IntegrationIdentityField {
+    /// ACP-agent or MCP-server executable content changed.
+    AgentExecutableSha256,
+    /// Imported MCP tool schema changed.
+    McpToolSchemaFingerprint,
+    /// Compiled workflow recipe content changed.
+    RecipeContentHash,
+}
+
+impl IntegrationIdentityField {
+    /// Stable spelling for the drift event payload.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AgentExecutableSha256 => "agent_executable_sha256",
+            Self::McpToolSchemaFingerprint => "mcp_tool_schema_fingerprint",
+            Self::RecipeContentHash => "recipe_content_hash",
+        }
+    }
+}
+
+/// Observable identity drift for an otherwise applicable approval grant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IntegrationIdentityDrift {
+    approval_id: ApprovalId,
+    changed_fields: Vec<IntegrationIdentityField>,
+}
+
+impl IntegrationIdentityDrift {
+    fn between(
+        approval_id: ApprovalId,
+        approved: IntegrationIdentity,
+        observed: IntegrationIdentity,
+    ) -> Self {
+        let mut changed_fields = Vec::new();
+        if approved.agent_executable_sha256() != observed.agent_executable_sha256() {
+            changed_fields.push(IntegrationIdentityField::AgentExecutableSha256);
+        }
+        if approved.mcp_tool_schema_fingerprint() != observed.mcp_tool_schema_fingerprint() {
+            changed_fields.push(IntegrationIdentityField::McpToolSchemaFingerprint);
+        }
+        if approved.recipe_content_hash() != observed.recipe_content_hash() {
+            changed_fields.push(IntegrationIdentityField::RecipeContentHash);
+        }
+        Self {
+            approval_id,
+            changed_fields,
+        }
+    }
+
+    /// Approval invalidated by drift.
+    #[must_use]
+    pub const fn approval_id(&self) -> ApprovalId {
+        self.approval_id
+    }
+
+    /// Exact hash fields whose observed values no longer match.
+    #[must_use]
+    pub fn changed_fields(&self) -> &[IntegrationIdentityField] {
+        &self.changed_fields
+    }
+}
+
+/// Result of matching one grant to one candidate call.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum GrantMatch {
+    /// The grant authorizes the candidate and is ready for policy evaluation.
+    Matched(RunGrant),
+    /// All non-identity axes match, but one or more identity hashes changed.
+    IdentityDrift(IntegrationIdentityDrift),
+    /// The grant belongs to another request, scope, run, or workspace.
+    NotApplicable,
+}
+
+/// Complete result of matching a run's grants to one candidate.
+///
+/// Identity drift is retained beside applicable grants so the coordinator can
+/// append one `approval_identity_drift` event per invalidated approval before
+/// it opens a replacement prompt. It is never collapsed into an ordinary
+/// non-match.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GrantMatches {
+    grants: Vec<RunGrant>,
+    identity_drifts: Vec<IntegrationIdentityDrift>,
+}
+
+impl GrantMatches {
+    /// Grants policy may consume for this candidate.
+    #[must_use]
+    pub fn grants(&self) -> &[RunGrant] {
+        &self.grants
+    }
+
+    /// Otherwise-applicable approvals invalidated by changed identity hashes.
+    #[must_use]
+    pub fn identity_drifts(&self) -> &[IntegrationIdentityDrift] {
+        &self.identity_drifts
     }
 }
 
@@ -119,6 +249,7 @@ pub struct CandidateCall<'a> {
     workspace: &'a WorkspaceBinding,
     tool: &'a ToolIdentity,
     capabilities: &'a [Capability],
+    integration_identity: IntegrationIdentity,
     input_hash: InputHash,
 }
 
@@ -138,6 +269,7 @@ impl<'a> CandidateCall<'a> {
             workspace,
             tool,
             capabilities: &[],
+            integration_identity: IntegrationIdentity::none(),
             input_hash,
         }
     }
@@ -146,6 +278,13 @@ impl<'a> CandidateCall<'a> {
     #[must_use]
     pub const fn with_capabilities(mut self, capabilities: &'a [Capability]) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    /// Attaches the external identities observed for the candidate call.
+    #[must_use]
+    pub const fn with_integration_identity(mut self, identity: IntegrationIdentity) -> Self {
+        self.integration_identity = identity;
         self
     }
 
@@ -204,6 +343,10 @@ impl<'a> CandidateCall<'a> {
 /// deadline a request may carry can only stop one from being granted.
 #[must_use]
 pub fn grant_applies(grant: &ApprovalGrant, candidate: &CandidateCall<'_>) -> bool {
+    matches!(grant.match_candidate(candidate), GrantMatch::Matched(_))
+}
+
+fn scope_applies_except_identity(grant: &ApprovalGrant, candidate: &CandidateCall<'_>) -> bool {
     grant.run_id == candidate.run_id
         && grant.workspace == *candidate.workspace
         && match grant.scope {
@@ -223,13 +366,31 @@ pub fn grant_applies(grant: &ApprovalGrant, candidate: &CandidateCall<'_>) -> bo
         }
 }
 
-/// Every grant that covers `candidate`, projected for policy evaluation.
+/// Every applicable grant for `candidate`.
+///
+/// This retains the v0.4 return type. Callers coordinating external identity
+/// changes can use [`matching_grants_detailed`] to receive drift diagnostics as
+/// well as the policy projections.
 #[must_use]
 pub fn matching_grants(grants: &[ApprovalGrant], candidate: &CandidateCall<'_>) -> Vec<RunGrant> {
-    grants
-        .iter()
-        .filter_map(|grant| grant.matching(candidate))
-        .collect()
+    matching_grants_detailed(grants, candidate).grants
+}
+
+/// Every applicable grant and every identity drift observed for `candidate`.
+#[must_use]
+pub fn matching_grants_detailed(
+    grants: &[ApprovalGrant],
+    candidate: &CandidateCall<'_>,
+) -> GrantMatches {
+    let mut matches = GrantMatches::default();
+    for grant in grants {
+        match grant.match_candidate(candidate) {
+            GrantMatch::Matched(grant) => matches.grants.push(grant),
+            GrantMatch::IdentityDrift(drift) => matches.identity_drifts.push(drift),
+            GrantMatch::NotApplicable => {}
+        }
+    }
+    matches
 }
 
 /// Narrows a durable scope to the projection policy consumes.
@@ -253,6 +414,7 @@ mod tests {
         ApprovalDecision, ApprovalRequest, DecidedVia, PendingApproval, canonical_input_hash,
     };
     use crate::domain::{RunId, ToolCallId};
+    use crate::integration::{IntegrationIdentity, Sha256Hash};
     use crate::policy::{
         PolicyEngine, PolicyRequest, PolicyVerdict, RunGrant, RunGrantScope, UserPolicy,
     };
@@ -262,7 +424,10 @@ mod tests {
     use crate::trust::{ExecutionMode, RequestFlags, TrustState, classify_request};
 
     use super::super::{ApprovalScope, ApprovalState, InputHash, WorkspaceBinding};
-    use super::{ApprovalGrant, CandidateCall, grant_applies, matching_grants};
+    use super::{
+        ApprovalGrant, CandidateCall, GrantMatch, IntegrationIdentityField, grant_applies,
+        matching_grants, matching_grants_detailed,
+    };
 
     fn tool() -> ToolIdentity {
         ToolIdentity::parse("fs.write", "1.2.0").unwrap()
@@ -643,6 +808,84 @@ mod tests {
         }
     }
 
+    #[test]
+    fn every_external_identity_hash_is_bound_at_every_scope() {
+        let identities = [
+            (
+                "launch_external_agent",
+                IntegrationIdentity::none()
+                    .with_agent_executable_sha256(Sha256Hash::of("agent-v1")),
+                IntegrationIdentity::none()
+                    .with_agent_executable_sha256(Sha256Hash::of("agent-v2")),
+                IntegrationIdentityField::AgentExecutableSha256,
+            ),
+            (
+                "invoke_mcp_tool",
+                IntegrationIdentity::none()
+                    .with_mcp_tool_schema_fingerprint(Sha256Hash::of("schema-v1")),
+                IntegrationIdentity::none()
+                    .with_mcp_tool_schema_fingerprint(Sha256Hash::of("schema-v2")),
+                IntegrationIdentityField::McpToolSchemaFingerprint,
+            ),
+            (
+                "execute_workflow_recipe",
+                IntegrationIdentity::none().with_recipe_content_hash(Sha256Hash::of("recipe-v1")),
+                IntegrationIdentity::none().with_recipe_content_hash(Sha256Hash::of("recipe-v2")),
+                IntegrationIdentityField::RecipeContentHash,
+            ),
+        ];
+
+        for scope in ApprovalScope::ALL.iter().copied() {
+            for (capability, approved, different, changed_field) in identities {
+                let pair = Pair::new(scope);
+                let external_capabilities = capabilities(&[capability]);
+                let mut request = ApprovalRequest::open(
+                    request_for(
+                        pair.run_id,
+                        pair.tool_call_id,
+                        &pair.workspace,
+                        &pair.tool,
+                        &external_capabilities,
+                        pair.input_hash,
+                        scope,
+                    )
+                    .with_integration_identity(approved),
+                )
+                .unwrap();
+                request
+                    .decide(ApprovalDecision::grant(
+                        request.id(),
+                        scope,
+                        DecidedVia::Cli,
+                        at(1),
+                    ))
+                    .unwrap();
+                let grant = request.grant().unwrap();
+                let candidate = pair
+                    .candidate()
+                    .with_capabilities(&external_capabilities)
+                    .with_integration_identity(approved);
+                assert!(grant_applies(&grant, &candidate), "{scope}/{approved:?}");
+                let drifted = pair
+                    .candidate()
+                    .with_capabilities(&external_capabilities)
+                    .with_integration_identity(different);
+                let GrantMatch::IdentityDrift(drift) = grant.match_candidate(&drifted) else {
+                    panic!("identity drift must be observable at {scope}");
+                };
+                assert_eq!(drift.changed_fields(), &[changed_field]);
+                assert_eq!(drift.changed_fields()[0].as_str(), changed_field.as_str());
+                assert!(
+                    !grant_applies(
+                        &grant,
+                        &pair.candidate().with_capabilities(&external_capabilities)
+                    ),
+                    "present versus absent must not match at {scope}"
+                );
+            }
+        }
+    }
+
     // -- capability grants ----------------------------------------------------
 
     #[test]
@@ -735,10 +978,11 @@ mod tests {
         );
 
         let grants = [unrelated, pair.grant.clone(), elsewhere];
-        let matched = matching_grants(&grants, &pair.candidate());
+        let matched = matching_grants_detailed(&grants, &pair.candidate());
 
-        assert_eq!(matched.len(), 1);
-        assert_eq!(matched[0].scope(), RunGrantScope::ExactCall);
+        assert_eq!(matched.grants().len(), 1);
+        assert_eq!(matched.grants()[0].scope(), RunGrantScope::ExactCall);
+        assert!(matched.identity_drifts().is_empty());
     }
 
     /// A tool whose only job is to publish a descriptor at a chosen risk.
@@ -816,8 +1060,8 @@ mod tests {
         assert_eq!(
             evaluate(&matching_grants(
                 std::slice::from_ref(&other_run.grant),
-                &other_run.candidate()
-            )),
+                &other_run.candidate(),
+            ),),
             PolicyVerdict::Deny
         );
     }

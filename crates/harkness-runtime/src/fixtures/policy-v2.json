@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "risks": {
+    "observe": "ask"
+  },
+  "tools": {
+    "fixture.policy": "deny"
+  },
+  "external_capabilities": {
+    "invoke_mcp_tool": "deny"
+  }
+}

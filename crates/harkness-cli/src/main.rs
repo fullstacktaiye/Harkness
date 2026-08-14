@@ -37,6 +37,7 @@ use harkness_git::{
     RefUpdate, StageOutcome, StagePathResult, StatusEntry, StatusRefreshOutcome,
     TrackedRestoreSource, UpstreamStatus, Whitespace, WhitespaceMode, WorktreeBase,
 };
+use harkness_runtime::policy::EXTERNAL_POLICY_DENIAL_KINDS;
 use serde::Serialize;
 use serde_json::{Value, json};
 use time::format_description::well_known::Rfc3339;
@@ -4490,6 +4491,7 @@ fn contract_result(json_output: bool) -> CommandResult {
             "project": ProjectError::DIRECT_KINDS,
             "git": GitError::KINDS,
             "editor": EditorError::KINDS,
+            "policy": EXTERNAL_POLICY_DENIAL_KINDS,
         },
         // The category map above names the codes; this names which code each
         // error kind actually reports. Without it a caller has to hardcode the
@@ -4500,6 +4502,7 @@ fn contract_result(json_output: bool) -> CommandResult {
             "project": kind_exit_codes(PROJECT_KIND_EXIT_CODES),
             "git": kind_exit_codes(GIT_KIND_EXIT_CODES),
             "editor": kind_exit_codes(EDITOR_KIND_EXIT_CODES),
+            "policy": kind_exit_codes(POLICY_KIND_EXIT_CODES),
         },
         "streams": {
             "result": "stdout",
@@ -4902,6 +4905,25 @@ const EDITOR_KIND_EXIT_CODES: &[(&str, u8)] = &[
     ("editor_launch", EXIT_OPERATION_FAILED),
 ];
 
+/// Every external-policy refusal is a guardrail denial (exit code 3).
+const POLICY_KIND_EXIT_CODES: &[(&str, u8)] = &[
+    ("noninteractive_external_agent_launch_denied", EXIT_REFUSED),
+    ("noninteractive_mcp_server_connect_denied", EXIT_REFUSED),
+    ("noninteractive_mcp_tool_invoke_denied", EXIT_REFUSED),
+    ("noninteractive_forge_resource_read_denied", EXIT_REFUSED),
+    ("noninteractive_remote_branch_push_denied", EXIT_REFUSED),
+    ("noninteractive_pull_request_create_denied", EXIT_REFUSED),
+    ("noninteractive_forge_resource_modify_denied", EXIT_REFUSED),
+    (
+        "noninteractive_workflow_recipe_execute_denied",
+        EXIT_REFUSED,
+    ),
+    ("agent_executable_identity_required", EXIT_REFUSED),
+    ("mcp_tool_schema_identity_required", EXIT_REFUSED),
+    ("recipe_content_identity_required", EXIT_REFUSED),
+    ("external_identity_context_invalid", EXIT_REFUSED),
+];
+
 /// The exit code every CLI-originated error kind reports, in
 /// `CLI_ERROR_KINDS` order.
 const CLI_KIND_EXIT_CODES: &[(&str, u8)] = &[
@@ -5248,11 +5270,12 @@ mod tests {
     use super::{
         CLI_ERROR_KINDS, CLI_KIND_EXIT_CODES, CliError, EDITOR_KIND_EXIT_CODES, EXIT_CANCELLED,
         EXIT_CONFLICT, EXIT_NOT_FOUND, EXIT_OPERATION_FAILED, EXIT_REFUSED, EXIT_USAGE,
-        EditorError, GIT_KIND_EXIT_CODES, GitError, HunkSelection, LineSelection,
-        PROJECT_KIND_EXIT_CODES, Project, ProjectError, RefusalKind, Whitespace, WhitespaceMode,
-        change_provenance_value, distinct_hunk_selection_count, distinct_line_selection_counts,
-        editor_exit_code, git_error_details, git_exit_code, parse_line_selection_document,
-        parse_selection_document, project_exit_code, project_value, requested_json, single_line,
+        EXTERNAL_POLICY_DENIAL_KINDS, EditorError, GIT_KIND_EXIT_CODES, GitError, HunkSelection,
+        LineSelection, POLICY_KIND_EXIT_CODES, PROJECT_KIND_EXIT_CODES, Project, ProjectError,
+        RefusalKind, Whitespace, WhitespaceMode, change_provenance_value,
+        distinct_hunk_selection_count, distinct_line_selection_counts, editor_exit_code,
+        git_error_details, git_exit_code, parse_line_selection_document, parse_selection_document,
+        project_exit_code, project_value, requested_json, single_line,
     };
 
     /// Attribution is advisory: a walk that could not be made degrades to a
@@ -5913,10 +5936,27 @@ mod tests {
             .chain(ProjectError::DIRECT_KINDS)
             .chain(GitError::KINDS)
             .chain(EditorError::KINDS)
+            .chain(EXTERNAL_POLICY_DENIAL_KINDS)
             .copied()
             .collect::<Vec<_>>();
         let unique = kinds.iter().copied().collect::<HashSet<_>>();
         assert_eq!(unique.len(), kinds.len(), "error kind collision: {kinds:?}");
+    }
+
+    #[test]
+    fn every_external_policy_denial_is_a_guardrail_refusal() {
+        assert_eq!(
+            POLICY_KIND_EXIT_CODES
+                .iter()
+                .map(|(kind, _)| *kind)
+                .collect::<Vec<_>>(),
+            EXTERNAL_POLICY_DENIAL_KINDS
+        );
+        assert!(
+            POLICY_KIND_EXIT_CODES
+                .iter()
+                .all(|(_, code)| *code == EXIT_REFUSED)
+        );
     }
 
     #[test]
