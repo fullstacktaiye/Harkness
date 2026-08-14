@@ -979,6 +979,7 @@ fn process_timeout_terminates_a_windows_descendant_job() {
         "$child = Start-Process -FilePath powershell.exe -ArgumentList \
          @('-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30') -PassThru; \
          Set-Content -NoNewline -Path '{quoted_pid_file}' -Value $child.Id; \
+         Start-Sleep -Seconds 30; \
          Wait-Process -Id $child.Id"
     );
     let output = harness

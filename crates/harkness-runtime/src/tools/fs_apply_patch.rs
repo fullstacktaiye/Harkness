@@ -1054,7 +1054,12 @@ impl WindowsAnchoredParent {
             .len()
             .checked_mul(std::mem::size_of::<u16>())
             .ok_or_else(|| patch_conflict(relative, "the target path is too long"))?;
-        let structure_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName)
+        // Windows requires the information buffer to include the complete
+        // fixed structure *plus* the variable-width name, even though the
+        // structure already declares its first `WCHAR`.  Passing only the
+        // offset to `FileName` plus its bytes is rejected by
+        // `SetFileInformationByHandle` as `ERROR_INVALID_PARAMETER`.
+        let structure_bytes = std::mem::size_of::<FILE_RENAME_INFO>()
             .checked_add(target_bytes)
             .ok_or_else(|| patch_conflict(relative, "the target path is too long"))?;
         let words = structure_bytes.div_ceil(std::mem::size_of::<u64>());
