@@ -974,20 +974,19 @@ fn a_detached_session_cannot_hold_a_timed_out_call_open() {
 fn process_timeout_terminates_a_windows_descendant_job() {
     let harness = Harness::new();
     let pid_file = harness.workspace.path().join("grandchild.pid");
-    let quoted_pid_file = pid_file.to_string_lossy().replace('\'', "''");
-    let script = format!(
-        "$child = Start-Process -FilePath powershell.exe -ArgumentList \
-         @('-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30') -PassThru; \
-         Set-Content -NoNewline -Path '{quoted_pid_file}' -Value $child.Id; \
-         Start-Sleep -Seconds 30; \
-         Wait-Process -Id $child.Id"
-    );
+    let executable = std::env::current_exe().unwrap();
     let output = harness
         .invoke(
             ProcessExec,
             json!({
-                "argv": ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-                "timeout_seconds": 1
+                "argv": [
+                    executable,
+                    "--ignored",
+                    "--exact",
+                    "tools::tests::windows_descendant_fixture",
+                    "--nocapture"
+                ],
+                "timeout_seconds": 2
             }),
         )
         .unwrap();
@@ -1004,6 +1003,31 @@ fn process_timeout_terminates_a_windows_descendant_job() {
         !windows_process_is_live(pid),
         "grandchild {pid} survived the Job Object timeout"
     );
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "only run as a child process by the Windows Job Object regression"]
+fn windows_descendant_fixture() {
+    let executable = std::env::current_exe().unwrap();
+    let child = std::process::Command::new(executable)
+        .args([
+            "--ignored",
+            "--exact",
+            "tools::tests::windows_sleep_fixture",
+            "--nocapture",
+        ])
+        .spawn()
+        .unwrap();
+    fs::write("grandchild.pid", child.id().to_string()).unwrap();
+    std::thread::sleep(Duration::from_secs(30));
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "only run as a child process by the Windows Job Object fixture"]
+fn windows_sleep_fixture() {
+    std::thread::sleep(Duration::from_secs(30));
 }
 
 #[cfg(windows)]

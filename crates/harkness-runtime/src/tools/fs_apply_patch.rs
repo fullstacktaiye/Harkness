@@ -27,15 +27,22 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Wdk::Storage::FileSystem::{
+    FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
+};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{
+    CloseHandle, HANDLE, INVALID_HANDLE_VALUE, RtlNtStatusToDosError,
+};
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FileRenameInfo, GetFileInformationByHandle, OPEN_EXISTING, ReOpenFile,
-    SetFileInformationByHandle,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    GetFileInformationByHandle, OPEN_EXISTING, ReOpenFile,
 };
+#[cfg(windows)]
+use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
 use crate::tool::{
     ArtifactRef, Capability, ExecutionContext, RiskLevel, Tool, ToolError, ToolIdentity,
@@ -1054,17 +1061,15 @@ impl WindowsAnchoredParent {
             .len()
             .checked_mul(std::mem::size_of::<u16>())
             .ok_or_else(|| patch_conflict(relative, "the target path is too long"))?;
-        // Windows requires the information buffer to include the complete
-        // fixed structure *plus* the variable-width name, even though the
-        // structure already declares its first `WCHAR`.  Passing only the
-        // offset to `FileName` plus its bytes is rejected by
-        // `SetFileInformationByHandle` as `ERROR_INVALID_PARAMETER`.
-        let structure_bytes = std::mem::size_of::<FILE_RENAME_INFO>()
+        // The native rename contract requires the complete fixed structure
+        // plus the variable-width name, even though the structure declares its
+        // first `WCHAR` inline.
+        let structure_bytes = std::mem::size_of::<FILE_RENAME_INFORMATION>()
             .checked_add(target_bytes)
             .ok_or_else(|| patch_conflict(relative, "the target path is too long"))?;
         let words = structure_bytes.div_ceil(std::mem::size_of::<u64>());
         let mut storage = vec![0u64; words];
-        let rename = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        let rename = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
         unsafe {
             (*rename).Anonymous.ReplaceIfExists = true;
             (*rename).RootDirectory = self.directory.as_raw_handle() as HANDLE;
@@ -1092,22 +1097,25 @@ impl WindowsAnchoredParent {
                 std::io::Error::last_os_error(),
             ));
         }
-        let renamed = unsafe {
-            SetFileInformationByHandle(
+        let mut io_status = IO_STATUS_BLOCK::default();
+        let status = unsafe {
+            NtSetInformationFile(
                 rename_handle,
-                FileRenameInfo,
-                rename.cast(),
+                &mut io_status,
+                rename.cast_const().cast(),
                 u32::try_from(structure_bytes).unwrap_or(u32::MAX),
+                FileRenameInformation,
             )
         };
         unsafe {
             CloseHandle(rename_handle);
         }
-        if renamed == 0 {
+        if status < 0 {
+            let error = unsafe { RtlNtStatusToDosError(status) };
             return Err(io_failure(
                 relative,
                 "could not replace",
-                std::io::Error::last_os_error(),
+                std::io::Error::from_raw_os_error(i32::try_from(error).unwrap_or(i32::MAX)),
             ));
         }
         Ok(())
