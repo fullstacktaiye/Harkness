@@ -16,6 +16,7 @@ mod history;
 mod hunk;
 mod intra_line;
 mod lock;
+mod patch;
 mod path;
 mod provenance;
 mod runner;
@@ -60,6 +61,10 @@ pub use discard::{
 pub use history::{CommitInfo, CommitSignature, LogCursor, LogOptions, LogPage, LogRange};
 pub use hunk::{HunkSelection, HunkStageOutcome, LineSelection, LineStageOutcome, remap_to_exact};
 use lock::RepositoryLock;
+pub use patch::{
+    PatchFileMode, UnifiedPatch, UnifiedPatchError, UnifiedPatchFile, UnifiedPatchHunk,
+    UnifiedPatchLine, parse_unified_patch, resulting_worktree_patch,
+};
 #[doc(hidden)]
 pub use path::canonicalize_with_missing_tail;
 pub use provenance::{

@@ -309,6 +309,29 @@ pub enum ToolError {
     #[error(transparent)]
     Boundary(#[from] BoundaryError),
 
+    /// A patch was approved against bytes that are no longer present.
+    #[error(
+        "patch base for {} is stale: expected {expected}, found {actual}",
+        .path.display()
+    )]
+    StalePatch {
+        /// Workspace-relative path whose precondition failed.
+        path: PathBuf,
+        /// Approved SHA-256, or `new file` for an expected absence.
+        expected: String,
+        /// SHA-256 observed at execution, or `missing` when absent.
+        actual: String,
+    },
+
+    /// A unified diff is malformed or does not apply cleanly to its base.
+    #[error("patch for {} conflicts with the workspace: {reason}", .path.display())]
+    PatchConflict {
+        /// Target path, or `<patch>` when the patch as a whole is malformed.
+        path: PathBuf,
+        /// Bounded explanation of the parse or hunk mismatch.
+        reason: String,
+    },
+
     /// The owning process stopped before the invocation completed.
     #[error("the tool invocation was interrupted before it completed")]
     Interrupted,
@@ -338,6 +361,8 @@ impl ToolError {
         "symlink_escapes",
         "root_unavailable",
         "candidate_unavailable",
+        "stale_patch",
+        "patch_conflict",
         "interrupted",
         "tool_panicked",
     ];
@@ -355,6 +380,8 @@ impl ToolError {
             Self::Denied { .. } => "denied",
             Self::ForbiddenPath { .. } => "forbidden_path",
             Self::Boundary(error) => error.kind(),
+            Self::StalePatch { .. } => "stale_patch",
+            Self::PatchConflict { .. } => "patch_conflict",
             Self::Interrupted => "interrupted",
             Self::ToolPanicked { .. } => "tool_panicked",
         }
@@ -821,6 +848,21 @@ mod tests {
                     reason: "fixture".to_owned(),
                 }),
                 "candidate_unavailable",
+            ),
+            (
+                ToolError::StalePatch {
+                    path: PathBuf::from("src/lib.rs"),
+                    expected: "expected".to_owned(),
+                    actual: "actual".to_owned(),
+                },
+                "stale_patch",
+            ),
+            (
+                ToolError::PatchConflict {
+                    path: PathBuf::from("src/lib.rs"),
+                    reason: "fixture".to_owned(),
+                },
+                "patch_conflict",
             ),
             (ToolError::Interrupted, "interrupted"),
             (

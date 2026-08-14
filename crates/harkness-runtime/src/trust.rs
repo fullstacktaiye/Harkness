@@ -449,6 +449,48 @@ impl AllowlistedEnv {
         Self(values)
     }
 
+    /// Replaces explicitly allowed values for one concrete process request.
+    ///
+    /// The fixed baseline is always eligible. Every other name must have been
+    /// published by the tool descriptor, so an input map cannot enlarge the
+    /// environment authority hidden behind an already-approved tool identity.
+    /// Names are validated and canonicalized exactly as descriptor names are.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvironmentOverrideError::InvalidName`] for a malformed key,
+    /// [`EnvironmentOverrideError::Undeclared`] for a valid but ungranted name,
+    /// and [`EnvironmentOverrideError::InvalidValue`] for a value containing a
+    /// NUL byte that no operating-system process environment can represent.
+    pub fn apply_overrides<'a>(
+        &mut self,
+        declared_extras: impl IntoIterator<Item = &'a EnvironmentName>,
+        overrides: &BTreeMap<String, String>,
+    ) -> Result<(), EnvironmentOverrideError> {
+        let allowed = declared_extras
+            .into_iter()
+            .map(EnvironmentName::as_str)
+            .chain(BASELINE_ENVIRONMENT)
+            .collect::<BTreeSet<_>>();
+        for (supplied, value) in overrides {
+            let name = EnvironmentName::new(supplied.clone())
+                .map_err(EnvironmentOverrideError::InvalidName)?;
+            if !allowed.contains(name.as_str()) {
+                return Err(EnvironmentOverrideError::Undeclared {
+                    name: name.as_str().to_owned(),
+                });
+            }
+            if value.contains('\0') {
+                return Err(EnvironmentOverrideError::InvalidValue {
+                    name: name.as_str().to_owned(),
+                });
+            }
+            self.0
+                .insert(OsString::from(name.as_str()), OsString::from(value));
+        }
+        Ok(())
+    }
+
     /// Value copied for `name`, if the parent held it and it was allowed.
     #[must_use]
     pub fn get(&self, name: impl AsRef<OsStr>) -> Option<&OsStr> {
@@ -465,6 +507,46 @@ impl AllowlistedEnv {
     /// Exact set of inherited names.
     pub fn names(&self) -> impl Iterator<Item = &OsStr> {
         self.0.keys().map(OsString::as_os_str)
+    }
+}
+
+/// An input environment map that exceeds a tool's published allowlist.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum EnvironmentOverrideError {
+    /// A supplied key is not an environment identifier.
+    #[error(transparent)]
+    InvalidName(EnvironmentError),
+    /// The tool descriptor did not grant this otherwise-valid name.
+    #[error("environment variable {name} is not declared by this tool")]
+    Undeclared {
+        /// Canonical spelling that was refused.
+        name: String,
+    },
+    /// Process environments cannot carry NUL bytes.
+    #[error("environment variable {name} contains a NUL byte")]
+    InvalidValue {
+        /// Canonical spelling whose value was refused.
+        name: String,
+    },
+}
+
+impl EnvironmentOverrideError {
+    /// Every stable discriminant this namespace can emit.
+    pub const KINDS: &'static [&'static str] = &[
+        "invalid_environment_name",
+        "undeclared_environment",
+        "invalid_environment_value",
+    ];
+
+    /// Stable machine-readable discriminant.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::InvalidName(error) => error.kind(),
+            Self::Undeclared { .. } => "undeclared_environment",
+            Self::InvalidValue { .. } => "invalid_environment_value",
+        }
     }
 }
 
@@ -795,6 +877,8 @@ pub fn classify_request(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::ffi::OsStr;
     #[cfg(unix)]
     use std::ffi::OsString;
     use std::fs;
@@ -1035,6 +1119,44 @@ mod tests {
             "HARKNESS_TOKEN_2"
         );
         assert_eq!(EnvironmentName::new("path").unwrap().as_str(), "PATH");
+    }
+
+    #[test]
+    fn environment_overrides_cannot_enlarge_the_published_allowlist() {
+        let declared = EnvironmentName::new("HARKNESS_ALLOWED").unwrap();
+        let mut env = AllowlistedEnv::build([&declared]);
+        env.apply_overrides(
+            [&declared],
+            &BTreeMap::from([("HARKNESS_ALLOWED".to_owned(), "value".to_owned())]),
+        )
+        .unwrap();
+        assert_eq!(env.get("HARKNESS_ALLOWED"), Some(OsStr::new("value")));
+
+        let error = env
+            .apply_overrides(
+                [&declared],
+                &BTreeMap::from([("HARKNESS_SECRET".to_owned(), "leak".to_owned())]),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), "undeclared_environment");
+        assert!(env.get("HARKNESS_SECRET").is_none());
+    }
+
+    #[test]
+    fn environment_override_error_kinds_round_trip() {
+        let errors = [
+            EnvironmentOverrideError::InvalidName(EnvironmentName::new("NOT-VALID").unwrap_err()),
+            EnvironmentOverrideError::Undeclared {
+                name: "HARKNESS_SECRET".to_owned(),
+            },
+            EnvironmentOverrideError::InvalidValue {
+                name: "PATH".to_owned(),
+            },
+        ];
+        assert_eq!(
+            errors.map(|error| error.kind()),
+            EnvironmentOverrideError::KINDS
+        );
     }
 
     #[test]

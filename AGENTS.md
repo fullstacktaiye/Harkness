@@ -589,7 +589,8 @@ on the calling thread is not a timeout. When the grace period expires the worker
 *abandoned*, not killed, since Rust cannot kill a thread; it owns its whole
 `ExecutionContext`, so nothing dangles. A tool that never polls its token therefore
 leaks a thread per call, which is why cancellation is a contract rather than a
-courtesy. A child *process* has no such caveat and is killed by process group.
+courtesy. A child *process* has no such caveat and is killed with its supervised
+process tree.
 
 A tool receives a token belonging to its own call, never the caller's.
 `Cancellation` latches and has no reset, so enforcing a deadline by cancelling the
@@ -644,15 +645,33 @@ applied twice; telling a call abandoned by a dead process from one still
 executing is a question about run ownership — the `owner_pid` column exists for
 it — and is not the executor's to answer.
 
-A process group is the unit of execution, so it is the unit that ends. When the
-direct child exits, the group is signalled before its output is collected: a pipe
+An executor may abandon an ordinary synchronous tool after the termination
+grace because Rust cannot kill its worker thread. A built-in tool with a bounded
+irreversible commit phase crosses that boundary through
+`ExecutionContext::begin_irreversible` immediately before its first commit and
+only after all validation is complete. The transition is one-way and races the
+executor's stop request under one mutex: either the stop wins and the commit is
+refused, or the commit wins and the executor waits for the body's real outcome
+instead of persisting cancellation while workspace bytes can still change.
+Third-party tools cannot enter this phase; making the hook public would let an
+untrusted body disable the executor's abandonment guarantee indefinitely.
+
+A supervised process unit is the unit of execution, so it is the unit that ends:
+a Unix process group or a Windows Job Object. A Unix descendant may deliberately
+detach into another session and outlive the portable process-group boundary; the
+supervisor makes its pipe readers stoppable so that descendant cannot hold the
+call open. A Windows child is assigned to its Job Object before it runs, so that
+platform retains a whole-descendant boundary. When the direct child exits, the
+supervisor is terminated before its output is collected: a pipe
 reaches end of file only when every write end closes, and a child that started a
 background helper leaves one open, so waiting for end of file would mean waiting
 however long the helper runs. Signalling after the child has been reaped is sound
-while any member is alive — the group keeps the identifier reserved — and is a
-harmless `ESRCH` once none is. A captured stream is *finished* on the stop paths
-rather than dropped: an unfinished artifact deletes the bytes it staged, and a
-build log matters most when the build was killed.
+while any Unix group member is alive — the group keeps the identifier reserved —
+and is a harmless `ESRCH` once none is. Closing a Windows Job Object configured
+with `KILL_ON_JOB_CLOSE` provides the corresponding descendant guarantee. A
+captured stream is *finished* on the stop paths rather than dropped: an unfinished
+artifact deletes the bytes it staged, and a build log matters most when the build
+was killed.
 
 `tool_calls.tool_version` is the one column of a recorded request that is ever
 rewritten, and only by `ToolCall::dispatch`, which pins the resolved version in the
@@ -688,6 +707,53 @@ away either: it is written as the `rejected-output.json` artifact of that call,
 because only the value says what the tool actually produced. Preserving it is best
 effort — a context with no artifact store must not change the failure the caller is
 told about.
+
+## Built-In Mutation & Process Tool Invariants
+
+`fs.apply_patch`, `process.exec`, and `test.run` are registered at `1.0.0` through
+`tools::register_mutating_tools`. Their descriptor risks are the scheduling and
+policy contract: patching is `WorkspaceWrite`; both process tools are `Execute`
+and declare that they spawn processes. No caller or registry helper special-cases
+their identifiers to recover metadata the descriptors omitted.
+
+A patch names every target twice: once in the unified diff and once in its base
+precondition. The two path sets must be identical. An existing file carries the
+lowercase SHA-256 of its exact bytes and a new file carries `null`; a mismatch is
+`stale_patch`. Containment, every hash, and every hunk are checked against
+in-memory base images before the first file is written, so a `patch_conflict`
+never leaves a prefix of the call applied. Deletes, renames, copies, binary
+patches, and missing parent directories are refused rather than interpreted as a
+more destructive operation than this tool declares. Old and new patch headers
+must name the same path. Every `.git` component and every symlink component is
+refused, even when a symlink's target remains inside the workspace, so the audited
+path is always the file that is replaced. Patch parsing and repository diff
+production stay behind `harkness-git`, the owner of production Git behavior.
+
+Each prepared file is replaced through a temporary file in the target directory:
+write, preserve or apply the requested regular/executable mode, sync, rename,
+then sync the directory. Immediately before each replacement, the lexical target
+and `ContainedPath` are revalidated and its exact bytes or absence are compared
+with the already-approved base image. An external edit therefore becomes
+`stale_patch` rather than being overwritten. Cancellation has one final gate
+before this bounded commit phase and is not reported between replacements, so a
+partially applied call is never recorded as cancelled. The result artifact is
+produced from libgit2's actual index-to-worktree diff over exactly the touched path
+set, not by echoing the caller's patch.
+
+`process.exec` has no shell form. `argv[0]` is the program and every later value
+is one argument even when it contains shell metacharacters. The cwd crosses the
+execution context's boundary, stdin is null, and the environment starts empty.
+An input override may replace only a fixed baseline name or an exact name the
+descriptor published; it can never enlarge that set. Both streams always go to
+artifacts and only a bounded tail enters the inline result.
+
+The child timeout defaults to 120 seconds and is clamped to 1 through 600. It is
+inside the enclosing call deadline: reaching it kills the supervised process
+tree and returns a typed result with `timed_out`, the enforced limit, duration,
+signal, tails, and both artifact references. Reaching the enclosing deadline
+remains a tool-call `timed_out` failure. `test.run` calls the same in-process supervisor —
+never nested tool dispatch — and adds only `passed = exit_code == 0 &&
+!timed_out`; a failing test is a valid test result, not a failed tool invocation.
 
 ## Runtime Scheduling Invariants
 
@@ -772,9 +838,9 @@ decided it. `cancel_run` trips the caller's token for running calls — that is 
 stop *is* — and the executor's own rule about never writing a caller's token is unchanged, because
 the executor is not the one asking.
 
-Shutdown cancels rather than abandons and then waits for its workers, so no child process group
-outlives the application. Dropping a `Scheduler` shuts it down; a caller wanting a different
-deadline calls `shutdown` first.
+Shutdown cancels rather than abandons and then waits for its workers, so no child
+process tree outlives the application. Dropping a `Scheduler` shuts it down; a
+caller wanting a different deadline calls `shutdown` first.
 
 ## Approval Invariants
 

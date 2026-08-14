@@ -50,4 +50,5 @@ pub mod policy;
 pub mod schedule;
 pub mod store;
 pub mod tool;
+pub mod tools;
 pub mod trust;
