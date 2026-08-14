@@ -93,6 +93,9 @@ harkness-gui ──┴─> harkness-core ─────────────
                    harkness-context ──────────┘
                    (also depends on harkness-core, for ProjectId)
 
+harkness-acp  ──┬─> harkness-transport ──> harkness-git
+harkness-mcp  ──┘
+
 harkness-acp  ──┐
 harkness-mcp  ──┤
 harkness-forge──┼─> harkness-runtime   (adapters never point back; see ADR-0009)
@@ -100,7 +103,9 @@ harkness-recipe─┘
 ```
 
 `X ──> Y` means X depends on Y. The four adapters are depended *on* by
-`harkness-runtime` and depend on none of it — nor on each other.
+`harkness-runtime` and depend on none of it — nor on each other. `harkness-transport`
+is the one thing two adapters share, and it sits *below* both rather than inside
+one of them, which is what ADR-0009's no-sideways-edges rule leaves available.
 
 `harkness-runtime` depends on `harkness-git` for one thing: `Cancellation`, which `tool`'s
 `ExecutionContext` carries so a tool that shells out to Git passes the same token down instead of
@@ -155,6 +160,17 @@ translating between two cancellation mechanisms.
   database of runs in the process. Read `snapshot.rs`'s module doc before
   changing anything a digest absorbs; the wire forms are frozen by fixtures under
   `src/fixtures/` because #110 turns them into `runtime.db` columns.
+- **`harkness-transport`** is the subprocess JSON-RPC engine `harkness-acp` and `harkness-mcp` both
+  run on, created by #147 against ADR-0012. `JsonRpcTransport` is the seam adapters see — send a
+  message, receive one with a deadline, quarantine, shut down with an outcome — and `StdioTransport`
+  is its subprocess implementation: three threads per connection, an environment allowlist rather
+  than a denylist, newline-delimited framing with a hard size bound, and the
+  close-stdin/`SIGTERM`/`SIGKILL` teardown against the child's process group. `Connection` is the
+  correlation layer above the seam and has no dispatcher thread — whichever caller is already blocked
+  holds the pump. The two layers split for a reason worth remembering: the transport reports a clean
+  peer exit as `idle` because it does not know what anybody asked for, and `Connection` is what
+  refines that into `exit_before_response`. Nothing here knows a method name; every protocol semantic
+  is #149's and #157's.
 - **`harkness-acp`, `harkness-mcp`, `harkness-forge`, `harkness-recipe`** are the v0.5
   external-integration adapters, currently compile-clean skeletons whose only code is the test each
   one runs against its own `Cargo.toml`. They may depend on `harkness-git` and `harkness-core`,
@@ -186,6 +202,12 @@ Getting these confused is the main source of deadlock risk:
 **Ordering: scheduler workspace slot, then repository lock, then catalog lock.** The store takes
 none of them, and no caller may hold a store transaction while acquiring any. The scheduler cannot
 violate the two beneath it because it calls no catalog or Git code at all.
+
+A `harkness-transport` connection is not a fifth mechanism and must not become one: its locks are
+per connection, its own order is pump → correlation table, and it takes none of the four above —
+it cannot, since it depends on `harkness-git` for `Cancellation` and on nothing else in the
+workspace. A caller holding one of the four while blocked on a peer is holding it across a network
+of somebody else's making, so treat a transport call the same way as a Git network verb.
 
 ### The hermetic Git invocation policy
 

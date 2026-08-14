@@ -1,0 +1,27 @@
+[package]
+name = "harkness-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# ADR-0012 puts this crate beside `harkness-git` at the bottom of the graph. It
+# depends on `harkness-git` for one type — `Cancellation` — on the precedent
+# ADR-0001 established, and on nothing else in the workspace. The runtime crate,
+# the two front ends, and all four adapter crates are ineligible: see the
+# manifest test in `src/lib.rs`, which reads this file and fails on their names.
+[dependencies]
+harkness-git.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+harkness-test-fixtures.workspace = true

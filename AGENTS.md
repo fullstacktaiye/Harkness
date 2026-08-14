@@ -2,11 +2,12 @@
 
 ## Project Structure & Module Organization
 
-Harkness is a Rust 2024 workspace split into eleven crates under `crates/`:
+Harkness is a Rust 2024 workspace split into twelve crates under `crates/`:
 
 - `harkness-core`: project catalog, storage layout, cross-domain project workflows, and directory-listing logic shared by front ends.
 - `harkness-git`: all production Git behavior: inspection, diffs and history, change provenance, file context and hunk staging, branch and worktree mutation, commits, clone and synchronization, hermetic process execution, and repository locking.
 - `harkness-context`: the context engine's typed vocabulary — workspace snapshot identity, stable identifiers, provenance, and file classification.
+- `harkness-transport`: the shared subprocess JSON-RPC engine both protocol adapters run on — hermetic allowlisted spawn, newline-delimited framing, request correlation, bounded messages, and the close-stdin/`SIGTERM`/`SIGKILL` teardown. Below every adapter and above nothing but `harkness-git`.
 - `harkness-acp`, `harkness-mcp`, `harkness-forge`, `harkness-recipe`: the v0.5 external-integration adapters — the Agent Client Protocol client, the Model Context Protocol client, forge-neutral contracts with the GitHub REST adapter, and the workflow-recipe source format and compiler. Currently skeletons; see the invariants below.
 - `harkness-test-fixtures`: hermetic repository, filesystem, and process fixtures shared only by crate tests.
 - `harkness-runtime`: typed task, run, step, and tool-call records, the typed tool contract and registry every executable operation implements, the execution contracts shared by front ends, and the SQLite run store that makes those records durable.
@@ -1012,13 +1013,125 @@ update statement names none of the binding columns, so a resolution cannot
 re-target the approval a human answered; the only one it may move is
 `effective_scope`, and only downwards.
 
+## Protocol Transport Invariants
+
+`harkness-transport` is the only place in the workspace that launches a protocol peer. An adapter
+speaks to a `JsonRpcTransport`; it never calls `Command::spawn`, never holds a `ChildStdin`, and
+never sends a signal. That is what makes a future remote transport a new implementation of one trait
+rather than an edit to protocol logic, and it is why `shutdown` takes `self: Box<Self>` — teardown
+has to consume the connection, and a by-value `self` would make the trait non-object-safe.
+
+A peer's environment is **allowlisted, not scrubbed**. `SpawnSpec` starts from `env_clear` and admits
+exactly the pairs a caller named; nothing is inherited and no wildcard exists. This is stricter than
+`GitCommand`'s denylist on purpose and the two must not be reconciled: Git is one known program whose
+credential helpers are the reason its runner keeps a denylist, while an agent is a program somebody
+else wrote running on a user's workspace. The program and the working directory are absolute by
+refusal rather than by convention, spawn is argv-only, and the child leads its own process group so
+teardown reaches its helpers.
+
+Everything a peer controls the size of is bounded, and the bound is enforced *before* the bytes are
+held. The inbound line is refused the moment it crosses `max_message_bytes`, so the most this process
+holds for a peer that never writes a newline is the limit plus one read chunk; a limit checked after
+a line is assembled is not a limit. The inbound queue, the outbound queue, the peer-message queue,
+and the retained stderr tail are each capped, and a full queue blocks its producer rather than
+growing. Nothing is discarded to make room.
+
+A message count is not a bound on memory, and the peer-message queue therefore carries a byte budget
+beside its count. A peer picks both how many messages it sends and how large each one is, so it picks
+their product: the count bound alone permits thousands of near-maximum messages and tens of gigabytes
+with every per-message limit respected. Whichever bound is reached first stops the pump. Any new
+queue holding peer-supplied content owes the same pair.
+
+A connection that faults is **quarantined and never resynchronized**. A non-JSON line, JSON that is
+not a JSON-RPC 2.0 message, a response to an id nobody sent, a second response to one already
+answered, and an oversized line all end the conversation. The thread that observed the fault gets the
+fault; every later caller gets `quarantined` naming it. Guessing where the next message starts is how
+one bad line becomes a wrong answer, so there is no recovery path and none may be added. Nothing a
+peer can put on standard output may panic a reader thread.
+
+Standard error is captured and is **never** an error signal. The MCP specification reserves it for
+free-form logging a client must not read as errors, so no byte written there fails a request,
+quarantines a connection, or changes a `ShutdownOutcome`. `StderrSink` is a trait because the
+destination is the artifact store, which lives above this crate; a sink method returns no `Result`,
+because a destination that stopped accepting bytes is a reason to stop capturing and never a reason
+to disturb a working conversation.
+
+Teardown is `close stdin → wait → SIGTERM → wait → SIGKILL` against the process *group*, it runs on
+`Drop` as well as on `shutdown`, and it is idempotent. Standard input is closed unconditionally and
+before the child's exit is inspected — the writer thread parks on its queue until every sender is
+gone, so a peer that had already exited would otherwise strand a thread teardown then waits on. The
+group is then killed on **every** rung, not only when the escalation is reached: the direct child
+being gone is not the group being gone, and a peer that backgrounded a helper and exited politely
+leaves that helper on the workspace *and* holding the standard-output pipe, so the reader never sees
+end of file either. While any member is alive the group keeps its identifier, so the signal is exact
+in the case it exists for; where the reaped child was the last member the group is already gone and
+the call is a harmless `ESRCH`, with a residual race — a window of microseconds in which that pid was
+recycled as another group's leader — that is stated rather than argued away. `harkness-runtime` takes
+the same trade signalling a reaped tool child's group. `ShutdownOutcome` records the rung reached, because "this agent had to be
+killed" is a bug report rather than an implementation detail. Windows has no `SIGTERM` and reports
+`killed` rather than claiming an escalation that did not happen.
+
+Correlation lives above the transport and disconnect kinds are finished there. The transport reports
+a clean exit as `idle` because it does not know what anybody asked for; `Connection` refines that to
+`exit_before_response` when the caller had a request outstanding. Outbound ids are allocated and
+never reused within a connection, which makes a duplicate outbound id unrepresentable rather than
+guarded against.
+
+A request that gives up **retires** its id rather than forgetting it, and the two must not be
+confused. A peer answering after this side's deadline passed is a peer behaving correctly — Harkness
+chose the deadline — so that late answer is discarded quietly. Forgetting the id instead would read
+it as a response to a request nobody sent, quarantine the connection, and make `request_timed_out`
+terminal in practice while `is_terminal` says it is not; an adapter trusting that and retrying would
+kill a live agent session over one slow call. A retired id records whether its one permitted answer
+has arrived, so a genuine *second* answer is still `duplicate_response_id`. Retained ids are bounded
+and evicted oldest-first; an answer arriving after eviction reads as an unknown id, which is the same
+conclusion reached later.
+
+The peer-message queue is bounded by the pump **refusing to read**, never by discarding: a dropped
+peer request is one an adapter never answers, and a dropped notification is history that silently did
+not happen. The bound therefore stalls the whole stream, and a caller waiting for a response behind
+unread messages cannot wait that out — one ordered stream, a bounded application queue, and an answer
+behind unconsumed messages leaves grow, discard, and fail as the whole of the choice. It fails, by
+name, as `peer_queue_full`. Do not "fix" that by silently dropping the overflow or by removing the
+bound; an adapter whose peer streams must consume what it sends.
+
+There is deliberately **no dispatcher thread**. Whichever caller is already blocked holds the pump,
+reads in poll-interval slices, routes what it finds, and re-offers it; a caller that is not leading
+waits on a condition variable for the same slice. Lock order is pump → table, and the pump is never
+taken while the pending table or the peer queue is held. Three OS threads per connection — stdout
+reader, writer, stderr reader — is the whole cost, and a fourth must not be added to "simplify"
+reading: a dispatcher blocked pushing into a full queue stalls every response behind it, which is the
+same stall with another thread paid for.
+
+A send that waits without reading is half of a deadlock, so `Connection` pumps between attempts
+rather than blocking inside the transport. The other half is a peer that floods its own output and
+stops reading its input until somebody drains it: this side's reader fills the inbound queue and
+parks, the peer's pipe fills, and the two wait for each other. `try_send` therefore hands the message
+*back* instead of taking it — returning it rather than requiring a clone is what keeps retrying
+affordable for a large one — and `send` is the blocking convenience built on top. A blocking send
+that does not drain must not be reintroduced.
+
+A caller's deadline bounds its *send* as well as its wait. A peer that stops reading its standard
+input fills its pipe and then the queue behind it, and an enqueue bounded only by the transport's own
+backstop overruns a one-second caller by thirty. Which bound expired decides which failure it is, and
+the distinction is load-bearing: the backstop expiring is a broken peer and is terminal, while the
+caller's own deadline expiring is `send_timed_out`, which is not — a short deadline is not evidence
+about the peer, and collapsing the two would let an impatient call end a working session.
+
+Cancellation is polled every 20 ms in every blocking phase, well inside the workspace's 250 ms
+visibility target, and an already-cancelled token launches nothing at all. `harkness_git::Cancellation`
+is re-exported rather than wrapped, so an adapter passes down the token it already holds instead of
+translating between two cancellation mechanisms.
+
 ## External-Integration Boundary Invariants
 
 `harkness-acp`, `harkness-mcp`, `harkness-forge`, and `harkness-recipe` sit strictly below
 `harkness-runtime`. None of them may name `harkness-runtime`, `harkness-cli`, or `harkness-gui` in
 its manifest, and none may depend on another adapter — shared machinery goes below all four, not
-sideways between two of them. Each crate carries a test that reads its own `Cargo.toml` and fails
-on any of those six names, so the rule breaks the build rather than a review. The sideways rule
+sideways between two of them, which is where `harkness-transport` is. Each crate carries a test that
+reads its own `Cargo.toml` and fails on any of those six names, so the rule breaks the build rather
+than a review; `harkness-transport` carries the same test against a longer list, since everything is
+above it. The sideways rule
 needs that test most: no dependency cycle exists to catch an adapter-to-adapter edge while
 `harkness-runtime` does not yet name the adapters. ADR-0009 records why.
 

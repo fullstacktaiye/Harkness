@@ -56,6 +56,14 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked -p harkness-context --no-deps
+      # The transport crate's rustdoc *is* the contract #149 and #157 are written
+      # against — the meaning of every `SpawnSpec` field, the connection
+      # lifecycle, and what each error kind is triggered by — so an undocumented
+      # public item has to fail here rather than at the adapter that reads it.
+      - name: Check transport documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked -p harkness-transport --no-deps
 
   core:
     name: Core (${{ matrix.os }})
@@ -85,6 +93,15 @@ jobs:
         run: cargo test --locked -p harkness-git
       - name: Test runtime
         run: cargo test --locked -p harkness-runtime
+      # The shared JSON-RPC transport is where every ACP agent and MCP server
+      # gets spawned, framed, and torn down. Its subprocess tests are Unix-only,
+      # because `Fixture::shim` writes a `#!/bin/sh` script — the same reason
+      # `harkness-git`'s runner tests are. What the Windows leg carries is the
+      # platform-independent half plus the one check that genuinely differs
+      # there: `SpawnSpec` refuses a program that is not absolute, and
+      # `/usr/bin/agent` is rooted but *not* absolute on Windows.
+      - name: Test transport
+        run: cargo test --locked -p harkness-transport
       # The v0.5 adapter crates are skeletons, so what these run is the ADR-0009
       # layering assertion each one makes about its own manifest. That check is
       # worth a matrix entry now precisely because the crates are empty: the

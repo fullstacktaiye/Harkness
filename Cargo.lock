@@ -778,6 +778,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "harkness-transport"
+version = "0.1.0"
+dependencies = [
+ "harkness-git",
+ "harkness-test-fixtures",
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
