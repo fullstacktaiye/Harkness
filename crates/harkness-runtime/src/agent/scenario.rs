@@ -9,8 +9,10 @@ use crate::tool::{ToolId, ToolVersion};
 
 use super::{AgentAction, AgentFailure, ApprovalOutcomeView, Observation, ObservationKind};
 
-/// Version of the deterministic scenario fixture format.
-pub const SCENARIO_FIXTURE_VERSION: u32 = 1;
+/// Newest retained deterministic scenario fixture version.
+pub const SCENARIO_FIXTURE_VERSION: u32 = 2;
+
+const MIN_SCENARIO_FIXTURE_VERSION: u32 = 1;
 
 const SCENARIO_DEFINITION_DIGEST_DOMAIN: &[u8] = b"harkness.agent.scenario-definition.v1";
 
@@ -376,11 +378,11 @@ impl Scenario {
                 supported: SCENARIO_FIXTURE_VERSION,
             });
         }
-        if version.v != SCENARIO_FIXTURE_VERSION {
+        if version.v < MIN_SCENARIO_FIXTURE_VERSION {
             return Err(ScenarioError::UnsupportedFixtureVersion { found: version.v });
         }
         let wire: ScenarioWire = serde_json::from_str(bytes)?;
-        debug_assert_eq!(wire.v, SCENARIO_FIXTURE_VERSION);
+        debug_assert!(wire.v <= SCENARIO_FIXTURE_VERSION);
         Self::from_parts(wire.v, wire.id, wire.steps)
     }
 
@@ -467,31 +469,35 @@ impl Scenario {
     }
 
     pub(crate) fn builtin(name: &str, version: u32) -> Result<Self, ScenarioError> {
-        if version != SCENARIO_FIXTURE_VERSION {
-            if BUILTIN_SCENARIO_NAMES.contains(&name) {
-                return Err(ScenarioError::UnknownScenarioVersion {
-                    name: name.to_owned(),
-                    version,
-                });
-            }
+        if !BUILTIN_SCENARIO_NAMES.contains(&name) {
             return Err(ScenarioError::UnknownScenario {
                 name: name.to_owned(),
             });
         }
-        match name {
-            "read_only_success" => Ok(Self::read_only_success()),
-            "edit_test_diff_success" => Ok(Self::edit_test_diff_success()),
-            "approval_denied" => Ok(Self::approval_denied()),
-            "invalid_tool_input" => Ok(Self::invalid_tool_input()),
-            "tool_process_failure" => Ok(Self::tool_process_failure()),
-            "tool_timeout" => Ok(Self::tool_timeout()),
-            "user_cancellation" => Ok(Self::user_cancellation()),
-            "restart_recovery" => Ok(Self::restart_recovery()),
-            "forbidden_path" => Ok(Self::forbidden_path()),
-            "disallowed_capability" => Ok(Self::disallowed_capability()),
-            _ => Err(ScenarioError::UnknownScenario {
+        match (name, version) {
+            ("read_only_success", 1) => Ok(Self::read_only_success()),
+            ("edit_test_diff_success", 1) => Ok(Self::edit_test_diff_success()),
+            ("edit_test_diff_success", 2) => Ok(Self::edit_test_diff_success_v2()),
+            ("approval_denied", 1) => Ok(Self::approval_denied()),
+            ("invalid_tool_input", 1) => Ok(Self::invalid_tool_input()),
+            ("tool_process_failure", 1) => Ok(Self::tool_process_failure()),
+            ("tool_timeout", 1) => Ok(Self::tool_timeout()),
+            ("user_cancellation", 1) => Ok(Self::user_cancellation()),
+            ("restart_recovery", 1) => Ok(Self::restart_recovery()),
+            ("forbidden_path", 1) => Ok(Self::forbidden_path()),
+            ("disallowed_capability", 1) => Ok(Self::disallowed_capability()),
+            _ => Err(ScenarioError::UnknownScenarioVersion {
                 name: name.to_owned(),
+                version,
             }),
+        }
+    }
+
+    pub(crate) fn builtin_latest(name: &str) -> Result<Self, ScenarioError> {
+        if name == "edit_test_diff_success" {
+            Self::builtin(name, 2)
+        } else {
+            Self::builtin(name, 1)
         }
     }
 
@@ -500,8 +506,9 @@ impl Scenario {
         definition_digest: &str,
     ) -> Result<Self, ScenarioError> {
         for name in BUILTIN_SCENARIO_NAMES {
-            let scenario = Self::builtin(name, version)?;
-            if scenario.definition_digest() == definition_digest {
+            if let Ok(scenario) = Self::builtin(name, version)
+                && scenario.definition_digest() == definition_digest
+            {
                 return Ok(scenario);
             }
         }
@@ -569,7 +576,7 @@ impl Scenario {
                     ),
                 ),
                 step(
-                    tool_result_containing(json!({"passed": true})),
+                    tool_result(),
                     call("git.diff", json!({"target": "unstaged"})),
                 ),
                 step(
@@ -578,6 +585,16 @@ impl Scenario {
                 ),
             ],
         )
+    }
+
+    /// Version two of the flagship, which requires the real test result to
+    /// report success before requesting the final diff.
+    #[must_use]
+    pub fn edit_test_diff_success_v2() -> Self {
+        let mut scenario = Self::edit_test_diff_success();
+        scenario.version = 2;
+        scenario.steps[4].expect = tool_result_containing(json!({"passed": true}));
+        scenario
     }
 
     /// Rust-data definition of the denied-approval scenario.
@@ -769,12 +786,8 @@ impl Scenario {
 }
 
 fn built_in(id: &str, steps: Vec<ScenarioStep>) -> Scenario {
-    Scenario::from_parts(
-        SCENARIO_FIXTURE_VERSION,
-        ScenarioId::new(id).expect("valid built-in id"),
-        steps,
-    )
-    .expect("valid built-in scenario")
+    Scenario::from_parts(1, ScenarioId::new(id).expect("valid built-in id"), steps)
+        .expect("valid built-in scenario")
 }
 
 fn fixture_process_command(program: &str) -> Vec<&str> {
@@ -908,7 +921,7 @@ mod tests {
             Scenario::from_json(too_new),
             Err(ScenarioError::FixtureTooNew {
                 found: 99,
-                supported: 1
+                supported: 2
             })
         ));
 

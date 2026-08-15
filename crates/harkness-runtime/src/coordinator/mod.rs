@@ -43,7 +43,10 @@ use crate::schedule::{ScheduledCall, Scheduler, WorkspaceKey};
 use crate::store::{
     DEFAULT_EVENT_PAGE_LIMIT, EventKind, EventSeq, RunEvent, RunPage, Store, StoredEvent,
 };
-use crate::tool::{CallOutcome, ExecutionError, ToolExecutor, ToolRegistry};
+use crate::tool::{
+    CallOutcome, ExecutionError, MAX_FAILURE_MESSAGE_BYTES, ToolExecutor, ToolRegistry,
+    WorkspaceMetadata, truncate_failure_text,
+};
 use crate::trust::{ExecutionMode, PathBoundary};
 
 const MAX_AGENT_TURNS: usize = 1_024;
@@ -131,6 +134,28 @@ impl RunCoordinator {
         agent: Box<dyn Agent>,
         workspace: WorkspaceRef,
     ) -> Result<RunId, RuntimeError> {
+        self.start_run_inner(task_id, agent, workspace, None)
+    }
+
+    /// Starts a run with authoritative project catalog metadata available to
+    /// every tool invocation.
+    pub fn start_run_with_workspace_metadata(
+        &self,
+        task_id: TaskId,
+        agent: Box<dyn Agent>,
+        workspace: WorkspaceRef,
+        metadata: WorkspaceMetadata,
+    ) -> Result<RunId, RuntimeError> {
+        self.start_run_inner(task_id, agent, workspace, Some(metadata))
+    }
+
+    fn start_run_inner(
+        &self,
+        task_id: TaskId,
+        agent: Box<dyn Agent>,
+        workspace: WorkspaceRef,
+        workspace_metadata: Option<WorkspaceMetadata>,
+    ) -> Result<RunId, RuntimeError> {
         let task = self.inner.store.load_task(task_id)?;
         let Some(project_id) = task.project_id() else {
             return Err(RuntimeError::WorkspaceIdentityRequired { task: task_id });
@@ -146,6 +171,20 @@ impl RunCoordinator {
                     reason: error.to_string(),
                 }
             })?;
+        if let Some(metadata) = workspace_metadata.as_ref() {
+            if metadata.project_id() != workspace_key.project_id() {
+                return Err(RuntimeError::WorkspaceMismatch { task: task_id });
+            }
+            let canonical = std::fs::canonicalize(metadata.canonical_root()).map_err(|error| {
+                RuntimeError::WorkspaceUnavailable {
+                    task: task_id,
+                    reason: format!("catalog workspace metadata is unavailable: {error}"),
+                }
+            })?;
+            if canonical != workspace_key.canonical_root() {
+                return Err(RuntimeError::WorkspaceMismatch { task: task_id });
+            }
+        }
         let policy = self
             .inner
             .policy
@@ -195,6 +234,7 @@ impl RunCoordinator {
                     task,
                     workspace,
                     workspace_key,
+                    workspace_metadata,
                     policy,
                     cancellation,
                     agent,
@@ -426,6 +466,7 @@ struct RunWorker {
     task: Task,
     workspace: WorkspaceRef,
     workspace_key: WorkspaceKey,
+    workspace_metadata: Option<WorkspaceMetadata>,
     policy: PolicyEngine,
     cancellation: Cancellation,
     agent: Box<dyn Agent>,
@@ -443,7 +484,7 @@ impl WorkerFault {
     fn new(kind: &'static str, message: impl Into<String>) -> Self {
         Self {
             kind,
-            message: message.into(),
+            message: truncate_failure_text(message.into(), MAX_FAILURE_MESSAGE_BYTES),
         }
     }
 }
@@ -456,6 +497,7 @@ impl RunWorker {
         task: Task,
         workspace: WorkspaceRef,
         workspace_key: WorkspaceKey,
+        workspace_metadata: Option<WorkspaceMetadata>,
         policy: PolicyEngine,
         cancellation: Cancellation,
         agent: Box<dyn Agent>,
@@ -466,6 +508,7 @@ impl RunWorker {
             task,
             workspace,
             workspace_key,
+            workspace_metadata,
             policy,
             cancellation,
             agent,
@@ -1112,6 +1155,11 @@ impl RunWorker {
             risk,
             self.cancellation.clone(),
         );
+        if let Some(metadata) = self.workspace_metadata.as_ref() {
+            scheduled = scheduled
+                .with_workspace_metadata(metadata.clone())
+                .map_err(|error| WorkerFault::new(error.kind(), error.to_string()))?;
+        }
         if let Some((decided_by, expected_tool, expected_input_hash)) = approval {
             scheduled =
                 scheduled.approved_with_binding(decided_by, expected_tool, expected_input_hash);

@@ -10,8 +10,8 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use crate::tool::{
     ExecutionContext, RequestEffects, RiskLevel, Tool, ToolError, ToolIdentity, ToolMetadata,
 };
-use crate::trust::{PathAccess, PathBoundary};
 use crate::trust::ContainedPath;
+use crate::trust::{PathAccess, PathBoundary};
 
 use super::git_status::{map_git_error, project_path};
 use super::safe_read::{ensure_no_symlink_components, list_directory, open_regular};

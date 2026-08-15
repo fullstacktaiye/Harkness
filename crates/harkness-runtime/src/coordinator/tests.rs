@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use harkness_core::ProjectId;
+use harkness_core::{Project, ProjectId, ProjectSource};
+use harkness_git::Cancellation;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -15,11 +16,13 @@ use crate::agent::{
     Observation, ObservationPattern, PlannedStep, Scenario, ScenarioId, ScenarioStep, WorkspaceRef,
 };
 use crate::approval::{ApprovalDecision, ApprovalScope, ApprovalState, DecidedVia};
-use crate::domain::{ExecutionState, RunId, Task};
+use crate::domain::{ExecutionState, Run, RunId, Step, Task, ToolCall};
 use crate::policy::{PolicyEngine, PolicyVerdict, RepositoryPolicy, UserPolicy};
+use crate::schedule::WorkspaceKey;
 use crate::store::{EventKind, PassThrough, Store};
 use crate::tool::{
     ExecutionContext, RiskLevel, Tool, ToolError, ToolIdentity, ToolMetadata, ToolRegistry,
+    WorkspaceMetadata,
 };
 use crate::trust::{TrustState, WorkspaceTrust};
 
@@ -688,6 +691,61 @@ fn schedulable_runs_require_a_stable_project_identity() {
         .unwrap_err();
 
     assert_eq!(error.kind(), "workspace_identity_required");
+}
+
+#[test]
+fn coordinator_refuses_workspace_metadata_for_another_project_or_root() {
+    let fixture = Fixture::new();
+    let task = Task::new(
+        "metadata identity",
+        fixture.workspace.path(),
+        Some(fixture.project),
+        OffsetDateTime::now_utc(),
+    );
+    let workspace = WorkspaceRef::from_task(&task, &PassThrough);
+    let task_id = fixture.coordinator.start_task(task).unwrap();
+    let project = |id, root: &std::path::Path| Project {
+        id,
+        display_name: "Catalog project".to_owned(),
+        root: root.to_owned(),
+        source: ProjectSource::Local,
+        last_opened: OffsetDateTime::now_utc(),
+        available: true,
+        git: None,
+    };
+
+    let error = fixture
+        .coordinator
+        .start_run_with_workspace_metadata(
+            task_id,
+            Box::new(scenario(
+                "wrong_metadata_project",
+                vec![run_started(AgentAction::CompleteRun {
+                    summary: "unreachable".to_owned(),
+                })],
+            )),
+            workspace.clone(),
+            WorkspaceMetadata::from_project(&project(ProjectId::new(), fixture.workspace.path())),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), "workspace_mismatch");
+
+    let other_root = TempDir::new().unwrap();
+    let error = fixture
+        .coordinator
+        .start_run_with_workspace_metadata(
+            task_id,
+            Box::new(scenario(
+                "wrong_metadata_root",
+                vec![run_started(AgentAction::CompleteRun {
+                    summary: "unreachable".to_owned(),
+                })],
+            )),
+            workspace,
+            WorkspaceMetadata::from_project(&project(fixture.project, other_root.path())),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), "workspace_mismatch");
 }
 
 #[test]
@@ -1529,6 +1587,90 @@ fn forced_invalid_transition_is_persisted_as_a_diagnostic_instead_of_panicking()
 }
 
 #[test]
+fn oversized_panic_fault_is_bounded_before_every_cleanup_transition() {
+    let fixture = Fixture::new();
+    let now = OffsetDateTime::now_utc();
+    let task = Task::new(
+        "oversized panic cleanup",
+        fixture.workspace.path(),
+        Some(fixture.project),
+        now,
+    );
+    fixture.store.insert_task(&task).unwrap();
+    let run = Run::new(task.id(), now);
+    fixture.store.insert_run(&run).unwrap();
+    fixture
+        .store
+        .transition_run_with_event(
+            run.id(),
+            ExecutionState::Running,
+            now,
+            super::run_state_event(ExecutionState::Running, now),
+        )
+        .unwrap();
+    let step = Step::new(run.id(), 0, "active step", now);
+    fixture.store.insert_step(&step).unwrap();
+    fixture
+        .store
+        .transition_step(step.id(), ExecutionState::Running, now)
+        .unwrap();
+    let call = ToolCall::new(
+        &step,
+        "fixture.observe",
+        "1.0.0",
+        json!({"message": "active"}),
+        now,
+    );
+    fixture.store.insert_tool_call(&call).unwrap();
+    let workspace = WorkspaceRef::from_task(&task, &PassThrough);
+    let workspace_key = WorkspaceKey::new(fixture.project, fixture.workspace.path()).unwrap();
+    let policy = fixture
+        .coordinator
+        .inner
+        .policy
+        .for_workspace(workspace_key.canonical_root());
+    let worker = super::RunWorker::new(
+        Arc::clone(&fixture.coordinator.inner),
+        run.id(),
+        task,
+        workspace,
+        workspace_key,
+        None,
+        policy,
+        Cancellation::default(),
+        Box::new(PanickingAgent {
+            panic_in_next: true,
+        }),
+    );
+    let panic = std::panic::catch_unwind(|| {
+        std::panic::panic_any("x".repeat(65_537));
+    })
+    .unwrap_err();
+    worker.record_fault(super::WorkerFault::new(
+        "agent_panicked",
+        super::panic_payload(&*panic),
+    ));
+
+    let snapshot = fixture.coordinator.run_snapshot(run.id()).unwrap();
+    assert_eq!(snapshot.run.state(), ExecutionState::Failed);
+    assert!(snapshot.steps.iter().all(|step| step.state().is_terminal()));
+    assert!(
+        snapshot
+            .tool_calls
+            .iter()
+            .all(|call| call.state().is_terminal())
+    );
+    assert!(snapshot.events.iter().any(|event| {
+        event.event.kind() == &EventKind::Diagnostic
+            && event.event.payload()["error_kind"] == "agent_panicked"
+    }));
+    let bounded_failure_bytes = crate::tool::MAX_FAILURE_MESSAGE_BYTES + "… (truncated)".len();
+    assert!(snapshot.run.failure().unwrap().message().len() <= bounded_failure_bytes);
+    assert!(snapshot.steps[0].failure().unwrap().message().len() <= bounded_failure_bytes);
+    assert!(snapshot.tool_calls[0].failure().unwrap().message().len() <= bounded_failure_bytes);
+}
+
+#[test]
 #[ignore = "latency target; meaningful only in a release build"]
 fn approval_decision_to_tool_dispatch_stays_below_ten_milliseconds() {
     assert!(
@@ -1666,11 +1808,21 @@ fn production_tools_complete_the_flagship_edit_test_diff_run() {
     );
     let workspace_ref = WorkspaceRef::from_task(&task, &PassThrough);
     let task_id = coordinator.start_task(task).unwrap();
+    let project = Project {
+        id: project,
+        display_name: "Flagship project".to_owned(),
+        root: workspace.path().canonicalize().unwrap(),
+        source: ProjectSource::Local,
+        last_opened: OffsetDateTime::now_utc(),
+        available: true,
+        git: None,
+    };
     let run = coordinator
-        .start_run(
+        .start_run_with_workspace_metadata(
             task_id,
             Box::new(MockAgent::scenario("edit_test_diff_success").unwrap()),
             workspace_ref,
+            WorkspaceMetadata::from_project(&project),
         )
         .unwrap();
 
@@ -1745,6 +1897,23 @@ fn production_tools_complete_the_flagship_edit_test_diff_run() {
         test_call.output().and_then(|output| output.get("passed")),
         Some(&json!(true))
     );
+    let inspect_call = snapshot
+        .tool_calls
+        .iter()
+        .find(|call| call.tool_id() == "workspace.inspect")
+        .unwrap();
+    assert_eq!(
+        inspect_call
+            .output()
+            .and_then(|output| output.get("project"))
+            .and_then(|project| project.get("id")),
+        Some(&json!(project.id.to_string()))
+    );
+    assert_eq!(
+        inspect_call.output().unwrap()["project"]["display_name"],
+        "Flagship project"
+    );
+    assert_eq!(inspect_call.output().unwrap()["project"]["source"], "local");
     assert_eq!(
         fs::read_to_string(workspace.path().join("src/lib.rs")).unwrap(),
         "pub const VALUE: &str = \"new\";\n"

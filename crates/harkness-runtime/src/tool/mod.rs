@@ -204,6 +204,7 @@ pub use descriptor::{
 pub use erased::{
     ErasedTool, PreparedRequest, REJECTED_OUTPUT_ARTIFACT, RequestEffects, Tool, erase,
 };
+pub(crate) use error::truncate as truncate_failure_text;
 pub use error::{
     InvocationError, MAX_COUNTED_VIOLATIONS, MAX_FAILURE_MESSAGE_BYTES, MAX_REPORTED_VIOLATIONS,
     MAX_VIOLATION_FIELD_BYTES, RegistryError, SchemaDirection, SchemaViolation, ToolError,

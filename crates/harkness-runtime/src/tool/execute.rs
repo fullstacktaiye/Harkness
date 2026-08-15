@@ -728,6 +728,10 @@ impl ToolExecutor {
     }
 
     /// Runs an exactly bound approved call with authoritative catalog metadata.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "approval identity, workspace identity, and cancellation stay explicit at this trust boundary"
+    )]
     pub fn execute_bound_approved_with_workspace_metadata(
         &self,
         call: ToolCallId,
