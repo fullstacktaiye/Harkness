@@ -10,6 +10,7 @@ mod fs_read;
 mod git_diff;
 mod git_status;
 mod process_exec;
+mod safe_read;
 mod workspace_inspect;
 mod workspace_search;
 
@@ -27,7 +28,8 @@ pub use git_diff::{
     MAX_TOOL_DIFF_FILE_SIZE, MAX_TOOL_DIFF_FILES, MAX_TOOL_DIFF_TOTAL_BYTES,
 };
 pub use git_status::{
-    GitChange, GitHead, GitStatus, GitStatusEntry, GitStatusInput, GitStatusOutput, GitUpstream,
+    GitChange, GitHead, GitStatus, GitStatusEntry, GitStatusInput, GitStatusOmission,
+    GitStatusOutput, GitUpstream,
 };
 pub use process_exec::{
     BoundedText, ProcessExec, ProcessExecInput, ProcessExecOutput, TestRun, TestRunInput,

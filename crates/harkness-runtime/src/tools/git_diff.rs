@@ -1,10 +1,9 @@
 //! Bounded structured Git diff with artifact spill for large JSON payloads.
 
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use harkness_git::{
     DiffLineKind, DiffOmission, DiffOptions, DiffTarget, FileDiff, GitService, Hunk,
-    IntraLineDegradation,
 };
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -220,7 +219,6 @@ pub struct GitDiffHunk {
     pub new_lines: u32,
     pub header: String,
     pub header_encoding: ContentEncoding,
-    pub intra_line_degradation: Option<String>,
     pub lines: Vec<GitDiffLine>,
 }
 
@@ -247,6 +245,8 @@ pub struct GitFileDiff {
     pub new_size: u64,
     pub binary: bool,
     pub omission: Option<GitDiffOmission>,
+    /// Null because this tool does not perform the optional provenance walk.
+    pub provenance: Option<serde_json::Value>,
     pub hunks: Vec<GitDiffHunk>,
 }
 
@@ -338,14 +338,7 @@ impl Tool for GitDiff {
             let mut relative = Vec::with_capacity(paths.len());
             for supplied in paths {
                 context.check_still_permitted()?;
-                let resolved = context.resolve(Path::new(supplied))?;
-                relative.push(
-                    resolved
-                        .as_path()
-                        .strip_prefix(context.workspace_root())
-                        .map_err(ToolError::execution_failed)?
-                        .to_path_buf(),
-                );
+                relative.push(literal_repository_path(supplied)?);
             }
             options = options.with_paths(relative);
         }
@@ -361,9 +354,14 @@ impl Tool for GitDiff {
             projected.push(project_file(file, context)?);
         }
         let summary = summarize(&projected);
+        let inline_files = projected
+            .iter()
+            .cloned()
+            .map(|file| redact_inline_file(file, context))
+            .collect();
         let tentative = GitDiffOutput {
             summary: summary.clone(),
-            files: Some(projected.clone()),
+            files: Some(inline_files),
             artifact: None,
         };
         let serialized = serde_json::to_vec(&tentative).map_err(ToolError::execution_failed)?;
@@ -372,9 +370,10 @@ impl Tool for GitDiff {
         if serialized.len() <= inline_limit {
             return Ok(tentative);
         }
-        let payload = serde_json::to_vec(&GitDiffPayload { files: projected })
+        let payload = serde_json::to_value(GitDiffPayload { files: projected })
             .map_err(ToolError::execution_failed)?;
-        let artifact = context.write_artifact("git-diff.json", "application/json", &payload)?;
+        let artifact =
+            context.write_json_artifact("git-diff.json", "application/json", &payload)?;
         Ok(GitDiffOutput {
             summary,
             files: None,
@@ -444,8 +443,50 @@ fn project_file(file: &FileDiff, context: &ExecutionContext) -> Result<GitFileDi
         new_size: file.new_size,
         binary: file.binary,
         omission: file.omission.as_ref().map(project_omission),
+        provenance: None,
         hunks,
     })
+}
+
+fn redact_inline_file(mut file: GitFileDiff, context: &ExecutionContext) -> GitFileDiff {
+    file.old_path = file.old_path.map(|value| context.redact_text(&value));
+    file.new_path = file.new_path.map(|value| context.redact_text(&value));
+    if let Some(details) = &mut file.target_details {
+        match details {
+            GitDiffTarget::Commit { revision, parent } => {
+                *revision = context.redact_text(revision);
+                *parent = parent.take().map(|value| context.redact_text(&value));
+            }
+            GitDiffTarget::Revisions {
+                old_revision,
+                new_revision,
+            } => {
+                *old_revision = context.redact_text(old_revision);
+                *new_revision = context.redact_text(new_revision);
+            }
+            GitDiffTarget::RevisionAgainstWorktree { revision } => {
+                *revision = context.redact_text(revision);
+            }
+            GitDiffTarget::BranchAgainstBase {
+                branch,
+                base_branch,
+            } => {
+                *branch = context.redact_text(branch);
+                *base_branch = context.redact_text(base_branch);
+            }
+            GitDiffTarget::Staged | GitDiffTarget::Unstaged => {}
+        }
+    }
+    if let Some(GitDiffOmission::Unrepresentable { detail }) = &mut file.omission {
+        *detail = context.redact_text(detail);
+    }
+    for hunk in &mut file.hunks {
+        hunk.header = context.redact_text(&hunk.header);
+        for line in &mut hunk.lines {
+            line.content = context.redact_text(&line.content);
+        }
+    }
+    file
 }
 
 fn optional_path(path: Option<&Path>) -> (Option<String>, Option<bool>, Option<String>) {
@@ -535,7 +576,6 @@ fn project_hunk(hunk: &Hunk, context: &ExecutionContext) -> Result<GitDiffHunk, 
         new_lines: hunk.new_lines,
         header,
         header_encoding,
-        intra_line_degradation: hunk.intra_line_degradation.as_ref().map(degradation_name),
         lines,
     })
 }
@@ -565,12 +605,24 @@ fn line_kind(kind: DiffLineKind) -> &'static str {
     }
 }
 
-fn degradation_name(degradation: &IntraLineDegradation) -> String {
-    match degradation {
-        IntraLineDegradation::LineTooLong { limit } => format!("line_too_long:{limit}"),
-        IntraLineDegradation::PairingTooLarge { limit } => format!("pairing_too_large:{limit}"),
-        _ => "unknown".to_owned(),
+fn literal_repository_path(supplied: &str) -> Result<PathBuf, ToolError> {
+    let path = Path::new(supplied);
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ToolError::ForbiddenPath {
+            path: path.to_path_buf(),
+            reason: "Git diff paths must be literal repository-relative paths without traversal"
+                .to_owned(),
+        });
     }
+    Ok(path.to_path_buf())
 }
 
 fn summarize(files: &[GitFileDiff]) -> GitDiffSummary {

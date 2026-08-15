@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
@@ -18,11 +19,24 @@ use time::OffsetDateTime;
 
 use super::register_read_only_tools;
 use crate::domain::{ArtifactId, Run, RunId, Step, StepId, Task, ToolCall, ToolCallId};
-use crate::store::{Store, StoreArtifacts};
+use crate::store::{Redactor, Store, StoreArtifacts};
 use crate::tool::{
     ArtifactRef, ArtifactStream, ArtifactWriter, DiscardedProgress, ExecutionContext,
     InvocationError, RiskLevel, ToolError, ToolRegistry, WorkspaceMetadata, invoke,
 };
+
+#[derive(Debug)]
+struct NonIdempotentMasking;
+
+impl Redactor for NonIdempotentMasking {
+    fn redact_text<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        Cow::Owned(format!("R({})", text.replace("secret", "[masked]")))
+    }
+
+    fn wrap_stream(&self, sink: Box<dyn Write + Send>) -> Box<dyn Write + Send> {
+        sink
+    }
+}
 
 #[derive(Clone, Default)]
 struct MemoryArtifacts {
@@ -51,6 +65,16 @@ impl ArtifactWriter for MemoryArtifacts {
             bytes: Vec::new(),
             records: Arc::clone(&self.records),
         }))
+    }
+
+    fn write_json(
+        &mut self,
+        name: &str,
+        media_type: &str,
+        value: &Value,
+    ) -> Result<ArtifactRef, ToolError> {
+        let bytes = serde_json::to_vec(value).map_err(ToolError::execution_failed)?;
+        self.write(name, media_type, &bytes)
     }
 }
 
@@ -204,6 +228,101 @@ fn escaping_symlinks_are_refused_by_read_and_search() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn search_refuses_internal_directory_symlinks_and_git_administration() {
+    use std::os::unix::fs::symlink;
+
+    let harness = Harness::new();
+    fs::create_dir(harness.workspace.path().join("real")).unwrap();
+    fs::create_dir(harness.workspace.path().join("real/subdir")).unwrap();
+    fs::write(
+        harness.workspace.path().join("real/subdir/file.txt"),
+        "needle\n",
+    )
+    .unwrap();
+    symlink("real", harness.workspace.path().join("internal_link")).unwrap();
+
+    assert_eq!(
+        harness
+            .invoke(
+                "workspace.search",
+                json!({"path": "internal_link/subdir", "query": "needle"}),
+            )
+            .unwrap_err()
+            .kind(),
+        "forbidden_path"
+    );
+    assert_eq!(
+        harness
+            .invoke(
+                "workspace.search",
+                json!({"path": ".git/objects", "query": "needle"}),
+            )
+            .unwrap_err()
+            .kind(),
+        "forbidden_path"
+    );
+}
+
+#[test]
+fn invalid_regex_is_rejected_before_search_observes_its_path() {
+    let harness = Harness::new();
+    let error = harness
+        .invoke(
+            "workspace.search",
+            json!({"path": "missing", "query": "(", "regex": true}),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), "invalid_input");
+}
+
+#[test]
+fn a_regex_match_longer_than_the_excerpt_is_still_clamped() {
+    let harness = Harness::new();
+    fs::write(harness.workspace.path().join("long.txt"), "x".repeat(200)).unwrap();
+    let output = harness
+        .invoke(
+            "workspace.search",
+            json!({
+                "query": "x{100}",
+                "regex": true,
+                "max_excerpt_bytes": 16
+            }),
+        )
+        .unwrap();
+    assert_eq!(output["matches"][0]["excerpt"].as_str().unwrap().len(), 16);
+}
+
+#[cfg(unix)]
+#[test]
+fn search_names_nonregular_and_non_utf8_binary_omissions_without_opening_them() {
+    use std::ffi::{CString, OsString};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let harness = Harness::new();
+    let fifo_name = OsString::from_vec(b"fifo-\xff".to_vec());
+    let fifo = harness.workspace.path().join(&fifo_name);
+    let encoded = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+    let binary_name = OsString::from_vec(b"binary-\xfe".to_vec());
+    fs::write(harness.workspace.path().join(&binary_name), [0xff, 0]).unwrap();
+
+    let output = harness
+        .invoke("workspace.search", json!({"query": "needle"}))
+        .unwrap();
+    for kind in ["non_regular_file", "binary_file"] {
+        let omission = output["omissions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|omission| omission["kind"] == kind)
+            .unwrap();
+        assert_eq!(omission["path_is_lossy"], true);
+        assert!(omission["path_base64"].as_str().is_some());
+    }
+}
+
 #[test]
 fn search_respects_gitignore_and_reports_match_and_output_budgets() {
     let harness = Harness::new();
@@ -269,6 +388,69 @@ fn git_status_matches_the_existing_detailed_projection_fields() {
             .iter()
             .any(|entry| { entry["path"] == "untracked.txt" && entry["unstaged"] == "untracked" })
     );
+}
+
+#[test]
+fn git_status_honors_disabled_rename_detection_and_entry_bounds() {
+    let harness = Harness::new();
+    initialize_repository(harness.workspace.path());
+    git(
+        harness.workspace.path(),
+        ["config", "status.renames", "false"],
+    );
+    git(
+        harness.workspace.path(),
+        ["mv", "tracked.txt", "renamed.txt"],
+    );
+
+    let full = harness.invoke("git.status", json!({})).unwrap();
+    assert!(
+        full["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| { entry["path"] == "tracked.txt" && entry["staged"] == "deleted" })
+    );
+    assert!(
+        full["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| { entry["path"] == "renamed.txt" && entry["staged"] == "added" })
+    );
+
+    let bounded = harness
+        .invoke("git.status", json!({"max_entries": 1}))
+        .unwrap();
+    assert_eq!(bounded["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(bounded["omission"]["kind"], "entry_budget_exhausted");
+    assert_eq!(bounded["omission"]["omitted_entries"], 1);
+}
+
+#[test]
+fn git_status_honors_copy_detection_configuration() {
+    let harness = Harness::new();
+    initialize_repository(harness.workspace.path());
+    git(
+        harness.workspace.path(),
+        ["config", "status.renames", "copies"],
+    );
+    fs::copy(
+        harness.workspace.path().join("tracked.txt"),
+        harness.workspace.path().join("copied.txt"),
+    )
+    .unwrap();
+    git(harness.workspace.path(), ["add", "copied.txt"]);
+
+    let output = harness.invoke("git.status", json!({})).unwrap();
+    let copy = output["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == "copied.txt")
+        .unwrap();
+    assert_eq!(copy["staged"], "copied");
+    assert_eq!(copy["rename_source"], "tracked.txt");
 }
 
 #[test]
@@ -361,6 +543,86 @@ fn diff_spill_uses_store_redaction_hashing_and_tool_call_associations() {
 }
 
 #[test]
+fn diff_redacts_content_once_without_rewriting_inline_controls_or_artifact_refs() {
+    let workspace = tempfile::tempdir().unwrap();
+    initialize_repository(workspace.path());
+    fs::write(workspace.path().join("tracked.txt"), "secret changed\n").unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        Store::open(data.path())
+            .unwrap()
+            .redacting(Arc::new(NonIdempotentMasking)),
+    );
+    let task = Task::new(
+        "Read a diff",
+        workspace.path(),
+        None,
+        OffsetDateTime::UNIX_EPOCH,
+    );
+    store.insert_task(&task).unwrap();
+    let run = Run::new(task.id(), OffsetDateTime::UNIX_EPOCH);
+    store.insert_run(&run).unwrap();
+    let step = Step::new(run.id(), 0, "Inspect", OffsetDateTime::UNIX_EPOCH);
+    store.insert_step(&step).unwrap();
+    let call = ToolCall::new(
+        &step,
+        "git.diff",
+        "",
+        json!({"target": {"kind": "unstaged"}}),
+        OffsetDateTime::UNIX_EPOCH,
+    );
+    store.insert_tool_call(&call).unwrap();
+    let mut registry = ToolRegistry::new();
+    register_read_only_tools(&mut registry).unwrap();
+    let id = "git.diff".parse().unwrap();
+
+    let invoke_with = |input: Value| {
+        let artifacts = StoreArtifacts::new(Arc::clone(&store), run.id(), step.id(), call.id());
+        let mut context = ExecutionContext::new(
+            run.id(),
+            step.id(),
+            call.id(),
+            workspace.path(),
+            Cancellation::default(),
+            Box::new(DiscardedProgress),
+            Box::new(artifacts),
+        )
+        .unwrap();
+        let raw = serde_json::value::to_raw_value(&input).unwrap();
+        let output = invoke(&registry, &id, None, &raw, &mut context).unwrap();
+        serde_json::from_str::<Value>(output.output().get()).unwrap()
+    };
+
+    let inline = invoke_with(json!({"target": {"kind": "unstaged"}}));
+    let file = &inline["files"][0];
+    assert_eq!(file["target"], "unstaged");
+    assert_eq!(file["hunks"][0]["lines"][0]["content_encoding"], "utf8");
+    assert!(inline.to_string().contains("R([masked] changed"));
+    assert!(!inline.to_string().contains("R(R("));
+
+    fs::write(
+        workspace.path().join("tracked.txt"),
+        "secret changed\n".repeat(600),
+    )
+    .unwrap();
+    let spilled = invoke_with(json!({
+        "target": {"kind": "unstaged"},
+        "inline_max_bytes": 1024
+    }));
+    let artifact_id = ArtifactId::from_str(spilled["artifact"]["id"].as_str().unwrap()).unwrap();
+    let metadata = store.artifact(artifact_id).unwrap();
+    assert_eq!(
+        spilled["artifact"]["media_type"].as_str().unwrap(),
+        metadata.media_type()
+    );
+    let payload: Value =
+        serde_json::from_slice(&store.read_artifact(artifact_id).unwrap()).unwrap();
+    assert!(payload.get("files").is_some(), "published keys stay intact");
+    assert!(payload.to_string().contains("R([masked] changed"));
+    assert!(!payload.to_string().contains("R(R("));
+}
+
+#[test]
 fn workspace_inspect_distinguishes_catalog_metadata_from_a_root_label() {
     let harness = Harness::new();
     initialize_repository(harness.workspace.path());
@@ -413,6 +675,82 @@ fn workspace_metadata_refuses_a_different_catalog_root() {
         .with_workspace_metadata(WorkspaceMetadata::from_project(&project))
         .unwrap_err();
     assert_eq!(error.kind(), "forbidden_path");
+}
+
+#[test]
+fn workspace_inspect_stops_at_the_requested_entry_sentinel() {
+    let harness = Harness::new();
+    for name in ["one", "two", "three", "four"] {
+        fs::write(harness.workspace.path().join(name), b"").unwrap();
+    }
+
+    let output = harness
+        .invoke("workspace.inspect", json!({"max_entries": 2}))
+        .unwrap();
+
+    assert_eq!(output["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(output["omission"]["kind"], "entry_budget_exhausted");
+    assert_eq!(output["omission"]["at_least_omitted_entries"], 1);
+}
+
+#[test]
+fn search_stops_traversal_at_its_entry_budget() {
+    let harness = Harness::new();
+    for index in 0..=super::workspace_search::MAX_SEARCH_ENTRIES {
+        fs::write(
+            harness.workspace.path().join(format!("file-{index:05}")),
+            b"no match\n",
+        )
+        .unwrap();
+    }
+
+    let output = harness
+        .invoke("workspace.search", json!({"query": "needle"}))
+        .unwrap();
+
+    assert!(output["omissions"].as_array().unwrap().iter().any(|item| {
+        item["kind"] == "file_budget_exhausted"
+            && item["limit"] == super::workspace_search::MAX_SEARCH_FILES
+    }));
+    assert!(
+        output["scanned_files"].as_u64().unwrap()
+            <= u64::try_from(super::workspace_search::MAX_SEARCH_FILES).unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn git_diff_preserves_a_literal_symlink_path_filter() {
+    use std::os::unix::fs::symlink;
+
+    let harness = Harness::new();
+    initialize_repository(harness.workspace.path());
+    symlink("tracked.txt", harness.workspace.path().join("tracked-link")).unwrap();
+    git(harness.workspace.path(), ["add", "tracked-link"]);
+    git(
+        harness.workspace.path(),
+        ["commit", "-m", "track literal symlink"],
+    );
+    fs::remove_file(harness.workspace.path().join("tracked-link")).unwrap();
+    symlink(
+        "other-target",
+        harness.workspace.path().join("tracked-link"),
+    )
+    .unwrap();
+
+    let output = harness
+        .invoke(
+            "git.diff",
+            json!({
+                "target": {"kind": "unstaged"},
+                "paths": ["tracked-link"]
+            }),
+        )
+        .unwrap();
+
+    assert_eq!(output["files"].as_array().unwrap().len(), 1);
+    assert_eq!(output["files"][0]["new_path"], "tracked-link");
+    assert_eq!(output["files"][0]["provenance"], Value::Null);
 }
 
 #[test]

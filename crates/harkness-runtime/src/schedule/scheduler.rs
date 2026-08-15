@@ -12,7 +12,8 @@ use harkness_git::Cancellation;
 use crate::approval::InputHash;
 use crate::domain::{RunId, ToolCallId};
 use crate::tool::{
-    CompletedCall, ExecutionError, RiskLevel, ToolExecutor, ToolId, ToolIdentity, ToolVersion,
+    CompletedCall, ExecutionError, RiskLevel, ToolError, ToolExecutor, ToolId, ToolIdentity,
+    ToolVersion, WorkspaceMetadata,
 };
 
 use super::ticket::{CallTicket, Report, outcome_channel};
@@ -81,6 +82,7 @@ pub struct ScheduledCall {
     risk: RiskLevel,
     cancellation: Cancellation,
     admission: Admission,
+    workspace_metadata: Option<WorkspaceMetadata>,
 }
 
 /// How a scheduled call is to be started once it reaches the front.
@@ -119,7 +121,39 @@ impl ScheduledCall {
             risk,
             cancellation,
             admission: Admission::Pending,
+            workspace_metadata: None,
         }
+    }
+
+    /// Attaches authoritative catalog fields for tools that inspect identity.
+    ///
+    /// The metadata must name both the same project and the same canonical root
+    /// as the scheduler key, so it cannot widen or relabel the workspace being
+    /// serialized.
+    pub fn with_workspace_metadata(
+        mut self,
+        metadata: WorkspaceMetadata,
+    ) -> Result<Self, ToolError> {
+        if metadata.project_id() != self.workspace.project_id() {
+            return Err(ToolError::ForbiddenPath {
+                path: metadata.canonical_root().to_path_buf(),
+                reason: "workspace metadata names a different catalog project".to_owned(),
+            });
+        }
+        let canonical = std::fs::canonicalize(metadata.canonical_root()).map_err(|error| {
+            ToolError::ForbiddenPath {
+                path: metadata.canonical_root().to_path_buf(),
+                reason: format!("the catalog workspace root is unavailable: {error}"),
+            }
+        })?;
+        if canonical != self.workspace.canonical_root() {
+            return Err(ToolError::ForbiddenPath {
+                path: metadata.canonical_root().to_path_buf(),
+                reason: "workspace metadata names a different canonical root".to_owned(),
+            });
+        }
+        self.workspace_metadata = Some(metadata);
+        Ok(self)
     }
 
     /// Schedules a call held at `awaiting_approval`, resumed by its decision.
@@ -196,6 +230,7 @@ struct Waiting {
     spawns_processes: bool,
     cancellation: Cancellation,
     admission: Admission,
+    workspace_metadata: Option<WorkspaceMetadata>,
     report: Report,
 }
 
@@ -598,6 +633,7 @@ impl Scheduler {
             spawns_processes: declared.spawns_processes,
             cancellation: call.cancellation,
             admission: call.admission,
+            workspace_metadata: call.workspace_metadata,
             report,
         };
 
@@ -1005,28 +1041,57 @@ impl Inner {
     /// Runs one admitted call through the executor.
     fn run(&self, waiting: &Waiting) -> Result<CompletedCall, ExecutionError> {
         match &waiting.admission {
-            Admission::Pending => {
-                self.executor
-                    .execute(waiting.call, &waiting.root, &waiting.cancellation)
-            }
-            Admission::Approved { decided_by } => self.executor.execute_approved(
-                waiting.call,
-                decided_by,
-                &waiting.root,
-                &waiting.cancellation,
-            ),
+            Admission::Pending => match &waiting.workspace_metadata {
+                Some(metadata) => self.executor.execute_with_workspace_metadata(
+                    waiting.call,
+                    &waiting.root,
+                    metadata.clone(),
+                    &waiting.cancellation,
+                ),
+                None => self
+                    .executor
+                    .execute(waiting.call, &waiting.root, &waiting.cancellation),
+            },
+            Admission::Approved { decided_by } => match &waiting.workspace_metadata {
+                Some(metadata) => self.executor.execute_approved_with_workspace_metadata(
+                    waiting.call,
+                    decided_by,
+                    &waiting.root,
+                    metadata.clone(),
+                    &waiting.cancellation,
+                ),
+                None => self.executor.execute_approved(
+                    waiting.call,
+                    decided_by,
+                    &waiting.root,
+                    &waiting.cancellation,
+                ),
+            },
             Admission::BoundApproved {
                 decided_by,
                 expected_tool,
                 expected_input_hash,
-            } => self.executor.execute_bound_approved(
-                waiting.call,
-                decided_by,
-                expected_tool,
-                *expected_input_hash,
-                &waiting.root,
-                &waiting.cancellation,
-            ),
+            } => match &waiting.workspace_metadata {
+                Some(metadata) => self
+                    .executor
+                    .execute_bound_approved_with_workspace_metadata(
+                        waiting.call,
+                        decided_by,
+                        expected_tool,
+                        *expected_input_hash,
+                        &waiting.root,
+                        metadata.clone(),
+                        &waiting.cancellation,
+                    ),
+                None => self.executor.execute_bound_approved(
+                    waiting.call,
+                    decided_by,
+                    expected_tool,
+                    *expected_input_hash,
+                    &waiting.root,
+                    &waiting.cancellation,
+                ),
+            },
         }
     }
 

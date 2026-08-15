@@ -16,6 +16,8 @@ use crate::tool::{
 };
 use crate::trust::{PathAccess, PathBoundary};
 
+use super::safe_read::open_regular;
+
 /// Default maximum number of file bytes returned inline.
 pub const DEFAULT_FS_READ_MAX_BYTES: u64 = 32 * 1024;
 /// Absolute maximum one `fs.read` invocation may return.
@@ -120,26 +122,12 @@ impl Tool for FsRead {
     ) -> Result<Self::Output, ToolError> {
         context.check_still_permitted()?;
         let path = context.resolve(Path::new(&input.path))?;
-        let metadata = match fs::metadata(path.as_path()) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(ToolError::NotFound {
-                    path: Path::new(&input.path).to_path_buf(),
-                });
-            }
-            Err(error) => return Err(ToolError::execution_failed(error)),
-        };
-        if !metadata.is_file() {
-            return Err(ToolError::execution_failed(format!(
-                "{} is not a regular file",
-                input.path
-            )));
-        }
+        let (file, metadata) = open_regular(&path)?;
         let max_bytes = input.max_bytes.unwrap_or(DEFAULT_FS_READ_MAX_BYTES);
         debug_assert!(max_bytes <= MAX_FS_READ_BYTES);
         let offset = input.offset.unwrap_or(0);
         let (bytes, truncated) = read_lines(
-            path.as_path(),
+            file,
             metadata.len(),
             offset,
             input.limit,
@@ -152,8 +140,8 @@ impl Tool for FsRead {
             Err(_) => (BASE64.encode(&bytes), ContentEncoding::Base64),
         };
         Ok(FsReadOutput {
-            path: input.path,
-            content,
+            path: context.redact_text(&input.path),
+            content: context.redact_text(&content),
             content_encoding,
             media_type: if binary || matches!(content_encoding, ContentEncoding::Base64) {
                 "application/octet-stream".to_owned()
@@ -170,19 +158,13 @@ impl Tool for FsRead {
 }
 
 fn read_lines(
-    path: &Path,
+    mut file: File,
     byte_size: u64,
     offset: u64,
     limit: Option<u64>,
     max_bytes: u64,
     context: &ExecutionContext,
 ) -> Result<(Vec<u8>, Option<ReadTruncation>), ToolError> {
-    let mut file = File::open(path).map_err(|error| match error.kind() {
-        std::io::ErrorKind::NotFound => ToolError::NotFound {
-            path: path.to_path_buf(),
-        },
-        _ => ToolError::execution_failed(error),
-    })?;
     let capacity = usize::try_from(max_bytes.min(64 * 1024)).unwrap_or(64 * 1024);
     let mut selected = Vec::with_capacity(capacity);
     let mut buffer = [0_u8; 8192];

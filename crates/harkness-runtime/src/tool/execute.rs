@@ -137,7 +137,7 @@ use super::context::ExecutionControl;
 use super::{
     DEFAULT_PROGRESS_CAPACITY, DEFAULT_STREAM_TAIL_BYTES, Deadline, ErasedTool, ExecutionContext,
     InvocationError, POLL_INTERVAL, ProgressReceiver, ToolError, ToolId, ToolIdentity, ToolOutcome,
-    ToolRegistry, ToolTimeout, ToolVersion, invoke_resolved, progress_channel,
+    ToolRegistry, ToolTimeout, ToolVersion, WorkspaceMetadata, invoke_resolved, progress_channel,
 };
 
 /// Kind recorded when a tool's result is larger than a result may be.
@@ -627,7 +627,24 @@ impl ToolExecutor {
         workspace_root: impl Into<PathBuf>,
         cancellation: &Cancellation,
     ) -> Result<CompletedCall, ExecutionError> {
-        self.run(call, &Start::Pending, workspace_root, cancellation)
+        self.run(call, &Start::Pending, workspace_root, None, cancellation)
+    }
+
+    /// Runs one recorded call with authoritative catalog workspace metadata.
+    pub fn execute_with_workspace_metadata(
+        &self,
+        call: ToolCallId,
+        workspace_root: impl Into<PathBuf>,
+        workspace_metadata: WorkspaceMetadata,
+        cancellation: &Cancellation,
+    ) -> Result<CompletedCall, ExecutionError> {
+        self.run(
+            call,
+            &Start::Pending,
+            workspace_root,
+            Some(workspace_metadata),
+            cancellation,
+        )
     }
 
     /// Runs one call that a human or a policy has decided may proceed.
@@ -663,6 +680,7 @@ impl ToolExecutor {
             call,
             &Start::LegacyApproved { decided_by },
             workspace_root,
+            None,
             cancellation,
         )
     }
@@ -686,6 +704,49 @@ impl ToolExecutor {
                 expected_input_hash,
             },
             workspace_root,
+            None,
+            cancellation,
+        )
+    }
+
+    /// Runs one approved call with authoritative catalog workspace metadata.
+    pub fn execute_approved_with_workspace_metadata(
+        &self,
+        call: ToolCallId,
+        decided_by: &str,
+        workspace_root: impl Into<PathBuf>,
+        workspace_metadata: WorkspaceMetadata,
+        cancellation: &Cancellation,
+    ) -> Result<CompletedCall, ExecutionError> {
+        self.run(
+            call,
+            &Start::LegacyApproved { decided_by },
+            workspace_root,
+            Some(workspace_metadata),
+            cancellation,
+        )
+    }
+
+    /// Runs an exactly bound approved call with authoritative catalog metadata.
+    pub fn execute_bound_approved_with_workspace_metadata(
+        &self,
+        call: ToolCallId,
+        decided_by: &str,
+        expected_tool: &ToolIdentity,
+        expected_input_hash: InputHash,
+        workspace_root: impl Into<PathBuf>,
+        workspace_metadata: WorkspaceMetadata,
+        cancellation: &Cancellation,
+    ) -> Result<CompletedCall, ExecutionError> {
+        self.run(
+            call,
+            &Start::Approved {
+                decided_by,
+                expected_tool,
+                expected_input_hash,
+            },
+            workspace_root,
+            Some(workspace_metadata),
             cancellation,
         )
     }
@@ -696,6 +757,7 @@ impl ToolExecutor {
         call: ToolCallId,
         start: &Start<'_>,
         workspace_root: impl Into<PathBuf>,
+        workspace_metadata: Option<WorkspaceMetadata>,
         cancellation: &Cancellation,
     ) -> Result<CompletedCall, ExecutionError> {
         let record = self.store.load_tool_call(call)?;
@@ -762,6 +824,10 @@ impl ToolExecutor {
                 call,
             )),
         )
+        .and_then(|context| match workspace_metadata {
+            Some(metadata) => context.with_workspace_metadata(metadata),
+            None => Ok(context),
+        })
         .map(|context| context.with_stream_tail_bytes(self.limits.stream_tail_bytes));
 
         // Everything that could refuse this call has now refused it, so the

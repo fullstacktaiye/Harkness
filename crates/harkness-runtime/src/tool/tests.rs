@@ -1072,6 +1072,16 @@ fn a_tool_can_return_an_artifact_reference_in_its_output() {
                 byte_len: 0,
             }))
         }
+
+        fn write_json(
+            &mut self,
+            name: &str,
+            media_type: &str,
+            value: &serde_json::Value,
+        ) -> Result<super::ArtifactRef, ToolError> {
+            let bytes = serde_json::to_vec(value).map_err(ToolError::execution_failed)?;
+            self.write(name, media_type, &bytes)
+        }
     }
 
     struct StoringStream {
