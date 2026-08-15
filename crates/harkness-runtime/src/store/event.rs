@@ -151,6 +151,8 @@ pub enum EventKind {
     StepFinished,
     /// A tool call entered a new lifecycle state.
     ToolCallStateChanged,
+    /// A validated tool request received its binding policy decision.
+    PolicyDecision,
     /// A running tool reported progress.
     ToolProgress,
     /// Work paused for a human decision.
@@ -161,6 +163,12 @@ pub enum EventKind {
     ApprovalIdentityDrift,
     /// Content was stored outside the log.
     ArtifactCreated,
+    /// A redacted observation was delivered to the run's agent.
+    AgentObservation,
+    /// A redacted action was returned by the run's agent.
+    AgentAction,
+    /// The agent's resumable session checkpoint was recorded.
+    AgentCheckpoint,
     /// Anything a run wants to say that no other kind covers.
     Diagnostic,
     /// A kind this build does not define, preserved exactly as stored.
@@ -183,11 +191,15 @@ impl EventKind {
         "step_started",
         "step_finished",
         "tool_call_state_changed",
+        "policy_decision",
         "tool_progress",
         "approval_requested",
         "approval_decided",
         "approval_identity_drift",
         "artifact_created",
+        "agent_observation",
+        "agent_action",
+        "agent_checkpoint",
         "diagnostic",
     ];
 
@@ -199,12 +211,16 @@ impl EventKind {
             Self::StepStarted => Self::KINDS[1],
             Self::StepFinished => Self::KINDS[2],
             Self::ToolCallStateChanged => Self::KINDS[3],
-            Self::ToolProgress => Self::KINDS[4],
-            Self::ApprovalRequested => Self::KINDS[5],
-            Self::ApprovalDecided => Self::KINDS[6],
-            Self::ApprovalIdentityDrift => Self::KINDS[7],
-            Self::ArtifactCreated => Self::KINDS[8],
-            Self::Diagnostic => Self::KINDS[9],
+            Self::PolicyDecision => Self::KINDS[4],
+            Self::ToolProgress => Self::KINDS[5],
+            Self::ApprovalRequested => Self::KINDS[6],
+            Self::ApprovalDecided => Self::KINDS[7],
+            Self::ApprovalIdentityDrift => Self::KINDS[8],
+            Self::ArtifactCreated => Self::KINDS[9],
+            Self::AgentObservation => Self::KINDS[10],
+            Self::AgentAction => Self::KINDS[11],
+            Self::AgentCheckpoint => Self::KINDS[12],
+            Self::Diagnostic => Self::KINDS[13],
             Self::Unrecognized(spelling) => spelling,
         }
     }
@@ -221,11 +237,15 @@ impl EventKind {
             "step_started" => Self::StepStarted,
             "step_finished" => Self::StepFinished,
             "tool_call_state_changed" => Self::ToolCallStateChanged,
+            "policy_decision" => Self::PolicyDecision,
             "tool_progress" => Self::ToolProgress,
             "approval_requested" => Self::ApprovalRequested,
             "approval_decided" => Self::ApprovalDecided,
             "approval_identity_drift" => Self::ApprovalIdentityDrift,
             "artifact_created" => Self::ArtifactCreated,
+            "agent_observation" => Self::AgentObservation,
+            "agent_action" => Self::AgentAction,
+            "agent_checkpoint" => Self::AgentCheckpoint,
             "diagnostic" => Self::Diagnostic,
             other => Self::Unrecognized(other.to_owned()),
         }
@@ -490,6 +510,31 @@ fn next_sequence(connection: &Connection, run_id: RunId) -> Result<EventSeq, Sto
     Ok(EventSeq(highest + 1))
 }
 
+/// Returns the durable tip of one run's log without materializing its history.
+pub(super) fn latest_sequence(
+    connection: &Connection,
+    run_id: RunId,
+) -> Result<Option<EventSeq>, StoreError> {
+    let highest: Option<i64> = connection
+        .query_row(
+            "SELECT MAX(seq) FROM run_events WHERE run_id = :run_id",
+            named_params! { ":run_id": run_id.to_string() },
+            |row| row.get(0),
+        )
+        .map_err(|error| query_failed("reading the latest event sequence", error))?;
+    highest
+        .map(|highest| {
+            u64::try_from(highest)
+                .map(EventSeq)
+                .map_err(|_| StoreError::ColumnEncoding {
+                    record: RUN_EVENT,
+                    field: "seq",
+                    reason: format!("{highest} is not a representable sequence number"),
+                })
+        })
+        .transpose()
+}
+
 /// Returns one page of a run's log, ordered by sequence.
 pub(super) fn events(
     connection: &Connection,
@@ -592,11 +637,15 @@ mod tests {
             EventKind::StepStarted,
             EventKind::StepFinished,
             EventKind::ToolCallStateChanged,
+            EventKind::PolicyDecision,
             EventKind::ToolProgress,
             EventKind::ApprovalRequested,
             EventKind::ApprovalDecided,
             EventKind::ApprovalIdentityDrift,
             EventKind::ArtifactCreated,
+            EventKind::AgentObservation,
+            EventKind::AgentAction,
+            EventKind::AgentCheckpoint,
             EventKind::Diagnostic,
         ];
 

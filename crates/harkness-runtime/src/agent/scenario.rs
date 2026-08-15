@@ -9,8 +9,10 @@ use crate::tool::{ToolId, ToolVersion};
 
 use super::{AgentAction, AgentFailure, ApprovalOutcomeView, Observation, ObservationKind};
 
-/// Version of the deterministic scenario fixture format.
-pub const SCENARIO_FIXTURE_VERSION: u32 = 1;
+/// Newest retained deterministic scenario fixture version.
+pub const SCENARIO_FIXTURE_VERSION: u32 = 2;
+
+const MIN_SCENARIO_FIXTURE_VERSION: u32 = 1;
 
 const SCENARIO_DEFINITION_DIGEST_DOMAIN: &[u8] = b"harkness.agent.scenario-definition.v1";
 
@@ -376,11 +378,11 @@ impl Scenario {
                 supported: SCENARIO_FIXTURE_VERSION,
             });
         }
-        if version.v != SCENARIO_FIXTURE_VERSION {
+        if version.v < MIN_SCENARIO_FIXTURE_VERSION {
             return Err(ScenarioError::UnsupportedFixtureVersion { found: version.v });
         }
         let wire: ScenarioWire = serde_json::from_str(bytes)?;
-        debug_assert_eq!(wire.v, SCENARIO_FIXTURE_VERSION);
+        debug_assert!(wire.v <= SCENARIO_FIXTURE_VERSION);
         Self::from_parts(wire.v, wire.id, wire.steps)
     }
 
@@ -467,31 +469,35 @@ impl Scenario {
     }
 
     pub(crate) fn builtin(name: &str, version: u32) -> Result<Self, ScenarioError> {
-        if version != SCENARIO_FIXTURE_VERSION {
-            if BUILTIN_SCENARIO_NAMES.contains(&name) {
-                return Err(ScenarioError::UnknownScenarioVersion {
-                    name: name.to_owned(),
-                    version,
-                });
-            }
+        if !BUILTIN_SCENARIO_NAMES.contains(&name) {
             return Err(ScenarioError::UnknownScenario {
                 name: name.to_owned(),
             });
         }
-        match name {
-            "read_only_success" => Ok(Self::read_only_success()),
-            "edit_test_diff_success" => Ok(Self::edit_test_diff_success()),
-            "approval_denied" => Ok(Self::approval_denied()),
-            "invalid_tool_input" => Ok(Self::invalid_tool_input()),
-            "tool_process_failure" => Ok(Self::tool_process_failure()),
-            "tool_timeout" => Ok(Self::tool_timeout()),
-            "user_cancellation" => Ok(Self::user_cancellation()),
-            "restart_recovery" => Ok(Self::restart_recovery()),
-            "forbidden_path" => Ok(Self::forbidden_path()),
-            "disallowed_capability" => Ok(Self::disallowed_capability()),
-            _ => Err(ScenarioError::UnknownScenario {
+        match (name, version) {
+            ("read_only_success", 1) => Ok(Self::read_only_success()),
+            ("edit_test_diff_success", 1) => Ok(Self::edit_test_diff_success()),
+            ("edit_test_diff_success", 2) => Ok(Self::edit_test_diff_success_v2()),
+            ("approval_denied", 1) => Ok(Self::approval_denied()),
+            ("invalid_tool_input", 1) => Ok(Self::invalid_tool_input()),
+            ("tool_process_failure", 1) => Ok(Self::tool_process_failure()),
+            ("tool_timeout", 1) => Ok(Self::tool_timeout()),
+            ("user_cancellation", 1) => Ok(Self::user_cancellation()),
+            ("restart_recovery", 1) => Ok(Self::restart_recovery()),
+            ("forbidden_path", 1) => Ok(Self::forbidden_path()),
+            ("disallowed_capability", 1) => Ok(Self::disallowed_capability()),
+            _ => Err(ScenarioError::UnknownScenarioVersion {
                 name: name.to_owned(),
+                version,
             }),
+        }
+    }
+
+    pub(crate) fn builtin_latest(name: &str) -> Result<Self, ScenarioError> {
+        if name == "edit_test_diff_success" {
+            Self::builtin(name, 2)
+        } else {
+            Self::builtin(name, 1)
         }
     }
 
@@ -500,8 +506,9 @@ impl Scenario {
         definition_digest: &str,
     ) -> Result<Self, ScenarioError> {
         for name in BUILTIN_SCENARIO_NAMES {
-            let scenario = Self::builtin(name, version)?;
-            if scenario.definition_digest() == definition_digest {
+            if let Ok(scenario) = Self::builtin(name, version)
+                && scenario.definition_digest() == definition_digest
+            {
                 return Ok(scenario);
             }
         }
@@ -578,6 +585,59 @@ impl Scenario {
                 ),
             ],
         )
+    }
+
+    /// Version two of the flagship, which requires the real test result to
+    /// report success before requesting the final diff.
+    ///
+    /// It also replaces v1's `cargo` argv with a fixture executable. v1's was
+    /// inert — nothing executed it — but v2 asserts on the result, so the
+    /// program has to be one a test creates rather than a host toolchain: the
+    /// tool runner starts its child with a cleared environment plus a
+    /// POSIX-shaped baseline, which is not enough for `cargo` to reach `rustc`
+    /// and a linker on Windows. v1 is a released wire form and is left alone.
+    #[must_use]
+    pub fn edit_test_diff_success_v2() -> Self {
+        let scenario = Self::edit_test_diff_success();
+        // Located by what the step *is*. Indexing meant an edit to v1 silently
+        // moved which transition v2 rewrote, or turned this into a panic.
+        let test_index = scenario_call_index(&scenario.steps, "test.run");
+        let mut steps = scenario.steps;
+        // v1's patch omits the `diff --git` header. Nothing executed it, so it
+        // was never a contract question; v2 does execute it, and teaching
+        // `fs.apply_patch@1.0.0` to synthesize a missing header would change
+        // what a *released* `(id, version)` applies — patches it refused as
+        // `patch_conflict` would start mutating the workspace. The scenario
+        // carries the header instead.
+        let patch_index = scenario_call_index(&steps, "fs.apply_patch");
+        steps[patch_index] = step(
+            steps[patch_index].expect.clone(),
+            call(
+                "fs.apply_patch",
+                json!({
+                    "patch": "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub const VALUE: &str = \"old\";\n+pub const VALUE: &str = \"new\";\n",
+                    "bases": [{
+                        "path": "src/lib.rs",
+                        "base_sha256": FLAGSHIP_SOURCE_SHA256
+                    }]
+                }),
+            ),
+        );
+        steps[test_index] = step(
+            steps[test_index].expect.clone(),
+            call(
+                "test.run",
+                json!({"command": fixture_process_command("fixture-pass")}),
+            ),
+        );
+        // The transition *after* the call is the one that observes its result.
+        steps[test_index + 1] = step(
+            tool_result_containing(json!({"passed": true})),
+            steps[test_index + 1].action.clone(),
+        );
+        // Through `from_parts` so v2 is validated exactly as v1 was, rather
+        // than assembled by mutating private fields.
+        Self::from_parts(2, scenario.id, steps).expect("valid built-in scenario")
     }
 
     /// Rust-data definition of the denied-approval scenario.
@@ -768,13 +828,22 @@ impl Scenario {
     }
 }
 
+/// Index of the transition whose action calls `tool_id`.
+///
+/// Located by what the step *is* rather than by position, so an edit to v1
+/// cannot silently move which transition a later version rewrites.
+fn scenario_call_index(steps: &[ScenarioStep], tool_id: &str) -> usize {
+    steps
+        .iter()
+        .position(|step| {
+            matches!(&step.action, AgentAction::CallTool { tool_id: called, .. } if called.as_str() == tool_id)
+        })
+        .unwrap_or_else(|| panic!("the flagship calls {tool_id}"))
+}
+
 fn built_in(id: &str, steps: Vec<ScenarioStep>) -> Scenario {
-    Scenario::from_parts(
-        SCENARIO_FIXTURE_VERSION,
-        ScenarioId::new(id).expect("valid built-in id"),
-        steps,
-    )
-    .expect("valid built-in scenario")
+    Scenario::from_parts(1, ScenarioId::new(id).expect("valid built-in id"), steps)
+        .expect("valid built-in scenario")
 }
 
 fn fixture_process_command(program: &str) -> Vec<&str> {
@@ -783,6 +852,7 @@ fn fixture_process_command(program: &str) -> Vec<&str> {
         "fixture-hang" => "scenario_process_fixture_hang_child",
         "fixture-cancellable" => "scenario_process_fixture_cancellable_child",
         "fixture-disallowed" => "scenario_process_fixture_disallowed_child",
+        "fixture-pass" => "scenario_process_fixture_pass_child",
         _ => unreachable!("built-in scenarios name only registered fixture processes"),
     };
     vec![program, "--exact", test, "--ignored", "--nocapture"]
@@ -908,7 +978,7 @@ mod tests {
             Scenario::from_json(too_new),
             Err(ScenarioError::FixtureTooNew {
                 found: 99,
-                supported: 1
+                supported: 2
             })
         ));
 

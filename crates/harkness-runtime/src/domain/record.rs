@@ -543,6 +543,30 @@ impl Run {
             .push(Approval::denied(decided_by, self.updated_at()));
         Ok(())
     }
+
+    /// Records that a tool-level approval was denied and resumes orchestration.
+    ///
+    /// The run itself was paused only because its current tool call needed an
+    /// answer. Refusing that call is an observation the agent may handle; it is
+    /// not necessarily a terminal failure of the whole run.
+    pub fn resume_after_denial(
+        &mut self,
+        decided_by: impl Into<String>,
+        at: OffsetDateTime,
+    ) -> Result<(), RunDomainError> {
+        require_state(
+            "run",
+            self.state() == ExecutionState::WaitingForApproval,
+            "approval decisions require waiting_for_approval",
+        )?;
+        // Validate the identity even though the tool call and durable approval
+        // request, rather than the run, retain the denial. Run approval history
+        // has the older invariant that a denial is a terminal run outcome.
+        let _ = approval_identity("run", decided_by)?;
+        self.lifecycle
+            .transition("run", ExecutionState::Running, at)?;
+        Ok(())
+    }
 }
 
 /// One ordered unit of work within a [`Run`].

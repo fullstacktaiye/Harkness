@@ -7,8 +7,11 @@ use regex::{Regex, RegexBuilder};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
-use crate::tool::{ExecutionContext, RiskLevel, Tool, ToolError, ToolIdentity, ToolMetadata};
+use crate::tool::{
+    ExecutionContext, RequestEffects, RiskLevel, Tool, ToolError, ToolIdentity, ToolMetadata,
+};
 use crate::trust::ContainedPath;
+use crate::trust::{PathAccess, PathBoundary};
 
 use super::git_status::{map_git_error, project_path};
 use super::safe_read::{ensure_no_symlink_components, list_directory, open_regular};
@@ -184,6 +187,19 @@ impl Tool for WorkspaceSearch {
             "Searches non-ignored regular files in process with bounded regexes, matches, excerpts, traversal, and scanned bytes.",
             RiskLevel::Observe,
         )
+    }
+
+    fn request_effects(
+        &self,
+        input: &Self::Input,
+        boundary: &PathBoundary,
+    ) -> Result<RequestEffects, ToolError> {
+        match input.path.as_deref() {
+            Some(path) => {
+                Ok(RequestEffects::default().with_path(boundary.contain(path)?, PathAccess::Read))
+            }
+            None => Ok(RequestEffects::default()),
+        }
     }
 
     fn execute(

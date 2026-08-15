@@ -685,6 +685,20 @@ impl PolicyEngine {
         Self { user, repository }
     }
 
+    /// Reuses the already-loaded user layer while loading repository policy
+    /// from the workspace this run will actually execute in.
+    #[must_use]
+    pub fn for_workspace(&self, workspace: impl AsRef<Path>) -> Self {
+        let repository = match load_repository_policy(workspace.as_ref()) {
+            Ok(policy) => LoadedPolicy::Loaded(policy.map(RepositoryPolicy)),
+            Err(error) => LoadedPolicy::Failed(error),
+        };
+        Self {
+            user: self.user.clone(),
+            repository,
+        }
+    }
+
     /// Evaluates a fully classified request without I/O, clock reads, or locks.
     ///
     /// Built-in, user, and repository rules combine with `max` on

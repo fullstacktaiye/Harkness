@@ -37,7 +37,7 @@ impl MockAgent {
     /// Returns [`ScenarioError::UnknownScenario`] when `name` is not in
     /// [`scenario_names`](Self::scenario_names).
     pub fn scenario(name: &str) -> Result<Self, ScenarioError> {
-        Self::scenario_version(name, super::SCENARIO_FIXTURE_VERSION)
+        Scenario::builtin_latest(name).map(Self::from_scenario)
     }
 
     /// Constructs one exact retained version of a registered scenario.

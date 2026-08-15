@@ -1,0 +1,94 @@
+{
+  "v": 2,
+  "id": "edit_test_diff_success",
+  "steps": [
+    {
+      "expect": {
+        "kind": "run_started"
+      },
+      "action": {
+        "kind": "call_tool",
+        "tool_id": "workspace.inspect",
+        "tool_version": "1.0.0",
+        "input": {}
+      }
+    },
+    {
+      "expect": {
+        "kind": "tool_result"
+      },
+      "action": {
+        "kind": "call_tool",
+        "tool_id": "fs.read",
+        "tool_version": "1.0.0",
+        "input": {
+          "path": "src/lib.rs"
+        }
+      }
+    },
+    {
+      "expect": {
+        "kind": "tool_result"
+      },
+      "action": {
+        "kind": "call_tool",
+        "tool_id": "fs.apply_patch",
+        "tool_version": "1.0.0",
+        "input": {
+          "bases": [
+            {
+              "base_sha256": "4f03383f0bbf9e30e56d77f0a1b85286436cf6df407f00ade9f115b71f382026",
+              "path": "src/lib.rs"
+            }
+          ],
+          "patch": "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub const VALUE: &str = \"old\";\n+pub const VALUE: &str = \"new\";\n"
+        }
+      }
+    },
+    {
+      "expect": {
+        "kind": "tool_result",
+        "artifact_media_type": "text/x-diff"
+      },
+      "action": {
+        "kind": "call_tool",
+        "tool_id": "test.run",
+        "tool_version": "1.0.0",
+        "input": {
+          "command": [
+            "fixture-pass",
+            "--exact",
+            "scenario_process_fixture_pass_child",
+            "--ignored",
+            "--nocapture"
+          ]
+        }
+      }
+    },
+    {
+      "expect": {
+        "kind": "tool_result",
+        "output_contains": {
+          "passed": true
+        }
+      },
+      "action": {
+        "kind": "call_tool",
+        "tool_id": "git.diff",
+        "tool_version": "1.0.0",
+        "input": {
+          "target": "unstaged"
+        }
+      }
+    },
+    {
+      "expect": {
+        "kind": "tool_result"
+      },
+      "action": {
+        "kind": "complete_run",
+        "summary": "Edited the workspace, passed tests, and captured the final diff."
+      }
+    }
+  ]
+}

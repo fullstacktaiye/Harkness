@@ -198,6 +198,15 @@ pub enum StoreError {
     #[error(transparent)]
     Approval(#[from] ApprovalError),
 
+    /// An approved call no longer matches the request that was authorized.
+    #[error("tool call {call} no longer matches its approval binding: {reason}")]
+    ApprovalBindingMismatch {
+        /// Call whose durable request changed.
+        call: String,
+        /// Stable explanation of the mismatched field.
+        reason: &'static str,
+    },
+
     /// A stored row could not be decoded into a valid domain record.
     #[error("a stored {record} row is not a valid record: {source}")]
     InvalidRecord {
@@ -278,6 +287,7 @@ impl StoreError {
         "non_utf8_path",
         "invalid_transition",
         "approval_refused",
+        "approval_binding_mismatch",
         "invalid_record",
         "column_encoding",
         "invalid_page_limit",
@@ -304,6 +314,7 @@ impl StoreError {
             Self::NonUtf8Path { .. } => "non_utf8_path",
             Self::InvalidTransition(_) => "invalid_transition",
             Self::Approval(_) => "approval_refused",
+            Self::ApprovalBindingMismatch { .. } => "approval_binding_mismatch",
             Self::InvalidRecord { .. } => "invalid_record",
             Self::ColumnEncoding { .. } => "column_encoding",
             Self::InvalidPageLimit { .. } => "invalid_page_limit",
@@ -507,6 +518,13 @@ mod tests {
                     state: crate::approval::ApprovalState::Denied,
                 }),
                 "approval_refused",
+            ),
+            (
+                StoreError::ApprovalBindingMismatch {
+                    call: "call".to_owned(),
+                    reason: "input changed",
+                },
+                "approval_binding_mismatch",
             ),
             (
                 StoreError::InvalidRecord {

@@ -176,7 +176,7 @@ impl SchemaViolation {
 ///
 /// The single truncation used by every bounded field in this module, so the cut
 /// and its marker cannot drift between them.
-pub(super) fn truncate(mut text: String, maximum: usize) -> String {
+pub(crate) fn truncate(mut text: String, maximum: usize) -> String {
     if text.len() <= maximum {
         return text;
     }

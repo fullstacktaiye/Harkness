@@ -28,6 +28,7 @@ use serde_json::json;
 use tempfile::TempDir;
 use time::OffsetDateTime;
 
+use crate::approval::canonical_input_hash;
 use crate::domain::{Run, Step, Task, ToolCall, ToolCallId, ToolCallState};
 use crate::store::Store;
 use crate::tool::{
@@ -401,6 +402,45 @@ fn scheduler_supplies_verified_catalog_metadata_to_workspace_inspection() {
         .output()
         .unwrap()
         .clone();
+    assert_eq!(output["project"]["id"], project.id.to_string());
+    assert_eq!(output["project"]["display_name"], project.display_name);
+    assert_eq!(output["project"]["source"], "local");
+}
+
+#[test]
+fn bound_approved_dispatch_preserves_verified_workspace_metadata() {
+    let fixture = Fixture::new();
+    let scheduler = fixture.scheduler(vec![eraseit(WorkspaceInspect)]);
+    let workspace = fixture.workspace("approved-catalogued");
+    let step = fixture.run(&workspace);
+    let call = fixture.call(&step, "workspace.inspect");
+    fixture
+        .store
+        .transition_tool_call(call, ToolCallState::AwaitingApproval, at(4))
+        .unwrap();
+    let project = Project {
+        id: fixture.project,
+        display_name: "Approved catalogued workspace".to_owned(),
+        root: workspace.canonical_root().to_path_buf(),
+        source: ProjectSource::Local,
+        last_opened: at(0),
+        available: true,
+        git: None,
+    };
+    let record = fixture.store.load_tool_call(call).unwrap();
+    let scheduled =
+        ScheduledCall::new(call, workspace, RiskLevel::Observe, Cancellation::default())
+            .approved_with_binding(
+                "reviewer",
+                ToolIdentity::parse("workspace.inspect", "1.0.0").unwrap(),
+                canonical_input_hash(record.input()).unwrap(),
+            )
+            .with_workspace_metadata(WorkspaceMetadata::from_project(&project))
+            .unwrap();
+
+    let completed = settled(scheduler.submit(scheduled).unwrap()).unwrap();
+    assert_eq!(completed.state(), ToolCallState::Succeeded);
+    let output = completed.record().output().unwrap();
     assert_eq!(output["project"]["id"], project.id.to_string());
     assert_eq!(output["project"]["display_name"], project.display_name);
     assert_eq!(output["project"]["source"], "local");

@@ -726,6 +726,30 @@ fn a_repeated_identity_is_refused_instead_of_overwriting_history() {
 }
 
 #[test]
+fn inserting_a_run_and_first_event_rolls_back_both_on_event_refusal() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let existing = stored_run(&fixture.store, &task);
+    let foreign_step = stored_step(&fixture.store, &existing);
+    let run = Run::new(task.id(), at(20));
+
+    let error = fixture
+        .store
+        .insert_run_with_event(
+            &run,
+            RunEvent::new(EventKind::Diagnostic, at(20)).for_step(foreign_step.id()),
+        )
+        .unwrap_err();
+
+    assert!(matches!(error.kind(), "missing_parent" | "query_failed"));
+    assert_eq!(
+        fixture.store.load_run(run.id()).unwrap_err().kind(),
+        "not_found"
+    );
+    assert!(fixture.store.events(run.id(), None, 10).unwrap().is_empty());
+}
+
+#[test]
 fn a_second_step_cannot_reuse_an_ordinal_within_its_run() {
     let fixture = Fixture::new();
     let task = stored_task(&fixture.store);
@@ -1787,6 +1811,61 @@ fn a_state_change_and_its_event_commit_atomically_or_not_at_all() {
     let reopened = fixture.reopen();
     assert_eq!(reopened.load_run(run.id()).unwrap(), running);
     assert_eq!(reopened.events(run.id(), None, 10).unwrap().len(), 1);
+}
+
+#[test]
+fn coordinator_state_helpers_roll_back_when_their_event_is_refused() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let failure = Failure::new("fixture", "must roll back");
+    let error = fixture
+        .store
+        .fail_run_with_event(
+            run.id(),
+            failure,
+            at(10),
+            RunEvent::new(EventKind::RunStateChanged, at(10)).for_step(StepId::new()),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), "missing_parent");
+    assert_eq!(fixture.store.load_run(run.id()).unwrap(), run);
+    assert!(fixture.store.events(run.id(), None, 10).unwrap().is_empty());
+
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = stored_step(&fixture.store, &run);
+    let error = fixture
+        .store
+        .transition_step_with_event(
+            step.id(),
+            ExecutionState::Running,
+            at(10),
+            RunEvent::new(EventKind::StepStarted, at(10)).for_tool_call(ToolCallId::new()),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), "missing_parent");
+    assert_eq!(fixture.store.load_step(step.id()).unwrap(), step);
+    assert!(fixture.store.events(run.id(), None, 10).unwrap().is_empty());
+
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = stored_step(&fixture.store, &run);
+    let call = stored_tool_call(&fixture.store, &step);
+    let error = fixture
+        .store
+        .apply_tool_call_policy_decision_with_event(
+            call.id(),
+            policy_decision(PolicyVerdict::Ask),
+            at(10),
+            RunEvent::new(EventKind::PolicyDecision, at(10)).for_artifact(ArtifactId::new()),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), "missing_parent");
+    assert_eq!(fixture.store.load_tool_call(call.id()).unwrap(), call);
+    assert!(fixture.store.events(run.id(), None, 10).unwrap().is_empty());
 }
 
 #[test]

@@ -14,6 +14,54 @@ use super::{
     ExecutionContext, MAX_FAILURE_MESSAGE_BYTES, RegistryError, SchemaDirection, SchemaViolation,
     ToolDescriptor, ToolError, ToolIdentity, ToolMetadata,
 };
+use crate::trust::{
+    ContainedPath, PathAccess, PathBoundary, RequestClassification, RequestFlags, RequestPath,
+    classify_request,
+};
+
+/// Invocation facts derived from validated typed input before policy runs.
+#[derive(Clone, Debug, Default)]
+pub struct RequestEffects {
+    paths: Vec<(ContainedPath, PathAccess)>,
+    flags: RequestFlags,
+}
+
+impl RequestEffects {
+    /// Adds one already-contained path and its concrete access mode.
+    #[must_use]
+    pub fn with_path(mut self, path: ContainedPath, access: PathAccess) -> Self {
+        self.paths.push((path, access));
+        self
+    }
+
+    /// Replaces the non-filesystem effects of this invocation.
+    #[must_use]
+    pub const fn with_flags(mut self, flags: RequestFlags) -> Self {
+        self.flags = flags;
+        self
+    }
+}
+
+/// A schema-valid request prepared for policy evaluation without execution.
+#[derive(Clone, Debug)]
+pub struct PreparedRequest {
+    paths: Vec<ContainedPath>,
+    classification: RequestClassification,
+}
+
+impl PreparedRequest {
+    /// Contained paths policy may inspect.
+    #[must_use]
+    pub fn paths(&self) -> &[ContainedPath] {
+        &self.paths
+    }
+
+    /// Effective risk and force variant derived from the descriptor and input.
+    #[must_use]
+    pub const fn classification(&self) -> RequestClassification {
+        self.classification
+    }
+}
 
 /// Name the artifact store holds a schema-refused result under.
 ///
@@ -120,6 +168,19 @@ pub trait Tool: Send + Sync {
     /// built here and then frozen.
     fn metadata(&self) -> ToolMetadata;
 
+    /// Derives policy facts from schema-valid typed input without executing it.
+    ///
+    /// The default adds no invocation-specific facts; the descriptor's risk is
+    /// still a floor. Implementations may resolve path arguments through
+    /// `boundary` and raise effects, but must not perform the operation.
+    fn request_effects(
+        &self,
+        _input: &Self::Input,
+        _boundary: &PathBoundary,
+    ) -> Result<RequestEffects, ToolError> {
+        Ok(RequestEffects::default())
+    }
+
     /// Performs the operation.
     ///
     /// # Errors
@@ -157,6 +218,14 @@ pub trait Tool: Send + Sync {
 pub trait ErasedTool: sealed::Sealed + std::fmt::Debug + Send + Sync {
     /// The frozen published contract of this tool.
     fn descriptor(&self) -> &ToolDescriptor;
+
+    /// Validates and deserializes input, then derives policy facts without
+    /// invoking the tool body.
+    fn prepare_json(
+        &self,
+        input: &RawValue,
+        boundary: &PathBoundary,
+    ) -> Result<PreparedRequest, ToolError>;
 
     /// Runs the full invocation pipeline for one JSON input.
     ///
@@ -240,6 +309,45 @@ where
 {
     fn descriptor(&self) -> &ToolDescriptor {
         &self.descriptor
+    }
+
+    fn prepare_json(
+        &self,
+        input: &RawValue,
+        boundary: &PathBoundary,
+    ) -> Result<PreparedRequest, ToolError> {
+        let identity = self.descriptor.identity();
+        let instance = serde_json::from_str::<Value>(input.get()).map_err(|error| {
+            schema::refusal(
+                identity,
+                SchemaDirection::Input,
+                vec![SchemaViolation::new("", "", error.to_string())],
+                0,
+            )
+        })?;
+        schema::validate(&self.input, identity, SchemaDirection::Input, &instance)?;
+        let typed = schema::deserialize_input::<T::Input>(identity, instance)?;
+        let effects = match catch_unwind(AssertUnwindSafe(|| {
+            self.tool.request_effects(&typed, boundary)
+        })) {
+            Ok(result) => result?,
+            Err(payload) => {
+                return Err(ToolError::ToolPanicked {
+                    tool: identity.clone(),
+                    payload: panic_message(&*payload),
+                });
+            }
+        };
+        let request_paths = effects
+            .paths
+            .iter()
+            .map(|(path, access)| RequestPath::new(path, *access))
+            .collect::<Vec<_>>();
+        let classification = classify_request(&self.descriptor, &request_paths, effects.flags);
+        Ok(PreparedRequest {
+            paths: effects.paths.into_iter().map(|(path, _)| path).collect(),
+            classification,
+        })
     }
 
     fn execute_json(

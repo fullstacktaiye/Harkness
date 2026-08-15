@@ -103,45 +103,60 @@ fn scenario_process_real_runner_child() {
     assert_ne!(output.code(), Some(0));
 }
 
-const SCENARIO_FIXTURES: &[(&str, &str)] = &[
+const SCENARIO_FIXTURES: &[(&str, u32, &str)] = &[
     (
         "read_only_success",
+        1,
         include_str!("../src/agent/fixtures/read-only-success-v1.json"),
     ),
     (
         "edit_test_diff_success",
+        1,
         include_str!("../src/agent/fixtures/edit-test-diff-success-v1.json"),
     ),
     (
+        "edit_test_diff_success",
+        2,
+        include_str!("../src/agent/fixtures/edit-test-diff-success-v2.json"),
+    ),
+    (
         "approval_denied",
+        1,
         include_str!("../src/agent/fixtures/approval-denied-v1.json"),
     ),
     (
         "invalid_tool_input",
+        1,
         include_str!("../src/agent/fixtures/invalid-tool-input-v1.json"),
     ),
     (
         "tool_process_failure",
+        1,
         include_str!("../src/agent/fixtures/tool-process-failure-v1.json"),
     ),
     (
         "tool_timeout",
+        1,
         include_str!("../src/agent/fixtures/tool-timeout-v1.json"),
     ),
     (
         "user_cancellation",
+        1,
         include_str!("../src/agent/fixtures/user-cancellation-v1.json"),
     ),
     (
         "restart_recovery",
+        1,
         include_str!("../src/agent/fixtures/restart-recovery-v1.json"),
     ),
     (
         "forbidden_path",
+        1,
         include_str!("../src/agent/fixtures/forbidden-path-v1.json"),
     ),
     (
         "disallowed_capability",
+        1,
         include_str!("../src/agent/fixtures/disallowed-capability-v1.json"),
     ),
 ];
@@ -178,16 +193,42 @@ fn all_ten_scenarios_are_registered_in_stable_order() {
 
 #[test]
 fn rust_scenarios_and_frozen_json_fixtures_are_byte_compatible() {
-    for (name, fixture) in SCENARIO_FIXTURES {
-        let rust = MockAgent::scenario(name).unwrap().definition().clone();
+    for (name, version, fixture) in SCENARIO_FIXTURES {
+        let rust = MockAgent::scenario_version(name, *version)
+            .unwrap()
+            .definition()
+            .clone();
         let loaded = Scenario::from_json(fixture).unwrap();
-        assert_eq!(loaded, rust, "{name} fixture changed meaning");
+        assert_eq!(loaded, rust, "{name} v{version} fixture changed meaning");
         assert_eq!(
             rust.to_json_pretty().unwrap(),
             *fixture,
-            "{name} fixture is not the canonical v1 encoding"
+            "{name} v{version} fixture is not canonical"
         );
     }
+}
+
+#[test]
+fn flagship_v1_checkpoints_remain_distinct_from_the_v2_success_contract() {
+    let v1 = MockAgent::scenario_version("edit_test_diff_success", 1).unwrap();
+    let v2 = MockAgent::scenario_version("edit_test_diff_success", 2).unwrap();
+    assert_eq!(v1.definition().version(), 1);
+    assert_eq!(v2.definition().version(), 2);
+    assert_ne!(
+        v1.definition().definition_digest(),
+        v2.definition().definition_digest()
+    );
+    assert_eq!(
+        MockAgent::scenario("edit_test_diff_success")
+            .unwrap()
+            .definition(),
+        v2.definition()
+    );
+    let restored_v1 = MockAgent::from_state(v1.state()).unwrap();
+    let restored_v2 = MockAgent::from_state(v2.state()).unwrap();
+    assert_eq!(restored_v1.definition(), v1.definition());
+    assert_eq!(restored_v2.definition(), v2.definition());
+    assert!(MockAgent::scenario_version("read_only_success", 2).is_err());
 }
 
 #[test]
@@ -230,7 +271,14 @@ fn every_scenario_replays_its_complete_action_sequence_through_the_agent_trait()
         ),
         Case::new(
             "edit_test_diff_success",
-            vec![started(), ok(), ok(), diff_artifact(), ok(), ok()],
+            vec![
+                started(),
+                ok(),
+                ok(),
+                diff_artifact(),
+                result(json!({"passed": true})),
+                ok(),
+            ],
             &[
                 "call:workspace.inspect",
                 "call:fs.read",
@@ -580,7 +628,13 @@ impl Case {
 }
 
 fn fixture_names() -> Vec<&'static str> {
-    SCENARIO_FIXTURES.iter().map(|(name, _)| *name).collect()
+    let mut names = Vec::new();
+    for (name, _, _) in SCENARIO_FIXTURES {
+        if names.last() != Some(name) {
+            names.push(*name);
+        }
+    }
+    names
 }
 
 fn labels(actions: &[AgentAction]) -> Vec<String> {

@@ -17,11 +17,18 @@ use tempfile::TempDir;
 pub const COMMIT_EPOCH_SECONDS: i64 = 1_700_000_000;
 
 /// Bare executable names used by the deterministic mock-agent process cases.
-pub const SCENARIO_PROCESS_PROGRAMS: [&str; 4] = [
+/// Printed by the passing scenario-process fixture child.
+///
+/// A caller asserts on this rather than on the exit status alone, because
+/// libtest exits zero when `--exact` selects no test at all.
+pub const SCENARIO_FIXTURE_PASS_MARKER: &str = "HARKNESS_SCENARIO_FIXTURE_PASSED";
+
+pub const SCENARIO_PROCESS_PROGRAMS: [&str; 5] = [
     "fixture-fail",
     "fixture-hang",
     "fixture-cancellable",
     "fixture-disallowed",
+    "fixture-pass",
 ];
 
 const FIXTURE_GIT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -98,6 +105,22 @@ macro_rules! scenario_process_fixture_tests {
         #[ignore = "policy must deny this fixture before execution"]
         fn scenario_process_fixture_disallowed_child() {
             panic!("a policy-denied fixture process executed");
+        }
+
+        /// Exits zero, so a scenario expecting `passed: true` has a program to
+        /// name that is not a host utility. The flagship previously named
+        /// `cargo`, which needs a whole toolchain and an environment the tool
+        /// runner deliberately clears.
+        ///
+        /// It prints [`SCENARIO_FIXTURE_PASS_MARKER`](crate::SCENARIO_FIXTURE_PASS_MARKER)
+        /// because "the child exited zero" is not evidence on its own: libtest
+        /// exits zero when `--exact` matches nothing, so a caller that failed
+        /// to resolve this program at all would observe success from a process
+        /// that ran no test.
+        #[test]
+        #[ignore = "re-executed by a mock-agent process scenario"]
+        fn scenario_process_fixture_pass_child() {
+            println!("{}", $crate::SCENARIO_FIXTURE_PASS_MARKER);
         }
     };
 }

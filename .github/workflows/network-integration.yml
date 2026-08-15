@@ -165,6 +165,14 @@ jobs:
           harkness-runtime
           tools::read_tests::registry_lookup_and_dispatch_overhead_stay_within_issue_budgets
           --release
+      # Issue #97 puts the coordinator on every protected tool call, so its
+      # per-call budget is a release requirement too.
+      - name: Measure coordinator decision-to-dispatch
+        run: >-
+          sh .github/scripts/run-ignored-exact-test.sh
+          harkness-runtime
+          coordinator::tests::approval_decision_to_tool_dispatch_stays_below_ten_milliseconds
+          --release
 
   github-remote-import:
     name: GitHub remote import

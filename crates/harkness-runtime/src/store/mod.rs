@@ -120,12 +120,14 @@ use serde_json::Value;
 use time::OffsetDateTime;
 
 use crate::approval::{
-    ApprovalDecision, ApprovalGrant, ApprovalId, ApprovalRequest, ApprovalState,
+    ApprovalDecision, ApprovalGrant, ApprovalId, ApprovalRequest, ApprovalState, InputHash,
+    canonical_input_hash,
 };
 use crate::domain::{
     ArtifactId, Failure, Run, RunDomainError, RunId, Step, StepId, Task, TaskId, ToolCall,
     ToolCallId,
 };
+use crate::tool::ToolIdentity;
 use crate::trust::{TrustState, WorkspaceTrust};
 
 pub use artifact::{ARTIFACTS_DIRECTORY, Artifact, ArtifactSink, Availability, StoreArtifacts};
@@ -574,6 +576,25 @@ impl Store {
         repository::insert_run(&guard(&self.writer), run)
     }
 
+    /// Stores a run and its first event in one transaction.
+    ///
+    /// A refused event leaves no inert queued run behind.
+    pub fn insert_run_with_event(
+        &self,
+        run: &Run,
+        event: RunEvent,
+    ) -> Result<EventSeq, StoreError> {
+        let prepared = self.prepare_event(run.id(), event)?;
+        self.commit_event(
+            "inserting a run with its first event",
+            prepared,
+            |connection, prepared| {
+                repository::insert_run(connection, run)?;
+                prepared.append(connection, run.id())
+            },
+        )
+    }
+
     /// Loads one run.
     ///
     /// # Errors
@@ -949,6 +970,145 @@ impl Store {
         )
     }
 
+    /// Fails a run and appends its diagnostic state event in one transaction.
+    pub fn fail_run_with_event(
+        &self,
+        id: RunId,
+        failure: Failure,
+        at: OffsetDateTime,
+        event: RunEvent,
+    ) -> Result<(Run, EventSeq), StoreError> {
+        self.change_run_with_event("failing a run with its event", id, event, move |run| {
+            run.fail(failure, at)
+        })
+    }
+
+    /// Records an approval and resumes a run with one atomic event.
+    pub fn approve_run_with_event(
+        &self,
+        id: RunId,
+        decided_by: &str,
+        at: OffsetDateTime,
+        event: RunEvent,
+    ) -> Result<(Run, EventSeq), StoreError> {
+        self.change_run_with_event("approving a run with its event", id, event, |run| {
+            run.approve(decided_by, at)
+        })
+    }
+
+    /// Records a denied tool-level approval and resumes agent orchestration.
+    pub fn resume_run_after_denial_with_event(
+        &self,
+        id: RunId,
+        decided_by: &str,
+        at: OffsetDateTime,
+        event: RunEvent,
+    ) -> Result<(Run, EventSeq), StoreError> {
+        self.change_run_with_event("resuming a run after a denied approval", id, event, |run| {
+            run.resume_after_denial(decided_by, at)
+        })
+    }
+
+    fn change_run_with_event<F>(
+        &self,
+        operation: &'static str,
+        id: RunId,
+        event: RunEvent,
+        change: F,
+    ) -> Result<(Run, EventSeq), StoreError>
+    where
+        F: FnOnce(&mut Run) -> Result<(), RunDomainError>,
+    {
+        let prepared = self.prepare_event(id, event)?;
+        self.commit_event(operation, prepared, |connection, prepared| {
+            let mut run = repository::load_run(connection, id)?;
+            change(&mut run).map_err(StoreError::InvalidTransition)?;
+            repository::update_run(connection, &run)?;
+            let seq = prepared.append(connection, id)?;
+            Ok((run, seq))
+        })
+    }
+
+    /// Applies a step transition and appends its event in one transaction.
+    pub fn transition_step_with_event(
+        &self,
+        id: StepId,
+        to: crate::domain::ExecutionState,
+        at: OffsetDateTime,
+        event: RunEvent,
+    ) -> Result<(Step, EventSeq), StoreError> {
+        self.change_step_with_event("transitioning a step with its event", id, event, |step| {
+            step.transition(to, at)
+        })
+    }
+
+    /// Fails a step and appends its event in one transaction.
+    pub fn fail_step_with_event(
+        &self,
+        id: StepId,
+        failure: Failure,
+        at: OffsetDateTime,
+        event: RunEvent,
+    ) -> Result<(Step, EventSeq), StoreError> {
+        self.change_step_with_event("failing a step with its event", id, event, move |step| {
+            step.fail(failure, at)
+        })
+    }
+
+    fn change_step_with_event<F>(
+        &self,
+        operation: &'static str,
+        id: StepId,
+        event: RunEvent,
+        change: F,
+    ) -> Result<(Step, EventSeq), StoreError>
+    where
+        F: FnOnce(&mut Step) -> Result<(), RunDomainError>,
+    {
+        let run_id = self.load_step(id)?.run_id();
+        let prepared = self.prepare_event(run_id, event)?;
+        self.commit_event(operation, prepared, |connection, prepared| {
+            let mut step = repository::load_step(connection, id)?;
+            change(&mut step).map_err(StoreError::InvalidTransition)?;
+            repository::update_step(connection, &step)?;
+            let seq = prepared.append(connection, run_id)?;
+            Ok((step, seq))
+        })
+    }
+
+    /// Persists policy and its immediate call-state consequence with one event.
+    pub fn apply_tool_call_policy_decision_with_event(
+        &self,
+        id: ToolCallId,
+        decision: crate::policy::PolicyDecision,
+        at: OffsetDateTime,
+        event: RunEvent,
+    ) -> Result<(ToolCall, EventSeq), StoreError> {
+        self.change_tool_call_with_event(
+            "applying tool-call policy with its event",
+            id,
+            event,
+            move |call| call.apply_policy_decision(decision, at),
+        )
+    }
+
+    /// Records a denied approval and the call's terminal event atomically.
+    pub fn reject_tool_call_approval_with_event(
+        &self,
+        id: ToolCallId,
+        decided_by: &str,
+        failure: Failure,
+        at: OffsetDateTime,
+        event: RunEvent,
+    ) -> Result<(ToolCall, EventSeq), StoreError> {
+        self.change_tool_call_with_event(
+            "rejecting a tool-call approval with its event",
+            id,
+            event,
+            move |call| call.reject_approval(decided_by, failure, at),
+        )
+    }
+
     /// Applies a tool-call transition and appends its event in one transaction.
     ///
     /// # Errors
@@ -1101,9 +1261,67 @@ impl Store {
         at: OffsetDateTime,
         event: RunEvent,
     ) -> Result<(ToolCall, EventSeq), StoreError> {
-        self.begin_tool_call(id, event, "dispatching an approved tool call", |call| {
-            call.dispatch_approved(decided_by, tool_version, at)
-        })
+        let call = self.load_tool_call(id)?;
+        let expected_tool = ToolIdentity::parse(call.tool_id(), tool_version).map_err(|error| {
+            StoreError::ColumnEncoding {
+                record: "tool_call",
+                field: "tool_id",
+                reason: error.to_string(),
+            }
+        })?;
+        let expected_input_hash = canonical_input_hash(call.input())?;
+        self.dispatch_bound_approved_tool_call_with_event(
+            id,
+            decided_by,
+            &expected_tool,
+            expected_input_hash,
+            at,
+            event,
+        )
+    }
+
+    /// Dispatches an approved call only while its durable request still
+    /// matches the identity and input digest authorized by the coordinator.
+    pub fn dispatch_bound_approved_tool_call_with_event(
+        &self,
+        id: ToolCallId,
+        decided_by: &str,
+        expected_tool: &ToolIdentity,
+        expected_input_hash: InputHash,
+        at: OffsetDateTime,
+        event: RunEvent,
+    ) -> Result<(ToolCall, EventSeq), StoreError> {
+        let run_id = self.load_tool_call(id)?.run_id();
+        let prepared = self.prepare_event(run_id, event)?;
+        self.commit_event(
+            "dispatching an approved tool call",
+            prepared,
+            |connection, prepared| {
+                let mut call = repository::load_tool_call(connection, id)?;
+                if call.tool_id() != expected_tool.id.as_str()
+                    || (!call.tool_version().is_empty()
+                        && call.tool_version() != expected_tool.version.to_string())
+                {
+                    return Err(StoreError::ApprovalBindingMismatch {
+                        call: id.to_string(),
+                        reason: "tool identity changed",
+                    });
+                }
+                let actual_hash = canonical_input_hash(call.input())?;
+                if actual_hash != expected_input_hash {
+                    return Err(StoreError::ApprovalBindingMismatch {
+                        call: id.to_string(),
+                        reason: "input changed",
+                    });
+                }
+                call.dispatch_approved(decided_by, expected_tool.version.to_string(), at)
+                    .map_err(StoreError::InvalidTransition)?;
+                repository::update_tool_call(connection, &call)?;
+                repository::pin_tool_call_version(connection, &call)?;
+                let seq = prepared.append(connection, call.run_id())?;
+                Ok((call, seq))
+            },
+        )
     }
 
     /// Succeeds a tool call with its output and appends its event.
@@ -1205,6 +1423,11 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<StoredEvent>, StoreError> {
         self.with_reader(|connection| event::events(connection, run_id, after, limit))
+    }
+
+    /// Returns the highest durable event sequence for `run_id`, if any.
+    pub fn latest_event_seq(&self, run_id: RunId) -> Result<Option<EventSeq>, StoreError> {
+        self.with_reader(|connection| event::latest_sequence(connection, run_id))
     }
 
     // -- artifacts ------------------------------------------------------------

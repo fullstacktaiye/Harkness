@@ -9,10 +9,11 @@ use std::time::{Duration, Instant};
 
 use harkness_git::Cancellation;
 
+use crate::approval::InputHash;
 use crate::domain::{RunId, ToolCallId};
 use crate::tool::{
-    CompletedCall, ExecutionError, RiskLevel, ToolError, ToolExecutor, ToolId, ToolVersion,
-    WorkspaceMetadata,
+    CompletedCall, ExecutionError, RiskLevel, ToolError, ToolExecutor, ToolId, ToolIdentity,
+    ToolVersion, WorkspaceMetadata,
 };
 
 use super::ticket::{CallTicket, Report, outcome_channel};
@@ -91,6 +92,11 @@ enum Admission {
     Pending,
     /// A call held for a decision, resumed by the decision itself.
     Approved { decided_by: String },
+    BoundApproved {
+        decided_by: String,
+        expected_tool: ToolIdentity,
+        expected_input_hash: InputHash,
+    },
 }
 
 impl ScheduledCall {
@@ -161,6 +167,23 @@ impl ScheduledCall {
     pub fn approved_by(mut self, decided_by: impl Into<String>) -> Self {
         self.admission = Admission::Approved {
             decided_by: decided_by.into(),
+        };
+        self
+    }
+
+    /// Schedules an approved call with the exact durable request binding that
+    /// was authorized before it entered the scheduler queue.
+    #[must_use]
+    pub fn approved_with_binding(
+        mut self,
+        decided_by: impl Into<String>,
+        expected_tool: ToolIdentity,
+        expected_input_hash: InputHash,
+    ) -> Self {
+        self.admission = Admission::BoundApproved {
+            decided_by: decided_by.into(),
+            expected_tool,
+            expected_input_hash,
         };
         self
     }
@@ -1040,6 +1063,31 @@ impl Inner {
                 None => self.executor.execute_approved(
                     waiting.call,
                     decided_by,
+                    &waiting.root,
+                    &waiting.cancellation,
+                ),
+            },
+            Admission::BoundApproved {
+                decided_by,
+                expected_tool,
+                expected_input_hash,
+            } => match &waiting.workspace_metadata {
+                Some(metadata) => self
+                    .executor
+                    .execute_bound_approved_with_workspace_metadata(
+                        waiting.call,
+                        decided_by,
+                        expected_tool,
+                        *expected_input_hash,
+                        &waiting.root,
+                        metadata.clone(),
+                        &waiting.cancellation,
+                    ),
+                None => self.executor.execute_bound_approved(
+                    waiting.call,
+                    decided_by,
+                    expected_tool,
+                    *expected_input_hash,
                     &waiting.root,
                     &waiting.cancellation,
                 ),

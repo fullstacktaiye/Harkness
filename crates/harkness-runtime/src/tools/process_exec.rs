@@ -8,10 +8,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::tool::{
-    ArtifactRef, Capability, Capture, CapturedStream, ExecutionContext, RiskLevel, Tool, ToolError,
-    ToolIdentity, ToolMetadata, ToolProcess,
+    ArtifactRef, Capability, Capture, CapturedStream, ExecutionContext, RequestEffects, RiskLevel,
+    Tool, ToolError, ToolIdentity, ToolMetadata, ToolProcess,
 };
-use crate::trust::{AllowlistedEnv, CommandSpec, EnvironmentName};
+use crate::trust::{
+    AllowlistedEnv, CommandSpec, EnvironmentName, PathAccess, PathBoundary, RequestFlags,
+};
 
 /// Timeout used when a process request omits one.
 pub const DEFAULT_PROCESS_TIMEOUT_SECONDS: u64 = 120;
@@ -90,6 +92,14 @@ impl Tool for ProcessExec {
         )
     }
 
+    fn request_effects(
+        &self,
+        input: &Self::Input,
+        boundary: &PathBoundary,
+    ) -> Result<RequestEffects, ToolError> {
+        process_effects(input.cwd.as_deref(), boundary)
+    }
+
     fn execute(
         &self,
         input: Self::Input,
@@ -150,6 +160,14 @@ impl Tool for TestRun {
         )
     }
 
+    fn request_effects(
+        &self,
+        input: &Self::Input,
+        boundary: &PathBoundary,
+    ) -> Result<RequestEffects, ToolError> {
+        process_effects(input.cwd.as_deref(), boundary)
+    }
+
     fn execute(
         &self,
         input: Self::Input,
@@ -168,6 +186,17 @@ impl Tool for TestRun {
             passed: process.exit_code == Some(0) && !process.timed_out,
             process,
         })
+    }
+}
+
+fn process_effects(
+    cwd: Option<&str>,
+    boundary: &PathBoundary,
+) -> Result<RequestEffects, ToolError> {
+    let effects = RequestEffects::default().with_flags(RequestFlags::default().executing());
+    match cwd {
+        Some(cwd) => Ok(effects.with_path(boundary.contain(cwd)?, PathAccess::Read)),
+        None => Ok(effects),
     }
 }
 
