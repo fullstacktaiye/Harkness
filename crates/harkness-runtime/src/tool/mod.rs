@@ -195,7 +195,7 @@ pub use context::{
     ArtifactRef, ArtifactStream, ArtifactWriter, DEFAULT_PROGRESS_CAPACITY,
     DEFAULT_STREAM_TAIL_BYTES, Deadline, DiscardedProgress, ExecutionContext, POLL_INTERVAL,
     ProgressChannel, ProgressEvent, ProgressReceiver, ProgressSink, ProgressUnit, RecordedProgress,
-    UnsupportedArtifacts, progress_channel,
+    UnsupportedArtifacts, WorkspaceMetadata, WorkspaceSourceKind, progress_channel,
 };
 pub use descriptor::{
     EnvironmentError, EnvironmentName, MAX_DESCRIPTION_LENGTH, MAX_ENVIRONMENT_NAME_LENGTH,

@@ -305,6 +305,20 @@ pub enum ToolError {
         reason: String,
     },
 
+    /// A requested workspace entry does not exist.
+    #[error("{} was not found", .path.display())]
+    NotFound {
+        /// Path the caller requested.
+        path: PathBuf,
+    },
+
+    /// A result could not be represented within its required inline budget.
+    #[error("the tool output exceeded its {limit}-byte inline budget")]
+    OutputBudgetExhausted {
+        /// Inline byte limit that was enforced.
+        limit: u64,
+    },
+
     /// A canonical filesystem boundary refused a path or root.
     #[error(transparent)]
     Boundary(#[from] BoundaryError),
@@ -357,6 +371,8 @@ impl ToolError {
         "cancelled",
         "denied",
         "forbidden_path",
+        "not_found",
+        "output_budget_exhausted",
         "outside_allowed_roots",
         "symlink_escapes",
         "root_unavailable",
@@ -379,6 +395,8 @@ impl ToolError {
             Self::Cancelled => "cancelled",
             Self::Denied { .. } => "denied",
             Self::ForbiddenPath { .. } => "forbidden_path",
+            Self::NotFound { .. } => "not_found",
+            Self::OutputBudgetExhausted { .. } => "output_budget_exhausted",
             Self::Boundary(error) => error.kind(),
             Self::StalePatch { .. } => "stale_patch",
             Self::PatchConflict { .. } => "patch_conflict",
@@ -820,6 +838,16 @@ mod tests {
                     reason: "fixture".to_owned(),
                 },
                 "forbidden_path",
+            ),
+            (
+                ToolError::NotFound {
+                    path: PathBuf::from("missing"),
+                },
+                "not_found",
+            ),
+            (
+                ToolError::OutputBudgetExhausted { limit: 1024 },
+                "output_budget_exhausted",
             ),
             (
                 ToolError::Boundary(BoundaryError::OutsideAllowedRoots {

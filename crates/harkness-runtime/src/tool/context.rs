@@ -4,6 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
+use harkness_core::{Project, ProjectId, ProjectSource};
 use harkness_git::Cancellation;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,72 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// The full stream still reaches an artifact; this bounds only what is held to
 /// explain a failure.
 pub const DEFAULT_STREAM_TAIL_BYTES: usize = 64 * 1024;
+
+/// Catalog source attached to a tool invocation's workspace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkspaceSourceKind {
+    /// A directory imported from the local machine.
+    Local,
+    /// A clone owned by Harkness.
+    ManagedRepository,
+    /// A linked worktree owned by Harkness.
+    Worktree,
+}
+
+/// Optional catalog metadata for the workspace a tool is observing.
+///
+/// Direct invocation is valid without catalog state, so this is deliberately
+/// optional on [`ExecutionContext`]. A tool must report the absence rather than
+/// inventing a project id or source from the filesystem path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceMetadata {
+    project_id: ProjectId,
+    display_name: String,
+    source: WorkspaceSourceKind,
+    canonical_root: PathBuf,
+}
+
+impl WorkspaceMetadata {
+    /// Captures the stable catalog fields inspection tools may publish.
+    #[must_use]
+    pub fn from_project(project: &Project) -> Self {
+        let source = match &project.source {
+            ProjectSource::Local => WorkspaceSourceKind::Local,
+            ProjectSource::ManagedRepository { .. } => WorkspaceSourceKind::ManagedRepository,
+            ProjectSource::Worktree { .. } => WorkspaceSourceKind::Worktree,
+        };
+        Self {
+            project_id: project.id,
+            display_name: project.display_name.clone(),
+            source,
+            canonical_root: project.root.clone(),
+        }
+    }
+
+    /// Stable project-catalog identifier.
+    #[must_use]
+    pub const fn project_id(&self) -> ProjectId {
+        self.project_id
+    }
+
+    /// Catalog display name.
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    /// How the catalog entry was created.
+    #[must_use]
+    pub const fn source(&self) -> WorkspaceSourceKind {
+        self.source
+    }
+
+    /// Canonical root the catalog identity names.
+    #[must_use]
+    pub fn canonical_root(&self) -> &Path {
+        &self.canonical_root
+    }
+}
 
 /// One call's shared relationship with the executor's abandonment boundary.
 ///
@@ -543,6 +610,7 @@ pub struct ExecutionContext {
     step: StepId,
     call: ToolCallId,
     boundary: PathBoundary,
+    workspace_metadata: Option<WorkspaceMetadata>,
     mode: ExecutionMode,
     cancellation: Cancellation,
     progress: Box<dyn ProgressSink>,
@@ -619,6 +687,7 @@ impl ExecutionContext {
             step,
             call,
             boundary,
+            workspace_metadata: None,
             mode: ExecutionMode::NonInteractive,
             cancellation,
             progress,
@@ -651,6 +720,28 @@ impl ExecutionContext {
     pub const fn with_execution_mode(mut self, mode: ExecutionMode) -> Self {
         self.mode = mode;
         self
+    }
+
+    /// Attaches catalog identity to this invocation's already-validated root.
+    pub fn with_workspace_metadata(
+        mut self,
+        metadata: WorkspaceMetadata,
+    ) -> Result<Self, ToolError> {
+        let root = std::fs::canonicalize(metadata.canonical_root()).map_err(|error| {
+            ToolError::ForbiddenPath {
+                path: metadata.canonical_root().to_path_buf(),
+                reason: format!("the catalog workspace root is unavailable: {error}"),
+            }
+        })?;
+        if root != self.workspace_root() {
+            return Err(ToolError::ForbiddenPath {
+                path: metadata.canonical_root().to_path_buf(),
+                reason: "the catalog metadata names a different canonical workspace root"
+                    .to_owned(),
+            });
+        }
+        self.workspace_metadata = Some(metadata);
+        Ok(self)
     }
 
     /// Builds a context with no progress reporting and no artifact storage.
@@ -705,6 +796,12 @@ impl ExecutionContext {
     #[must_use]
     pub const fn boundary(&self) -> &PathBoundary {
         &self.boundary
+    }
+
+    /// Catalog identity supplied by the caller, if this invocation has one.
+    #[must_use]
+    pub const fn workspace_metadata(&self) -> Option<&WorkspaceMetadata> {
+        self.workspace_metadata.as_ref()
     }
 
     /// Whether this invocation is attached to an interactive front end.
