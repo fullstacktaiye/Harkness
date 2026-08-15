@@ -6,11 +6,15 @@
 //! single project a caller names.
 
 use std::{
+    collections::BTreeMap,
     fmt,
     path::{Path, PathBuf},
 };
 
-use git2::{Branch, ErrorCode, Repository, RepositoryState, Status, StatusOptions};
+use git2::{
+    Branch, Delta, DiffFindOptions, DiffOptions as GitDiffOptions, ErrorCode, Repository,
+    RepositoryState, Status, StatusOptions,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -185,6 +189,15 @@ pub struct DetailedStatus {
     pub pending: Option<PendingOperation>,
     /// Every changed, untracked or conflicted path.
     pub entries: Vec<StatusEntry>,
+}
+
+/// A detailed status whose changed-path projection was bounded during its walk.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DetailedStatusPage {
+    /// Retained status fields and changed paths.
+    pub status: DetailedStatus,
+    /// Changed paths withheld by the requested bound.
+    pub omitted_entries: usize,
 }
 
 impl DetailedStatus {
@@ -374,6 +387,15 @@ pub(crate) fn detailed_in_process(
     root: &Path,
     cancellation: &Cancellation,
 ) -> Result<DetailedStatus, GitError> {
+    Ok(detailed_in_process_bounded(root, cancellation, usize::MAX)?.status)
+}
+
+/// Reports detailed status while retaining at most `maximum_entries` paths.
+pub(crate) fn detailed_in_process_bounded(
+    root: &Path,
+    cancellation: &Cancellation,
+    maximum_entries: usize,
+) -> Result<DetailedStatusPage, GitError> {
     if cancellation.is_cancelled() {
         return Err(GitError::Cancelled);
     }
@@ -385,25 +407,37 @@ pub(crate) fn detailed_in_process(
         )
     })?;
     let upstream = inspect(root)?.and_then(|status| status.upstream);
+    let rename_mode = status_rename_mode(&repository, root)?;
+    let copy_sources = if rename_mode == StatusRenameMode::Copies {
+        staged_copy_sources(&repository, root)?
+    } else {
+        BTreeMap::new()
+    };
     let mut options = StatusOptions::new();
     options
         .include_untracked(true)
         .recurse_untracked_dirs(false)
-        .include_ignored(false)
-        .renames_head_to_index(true)
-        .renames_index_to_workdir(true);
+        .include_ignored(false);
+    let detect_renames = rename_mode != StatusRenameMode::Disabled;
+    options
+        .renames_head_to_index(detect_renames)
+        .renames_index_to_workdir(detect_renames);
     let statuses = repository
         .statuses(Some(&mut options))
         .map_err(|source| inspection(root, source))?;
-    let mut entries = Vec::with_capacity(statuses.len());
-    for entry in statuses.iter() {
+    let retained = statuses.len().min(maximum_entries);
+    let mut entries = Vec::with_capacity(retained);
+    for entry in statuses.iter().take(maximum_entries) {
         if cancellation.is_cancelled() {
             return Err(GitError::Cancelled);
         }
         let flags = entry.status();
         let conflicted = flags.contains(Status::CONFLICTED);
+        let path = path_from_bytes(entry.path_bytes());
         let staged = if conflicted {
             Some(FileChange::Unmerged)
+        } else if copy_sources.contains_key(&path) {
+            Some(FileChange::Copied)
         } else {
             staged_change(flags)
         };
@@ -412,7 +446,9 @@ pub(crate) fn detailed_in_process(
         } else {
             unstaged_change(flags)
         };
-        let rename_source = if flags.contains(Status::INDEX_RENAMED) {
+        let rename_source = if let Some(source) = copy_sources.get(&path) {
+            Some(source.clone())
+        } else if flags.contains(Status::INDEX_RENAMED) {
             entry
                 .head_to_index()
                 .and_then(|delta| delta.old_file().path().map(Path::to_path_buf))
@@ -424,19 +460,96 @@ pub(crate) fn detailed_in_process(
             None
         };
         entries.push(StatusEntry {
-            path: path_from_bytes(entry.path_bytes()),
+            path,
             staged,
             unstaged,
             rename_source,
             conflicted,
         });
     }
-    Ok(DetailedStatus {
-        head,
-        upstream,
-        pending: pending(&repository),
-        entries,
+    Ok(DetailedStatusPage {
+        status: DetailedStatus {
+            head,
+            upstream,
+            pending: pending(&repository),
+            entries,
+        },
+        omitted_entries: statuses.len().saturating_sub(retained),
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StatusRenameMode {
+    Disabled,
+    Renames,
+    Copies,
+}
+
+fn status_rename_mode(repository: &Repository, root: &Path) -> Result<StatusRenameMode, GitError> {
+    let config = repository
+        .config()
+        .map_err(|source| inspection(root, source))?;
+    for key in ["status.renames", "diff.renames"] {
+        match config.get_string(key) {
+            Ok(value) => {
+                return match value.to_ascii_lowercase().as_str() {
+                    "false" | "no" | "off" | "0" => Ok(StatusRenameMode::Disabled),
+                    "copies" => Ok(StatusRenameMode::Copies),
+                    "true" | "yes" | "on" | "1" => Ok(StatusRenameMode::Renames),
+                    _ => Err(inspection(
+                        root,
+                        git2::Error::from_str(&format!("{key} has unsupported value {value:?}")),
+                    )),
+                };
+            }
+            Err(error) if error.code() == ErrorCode::NotFound => {}
+            Err(source) => return Err(inspection(root, source)),
+        }
+    }
+    Ok(StatusRenameMode::Renames)
+}
+
+fn staged_copy_sources(
+    repository: &Repository,
+    root: &Path,
+) -> Result<BTreeMap<PathBuf, PathBuf>, GitError> {
+    let head = match repository.head() {
+        Ok(head) => head,
+        Err(error) if matches!(error.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => {
+            return Ok(BTreeMap::new());
+        }
+        Err(source) => return Err(inspection(root, source)),
+    };
+    let tree = head
+        .peel_to_tree()
+        .map_err(|source| inspection(root, source))?;
+    let index = repository
+        .index()
+        .map_err(|source| inspection(root, source))?;
+    let mut options = GitDiffOptions::new();
+    options.include_unmodified(true);
+    let mut diff = repository
+        .diff_tree_to_index(Some(&tree), Some(&index), Some(&mut options))
+        .map_err(|source| inspection(root, source))?;
+    let mut find = DiffFindOptions::new();
+    find.copies(true)
+        .copies_from_unmodified(true)
+        .renames(true)
+        .remove_unmodified(true);
+    diff.find_similar(Some(&mut find))
+        .map_err(|source| inspection(root, source))?;
+    let mut sources = BTreeMap::new();
+    for delta in diff.deltas() {
+        if delta.status() != Delta::Copied {
+            continue;
+        }
+        let (Some(old), Some(new)) = (delta.old_file().path_bytes(), delta.new_file().path_bytes())
+        else {
+            continue;
+        };
+        sources.insert(path_from_bytes(new), path_from_bytes(old));
+    }
+    Ok(sources)
 }
 
 fn staged_change(status: Status) -> Option<FileChange> {

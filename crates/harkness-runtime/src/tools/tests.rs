@@ -63,6 +63,16 @@ impl ArtifactWriter for DiskArtifacts {
             bytes: 0,
         }))
     }
+
+    fn write_json(
+        &mut self,
+        name: &str,
+        media_type: &str,
+        value: &serde_json::Value,
+    ) -> Result<ArtifactRef, ToolError> {
+        let bytes = serde_json::to_vec(value).map_err(ToolError::execution_failed)?;
+        self.write(name, media_type, &bytes)
+    }
 }
 
 struct DiskStream {
@@ -598,6 +608,15 @@ fn mandatory_diff_artifact_is_opened_before_any_patch_write() {
         ) -> Result<Box<dyn ArtifactStream>, ToolError> {
             Err(ToolError::execution_failed("artifact storage unavailable"))
         }
+
+        fn write_json(
+            &mut self,
+            _name: &str,
+            _media_type: &str,
+            _value: &serde_json::Value,
+        ) -> Result<ArtifactRef, ToolError> {
+            Err(ToolError::execution_failed("artifact storage unavailable"))
+        }
     }
 
     let harness = Harness::new();
@@ -845,6 +864,15 @@ fn cancellation_during_artifact_setup_prevents_process_launch() {
                 self.cancellation.cancel();
             }
             self.inner.open(name, media_type)
+        }
+
+        fn write_json(
+            &mut self,
+            name: &str,
+            media_type: &str,
+            value: &serde_json::Value,
+        ) -> Result<ArtifactRef, ToolError> {
+            self.inner.write_json(name, media_type, value)
         }
     }
 

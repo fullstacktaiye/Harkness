@@ -15,7 +15,14 @@ use crate::tool::{ExecutionContext, RiskLevel, Tool, ToolError, ToolIdentity, To
 /// Input to `git.status@1.0.0`.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct GitStatusInput {}
+pub struct GitStatusInput {
+    /// Maximum changed-path records retained from libgit2's status walk.
+    #[schemars(range(min = 1, max = 10000))]
+    pub max_entries: Option<usize>,
+    /// Serialized changed-path budget.
+    #[schemars(range(min = 1024, max = 49152))]
+    pub max_output_bytes: Option<usize>,
+}
 
 /// Checked-out head projection.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
@@ -91,6 +98,22 @@ pub struct GitStatusOutput {
     pub pending: Option<String>,
     /// Every changed, untracked, or conflicted path.
     pub entries: Vec<GitStatusEntry>,
+    /// Named reason changed paths were withheld.
+    pub omission: Option<GitStatusOmission>,
+}
+
+/// Why detailed status does not carry every changed path.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum GitStatusOmission {
+    EntryBudgetExhausted {
+        limit: usize,
+        omitted_entries: usize,
+    },
+    OutputBudgetExhausted {
+        limit: usize,
+        omitted_entries: usize,
+    },
 }
 
 /// The production `git.status@1.0.0` tool.
@@ -112,20 +135,50 @@ impl Tool for GitStatus {
 
     fn execute(
         &self,
-        _input: Self::Input,
+        input: Self::Input,
         context: &mut ExecutionContext,
     ) -> Result<Self::Output, ToolError> {
         context.check_still_permitted()?;
         let service = GitService::new(context.workspace_root(), context.workspace_root());
-        let status = service
-            .detailed_status_in_process(context.cancellation())
+        let maximum = input.max_entries.unwrap_or(4096);
+        let output_budget = input.max_output_bytes.unwrap_or(48 * 1024);
+        let page = service
+            .detailed_status_in_process_bounded(context.cancellation(), maximum)
             .map_err(map_git_error)?;
         context.check_still_permitted()?;
+        let status = page.status;
+        let mut entries = Vec::new();
+        let retained = status.entries.len();
+        let mut entry_bytes = 0_usize;
+        let mut omission =
+            (page.omitted_entries > 0).then_some(GitStatusOmission::EntryBudgetExhausted {
+                limit: maximum,
+                omitted_entries: page.omitted_entries,
+            });
+        for entry in &status.entries {
+            context.check_still_permitted()?;
+            let projected = project_entry(entry);
+            let bytes = serde_json::to_vec(&projected)
+                .map_err(ToolError::execution_failed)?
+                .len();
+            if entry_bytes.saturating_add(bytes) > output_budget {
+                omission = Some(GitStatusOmission::OutputBudgetExhausted {
+                    limit: output_budget,
+                    omitted_entries: page
+                        .omitted_entries
+                        .saturating_add(retained.saturating_sub(entries.len())),
+                });
+                break;
+            }
+            entry_bytes += bytes;
+            entries.push(projected);
+        }
         let output = GitStatusOutput {
             head: project_head(&status.head),
             upstream: status.upstream.as_ref().map(project_upstream),
             pending: status.pending.map(pending_name).map(str::to_owned),
-            entries: status.entries.iter().map(project_entry).collect(),
+            entries,
+            omission,
         };
         let serialized = serde_json::to_vec(&output).map_err(ToolError::execution_failed)?;
         if serialized.len() > 60 * 1024 {

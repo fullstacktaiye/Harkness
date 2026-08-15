@@ -329,10 +329,7 @@ where
 /// one-shot invocation — refuses the write, and losing the evidence must not
 /// change the failure a caller is told about.
 fn preserve_rejected_output(context: &mut ExecutionContext, produced: &Value) {
-    let Ok(encoded) = serde_json::to_vec(produced) else {
-        return;
-    };
-    let _ = context.write_artifact(REJECTED_OUTPUT_ARTIFACT, "application/json", &encoded);
+    let _ = context.write_json_artifact(REJECTED_OUTPUT_ARTIFACT, "application/json", produced);
 }
 
 /// Re-labels a failure a tool body raised but is not entitled to claim.

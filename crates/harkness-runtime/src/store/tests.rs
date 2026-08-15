@@ -34,7 +34,7 @@ use crate::trust::{TrustState, WorkspaceTrust};
 
 use super::artifact::artifact_path;
 use super::migration::{MIGRATIONS, Migration, SCHEMA_VERSION, apply, recorded_version};
-use super::redaction::tests::{MASK, Masking, SECRET, Shouting};
+use super::redaction::tests::{MASK, Masking, NonIdempotentValueOnly, SECRET, Shouting};
 use super::{
     ARTIFACTS_DIRECTORY, Artifact, Availability, DATABASE_FILE, EventKind, EventSeq,
     MAX_EVENT_PAGE_LIMIT, MAX_INLINE_PAYLOAD_BYTES, Redactor, RunCursor, RunEvent, RunPage, Store,
@@ -2722,6 +2722,37 @@ fn a_redactor_that_only_scrubs_values_still_scrubs_an_oversized_payload() {
         "the spilled payload should keep its published field names: {}",
         &content[..40.min(content.len())]
     );
+}
+
+#[test]
+fn structured_artifact_redacts_values_and_metadata_once_but_not_keys() {
+    let data_dir = TempDir::new().unwrap();
+    let store = Arc::new(
+        Store::open(data_dir.path())
+            .unwrap()
+            .redacting(Arc::new(NonIdempotentValueOnly)),
+    );
+    let task = stored_task(&store);
+    let run = stored_run(&store, &task);
+    let step = stored_step(&store, &run);
+    let call = stored_tool_call(&store, &step);
+    let mut artifacts = StoreArtifacts::new(Arc::clone(&store), run.id(), step.id(), call.id());
+
+    let reference = artifacts
+        .write_json(
+            "diff-hunter2.json",
+            "application/hunter2+json",
+            &json!({"published_key": SECRET}),
+        )
+        .unwrap();
+    let id = ArtifactId::from_str(&reference.id).unwrap();
+    let metadata = store.artifact(id).unwrap();
+    let payload: Value = serde_json::from_slice(&store.read_artifact(id).unwrap()).unwrap();
+
+    assert_eq!(payload, json!({"published_key": format!("R({MASK})")}));
+    assert_eq!(metadata.name(), "R(diff-[redacted].json)");
+    assert_eq!(metadata.media_type(), "R(application/[redacted]+json)");
+    assert!(!payload.to_string().contains("R(R("));
 }
 
 #[test]

@@ -495,6 +495,19 @@ pub trait ArtifactWriter: Send {
     /// the failure rather than return a partial result.
     fn open(&mut self, name: &str, media_type: &str) -> Result<Box<dyn ArtifactStream>, ToolError>;
 
+    /// Stores a structured JSON value, redacting string values once without
+    /// rewriting object keys.
+    ///
+    /// Pass-through and test writers use the ordinary stream path. Durable
+    /// writers override this method to apply their value redactor and bypass
+    /// their stream redactor for the resulting already-redacted encoding.
+    fn write_json(
+        &mut self,
+        name: &str,
+        media_type: &str,
+        value: &serde_json::Value,
+    ) -> Result<ArtifactRef, ToolError>;
+
     /// Stores `bytes` and returns a reference the tool can put in its output.
     ///
     /// The convenience shape for content a tool already holds. It is a provided
@@ -532,6 +545,19 @@ impl ArtifactWriter for UnsupportedArtifacts {
         name: &str,
         _media_type: &str,
     ) -> Result<Box<dyn ArtifactStream>, ToolError> {
+        Err(ToolError::ExecutionFailed {
+            message: format!(
+                "no artifact store is attached to this execution context, so {name:?} cannot be stored"
+            ),
+        })
+    }
+
+    fn write_json(
+        &mut self,
+        name: &str,
+        _media_type: &str,
+        _value: &serde_json::Value,
+    ) -> Result<ArtifactRef, ToolError> {
         Err(ToolError::ExecutionFailed {
             message: format!(
                 "no artifact store is attached to this execution context, so {name:?} cannot be stored"
@@ -913,6 +939,17 @@ impl ExecutionContext {
         bytes: &[u8],
     ) -> Result<ArtifactRef, ToolError> {
         self.artifacts.write(name, media_type, bytes)
+    }
+
+    /// Stores a structured JSON value through the artifact writer's
+    /// value-redaction path.
+    pub(crate) fn write_json_artifact(
+        &mut self,
+        name: &str,
+        media_type: &str,
+        value: &serde_json::Value,
+    ) -> Result<ArtifactRef, ToolError> {
+        self.artifacts.write_json(name, media_type, value)
     }
 
     /// Opens a stream storing content outside the tool's result.
@@ -1298,6 +1335,16 @@ mod tests {
                 media_type: media_type.to_owned(),
                 bytes: Vec::new(),
             }))
+        }
+
+        fn write_json(
+            &mut self,
+            name: &str,
+            media_type: &str,
+            value: &serde_json::Value,
+        ) -> Result<ArtifactRef, ToolError> {
+            let bytes = serde_json::to_vec(value).map_err(ToolError::execution_failed)?;
+            self.write(name, media_type, &bytes)
         }
     }
 

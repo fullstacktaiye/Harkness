@@ -6,6 +6,8 @@
 //! symlinked directories are reported as plain leaves rather than followed.
 
 use std::{
+    cmp::Ordering,
+    ffi::OsStr,
     fs, io,
     path::{Path, PathBuf},
 };
@@ -37,12 +39,12 @@ pub fn list_directory(path: impl AsRef<Path>) -> io::Result<Vec<DirEntry>> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name == ".git" {
+        if !directory_entry_is_visible(OsStr::new(&name)) {
             continue;
         }
-        // `DirEntry::metadata` does not follow symlinks, which is exactly the
-        // traversal guarantee the tree relies on.
-        let is_dir = entry.metadata()?.is_dir();
+        // `file_type` does not follow symlinks, which is exactly the traversal
+        // guarantee the tree relies on.
+        let is_dir = entry.file_type()?.is_dir();
         entries.push(DirEntry {
             name,
             path: entry.path(),
@@ -51,12 +53,36 @@ pub fn list_directory(path: impl AsRef<Path>) -> io::Result<Vec<DirEntry>> {
         });
     }
     entries.sort_by(|left, right| {
-        right
-            .is_dir
-            .cmp(&left.is_dir)
-            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+        compare_directory_entries(
+            left.is_dir,
+            OsStr::new(&left.name),
+            right.is_dir,
+            OsStr::new(&right.name),
+        )
     });
     Ok(entries)
+}
+
+/// Whether an entry belongs in a project-tree or observation-tool listing.
+#[must_use]
+pub fn directory_entry_is_visible(name: &OsStr) -> bool {
+    name != OsStr::new(".git")
+}
+
+/// Shared stable order for project-tree and observation-tool directory entries.
+#[must_use]
+pub fn compare_directory_entries(
+    left_is_dir: bool,
+    left_name: &OsStr,
+    right_is_dir: bool,
+    right_name: &OsStr,
+) -> Ordering {
+    right_is_dir.cmp(&left_is_dir).then_with(|| {
+        left_name
+            .to_string_lossy()
+            .to_lowercase()
+            .cmp(&right_name.to_string_lossy().to_lowercase())
+    })
 }
 
 #[cfg(test)]

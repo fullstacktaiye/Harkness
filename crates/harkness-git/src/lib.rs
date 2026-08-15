@@ -74,7 +74,8 @@ pub use provenance::{
 };
 pub use runner::{Cancellation, CloneCancellation};
 pub use status::{
-    DetailedStatus, FileChange, GitStatus, HeadState, PendingOperation, StatusEntry, UpstreamStatus,
+    DetailedStatus, DetailedStatusPage, FileChange, GitStatus, HeadState, PendingOperation,
+    StatusEntry, UpstreamStatus,
 };
 pub use sync::{
     FetchOptions, FetchOutcome, PullOptions, PullOutcome, PullStrategy, PushOptions, PushOutcome,
@@ -953,6 +954,15 @@ impl GitService {
         cancellation: &Cancellation,
     ) -> Result<DetailedStatus, GitError> {
         status::detailed_in_process(&self.root, cancellation)
+    }
+
+    /// Detailed status with an allocation bound on changed-path records.
+    pub fn detailed_status_in_process_bounded(
+        &self,
+        cancellation: &Cancellation,
+        maximum_entries: usize,
+    ) -> Result<DetailedStatusPage, GitError> {
+        status::detailed_in_process_bounded(&self.root, cancellation, maximum_entries)
     }
 
     /// Clones `remote` to an explicit destination using this service's working

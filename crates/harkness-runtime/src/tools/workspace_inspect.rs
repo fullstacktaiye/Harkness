@@ -1,6 +1,5 @@
 //! Bounded overview of one workspace root.
 
-use harkness_core::list_directory;
 use harkness_git::GitService;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -12,6 +11,7 @@ use crate::tool::{
 use super::git_status::{
     GitHead, GitUpstream, map_git_error, project_head, project_path, project_upstream,
 };
+use super::safe_read::list_directory;
 
 /// Default top-level entry count returned by inspection.
 pub const DEFAULT_INSPECT_MAX_ENTRIES: usize = 256;
@@ -92,7 +92,7 @@ pub enum InspectOmission {
     /// More direct children existed than the requested bound.
     EntryBudgetExhausted {
         limit: usize,
-        omitted_entries: usize,
+        at_least_omitted_entries: usize,
     },
     /// Directory entries did not fit the inline result budget.
     OutputBudgetExhausted {
@@ -149,15 +149,16 @@ impl Tool for WorkspaceInspect {
         let maximum = input.max_entries.unwrap_or(DEFAULT_INSPECT_MAX_ENTRIES);
         let output_budget = input.max_output_bytes.unwrap_or(48 * 1024);
         debug_assert!(maximum <= MAX_INSPECT_ENTRIES);
-        let mut listed =
-            list_directory(context.workspace_root()).map_err(ToolError::execution_failed)?;
+        let root = context.resolve(".")?;
+        let listing = list_directory(&root, maximum, context)?;
         context.check_still_permitted()?;
-        let mut omission =
-            (listed.len() > maximum).then(|| InspectOmission::EntryBudgetExhausted {
+        let mut omission = listing
+            .truncated
+            .then_some(InspectOmission::EntryBudgetExhausted {
                 limit: maximum,
-                omitted_entries: listed.len() - maximum,
+                at_least_omitted_entries: 1,
             });
-        listed.truncate(maximum);
+        let listed = listing.entries;
         let listed_count = listed.len();
         let mut entry_bytes = 0_usize;
         let mut entries = Vec::new();
@@ -168,12 +169,12 @@ impl Tool for WorkspaceInspect {
                 .unwrap_or(entry.path.as_path());
             let (path, path_is_lossy, path_base64) = project_path(relative);
             let projected = WorkspaceEntry {
-                name: entry.name,
+                name: entry.name.to_string_lossy().into_owned(),
                 path,
                 path_is_lossy,
                 path_base64,
                 is_dir: entry.is_dir,
-                expandable: entry.expandable,
+                expandable: entry.is_dir,
             };
             let bytes = serde_json::to_vec(&projected)
                 .map_err(ToolError::execution_failed)?

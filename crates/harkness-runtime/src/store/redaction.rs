@@ -137,6 +137,10 @@ pub(super) mod tests {
     #[derive(Clone, Copy, Debug, Default)]
     pub(in crate::store) struct Masking;
 
+    /// A value-only rule whose visible wrapper proves it ran exactly once.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub(in crate::store) struct NonIdempotentValueOnly;
+
     /// The one thing [`Masking`] knows to look for.
     pub(in crate::store) const SECRET: &str = "hunter2";
 
@@ -149,6 +153,16 @@ pub(super) mod tests {
                 return Cow::Owned(text.replace(SECRET, MASK));
             }
             Cow::Borrowed(text)
+        }
+
+        fn wrap_stream(&self, sink: Box<dyn Write + Send>) -> Box<dyn Write + Send> {
+            sink
+        }
+    }
+
+    impl Redactor for NonIdempotentValueOnly {
+        fn redact_text<'a>(&self, text: &'a str) -> Cow<'a, str> {
+            Cow::Owned(format!("R({})", text.replace(SECRET, MASK)))
         }
 
         fn wrap_stream(&self, sink: Box<dyn Write + Send>) -> Box<dyn Write + Send> {
