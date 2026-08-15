@@ -6,12 +6,14 @@ use harkness_git::{
     DiffLineKind, DiffOmission, DiffOptions, DiffTarget, FileDiff, GitService, Hunk,
     IntraLineDegradation,
 };
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use schemars::{JsonSchema, Schema, SchemaGenerator};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::tool::{
-    ArtifactRef, ExecutionContext, RiskLevel, Tool, ToolError, ToolIdentity, ToolMetadata,
+    ArtifactRef, ExecutionContext, RequestEffects, RiskLevel, Tool, ToolError, ToolIdentity,
+    ToolMetadata,
 };
+use crate::trust::{PathAccess, PathBoundary};
 
 use super::fs_read::ContentEncoding;
 use super::git_status::{GitChange, map_git_error, project_change, project_path};
@@ -30,8 +32,8 @@ pub const MAX_TOOL_DIFF_FILES: usize = 10_000;
 pub const MAX_TOOL_DIFF_CONTEXT_LINES: u32 = 100;
 
 /// Comparison requested from `git.diff@1.0.0`.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
 pub enum GitDiffTarget {
     Staged,
     Unstaged,
@@ -50,6 +52,92 @@ pub enum GitDiffTarget {
         branch: String,
         base_branch: String,
     },
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ShortGitDiffTarget {
+    Staged,
+    Unstaged,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
+enum TaggedGitDiffTarget {
+    Staged,
+    Unstaged,
+    Commit {
+        revision: String,
+        parent: Option<String>,
+    },
+    Revisions {
+        old_revision: String,
+        new_revision: String,
+    },
+    RevisionAgainstWorktree {
+        revision: String,
+    },
+    BranchAgainstBase {
+        branch: String,
+        base_branch: String,
+    },
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(untagged)]
+enum GitDiffTargetWire {
+    Short(ShortGitDiffTarget),
+    Tagged(TaggedGitDiffTarget),
+}
+
+impl From<GitDiffTargetWire> for GitDiffTarget {
+    fn from(wire: GitDiffTargetWire) -> Self {
+        match wire {
+            GitDiffTargetWire::Short(ShortGitDiffTarget::Staged)
+            | GitDiffTargetWire::Tagged(TaggedGitDiffTarget::Staged) => Self::Staged,
+            GitDiffTargetWire::Short(ShortGitDiffTarget::Unstaged)
+            | GitDiffTargetWire::Tagged(TaggedGitDiffTarget::Unstaged) => Self::Unstaged,
+            GitDiffTargetWire::Tagged(TaggedGitDiffTarget::Commit { revision, parent }) => {
+                Self::Commit { revision, parent }
+            }
+            GitDiffTargetWire::Tagged(TaggedGitDiffTarget::Revisions {
+                old_revision,
+                new_revision,
+            }) => Self::Revisions {
+                old_revision,
+                new_revision,
+            },
+            GitDiffTargetWire::Tagged(TaggedGitDiffTarget::RevisionAgainstWorktree {
+                revision,
+            }) => Self::RevisionAgainstWorktree { revision },
+            GitDiffTargetWire::Tagged(TaggedGitDiffTarget::BranchAgainstBase {
+                branch,
+                base_branch,
+            }) => Self::BranchAgainstBase {
+                branch,
+                base_branch,
+            },
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for GitDiffTarget {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        GitDiffTargetWire::deserialize(deserializer).map(Into::into)
+    }
+}
+
+impl JsonSchema for GitDiffTarget {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "GitDiffTarget".into()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        GitDiffTargetWire::json_schema(generator)
+    }
 }
 
 /// Input to `git.diff@1.0.0`.
@@ -205,6 +293,21 @@ impl Tool for GitDiff {
             "Returns the existing bounded structured diff model and spills oversized JSON to a redacted artifact without taking a repository lock.",
             RiskLevel::Observe,
         )
+    }
+
+    fn request_effects(
+        &self,
+        input: &Self::Input,
+        boundary: &PathBoundary,
+    ) -> Result<RequestEffects, ToolError> {
+        input
+            .paths
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .try_fold(RequestEffects::default(), |effects, path| {
+                Ok(effects.with_path(boundary.contain(path)?, PathAccess::Read))
+            })
     }
 
     fn execute(

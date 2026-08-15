@@ -11,7 +11,10 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::tool::{ExecutionContext, RiskLevel, Tool, ToolError, ToolIdentity, ToolMetadata};
+use crate::tool::{
+    ExecutionContext, RequestEffects, RiskLevel, Tool, ToolError, ToolIdentity, ToolMetadata,
+};
+use crate::trust::{PathAccess, PathBoundary};
 
 /// Default maximum number of file bytes returned inline.
 pub const DEFAULT_FS_READ_MAX_BYTES: u64 = 32 * 1024;
@@ -100,6 +103,14 @@ impl Tool for FsRead {
             "Reads a contained regular file by line range with a hard byte cap and byte-preserving UTF-8 or Base64 output.",
             RiskLevel::Observe,
         )
+    }
+
+    fn request_effects(
+        &self,
+        input: &Self::Input,
+        boundary: &PathBoundary,
+    ) -> Result<RequestEffects, ToolError> {
+        Ok(RequestEffects::default().with_path(boundary.contain(&input.path)?, PathAccess::Read))
     }
 
     fn execute(

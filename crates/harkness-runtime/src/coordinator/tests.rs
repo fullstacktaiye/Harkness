@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -43,6 +43,7 @@ struct CountingObserve {
 
 struct CountingWrite {
     executions: Arc<AtomicUsize>,
+    started_at: Arc<Mutex<Option<Instant>>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -165,6 +166,10 @@ impl Tool for CountingWrite {
         input: ObserveInput,
         _context: &mut ExecutionContext,
     ) -> Result<ObserveOutput, ToolError> {
+        *self
+            .started_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
         self.executions.fetch_add(1, Ordering::Release);
         Ok(ObserveOutput {
             echoed: input.message,
@@ -205,6 +210,7 @@ struct Fixture {
     project: ProjectId,
     executions: Arc<AtomicUsize>,
     write_executions: Arc<AtomicUsize>,
+    write_started_at: Arc<Mutex<Option<Instant>>>,
     blocking_started: Arc<AtomicUsize>,
     gate: Arc<GateWitness>,
 }
@@ -228,6 +234,7 @@ impl Fixture {
             .unwrap();
         let executions = Arc::new(AtomicUsize::new(0));
         let write_executions = Arc::new(AtomicUsize::new(0));
+        let write_started_at = Arc::new(Mutex::new(None));
         let blocking_started = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(GateWitness::default());
         let mut registry = ToolRegistry::new();
@@ -250,6 +257,7 @@ impl Fixture {
         registry
             .register(CountingWrite {
                 executions: Arc::clone(&write_executions),
+                started_at: Arc::clone(&write_started_at),
             })
             .unwrap();
         let coordinator = RunCoordinator::new(
@@ -265,6 +273,7 @@ impl Fixture {
             project,
             executions,
             write_executions,
+            write_started_at,
             blocking_started,
             gate,
         }
@@ -827,4 +836,238 @@ fn mutating_calls_serialize_per_workspace_but_different_workspaces_overlap() {
     fixture.gate.released.store(true, Ordering::Release);
     fixture.terminal(first);
     fixture.terminal(second);
+}
+
+#[test]
+fn forced_invalid_transition_is_persisted_as_a_diagnostic_instead_of_panicking() {
+    let fixture = Fixture::new();
+    let run = fixture.start(gated_scenario("forced_invalid_transition"));
+    let request = fixture.pending_approval(run);
+    fixture
+        .store
+        .transition_run(run, ExecutionState::Cancelled, OffsetDateTime::now_utc())
+        .unwrap();
+
+    fixture
+        .coordinator
+        .decide_approval(ApprovalDecision::grant(
+            request.id(),
+            ApprovalScope::ExactCall,
+            DecidedVia::Cli,
+            OffsetDateTime::now_utc(),
+        ))
+        .unwrap();
+
+    fixture.wait_until("coordinator diagnostic", || {
+        fixture
+            .coordinator
+            .run_snapshot(run)
+            .unwrap()
+            .events
+            .iter()
+            .any(|stored| {
+                stored.event.kind() == &EventKind::Diagnostic
+                    && stored.event.payload()["kind"] == "coordinator_error"
+                    && stored.event.payload()["error_kind"] == "invalid_transition"
+            })
+    });
+    let snapshot = fixture.coordinator.run_snapshot(run).unwrap();
+    assert_eq!(snapshot.run.state(), ExecutionState::Cancelled);
+    assert_eq!(fixture.write_executions.load(Ordering::Acquire), 0);
+}
+
+#[test]
+#[ignore = "latency target; meaningful only in a release build"]
+fn approval_decision_to_tool_dispatch_stays_below_ten_milliseconds() {
+    let fixture = Fixture::new();
+    let agent = scenario(
+        "coordinator_dispatch_latency",
+        vec![
+            run_started(call_write(json!({"message": "hello"}))),
+            complete_after_result(),
+        ],
+    );
+    let run = fixture.start(agent);
+    let request = fixture.pending_approval(run);
+    let started = Instant::now();
+    fixture
+        .coordinator
+        .decide_approval(ApprovalDecision::grant(
+            request.id(),
+            ApprovalScope::ExactCall,
+            DecidedVia::Cli,
+            OffsetDateTime::now_utc(),
+        ))
+        .unwrap();
+    fixture.wait_until("approved tool dispatch", || {
+        fixture
+            .write_started_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+    });
+    let dispatched = fixture
+        .write_started_at
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .expect("the wait observed a dispatch timestamp");
+    let elapsed = dispatched.duration_since(started);
+    let rustc = std::process::Command::new("rustc")
+        .arg("--version")
+        .output()
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .unwrap_or_else(|| "rustc version unavailable".to_owned());
+    println!(
+        "decision-to-dispatch={elapsed:?}; {rustc}; {}-{}; parallelism={}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        thread::available_parallelism().map_or(0, std::num::NonZero::get),
+    );
+    assert!(
+        elapsed < Duration::from_millis(10),
+        "dispatch took {elapsed:?}"
+    );
+    fixture.terminal(run);
+}
+
+#[test]
+fn production_tools_complete_the_flagship_edit_test_diff_run() {
+    use std::fs;
+
+    use harkness_test_fixtures::{git, initialize_repository};
+
+    let data_dir = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    initialize_repository(workspace.path());
+    fs::create_dir(workspace.path().join("src")).unwrap();
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname = \"harkness-runtime\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("src/lib.rs"),
+        b"pub const VALUE: &str = \"old\";\n",
+    )
+    .unwrap();
+    git(workspace.path(), ["add", "Cargo.toml", "src/lib.rs"]);
+    git(workspace.path(), ["commit", "-m", "add flagship crate"]);
+
+    let store = Arc::new(Store::open(data_dir.path()).unwrap());
+    let project = ProjectId::new();
+    store
+        .put_workspace_trust(
+            &WorkspaceTrust::decide(
+                project,
+                workspace.path(),
+                TrustState::Trusted,
+                OffsetDateTime::now_utc(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let mut registry = ToolRegistry::new();
+    crate::tools::register_read_only_tools(&mut registry).unwrap();
+    crate::tools::register_mutating_tools(&mut registry).unwrap();
+    let coordinator = RunCoordinator::new(
+        Arc::clone(&store),
+        Arc::new(registry),
+        PolicyEngine::new(UserPolicy::default(), None),
+    );
+    let task = Task::new(
+        "flagship edit test diff",
+        workspace.path(),
+        Some(project),
+        OffsetDateTime::now_utc(),
+    );
+    let workspace_ref = WorkspaceRef::from_task(&task, &PassThrough);
+    let task_id = coordinator.start_task(task).unwrap();
+    let run = coordinator
+        .start_run(
+            task_id,
+            Box::new(MockAgent::scenario("edit_test_diff_success").unwrap()),
+            workspace_ref,
+        )
+        .unwrap();
+
+    for _ in 0..2 {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let request = loop {
+            let snapshot = coordinator.run_snapshot(run).unwrap();
+            if let Some(request) = snapshot
+                .approvals
+                .into_iter()
+                .find(|request| request.state() == ApprovalState::Pending)
+            {
+                break request;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "flagship approval was not requested: {}",
+                serde_json::to_string_pretty(&coordinator.run_snapshot(run).unwrap()).unwrap()
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        coordinator
+            .decide_approval(ApprovalDecision::grant(
+                request.id(),
+                ApprovalScope::ExactCall,
+                DecidedVia::Cli,
+                OffsetDateTime::now_utc(),
+            ))
+            .unwrap();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let snapshot = loop {
+        let snapshot = coordinator.run_snapshot(run).unwrap();
+        if snapshot.run.state().is_terminal() {
+            break snapshot;
+        }
+        assert!(Instant::now() < deadline, "flagship run did not finish");
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(snapshot.run.state(), ExecutionState::Succeeded);
+    assert_eq!(snapshot.steps.len(), 5);
+    assert!(snapshot.steps.iter().all(|step| step.state().is_terminal()));
+    assert_eq!(snapshot.tool_calls.len(), 5);
+    assert!(
+        snapshot
+            .tool_calls
+            .iter()
+            .all(|call| call.state().is_terminal())
+    );
+    assert_eq!(snapshot.approvals.len(), 2);
+    assert!(
+        snapshot
+            .approvals
+            .iter()
+            .all(|request| request.state() == ApprovalState::Granted)
+    );
+    assert!(!snapshot.artifacts.is_empty());
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("src/lib.rs")).unwrap(),
+        "pub const VALUE: &str = \"new\";\n"
+    );
+    for call in &snapshot.tool_calls {
+        let policy = snapshot
+            .events
+            .iter()
+            .find(|stored| {
+                stored.event.kind() == &EventKind::PolicyDecision
+                    && stored.event.tool_call_id() == Some(call.id())
+            })
+            .unwrap();
+        let running = snapshot
+            .events
+            .iter()
+            .find(|stored| {
+                stored.event.kind() == &EventKind::ToolCallStateChanged
+                    && stored.event.tool_call_id() == Some(call.id())
+                    && stored.event.payload()["state"] == "running"
+            })
+            .unwrap();
+        assert!(policy.seq < running.seq);
+    }
 }

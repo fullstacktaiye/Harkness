@@ -263,6 +263,12 @@ pub(super) fn execute_with_before_replace(
 
 fn parse_patch(bytes: &[u8]) -> Result<Vec<ParsedFile>, ToolError> {
     parse_unified_patch(bytes)
+        .or_else(|original| {
+            let Some(normalized) = normalize_headerless_single_file_patch(bytes) else {
+                return Err(original);
+            };
+            parse_unified_patch(&normalized)
+        })
         .map_err(|error| patch_conflict(error.path(), error.detail()))
         .map(|patch| {
             patch
@@ -296,6 +302,21 @@ fn parse_patch(bytes: &[u8]) -> Result<Vec<ParsedFile>, ToolError> {
                 })
                 .collect()
         })
+}
+
+/// Accepts the conventional single-file `---`/`+++` unified form emitted by
+/// agents as well as Git's `diff --git` envelope expected by the shared parser.
+fn normalize_headerless_single_file_patch(bytes: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut lines = text.lines();
+    let old = lines.next()?.strip_prefix("--- ")?.split('\t').next()?;
+    let new = lines.next()?.strip_prefix("+++ ")?.split('\t').next()?;
+    if old.is_empty() || new.is_empty() || text.contains("\ndiff --git ") {
+        return None;
+    }
+    let mut normalized = format!("diff --git {old} {new}\n").into_bytes();
+    normalized.extend_from_slice(bytes);
+    Some(normalized)
 }
 
 fn resolve_bases(
