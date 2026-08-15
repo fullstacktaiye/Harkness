@@ -61,3 +61,12 @@ pub mod store;
 pub mod tool;
 pub mod tools;
 pub mod trust;
+
+// Declared at the test binary's root so a scenario's frozen argv — a bare
+// program name plus `--exact <role>` — names the role with no module prefix,
+// exactly as it does in the integration-test binary. Without these roles
+// present, `--exact` would match nothing, libtest would run zero tests and exit
+// zero, and a scenario asserting `passed: true` would be satisfied by a child
+// that did nothing at all.
+#[cfg(test)]
+harkness_test_fixtures::scenario_process_fixture_tests!();

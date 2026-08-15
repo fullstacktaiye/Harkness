@@ -100,7 +100,14 @@ fn approval_value(request: &ApprovalRequest) -> Value {
         "input_summary": request.input_summary(),
         "workspace": {
             "project_id": request.workspace().project_id(),
-            "canonical_root": request.workspace().canonical_root(),
+            // Lossy, and flagged as such, rather than embedded as a `Path`.
+            // `json!` expands a value to `to_value(..).unwrap()`, and `Path`'s
+            // `Serialize` *errors* on non-UTF-8 — so a canonical root with a
+            // non-UTF-8 component panicked here, inside an impl whose every
+            // other field carefully reports a serialization error instead.
+            "canonical_root": request.workspace().canonical_root().to_string_lossy(),
+            "canonical_root_is_lossy":
+                request.workspace().canonical_root().as_os_str().to_str().is_none(),
         },
         "risk": request.risk().as_str(),
         "requested_scope": request.requested_scope().as_str(),

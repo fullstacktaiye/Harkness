@@ -41,7 +41,7 @@
               "path": "src/lib.rs"
             }
           ],
-          "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub const VALUE: &str = \"old\";\n+pub const VALUE: &str = \"new\";\n"
+          "patch": "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub const VALUE: &str = \"old\";\n+pub const VALUE: &str = \"new\";\n"
         }
       }
     },
@@ -56,10 +56,11 @@
         "tool_version": "1.0.0",
         "input": {
           "command": [
-            "cargo",
-            "test",
-            "-p",
-            "harkness-runtime"
+            "fixture-pass",
+            "--exact",
+            "scenario_process_fixture_pass_child",
+            "--ignored",
+            "--nocapture"
           ]
         }
       }

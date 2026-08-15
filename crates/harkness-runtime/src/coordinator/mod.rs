@@ -337,7 +337,7 @@ impl RunCoordinator {
 
     /// Subscribes to persisted events, replaying existing history first.
     pub fn subscribe(&self, run: RunId) -> Result<EventReceiver, RuntimeError> {
-        self.inner.store.load_run(run)?;
+        let record = self.inner.store.load_run(run)?;
         let delivery = self.delivery(run);
         let mut state = delivery
             .state
@@ -345,7 +345,15 @@ impl RunCoordinator {
             .unwrap_or_else(PoisonError::into_inner);
         let replay_tip = self.inner.store.latest_event_seq(run)?;
         let subscriber = Arc::new(subscription::Subscriber::new(replay_tip));
-        if state.closed {
+        // `closed` is set by the worker that drove the run, so it is only ever
+        // true for a run *this* coordinator started. A run that reached a
+        // terminal state in another process — after a restart, from a second
+        // front end, or simply a historical run — mints a fresh open delivery
+        // here, and nothing will ever publish to it or close it: the receiver
+        // replays the durable history and then blocks forever, with `try_recv`
+        // reporting `Empty` rather than `Disconnected`. The run's own recorded
+        // state is the authority when no worker is left to speak for it.
+        if state.closed || (record.state().is_terminal() && !self.is_active(run)) {
             subscriber.close();
         } else {
             state.subscribers.push(Arc::downgrade(&subscriber));
@@ -361,6 +369,18 @@ impl RunCoordinator {
     /// Delegates newest-first run listing to the durable store.
     pub fn list_runs(&self, page: RunPage) -> Result<crate::store::RunListing, RuntimeError> {
         Ok(self.inner.store.list_runs(page)?)
+    }
+
+    /// Whether a worker in this process is still driving `run`.
+    ///
+    /// A terminal record plus no live worker means nothing will ever publish
+    /// again, which is what lets a subscription close instead of waiting.
+    fn is_active(&self, run: RunId) -> bool {
+        self.inner
+            .active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(&run)
     }
 
     fn delivery(&self, run: RunId) -> Arc<RunDelivery> {
@@ -891,6 +911,13 @@ impl RunWorker {
         kind: &str,
         message: String,
     ) -> Result<Option<Observation>, WorkerFault> {
+        // Clamped, for the reason `ToolError::as_failure` clamps: the store
+        // refuses an oversized `failure_message`, and here that refusal becomes
+        // a `WorkerFault` that fails the whole *run* rather than handing the
+        // agent a recoverable `ToolFailed`. A caller-chosen path is enough to
+        // reach it — a boundary refusal embeds the path it was given, so an
+        // input that fit the inline bound produces a message that does not.
+        let message = truncate_failure_text(message, MAX_FAILURE_MESSAGE_BYTES);
         let failure = Failure::new(kind, &message);
         let at = OffsetDateTime::now_utc();
         self.inner
@@ -1288,6 +1315,13 @@ impl RunWorker {
                 self.finish_step(step, ExecutionState::Cancelled)?;
             }
         }
+        // A plan the agent already published outlives the step that was
+        // running. Terminalizing only the current one left every later planned
+        // step `queued` under a run that had reached `Cancelled`, with no
+        // worker left to move it and nothing that sweeps it — a terminal run
+        // whose own children contradict it. `CompleteRun` and `FailRun` have
+        // always drained this queue; the cancel and interrupt exits did not.
+        self.terminalize_planned_steps()?;
         let run = self.inner.store.load_run(self.run).map_err(store_fault)?;
         if !run.state().is_terminal() {
             let at = OffsetDateTime::now_utc();
@@ -1306,10 +1340,22 @@ impl RunWorker {
     }
 
     fn terminalize_unexecuted_steps(&mut self) -> Result<(), WorkerFault> {
-        while let Some(step) = self.planned.pop_front() {
-            let record = self.inner.store.load_step(step).map_err(store_fault)?;
+        self.terminalize_planned_steps()?;
+        self.planned.clear();
+        Ok(())
+    }
+
+    /// Cancels every step the agent planned but no worker ever began.
+    ///
+    /// Borrows shared rather than exclusively so the cancellation exits can
+    /// call it: those run while an approval ticket borrows the gate out of
+    /// `self.inner`, and draining the queue there would need a second mutable
+    /// borrow. Not draining costs nothing — the worker is finished either way.
+    fn terminalize_planned_steps(&self) -> Result<(), WorkerFault> {
+        for step in &self.planned {
+            let record = self.inner.store.load_step(*step).map_err(store_fault)?;
             if !record.state().is_terminal() {
-                self.finish_step(step, ExecutionState::Cancelled)?;
+                self.finish_step(*step, ExecutionState::Cancelled)?;
             }
         }
         Ok(())

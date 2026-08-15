@@ -589,12 +589,55 @@ impl Scenario {
 
     /// Version two of the flagship, which requires the real test result to
     /// report success before requesting the final diff.
+    ///
+    /// It also replaces v1's `cargo` argv with a fixture executable. v1's was
+    /// inert — nothing executed it — but v2 asserts on the result, so the
+    /// program has to be one a test creates rather than a host toolchain: the
+    /// tool runner starts its child with a cleared environment plus a
+    /// POSIX-shaped baseline, which is not enough for `cargo` to reach `rustc`
+    /// and a linker on Windows. v1 is a released wire form and is left alone.
     #[must_use]
     pub fn edit_test_diff_success_v2() -> Self {
-        let mut scenario = Self::edit_test_diff_success();
-        scenario.version = 2;
-        scenario.steps[4].expect = tool_result_containing(json!({"passed": true}));
-        scenario
+        let scenario = Self::edit_test_diff_success();
+        // Located by what the step *is*. Indexing meant an edit to v1 silently
+        // moved which transition v2 rewrote, or turned this into a panic.
+        let test_index = scenario_call_index(&scenario.steps, "test.run");
+        let mut steps = scenario.steps;
+        // v1's patch omits the `diff --git` header. Nothing executed it, so it
+        // was never a contract question; v2 does execute it, and teaching
+        // `fs.apply_patch@1.0.0` to synthesize a missing header would change
+        // what a *released* `(id, version)` applies — patches it refused as
+        // `patch_conflict` would start mutating the workspace. The scenario
+        // carries the header instead.
+        let patch_index = scenario_call_index(&steps, "fs.apply_patch");
+        steps[patch_index] = step(
+            steps[patch_index].expect.clone(),
+            call(
+                "fs.apply_patch",
+                json!({
+                    "patch": "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub const VALUE: &str = \"old\";\n+pub const VALUE: &str = \"new\";\n",
+                    "bases": [{
+                        "path": "src/lib.rs",
+                        "base_sha256": FLAGSHIP_SOURCE_SHA256
+                    }]
+                }),
+            ),
+        );
+        steps[test_index] = step(
+            steps[test_index].expect.clone(),
+            call(
+                "test.run",
+                json!({"command": fixture_process_command("fixture-pass")}),
+            ),
+        );
+        // The transition *after* the call is the one that observes its result.
+        steps[test_index + 1] = step(
+            tool_result_containing(json!({"passed": true})),
+            steps[test_index + 1].action.clone(),
+        );
+        // Through `from_parts` so v2 is validated exactly as v1 was, rather
+        // than assembled by mutating private fields.
+        Self::from_parts(2, scenario.id, steps).expect("valid built-in scenario")
     }
 
     /// Rust-data definition of the denied-approval scenario.
@@ -785,6 +828,19 @@ impl Scenario {
     }
 }
 
+/// Index of the transition whose action calls `tool_id`.
+///
+/// Located by what the step *is* rather than by position, so an edit to v1
+/// cannot silently move which transition a later version rewrites.
+fn scenario_call_index(steps: &[ScenarioStep], tool_id: &str) -> usize {
+    steps
+        .iter()
+        .position(|step| {
+            matches!(&step.action, AgentAction::CallTool { tool_id: called, .. } if called.as_str() == tool_id)
+        })
+        .unwrap_or_else(|| panic!("the flagship calls {tool_id}"))
+}
+
 fn built_in(id: &str, steps: Vec<ScenarioStep>) -> Scenario {
     Scenario::from_parts(1, ScenarioId::new(id).expect("valid built-in id"), steps)
         .expect("valid built-in scenario")
@@ -796,6 +852,7 @@ fn fixture_process_command(program: &str) -> Vec<&str> {
         "fixture-hang" => "scenario_process_fixture_hang_child",
         "fixture-cancellable" => "scenario_process_fixture_cancellable_child",
         "fixture-disallowed" => "scenario_process_fixture_disallowed_child",
+        "fixture-pass" => "scenario_process_fixture_pass_child",
         _ => unreachable!("built-in scenarios name only registered fixture processes"),
     };
     vec![program, "--exact", test, "--ignored", "--nocapture"]

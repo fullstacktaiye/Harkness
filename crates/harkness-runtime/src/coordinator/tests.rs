@@ -1080,6 +1080,96 @@ fn queued_plan_steps_are_terminalized_before_agent_completion() {
     assert_eq!(snapshot.steps[0].state(), ExecutionState::Cancelled);
 }
 
+/// A cancelled run leaves no planned step behind it.
+///
+/// `terminalize_unexecuted_steps` ran only from the `CompleteRun` and `FailRun`
+/// arms, so cancelling mid-call terminalized the running step and the run and
+/// abandoned every later planned step as `queued` — under a run that was
+/// already `Cancelled`, with no worker left to move it and nothing that sweeps
+/// it. `#98`'s recovery pass could not tell those from an interrupted process's.
+#[test]
+fn cancelling_a_run_terminalizes_the_steps_its_plan_never_reached() {
+    let fixture = Fixture::new();
+    let agent = scenario(
+        "plan_then_cancel",
+        vec![
+            run_started(AgentAction::Plan {
+                steps: vec![
+                    PlannedStep::new("first"),
+                    PlannedStep::new("second"),
+                    PlannedStep::new("third"),
+                ],
+            }),
+            ScenarioStep::new(
+                ObservationPattern::RunStarted { task_title: None },
+                call_named("fixture.blocking", json!({})),
+            ),
+            ScenarioStep::new(
+                ObservationPattern::ToolFailed { error_kind: None },
+                AgentAction::CompleteRun {
+                    summary: "unreachable".to_owned(),
+                },
+            ),
+        ],
+    );
+    let run = fixture.start(agent);
+    fixture.wait_until("blocking tool start", || {
+        fixture.blocking_started.load(Ordering::Acquire) == 1
+    });
+
+    fixture.coordinator.cancel_run(run).unwrap();
+
+    let snapshot = fixture.terminal(run);
+    assert_eq!(snapshot.run.state(), ExecutionState::Cancelled);
+    assert_eq!(snapshot.steps.len(), 3);
+    let stranded = snapshot
+        .steps
+        .iter()
+        .filter(|step| !step.state().is_terminal())
+        .map(|step| format!("{}={:?}", step.title(), step.state()))
+        .collect::<Vec<_>>();
+    assert!(
+        stranded.is_empty(),
+        "a terminal run left non-terminal steps: {stranded:?}"
+    );
+}
+
+/// A subscription to a finished run this coordinator never drove disconnects.
+///
+/// `closed` is only ever set by the worker that drove a run, so a run that
+/// reached a terminal state in another process minted a fresh *open* delivery:
+/// the receiver replayed durable history and then blocked forever, reporting
+/// `Empty` rather than `Disconnected` to a front end that was told the stream
+/// had ended.
+#[test]
+fn subscribing_to_a_finished_run_this_coordinator_never_drove_disconnects() {
+    use crate::coordinator::TryReceiveError;
+
+    let fixture = Fixture::new();
+    let snapshot = fixture.terminal(fixture.start(scenario(
+        "finished_elsewhere",
+        vec![run_started(AgentAction::CompleteRun {
+            summary: "done".to_owned(),
+        })],
+    )));
+    assert!(snapshot.run.state().is_terminal());
+
+    // A second coordinator over the same store, exactly as a restart or a
+    // second front end sees it: this process never drove that run.
+    let observer = RunCoordinator::new(
+        Arc::clone(&fixture.store),
+        Arc::clone(&fixture.coordinator.inner.registry),
+        PolicyEngine::new(UserPolicy::default(), None),
+    );
+    let receiver = observer.subscribe(snapshot.run.id()).unwrap();
+    while receiver.try_recv().is_ok() {}
+
+    assert!(
+        matches!(receiver.try_recv(), Err(TryReceiveError::Disconnected)),
+        "a terminal run's subscription never closed"
+    );
+}
+
 #[test]
 fn repository_policy_is_loaded_for_each_run_workspace() {
     let fixture = Fixture::new();
@@ -1316,6 +1406,11 @@ fn approved_dispatch_rejects_input_tampered_while_parked() {
         .pop()
         .unwrap();
     let connection = rusqlite::Connection::open(fixture.store.path()).unwrap();
+    // The coordinator is writing to this database right now. A bare
+    // `Connection::open` applies none of the store's pragmas, and rusqlite's
+    // default busy handler returns `SQLITE_BUSY` immediately rather than
+    // waiting, so a contended write here panics the test instead of retrying.
+    connection.busy_timeout(Duration::from_secs(5)).unwrap();
     connection
         .execute(
             "UPDATE tool_calls SET input_json = ?1 WHERE id = ?2",
@@ -1377,6 +1472,11 @@ fn approved_dispatch_rechecks_identity_after_scheduler_queueing() {
         .pop()
         .unwrap();
     let connection = rusqlite::Connection::open(fixture.store.path()).unwrap();
+    // The coordinator is writing to this database right now. A bare
+    // `Connection::open` applies none of the store's pragmas, and rusqlite's
+    // default busy handler returns `SQLITE_BUSY` immediately rather than
+    // waiting, so a contended write here panics the test instead of retrying.
+    connection.busy_timeout(Duration::from_secs(5)).unwrap();
     connection
         .execute(
             "UPDATE tool_calls SET tool_id = 'fixture.observe' WHERE id = ?1",
@@ -1747,8 +1847,41 @@ fn approval_decision_to_tool_dispatch_stays_below_ten_milliseconds() {
     );
 }
 
+/// Drives the flagship through a child process whose `PATH` resolves the
+/// scenario's fixture executable.
+///
+/// The coordinator runs in *this* process, and a tool's child inherits only the
+/// allowlisted baseline environment — `PATH` among it — from this process. So
+/// the bare program name frozen in the scenario can only resolve if the test
+/// runner's own `PATH` already contains the fixture directory, and setting that
+/// process-wide from a test would race every other test in the binary. Handing
+/// a scoped `PATH` to a re-execution of this binary is how the rest of the
+/// suite solves it.
 #[test]
 fn production_tools_complete_the_flagship_edit_test_diff_run() {
+    use std::process::Command;
+
+    use harkness_test_fixtures::Fixture;
+
+    let fixture = Fixture::new();
+    let mut child = Command::new(std::env::current_exe().unwrap());
+    child.args([
+        "--exact",
+        "coordinator::tests::flagship_edit_test_diff_child",
+        "--ignored",
+        "--nocapture",
+    ]);
+    child.env_clear();
+    fixture.configure_scenario_process_path(&mut child);
+    assert!(
+        child.status().unwrap().success(),
+        "the flagship child run failed"
+    );
+}
+
+#[test]
+#[ignore = "re-executed by production_tools_complete_the_flagship_edit_test_diff_run"]
+fn flagship_edit_test_diff_child() {
     use std::fs;
 
     use harkness_test_fixtures::{git, initialize_repository};
@@ -1863,7 +1996,16 @@ fn production_tools_complete_the_flagship_edit_test_diff_run() {
         assert!(Instant::now() < deadline, "flagship run did not finish");
         thread::sleep(Duration::from_millis(10));
     };
-    assert_eq!(snapshot.run.state(), ExecutionState::Succeeded);
+    // With the snapshot, because `left: Failed / right: Succeeded` was the
+    // entire record of this test's last cross-platform failure: which of the
+    // five calls failed, and its failure kind and message, were already in hand
+    // and thrown away.
+    assert_eq!(
+        snapshot.run.state(),
+        ExecutionState::Succeeded,
+        "{}",
+        serde_json::to_string_pretty(&snapshot).unwrap()
+    );
     assert_eq!(snapshot.steps.len(), 5);
     assert!(snapshot.steps.iter().all(|step| step.state().is_terminal()));
     assert_eq!(snapshot.tool_calls.len(), 5);
@@ -1896,6 +2038,17 @@ fn production_tools_complete_the_flagship_edit_test_diff_run() {
     assert_eq!(
         test_call.output().and_then(|output| output.get("passed")),
         Some(&json!(true))
+    );
+    // A zero exit is not evidence the fixture ran: libtest exits zero when
+    // `--exact` matches nothing, so an unresolved program would report
+    // `passed: true` from a child that ran no test at all.
+    assert!(
+        test_call.output().unwrap()["stdout_tail"]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(harkness_test_fixtures::SCENARIO_FIXTURE_PASS_MARKER),
+        "the test fixture child did not run: {}",
+        serde_json::to_string_pretty(test_call.output().unwrap()).unwrap()
     );
     let inspect_call = snapshot
         .tool_calls

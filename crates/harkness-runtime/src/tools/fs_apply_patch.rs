@@ -262,13 +262,14 @@ pub(super) fn execute_with_before_replace(
 }
 
 fn parse_patch(bytes: &[u8]) -> Result<Vec<ParsedFile>, ToolError> {
+    // Straight to `harkness-git`'s parser, with no tolerance layer in front.
+    // Synthesizing a `diff --git` envelope from `---`/`+++` lines is patch
+    // *parsing*, which belongs to the crate that owns production Git behavior —
+    // and doing it here would also change what the already-released
+    // `fs.apply_patch@1.0.0` applies, turning documents it refused as
+    // `patch_conflict` into workspace mutations under a version an approval can
+    // already name. A caller that wants the header emits the header.
     parse_unified_patch(bytes)
-        .or_else(|original| {
-            let Some(normalized) = normalize_headerless_single_file_patch(bytes) else {
-                return Err(original);
-            };
-            parse_unified_patch(&normalized)
-        })
         .map_err(|error| patch_conflict(error.path(), error.detail()))
         .map(|patch| {
             patch
@@ -302,21 +303,6 @@ fn parse_patch(bytes: &[u8]) -> Result<Vec<ParsedFile>, ToolError> {
                 })
                 .collect()
         })
-}
-
-/// Accepts the conventional single-file `---`/`+++` unified form emitted by
-/// agents as well as Git's `diff --git` envelope expected by the shared parser.
-fn normalize_headerless_single_file_patch(bytes: &[u8]) -> Option<Vec<u8>> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    let mut lines = text.lines();
-    let old = lines.next()?.strip_prefix("--- ")?.split('\t').next()?;
-    let new = lines.next()?.strip_prefix("+++ ")?.split('\t').next()?;
-    if old.is_empty() || new.is_empty() || text.contains("\ndiff --git ") {
-        return None;
-    }
-    let mut normalized = format!("diff --git {old} {new}\n").into_bytes();
-    normalized.extend_from_slice(bytes);
-    Some(normalized)
 }
 
 fn resolve_bases(
