@@ -32,8 +32,8 @@ pub use git_status::{
     GitStatusOutput, GitUpstream,
 };
 pub use process_exec::{
-    BoundedText, ProcessExec, ProcessExecInput, ProcessExecOutput, TestRun, TestRunInput,
-    TestRunOutput,
+    BoundedText, CheckOutputParser, CheckRun, CheckRunInput, CheckRunOutput, CheckWorkspaceState,
+    ProcessExec, ProcessExecInput, ProcessExecOutput, TestRun, TestRunInput, TestRunOutput,
 };
 pub use workspace_inspect::{
     DEFAULT_INSPECT_MAX_ENTRIES, InspectOmission, InspectedProject, MAX_INSPECT_ENTRIES,
@@ -64,7 +64,7 @@ pub fn register_read_only_tools(registry: &mut ToolRegistry) -> Result<(), Regis
 
 /// Registers the workspace-mutating and process tools from issue 95.
 ///
-/// All three identities are published at `1.0.0`. The function is intentionally
+/// All four identities are published at `1.0.0`. The function is intentionally
 /// separate from the read-only tool set so front ends can assemble a registry
 /// explicitly while the two issue tracks land independently.
 ///
@@ -75,6 +75,7 @@ pub fn register_mutating_tools(registry: &mut ToolRegistry) -> Result<(), Regist
     registry.register(FsApplyPatch)?;
     registry.register(ProcessExec)?;
     registry.register(TestRun)?;
+    registry.register(CheckRun)?;
     Ok(())
 }
 

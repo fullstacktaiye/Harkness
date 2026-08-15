@@ -701,6 +701,18 @@ impl Store {
         self.with_reader(|connection| listing::list_runs(connection, page))
     }
 
+    /// Returns newest run identities for one tool and catalog project.
+    pub fn project_tool_run_ids(
+        &self,
+        project_id: harkness_core::ProjectId,
+        tool_id: &str,
+        limit: usize,
+    ) -> Result<Vec<RunId>, StoreError> {
+        self.with_reader(|connection| {
+            listing::project_tool_run_ids(connection, project_id, tool_id, limit)
+        })
+    }
+
     // -- steps --------------------------------------------------------------
 
     /// Stores a step against an already-stored run.
@@ -1524,7 +1536,9 @@ impl Store {
     // -- internals ----------------------------------------------------------
 
     /// The data directory this store's artifacts live under.
-    pub(super) fn data_dir(&self) -> &Path {
+    /// Harkness data directory containing this store and its artifacts.
+    #[must_use]
+    pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
 

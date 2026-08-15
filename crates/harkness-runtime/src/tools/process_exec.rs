@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::time::Duration;
 
+use harkness_context::{CaptureRequest, FilesystemProbe, SnapshotWireRef, WorkspaceSnapshot};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -40,7 +41,7 @@ pub struct ProcessExecInput {
 }
 
 /// A bounded inline view of one complete artifact-backed stream.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BoundedText {
     /// Lossy UTF-8 excerpt from the end of the stream.
@@ -52,7 +53,7 @@ pub struct BoundedText {
 }
 
 /// Result of `process.exec@1.0.0`.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessExecOutput {
     /// Direct child's exit code, absent when a signal ended it.
@@ -133,7 +134,7 @@ pub struct TestRunInput {
 }
 
 /// Result of `test.run@1.0.0`.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TestRunOutput {
     /// True exactly when the process exited with code zero without timing out.
@@ -184,6 +185,148 @@ impl Tool for TestRun {
         )?;
         Ok(TestRunOutput {
             passed: process.exit_code == Some(0) && !process.timed_out,
+            process,
+        })
+    }
+}
+
+/// Machine-readable output convention for `check.run@1.0.0`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckOutputParser {
+    /// Keep the result at run level; make no file or line inference.
+    #[default]
+    Plain,
+    /// Parse Cargo/rustc newline-delimited JSON diagnostics.
+    CargoJson,
+}
+
+/// Input to `check.run@1.0.0`.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CheckRunInput {
+    /// Stable per-project check identifier.
+    pub check_id: String,
+    /// Human-readable configured label.
+    pub label: String,
+    /// Explicit executable and argv. No shell is involved.
+    #[schemars(length(min = 1))]
+    pub command: Vec<String>,
+    /// Workspace-relative working directory.
+    pub cwd: Option<String>,
+    /// Exact environment overrides admitted by the descriptor.
+    pub env: Option<BTreeMap<String, String>>,
+    /// Child timeout in seconds.
+    pub timeout_seconds: Option<u64>,
+    /// How stored output may be associated with files and lines.
+    #[serde(default)]
+    pub parser: CheckOutputParser,
+}
+
+/// Compact identity of the workspace a check actually ran against.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckWorkspaceState {
+    /// Composite workspace digest. Never `HEAD` alone.
+    pub digest: String,
+    /// Checked-out commit, when one exists.
+    pub head: Option<String>,
+    /// Checked-out branch, when attached.
+    pub branch: Option<String>,
+    /// Full strict snapshot used to compute freshness later.
+    pub snapshot_artifact: ArtifactRef,
+}
+
+/// Result of `check.run@1.0.0`.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckRunOutput {
+    /// Stable configured identity copied from the request.
+    pub check_id: String,
+    /// Configured display label copied from the request.
+    pub label: String,
+    /// True exactly when the process exited zero without timing out.
+    pub passed: bool,
+    /// Parser a read-only projection may apply to the stored artifacts.
+    pub parser: CheckOutputParser,
+    /// Exact workspace identity captured immediately before spawn.
+    pub workspace_state: CheckWorkspaceState,
+    /// Controlled child-process result and bounded inline tails.
+    #[serde(flatten)]
+    pub process: ProcessExecOutput,
+}
+
+/// State-bound project check executed through the ordinary runtime pipeline.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CheckRun;
+
+impl Tool for CheckRun {
+    type Input = CheckRunInput;
+    type Output = CheckRunOutput;
+
+    fn metadata(&self) -> ToolMetadata {
+        process_metadata(
+            "check.run",
+            "Run a project check",
+            "Captures the composite workspace identity, executes one configured argv-only check, and stores complete bounded-output artifacts.",
+            &[],
+        )
+    }
+
+    fn request_effects(
+        &self,
+        input: &Self::Input,
+        boundary: &PathBoundary,
+    ) -> Result<RequestEffects, ToolError> {
+        process_effects(input.cwd.as_deref(), boundary)
+    }
+
+    fn execute(
+        &self,
+        input: Self::Input,
+        context: &mut ExecutionContext,
+    ) -> Result<Self::Output, ToolError> {
+        let metadata = context.workspace_metadata().ok_or_else(|| {
+            ToolError::execution_failed("check.run requires catalog workspace metadata")
+        })?;
+        let project_id = metadata.project_id();
+        let root = context.workspace_root().to_path_buf();
+        let git = harkness_git::GitService::new(&root, &root);
+        let snapshot = WorkspaceSnapshot::capture(
+            &CaptureRequest::new(project_id),
+            &git,
+            &FilesystemProbe::new(&root),
+            context.cancellation(),
+        )
+        .map_err(ToolError::execution_failed)?;
+        let mut snapshot_stream = context.open_artifact(
+            "check-workspace-state.json",
+            "application/vnd.harkness.workspace-snapshot+json",
+        )?;
+        serde_json::to_writer(&mut snapshot_stream, &SnapshotWireRef::from(&snapshot))
+            .map_err(ToolError::execution_failed)?;
+        let snapshot_artifact = snapshot_stream.finish()?;
+        let workspace_state = CheckWorkspaceState {
+            digest: snapshot.digest().to_string(),
+            head: snapshot.head().map(str::to_owned),
+            branch: snapshot.branch().map(str::to_owned),
+            snapshot_artifact,
+        };
+        let process = run_process(
+            input.command,
+            input.cwd,
+            input.env,
+            input.timeout_seconds,
+            &[],
+            "check",
+            context,
+        )?;
+        Ok(CheckRunOutput {
+            check_id: input.check_id,
+            label: input.label,
+            passed: process.exit_code == Some(0) && !process.timed_out,
+            parser: input.parser,
+            workspace_state,
             process,
         })
     }

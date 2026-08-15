@@ -1052,6 +1052,32 @@ Kirigami.ApplicationWindow {
                 "parentCount": 1
             }]
         })
+        property var checks: ({
+            "projectId": "00000000-0000-0000-0000-000000000000",
+            "loading": false,
+            "error": "",
+            "configured": [],
+            "results": [{
+                "runId": "check-run-fixture",
+                "checkId": "cargo.test",
+                "label": "Cargo tests",
+                "outcome": "failed",
+                "freshness": "current",
+                "freshnessDetail": "",
+                "createdAt": "2026-08-15T12:00:00.000000000Z",
+                "durationMs": 1842,
+                "stdoutTail": "",
+                "stderrTail": "",
+                "diagnostics": [{
+                    "path": "src/main.rs",
+                    "line": 1,
+                    "column": 5,
+                    "level": "error",
+                    "message": "fixture check diagnostic"
+                }],
+                "diagnosticsOmitted": 0
+            }]
+        })
         property var review: ({
             "projectId": "00000000-0000-0000-0000-000000000000",
             "title": "Working-tree changes",

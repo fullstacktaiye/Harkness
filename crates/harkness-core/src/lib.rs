@@ -6,6 +6,7 @@
 //! dependency.
 
 mod catalog;
+mod check;
 mod editor;
 mod listing;
 mod paths;
@@ -15,6 +16,7 @@ mod remote;
 mod testing;
 
 pub use catalog::entry::{Project, ProjectId, ProjectSource};
+pub use check::{CheckConfiguration, CheckParser, default_checks};
 pub use editor::{
     EditorConfiguration, EditorError, EditorLaunch, EditorLaunchContext, EditorPosition,
     EditorPreset,

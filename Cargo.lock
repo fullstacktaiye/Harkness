@@ -731,6 +731,7 @@ dependencies = [
  "git2",
  "harkness-core",
  "harkness-git",
+ "harkness-runtime",
  "libc",
  "serde",
  "serde_json",
@@ -751,6 +752,7 @@ name = "harkness-runtime"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "harkness-context",
  "harkness-core",
  "harkness-git",
  "harkness-test-fixtures",

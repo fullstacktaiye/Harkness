@@ -34,6 +34,12 @@ ColumnLayout {
     readonly property var reviewProvenance: reviewReady && reviewState.provenance !== undefined
         ? reviewState.provenance
         : ({})
+    readonly property var checkState: backend.checks !== undefined
+        && String(backend.checks.projectId || "") === String(project.id)
+        ? backend.checks : ({})
+    readonly property var checkResults: checkState.results !== undefined
+        ? checkState.results : []
+    readonly property var checkDiagnostics: buildCheckDiagnostics()
     readonly property string repositoryLockScope: String(
         project.lockScope || project.parentId || project.id
     )
@@ -83,6 +89,53 @@ ColumnLayout {
         if (kind === "deletion")
             return Kirigami.Theme.negativeTextColor;
         return Kirigami.Theme.disabledTextColor;
+    }
+
+    function buildCheckDiagnostics() {
+        const files = {};
+        const lines = {};
+        for (let resultIndex = 0; resultIndex < checkResults.length; ++resultIndex) {
+            const result = checkResults[resultIndex];
+            const diagnostics = result.diagnostics || [];
+            for (let index = 0; index < diagnostics.length; ++index) {
+                const diagnostic = diagnostics[index];
+                const path = String(diagnostic.path || "");
+                if (path.length === 0)
+                    continue;
+                files[path] = Number(files[path] || 0) + 1;
+                const line = Number(diagnostic.line || 0);
+                if (line > 0)
+                    lines[path + "\u0000" + line] = diagnostic;
+            }
+        }
+        return ({ "files": files, "lines": lines });
+    }
+
+    function fileDiagnosticCount(path) {
+        return Number((checkDiagnostics.files || ({}))[String(path)] || 0);
+    }
+
+    function lineDiagnostic(path, line) {
+        return (checkDiagnostics.lines || ({}))[String(path) + "\u0000" + Number(line)] || null;
+    }
+
+    function checkHeadline() {
+        if (checkResults.length === 0)
+            return "";
+        let passed = 0;
+        let failed = 0;
+        let stale = 0;
+        for (let index = 0; index < checkResults.length; ++index) {
+            const result = checkResults[index];
+            if (String(result.outcome) === "passed")
+                ++passed;
+            else
+                ++failed;
+            if (String(result.freshness) === "stale")
+                ++stale;
+        }
+        return qsTr("Checks: %1 passed · %2 not passing · %3 stale")
+            .arg(passed).arg(failed).arg(stale);
     }
 
     // Fills every `%N` in one pass over the template.
@@ -1005,6 +1058,16 @@ ColumnLayout {
                     textFormat: Text.PlainText
                     visible: text.length > 0
                 }
+
+                Controls.Label {
+                    Layout.fillWidth: true
+                    color: Kirigami.Theme.disabledTextColor
+                    elide: Text.ElideRight
+                    font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                    text: reviewSurface.checkHeadline()
+                    textFormat: Text.PlainText
+                    visible: text.length > 0
+                }
             }
 
             Controls.Label {
@@ -1265,6 +1328,15 @@ ColumnLayout {
                                         textFormat: Text.PlainText
                                         visible: reviewSurface.reviewProvenance.resolved === true
                                     }
+                                }
+
+                                Kirigami.Icon {
+                                    Layout.preferredHeight: Kirigami.Units.iconSizes.small
+                                    Layout.preferredWidth: Kirigami.Units.iconSizes.small
+                                    source: "data-error"
+                                    visible: reviewSurface.fileDiagnosticCount(
+                                        reviewFileDelegate.modelData.path
+                                    ) > 0
                                 }
 
                                 Controls.Label {
@@ -1834,6 +1906,21 @@ ColumnLayout {
                         font.family: "monospace"
                         horizontalAlignment: Text.AlignHCenter
                         text: reviewLineDelegate.unified.marker
+                    }
+
+                    Kirigami.Icon {
+                        readonly property var diagnostic: reviewSurface.lineDiagnostic(
+                            reviewSurface.reviewFile.path || "",
+                            reviewLineDelegate.unified.newLine > 0
+                                ? reviewLineDelegate.unified.newLine
+                                : reviewLineDelegate.row.openLine
+                        )
+                        Layout.preferredHeight: diagnostic !== null
+                            ? Kirigami.Units.iconSizes.small : 0
+                        Layout.preferredWidth: diagnostic !== null
+                            ? Kirigami.Units.iconSizes.small : 0
+                        source: "data-error"
+                        visible: diagnostic !== null
                     }
 
                     Controls.Label {

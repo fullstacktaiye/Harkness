@@ -21,9 +21,13 @@ use crate::{
 };
 
 /// The newest catalog schema understood by this Harkness build.
-pub(crate) const CATALOG_VERSION: u32 = 3;
+pub(crate) const CATALOG_VERSION: u32 = 4;
 /// The first schema that can represent managed worktrees.
 pub(crate) const WORKTREE_CATALOG_VERSION: u32 = 2;
+/// The first schema that can represent global editor configuration.
+pub(crate) const EDITOR_CATALOG_VERSION: u32 = 3;
+/// The first schema that can represent explicit project checks.
+pub(crate) const CHECK_CATALOG_VERSION: u32 = 4;
 /// The oldest catalog schema this build can load without losing data.
 pub(crate) const MINIMUM_SUPPORTED_CATALOG_VERSION: u32 = 1;
 
@@ -99,7 +103,10 @@ pub(crate) fn read_catalog(catalog_path: &Path) -> Result<Catalog, ProjectError>
             if probe.version == 1 {
                 normalize_legacy_managed_rows(&mut body);
             }
-            let catalog = if probe.version < CATALOG_VERSION {
+            if probe.version < CHECK_CATALOG_VERSION {
+                reject_checks_before_v4(catalog_path, &body)?;
+            }
+            let catalog = if probe.version < EDITOR_CATALOG_VERSION {
                 let wire: LegacyCatalogWire = serde_json::from_value(body).map_err(|source| {
                     ProjectError::MalformedCatalog {
                         path: catalog_path.to_path_buf(),
@@ -132,6 +139,24 @@ pub(crate) fn read_catalog(catalog_path: &Path) -> Result<Catalog, ProjectError>
             source,
         }),
     }
+}
+
+fn reject_checks_before_v4(catalog_path: &Path, body: &Value) -> Result<(), ProjectError> {
+    let carries_checks = body
+        .get("projects")
+        .and_then(Value::as_array)
+        .is_some_and(|projects| {
+            projects
+                .iter()
+                .any(|project| project.get("checks").is_some())
+        });
+    if carries_checks {
+        return Err(invalid_catalog(
+            catalog_path,
+            "project checks require catalog version 4".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Before source-specific Rust types existed, a v1 managed row could omit its
@@ -233,12 +258,18 @@ pub(crate) fn persist_catalog(
 ) -> io::Result<()> {
     fs::create_dir_all(data_dir)?;
     let mut temporary = NamedTempFile::new_in(data_dir)?;
-    // Persist the oldest schema that can represent every field: editor
-    // configuration requires v3, a worktree requires v2, and an ordinary
-    // project remains v1-compatible. Removing the last newer field naturally
-    // restores the corresponding downgrade path.
-    let version = if catalog.editor.is_some() {
-        CATALOG_VERSION
+    // Persist the oldest schema that can represent every field: explicit
+    // checks require v4, editor configuration requires v3, a worktree requires
+    // v2, and an ordinary project remains v1-compatible. Removing the last
+    // newer field naturally restores the corresponding downgrade path.
+    let version = if catalog
+        .projects
+        .iter()
+        .any(|project| project.checks.is_some())
+    {
+        CHECK_CATALOG_VERSION
+    } else if catalog.editor.is_some() {
+        EDITOR_CATALOG_VERSION
     } else if catalog
         .projects
         .iter()

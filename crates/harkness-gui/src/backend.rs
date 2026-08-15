@@ -43,6 +43,7 @@ pub mod ffi {
         #[qproperty(QVariant, git)]
         #[qproperty(QVariant, history)]
         #[qproperty(QVariant, issues)]
+        #[qproperty(QVariant, checks)]
         #[qproperty(QVariant, review)]
         type HarknessBackend = super::HarknessBackendRust;
 
@@ -117,6 +118,21 @@ pub mod ffi {
             self: Pin<&mut HarknessBackend>,
             project_id: &QString,
             github_remote: &QString,
+        );
+
+        /// Reads configured checks and recorded results without executing any command.
+        #[qinvokable]
+        #[cxx_name = "refreshChecks"]
+        fn refresh_checks(self: Pin<&mut HarknessBackend>, project_id: &QString);
+
+        /// Trusts the reviewed workspace when requested, then runs one exact configured check.
+        #[qinvokable]
+        #[cxx_name = "runCheck"]
+        fn run_check(
+            self: Pin<&mut HarknessBackend>,
+            project_id: &QString,
+            check_id: &QString,
+            trust_workspace: bool,
         );
 
         /// Opens a commit against its first parent in the read-only review surface.
@@ -397,6 +413,7 @@ pub struct HarknessBackendRust {
     git: QVariant,
     history: QVariant,
     issues: QVariant,
+    checks: QVariant,
     review: QVariant,
     job_records: Vec<JobRecord>,
     cancellations: HashMap<String, harkness_git::Cancellation>,
@@ -441,6 +458,7 @@ impl Default for HarknessBackendRust {
             git: empty_git(),
             history: empty_history(),
             issues: empty_issues(),
+            checks: empty_checks(),
             review: empty_review(),
             job_records: Vec::new(),
             cancellations: HashMap::new(),
@@ -584,6 +602,10 @@ fn is_repository_snapshot_job(kind: &str) -> bool {
     matches!(kind, "status" | "history" | "branches" | "worktrees")
 }
 
+fn is_check_job(kind: &str) -> bool {
+    kind == "check"
+}
+
 fn is_repository_mutation_job(kind: &str) -> bool {
     matches!(
         kind,
@@ -616,6 +638,12 @@ fn jobs_conflict(existing: &str, requested: &str) -> bool {
         || (is_repository_mutation_job(existing) && is_repository_mutation_job(requested))
         || (is_repository_snapshot_job(existing) && is_repository_mutation_job(requested))
         || (is_repository_mutation_job(existing) && is_repository_snapshot_job(requested))
+        || (is_check_job(existing)
+            && (is_check_job(requested)
+                || is_repository_mutation_job(requested)
+                || is_review_read_job(requested)))
+        || (is_check_job(requested)
+            && (is_repository_mutation_job(existing) || is_review_read_job(existing)))
 }
 
 fn conflicting_repository_job<'a>(
@@ -1538,6 +1566,93 @@ fn load_project_git(project_id: &str) -> Result<harkness_git::GitService, GitFai
     })
 }
 
+fn load_check_project(
+    project_id: &str,
+) -> Result<(harkness_core::ProjectService, harkness_core::Project), String> {
+    let id: harkness_core::ProjectId = project_id
+        .parse()
+        .map_err(|_| "invalid project identifier".to_owned())?;
+    let service = harkness_core::ProjectService::load().map_err(|error| error.to_string())?;
+    let project = service
+        .resolve(&harkness_core::ProjectSelector::from(id.to_string()))
+        .map_err(|error| error.to_string())?;
+    Ok((service, project))
+}
+
+fn load_project_checks(
+    project_id: &str,
+) -> Result<
+    (
+        Vec<harkness_core::CheckConfiguration>,
+        Vec<harkness_runtime::check::CheckSummary>,
+    ),
+    String,
+> {
+    let (service, project) = load_check_project(project_id)?;
+    let configurations = project.effective_checks();
+    let store = harkness_runtime::store::Store::open(service.data_dir())
+        .map_err(|error| error.to_string())?;
+    let results = harkness_runtime::check::project_checks(&store, &project)
+        .map_err(|error| error.to_string())?;
+    Ok((configurations, results))
+}
+
+fn run_project_check(
+    project_id: &str,
+    check_id: &str,
+    trust_workspace: bool,
+    cancellation: &harkness_git::Cancellation,
+) -> Result<
+    (
+        Vec<harkness_core::CheckConfiguration>,
+        Vec<harkness_runtime::check::CheckSummary>,
+    ),
+    String,
+> {
+    let (service, project) = load_check_project(project_id)?;
+    let configurations = project.effective_checks();
+    let check = configurations
+        .iter()
+        .find(|check| check.id == check_id)
+        .ok_or_else(|| format!("project has no configured check {check_id:?}"))?;
+    let store = Arc::new(
+        harkness_runtime::store::Store::open(service.data_dir())
+            .map_err(|error| error.to_string())?,
+    );
+    if trust_workspace {
+        let trust = harkness_runtime::trust::WorkspaceTrust::decide(
+            project.id,
+            &project.root,
+            harkness_runtime::trust::TrustState::Trusted,
+            time::OffsetDateTime::now_utc(),
+        )
+        .map_err(|error| error.to_string())?;
+        store
+            .put_workspace_trust(&trust)
+            .map_err(|error| error.to_string())?;
+    }
+    if store
+        .resolve_workspace_trust(project.id, &project.root)
+        .map_err(|error| error.to_string())?
+        != harkness_runtime::trust::TrustState::Trusted
+    {
+        return Err(
+            "workspace is untrusted; review and trust it before running a check".to_owned(),
+        );
+    }
+    harkness_runtime::check::run_configured_check(
+        Arc::clone(&store),
+        &project,
+        check,
+        harkness_runtime::approval::DecidedVia::Gui,
+        cancellation,
+    )
+    .map_err(|error| error.to_string())?;
+    let results = harkness_runtime::check::project_checks(&store, &project)
+        .map_err(|error| error.to_string())?;
+    Ok((configurations, results))
+}
+
 const HISTORY_PAGE_SIZE: usize = 50;
 const REVIEW_CONTEXT_STEP: u32 = 20;
 // This is a transfer page, not an omission limit: QML can request every
@@ -1889,6 +2004,151 @@ query($owner: String!, $name: String!, $endCursor: String) {
 
 fn empty_issues() -> QVariant {
     QVariant::from(&QMap::<QMapPair_QString_QVariant>::default())
+}
+
+fn empty_checks() -> QVariant {
+    QVariant::from(&QMap::<QMapPair_QString_QVariant>::default())
+}
+
+fn check_outcome_name(outcome: harkness_runtime::check::CheckOutcome) -> &'static str {
+    use harkness_runtime::check::CheckOutcome;
+    match outcome {
+        CheckOutcome::Queued => "queued",
+        CheckOutcome::WaitingForApproval => "waiting_for_approval",
+        CheckOutcome::Running => "running",
+        CheckOutcome::Passed => "passed",
+        CheckOutcome::Failed => "failed",
+        CheckOutcome::TimedOut => "timed_out",
+        CheckOutcome::Denied => "denied",
+        CheckOutcome::Cancelled => "cancelled",
+        CheckOutcome::Interrupted => "interrupted",
+    }
+}
+
+fn to_checks(
+    project_id: &str,
+    configurations: &[harkness_core::CheckConfiguration],
+    results: &[harkness_runtime::check::CheckSummary],
+    loading: bool,
+    error: &str,
+) -> QVariant {
+    let mut state = QMap::<QMapPair_QString_QVariant>::default();
+    state.insert(
+        QString::from("projectId"),
+        QVariant::from(&QString::from(project_id)),
+    );
+    state.insert(QString::from("loading"), QVariant::from(&loading));
+    state.insert(
+        QString::from("error"),
+        QVariant::from(&QString::from(error)),
+    );
+
+    let mut configured = QList::<QVariant>::default();
+    for check in configurations {
+        let mut row = QMap::<QMapPair_QString_QVariant>::default();
+        row.insert(
+            QString::from("id"),
+            QVariant::from(&QString::from(check.id.as_str())),
+        );
+        row.insert(
+            QString::from("label"),
+            QVariant::from(&QString::from(check.label.as_str())),
+        );
+        let mut command = QList::<QVariant>::default();
+        for part in &check.command {
+            command.append(QVariant::from(&QString::from(part.as_str())));
+        }
+        row.insert(QString::from("command"), QVariant::from(&command));
+        configured.append(QVariant::from(&row));
+    }
+    state.insert(QString::from("configured"), QVariant::from(&configured));
+
+    let mut recorded = QList::<QVariant>::default();
+    for result in results {
+        let mut row = QMap::<QMapPair_QString_QVariant>::default();
+        row.insert(
+            QString::from("runId"),
+            QVariant::from(&QString::from(result.run_id.as_str())),
+        );
+        row.insert(
+            QString::from("checkId"),
+            QVariant::from(&QString::from(result.check_id.as_str())),
+        );
+        row.insert(
+            QString::from("label"),
+            QVariant::from(&QString::from(result.label.as_str())),
+        );
+        row.insert(
+            QString::from("outcome"),
+            QVariant::from(&QString::from(check_outcome_name(result.outcome))),
+        );
+        let (freshness, freshness_detail) = match &result.freshness {
+            harkness_runtime::check::CheckFreshness::Current => ("current", String::new()),
+            harkness_runtime::check::CheckFreshness::Stale { changed } => {
+                ("stale", changed.join(", "))
+            }
+            harkness_runtime::check::CheckFreshness::Unverifiable { reason } => {
+                ("unverifiable", reason.clone())
+            }
+        };
+        row.insert(
+            QString::from("freshness"),
+            QVariant::from(&QString::from(freshness)),
+        );
+        row.insert(
+            QString::from("freshnessDetail"),
+            QVariant::from(&QString::from(freshness_detail.as_str())),
+        );
+        row.insert(
+            QString::from("createdAt"),
+            QVariant::from(&QString::from(result.created_at.as_str())),
+        );
+        row.insert(
+            QString::from("durationMs"),
+            QVariant::from(&i64::try_from(result.duration_ms.unwrap_or(0)).unwrap_or(i64::MAX)),
+        );
+        row.insert(
+            QString::from("stdoutTail"),
+            QVariant::from(&QString::from(result.stdout_tail.as_str())),
+        );
+        row.insert(
+            QString::from("stderrTail"),
+            QVariant::from(&QString::from(result.stderr_tail.as_str())),
+        );
+        let mut diagnostics = QList::<QVariant>::default();
+        for diagnostic in &result.diagnostics {
+            let mut value = QMap::<QMapPair_QString_QVariant>::default();
+            value.insert(
+                QString::from("path"),
+                QVariant::from(&QString::from(diagnostic.path.as_deref().unwrap_or(""))),
+            );
+            value.insert(
+                QString::from("line"),
+                QVariant::from(&i32::try_from(diagnostic.line.unwrap_or(0)).unwrap_or(i32::MAX)),
+            );
+            value.insert(
+                QString::from("column"),
+                QVariant::from(&i32::try_from(diagnostic.column.unwrap_or(0)).unwrap_or(i32::MAX)),
+            );
+            value.insert(
+                QString::from("level"),
+                QVariant::from(&QString::from(diagnostic.level.as_str())),
+            );
+            value.insert(
+                QString::from("message"),
+                QVariant::from(&QString::from(diagnostic.message.as_str())),
+            );
+            diagnostics.append(QVariant::from(&value));
+        }
+        row.insert(QString::from("diagnostics"), QVariant::from(&diagnostics));
+        row.insert(
+            QString::from("diagnosticsOmitted"),
+            QVariant::from(&i32::try_from(result.diagnostics_omitted).unwrap_or(i32::MAX)),
+        );
+        recorded.append(QVariant::from(&row));
+    }
+    state.insert(QString::from("results"), QVariant::from(&recorded));
+    QVariant::from(&state)
 }
 
 fn to_issues(row: &IssuesStateRow) -> QVariant {
@@ -5799,6 +6059,7 @@ impl ffi::HarknessBackend {
         self.as_mut().set_worktrees(QList::default());
         clear_history_state(self.as_mut());
         clear_issues_state(self.as_mut());
+        self.as_mut().set_checks(empty_checks());
         clear_review_state(self.as_mut());
     }
 
@@ -6119,6 +6380,102 @@ impl ffi::HarknessBackend {
                     Err(failure) => {
                         backend.as_mut().set_status(failure.message.as_str().into());
                         set_issues_state(backend.as_mut(), current.with_failure(failure));
+                    }
+                }
+            });
+        });
+    }
+
+    fn refresh_checks(mut self: Pin<&mut Self>, project_id: &QString) {
+        let project_id = project_id.to_string();
+        let Some((job_id, _cancellation)) =
+            start_job(self.as_mut(), "checks", &project_id, "Load checks", false)
+        else {
+            return;
+        };
+        self.as_mut()
+            .set_checks(to_checks(&project_id, &[], &[], true, ""));
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let result = load_project_checks(&project_id);
+            let _ = qt_thread.queue(move |mut backend| {
+                finish_job(backend.as_mut(), &job_id);
+                if opened_project_id(backend.as_ref().opened()).as_deref()
+                    != Some(project_id.as_str())
+                {
+                    return;
+                }
+                match result {
+                    Ok((configured, results)) => backend.as_mut().set_checks(to_checks(
+                        &project_id,
+                        &configured,
+                        &results,
+                        false,
+                        "",
+                    )),
+                    Err(error) => {
+                        backend.as_mut().set_status(error.as_str().into());
+                        backend.as_mut().set_checks(to_checks(
+                            &project_id,
+                            &[],
+                            &[],
+                            false,
+                            &error,
+                        ));
+                    }
+                }
+            });
+        });
+    }
+
+    fn run_check(
+        mut self: Pin<&mut Self>,
+        project_id: &QString,
+        check_id: &QString,
+        trust_workspace: bool,
+    ) {
+        let project_id = project_id.to_string();
+        let check_id = check_id.to_string();
+        if check_id.trim().is_empty() {
+            self.as_mut().set_status("Choose a configured check".into());
+            return;
+        }
+        let Some((job_id, cancellation)) =
+            start_job(self.as_mut(), "check", &project_id, "Run check", true)
+        else {
+            return;
+        };
+        self.as_mut().set_status("Running check…".into());
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let result = run_project_check(&project_id, &check_id, trust_workspace, &cancellation);
+            let _ = qt_thread.queue(move |mut backend| {
+                finish_job(backend.as_mut(), &job_id);
+                if opened_project_id(backend.as_ref().opened()).as_deref()
+                    != Some(project_id.as_str())
+                {
+                    return;
+                }
+                match result {
+                    Ok((configured, results)) => {
+                        backend.as_mut().set_checks(to_checks(
+                            &project_id,
+                            &configured,
+                            &results,
+                            false,
+                            "",
+                        ));
+                        backend.as_mut().set_status("Check completed".into());
+                    }
+                    Err(error) => {
+                        backend.as_mut().set_status(error.as_str().into());
+                        backend.as_mut().set_checks(to_checks(
+                            &project_id,
+                            &[],
+                            &[],
+                            false,
+                            &error,
+                        ));
                     }
                 }
             });
@@ -7507,6 +7864,7 @@ mod tests {
             last_opened: time::OffsetDateTime::now_utc(),
             available: true,
             git,
+            checks: None,
         }
     }
 

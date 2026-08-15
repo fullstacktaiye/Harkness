@@ -10,6 +10,8 @@ use rusqlite::{Connection, named_params};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use time::OffsetDateTime;
 
+use harkness_core::ProjectId;
+
 use crate::domain::{Run, RunId};
 
 use super::column::{decode_cursor_timestamp, decode_id, encode_timestamp};
@@ -205,6 +207,45 @@ pub(super) fn list_runs(connection: &Connection, page: RunPage) -> Result<RunLis
         .map(run_from_wire)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(RunListing { runs, next_cursor })
+}
+
+pub(super) fn project_tool_run_ids(
+    connection: &Connection,
+    project_id: ProjectId,
+    tool_id: &str,
+    limit: usize,
+) -> Result<Vec<RunId>, StoreError> {
+    if limit == 0 || limit > MAX_RUN_PAGE_LIMIT {
+        return Err(StoreError::InvalidPageLimit {
+            limit,
+            maximum: MAX_RUN_PAGE_LIMIT,
+        });
+    }
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT runs.id FROM runs JOIN tasks ON tasks.id = runs.task_id \
+             WHERE tasks.project_id = :project_id AND EXISTS (\
+                 SELECT 1 FROM tool_calls \
+                 WHERE tool_calls.run_id = runs.id AND tool_calls.tool_id = :tool_id\
+             ) \
+             ORDER BY runs.created_at DESC, runs.id DESC LIMIT :limit",
+        )
+        .map_err(|error| query_failed("preparing the project run listing", error))?;
+    let rows = statement
+        .query_map(
+            named_params! {
+                ":project_id": project_id.to_string(),
+                ":tool_id": tool_id,
+                ":limit": i64::try_from(limit).unwrap_or(i64::MAX),
+            },
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| query_failed("listing project tool runs", error))?;
+    rows.map(|row| {
+        let stored = row.map_err(|error| query_failed("reading a project run id", error))?;
+        decode_id("run", "id", &stored)
+    })
+    .collect()
 }
 
 #[cfg(test)]

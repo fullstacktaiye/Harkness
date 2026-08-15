@@ -41,7 +41,9 @@ Place focused unit tests in a `#[cfg(test)] mod tests` beside the implementation
 `projects.lock` inode. Probe `version` before deserializing the body so a newer
 schema produces an upgrade message rather than a corruption message. Persist
 the oldest version that can represent the current entries: ordinary local and
-managed projects remain v1-compatible, while the first worktree requires v2.
+managed projects remain v1-compatible, the first worktree requires v2, global
+editor configuration requires v3, and the first explicit project check list
+requires v4.
 Read-only operations must never rewrite the file.
 
 Additive optional fields must deserialize missing values to a safe default and
@@ -52,8 +54,8 @@ dropped on the next write.
 
 New durable JSON formats use explicit schema versions and RFC 3339 UTC
 timestamps. The project catalog's human-readable `time` encoding is a legacy
-exception that remains frozen until a future catalog v3 migration; do not copy
-it into new formats. JSON-backed path fields currently require UTF-8, so
+exception that remains frozen until a future catalog migration; do not copy it
+into new formats. JSON-backed path fields currently require UTF-8, so
 persisting a runtime task with a non-UTF-8 workspace path is a known Unix
 limitation and must surface as a serialization error rather than lossy data.
 
