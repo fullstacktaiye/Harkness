@@ -201,7 +201,9 @@ pub use descriptor::{
     EnvironmentError, EnvironmentName, MAX_DESCRIPTION_LENGTH, MAX_ENVIRONMENT_NAME_LENGTH,
     MAX_TITLE_LENGTH, RiskLevel, ToolDescriptor, ToolMetadata, ToolTimeout, UnknownRiskLevel,
 };
-pub use erased::{ErasedTool, REJECTED_OUTPUT_ARTIFACT, Tool, erase};
+pub use erased::{
+    ErasedTool, PreparedRequest, REJECTED_OUTPUT_ARTIFACT, RequestEffects, Tool, erase,
+};
 pub use error::{
     InvocationError, MAX_COUNTED_VIOLATIONS, MAX_FAILURE_MESSAGE_BYTES, MAX_REPORTED_VIOLATIONS,
     MAX_VIOLATION_FIELD_BYTES, RegistryError, SchemaDirection, SchemaViolation, ToolError,

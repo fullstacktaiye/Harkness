@@ -45,10 +45,10 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
 use crate::tool::{
-    ArtifactRef, Capability, ExecutionContext, RiskLevel, Tool, ToolError, ToolIdentity,
-    ToolMetadata,
+    ArtifactRef, Capability, ExecutionContext, RequestEffects, RiskLevel, Tool, ToolError,
+    ToolIdentity, ToolMetadata,
 };
-use crate::trust::ContainedPath;
+use crate::trust::{ContainedPath, PathAccess, PathBoundary};
 
 /// Input to `fs.apply_patch@1.0.0`.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq)]
@@ -123,6 +123,19 @@ impl Tool for FsApplyPatch {
         .with_capabilities([
             Capability::new("fs.write").expect("a built-in capability"),
         ])
+    }
+
+    fn request_effects(
+        &self,
+        input: &Self::Input,
+        boundary: &PathBoundary,
+    ) -> Result<RequestEffects, ToolError> {
+        input
+            .bases
+            .iter()
+            .try_fold(RequestEffects::default(), |effects, base| {
+                Ok(effects.with_path(boundary.contain(&base.path)?, PathAccess::Write))
+            })
     }
 
     fn execute(

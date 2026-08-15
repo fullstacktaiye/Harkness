@@ -1790,6 +1790,61 @@ fn a_state_change_and_its_event_commit_atomically_or_not_at_all() {
 }
 
 #[test]
+fn coordinator_state_helpers_roll_back_when_their_event_is_refused() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let failure = Failure::new("fixture", "must roll back");
+    let error = fixture
+        .store
+        .fail_run_with_event(
+            run.id(),
+            failure,
+            at(10),
+            RunEvent::new(EventKind::RunStateChanged, at(10)).for_step(StepId::new()),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), "missing_parent");
+    assert_eq!(fixture.store.load_run(run.id()).unwrap(), run);
+    assert!(fixture.store.events(run.id(), None, 10).unwrap().is_empty());
+
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = stored_step(&fixture.store, &run);
+    let error = fixture
+        .store
+        .transition_step_with_event(
+            step.id(),
+            ExecutionState::Running,
+            at(10),
+            RunEvent::new(EventKind::StepStarted, at(10)).for_tool_call(ToolCallId::new()),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), "missing_parent");
+    assert_eq!(fixture.store.load_step(step.id()).unwrap(), step);
+    assert!(fixture.store.events(run.id(), None, 10).unwrap().is_empty());
+
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = stored_step(&fixture.store, &run);
+    let call = stored_tool_call(&fixture.store, &step);
+    let error = fixture
+        .store
+        .apply_tool_call_policy_decision_with_event(
+            call.id(),
+            policy_decision(PolicyVerdict::Ask),
+            at(10),
+            RunEvent::new(EventKind::PolicyDecision, at(10)).for_artifact(ArtifactId::new()),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), "missing_parent");
+    assert_eq!(fixture.store.load_tool_call(call.id()).unwrap(), call);
+    assert!(fixture.store.events(run.id(), None, 10).unwrap().is_empty());
+}
+
+#[test]
 fn an_invalid_transition_writes_no_event() {
     let fixture = Fixture::new();
     let task = stored_task(&fixture.store);

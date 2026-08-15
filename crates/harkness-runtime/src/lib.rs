@@ -52,6 +52,7 @@
 
 pub mod agent;
 pub mod approval;
+pub mod coordinator;
 pub mod domain;
 pub mod integration;
 pub mod policy;
