@@ -134,6 +134,16 @@ fn ensure_no_symlink_components_platform(path: &Path) -> Result<(), ToolError> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
+        // A prefix and a root are not filesystem entries and cannot be links.
+        // Asking about one is not merely redundant: a contained path is
+        // canonical, so on Windows the first component is the verbatim prefix
+        // `\\?\C:`, which names the *volume device*. Opening that succeeds and
+        // then querying its attributes fails with ERROR_INVALID_FUNCTION, so
+        // every search would refuse itself before reading a single entry.
+        // `PathBoundary::escaping_symlink` skips them for the same reason.
+        if matches!(component, Component::Prefix(_) | Component::RootDir) {
+            continue;
+        }
         match fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(ToolError::ForbiddenPath {
@@ -201,6 +211,13 @@ fn list_directory_platform(
     let result = (|| {
         loop {
             context.check_still_permitted()?;
+            // `readdir` returns NULL both at end of stream and on failure, and
+            // only `errno` distinguishes them — which means clearing `errno`
+            // first, and its location is `__errno_location` on glibc and
+            // `__error` on Darwin. Telling an `EIO` part-way through a
+            // directory from a genuine end of stream is worth having, but not
+            // at the cost of hand-rolled per-platform `unsafe` in the middle of
+            // the containment path. Tracked rather than guessed at.
             let raw = unsafe { libc::readdir(stream) };
             if raw.is_null() {
                 break;

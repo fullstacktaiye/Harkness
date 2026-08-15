@@ -629,7 +629,14 @@ fn two_production_git_diffs_complete_through_the_scheduler_read_path() {
 
     assert_eq!(succeeded(first), ToolCallState::Succeeded);
     assert_eq!(succeeded(second), ToolCallState::Succeeded);
-    assert!(!workspace.canonical_root().join(".git/index.lock").exists());
+    // The repository lock lives under `locks/` in the data directory, never in
+    // `.git`; `git.diff` builds its service with the workspace root as that
+    // directory, so this is where one would appear. The earlier `.git/index.lock`
+    // spelling named Git's own lock and held with no tool invoked at all.
+    assert!(
+        !workspace.canonical_root().join("locks").exists(),
+        "a read-only tool acquired the repository lock"
+    );
 }
 
 #[test]

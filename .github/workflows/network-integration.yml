@@ -155,6 +155,16 @@ jobs:
           harkness-runtime
           tool::tests::registry_lookup_meets_the_latency_target
           --release
+      # Issue #94 makes per-call dispatch overhead a release requirement, so it
+      # belongs here for the same reason the two above do: an `#[ignore]`d
+      # benchmark named by no job runs in no profile on no platform, and its
+      # numbers stay unverified.
+      - name: Measure read-tool dispatch overhead
+        run: >-
+          sh .github/scripts/run-ignored-exact-test.sh
+          harkness-runtime
+          tools::read_tests::registry_lookup_and_dispatch_overhead_stay_within_issue_budgets
+          --release
 
   github-remote-import:
     name: GitHub remote import

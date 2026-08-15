@@ -251,6 +251,13 @@ pub(super) fn project_change(change: FileChange) -> GitChange {
     }
 }
 
+/// Projects one path into its display spelling, lossiness, and exact bytes.
+///
+/// Deliberately *not* redacting. `git.diff` feeds this same projection into two
+/// destinations that redact differently — the inline result through
+/// `redact_inline_file`, the spilled artifact through the store's
+/// `redact_payload` — and redaction has to happen exactly once on each route.
+/// Applying it here instead would run a non-idempotent rule twice on the spill.
 pub(super) fn project_path(path: &Path) -> (String, bool, Option<String>) {
     let display = path.to_string_lossy().into_owned();
     let lossy = path.as_os_str().to_str().is_none();

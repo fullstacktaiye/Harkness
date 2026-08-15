@@ -826,6 +826,68 @@ remains a tool-call `timed_out` failure. `test.run` calls the same in-process su
 never nested tool dispatch — and adds only `passed = exit_code == 0 &&
 !timed_out`; a failing test is a valid test result, not a failed tool invocation.
 
+## Built-In Read-Only Tool Invariants
+
+`workspace.inspect`, `fs.read`, `workspace.search`, `git.status`, and `git.diff`
+are registered at `1.0.0` through `tools::register_read_only_tools`. All five are
+`RiskLevel::Observe`, declare no capabilities, and declare that they spawn no
+processes — which is what lets the scheduler run them concurrently and takes them
+off the global process limit. No read takes the repository lock, and none spawns
+Git: status, head, ignore checks and diffs all go through `GitService`'s
+in-process libgit2 verbs, and search is a walk in this process.
+
+**Containment decides before anything opens a path.** Every path input crosses
+`ExecutionContext::resolve` *first*. A check that opens or stats a path — the
+symlink-component walk `workspace.search` runs on its root — comes after, because
+running one on a caller's raw string answers "does this exist, is it a link, is
+it a directory, is it readable" for any path on the host, and the distinct
+refusals are a filesystem oracle whether or not a byte is read. That walk stays
+lexical rather than moving to the resolved path, because resolution
+canonicalizes: a root reached through a link inside the workspace would already
+have been rewritten to its target and the link would be invisible. It folds `.`
+and `..` first, since dropping a `..` would inspect a different path than the one
+that was resolved.
+
+**A path component that is not a filesystem entry is not probed.** A prefix and a
+root cannot be links, and on Windows a canonical path begins `\\?\C:`, which names
+the volume *device*; asking for its attributes fails with
+`ERROR_INVALID_FUNCTION` rather than describing a file, so every search refuses
+itself before reading an entry. `PathBoundary::escaping_symlink` skips them for
+the same reason and the two walks must not drift.
+
+**Every budget is charged, and nothing is discarded to pay for something else.**
+Matches and omissions have separate byte allowances, because charging them to one
+budget lets a workspace full of unsearchable files spend the whole response on
+omissions and report "nothing found" for a query that matched. A per-file cap
+ends that file rather than that line — a cap that ends only the innermost loop
+emits one record per later matching line, unbounded. Exhaustion trims from the
+tail and is always a named omission; clearing the answer is not a way to fit a
+budget. A file that reads short for any reason other than the scan budget is
+named too, never silently abandoning the rest of the walk.
+
+**A result is bounded as it will be stored, not as it was read.** `max_bytes`
+counts decoded bytes and JSON escaping is not a fixed factor over them — a
+control byte becomes six characters — so `fs.read` measures its serialized result
+against the store's inline bound and re-truncates until it fits. A tool that can
+exceed that bound at its own defaults fails on ordinary input.
+
+**A projection matches the producer it claims to match.** `git.status` reports a
+rename under its *destination*: libgit2's status entry path is the delta's old
+file, so taking it verbatim names the source twice and drops the new name.
+`status.renames=copies` means Git's `-C`, never `--find-copies-harder`, so a copy
+of an unmodified file stays an `added` path exactly as `git status` reports it.
+Rename configuration is read the way Git reads it — `copy` beside `copies`, any
+non-zero integer and a valueless key as true — and a spelling this build does not
+recognize degrades to Git's default rather than failing the read, because the
+value comes from untrusted repository content and from the user's global config.
+
+**A `*_base64` sidecar is not redacted and must not be published beside a value
+that was.** It carries the path's exact bytes, which is what makes a name no
+lossy conversion can round-trip recoverable. `project_path` therefore stays
+redaction-free: `git.diff` feeds one projection to two destinations that redact
+differently — the inline result through `redact_inline_file`, the spilled artifact
+through the store's `redact_payload` — and each route must redact exactly once.
+
 ## Runtime Scheduling Invariants
 
 Mutation serialization is keyed by `WorkspaceKey` — `ProjectId` *and* canonical root,
