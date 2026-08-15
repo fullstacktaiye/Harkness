@@ -1359,18 +1359,34 @@ fn a_stalled_subscriber_does_not_delay_run_completion() {
         )
     };
     let fixture = Fixture::new();
+
+    // The baseline run carries a subscriber that *is* drained, so the only
+    // thing that differs between the two runs is whether anyone consumes.
+    // Measuring against a run with no subscriber at all folded in every
+    // per-event delivery read that only happens once one exists — on a slow
+    // filesystem that asymmetry alone was 750 ms, and the test failed on
+    // Windows for doing more I/O rather than for being delayed by the stall.
     let started = Instant::now();
     let baseline = fixture.start(make_agent("subscriber_baseline"));
+    let drained = fixture.coordinator.subscribe(baseline).unwrap();
+    let drainer = thread::spawn(move || while drained.recv().is_ok() {});
     fixture.terminal(baseline);
     let baseline_duration = started.elapsed();
+    drainer.join().unwrap();
 
     let started = Instant::now();
     let stalled = fixture.start(make_agent("subscriber_stalled"));
     let receiver = fixture.coordinator.subscribe(stalled).unwrap();
     fixture.terminal(stalled);
     let stalled_duration = started.elapsed();
+
+    // A push that blocked rather than dropping would not merely be slower: the
+    // run would never reach terminal and `terminal` would fail on its own five
+    // second deadline. This bound catches the softer regression of a push that
+    // waits per event, so it is set above ordinary scheduling noise on a
+    // contended runner rather than tight against it.
     assert!(
-        stalled_duration <= baseline_duration + Duration::from_millis(500),
+        stalled_duration <= baseline_duration + Duration::from_secs(2),
         "stalled subscriber delayed completion: baseline={baseline_duration:?}, stalled={stalled_duration:?}"
     );
     let mut lagged = false;
