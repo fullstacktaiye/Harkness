@@ -66,7 +66,10 @@
     },
     {
       "expect": {
-        "kind": "tool_result"
+        "kind": "tool_result",
+        "output_contains": {
+          "passed": true
+        }
       },
       "action": {
         "kind": "call_tool",

@@ -120,12 +120,14 @@ use serde_json::Value;
 use time::OffsetDateTime;
 
 use crate::approval::{
-    ApprovalDecision, ApprovalGrant, ApprovalId, ApprovalRequest, ApprovalState,
+    ApprovalDecision, ApprovalGrant, ApprovalId, ApprovalRequest, ApprovalState, InputHash,
+    canonical_input_hash,
 };
 use crate::domain::{
     ArtifactId, Failure, Run, RunDomainError, RunId, Step, StepId, Task, TaskId, ToolCall,
     ToolCallId,
 };
+use crate::tool::ToolIdentity;
 use crate::trust::{TrustState, WorkspaceTrust};
 
 pub use artifact::{ARTIFACTS_DIRECTORY, Artifact, ArtifactSink, Availability, StoreArtifacts};
@@ -572,6 +574,25 @@ impl Store {
     /// [`StoreError::AlreadyExists`] when the identity is taken.
     pub fn insert_run(&self, run: &Run) -> Result<(), StoreError> {
         repository::insert_run(&guard(&self.writer), run)
+    }
+
+    /// Stores a run and its first event in one transaction.
+    ///
+    /// A refused event leaves no inert queued run behind.
+    pub fn insert_run_with_event(
+        &self,
+        run: &Run,
+        event: RunEvent,
+    ) -> Result<EventSeq, StoreError> {
+        let prepared = self.prepare_event(run.id(), event)?;
+        self.commit_event(
+            "inserting a run with its first event",
+            prepared,
+            |connection, prepared| {
+                repository::insert_run(connection, run)?;
+                prepared.append(connection, run.id())
+            },
+        )
     }
 
     /// Loads one run.
@@ -1240,9 +1261,67 @@ impl Store {
         at: OffsetDateTime,
         event: RunEvent,
     ) -> Result<(ToolCall, EventSeq), StoreError> {
-        self.begin_tool_call(id, event, "dispatching an approved tool call", |call| {
-            call.dispatch_approved(decided_by, tool_version, at)
-        })
+        let call = self.load_tool_call(id)?;
+        let expected_tool = ToolIdentity::parse(call.tool_id(), tool_version).map_err(|error| {
+            StoreError::ColumnEncoding {
+                record: "tool_call",
+                field: "tool_id",
+                reason: error.to_string(),
+            }
+        })?;
+        let expected_input_hash = canonical_input_hash(call.input())?;
+        self.dispatch_bound_approved_tool_call_with_event(
+            id,
+            decided_by,
+            &expected_tool,
+            expected_input_hash,
+            at,
+            event,
+        )
+    }
+
+    /// Dispatches an approved call only while its durable request still
+    /// matches the identity and input digest authorized by the coordinator.
+    pub fn dispatch_bound_approved_tool_call_with_event(
+        &self,
+        id: ToolCallId,
+        decided_by: &str,
+        expected_tool: &ToolIdentity,
+        expected_input_hash: InputHash,
+        at: OffsetDateTime,
+        event: RunEvent,
+    ) -> Result<(ToolCall, EventSeq), StoreError> {
+        let run_id = self.load_tool_call(id)?.run_id();
+        let prepared = self.prepare_event(run_id, event)?;
+        self.commit_event(
+            "dispatching an approved tool call",
+            prepared,
+            |connection, prepared| {
+                let mut call = repository::load_tool_call(connection, id)?;
+                if call.tool_id() != expected_tool.id.as_str()
+                    || (!call.tool_version().is_empty()
+                        && call.tool_version() != expected_tool.version.to_string())
+                {
+                    return Err(StoreError::ApprovalBindingMismatch {
+                        call: id.to_string(),
+                        reason: "tool identity changed",
+                    });
+                }
+                let actual_hash = canonical_input_hash(call.input())?;
+                if actual_hash != expected_input_hash {
+                    return Err(StoreError::ApprovalBindingMismatch {
+                        call: id.to_string(),
+                        reason: "input changed",
+                    });
+                }
+                call.dispatch_approved(decided_by, expected_tool.version.to_string(), at)
+                    .map_err(StoreError::InvalidTransition)?;
+                repository::update_tool_call(connection, &call)?;
+                repository::pin_tool_call_version(connection, &call)?;
+                let seq = prepared.append(connection, call.run_id())?;
+                Ok((call, seq))
+            },
+        )
     }
 
     /// Succeeds a tool call with its output and appends its event.
@@ -1344,6 +1423,11 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<StoredEvent>, StoreError> {
         self.with_reader(|connection| event::events(connection, run_id, after, limit))
+    }
+
+    /// Returns the highest durable event sequence for `run_id`, if any.
+    pub fn latest_event_seq(&self, run_id: RunId) -> Result<Option<EventSeq>, StoreError> {
+        self.with_reader(|connection| event::latest_sequence(connection, run_id))
     }
 
     // -- artifacts ------------------------------------------------------------

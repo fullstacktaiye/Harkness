@@ -9,8 +9,11 @@ use std::time::{Duration, Instant};
 
 use harkness_git::Cancellation;
 
+use crate::approval::InputHash;
 use crate::domain::{RunId, ToolCallId};
-use crate::tool::{CompletedCall, ExecutionError, RiskLevel, ToolExecutor, ToolId, ToolVersion};
+use crate::tool::{
+    CompletedCall, ExecutionError, RiskLevel, ToolExecutor, ToolId, ToolIdentity, ToolVersion,
+};
 
 use super::ticket::{CallTicket, Report, outcome_channel};
 use super::{ProcessSlots, ScheduleError, ScheduleSnapshot, WorkspaceKey, WorkspaceLoad};
@@ -87,6 +90,11 @@ enum Admission {
     Pending,
     /// A call held for a decision, resumed by the decision itself.
     Approved { decided_by: String },
+    BoundApproved {
+        decided_by: String,
+        expected_tool: ToolIdentity,
+        expected_input_hash: InputHash,
+    },
 }
 
 impl ScheduledCall {
@@ -125,6 +133,23 @@ impl ScheduledCall {
     pub fn approved_by(mut self, decided_by: impl Into<String>) -> Self {
         self.admission = Admission::Approved {
             decided_by: decided_by.into(),
+        };
+        self
+    }
+
+    /// Schedules an approved call with the exact durable request binding that
+    /// was authorized before it entered the scheduler queue.
+    #[must_use]
+    pub fn approved_with_binding(
+        mut self,
+        decided_by: impl Into<String>,
+        expected_tool: ToolIdentity,
+        expected_input_hash: InputHash,
+    ) -> Self {
+        self.admission = Admission::BoundApproved {
+            decided_by: decided_by.into(),
+            expected_tool,
+            expected_input_hash,
         };
         self
     }
@@ -987,6 +1012,18 @@ impl Inner {
             Admission::Approved { decided_by } => self.executor.execute_approved(
                 waiting.call,
                 decided_by,
+                &waiting.root,
+                &waiting.cancellation,
+            ),
+            Admission::BoundApproved {
+                decided_by,
+                expected_tool,
+                expected_input_hash,
+            } => self.executor.execute_bound_approved(
+                waiting.call,
+                decided_by,
+                expected_tool,
+                *expected_input_hash,
                 &waiting.root,
                 &waiting.cancellation,
             ),

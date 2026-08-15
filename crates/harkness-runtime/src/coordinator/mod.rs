@@ -16,7 +16,9 @@ mod subscription;
 #[cfg(test)]
 mod tests;
 
+use std::any::Any;
 use std::collections::{HashMap, VecDeque};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::thread;
 
@@ -41,7 +43,7 @@ use crate::schedule::{ScheduledCall, Scheduler, WorkspaceKey};
 use crate::store::{
     DEFAULT_EVENT_PAGE_LIMIT, EventKind, EventSeq, RunEvent, RunPage, Store, StoredEvent,
 };
-use crate::tool::{CallOutcome, ToolExecutor, ToolRegistry};
+use crate::tool::{CallOutcome, ExecutionError, ToolExecutor, ToolRegistry};
 use crate::trust::{ExecutionMode, PathBoundary};
 
 const MAX_AGENT_TURNS: usize = 1_024;
@@ -144,18 +146,32 @@ impl RunCoordinator {
                     reason: error.to_string(),
                 }
             })?;
+        let policy = self
+            .inner
+            .policy
+            .for_workspace(workspace_key.canonical_root());
 
         let now = OffsetDateTime::now_utc();
         let run = Run::new(task_id, now);
         let run_id = run.id();
-        self.inner.store.insert_run(&run)?;
-        self.delivery(run_id);
-        self.inner.store.append_event(
-            run_id,
+        self.inner.store.insert_run_with_event(
+            &run,
             RunEvent::new(EventKind::RunStateChanged, now)
                 .with_payload(json!({"state": ExecutionState::Queued.as_str()})),
         )?;
-        self.publish(run_id)?;
+        self.delivery(run_id);
+        if let Err(error) = self.publish(run_id) {
+            let _ = self.inner.store.append_event(
+                run_id,
+                RunEvent::new(EventKind::Diagnostic, OffsetDateTime::now_utc()).with_payload(
+                    json!({
+                        "kind": "startup_delivery_failed",
+                        "error_kind": error.kind(),
+                        "message": error.to_string(),
+                    }),
+                ),
+            );
+        }
 
         let cancellation = Cancellation::default();
         self.inner
@@ -179,6 +195,7 @@ impl RunCoordinator {
                     task,
                     workspace,
                     workspace_key,
+                    policy,
                     cancellation,
                     agent,
                 )
@@ -282,18 +299,23 @@ impl RunCoordinator {
     pub fn subscribe(&self, run: RunId) -> Result<EventReceiver, RuntimeError> {
         self.inner.store.load_run(run)?;
         let delivery = self.delivery(run);
-        let subscriber = Arc::new(subscription::Subscriber::default());
         let mut state = delivery
             .state
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let replay = load_all_events(&self.inner.store, run)?;
+        let replay_tip = self.inner.store.latest_event_seq(run)?;
+        let subscriber = Arc::new(subscription::Subscriber::new(replay_tip));
         if state.closed {
             subscriber.close();
         } else {
             state.subscribers.push(Arc::downgrade(&subscriber));
         }
-        Ok(EventReceiver::new(subscriber, replay))
+        Ok(EventReceiver::new(
+            subscriber,
+            Arc::clone(&self.inner.store),
+            run,
+            replay_tip,
+        ))
     }
 
     /// Delegates newest-first run listing to the durable store.
@@ -404,6 +426,7 @@ struct RunWorker {
     task: Task,
     workspace: WorkspaceRef,
     workspace_key: WorkspaceKey,
+    policy: PolicyEngine,
     cancellation: Cancellation,
     agent: Box<dyn Agent>,
     planned: VecDeque<StepId>,
@@ -426,12 +449,14 @@ impl WorkerFault {
 }
 
 impl RunWorker {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         inner: Arc<CoordinatorInner>,
         run: RunId,
         task: Task,
         workspace: WorkspaceRef,
         workspace_key: WorkspaceKey,
+        policy: PolicyEngine,
         cancellation: Cancellation,
         agent: Box<dyn Agent>,
     ) -> Self {
@@ -441,6 +466,7 @@ impl RunWorker {
             task,
             workspace,
             workspace_key,
+            policy,
             cancellation,
             agent,
             planned: VecDeque::new(),
@@ -453,8 +479,14 @@ impl RunWorker {
             .store
             .set_run_owner(self.run, Some(std::process::id()))
             .ok();
-        if let Err(fault) = self.drive_inner() {
-            self.record_fault(fault);
+        let outcome = catch_unwind(AssertUnwindSafe(|| self.drive_inner()));
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(fault)) => self.record_fault(fault),
+            Err(payload) => self.record_fault(WorkerFault::new(
+                "coordinator_panicked",
+                panic_payload(&*payload),
+            )),
         }
         let _ = self.inner.store.set_run_owner(self.run, None);
         let _ = publish(&self.inner, self.run);
@@ -489,9 +521,18 @@ impl RunWorker {
             }
 
             self.record_observation(&observation)?;
-            let action = self.agent.next_action(observation.clone());
+            let action = catch_unwind(AssertUnwindSafe(|| {
+                self.agent.next_action(observation.clone())
+            }))
+            .map_err(|payload| WorkerFault::new("agent_panicked", panic_payload(&*payload)))?;
+            if self.cancellation.is_cancelled() {
+                return self.finish_cancelled(None);
+            }
             self.record_action(&action)?;
             self.record_checkpoint()?;
+            if self.cancellation.is_cancelled() {
+                return self.finish_cancelled(None);
+            }
 
             match action {
                 AgentAction::Plan { steps } => {
@@ -512,6 +553,7 @@ impl RunWorker {
                     observation = next;
                 }
                 AgentAction::CompleteRun { summary } => {
+                    self.terminalize_unexecuted_steps()?;
                     let at = OffsetDateTime::now_utc();
                     self.inner
                         .store
@@ -527,6 +569,7 @@ impl RunWorker {
                     return Ok(());
                 }
                 AgentAction::FailRun { reason } => {
+                    self.terminalize_unexecuted_steps()?;
                     let at = OffsetDateTime::now_utc();
                     let message = serde_json::to_string(&reason)
                         .unwrap_or_else(|_| "the agent failed the run".to_owned());
@@ -581,12 +624,14 @@ impl RunWorker {
     }
 
     fn record_checkpoint(&self) -> Result<(), WorkerFault> {
+        let state = catch_unwind(AssertUnwindSafe(|| self.agent.state()))
+            .map_err(|payload| WorkerFault::new("agent_panicked", panic_payload(&*payload)))?;
         self.inner
             .store
             .append_event(
                 self.run,
                 RunEvent::new(EventKind::AgentCheckpoint, OffsetDateTime::now_utc())
-                    .with_payload(self.agent.state().to_event_payload()),
+                    .with_payload(state.to_event_payload()),
             )
             .map_err(store_fault)?;
         self.publish()
@@ -696,6 +741,23 @@ impl RunWorker {
                 return self.fail_before_policy(&step, call_id, error.kind(), error.to_string());
             }
         };
+        if self.cancellation.is_cancelled() {
+            let at = OffsetDateTime::now_utc();
+            self.inner
+                .store
+                .transition_tool_call_with_event(
+                    call_id,
+                    ToolCallState::Cancelled,
+                    at,
+                    RunEvent::new(EventKind::ToolCallStateChanged, at)
+                        .for_step(step.id())
+                        .for_tool_call(call_id)
+                        .with_payload(json!({"state": "cancelled"})),
+                )
+                .map_err(store_fault)?;
+            self.finish_cancelled(Some(step.id()))?;
+            return Ok(None);
+        }
 
         let input_hash = canonical_input_hash(&input)
             .map_err(|error| WorkerFault::new(error.kind(), error.to_string()))?;
@@ -724,8 +786,25 @@ impl RunWorker {
         )
         .with_paths(prepared.paths())
         .with_grants(&matching);
-        let decision = self.inner.policy.evaluate(&request);
+        let decision = self.policy.evaluate(&request);
         let risk = request.risk();
+        if self.cancellation.is_cancelled() {
+            let at = OffsetDateTime::now_utc();
+            self.inner
+                .store
+                .transition_tool_call_with_event(
+                    call_id,
+                    ToolCallState::Cancelled,
+                    at,
+                    RunEvent::new(EventKind::ToolCallStateChanged, at)
+                        .for_step(step.id())
+                        .for_tool_call(call_id)
+                        .with_payload(json!({"state": "cancelled"})),
+                )
+                .map_err(store_fault)?;
+            self.finish_cancelled(Some(step.id()))?;
+            return Ok(None);
+        }
         let at = OffsetDateTime::now_utc();
         self.inner
             .store
@@ -1008,7 +1087,12 @@ impl RunWorker {
             )
             .map_err(store_fault)?;
         self.publish()?;
-        self.execute_scheduled(step, call, risk, Some(decided_by.to_owned()))
+        self.execute_scheduled(
+            step,
+            call,
+            risk,
+            Some((decided_by.to_owned(), identity, input_hash)),
+        )
     }
 
     fn execute_scheduled(
@@ -1016,7 +1100,11 @@ impl RunWorker {
         step: Step,
         call: crate::domain::ToolCallId,
         risk: crate::tool::RiskLevel,
-        approved_by: Option<String>,
+        approval: Option<(
+            String,
+            crate::tool::ToolIdentity,
+            crate::approval::InputHash,
+        )>,
     ) -> Result<Option<Observation>, WorkerFault> {
         let mut scheduled = ScheduledCall::new(
             call,
@@ -1024,8 +1112,9 @@ impl RunWorker {
             risk,
             self.cancellation.clone(),
         );
-        if let Some(decided_by) = approved_by {
-            scheduled = scheduled.approved_by(decided_by);
+        if let Some((decided_by, expected_tool, expected_input_hash)) = approval {
+            scheduled =
+                scheduled.approved_with_binding(decided_by, expected_tool, expected_input_hash);
         }
         let mut ticket = self
             .inner
@@ -1041,7 +1130,13 @@ impl RunWorker {
                 }
             }
         }
-        .map_err(|error| WorkerFault::new(error.kind(), error.to_string()))?;
+        .map_err(|error| match error {
+            crate::schedule::ScheduleError::Execution { source, .. } => match *source {
+                ExecutionError::Store(error) => store_fault(error),
+                source => WorkerFault::new(source.kind(), source.to_string()),
+            },
+            error => WorkerFault::new(error.kind(), error.to_string()),
+        })?;
         self.publish()?;
 
         match completed.outcome() {
@@ -1162,8 +1257,77 @@ impl RunWorker {
         Ok(())
     }
 
+    fn terminalize_unexecuted_steps(&mut self) -> Result<(), WorkerFault> {
+        while let Some(step) = self.planned.pop_front() {
+            let record = self.inner.store.load_step(step).map_err(store_fault)?;
+            if !record.state().is_terminal() {
+                self.finish_step(step, ExecutionState::Cancelled)?;
+            }
+        }
+        Ok(())
+    }
+
     fn record_fault(&self, fault: WorkerFault) {
         let at = OffsetDateTime::now_utc();
+        for request in self.inner.store.run_approvals(self.run).unwrap_or_default() {
+            if request.state() == ApprovalState::Pending
+                && let Ok((resolved, _)) =
+                    self.inner
+                        .store
+                        .resolve_approval(request.id(), ApprovalState::Cancelled, at)
+            {
+                self.inner.approvals.resolve_from(&resolved);
+            }
+        }
+        for call in self
+            .inner
+            .store
+            .load_run_tool_calls(self.run)
+            .unwrap_or_default()
+        {
+            if !call.state().is_terminal() {
+                if call.state() == ToolCallState::AwaitingApproval {
+                    let _ = self.inner.store.transition_tool_call_with_event(
+                        call.id(),
+                        ToolCallState::Cancelled,
+                        at,
+                        RunEvent::new(EventKind::ToolCallStateChanged, at)
+                            .for_step(call.step_id())
+                            .for_tool_call(call.id())
+                            .with_payload(json!({"state": "cancelled", "kind": fault.kind})),
+                    );
+                } else {
+                    let failure = Failure::new(fault.kind, &fault.message);
+                    let _ = self.inner.store.fail_tool_call_with_event(
+                        call.id(),
+                        failure,
+                        at,
+                        RunEvent::new(EventKind::ToolCallStateChanged, at)
+                            .for_step(call.step_id())
+                            .for_tool_call(call.id())
+                            .with_payload(json!({"state": "failed", "kind": fault.kind})),
+                    );
+                }
+            }
+        }
+        for step in self
+            .inner
+            .store
+            .load_run_steps(self.run)
+            .unwrap_or_default()
+        {
+            if !step.state().is_terminal() {
+                let failure = Failure::new(fault.kind, &fault.message);
+                let _ = self.inner.store.fail_step_with_event(
+                    step.id(),
+                    failure,
+                    at,
+                    RunEvent::new(EventKind::StepFinished, at)
+                        .for_step(step.id())
+                        .with_payload(json!({"state": "failed", "kind": fault.kind})),
+                );
+            }
+        }
         let _ = self.inner.store.append_event(
             self.run,
             RunEvent::new(EventKind::Diagnostic, at).with_payload(json!({
@@ -1187,6 +1351,14 @@ impl RunWorker {
     fn publish(&self) -> Result<(), WorkerFault> {
         publish(&self.inner, self.run).map_err(store_fault)
     }
+}
+
+fn panic_payload(payload: &(dyn Any + Send)) -> String {
+    payload
+        .downcast_ref::<&'static str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a component panicked with a non-string payload".to_owned())
 }
 
 fn store_fault(error: crate::store::StoreError) -> WorkerFault {

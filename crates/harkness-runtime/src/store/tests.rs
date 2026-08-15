@@ -726,6 +726,30 @@ fn a_repeated_identity_is_refused_instead_of_overwriting_history() {
 }
 
 #[test]
+fn inserting_a_run_and_first_event_rolls_back_both_on_event_refusal() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let existing = stored_run(&fixture.store, &task);
+    let foreign_step = stored_step(&fixture.store, &existing);
+    let run = Run::new(task.id(), at(20));
+
+    let error = fixture
+        .store
+        .insert_run_with_event(
+            &run,
+            RunEvent::new(EventKind::Diagnostic, at(20)).for_step(foreign_step.id()),
+        )
+        .unwrap_err();
+
+    assert!(matches!(error.kind(), "missing_parent" | "query_failed"));
+    assert_eq!(
+        fixture.store.load_run(run.id()).unwrap_err().kind(),
+        "not_found"
+    );
+    assert!(fixture.store.events(run.id(), None, 10).unwrap().is_empty());
+}
+
+#[test]
 fn a_second_step_cannot_reuse_an_ordinal_within_its_run() {
     let fixture = Fixture::new();
     let task = stored_task(&fixture.store);

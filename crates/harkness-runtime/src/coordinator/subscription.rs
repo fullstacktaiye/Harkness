@@ -3,7 +3,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::domain::RunId;
-use crate::store::{EventSeq, StoredEvent};
+use crate::store::{DEFAULT_EVENT_PAGE_LIMIT, EventSeq, Store, StoredEvent};
 
 /// Maximum live events retained for one subscriber.
 pub const SUBSCRIBER_CAPACITY: usize = 64;
@@ -47,14 +47,26 @@ struct QueueState {
     closed: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct Subscriber {
     state: Mutex<QueueState>,
     ready: Condvar,
+    live_after: Option<EventSeq>,
 }
 
 impl Subscriber {
+    pub(super) fn new(live_after: Option<EventSeq>) -> Self {
+        Self {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+            live_after,
+        }
+    }
+
     pub(super) fn push(&self, event: StoredEvent) {
+        if self.live_after.is_some_and(|tip| event.seq <= tip) {
+            return;
+        }
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if state.closed {
             return;
@@ -85,25 +97,70 @@ impl Subscriber {
 #[derive(Debug)]
 pub struct EventReceiver {
     subscriber: Arc<Subscriber>,
-    replay: Mutex<VecDeque<StoredEvent>>,
+    replay: Mutex<ReplayState>,
+}
+
+#[derive(Debug)]
+struct ReplayState {
+    store: Arc<Store>,
+    run: RunId,
+    tip: Option<EventSeq>,
+    cursor: Option<EventSeq>,
+    items: VecDeque<StoredEvent>,
+    exhausted: bool,
 }
 
 impl EventReceiver {
-    pub(super) fn new(subscriber: Arc<Subscriber>, replay: Vec<StoredEvent>) -> Self {
+    pub(super) fn new(
+        subscriber: Arc<Subscriber>,
+        store: Arc<Store>,
+        run: RunId,
+        tip: Option<EventSeq>,
+    ) -> Self {
         Self {
             subscriber,
-            replay: Mutex::new(replay.into()),
+            replay: Mutex::new(ReplayState {
+                store,
+                run,
+                tip,
+                cursor: None,
+                items: VecDeque::new(),
+                exhausted: tip.is_none(),
+            }),
         }
+    }
+
+    fn replay_next(&self) -> Option<StoredEvent> {
+        let mut replay = self.replay.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(event) = replay.items.pop_front() {
+            return Some(event);
+        }
+        if replay.exhausted {
+            return None;
+        }
+        let page = match replay
+            .store
+            .events(replay.run, replay.cursor, DEFAULT_EVENT_PAGE_LIMIT)
+        {
+            Ok(page) => page,
+            Err(_) => {
+                replay.exhausted = true;
+                self.subscriber.close();
+                return None;
+            }
+        };
+        let tip = replay.tip.expect("a non-empty replay has a tip");
+        replay
+            .items
+            .extend(page.into_iter().take_while(|event| event.seq <= tip));
+        replay.cursor = replay.items.back().map(|event| event.seq).or(replay.cursor);
+        replay.exhausted = replay.cursor.is_none_or(|cursor| cursor >= tip);
+        replay.items.pop_front()
     }
 
     /// Waits until an event is available or the stream closes.
     pub fn recv(&self) -> Result<EventDelivery, ReceiveTimeoutError> {
-        if let Some(event) = self
-            .replay
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pop_front()
-        {
+        if let Some(event) = self.replay_next() {
             return Ok(EventDelivery::Event(event));
         }
         let mut state = self
@@ -128,12 +185,7 @@ impl EventReceiver {
 
     /// Waits no longer than `limit` for an event.
     pub fn recv_timeout(&self, limit: Duration) -> Result<EventDelivery, ReceiveTimeoutError> {
-        if let Some(event) = self
-            .replay
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pop_front()
-        {
+        if let Some(event) = self.replay_next() {
             return Ok(EventDelivery::Event(event));
         }
         let deadline = Instant::now() + limit;
@@ -163,12 +215,7 @@ impl EventReceiver {
 
     /// Returns immediately with the next available event.
     pub fn try_recv(&self) -> Result<EventDelivery, TryReceiveError> {
-        if let Some(event) = self
-            .replay
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pop_front()
-        {
+        if let Some(event) = self.replay_next() {
             return Ok(EventDelivery::Event(event));
         }
         let mut state = self

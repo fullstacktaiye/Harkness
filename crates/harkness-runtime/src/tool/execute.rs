@@ -129,6 +129,7 @@ use harkness_git::Cancellation;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 
+use crate::approval::InputHash;
 use crate::domain::{Failure, RunId, StepId, ToolCall, ToolCallId, ToolCallState};
 use crate::store::{EventKind, RunEvent, Store, StoreArtifacts, StoreError};
 
@@ -465,10 +466,17 @@ impl ExecutionError {
 enum Start<'a> {
     /// An authorized call nobody had to decide on.
     Pending,
+    /// Compatibility entry point for callers that do not carry a prior
+    /// coordinator binding.
+    LegacyApproved { decided_by: &'a str },
     /// A call held for a decision, resumed by the decision itself.
     Approved {
         /// Stable identity of whoever decided, recorded in the audit history.
         decided_by: &'a str,
+        /// Tool identity that decision authorized.
+        expected_tool: &'a ToolIdentity,
+        /// Canonical input digest that decision authorized.
+        expected_input_hash: InputHash,
     },
 }
 
@@ -477,7 +485,7 @@ impl Start<'_> {
     const fn required_state(&self) -> ToolCallState {
         match self {
             Self::Pending => ToolCallState::Pending,
-            Self::Approved { .. } => ToolCallState::AwaitingApproval,
+            Self::LegacyApproved { .. } | Self::Approved { .. } => ToolCallState::AwaitingApproval,
         }
     }
 }
@@ -653,7 +661,30 @@ impl ToolExecutor {
     ) -> Result<CompletedCall, ExecutionError> {
         self.run(
             call,
-            &Start::Approved { decided_by },
+            &Start::LegacyApproved { decided_by },
+            workspace_root,
+            cancellation,
+        )
+    }
+
+    /// Runs an approved call only if its durable request still matches the
+    /// exact authorization binding supplied by the coordinator.
+    pub fn execute_bound_approved(
+        &self,
+        call: ToolCallId,
+        decided_by: &str,
+        expected_tool: &ToolIdentity,
+        expected_input_hash: InputHash,
+        workspace_root: impl Into<PathBuf>,
+        cancellation: &Cancellation,
+    ) -> Result<CompletedCall, ExecutionError> {
+        self.run(
+            call,
+            &Start::Approved {
+                decided_by,
+                expected_tool,
+                expected_input_hash,
+            },
             workspace_root,
             cancellation,
         )
@@ -679,7 +710,15 @@ impl ToolExecutor {
         // Resolution happens before anything is written, so a call naming a tool
         // that does not exist fails without ever having been `running`.
         let step = record.step_id();
-        let tool = match self.resolve(&record) {
+        let resolved = match start {
+            Start::Pending | Start::LegacyApproved { .. } => self.resolve(&record),
+            Start::Approved { expected_tool, .. } => self
+                .registry
+                .resolve(&expected_tool.id, Some(&expected_tool.version))
+                .cloned()
+                .map_err(InvocationError::from),
+        };
+        let tool = match resolved {
             Ok(tool) => tool,
             Err(error) => {
                 let failure = error.as_failure();
@@ -735,7 +774,7 @@ impl ToolExecutor {
             "tool_id": identity.id.as_str(),
             "tool_version": version,
         });
-        if let Start::Approved { decided_by } = start {
+        if let Start::LegacyApproved { decided_by } | Start::Approved { decided_by, .. } = start {
             // The decision belongs on the timeline as well as in the approval
             // history: a reader of the log should see *why* a call that was
             // waiting is suddenly running.
@@ -749,9 +788,21 @@ impl ToolExecutor {
             Start::Pending => self
                 .store
                 .dispatch_tool_call_with_event(call, &version, at, event)?,
-            Start::Approved { decided_by } => self
+            Start::LegacyApproved { decided_by } => self
                 .store
                 .dispatch_approved_tool_call_with_event(call, decided_by, &version, at, event)?,
+            Start::Approved {
+                decided_by,
+                expected_tool,
+                expected_input_hash,
+            } => self.store.dispatch_bound_approved_tool_call_with_event(
+                call,
+                decided_by,
+                expected_tool,
+                *expected_input_hash,
+                at,
+                event,
+            )?,
         };
         let run_id = dispatched.run_id();
 

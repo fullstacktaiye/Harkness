@@ -230,7 +230,14 @@ fn every_scenario_replays_its_complete_action_sequence_through_the_agent_trait()
         ),
         Case::new(
             "edit_test_diff_success",
-            vec![started(), ok(), ok(), diff_artifact(), ok(), ok()],
+            vec![
+                started(),
+                ok(),
+                ok(),
+                diff_artifact(),
+                result(json!({"passed": true})),
+                ok(),
+            ],
             &[
                 "call:workspace.inspect",
                 "call:fs.read",

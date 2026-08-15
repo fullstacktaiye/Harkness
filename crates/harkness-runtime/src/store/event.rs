@@ -510,6 +510,31 @@ fn next_sequence(connection: &Connection, run_id: RunId) -> Result<EventSeq, Sto
     Ok(EventSeq(highest + 1))
 }
 
+/// Returns the durable tip of one run's log without materializing its history.
+pub(super) fn latest_sequence(
+    connection: &Connection,
+    run_id: RunId,
+) -> Result<Option<EventSeq>, StoreError> {
+    let highest: Option<i64> = connection
+        .query_row(
+            "SELECT MAX(seq) FROM run_events WHERE run_id = :run_id",
+            named_params! { ":run_id": run_id.to_string() },
+            |row| row.get(0),
+        )
+        .map_err(|error| query_failed("reading the latest event sequence", error))?;
+    highest
+        .map(|highest| {
+            u64::try_from(highest)
+                .map(EventSeq)
+                .map_err(|_| StoreError::ColumnEncoding {
+                    record: RUN_EVENT,
+                    field: "seq",
+                    reason: format!("{highest} is not a representable sequence number"),
+                })
+        })
+        .transpose()
+}
+
 /// Returns one page of a run's log, ordered by sequence.
 pub(super) fn events(
     connection: &Connection,

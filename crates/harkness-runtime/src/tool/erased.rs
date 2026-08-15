@@ -327,7 +327,17 @@ where
         })?;
         schema::validate(&self.input, identity, SchemaDirection::Input, &instance)?;
         let typed = schema::deserialize_input::<T::Input>(identity, instance)?;
-        let effects = self.tool.request_effects(&typed, boundary)?;
+        let effects = match catch_unwind(AssertUnwindSafe(|| {
+            self.tool.request_effects(&typed, boundary)
+        })) {
+            Ok(result) => result?,
+            Err(payload) => {
+                return Err(ToolError::ToolPanicked {
+                    tool: identity.clone(),
+                    payload: panic_message(&*payload),
+                });
+            }
+        };
         let request_paths = effects
             .paths
             .iter()

@@ -569,7 +569,7 @@ impl Scenario {
                     ),
                 ),
                 step(
-                    tool_result(),
+                    tool_result_containing(json!({"passed": true})),
                     call("git.diff", json!({"target": "unstaged"})),
                 ),
                 step(
