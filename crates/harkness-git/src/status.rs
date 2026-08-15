@@ -270,6 +270,74 @@ pub(crate) fn inspect(path: &Path) -> Result<Option<GitStatus>, GitError> {
     }))
 }
 
+/// Reads the checked-out head without spawning Git.
+pub(crate) fn head(path: &Path) -> Result<Option<HeadState>, GitError> {
+    if !path.join(".git").exists() {
+        return Ok(None);
+    }
+    let repository = match Repository::open(path) {
+        Ok(repository) => repository,
+        Err(error) if error.code() == ErrorCode::NotFound => return Ok(None),
+        Err(source) => return Err(inspection(path, source)),
+    };
+    if repository.workdir().is_none() {
+        return Ok(None);
+    }
+    match repository.head() {
+        Ok(reference) if reference.is_branch() => Ok(Some(HeadState::Branch {
+            name: reference
+                .shorthand()
+                .map_err(|source| inspection(path, source))?
+                .to_owned(),
+        })),
+        Ok(reference) => Ok(Some(HeadState::Detached {
+            commit: reference
+                .target()
+                .ok_or_else(|| inspection(path, git2::Error::from_str("HEAD has no target")))?
+                .to_string(),
+        })),
+        Err(error) if matches!(error.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => {
+            let branch = repository
+                .find_reference("HEAD")
+                .ok()
+                .and_then(|reference| {
+                    reference
+                        .symbolic_target()
+                        .ok()
+                        .flatten()
+                        .map(str::to_owned)
+                })
+                .and_then(|target| target.strip_prefix("refs/heads/").map(str::to_owned));
+            Ok(Some(HeadState::Unborn { branch }))
+        }
+        Err(source) => Err(inspection(path, source)),
+    }
+}
+
+/// Returns whether each workspace-relative path is ignored by Git.
+///
+/// A non-repository is an ordinary workspace and therefore ignores nothing.
+pub(crate) fn ignored(path: &Path, candidates: &[PathBuf]) -> Result<Vec<bool>, GitError> {
+    if !path.join(".git").exists() {
+        return Ok(vec![false; candidates.len()]);
+    }
+    let repository = match Repository::open(path) {
+        Ok(repository) => repository,
+        Err(error) if error.code() == ErrorCode::NotFound => {
+            return Ok(vec![false; candidates.len()]);
+        }
+        Err(source) => return Err(inspection(path, source)),
+    };
+    candidates
+        .iter()
+        .map(|candidate| {
+            repository
+                .status_should_ignore(candidate)
+                .map_err(|source| inspection(path, source))
+        })
+        .collect()
+}
+
 /// Reports the detailed status of the repository rooted at `root`.
 ///
 /// One spawn, bounded by the local-read timeout, so it cannot hang a caller
@@ -295,6 +363,112 @@ pub(crate) fn detailed(
     let mut status = parse_porcelain_v2(&output.stdout)?;
     status.pending = pending(&repository);
     Ok(status)
+}
+
+/// Reports detailed status entirely through libgit2.
+///
+/// This is the read-tool path: it takes no repository lock and launches no
+/// process. The older porcelain parser remains for front ends whose contract
+/// is intentionally tied to system Git's status output.
+pub(crate) fn detailed_in_process(
+    root: &Path,
+    cancellation: &Cancellation,
+) -> Result<DetailedStatus, GitError> {
+    if cancellation.is_cancelled() {
+        return Err(GitError::Cancelled);
+    }
+    let repository = Repository::open(root).map_err(|source| inspection(root, source))?;
+    let head = head(root)?.ok_or_else(|| {
+        inspection(
+            root,
+            git2::Error::from_str("the path is not a working repository"),
+        )
+    })?;
+    let upstream = inspect(root)?.and_then(|status| status.upstream);
+    let mut options = StatusOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(false)
+        .include_ignored(false)
+        .renames_head_to_index(true)
+        .renames_index_to_workdir(true);
+    let statuses = repository
+        .statuses(Some(&mut options))
+        .map_err(|source| inspection(root, source))?;
+    let mut entries = Vec::with_capacity(statuses.len());
+    for entry in statuses.iter() {
+        if cancellation.is_cancelled() {
+            return Err(GitError::Cancelled);
+        }
+        let flags = entry.status();
+        let conflicted = flags.contains(Status::CONFLICTED);
+        let staged = if conflicted {
+            Some(FileChange::Unmerged)
+        } else {
+            staged_change(flags)
+        };
+        let unstaged = if conflicted {
+            Some(FileChange::Unmerged)
+        } else {
+            unstaged_change(flags)
+        };
+        let rename_source = if flags.contains(Status::INDEX_RENAMED) {
+            entry
+                .head_to_index()
+                .and_then(|delta| delta.old_file().path().map(Path::to_path_buf))
+        } else if flags.contains(Status::WT_RENAMED) {
+            entry
+                .index_to_workdir()
+                .and_then(|delta| delta.old_file().path().map(Path::to_path_buf))
+        } else {
+            None
+        };
+        entries.push(StatusEntry {
+            path: path_from_bytes(entry.path_bytes()),
+            staged,
+            unstaged,
+            rename_source,
+            conflicted,
+        });
+    }
+    Ok(DetailedStatus {
+        head,
+        upstream,
+        pending: pending(&repository),
+        entries,
+    })
+}
+
+fn staged_change(status: Status) -> Option<FileChange> {
+    if status.contains(Status::INDEX_NEW) {
+        Some(FileChange::Added)
+    } else if status.contains(Status::INDEX_MODIFIED) {
+        Some(FileChange::Modified)
+    } else if status.contains(Status::INDEX_DELETED) {
+        Some(FileChange::Deleted)
+    } else if status.contains(Status::INDEX_RENAMED) {
+        Some(FileChange::Renamed)
+    } else if status.contains(Status::INDEX_TYPECHANGE) {
+        Some(FileChange::TypeChanged)
+    } else {
+        None
+    }
+}
+
+fn unstaged_change(status: Status) -> Option<FileChange> {
+    if status.contains(Status::WT_NEW) {
+        Some(FileChange::Untracked)
+    } else if status.contains(Status::WT_MODIFIED) {
+        Some(FileChange::Modified)
+    } else if status.contains(Status::WT_DELETED) {
+        Some(FileChange::Deleted)
+    } else if status.contains(Status::WT_RENAMED) {
+        Some(FileChange::Renamed)
+    } else if status.contains(Status::WT_TYPECHANGE) {
+        Some(FileChange::TypeChanged)
+    } else {
+        None
+    }
 }
 
 /// Counts as a difference between the index and HEAD.

@@ -34,6 +34,7 @@ use crate::tool::{
     CallOutcome, ErasedTool, ExecutionContext, ExecutionError, RiskLevel, Tool, ToolError,
     ToolExecutor, ToolIdentity, ToolMetadata, ToolRegistry, erase,
 };
+use crate::tools::GitDiff;
 
 use super::{
     CallTicket, MAX_PROCESS_CONCURRENCY, OUTCOME_CAPACITY, ScheduleError, Scheduled, ScheduledCall,
@@ -307,7 +308,11 @@ impl Fixture {
 
     /// Records one pending call of `tool_id` against `step`.
     fn call(&self, step: &Step, tool_id: &str) -> ToolCallId {
-        let call = ToolCall::new(step, tool_id, "", json!({}), at(3));
+        self.call_with_input(step, tool_id, json!({}))
+    }
+
+    fn call_with_input(&self, step: &Step, tool_id: &str, input: serde_json::Value) -> ToolCallId {
+        let call = ToolCall::new(step, tool_id, "", input, at(3));
         self.store.insert_tool_call(&call).unwrap();
         call.id()
     }
@@ -526,6 +531,26 @@ fn reads_of_one_workspace_run_concurrently_up_to_the_cap() {
         WORKSPACE_READ_CONCURRENCY,
         "more reads ran at once than the cap allows"
     );
+}
+
+#[test]
+fn two_production_git_diffs_complete_through_the_scheduler_read_path() {
+    let fixture = Fixture::new();
+    let workspace = fixture.workspace("real-diff-reads");
+    harkness_test_fixtures::initialize_repository(workspace.canonical_root());
+    std::fs::write(workspace.canonical_root().join("tracked.txt"), b"changed\n").unwrap();
+    let step = fixture.run(&workspace);
+    let scheduler = fixture.scheduler(vec![eraseit(GitDiff)]);
+    let input = json!({"target": {"kind": "unstaged"}});
+    let first = fixture.call_with_input(&step, "git.diff", input.clone());
+    let second = fixture.call_with_input(&step, "git.diff", input);
+
+    let first = submit(&scheduler, first, &workspace, RiskLevel::Observe);
+    let second = submit(&scheduler, second, &workspace, RiskLevel::Observe);
+
+    assert_eq!(succeeded(first), ToolCallState::Succeeded);
+    assert_eq!(succeeded(second), ToolCallState::Succeeded);
+    assert!(!workspace.canonical_root().join(".git/index.lock").exists());
 }
 
 #[test]

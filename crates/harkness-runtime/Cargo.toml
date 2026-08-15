@@ -10,9 +10,11 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
+base64.workspace = true
 harkness-core.workspace = true
 harkness-git.workspace = true
 jsonschema.workspace = true
+regex.workspace = true
 rusqlite.workspace = true
 schemars.workspace = true
 semver.workspace = true
