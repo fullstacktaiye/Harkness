@@ -6,11 +6,15 @@
 //! single project a caller names.
 
 use std::{
+    collections::BTreeMap,
     fmt,
     path::{Path, PathBuf},
 };
 
-use git2::{Branch, ErrorCode, Repository, RepositoryState, Status, StatusOptions};
+use git2::{
+    Branch, Delta, DiffFindOptions, DiffOptions as GitDiffOptions, ErrorCode, Repository,
+    RepositoryState, Status, StatusOptions,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -187,6 +191,15 @@ pub struct DetailedStatus {
     pub entries: Vec<StatusEntry>,
 }
 
+/// A detailed status whose changed-path projection was bounded during its walk.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DetailedStatusPage {
+    /// Retained status fields and changed paths.
+    pub status: DetailedStatus,
+    /// Changed paths withheld by the requested bound.
+    pub omitted_entries: usize,
+}
+
 impl DetailedStatus {
     /// Whether any path was left unresolved by a merge.
     #[must_use]
@@ -270,6 +283,74 @@ pub(crate) fn inspect(path: &Path) -> Result<Option<GitStatus>, GitError> {
     }))
 }
 
+/// Reads the checked-out head without spawning Git.
+pub(crate) fn head(path: &Path) -> Result<Option<HeadState>, GitError> {
+    if !path.join(".git").exists() {
+        return Ok(None);
+    }
+    let repository = match Repository::open(path) {
+        Ok(repository) => repository,
+        Err(error) if error.code() == ErrorCode::NotFound => return Ok(None),
+        Err(source) => return Err(inspection(path, source)),
+    };
+    if repository.workdir().is_none() {
+        return Ok(None);
+    }
+    match repository.head() {
+        Ok(reference) if reference.is_branch() => Ok(Some(HeadState::Branch {
+            name: reference
+                .shorthand()
+                .map_err(|source| inspection(path, source))?
+                .to_owned(),
+        })),
+        Ok(reference) => Ok(Some(HeadState::Detached {
+            commit: reference
+                .target()
+                .ok_or_else(|| inspection(path, git2::Error::from_str("HEAD has no target")))?
+                .to_string(),
+        })),
+        Err(error) if matches!(error.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => {
+            let branch = repository
+                .find_reference("HEAD")
+                .ok()
+                .and_then(|reference| {
+                    reference
+                        .symbolic_target()
+                        .ok()
+                        .flatten()
+                        .map(str::to_owned)
+                })
+                .and_then(|target| target.strip_prefix("refs/heads/").map(str::to_owned));
+            Ok(Some(HeadState::Unborn { branch }))
+        }
+        Err(source) => Err(inspection(path, source)),
+    }
+}
+
+/// Returns whether each workspace-relative path is ignored by Git.
+///
+/// A non-repository is an ordinary workspace and therefore ignores nothing.
+pub(crate) fn ignored(path: &Path, candidates: &[PathBuf]) -> Result<Vec<bool>, GitError> {
+    if !path.join(".git").exists() {
+        return Ok(vec![false; candidates.len()]);
+    }
+    let repository = match Repository::open(path) {
+        Ok(repository) => repository,
+        Err(error) if error.code() == ErrorCode::NotFound => {
+            return Ok(vec![false; candidates.len()]);
+        }
+        Err(source) => return Err(inspection(path, source)),
+    };
+    candidates
+        .iter()
+        .map(|candidate| {
+            repository
+                .status_should_ignore(candidate)
+                .map_err(|source| inspection(path, source))
+        })
+        .collect()
+}
+
 /// Reports the detailed status of the repository rooted at `root`.
 ///
 /// One spawn, bounded by the local-read timeout, so it cannot hang a caller
@@ -295,6 +376,244 @@ pub(crate) fn detailed(
     let mut status = parse_porcelain_v2(&output.stdout)?;
     status.pending = pending(&repository);
     Ok(status)
+}
+
+/// Reports detailed status entirely through libgit2.
+///
+/// This is the read-tool path: it takes no repository lock and launches no
+/// process. The older porcelain parser remains for front ends whose contract
+/// is intentionally tied to system Git's status output.
+pub(crate) fn detailed_in_process(
+    root: &Path,
+    cancellation: &Cancellation,
+) -> Result<DetailedStatus, GitError> {
+    Ok(detailed_in_process_bounded(root, cancellation, usize::MAX)?.status)
+}
+
+/// Reports detailed status while retaining at most `maximum_entries` paths.
+pub(crate) fn detailed_in_process_bounded(
+    root: &Path,
+    cancellation: &Cancellation,
+    maximum_entries: usize,
+) -> Result<DetailedStatusPage, GitError> {
+    if cancellation.is_cancelled() {
+        return Err(GitError::Cancelled);
+    }
+    let repository = Repository::open(root).map_err(|source| inspection(root, source))?;
+    let head = head(root)?.ok_or_else(|| {
+        inspection(
+            root,
+            git2::Error::from_str("the path is not a working repository"),
+        )
+    })?;
+    let upstream = inspect(root)?.and_then(|status| status.upstream);
+    let rename_mode = status_rename_mode(&repository, root)?;
+    let copy_sources = if rename_mode == StatusRenameMode::Copies {
+        staged_copy_sources(&repository, root)?
+    } else {
+        BTreeMap::new()
+    };
+    let mut options = StatusOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(false)
+        .include_ignored(false);
+    let detect_renames = rename_mode != StatusRenameMode::Disabled;
+    options
+        .renames_head_to_index(detect_renames)
+        .renames_index_to_workdir(detect_renames);
+    let statuses = repository
+        .statuses(Some(&mut options))
+        .map_err(|source| inspection(root, source))?;
+    let retained = statuses.len().min(maximum_entries);
+    let mut entries = Vec::with_capacity(retained);
+    for entry in statuses.iter().take(maximum_entries) {
+        if cancellation.is_cancelled() {
+            return Err(GitError::Cancelled);
+        }
+        let flags = entry.status();
+        let conflicted = flags.contains(Status::CONFLICTED);
+        // `StatusEntry::path_bytes` reports the delta's *old* file, which for a
+        // rename is the name the file no longer has. Taking it verbatim made
+        // `path` and `rename_source` the same string and dropped the
+        // destination entirely, so a staged `git mv a b` read as "a was renamed
+        // from a" and `b` appeared nowhere in the result. Porcelain reports the
+        // destination, and every consumer means the destination by "the path".
+        let renamed_destination = if flags.contains(Status::INDEX_RENAMED) {
+            entry.head_to_index()
+        } else if flags.contains(Status::WT_RENAMED) {
+            entry.index_to_workdir()
+        } else {
+            None
+        }
+        .and_then(|delta| delta.new_file().path_bytes().map(path_from_bytes));
+        let path = renamed_destination.unwrap_or_else(|| path_from_bytes(entry.path_bytes()));
+        let staged = if conflicted {
+            Some(FileChange::Unmerged)
+        } else if copy_sources.contains_key(&path) {
+            Some(FileChange::Copied)
+        } else {
+            staged_change(flags)
+        };
+        let unstaged = if conflicted {
+            Some(FileChange::Unmerged)
+        } else {
+            unstaged_change(flags)
+        };
+        // `path_bytes` rather than `path`: git2's `bytes2path` unwraps a UTF-8
+        // conversion on Windows, so a non-UTF-8 rename source read through
+        // `path()` panics on the one platform that cannot represent it.
+        let rename_source = if let Some(source) = copy_sources.get(&path) {
+            Some(source.clone())
+        } else if flags.contains(Status::INDEX_RENAMED) {
+            entry
+                .head_to_index()
+                .and_then(|delta| delta.old_file().path_bytes().map(path_from_bytes))
+        } else if flags.contains(Status::WT_RENAMED) {
+            entry
+                .index_to_workdir()
+                .and_then(|delta| delta.old_file().path_bytes().map(path_from_bytes))
+        } else {
+            None
+        };
+        entries.push(StatusEntry {
+            path,
+            staged,
+            unstaged,
+            rename_source,
+            conflicted,
+        });
+    }
+    Ok(DetailedStatusPage {
+        status: DetailedStatus {
+            head,
+            upstream,
+            pending: pending(&repository),
+            entries,
+        },
+        omitted_entries: statuses.len().saturating_sub(retained),
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StatusRenameMode {
+    Disabled,
+    Renames,
+    Copies,
+}
+
+/// Reads the rename-detection setting the way Git itself reads it.
+///
+/// This value comes from the repository's own config and from the user's
+/// global one, so neither is a place a read may be refused from. Git accepts
+/// `copy` as well as `copies`, treats any non-zero integer and a valueless key
+/// as true, and this is untrusted repository content besides (ADR-0006), so a
+/// spelling this build does not recognize degrades to Git's own default rather
+/// than failing the status read. Refusing instead let one line in
+/// `~/.gitconfig` — `renames = copy`, which real Git accepts — make
+/// `git.status` fail in every workspace on the machine.
+fn status_rename_mode(repository: &Repository, root: &Path) -> Result<StatusRenameMode, GitError> {
+    let config = repository
+        .config()
+        .map_err(|source| inspection(root, source))?;
+    for key in ["status.renames", "diff.renames"] {
+        match config.get_string(key) {
+            Ok(value) => {
+                return Ok(match value.trim().to_ascii_lowercase().as_str() {
+                    "false" | "no" | "off" | "0" => StatusRenameMode::Disabled,
+                    "copies" | "copy" => StatusRenameMode::Copies,
+                    // A valueless key (`[status]\n\trenames`) reads as true.
+                    "" | "true" | "yes" | "on" => StatusRenameMode::Renames,
+                    other => match other.parse::<i64>() {
+                        Ok(0) => StatusRenameMode::Disabled,
+                        Ok(_) => StatusRenameMode::Renames,
+                        Err(_) => StatusRenameMode::Renames,
+                    },
+                });
+            }
+            Err(error) if error.code() == ErrorCode::NotFound => {}
+            Err(source) => return Err(inspection(root, source)),
+        }
+    }
+    Ok(StatusRenameMode::Renames)
+}
+
+fn staged_copy_sources(
+    repository: &Repository,
+    root: &Path,
+) -> Result<BTreeMap<PathBuf, PathBuf>, GitError> {
+    let head = match repository.head() {
+        Ok(head) => head,
+        Err(error) if matches!(error.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => {
+            return Ok(BTreeMap::new());
+        }
+        Err(source) => return Err(inspection(root, source)),
+    };
+    let tree = head
+        .peel_to_tree()
+        .map_err(|source| inspection(root, source))?;
+    let index = repository
+        .index()
+        .map_err(|source| inspection(root, source))?;
+    let mut options = GitDiffOptions::new();
+    let mut diff = repository
+        .diff_tree_to_index(Some(&tree), Some(&index), Some(&mut options))
+        .map_err(|source| inspection(root, source))?;
+    // `copies` only, never `copies_from_unmodified`. The latter is
+    // `--find-copies-harder`, which `status.renames=copies` does not ask for:
+    // Git reports a copy of an *unmodified* file as a plain add, so enabling it
+    // made this projection classify additions as copies that `git status` and
+    // the CLI's own projection both call `added`. It is also the expensive
+    // spelling — every added path against every tracked path — on a read that
+    // polls no cancellation token.
+    let mut find = DiffFindOptions::new();
+    find.copies(true).renames(true).remove_unmodified(true);
+    diff.find_similar(Some(&mut find))
+        .map_err(|source| inspection(root, source))?;
+    let mut sources = BTreeMap::new();
+    for delta in diff.deltas() {
+        if delta.status() != Delta::Copied {
+            continue;
+        }
+        let (Some(old), Some(new)) = (delta.old_file().path_bytes(), delta.new_file().path_bytes())
+        else {
+            continue;
+        };
+        sources.insert(path_from_bytes(new), path_from_bytes(old));
+    }
+    Ok(sources)
+}
+
+fn staged_change(status: Status) -> Option<FileChange> {
+    if status.contains(Status::INDEX_NEW) {
+        Some(FileChange::Added)
+    } else if status.contains(Status::INDEX_MODIFIED) {
+        Some(FileChange::Modified)
+    } else if status.contains(Status::INDEX_DELETED) {
+        Some(FileChange::Deleted)
+    } else if status.contains(Status::INDEX_RENAMED) {
+        Some(FileChange::Renamed)
+    } else if status.contains(Status::INDEX_TYPECHANGE) {
+        Some(FileChange::TypeChanged)
+    } else {
+        None
+    }
+}
+
+fn unstaged_change(status: Status) -> Option<FileChange> {
+    if status.contains(Status::WT_NEW) {
+        Some(FileChange::Untracked)
+    } else if status.contains(Status::WT_MODIFIED) {
+        Some(FileChange::Modified)
+    } else if status.contains(Status::WT_DELETED) {
+        Some(FileChange::Deleted)
+    } else if status.contains(Status::WT_RENAMED) {
+        Some(FileChange::Renamed)
+    } else if status.contains(Status::WT_TYPECHANGE) {
+        Some(FileChange::TypeChanged)
+    } else {
+        None
+    }
 }
 
 /// Counts as a difference between the index and HEAD.

@@ -20,7 +20,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use harkness_core::ProjectId;
+use harkness_core::{Project, ProjectId, ProjectSource};
 use harkness_git::Cancellation;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -32,8 +32,9 @@ use crate::domain::{Run, Step, Task, ToolCall, ToolCallId, ToolCallState};
 use crate::store::Store;
 use crate::tool::{
     CallOutcome, ErasedTool, ExecutionContext, ExecutionError, RiskLevel, Tool, ToolError,
-    ToolExecutor, ToolIdentity, ToolMetadata, ToolRegistry, erase,
+    ToolExecutor, ToolIdentity, ToolMetadata, ToolRegistry, WorkspaceMetadata, erase,
 };
+use crate::tools::{GitDiff, WorkspaceInspect};
 
 use super::{
     CallTicket, MAX_PROCESS_CONCURRENCY, OUTCOME_CAPACITY, ScheduleError, Scheduled, ScheduledCall,
@@ -307,7 +308,11 @@ impl Fixture {
 
     /// Records one pending call of `tool_id` against `step`.
     fn call(&self, step: &Step, tool_id: &str) -> ToolCallId {
-        let call = ToolCall::new(step, tool_id, "", json!({}), at(3));
+        self.call_with_input(step, tool_id, json!({}))
+    }
+
+    fn call_with_input(&self, step: &Step, tool_id: &str, input: serde_json::Value) -> ToolCallId {
+        let call = ToolCall::new(step, tool_id, "", input, at(3));
         self.store.insert_tool_call(&call).unwrap();
         call.id()
     }
@@ -360,6 +365,45 @@ fn submit(
             Cancellation::default(),
         ))
         .unwrap_or_else(|error| panic!("submitting {call} was refused: {error}"))
+}
+
+#[test]
+fn scheduler_supplies_verified_catalog_metadata_to_workspace_inspection() {
+    let fixture = Fixture::new();
+    let scheduler = fixture.scheduler(vec![eraseit(WorkspaceInspect)]);
+    let workspace = fixture.workspace("catalogued");
+    let step = fixture.run(&workspace);
+    let call = fixture.call(&step, "workspace.inspect");
+    let project = Project {
+        id: fixture.project,
+        display_name: "Catalogued workspace".to_owned(),
+        root: workspace.canonical_root().to_path_buf(),
+        source: ProjectSource::Local,
+        last_opened: at(0),
+        available: true,
+        git: None,
+    };
+    let scheduled = ScheduledCall::new(
+        call,
+        workspace.clone(),
+        RiskLevel::Observe,
+        Cancellation::default(),
+    )
+    .with_workspace_metadata(WorkspaceMetadata::from_project(&project))
+    .unwrap();
+
+    let ticket = scheduler.submit(scheduled).unwrap();
+    assert_eq!(settled(ticket).unwrap().state(), ToolCallState::Succeeded);
+    let output = fixture
+        .store
+        .load_tool_call(call)
+        .unwrap()
+        .output()
+        .unwrap()
+        .clone();
+    assert_eq!(output["project"]["id"], project.id.to_string());
+    assert_eq!(output["project"]["display_name"], project.display_name);
+    assert_eq!(output["project"]["source"], "local");
 }
 
 // ---------------------------------------------------------------------------
@@ -525,6 +569,33 @@ fn reads_of_one_workspace_run_concurrently_up_to_the_cap() {
         gate.peak(),
         WORKSPACE_READ_CONCURRENCY,
         "more reads ran at once than the cap allows"
+    );
+}
+
+#[test]
+fn two_production_git_diffs_complete_through_the_scheduler_read_path() {
+    let fixture = Fixture::new();
+    let workspace = fixture.workspace("real-diff-reads");
+    harkness_test_fixtures::initialize_repository(workspace.canonical_root());
+    std::fs::write(workspace.canonical_root().join("tracked.txt"), b"changed\n").unwrap();
+    let step = fixture.run(&workspace);
+    let scheduler = fixture.scheduler(vec![eraseit(GitDiff)]);
+    let input = json!({"target": {"kind": "unstaged"}});
+    let first = fixture.call_with_input(&step, "git.diff", input.clone());
+    let second = fixture.call_with_input(&step, "git.diff", input);
+
+    let first = submit(&scheduler, first, &workspace, RiskLevel::Observe);
+    let second = submit(&scheduler, second, &workspace, RiskLevel::Observe);
+
+    assert_eq!(succeeded(first), ToolCallState::Succeeded);
+    assert_eq!(succeeded(second), ToolCallState::Succeeded);
+    // The repository lock lives under `locks/` in the data directory, never in
+    // `.git`; `git.diff` builds its service with the workspace root as that
+    // directory, so this is where one would appear. The earlier `.git/index.lock`
+    // spelling named Git's own lock and held with no tool invoked at all.
+    assert!(
+        !workspace.canonical_root().join("locks").exists(),
+        "a read-only tool acquired the repository lock"
     );
 }
 

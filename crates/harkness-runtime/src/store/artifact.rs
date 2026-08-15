@@ -745,13 +745,22 @@ impl StoreArtifacts {
     }
 
     fn open_sink(&self, name: &str, media_type: &str) -> Result<ArtifactSink<'static>, StoreError> {
+        self.open_sink_with_redaction(name, media_type, Redaction::Pending)
+    }
+
+    fn open_sink_with_redaction(
+        &self,
+        name: &str,
+        media_type: &str,
+        redaction: Redaction,
+    ) -> Result<ArtifactSink<'static>, StoreError> {
         let mut sink = ArtifactSink::create_owned(
             Arc::clone(&self.store),
             self.run_id,
             name,
             media_type,
             OffsetDateTime::now_utc(),
-            Redaction::Pending,
+            redaction,
         )?;
         if let Some(step_id) = self.step_id {
             sink = sink.for_step(step_id);
@@ -783,6 +792,28 @@ impl ArtifactWriter for StoreArtifacts {
             name: name.to_owned(),
             sink,
         }))
+    }
+
+    fn write_json(
+        &mut self,
+        name: &str,
+        media_type: &str,
+        value: &serde_json::Value,
+    ) -> Result<ArtifactRef, ToolError> {
+        let redacted = super::redaction::redact_payload(&**self.store.redactor(), value);
+        let bytes = serde_json::to_vec(&redacted).map_err(ToolError::execution_failed)?;
+        let name = self.store.redactor().redact_text(name).into_owned();
+        let media_type = self.store.redactor().redact_text(media_type).into_owned();
+        let mut sink = self
+            .open_sink_with_redaction(&name, &media_type, Redaction::Applied)
+            .map_err(|error| ToolError::ExecutionFailed {
+                message: format!("{name:?} could not be stored as an artifact: {error}"),
+            })?;
+        sink.write_all(&bytes).map_err(|error| {
+            ToolError::execution_failed(format!("{name:?} could not be written: {error}"))
+        })?;
+        let stream = StoreArtifactStream { name, sink };
+        Box::new(stream).finish()
     }
 }
 

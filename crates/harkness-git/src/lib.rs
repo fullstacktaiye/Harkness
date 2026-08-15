@@ -74,7 +74,8 @@ pub use provenance::{
 };
 pub use runner::{Cancellation, CloneCancellation};
 pub use status::{
-    DetailedStatus, FileChange, GitStatus, HeadState, PendingOperation, StatusEntry, UpstreamStatus,
+    DetailedStatus, DetailedStatusPage, FileChange, GitStatus, HeadState, PendingOperation,
+    StatusEntry, UpstreamStatus,
 };
 pub use sync::{
     FetchOptions, FetchOutcome, PullOptions, PullOutcome, PullStrategy, PushOptions, PushOutcome,
@@ -927,12 +928,41 @@ impl GitService {
         status::inspect(&self.root)
     }
 
+    /// Reads the checked-out branch, unborn branch, or detached commit in process.
+    pub fn head_state(&self) -> Result<Option<HeadState>, GitError> {
+        status::head(&self.root)
+    }
+
+    /// Classifies workspace-relative paths through Git's ignore rules in process.
+    ///
+    /// A plain non-repository workspace returns `false` for every candidate.
+    pub fn ignored_paths(&self, candidates: &[PathBuf]) -> Result<Vec<bool>, GitError> {
+        status::ignored(&self.root, candidates)
+    }
+
     /// Describes every changed path in the repository.
     ///
     /// One `git status` spawn, so it is computed only for a project a caller
     /// names rather than for a whole listing.
     pub fn detailed_status(&self, cancellation: &Cancellation) -> Result<DetailedStatus, GitError> {
         status::detailed(&self.git_executable, &self.root, cancellation)
+    }
+
+    /// Describes every changed path in process, without a lock or child process.
+    pub fn detailed_status_in_process(
+        &self,
+        cancellation: &Cancellation,
+    ) -> Result<DetailedStatus, GitError> {
+        status::detailed_in_process(&self.root, cancellation)
+    }
+
+    /// Detailed status with an allocation bound on changed-path records.
+    pub fn detailed_status_in_process_bounded(
+        &self,
+        cancellation: &Cancellation,
+        maximum_entries: usize,
+    ) -> Result<DetailedStatusPage, GitError> {
+        status::detailed_in_process_bounded(&self.root, cancellation, maximum_entries)
     }
 
     /// Clones `remote` to an explicit destination using this service's working
