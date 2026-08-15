@@ -433,7 +433,21 @@ pub(crate) fn detailed_in_process_bounded(
         }
         let flags = entry.status();
         let conflicted = flags.contains(Status::CONFLICTED);
-        let path = path_from_bytes(entry.path_bytes());
+        // `StatusEntry::path_bytes` reports the delta's *old* file, which for a
+        // rename is the name the file no longer has. Taking it verbatim made
+        // `path` and `rename_source` the same string and dropped the
+        // destination entirely, so a staged `git mv a b` read as "a was renamed
+        // from a" and `b` appeared nowhere in the result. Porcelain reports the
+        // destination, and every consumer means the destination by "the path".
+        let renamed_destination = if flags.contains(Status::INDEX_RENAMED) {
+            entry.head_to_index()
+        } else if flags.contains(Status::WT_RENAMED) {
+            entry.index_to_workdir()
+        } else {
+            None
+        }
+        .and_then(|delta| delta.new_file().path_bytes().map(path_from_bytes));
+        let path = renamed_destination.unwrap_or_else(|| path_from_bytes(entry.path_bytes()));
         let staged = if conflicted {
             Some(FileChange::Unmerged)
         } else if copy_sources.contains_key(&path) {
@@ -446,16 +460,19 @@ pub(crate) fn detailed_in_process_bounded(
         } else {
             unstaged_change(flags)
         };
+        // `path_bytes` rather than `path`: git2's `bytes2path` unwraps a UTF-8
+        // conversion on Windows, so a non-UTF-8 rename source read through
+        // `path()` panics on the one platform that cannot represent it.
         let rename_source = if let Some(source) = copy_sources.get(&path) {
             Some(source.clone())
         } else if flags.contains(Status::INDEX_RENAMED) {
             entry
                 .head_to_index()
-                .and_then(|delta| delta.old_file().path().map(Path::to_path_buf))
+                .and_then(|delta| delta.old_file().path_bytes().map(path_from_bytes))
         } else if flags.contains(Status::WT_RENAMED) {
             entry
                 .index_to_workdir()
-                .and_then(|delta| delta.old_file().path().map(Path::to_path_buf))
+                .and_then(|delta| delta.old_file().path_bytes().map(path_from_bytes))
         } else {
             None
         };
@@ -485,6 +502,16 @@ enum StatusRenameMode {
     Copies,
 }
 
+/// Reads the rename-detection setting the way Git itself reads it.
+///
+/// This value comes from the repository's own config and from the user's
+/// global one, so neither is a place a read may be refused from. Git accepts
+/// `copy` as well as `copies`, treats any non-zero integer and a valueless key
+/// as true, and this is untrusted repository content besides (ADR-0006), so a
+/// spelling this build does not recognize degrades to Git's own default rather
+/// than failing the status read. Refusing instead let one line in
+/// `~/.gitconfig` — `renames = copy`, which real Git accepts — make
+/// `git.status` fail in every workspace on the machine.
 fn status_rename_mode(repository: &Repository, root: &Path) -> Result<StatusRenameMode, GitError> {
     let config = repository
         .config()
@@ -492,15 +519,17 @@ fn status_rename_mode(repository: &Repository, root: &Path) -> Result<StatusRena
     for key in ["status.renames", "diff.renames"] {
         match config.get_string(key) {
             Ok(value) => {
-                return match value.to_ascii_lowercase().as_str() {
-                    "false" | "no" | "off" | "0" => Ok(StatusRenameMode::Disabled),
-                    "copies" => Ok(StatusRenameMode::Copies),
-                    "true" | "yes" | "on" | "1" => Ok(StatusRenameMode::Renames),
-                    _ => Err(inspection(
-                        root,
-                        git2::Error::from_str(&format!("{key} has unsupported value {value:?}")),
-                    )),
-                };
+                return Ok(match value.trim().to_ascii_lowercase().as_str() {
+                    "false" | "no" | "off" | "0" => StatusRenameMode::Disabled,
+                    "copies" | "copy" => StatusRenameMode::Copies,
+                    // A valueless key (`[status]\n\trenames`) reads as true.
+                    "" | "true" | "yes" | "on" => StatusRenameMode::Renames,
+                    other => match other.parse::<i64>() {
+                        Ok(0) => StatusRenameMode::Disabled,
+                        Ok(_) => StatusRenameMode::Renames,
+                        Err(_) => StatusRenameMode::Renames,
+                    },
+                });
             }
             Err(error) if error.code() == ErrorCode::NotFound => {}
             Err(source) => return Err(inspection(root, source)),
@@ -527,15 +556,18 @@ fn staged_copy_sources(
         .index()
         .map_err(|source| inspection(root, source))?;
     let mut options = GitDiffOptions::new();
-    options.include_unmodified(true);
     let mut diff = repository
         .diff_tree_to_index(Some(&tree), Some(&index), Some(&mut options))
         .map_err(|source| inspection(root, source))?;
+    // `copies` only, never `copies_from_unmodified`. The latter is
+    // `--find-copies-harder`, which `status.renames=copies` does not ask for:
+    // Git reports a copy of an *unmodified* file as a plain add, so enabling it
+    // made this projection classify additions as copies that `git status` and
+    // the CLI's own projection both call `added`. It is also the expensive
+    // spelling — every added path against every tracked path — on a read that
+    // polls no cancellation token.
     let mut find = DiffFindOptions::new();
-    find.copies(true)
-        .copies_from_unmodified(true)
-        .renames(true)
-        .remove_unmodified(true);
+    find.copies(true).renames(true).remove_unmodified(true);
     diff.find_similar(Some(&mut find))
         .map_err(|source| inspection(root, source))?;
     let mut sources = BTreeMap::new();

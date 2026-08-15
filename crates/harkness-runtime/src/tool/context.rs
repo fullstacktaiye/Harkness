@@ -498,15 +498,25 @@ pub trait ArtifactWriter: Send {
     /// Stores a structured JSON value, redacting string values once without
     /// rewriting object keys.
     ///
-    /// Pass-through and test writers use the ordinary stream path. Durable
-    /// writers override this method to apply their value redactor and bypass
-    /// their stream redactor for the resulting already-redacted encoding.
+    /// Provided rather than required, for the same reason [`write`](Self::write)
+    /// is: a writer that had to implement both could store a value one way and
+    /// a stream another. The default *is* the stream route, so an implementor
+    /// that does nothing gets exactly the redaction, hashing, and naming
+    /// [`open`](Self::open) already gives it.
+    ///
+    /// A durable writer overrides this only where the distinction is real —
+    /// where the value's object keys are published schema field names, so
+    /// rewriting them would change what recovering the payload yields. Anything
+    /// whose keys are untrusted belongs on the stream route instead.
     fn write_json(
         &mut self,
         name: &str,
         media_type: &str,
         value: &serde_json::Value,
-    ) -> Result<ArtifactRef, ToolError>;
+    ) -> Result<ArtifactRef, ToolError> {
+        let encoded = serde_json::to_vec(value).map_err(ToolError::execution_failed)?;
+        self.write(name, media_type, &encoded)
+    }
 
     /// Stores `bytes` and returns a reference the tool can put in its output.
     ///

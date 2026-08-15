@@ -98,6 +98,11 @@ pub enum InspectOmission {
     OutputBudgetExhausted {
         limit: usize,
         omitted_entries: usize,
+        /// Whether the directory walk *also* stopped at its entry sentinel, so
+        /// more children exist than `omitted_entries` counts. Only one omission
+        /// is reported, and without this the caller could not tell a listing
+        /// trimmed for size from one that was never fully walked.
+        entry_budget_also_exhausted: bool,
     },
 }
 
@@ -152,12 +157,11 @@ impl Tool for WorkspaceInspect {
         let root = context.resolve(".")?;
         let listing = list_directory(&root, maximum, context)?;
         context.check_still_permitted()?;
-        let mut omission = listing
-            .truncated
-            .then_some(InspectOmission::EntryBudgetExhausted {
-                limit: maximum,
-                at_least_omitted_entries: 1,
-            });
+        let entry_budget_hit = listing.truncated;
+        let mut omission = entry_budget_hit.then_some(InspectOmission::EntryBudgetExhausted {
+            limit: maximum,
+            at_least_omitted_entries: 1,
+        });
         let listed = listing.entries;
         let listed_count = listed.len();
         let mut entry_bytes = 0_usize;
@@ -180,9 +184,15 @@ impl Tool for WorkspaceInspect {
                 .map_err(ToolError::execution_failed)?
                 .len();
             if entry_bytes.saturating_add(bytes) > output_budget {
+                // The walk itself may also have stopped early, and this used to
+                // overwrite that. `git.status` folds the two the same way: the
+                // count reports what the caller did not get, and the entry
+                // budget is still named as a cause rather than disappearing
+                // because a second budget was reached afterwards.
                 omission = Some(InspectOmission::OutputBudgetExhausted {
                     limit: output_budget,
                     omitted_entries: listed_count - entries.len(),
+                    entry_budget_also_exhausted: entry_budget_hit,
                 });
                 break;
             }

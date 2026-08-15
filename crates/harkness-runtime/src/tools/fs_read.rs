@@ -19,6 +19,15 @@ use super::safe_read::open_regular;
 pub const DEFAULT_FS_READ_MAX_BYTES: u64 = 32 * 1024;
 /// Absolute maximum one `fs.read` invocation may return.
 pub const MAX_FS_READ_BYTES: u64 = 32 * 1024;
+/// Largest serialized result `fs.read` will deliver.
+///
+/// The store refuses a `tool_calls.output` above
+/// [`MAX_INLINE_PAYLOAD_BYTES`](crate::store::MAX_INLINE_PAYLOAD_BYTES), and the
+/// executor turns that refusal into a recorded `payload_too_large` failure. A
+/// tool that can produce such a result at its own defaults is a tool that fails
+/// on ordinary input, so the bound belongs here rather than being discovered on
+/// the way to the database.
+pub const MAX_FS_READ_RESULT_BYTES: usize = crate::store::MAX_INLINE_PAYLOAD_BYTES;
 
 /// Input to `fs.read@1.0.0`.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq)]
@@ -123,26 +132,72 @@ impl Tool for FsRead {
             max_bytes,
             context,
         )?;
-        let binary = bytes.contains(&0);
-        let (content, content_encoding) = match String::from_utf8(bytes.clone()) {
-            Ok(text) => (text, ContentEncoding::Utf8),
-            Err(_) => (BASE64.encode(&bytes), ContentEncoding::Base64),
-        };
-        Ok(FsReadOutput {
-            path: context.redact_text(&input.path),
-            content: context.redact_text(&content),
-            content_encoding,
-            media_type: if binary || matches!(content_encoding, ContentEncoding::Base64) {
-                "application/octet-stream".to_owned()
-            } else {
-                "text/plain".to_owned()
-            },
-            byte_size: metadata.len(),
-            returned_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-            offset,
-            truncated,
-            executable: executable(&metadata),
-        })
+        let mut bytes = bytes;
+        let mut truncated = truncated;
+        loop {
+            let output = project_read(&input, &bytes, &metadata, offset, truncated, context);
+            let encoded = serde_json::to_vec(&output).map_err(ToolError::execution_failed)?;
+            if encoded.len() <= MAX_FS_READ_RESULT_BYTES || bytes.is_empty() {
+                return Ok(output);
+            }
+            // `max_bytes` bounds the *decoded* bytes, and JSON escaping is not
+            // a fixed factor over them: `"` and `\` double, and a C0 control
+            // byte becomes six characters. A 32 KiB window of control-dense but
+            // perfectly ordinary text therefore serialized to ~196 KB, which
+            // the store refuses above its 64 KiB inline bound — so a read the
+            // caller made entirely within the published schema was recorded as
+            // a `payload_too_large` failure instead of returning content. Every
+            // other tool here measures its own encoded size; this one now does
+            // too, and reports the shortfall as the byte limit it is.
+            let keep = bytes.len() / 2;
+            bytes.truncate(char_boundary_at_or_below(&bytes, keep));
+            truncated = Some(ReadTruncation::ByteLimit {
+                limit: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            });
+        }
+    }
+}
+
+/// Largest index at or below `limit` that does not split a UTF-8 character.
+///
+/// Cutting mid-character would flip the encoding to Base64 partway through a
+/// shrink loop, so the same read would report a different `content_encoding`
+/// depending only on how large it was.
+fn char_boundary_at_or_below(bytes: &[u8], limit: usize) -> usize {
+    let mut index = limit.min(bytes.len());
+    while index > 0 && (bytes[index] & 0b1100_0000) == 0b1000_0000 {
+        index -= 1;
+    }
+    index
+}
+
+fn project_read(
+    input: &FsReadInput,
+    bytes: &[u8],
+    metadata: &fs::Metadata,
+    offset: u64,
+    truncated: Option<ReadTruncation>,
+    context: &ExecutionContext,
+) -> FsReadOutput {
+    let binary = bytes.contains(&0);
+    let (content, content_encoding) = match std::str::from_utf8(bytes) {
+        Ok(text) => (text.to_owned(), ContentEncoding::Utf8),
+        Err(_) => (BASE64.encode(bytes), ContentEncoding::Base64),
+    };
+    FsReadOutput {
+        path: context.redact_text(&input.path),
+        content: context.redact_text(&content),
+        content_encoding,
+        media_type: if binary || matches!(content_encoding, ContentEncoding::Base64) {
+            "application/octet-stream".to_owned()
+        } else {
+            "text/plain".to_owned()
+        },
+        byte_size: metadata.len(),
+        returned_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        offset,
+        truncated,
+        executable: executable(metadata),
     }
 }
 

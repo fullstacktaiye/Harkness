@@ -15,4 +15,7 @@ if ! printf '%s\n' "$listing" | grep -Fqx "$test_name: test"; then
     exit 1
 fi
 
-cargo test --locked -p "$package" "$@" "$test_name" -- --ignored --exact
+# `--nocapture` so a latency target's recorded environment reaches the log.
+# libtest captures a passing test's output, which otherwise leaves the
+# measurement this job exists to produce visible nowhere.
+cargo test --locked -p "$package" "$@" "$test_name" -- --ignored --exact --nocapture

@@ -328,8 +328,19 @@ where
 /// Best effort by design. A context with no artifact store attached — a test, a
 /// one-shot invocation — refuses the write, and losing the evidence must not
 /// change the failure a caller is told about.
+///
+/// It goes through the *stream* route rather than `write_json`, and the
+/// difference is load-bearing. `write_json` redacts values and deliberately
+/// leaves object keys alone, because a key there is a published schema field.
+/// This value exists precisely because it did **not** match the published
+/// schema, so its keys are untrusted tool output like any other byte, and a
+/// tool smuggling a secret into a key would otherwise land it in the one
+/// artifact redaction never reads.
 fn preserve_rejected_output(context: &mut ExecutionContext, produced: &Value) {
-    let _ = context.write_json_artifact(REJECTED_OUTPUT_ARTIFACT, "application/json", produced);
+    let Ok(encoded) = serde_json::to_vec(produced) else {
+        return;
+    };
+    let _ = context.write_artifact(REJECTED_OUTPUT_ARTIFACT, "application/json", &encoded);
 }
 
 /// Re-labels a failure a tool body raised but is not entitled to claim.
