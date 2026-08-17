@@ -44,7 +44,15 @@ pub struct CheckConfiguration {
     /// Optional workspace-relative working directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    /// Exact environment overrides. Names still have to be admitted by the tool.
+    /// Exact environment overrides.
+    ///
+    /// A name still has to be one the executing tool declares. `check.run`
+    /// declares none of its own, so today only the baseline an arbitrary child
+    /// may inherit — `PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM` — can be set here,
+    /// and configuring anything else is refused before the check is launched
+    /// rather than failing when the child is spawned. This type deliberately
+    /// does not encode that list: the allowlist belongs to the tool contract in
+    /// `harkness-runtime`, which sits above this crate.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
     /// Output parser selected for this command.

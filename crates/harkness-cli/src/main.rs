@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env,
     ffi::OsString,
     fs,
@@ -42,7 +43,7 @@ use harkness_git::{
 };
 use harkness_runtime::{
     approval::DecidedVia,
-    check::{CheckSummary, project_checks, run_configured_check},
+    check::{CheckOutcome, CheckSummary, project_checks, run_configured_check},
     policy::EXTERNAL_POLICY_DENIAL_KINDS,
     store::Store,
     trust::{TrustState, WorkspaceTrust},
@@ -65,6 +66,8 @@ const CLI_ERROR_KINDS: &[&str] = &[
     "wire_projection_failed",
     "path_operation_failed",
     "check_operation_failed",
+    "check_failed",
+    "check_cancelled",
     "confirmation_required",
     "managed_project_requires_delete",
     "local_project_requires_forget",
@@ -1590,6 +1593,18 @@ impl RefusalKind {
 enum CliError {
     Project(ProjectError),
     Check(String),
+    /// A check ran correctly and did not pass.
+    ///
+    /// Reported through the error envelope rather than as a success carrying a
+    /// negative verdict, so a caller can act on the exit status without parsing
+    /// stdout — the reason `cargo test` and `gh pr checks` both exit non-zero.
+    /// The whole recorded result travels in `details`, so nothing a success
+    /// envelope carried is lost.
+    CheckVerdict {
+        kind: &'static str,
+        message: String,
+        details: Value,
+    },
     Usage(String),
     CurrentDirectory(io::Error),
     InterruptHandler(io::Error),
@@ -1622,6 +1637,7 @@ impl CliError {
         match self {
             Self::Project(error) => error.kind(),
             Self::Check(_) => "check_operation_failed",
+            Self::CheckVerdict { kind, .. } => kind,
             Self::Usage(_) => "usage_error",
             Self::CurrentDirectory(_) => "current_directory_unavailable",
             Self::InterruptHandler(_) => "interrupt_handler_unavailable",
@@ -1634,7 +1650,7 @@ impl CliError {
     fn message(&self) -> String {
         match self {
             Self::Project(error) => error.to_string(),
-            Self::Check(message) => message.clone(),
+            Self::Check(message) | Self::CheckVerdict { message, .. } => message.clone(),
             Self::Usage(message) => message.clone(),
             Self::WireProjection(message) => message.clone(),
             Self::PathOperation { operation, .. } => {
@@ -1659,6 +1675,13 @@ impl CliError {
             | Self::WireProjection(_)
             | Self::PathOperation { .. }
             | Self::Check(_) => EXIT_OPERATION_FAILED,
+            Self::CheckVerdict { kind, .. } => {
+                if *kind == "check_cancelled" {
+                    EXIT_CANCELLED
+                } else {
+                    EXIT_OPERATION_FAILED
+                }
+            }
             Self::Refused { .. } => EXIT_REFUSED,
         }
     }
@@ -1668,6 +1691,7 @@ impl CliError {
             Self::Project(error) => project_error_details(error),
             Self::Refused { details, .. } => details.clone(),
             Self::PathOperation { details, .. } => details.clone(),
+            Self::CheckVerdict { details, .. } => details.clone(),
             Self::Check(_)
             | Self::Usage(_)
             | Self::CurrentDirectory(_)
@@ -1855,10 +1879,7 @@ fn run_check(
         CheckCommand::List(selection) => {
             let project = resolve_project(&service, selection.project.as_deref())?;
             let checks = project.effective_checks();
-            let store = Store::open(service.data_dir())
-                .map_err(|error| CliError::Check(error.to_string()))?;
-            let results = project_checks(&store, &project)
-                .map_err(|error| CliError::Check(error.to_string()))?;
+            let results = recorded_checks_without_creating_a_store(&service, &project)?;
             check_list_result(json_output, &checks, &results)
         }
         CheckCommand::Run(arguments) => {
@@ -1921,12 +1942,33 @@ fn run_check(
                 DecidedVia::Cli,
                 cancellation,
             )
-            .map_err(|error| CliError::Check(error.to_string()))?;
+            .map_err(|error| match error {
+                // A configuration this build cannot execute is the caller's
+                // input, not a failed operation.
+                harkness_runtime::check::CheckLaunchError::UndeclaredEnvironment { .. } => {
+                    CliError::Usage(error.to_string())
+                }
+                other => CliError::Check(other.to_string()),
+            })?;
             let results = project_checks(&store, &project)
                 .map_err(|error| CliError::Check(error.to_string()))?;
             let result = results
                 .iter()
                 .find(|result| result.run_id == run_id.to_string());
+            let data = json!({
+                "kind": "check_run",
+                "run_id": run_id,
+                "check": check,
+                "result": result,
+            });
+            // The verdict decides the exit status. Reporting a check that did not
+            // pass as a plain success left the only usable signal inside the JSON,
+            // so the CI-shaped caller this command exists for could not tell pass
+            // from fail without parsing it — and a run cancelled by Ctrl-C never
+            // produced the documented 130 at all.
+            if let Some(verdict) = check_verdict(check, result, &data) {
+                return Err(verdict);
+            }
             command_result(
                 json_output,
                 || {
@@ -1935,14 +1977,7 @@ fn run_check(
                         check_summary_line,
                     )
                 },
-                || {
-                    Ok(json!({
-                        "kind": "check_run",
-                        "run_id": run_id,
-                        "check": check,
-                        "result": result,
-                    }))
-                },
+                || Ok(data),
             )
         }
     }
@@ -1975,6 +2010,65 @@ fn check_list_result(
         },
         || Ok(json!({ "kind": "check_list", "checks": checks, "results": results })),
     )
+}
+
+/// Recorded check results for a read-only projection.
+///
+/// A read must not bring a run store into existence. `Store::open` creates
+/// `runtime.db`, its WAL sidecars and every migration as a side effect, so
+/// `check list` and `git diff --checks` — both of which only report — used to
+/// write to a data directory a caller had asked them to read. No database means
+/// nothing has been recorded, which is the empty projection.
+fn recorded_checks_without_creating_a_store(
+    service: &ProjectService,
+    project: &Project,
+) -> Result<Vec<CheckSummary>, CliError> {
+    let Some(store) = Store::open_existing(service.data_dir())
+        .map_err(|error| CliError::Check(error.to_string()))?
+    else {
+        return Ok(Vec::new());
+    };
+    project_checks(&store, project).map_err(|error| CliError::Check(error.to_string()))
+}
+
+/// The error a non-passing run reports, or `None` when the check passed.
+///
+/// An absent result is a verdict too: the command was asked to produce one and
+/// there is nothing recorded to read, which no caller should see as a pass.
+fn check_verdict(
+    check: &CheckConfiguration,
+    result: Option<&CheckSummary>,
+    data: &Value,
+) -> Option<CliError> {
+    let Some(result) = result else {
+        return Some(CliError::CheckVerdict {
+            kind: "check_failed",
+            message: format!(
+                "check {} recorded no result to report",
+                single_line(&check.label)
+            ),
+            details: data.clone(),
+        });
+    };
+    let (kind, verdict) = match result.outcome {
+        CheckOutcome::Passed => return None,
+        CheckOutcome::Cancelled => ("check_cancelled", "was cancelled"),
+        CheckOutcome::Interrupted => ("check_cancelled", "was interrupted"),
+        CheckOutcome::TimedOut => ("check_failed", "timed out"),
+        CheckOutcome::Denied => ("check_failed", "was denied"),
+        CheckOutcome::Failed => ("check_failed", "failed"),
+        // Neither is reachable from here: this runs after the supervising loop
+        // has seen the run reach a terminal state. Named rather than caught by a
+        // wildcard so a new outcome has to be classified here on purpose.
+        CheckOutcome::Queued | CheckOutcome::WaitingForApproval | CheckOutcome::Running => {
+            ("check_failed", "did not reach a verdict")
+        }
+    };
+    Some(CliError::CheckVerdict {
+        kind,
+        message: format!("check {} {verdict}", single_line(&result.label)),
+        details: data.clone(),
+    })
 }
 
 fn check_summary_line(summary: &CheckSummary) -> String {
@@ -2192,14 +2286,12 @@ fn run_git(
                 mode: arguments.whitespace.into(),
                 ignore_blank_lines: arguments.ignore_blank_lines,
             };
-            let check_project = arguments
-                .checks
-                .then(|| resolve_project(&service, arguments.selection.project.as_deref()))
-                .transpose()?;
-            let git = match check_project.as_ref() {
-                Some(project) => service.git(project.id)?,
-                None => selected_git(&service, arguments.selection)?,
-            };
+            // Resolved once, whether or not the checks projection was asked for:
+            // `selected_git` resolves the same project internally and throws it
+            // away, so keeping it costs nothing and the two paths stop being two
+            // copies of one lookup.
+            let (project, git) = selected_project_git(&service, arguments.selection)?;
+            let check_project = arguments.checks.then_some(project);
             let options = DiffOptions::default()
                 .with_context_lines(arguments.context_lines)
                 .with_whitespace(whitespace)
@@ -2247,25 +2339,26 @@ fn run_git(
             };
             let recorded_checks = check_project
                 .as_ref()
-                .map(|project| {
-                    let store = Store::open(service.data_dir())
-                        .map_err(|error| CliError::Check(error.to_string()))?;
-                    project_checks(&store, project)
-                        .map_err(|error| CliError::Check(error.to_string()))
-                })
+                .map(|project| recorded_checks_without_creating_a_store(&service, project))
                 .transpose()?;
             let (checks, checks_excluded_for_target) =
                 recorded_checks.map_or(Ok::<_, CliError>((None, 0usize)), |recorded| {
                     let total = recorded.len();
                     let mut covering = Vec::new();
+                    // One resolver for the whole pass, and the first target that
+                    // is not covered ends this check. Resolving inside the target
+                    // loop asked Git for the same two or three revisions once per
+                    // recorded check.
+                    let mut revisions = RevisionCache::new(&git);
                     for check in recorded {
-                        if targets
-                            .iter()
-                            .map(|target| check_covers_diff_target(&git, &check, target))
-                            .collect::<Result<Vec<_>, _>>()?
-                            .into_iter()
-                            .all(|covers| covers)
-                        {
+                        let mut covers_every_target = true;
+                        for target in &targets {
+                            if !check_covers_diff_target(&mut revisions, &check, target)? {
+                                covers_every_target = false;
+                                break;
+                            }
+                        }
+                        if covers_every_target {
                             covering.push(check);
                         }
                     }
@@ -2993,12 +3086,25 @@ fn resolve_project(service: &ProjectService, selector: Option<&str>) -> Result<P
     service.resolve(&selector).map_err(Into::into)
 }
 
+/// Resolves the selected project and opens its Git service.
+///
+/// The project is worth keeping: the `--checks` projection needs it, and
+/// `selected_git` resolved one only to drop it, so the two call sites were two
+/// copies of this lookup waiting to disagree.
+fn selected_project_git(
+    service: &ProjectService,
+    selection: ProjectSelection,
+) -> Result<(Project, GitService), CliError> {
+    let project = resolve_project(service, selection.project.as_deref())?;
+    let git = service.git(project.id)?;
+    Ok((project, git))
+}
+
 fn selected_git(
     service: &ProjectService,
     selection: ProjectSelection,
 ) -> Result<GitService, CliError> {
-    let project = resolve_project(service, selection.project.as_deref())?;
-    service.git(project.id).map_err(Into::into)
+    selected_project_git(service, selection).map(|(_, git)| git)
 }
 
 fn refusal(kind: RefusalKind, message: String, details: Value) -> CliError {
@@ -4590,8 +4696,37 @@ fn diff_target_value(target: &DiffTarget) -> Value {
     diff_target_details(target).unwrap_or_else(|| json!({ "kind": diff_target_name(target) }))
 }
 
+/// Resolves each named revision once for a whole coverage pass.
+///
+/// A recorded check is compared against the 40-hex commit a target names, and
+/// every recorded check asks about the same handful of targets. Resolving per
+/// (check, target) pair meant up to `checks x targets` Git invocations for two
+/// or three distinct revisions.
+struct RevisionCache<'a> {
+    git: &'a GitService,
+    resolved: HashMap<String, String>,
+}
+
+impl<'a> RevisionCache<'a> {
+    fn new(git: &'a GitService) -> Self {
+        Self {
+            git,
+            resolved: HashMap::new(),
+        }
+    }
+
+    fn resolve(&mut self, revision: &str) -> Result<String, CliError> {
+        if let Some(resolved) = self.resolved.get(revision) {
+            return Ok(resolved.clone());
+        }
+        let resolved = self.git.resolve_revision(revision)?.to_string();
+        self.resolved.insert(revision.to_owned(), resolved.clone());
+        Ok(resolved)
+    }
+}
+
 fn check_covers_diff_target(
-    git: &GitService,
+    revisions: &mut RevisionCache<'_>,
     check: &CheckSummary,
     target: &DiffTarget,
 ) -> Result<bool, CliError> {
@@ -4609,19 +4744,23 @@ fn check_covers_diff_target(
         DiffTarget::Staged => {
             Ok(live_state_is_current && check.workspace_matches_index == Some(true))
         }
-        DiffTarget::Commit { revision, .. } => check_covers_commit(git, check, revision),
-        DiffTarget::Revisions { new_revision, .. } => check_covers_commit(git, check, new_revision),
-        DiffTarget::BranchAgainstBase { branch, .. } => check_covers_commit(git, check, branch),
+        DiffTarget::Commit { revision, .. } => check_covers_commit(revisions, check, revision),
+        DiffTarget::Revisions { new_revision, .. } => {
+            check_covers_commit(revisions, check, new_revision)
+        }
+        DiffTarget::BranchAgainstBase { branch, .. } => {
+            check_covers_commit(revisions, check, branch)
+        }
         _ => Ok(false),
     }
 }
 
 fn check_covers_commit(
-    git: &GitService,
+    revisions: &mut RevisionCache<'_>,
     check: &CheckSummary,
     revision: &str,
 ) -> Result<bool, CliError> {
-    let resolved = git.resolve_revision(revision)?.to_string();
+    let resolved = revisions.resolve(revision)?;
     Ok(check.workspace_clean == Some(true)
         && check.state_head.as_deref() == Some(resolved.as_str()))
 }
@@ -5211,6 +5350,8 @@ const CLI_KIND_EXIT_CODES: &[(&str, u8)] = &[
     ("wire_projection_failed", EXIT_OPERATION_FAILED),
     ("path_operation_failed", EXIT_OPERATION_FAILED),
     ("check_operation_failed", EXIT_OPERATION_FAILED),
+    ("check_failed", EXIT_OPERATION_FAILED),
+    ("check_cancelled", EXIT_CANCELLED),
     ("confirmation_required", EXIT_REFUSED),
     ("managed_project_requires_delete", EXIT_REFUSED),
     ("local_project_requires_forget", EXIT_REFUSED),
@@ -5623,6 +5764,7 @@ mod tests {
             diagnostics: Vec::new(),
             diagnostics_omitted: 0,
             diagnostics_scan_truncated: false,
+            diagnostics_unavailable: None,
             stdout_tail: String::new(),
             stderr_tail: String::new(),
             stdout_truncated: false,
@@ -5632,9 +5774,10 @@ mod tests {
             stderr_artifact_truncated: false,
         };
 
+        let mut revisions = super::RevisionCache::new(&git);
         assert!(
             !check_covers_diff_target(
-                &git,
+                &mut revisions,
                 &summary,
                 &super::DiffTarget::Commit {
                     revision: first.to_string(),
@@ -5645,7 +5788,7 @@ mod tests {
         );
         assert!(
             check_covers_diff_target(
-                &git,
+                &mut revisions,
                 &summary,
                 &super::DiffTarget::Commit {
                     revision: second.to_string(),
@@ -6347,6 +6490,16 @@ mod tests {
                 details: serde_json::json!({}),
             },
             CliError::Check("fixture".to_owned()),
+            CliError::CheckVerdict {
+                kind: "check_failed",
+                message: "fixture".to_owned(),
+                details: serde_json::json!({}),
+            },
+            CliError::CheckVerdict {
+                kind: "check_cancelled",
+                message: "fixture".to_owned(),
+                details: serde_json::json!({}),
+            },
             refused(RefusalKind::ConfirmationRequired),
             refused(RefusalKind::ManagedProjectRequiresDelete),
             refused(RefusalKind::LocalProjectRequiresForget),

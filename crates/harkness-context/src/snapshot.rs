@@ -168,6 +168,24 @@ pub enum UnverifiableReason {
     Cancelled,
 }
 
+impl UnverifiableReason {
+    /// The same spelling `Serialize` emits.
+    ///
+    /// It exists so a caller putting this reason into a message or a JSON field
+    /// of its own does not reach for `Debug`. A lowercased `Debug` rendering
+    /// produces `repositoryunavailable`, agrees with nothing, and would case-fold
+    /// any path a future variant carried.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RepositoryUnavailable => "repository_unavailable",
+            Self::WorktreeRootMissing => "worktree_root_missing",
+            Self::StatusUnavailable => "status_unavailable",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
 /// Whether a snapshot still describes its workspace.
 ///
 /// Anything other than [`FreshnessState::Fresh`] must stop a mutation that was

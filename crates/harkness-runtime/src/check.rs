@@ -10,7 +10,7 @@ use std::io::{self, BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use harkness_context::{FilesystemProbe, FreshnessState, SnapshotWire, WorkspaceSnapshot};
 use harkness_core::CheckConfiguration;
@@ -47,6 +47,8 @@ pub const MAX_DIAGNOSTIC_SCAN_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_DIAGNOSTIC_SCAN_LINES: usize = 10_000;
 /// Longest user-facing diagnostic text retained inline.
 pub const MAX_DIAGNOSTIC_TEXT_BYTES: usize = 4 * 1024;
+/// How long a cancelled check is waited on before its caller is released.
+const CANCELLATION_GRACE: Duration = Duration::from_secs(30);
 
 /// Failure to launch or supervise one configured check.
 #[derive(Debug, Error)]
@@ -60,6 +62,19 @@ pub enum CheckLaunchError {
     Scenario(#[from] ScenarioError),
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
+    /// The configuration names an environment variable `check.run` cannot set.
+    #[error(
+        "project check {check} configures environment variable {name}, which check.run does not \
+         declare; only {baseline} may be overridden"
+    )]
+    UndeclaredEnvironment {
+        /// Configured check identifier.
+        check: String,
+        /// The refused name, as configured.
+        name: String,
+        /// The names that can be set, for the message.
+        baseline: String,
+    },
 }
 
 /// Runs one configured check through the ordinary coordinator, policy,
@@ -76,6 +91,25 @@ pub fn run_configured_check(
     via: DecidedVia,
     cancellation: &Cancellation,
 ) -> Result<RunId, CheckLaunchError> {
+    // Refused here rather than at spawn. A tool descriptor publishes the
+    // environment names it may set, so an input map cannot widen the authority
+    // behind an already-approved tool identity — and `check.run` declares none
+    // beyond the baseline. A catalog may still carry any name, so a check
+    // configuring one used to reach the supervisor, fail inside
+    // `AllowlistedEnv::apply_overrides`, and surface as a generic
+    // `execution_failed` after a run, a task and an approval had been recorded.
+    // Saying so before any of that exists names the variable and the limit.
+    if let Some(name) = check
+        .env
+        .keys()
+        .find(|name| !crate::trust::BASELINE_ENVIRONMENT.contains(&name.as_str()))
+    {
+        return Err(CheckLaunchError::UndeclaredEnvironment {
+            check: check.id.clone(),
+            name: name.clone(),
+            baseline: crate::trust::BASELINE_ENVIRONMENT.join(", "),
+        });
+    }
     let mut registry = ToolRegistry::new();
     registry.register(CheckRun)?;
     let policy = PolicyEngine::load(store.data_dir(), &project.root);
@@ -86,7 +120,13 @@ pub fn run_configured_check(
         Some(project.id),
         OffsetDateTime::now_utc(),
     );
-    let workspace = WorkspaceRef::from_task(&task, &crate::store::PassThrough);
+    // Built with the store's own redactor, not `PassThrough`. The coordinator
+    // validates this reference against `WorkspaceRef::from_task(&task,
+    // store.redactor())` and refuses the run when either field differs, so a
+    // store opened with a redactor that rewrites any part of the workspace-root
+    // text — which is what a redactor is for — rejected every check before it
+    // started.
+    let workspace = WorkspaceRef::from_task(&task, &**store.redactor());
     let task_id = coordinator.start_task(task)?;
     let parser = match check.parser {
         CheckParser::Plain => CheckOutputParser::Plain,
@@ -129,13 +169,34 @@ pub fn run_configured_check(
         WorkspaceMetadata::from_project(project),
     )?;
 
+    let mut cancel_requested_at = None;
     loop {
         let snapshot = coordinator.run_snapshot(run_id)?;
-        if cancellation.is_cancelled() {
-            if !snapshot.run.state().is_terminal() {
-                coordinator.cancel_run(run_id)?;
-            }
+        if snapshot.run.state().is_terminal() {
             return Ok(run_id);
+        }
+        if cancellation.is_cancelled() {
+            // Asked once, then waited for. Returning the moment cancellation was
+            // requested handed back a run that had not stopped: the child was
+            // still executing, and a single-shot caller exiting there left it
+            // running with nothing to reap it. The cancellation chain reaches the
+            // child's process group, so this waits for that to land instead of
+            // racing it.
+            match cancel_requested_at {
+                None => {
+                    coordinator.cancel_run(run_id)?;
+                    cancel_requested_at = Some(Instant::now());
+                }
+                // The teardown below is itself bounded, so passing this means
+                // something is wedged. Releasing the caller beats hanging it; the
+                // run's own recorded state still says it never became terminal.
+                Some(requested) if requested.elapsed() >= CANCELLATION_GRACE => {
+                    return Ok(run_id);
+                }
+                Some(_) => {}
+            }
+            thread::sleep(Duration::from_millis(10));
+            continue;
         }
         if let Some(request) = snapshot
             .approvals
@@ -148,9 +209,6 @@ pub fn run_configured_check(
                 via,
                 OffsetDateTime::now_utc(),
             ))?;
-        }
-        if snapshot.run.state().is_terminal() {
-            return Ok(run_id);
         }
         thread::sleep(Duration::from_millis(10));
     }
@@ -238,6 +296,13 @@ pub struct CheckSummary {
     pub diagnostics: Vec<CheckDiagnostic>,
     pub diagnostics_omitted: usize,
     pub diagnostics_scan_truncated: bool,
+    /// Why stored output could not be inspected, when it could not be.
+    ///
+    /// Absent means the streams were read. Present means the diagnostics above
+    /// are not the whole answer and no count can say how much is missing —
+    /// distinct from `diagnostics_omitted`, which counts records this build
+    /// chose to drop from output it did read.
+    pub diagnostics_unavailable: Option<String>,
     pub stdout_tail: String,
     pub stderr_tail: String,
     pub stdout_truncated: bool,
@@ -280,14 +345,34 @@ pub fn project_checks(store: &Store, project: &Project) -> Result<Vec<CheckSumma
         let Some(current) = by_id.get(check_id.as_str()) else {
             continue;
         };
+        // Every recorded string is bounded and stripped of control characters,
+        // including the ones that came from the call's own input. `check.run` is
+        // registered as a mutating tool, so an agent can invoke it directly with
+        // a label or an argv of its choosing; nothing downstream of this
+        // projection re-checks them, and the front ends render what they are
+        // given.
         let label = output.as_ref().map_or_else(
             || input.map_or_else(|| current.label.clone(), |input| input.label.clone()),
             |output| output.label.clone(),
         );
-        let command = input.map_or_else(Vec::new, |input| input.command.clone());
-        let recorded_cwd = input.and_then(|input| input.cwd.clone());
+        let label = bounded_text(&label);
+        let command = input.map_or_else(Vec::new, |input| {
+            input
+                .command
+                .iter()
+                .map(|part| bounded_text(part))
+                .collect()
+        });
+        let recorded_cwd = input
+            .and_then(|input| input.cwd.as_deref())
+            .map(bounded_text);
         let recorded_env = input
-            .and_then(|input| input.env.clone())
+            .and_then(|input| input.env.as_ref())
+            .map(|env| {
+                env.iter()
+                    .map(|(name, value)| (bounded_text(name), bounded_text(value)))
+                    .collect()
+            })
             .unwrap_or_default();
         let recorded_timeout = input.and_then(|input| input.timeout_seconds);
         let recorded_parser = input
@@ -340,6 +425,7 @@ pub fn project_checks(store: &Store, project: &Project) -> Result<Vec<CheckSumma
             diagnostics: parsed_diagnostics.diagnostics,
             diagnostics_omitted: parsed_diagnostics.omitted,
             diagnostics_scan_truncated: parsed_diagnostics.scan_truncated,
+            diagnostics_unavailable: parsed_diagnostics.unavailable,
             stdout_tail: output.as_ref().map_or_else(String::new, |output| {
                 bounded_text(&output.process.stdout_tail.text)
             }),
@@ -366,8 +452,16 @@ pub fn project_checks(store: &Store, project: &Project) -> Result<Vec<CheckSumma
     Ok(summaries)
 }
 
+/// Whether the recorded call is the configured check, in every field the
+/// configuration names.
+///
+/// The label is one of those fields. Leaving it out let a call reproduce the
+/// configured invocation exactly, store an arbitrary label beside it, and still
+/// be reported as `definition_current` — so the name a reader identifies the
+/// evidence by was the one field an agent could choose freely.
 fn definition_matches(input: &CheckRunInput, configured: &CheckConfiguration) -> bool {
     input.check_id == configured.id
+        && input.label == configured.label
         && input.command == configured.command
         && input.cwd == configured.cwd
         && input.env.as_ref().cloned().unwrap_or_default() == configured.env
@@ -486,9 +580,7 @@ fn verify_output_state(
                 })
                 .collect(),
         },
-        Ok(FreshnessState::Unverifiable { reason }) => {
-            unverifiable(format!("{reason:?}").to_lowercase())
-        }
+        Ok(FreshnessState::Unverifiable { reason }) => unverifiable(reason.as_str().to_owned()),
         Err(error) => unverifiable(error.to_string()),
         _ => unverifiable("unknown freshness state".to_owned()),
     };
@@ -524,17 +616,41 @@ fn parse_diagnostics(
         &output.process.stdout_artifact,
         &output.process.stderr_artifact,
     ] {
-        let Ok(id) = reference.id.parse::<ArtifactId>() else {
-            continue;
+        // Every way of losing a stream is recorded rather than skipped. Silently
+        // continuing reported a pruned or unreadable artifact as "no
+        // diagnostics" with nothing omitted and no truncation — the same answer
+        // as a clean run, from a check that may have found forty errors. The
+        // freshness verification directly above says `unverifiable` for exactly
+        // these failures, and this says the equivalent.
+        let id = match reference.id.parse::<ArtifactId>() {
+            Ok(id) => id,
+            Err(error) => {
+                projection.record_unavailable(format!("invalid artifact identity: {error}"));
+                continue;
+            }
         };
-        let Ok(artifact) = store.artifact(id) else {
-            continue;
+        let artifact = match store.artifact(id) {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                projection.record_unavailable(error.to_string());
+                continue;
+            }
         };
         if artifact.run_id() != run_id || artifact.tool_call_id() != Some(call_id) {
+            projection.record_unavailable("output artifact belongs to another call".to_owned());
             continue;
         }
-        let Ok(file) = store.open_artifact(id) else {
+        if artifact.availability() != Availability::Available {
+            projection
+                .record_unavailable(format!("output artifact is {}", artifact.availability()));
             continue;
+        }
+        let file = match store.open_artifact(id) {
+            Ok(file) => file,
+            Err(error) => {
+                projection.record_unavailable(error.to_string());
+                continue;
+            }
         };
         parse_cargo_stream(
             BufReader::new(file),
@@ -562,7 +678,14 @@ fn parse_cargo_stream(
         let remaining = MAX_DIAGNOSTIC_SCAN_BYTES - projection.scanned_bytes;
         let line = match read_bounded_line(&mut reader, remaining) {
             Ok(Some(line)) => line,
-            Ok(None) | Err(_) => break,
+            // End of stream is the ordinary exit. A read error is not: it means
+            // the rest of this stream was never inspected, and saying nothing
+            // would report whatever was found so far as the whole answer.
+            Ok(None) => break,
+            Err(error) => {
+                projection.record_unavailable(format!("output artifact read failed: {error}"));
+                break;
+            }
         };
         projection.scanned_bytes = projection.scanned_bytes.saturating_add(line.consumed);
         projection.scanned_lines = projection.scanned_lines.saturating_add(1);
@@ -636,6 +759,18 @@ struct DiagnosticProjection {
     scan_truncated: bool,
     scanned_bytes: usize,
     scanned_lines: usize,
+    unavailable: Option<String>,
+}
+
+impl DiagnosticProjection {
+    /// Records why a stream could not be read. The first reason is kept: it is
+    /// the one that happened before any later failure it may have caused, and a
+    /// reader needs one sentence rather than a list.
+    fn record_unavailable(&mut self, reason: String) {
+        if self.unavailable.is_none() {
+            self.unavailable = Some(bounded_text(&reason));
+        }
+    }
 }
 
 struct BoundedLine {
@@ -787,7 +922,8 @@ mod tests {
     use crate::trust::{TrustState, WorkspaceTrust};
 
     use super::{
-        CheckFreshness, CheckOutcome, parse_cargo_stream, project_checks, run_configured_check,
+        CheckFreshness, CheckLaunchError, CheckOutcome, parse_cargo_stream, project_checks,
+        run_configured_check,
     };
 
     #[test]
@@ -1343,6 +1479,149 @@ mod tests {
             project_checks(&store, &project).unwrap()[0].freshness,
             CheckFreshness::Current
         );
+    }
+
+    /// Rewrites the workspace root wherever it appears, which is the ordinary
+    /// job of a redactor and the one thing the coordinator compares a run's
+    /// workspace reference against. Everything else is left alone so this test
+    /// fails for the reference alone.
+    #[derive(Debug)]
+    struct RootRedactor {
+        root: String,
+    }
+
+    impl Redactor for RootRedactor {
+        fn redact_text<'a>(&self, text: &'a str) -> Cow<'a, str> {
+            if text.contains(&self.root) {
+                Cow::Owned(text.replace(&self.root, "<workspace>"))
+            } else {
+                Cow::Borrowed(text)
+            }
+        }
+
+        fn wrap_stream(&self, sink: Box<dyn Write + Send>) -> Box<dyn Write + Send> {
+            sink
+        }
+    }
+
+    /// A check built its own workspace reference with `PassThrough` while the
+    /// coordinator built the one it validates against from the store's redactor,
+    /// so any store whose redactor touched the root text refused every check
+    /// before it started. The identity redactor in the test above cannot see
+    /// this, because both sides agree when neither rewrites anything.
+    #[test]
+    fn a_check_runs_against_a_store_whose_redactor_rewrites_the_workspace_root() {
+        let workspace = tempdir().unwrap();
+        let data = tempdir().unwrap();
+        initialize_repository(workspace.path());
+        let root = workspace.path().canonicalize().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let check = CheckConfiguration {
+            id: "fixture".to_owned(),
+            label: "Fixture".to_owned(),
+            command: vec![
+                executable.to_string_lossy().into_owned(),
+                "--ignored".to_owned(),
+                "--exact".to_owned(),
+                "scenario_process_fixture_pass_child".to_owned(),
+                "--nocapture".to_owned(),
+            ],
+            cwd: None,
+            env: BTreeMap::new(),
+            parser: CheckParser::Plain,
+            timeout_seconds: Some(10),
+        };
+        let project = Project {
+            id: ProjectId::new(),
+            display_name: "fixture".to_owned(),
+            root: root.clone(),
+            source: ProjectSource::Local,
+            checks: Some(vec![check.clone()]),
+            last_opened: OffsetDateTime::UNIX_EPOCH,
+            available: true,
+            git: None,
+        };
+        let store = Arc::new(
+            Store::open(data.path())
+                .unwrap()
+                .redacting(Arc::new(RootRedactor {
+                    root: root.to_string_lossy().into_owned(),
+                })),
+        );
+        trust(&store, &project);
+
+        run_configured_check(
+            Arc::clone(&store),
+            &project,
+            &check,
+            DecidedVia::Cli,
+            &Cancellation::default(),
+        )
+        .unwrap();
+
+        let summaries = project_checks(&store, &project).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].outcome, CheckOutcome::Passed);
+    }
+
+    /// The catalog admits 128 arbitrary environment names, `check.run` declares
+    /// none, and the two only met inside the process supervisor — after a task, a
+    /// run and an approval had been recorded — where the refusal arrived as a
+    /// generic execution failure. It is now refused before any of that, naming
+    /// the variable.
+    #[test]
+    fn an_environment_name_the_check_tool_cannot_set_is_refused_before_a_run_exists() {
+        let workspace = tempdir().unwrap();
+        let data = tempdir().unwrap();
+        initialize_repository(workspace.path());
+        let mut check = CheckConfiguration {
+            id: "fixture".to_owned(),
+            label: "Fixture".to_owned(),
+            command: vec!["true".to_owned()],
+            cwd: None,
+            env: BTreeMap::from([("RUSTFLAGS".to_owned(), "-D warnings".to_owned())]),
+            parser: CheckParser::Plain,
+            timeout_seconds: Some(10),
+        };
+        let project = Project {
+            id: ProjectId::new(),
+            display_name: "fixture".to_owned(),
+            root: workspace.path().canonicalize().unwrap(),
+            source: ProjectSource::Local,
+            checks: Some(vec![check.clone()]),
+            last_opened: OffsetDateTime::UNIX_EPOCH,
+            available: true,
+            git: None,
+        };
+        let store = Arc::new(Store::open(data.path()).unwrap());
+        trust(&store, &project);
+
+        let error = run_configured_check(
+            Arc::clone(&store),
+            &project,
+            &check,
+            DecidedVia::Cli,
+            &Cancellation::default(),
+        )
+        .expect_err("an undeclared environment name cannot start a check");
+        assert!(matches!(
+            error,
+            CheckLaunchError::UndeclaredEnvironment { ref name, .. } if name == "RUSTFLAGS"
+        ));
+        assert!(error.to_string().contains("RUSTFLAGS"));
+        // Nothing was recorded: the refusal happens before the task exists.
+        assert!(project_checks(&store, &project).unwrap().is_empty());
+
+        // A baseline name is still configurable, so the field is not inert.
+        check.env = BTreeMap::from([("LANG".to_owned(), "C".to_owned())]);
+        run_configured_check(
+            Arc::clone(&store),
+            &project,
+            &check,
+            DecidedVia::Cli,
+            &Cancellation::default(),
+        )
+        .unwrap();
     }
 
     fn trust(store: &Store, project: &Project) {

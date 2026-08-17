@@ -1340,7 +1340,11 @@ Item {
                                 ? qsTr("This check has never run.")
                                 : qsTr("No diagnostics were extracted from this run.")
                             textFormat: Text.PlainText
+                            // Not shown when the streams could not be read: that
+                            // is not an absence of diagnostics, and the reason
+                            // below says so instead.
                             visible: problemsColumn.diagnostics.length === 0
+                                && problemsColumn.unavailableNote.length === 0
                         }
 
                         Controls.ScrollView {
@@ -1350,12 +1354,16 @@ Item {
                             clip: true
                             visible: problemsColumn.diagnostics.length > 0
                                 || problemsColumn.omissionNote.length > 0
+                                || problemsColumn.unavailableNote.length > 0
 
                             ColumnLayout {
                                 id: problemsColumn
 
                                 readonly property var diagnostics: panel.selectedResult !== null
                                     ? (panel.selectedResult.diagnostics || []) : []
+                                readonly property string unavailableNote: panel.selectedResult !== null
+                                    ? String(panel.selectedResult.diagnosticsUnavailable || "")
+                                    : ""
                                 readonly property string omissionNote: {
                                     const result = panel.selectedResult;
                                     if (result === null)
@@ -1378,6 +1386,18 @@ Item {
                                 // the pane instead of wrapping inside it.
                                 width: problemsScroll.availableWidth
                                     - Kirigami.Units.smallSpacing
+
+                                // Leads the list rather than following it: it
+                                // says the diagnostics below are not the whole
+                                // answer, which has to be read before them.
+                                Kirigami.InlineMessage {
+                                    Layout.fillWidth: true
+                                    text: panel.escapedRichText(panel.format(
+                                        qsTr("Stored output could not be inspected, so any diagnostics it held are missing: %1"),
+                                        [problemsColumn.unavailableNote]))
+                                    type: Kirigami.MessageType.Warning
+                                    visible: problemsColumn.unavailableNote.length > 0
+                                }
 
                                 Repeater {
                                     model: problemsColumn.diagnostics

@@ -146,9 +146,17 @@ fn reject_checks_before_v4(catalog_path: &Path, body: &Value) -> Result<(), Proj
         .get("projects")
         .and_then(Value::as_array)
         .is_some_and(|projects| {
-            projects
-                .iter()
-                .any(|project| project.get("checks").is_some())
+            projects.iter().any(|project| {
+                // An explicit null is the absence of checks, not a v4 field: it
+                // is what `#[serde(default)] Option` reads as `None`, which is
+                // the state this version is allowed to hold. An empty array is
+                // not the same thing — that is an explicit "run nothing",
+                // distinguishable from the built-in defaults, and it does
+                // require v4.
+                project
+                    .get("checks")
+                    .is_some_and(|checks| !checks.is_null())
+            })
         });
     if carries_checks {
         return Err(invalid_catalog(

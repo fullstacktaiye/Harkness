@@ -2388,6 +2388,12 @@ fn to_checks(
             QString::from("diagnosticsScanTruncated"),
             QVariant::from(&result.diagnostics_scan_truncated),
         );
+        row.insert(
+            QString::from("diagnosticsUnavailable"),
+            QVariant::from(&QString::from(
+                result.diagnostics_unavailable.as_deref().unwrap_or(""),
+            )),
+        );
         recorded.append(QVariant::from(&row));
     }
     state.insert(QString::from("results"), QVariant::from(&recorded));
@@ -8164,6 +8170,7 @@ mod tests {
             diagnostics: Vec::new(),
             diagnostics_omitted: 3,
             diagnostics_scan_truncated: true,
+            diagnostics_unavailable: None,
             stdout_tail: "stdout".to_owned(),
             stderr_tail: "stderr".to_owned(),
             stdout_truncated: true,

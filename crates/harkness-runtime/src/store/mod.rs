@@ -200,6 +200,30 @@ impl Store {
         })
     }
 
+    /// Opens `<data_dir>/runtime.db` only if it is already there.
+    ///
+    /// [`Store::open`] creates the directory, the database, its WAL sidecars and
+    /// the whole migration ladder as a side effect of being called. That is right
+    /// for anything that is about to record something, and wrong for a read: a
+    /// caller projecting recorded state should be able to ask a data directory
+    /// what it holds without writing to it, and a read that reports "nothing
+    /// recorded" should leave no trace behind.
+    ///
+    /// `Ok(None)` means nothing has ever been recorded in this data directory.
+    /// An existing database is opened exactly as [`Store::open`] opens it,
+    /// migrations included — a schema older than this build still has to be
+    /// climbed before its rows can be read.
+    ///
+    /// # Errors
+    ///
+    /// The same failures [`Store::open`] reports for a database that does exist.
+    pub fn open_existing(data_dir: &Path) -> Result<Option<Self>, StoreError> {
+        if !data_dir.join(DATABASE_FILE).is_file() {
+            return Ok(None);
+        }
+        Self::open(data_dir).map(Some)
+    }
+
     /// Routes every event payload and artifact stream through `redactor`.
     ///
     /// Consuming rather than mutating is deliberate: a store is shared across
