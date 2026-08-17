@@ -58,8 +58,16 @@
 //! pure check reports which of eight typed reasons made it stop applying.
 //! Trust there is a precondition and never an authorization: a trusted subject
 //! still passes [`policy`] and [`approval`] on every action it takes.
+//!
+//! [`agent_registry`] is the first consumer of that model and the first thing to
+//! persist it. It owns `agents.json`, the enumeration-only discovery probe, the
+//! grant that binds one registration to one executable digest, and the health
+//! check that spawns an agent, negotiates once, and tears it down under a hard
+//! deadline. Every gate a launch passes is enforced there rather than in a front
+//! end, so no surface can arrange to run a program nobody trusted.
 
 pub mod agent;
+pub mod agent_registry;
 pub mod approval;
 pub mod check;
 pub mod context;

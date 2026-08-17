@@ -46,7 +46,7 @@ build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing lin
   `.github/workflows/network-integration.yml`.
 - **Fixture regeneration**: `cargo test -p harkness-runtime regenerate_the_frozen_v1_fixture --
   --ignored` rewrites `crates/harkness-runtime/src/store/fixtures/runtime-v1.db`, and
-  `regenerate_the_frozen_v2_fixture` (through `v8`) rewrites the corresponding `runtime-v*.db`. Run
+  `regenerate_the_frozen_v2_fixture` (through `v9`) rewrites the corresponding `runtime-v*.db`. Run
   each only when that migration itself changes; a released migration is otherwise never edited. The
   v1 regenerator applies a truncated ladder rather than opening a `Store`, because opening one now
   climbs to the newest schema. `regenerate_the_frozen_canonicalization_fixture` rewrites
@@ -65,7 +65,11 @@ build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing lin
   wire form is replaced by a new versioned fixture, never edited in place. The integration
   regenerator deliberately leaves `trust-record-future-schema.json` and
   `trust-record-unknown-field.json` alone — neither is a wire form this build can produce, so they
-  are hand-maintained beside the frozen set they probe. `cargo test -p harkness-provider --
+  are hand-maintained beside the frozen set they probe.
+  `cargo test -p harkness-runtime -- --ignored regenerate_the_frozen_v1_registry` rewrites
+  `crates/harkness-runtime/src/agent_registry/fixtures/agents-v1.json`; it is the `agents.json`
+  format's frozen example, so run it only when a *new* version of that format is published.
+  `cargo test -p harkness-provider --
   --ignored regenerate_the_frozen_v1_fixtures` rewrites
   `crates/harkness-provider/src/scripted/fixtures/*.json`, and is the one regenerator that is
   routine: those scripts are authored as JSON, so it only re-canonicalizes the formatting of a
@@ -80,9 +84,10 @@ build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing lin
 `crates/harkness-context/src/fixtures/*.json`, `crates/harkness-acp/src/fixtures/*.json`,
 `crates/harkness-runtime/src/approval/fixtures/canonical-input-v1.json`,
 `crates/harkness-runtime/src/agent/fixtures/*.json`,
+`crates/harkness-runtime/src/agent_registry/fixtures/agents-v1.json`,
 `crates/harkness-runtime/src/integration/fixtures/*.json`,
 `crates/harkness-provider/src/scripted/fixtures/*.json`, and
-`crates/harkness-runtime/src/store/fixtures/runtime-v{1..8}.db` pin released on-disk formats. A new
+`crates/harkness-runtime/src/store/fixtures/runtime-v{1..9}.db` pin released on-disk formats. A new
 persisted field, state spelling, or table means a version bump plus a *new* fixture, not an edit to
 an existing one. The `v8` fixture is the one whose contents are not pinned by constants: a workspace
 snapshot's id is minted per capture and its digest covers a temporary worktree root, so the test
@@ -118,7 +123,7 @@ harkness-acp  ──┬─> harkness-transport ──> harkness-git
 harkness-mcp  ──┘   (harkness-acp also depends on agent-client-protocol-schema,
                      the one external protocol crate in the workspace; ADR-0010)
 
-harkness-acp  ──┐
+harkness-acp  ──┐   (a real edge since #150: the agent registry needs the handshake)
 harkness-mcp  ──┤
 harkness-forge──┼─> harkness-runtime   (adapters never point back; see ADR-0009)
 harkness-recipe─┘
@@ -128,6 +133,8 @@ harkness-recipe─┘
 `harkness-runtime` and depend on none of it — nor on each other. `harkness-transport`
 is the one thing two adapters share, and it sits *below* both rather than inside
 one of them, which is what ADR-0009's no-sideways-edges rule leaves available.
+Only the `harkness-acp` edge is presently drawn; the other three adapters are
+still compiled by nothing but the workspace.
 
 `harkness-runtime` depends on `harkness-git` for one thing: `Cancellation`, which `tool`'s
 `ExecutionContext` carries so a tool that shells out to Git passes the same token down instead of
@@ -191,6 +198,14 @@ translating between two cancellation mechanisms.
   out the cache's busy timeout. Persistence is the *store's*: `record_workspace_snapshot_for_run`
   writes the `workspace_snapshots` row and its `snapshot_captured` event in one transaction, and it
   is the only producer of that kind.
+  `agent_registry` is the first consumer of the integration vocabulary and the first thing to
+  persist it. It owns `agents.json` (catalog discipline: probe, strict body, atomic rewrite under
+  `agents.lock`, frozen fixture), the enumeration-only discovery probe, the grant binding one
+  registration to one executable digest, and the health check that spawns an agent, runs
+  `initialize` and tears it down under a hard deadline. Four gates — registered, enabled, trusted,
+  unchanged — are enforced here rather than in a front end, and `AgentLaunch` is the unforgeable
+  proof they passed. This is why `harkness-runtime` names `harkness-acp`: the runtime is the
+  composer, and ADR-0009 points that edge downward.
 - **`harkness-context`** owns the context engine's vocabulary, its service
   boundary, and the first feature behind it: identifiers, `WorkspaceSnapshot`
   identity, `Provenance`, `FileClass`, the `ContextEngine` facade, the disposable
@@ -248,7 +263,9 @@ translating between two cancellation mechanisms.
   is the *union* of its own table and `harkness-transport`'s: a transport failure is carried whole
   and keeps the discriminant #147 gave it, exactly as `InvocationError` delegates to `ToolError`.
   Negotiation is total over the selected version and decided before any capability is read; an
-  unsupported one closes the connection and asks nothing more. `docs/acp.md` is the reference.
+  unsupported one closes the connection and asks nothing more. It launches nothing: which executable
+  may run is `harkness-runtime`'s `agent_registry` decision. `docs/acp.md` and `docs/agents.md` are
+  the two references.
 - **`harkness-mcp`, `harkness-forge`, `harkness-recipe`** are the remaining v0.5
   external-integration adapters, currently compile-clean skeletons whose only code is the test each
   one runs against its own `Cargo.toml`. They may depend on `harkness-git` and `harkness-core`,
@@ -276,6 +293,13 @@ Getting these confused is the main source of deadlock risk:
    the stable `projects.lock` inode. Never held during a long Git operation.
 3. **Run store** (`harkness-runtime/src/store`) — one mutex-guarded writer connection plus pooled
    readers; `BEGIN IMMEDIATE` per read-modify-write.
+
+The **agent registry lock** (`agents.lock`, guarded the same way `projects.lock` is) is not a fifth
+mechanism either. It is taken for the length of one registry mutation, its order against the store is
+fixed — **`agents.lock` → run store**, never the reverse — and it is never held while any of the
+four above is acquired. A mutation reads `agents.json` directly under its own exclusive lock rather
+than through the shared-lock read path, because an advisory lock does not care that the same process
+is on both ends of the wait.
 
 **Ordering: scheduler workspace slot, then repository lock, then catalog lock.** The store takes
 none of them, and no caller may hold a store transaction while acquiring any. The scheduler cannot
@@ -408,8 +432,9 @@ past `clippy::result_large_err`'s threshold, which is why `SendRejection` carrie
 
 `HARKNESS_DATA_DIR` replaces the platform data directory outright; the CLI's `--data-dir` takes
 precedence over it. Tests and isolated front ends rely on this — use it rather than touching real
-user data. The directory holds `projects.json`, `projects.lock`, `runtime.db` (+ `-wal`/`-shm`),
-`artifacts/`, `context/`, `locks/`, `repositories/`, and `worktrees/`. `context/` is the one
+user data. The directory holds `projects.json`, `projects.lock`, `agents.json`, `agents.lock`,
+`runtime.db` (+ `-wal`/`-shm`), `artifacts/`, `agent-scratch/`, `context/`, `locks/`,
+`repositories/`, and `worktrees/`. `context/` is the one
 disposable subtree: it holds `<repository-key>/index.db` per repository and deleting the whole thing
 costs warm-up time and no evidence (ADR-0004). Artifact content lives at
 `artifacts/<run_id>/<artifact_id>`; the `artifacts` table records the metadata and re-derives that

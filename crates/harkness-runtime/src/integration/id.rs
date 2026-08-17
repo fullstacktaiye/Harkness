@@ -15,6 +15,19 @@ define_id!(
     ExternalAgentId
 );
 define_id!(
+    /// The row identity of one stored [`TrustRecord`](super::TrustRecord).
+    ///
+    /// A record has no natural key and must not be given one:
+    /// [`check`](super::TrustRecord::check) ignores two basis fields and accepts
+    /// a compatible upgrade, so equality over the record's fields is a
+    /// compatibility relation rather than a key, and a revoked record would
+    /// collide with the later grant that replaced it. A store therefore
+    /// addresses a row by this value, which nothing else derives.
+    ///
+    /// [`Default`] generates a fresh random identity rather than an empty value.
+    TrustRecordId
+);
+define_id!(
     /// A stable identifier for one configured MCP server.
     ///
     /// [`Default`] generates a fresh random identity rather than an empty value.
@@ -59,7 +72,10 @@ mod tests {
 
     use serde::{Serialize, de::DeserializeOwned};
 
-    use super::{ExternalAgentId, ForgeAccountId, ForgeRepoRef, McpServerId, McpToolRef, RecipeId};
+    use super::{
+        ExternalAgentId, ForgeAccountId, ForgeRepoRef, McpServerId, McpToolRef, RecipeId,
+        TrustRecordId,
+    };
 
     const FIXTURE_ID: &str = "123e4567-e89b-42d3-a456-426614174000";
 
@@ -83,6 +99,7 @@ mod tests {
     #[test]
     fn integration_ids_parse_display_and_serde_round_trip_like_task_id() {
         assert_id_contract::<ExternalAgentId>();
+        assert_id_contract::<TrustRecordId>();
         assert_id_contract::<McpServerId>();
         assert_id_contract::<McpToolRef>();
         assert_id_contract::<RecipeId>();

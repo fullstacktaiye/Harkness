@@ -174,6 +174,34 @@ impl Sha256Hash {
         Self(hasher.finalize().into())
     }
 
+    /// Hashes everything `reader` yields, in bounded chunks.
+    ///
+    /// An agent executable is the one subject whose bytes are read from disk
+    /// rather than handed over already in memory, and it is routinely tens of
+    /// megabytes. Reading it whole to call [`of`](Self::of) would make the size
+    /// of somebody else's program decide this process's peak memory, so the
+    /// digest is streamed through a fixed buffer instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever `reader` failed with, unchanged: the caller knows what
+    /// it opened and this does not.
+    pub fn of_reader(reader: &mut impl std::io::Read) -> std::io::Result<Self> {
+        /// Large enough that a big executable is a few thousand reads, small
+        /// enough that the buffer is irrelevant beside the process itself.
+        const CHUNK: usize = 64 * 1024;
+
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0u8; CHUNK];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                return Ok(Self(hasher.finalize().into()));
+            }
+            hasher.update(&buffer[..read]);
+        }
+    }
+
     /// The raw digest.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {
@@ -757,7 +785,8 @@ where
 /// are accepted everywhere. Nothing here resolves a path, so recognizing a
 /// spelling this platform cannot resolve costs nothing and keeps a record
 /// readable where it was not written.
-pub(super) fn is_rooted_anywhere(path: &Path) -> bool {
+#[must_use]
+pub fn is_rooted_anywhere(path: &Path) -> bool {
     if path.is_absolute() || path.has_root() {
         return true;
     }

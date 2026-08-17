@@ -12,7 +12,7 @@ Harkness is a Rust 2024 workspace split into thirteen crates under `crates/`:
 - `harkness-acp`: the Agent Client Protocol client — the wire vocabulary, the `initialize` handshake, protocol-version and capability negotiation, and gated authentication. Sessions, mediation, and the rest of the v0.5 ACP surface land here beside them.
 - `harkness-mcp`, `harkness-forge`, `harkness-recipe`: the remaining v0.5 external-integration adapters — the Model Context Protocol client, forge-neutral contracts with the GitHub REST adapter, and the workflow-recipe source format and compiler. Currently skeletons; see the invariants below.
 - `harkness-test-fixtures`: hermetic repository, filesystem, and process fixtures shared only by crate tests.
-- `harkness-runtime`: typed task, run, step, and tool-call records, the typed tool contract and registry every executable operation implements, the execution contracts shared by front ends, and the SQLite run store that makes those records durable.
+- `harkness-runtime`: typed task, run, step, and tool-call records, the typed tool contract and registry every executable operation implements, the execution contracts shared by front ends, the SQLite run store that makes those records durable, and the external-agent registry that decides which program Harkness is willing to launch at all.
 - `harkness-cli`: the `harkness` command and its integration tests in `tests/`.
 - `harkness-gui`: the Qt 6/KDE Kirigami application. Rust/CXX-Qt bindings live in `src/` and `cxx/`; UI components live in `qml/`. Run, timeline, and approval bridge code lives outside `backend.rs`, in `src/run_list_model.rs`, `src/run_timeline_model.rs`, `src/approval_model.rs`, and `src/runs_backend.rs`, sharing `src/reconcile.rs` and `cxx/listmodelbase.h`; `backend.rs` stays the Git and catalog surface and gains no run or approval members. A front-end read takes the run store, never the coordinator: building one takes this process's lease and runs the recovery sweep, which writes, so it belongs to deciding to drive work rather than to looking at what was recorded.
 
@@ -1569,7 +1569,13 @@ for the async ACP SDK whose crate name is a prefix of the permitted schema crate
 `harkness-transport` carries the layering test against a longer list, since everything is above it.
 The sideways rule
 needs that test most: no dependency cycle exists to catch an adapter-to-adapter edge while
-`harkness-runtime` does not yet name the adapters. ADR-0009 records why.
+`harkness-runtime` names only one of the adapters. ADR-0009 records why.
+
+The edge that *is* permitted runs the other way, and #150 is the first to draw it:
+`harkness-runtime` names `harkness-acp`, because the agent registry needs both the run store and the
+`initialize` handshake, and trust has to compose with `trust` and `policy`, which an adapter cannot
+see. An adapter still reports what it observed as plain data and the runtime still builds the record;
+what changed is only that the composer now compiles the thing it composes.
 
 Protocol wire types are private to their adapter. No type defined by ACP, MCP, or the GitHub REST
 API — and no type generated from their schemas — may appear in an adapter's public API, in a
@@ -1734,6 +1740,65 @@ owes it the store's inline bound.
 because which executable may run is a trust decision bound to a digest and that decision is #150's
 under ADR-0016.
 
+## Agent Registry Invariants
+
+`harkness-runtime/src/agent_registry` is where that decision is made, and it is the one place it is
+made. Every launch and every health check passes four gates in one order — **registered, enabled,
+trusted, unchanged** — and the fourth hashes the executable *now* rather than trusting a stored
+digest. A front end cannot arrange to skip one: the gates are inside `AgentRegistryService` and the
+value that proves they passed, `AgentLaunch`, has no public constructor.
+
+**A registration is created disabled and only a trust decision takes it out of that state.** That is
+what makes "a repository suggestion never auto-enables" a property of every registration path rather
+than a rule the repository path remembers. `set_enabled(true)` refuses an agent no grant covers, an
+update lands disabled, and detected drift disables before it refuses.
+
+**Discovery enumerates and never executes.** No candidate is spawned, opened, read, or hashed;
+`DiscoveredCandidate` carries a name and a path and deliberately has no digest or capability field,
+because every one of those would require running or reading the program. The probe is bounded in
+time and in directories, honours cancellation, and reports a named `DiscoveryTruncation` rather than
+a short list — a truncated probe that stayed quiet reads as "nothing else is installed", the one
+conclusion it cannot support. The test that holds this points discovery at shims which record every
+invocation and asserts there are none; keep it that way.
+
+**Repository configuration is a different type, not a flag.** `AgentSuggestion` is what
+`.harkness/agents.json` produces, nothing in that path writes the user's registry, and an entry
+asking to be enabled has the request recorded and not honoured. ADR-0006 and #148's rule — repository
+content may tighten and never widen — are held structurally here.
+
+`agents.json` follows the catalog's discipline exactly: `schema_version` probed before a strict
+`deny_unknown_fields` body, additive optional fields defaulting to the safe value and absent meaning
+*off*, atomic write-temp-then-rename under the stable `agents.lock` inode, a frozen fixture compared
+against the encoder that writes the file, and no read that rewrites — or creates — anything. Runtime
+state stays out of it entirely: a digest, a capability snapshot, a health record and a grant are
+`runtime.db` rows, so losing the database costs a re-trust rather than a registration.
+
+The environment allowlist is **exhaustive and verbatim**. The child starts from an empty environment
+and sees exactly the named variables this process holds, with no implicit baseline — not even the one
+`BASELINE_ENVIRONMENT` gives a Harkness tool, because a tool is code Harkness ships and an agent is
+not. Names are never folded to upper case the way `EnvironmentName` folds a tool's declaration: on
+Unix `path` and `PATH` are two variables, and folding one onto the other admits one nobody named.
+
+The trust basis for an agent is the display name, the configuration source, and the executable's path
+and digest — and *only the digest and the source are compared*. Nothing the agent reports about
+itself takes part: a version it prints and a capability set it advertises are claims, and binding a
+grant to a claim would let the subject decide whether its own grant still applies. Those live in
+`agent_runtime_state` instead, where they are evidence rather than authority.
+
+The registry lock is the outermost of a mutation's locks: **`agents.lock` → run store**, never the
+reverse, and no other lock family is taken while it is held. It is an advisory lock like every other
+one in the workspace, so a mutation reads the file directly under its own exclusive lock rather than
+through the shared-lock read path — asking for a shared lock while holding the exclusive one is a
+process waiting for itself.
+
+`AgentRegistryError` publishes a union namespace the way `InvocationError` and `AcpError` do: its own
+table followed by the store's, the integration domain's, and ACP's, each carrying its own
+discriminant. Exactly two failures are re-classified rather than passed through, and both answer a
+question the layer beneath cannot — `initialize_timeout` says *which* deadline expired during a
+handshake, and `invalid_executable` says the program is not runnable at all — with the original
+failure kept as the source. A health record is written for every check that launched something and
+for none that refused before it did; a refusal before launch has nothing about the agent to record.
+
 ## Canonical JSON Key Order
 
 `serde_json::Map` is a `BTreeMap` — and therefore sorted — only until some crate anywhere in the
@@ -1742,12 +1807,17 @@ Cargo unifies that choice onto every member. `agent-client-protocol-schema` requ
 ADR-0010 requires that crate, so the workspace has already lost the free version of this property
 once. Nothing may rely on it again.
 
-Unification is per build graph rather than per repository, and that is the sharp edge: `cargo test
--p harkness-runtime` does not build `harkness-acp`, so it resolves `serde_json` *without*
-`preserve_order` and sees a `BTreeMap`, while `cargo test --workspace` sees an `IndexMap`. A
-byte-level assertion over an untyped `Value` can therefore pass under one command and fail under the
-other. Anything that freezes such bytes must sort them, and anything that merely reads them must not
-assume an order at all.
+Unification is per build graph rather than per repository, and that is the sharp edge: a `cargo test
+-p <crate>` whose graph excludes `harkness-acp` resolves `serde_json` *without* `preserve_order` and
+sees a `BTreeMap`, while `cargo test --workspace` sees an `IndexMap`. A byte-level assertion over an
+untyped `Value` can therefore pass under one command and fail under the other. Anything that freezes
+such bytes must sort them, and anything that merely reads them must not assume an order at all.
+
+`harkness-runtime` is no longer one of the crates that escapes it: #150 gives it the `harkness-acp`
+edge ADR-0009 permits, so `cargo test -p harkness-runtime` now sees an `IndexMap` too. That removes
+one command from the list of ways to notice the difference rather than removing the difference —
+`harkness-core`, `harkness-git`, `harkness-context` and `harkness-provider` still resolve without the
+feature, and the rule is unchanged for all of them.
 
 `harkness_runtime::canonical_json` is the one definition: every object key sorted by its exact UTF-8
 bytes at every depth, arrays untouched, idempotent. Three places take it because their bytes are a
