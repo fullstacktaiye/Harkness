@@ -200,6 +200,30 @@ impl Store {
         })
     }
 
+    /// Opens `<data_dir>/runtime.db` only if it is already there.
+    ///
+    /// [`Store::open`] creates the directory, the database, its WAL sidecars and
+    /// the whole migration ladder as a side effect of being called. That is right
+    /// for anything that is about to record something, and wrong for a read: a
+    /// caller projecting recorded state should be able to ask a data directory
+    /// what it holds without writing to it, and a read that reports "nothing
+    /// recorded" should leave no trace behind.
+    ///
+    /// `Ok(None)` means nothing has ever been recorded in this data directory.
+    /// An existing database is opened exactly as [`Store::open`] opens it,
+    /// migrations included — a schema older than this build still has to be
+    /// climbed before its rows can be read.
+    ///
+    /// # Errors
+    ///
+    /// The same failures [`Store::open`] reports for a database that does exist.
+    pub fn open_existing(data_dir: &Path) -> Result<Option<Self>, StoreError> {
+        if !data_dir.join(DATABASE_FILE).is_file() {
+            return Ok(None);
+        }
+        Self::open(data_dir).map(Some)
+    }
+
     /// Routes every event payload and artifact stream through `redactor`.
     ///
     /// Consuming rather than mutating is deliberate: a store is shared across
@@ -699,6 +723,20 @@ impl Store {
     /// above [`MAX_RUN_PAGE_LIMIT`].
     pub fn list_runs(&self, page: RunPage) -> Result<RunListing, StoreError> {
         self.with_reader(|connection| listing::list_runs(connection, page))
+    }
+
+    /// Returns the newest `check.run` call for each requested configured id.
+    ///
+    /// The result is bounded by `check_ids`, whose catalog limit is 32, rather
+    /// than by an arbitrary page of unrelated newer runs.
+    pub fn project_latest_check_call_ids(
+        &self,
+        project_id: harkness_core::ProjectId,
+        check_ids: &[String],
+    ) -> Result<Vec<ToolCallId>, StoreError> {
+        self.with_reader(|connection| {
+            listing::project_latest_tool_call_ids_by_check(connection, project_id, check_ids)
+        })
     }
 
     // -- steps --------------------------------------------------------------
@@ -1524,7 +1562,9 @@ impl Store {
     // -- internals ----------------------------------------------------------
 
     /// The data directory this store's artifacts live under.
-    pub(super) fn data_dir(&self) -> &Path {
+    /// Harkness data directory containing this store and its artifacts.
+    #[must_use]
+    pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
 

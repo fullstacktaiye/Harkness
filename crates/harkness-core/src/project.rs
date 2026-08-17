@@ -108,6 +108,10 @@ pub enum ProjectError {
     #[error("project {0} was not found in the catalog")]
     ProjectNotFound(ProjectId),
 
+    /// A project check list violates the bounded public configuration contract.
+    #[error("invalid project check configuration: {reason}")]
+    InvalidCheckConfiguration { reason: String },
+
     /// A catalog entry exists, but its root cannot currently be opened.
     #[error("project {id} is unavailable at '{}'", path.display())]
     ProjectUnavailable { id: ProjectId, path: PathBuf },
@@ -344,6 +348,7 @@ impl_project_error_kinds! {
     Self::ProjectSelectorNotFound { .. } => "project_selector_not_found",
     Self::AmbiguousProjectSelector { .. } => "ambiguous_project_selector",
     Self::ProjectNotFound(_) => "project_not_found",
+    Self::InvalidCheckConfiguration { .. } => "invalid_check_configuration",
     Self::ProjectUnavailable { .. } => "project_unavailable",
     Self::GitInspection { .. } => "git_inspection",
     Self::Persistence { .. } => "persistence",
@@ -527,8 +532,7 @@ impl ProjectService {
     }
 
     /// The Harkness data directory this service is rooted at.
-    #[cfg(test)]
-    pub(crate) fn data_dir(&self) -> &Path {
+    pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
 
@@ -674,6 +678,7 @@ impl ProjectService {
                 display_name: display_name(&canonical_root),
                 root: canonical_root.clone(),
                 source: ProjectSource::Local,
+                checks: None,
                 available: true,
                 last_opened: OffsetDateTime::now_utc(),
                 git,
@@ -715,6 +720,36 @@ impl ProjectService {
         self.persist(&candidate)?;
         self.catalog = candidate;
         Ok(opened)
+    }
+
+    /// Replaces one project's explicit checks under the catalog lock.
+    ///
+    /// `None` restores workspace defaults; `Some([])` intentionally disables
+    /// them. No command is executed while the catalog lock is held.
+    pub fn configure_checks(
+        &mut self,
+        id: ProjectId,
+        checks: Option<Vec<crate::CheckConfiguration>>,
+    ) -> Result<Project, ProjectError> {
+        if let Some(checks) = checks.as_deref() {
+            crate::CheckConfiguration::validate_all(checks).map_err(|reason| {
+                ProjectError::InvalidCheckConfiguration {
+                    reason: reason.to_owned(),
+                }
+            })?;
+        }
+        let _lock = self.lock_exclusive()?;
+        let mut candidate = self.read_catalog()?;
+        let project = candidate
+            .projects
+            .iter_mut()
+            .find(|project| project.id == id)
+            .ok_or(ProjectError::ProjectNotFound(id))?;
+        project.checks = checks;
+        let configured = project.clone();
+        self.persist(&candidate)?;
+        self.catalog = candidate;
+        Ok(configured)
     }
 
     /// Removes a project record without touching its source directory.
@@ -824,6 +859,7 @@ impl ProjectService {
                 source: ProjectSource::ManagedRepository {
                     remote: normalized.clone(),
                 },
+                checks: None,
                 last_opened: OffsetDateTime::now_utc(),
                 available: true,
                 git: inspect_git(&canonical_root)?,
@@ -1112,6 +1148,7 @@ impl ProjectService {
                         parent: parent_id,
                         worktree_branch,
                     },
+                    checks: None,
                     last_opened: OffsetDateTime::now_utc(),
                     available: true,
                     git,
@@ -2858,6 +2895,7 @@ mod tests {
     const VERSION_ONE_CATALOG: &str = include_str!("catalog/fixtures/v1.json");
     const VERSION_TWO_CATALOG: &str = include_str!("catalog/fixtures/v2.json");
     const VERSION_THREE_CATALOG: &str = include_str!("catalog/fixtures/v3.json");
+    const VERSION_FOUR_CATALOG: &str = include_str!("catalog/fixtures/v4.json");
 
     /// A path in the form the catalog records it.
     ///
@@ -2975,6 +3013,7 @@ mod tests {
                 parent,
                 worktree_branch: Some(branch.to_owned()),
             },
+            checks: None,
             last_opened: time::OffsetDateTime::now_utc(),
             available: true,
             git: None,
@@ -3131,6 +3170,7 @@ mod tests {
             display_name: "fixture".to_owned(),
             root: path.clone(),
             source: ProjectSource::Local,
+            checks: None,
             last_opened: time::OffsetDateTime::UNIX_EPOCH,
             available: false,
             git: None,
@@ -3213,6 +3253,12 @@ mod tests {
                 "ambiguous_project_selector",
             ),
             (ProjectError::ProjectNotFound(id), "project_not_found"),
+            (
+                ProjectError::InvalidCheckConfiguration {
+                    reason: "fixture".to_owned(),
+                },
+                "invalid_check_configuration",
+            ),
             (
                 ProjectError::ProjectUnavailable {
                     id,
@@ -3649,6 +3695,118 @@ mod tests {
             ["code", "--goto", "{file}:{line}:{column}"]
         );
         assert_eq!(fs::read(catalog_path).unwrap(), fixture_bytes);
+    }
+
+    #[test]
+    fn frozen_version_four_project_checks_load_without_rewrite() {
+        let fixture = Fixture::new();
+        let local_root = fixture.directory("version-four-local");
+        fs::create_dir_all(&fixture.data_dir).unwrap();
+        let catalog_path = fixture.data_dir.join(CATALOG_FILE);
+        let fixture_bytes = catalog_fixture(
+            VERSION_FOUR_CATALOG,
+            &[("__LOCAL_ROOT__", &as_catalogued(&local_root))],
+        );
+        fs::write(&catalog_path, &fixture_bytes).unwrap();
+
+        let service = ProjectService::load_from_data_dir(&fixture.data_dir).unwrap();
+        let projects = service.list_catalog_only().unwrap();
+
+        let checks = projects[0].checks.as_ref().unwrap();
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].id, "lint");
+        assert_eq!(checks[0].command, ["custom-linter", "--machine"]);
+        assert_eq!(fs::read(catalog_path).unwrap(), fixture_bytes);
+    }
+
+    /// An explicit null is the shape `#[serde(default)] Option` reads as "no
+    /// checks", which is the state a pre-v4 catalog is allowed to hold, so such
+    /// a file has to keep loading — rejecting it made every project in it
+    /// unreachable until the null was deleted by hand. An empty array is a
+    /// different statement, "run nothing" rather than the built-in defaults,
+    /// and does require the version that can represent it.
+    #[test]
+    fn a_pre_v4_catalog_takes_a_null_checks_field_and_still_refuses_a_present_one() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("null-checks");
+        fs::create_dir_all(&fixture.data_dir).unwrap();
+        let catalog_path = fixture.data_dir.join(CATALOG_FILE);
+        let write = |checks: serde_json::Value| {
+            let mut project = serde_json::json!({
+                "id": "00000000-0000-4000-8000-000000000001",
+                "display_name": "null-checks",
+                "root": as_catalogued(&root),
+                "source": "local",
+                "last_opened": "2026-08-06 18:52:03.000000000 +00:00:00"
+            });
+            project
+                .as_object_mut()
+                .unwrap()
+                .insert("checks".to_owned(), checks);
+            fs::write(
+                &catalog_path,
+                serde_json::to_vec(&serde_json::json!({
+                    "version": MINIMUM_SUPPORTED_CATALOG_VERSION,
+                    "projects": [project]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+
+        write(serde_json::Value::Null);
+        let stored = fs::read(&catalog_path).unwrap();
+        let service = ProjectService::load_from_data_dir(&fixture.data_dir).unwrap();
+        assert!(service.list_catalog_only().unwrap()[0].checks.is_none());
+        assert_eq!(fs::read(&catalog_path).unwrap(), stored);
+
+        for present in [
+            serde_json::json!([]),
+            serde_json::json!([{
+                "id": "lint",
+                "label": "Lint",
+                "command": ["custom-linter"]
+            }]),
+        ] {
+            write(present);
+            assert!(matches!(
+                ProjectService::load_from_data_dir(&fixture.data_dir),
+                Err(ProjectError::InvalidCatalog { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn configuring_and_clearing_checks_upgrades_then_downgrades_the_catalog() {
+        let fixture = Fixture::new();
+        let root = fixture.directory("check-configuration");
+        let mut service = fixture.service();
+        let project = service.import_local(root).unwrap();
+        let check = crate::CheckConfiguration {
+            id: "verify".to_owned(),
+            label: "Verify".to_owned(),
+            command: vec!["verify-project".to_owned()],
+            cwd: None,
+            env: Default::default(),
+            parser: crate::CheckParser::Plain,
+            timeout_seconds: None,
+        };
+
+        service
+            .configure_checks(project.id, Some(vec![check]))
+            .unwrap();
+        let configured: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.data_dir.join(CATALOG_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(configured["version"], 4);
+        assert_eq!(configured["projects"][0]["checks"][0]["id"], "verify");
+
+        service.configure_checks(project.id, None).unwrap();
+        let restored: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.data_dir.join(CATALOG_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(restored["version"], 1);
+        assert!(restored["projects"][0].get("checks").is_none());
     }
 
     /// Set through `Command::env` on a re-executed child rather than
@@ -5848,6 +6006,7 @@ mod tests {
                 parent: parent.id,
                 worktree_branch: Some("agent/symlink-worktree".to_owned()),
             },
+            checks: None,
             last_opened: time::OffsetDateTime::now_utc(),
             available: true,
             git: None,
@@ -6251,6 +6410,35 @@ mod tests {
             assert!(matches!(
                 ProjectService::load_from_data_dir(&fixture.data_dir),
                 Err(ProjectError::MalformedCatalog { .. })
+            ));
+        }
+
+        // Project checks are v4 data. Accepting them under an older spelling
+        // would let any v1-v3 writer silently discard the command list.
+        for legacy_version in [1, WORKTREE_CATALOG_VERSION, 3] {
+            fs::write(
+                &catalog_path,
+                serde_json::to_vec(&serde_json::json!({
+                    "version": legacy_version,
+                    "projects": [{
+                        "id": "00000000-0000-4000-8000-000000000001",
+                        "display_name": "invalid legacy checks",
+                        "root": fixture.directory(&format!("legacy-checks-{legacy_version}")),
+                        "source": "local",
+                        "checks": [{
+                            "id": "test",
+                            "label": "Tests",
+                            "command": ["test-project"]
+                        }],
+                        "last_opened": "2026-08-06 18:52:03.000000000 +00:00:00"
+                    }]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(matches!(
+                ProjectService::load_from_data_dir(&fixture.data_dir),
+                Err(ProjectError::InvalidCatalog { .. })
             ));
         }
     }

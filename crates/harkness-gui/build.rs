@@ -22,6 +22,7 @@ fn main() {
             "qml/RepositoryToolbar.qml",
             "qml/GitPanel.qml",
             "qml/IssuesPanel.qml",
+            "qml/ChecksPanel.qml",
             "qml/ChangesPanel.qml",
             "qml/DiscardPrompt.qml",
             "qml/HistoryPanel.qml",

@@ -16,6 +16,7 @@ import org.kde.kirigami as Kirigami
 ///   viewIcon       themed icon name for the activity bar
 ///   viewShortcut   shortcut advertised in the tooltip; may be empty
 ///   viewBadge      count drawn on the activity-bar icon; 0 hides it
+///   viewBadgeColor ground for that count; optional, accent when not declared
 ///   viewAvailable  whether the view applies to the current project
 Item {
     id: sidePanel

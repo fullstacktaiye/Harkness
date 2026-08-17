@@ -10,7 +10,9 @@ use rusqlite::{Connection, named_params};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use time::OffsetDateTime;
 
-use crate::domain::{Run, RunId};
+use harkness_core::ProjectId;
+
+use crate::domain::{Run, RunId, ToolCallId};
 
 use super::column::{decode_cursor_timestamp, decode_id, encode_timestamp};
 use super::error::{StoreError, query_failed};
@@ -205,6 +207,54 @@ pub(super) fn list_runs(connection: &Connection, page: RunPage) -> Result<RunLis
         .map(run_from_wire)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(RunListing { runs, next_cursor })
+}
+
+pub(super) fn project_latest_tool_call_ids_by_check(
+    connection: &Connection,
+    project_id: ProjectId,
+    check_ids: &[String],
+) -> Result<Vec<ToolCallId>, StoreError> {
+    if check_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let check_ids =
+        serde_json::to_string(check_ids).expect("a string array is always representable as JSON");
+    let mut statement = connection
+        .prepare_cached(
+            "WITH matching AS (\
+                 SELECT tool_calls.id, tool_calls.created_at, \
+                        ROW_NUMBER() OVER (\
+                            PARTITION BY json_extract(tool_calls.input_json, '$.check_id') \
+                            ORDER BY tool_calls.created_at DESC, tool_calls.id DESC\
+                        ) AS newest \
+                 FROM tool_calls \
+                 JOIN runs ON runs.id = tool_calls.run_id \
+                 JOIN tasks ON tasks.id = runs.task_id \
+                 WHERE tasks.project_id = :project_id \
+                   AND tool_calls.tool_id = 'check.run' \
+                   AND json_type(tool_calls.input_json, '$.check_id') = 'text' \
+                   AND json_extract(tool_calls.input_json, '$.check_id') IN (\
+                       SELECT value FROM json_each(:check_ids)\
+                   )\
+             ) \
+             SELECT id FROM matching WHERE newest = 1 \
+             ORDER BY created_at DESC, id DESC",
+        )
+        .map_err(|error| query_failed("preparing the latest project checks", error))?;
+    let rows = statement
+        .query_map(
+            named_params! {
+                ":project_id": project_id.to_string(),
+                ":check_ids": check_ids,
+            },
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| query_failed("listing the latest project checks", error))?;
+    rows.map(|row| {
+        let stored = row.map_err(|error| query_failed("reading a project check call id", error))?;
+        decode_id("tool call", "id", &stored)
+    })
+    .collect()
 }
 
 #[cfg(test)]

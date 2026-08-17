@@ -80,7 +80,7 @@ fn project_json_wire_shape_and_rfc3339_timestamp_are_exact() {
         serde_json::to_string(&fs::canonicalize(project_root).unwrap().to_string_lossy()).unwrap();
     let branch = serde_json::to_string(&branch).unwrap();
     let expected = format!(
-        "{{\"v\":1,\"type\":\"success\",\"ok\":true,\"data\":{{\"project\":{{\"available\":true,\"display_name\":\"wire-project\",\"git\":{{\"branch\":{branch},\"dirty\":false,\"staged\":0,\"unstaged\":0,\"upstream\":null}},\"id\":\"{FIXED_ID}\",\"last_opened\":\"2026-08-06T18:52:03Z\",\"parent\":null,\"path_is_lossy\":false,\"remote\":null,\"root\":{root},\"source\":\"local\",\"status_checked\":true,\"worktree_branch\":null}}}}}}\n"
+        "{{\"v\":1,\"type\":\"success\",\"ok\":true,\"data\":{{\"project\":{{\"available\":true,\"checks\":null,\"display_name\":\"wire-project\",\"effective_checks\":[],\"git\":{{\"branch\":{branch},\"dirty\":false,\"staged\":0,\"unstaged\":0,\"upstream\":null}},\"id\":\"{FIXED_ID}\",\"last_opened\":\"2026-08-06T18:52:03Z\",\"parent\":null,\"path_is_lossy\":false,\"remote\":null,\"root\":{root},\"source\":\"local\",\"status_checked\":true,\"worktree_branch\":null}}}}}}\n"
     );
     assert_eq!(output.stdout, expected.as_bytes());
 }
@@ -637,6 +637,221 @@ fn no_status_listing_is_cheap_and_marks_derived_state_unchecked() {
         String::from_utf8(human.stdout)
             .unwrap()
             .contains("\tunchecked\n")
+    );
+}
+
+/// Checks were configurable only by hand-editing `projects.json`: the catalog
+/// could hold them, the runtime could run them, and no command could set one.
+/// The round trip also has to leave the catalog at the oldest version that can
+/// represent what it now holds.
+#[test]
+fn project_checks_are_configurable_listable_and_clearable_through_the_cli() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let project_root = fixture.path().join("project");
+    fs::create_dir_all(&project_root).unwrap();
+    let project_id = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&project_root)
+        .unwrap()
+        .id
+        .to_string();
+    let catalog = data_dir.join("projects.json");
+    let stored_version = || -> u64 {
+        serde_json::from_slice::<Value>(&fs::read(&catalog).unwrap()).unwrap()["version"]
+            .as_u64()
+            .unwrap()
+    };
+
+    let configured = harkness_with_stdin(
+        &data_dir,
+        &[
+            "--json",
+            "check",
+            "configure",
+            "--project",
+            &project_id,
+            "--from",
+            "-",
+        ],
+        r#"[{"id":"lint","label":"Lint","command":["true"],"parser":"plain"}]"#,
+    );
+    assert_success(&configured);
+    assert_eq!(json_output(&configured)["data"]["checks"][0]["id"], "lint");
+    assert_eq!(stored_version(), 4);
+
+    let listed = harkness(
+        &data_dir,
+        &["--json", "check", "list", "--project", &project_id],
+    );
+    assert_success(&listed);
+    assert_eq!(json_output(&listed)["data"]["checks"][0]["id"], "lint");
+    // Listing is a read: it must not bring a run store into being.
+    assert!(!data_dir.join("runtime.db").exists());
+
+    // `project show` reports both the explicit configuration and what it
+    // resolves to, so a caller can tell "configured empty" from "unconfigured".
+    let shown = harkness(&data_dir, &["--json", "project", "list"]);
+    let project = &json_output(&shown)["data"]["projects"][0];
+    assert_eq!(project["checks"][0]["id"], "lint");
+    assert_eq!(project["effective_checks"][0]["id"], "lint");
+
+    let refused = harkness(
+        &data_dir,
+        &["--json", "check", "clear", "--project", &project_id],
+    );
+    assert_eq!(refused.status.code(), Some(3));
+    assert_eq!(
+        json_output(&refused)["error"]["kind"],
+        "confirmation_required"
+    );
+
+    let cleared = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "check",
+            "clear",
+            "--project",
+            &project_id,
+            "--yes",
+        ],
+    );
+    assert_success(&cleared);
+    assert_eq!(json_output(&cleared)["data"]["checks"], Value::Null);
+    assert_eq!(stored_version(), 1);
+}
+
+/// A CI-shaped caller has to be able to read the verdict from the exit status.
+/// Every non-passing outcome used to arrive inside a success envelope with code
+/// zero, so pass and fail were indistinguishable without parsing stdout.
+#[test]
+fn a_failing_check_reports_through_the_exit_status_and_keeps_its_evidence() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let project_root = fixture.path().join("project");
+    initialize_repository(&project_root);
+    let project_id = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&project_root)
+        .unwrap()
+        .id
+        .to_string();
+
+    assert_success(&harkness_with_stdin(
+        &data_dir,
+        &[
+            "--json",
+            "check",
+            "configure",
+            "--project",
+            &project_id,
+            "--from",
+            "-",
+        ],
+        r#"[{"id":"nope","label":"Nope","command":["false"],"parser":"plain"},
+            {"id":"yep","label":"Yep","command":["true"],"parser":"plain"}]"#,
+    ));
+
+    let passed = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "check",
+            "run",
+            "--project",
+            &project_id,
+            "yep",
+            "--yes",
+            "--trust-workspace",
+        ],
+    );
+    assert_success(&passed);
+    assert_eq!(json_output(&passed)["data"]["result"]["outcome"], "passed");
+
+    let failed = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "check",
+            "run",
+            "--project",
+            &project_id,
+            "nope",
+            "--yes",
+        ],
+    );
+    assert_eq!(failed.status.code(), Some(1));
+    let body = json_output(&failed);
+    assert_eq!(body["error"]["kind"], "check_failed");
+    // The evidence a success envelope carried is still here, in full.
+    assert_eq!(body["error"]["details"]["result"]["outcome"], "failed");
+    assert_eq!(body["error"]["details"]["check"]["id"], "nope");
+}
+
+/// The catalog admits any environment name; `check.run` declares none beyond the
+/// baseline. The two used to meet inside the process supervisor, after a run had
+/// been recorded, and surfaced as a generic operation failure.
+#[test]
+fn an_environment_name_no_check_can_set_is_a_usage_error_before_anything_runs() {
+    let fixture = TempDir::new().unwrap();
+    let data_dir = fixture.path().join("data");
+    let project_root = fixture.path().join("project");
+    initialize_repository(&project_root);
+    let project_id = ProjectService::load_from_data_dir(&data_dir)
+        .unwrap()
+        .import_local(&project_root)
+        .unwrap()
+        .id
+        .to_string();
+    assert_success(&harkness_with_stdin(
+        &data_dir,
+        &[
+            "--json",
+            "check",
+            "configure",
+            "--project",
+            &project_id,
+            "--from",
+            "-",
+        ],
+        r#"[{"id":"envy","label":"Envy","command":["true"],
+             "env":{"RUSTFLAGS":"-D warnings"},"parser":"plain"}]"#,
+    ));
+
+    let refused = harkness(
+        &data_dir,
+        &[
+            "--json",
+            "check",
+            "run",
+            "--project",
+            &project_id,
+            "envy",
+            "--yes",
+            "--trust-workspace",
+        ],
+    );
+    assert_eq!(refused.status.code(), Some(2));
+    let body = json_output(&refused);
+    assert_eq!(body["error"]["kind"], "usage_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("RUSTFLAGS")
+    );
+    let listed = harkness(
+        &data_dir,
+        &["--json", "check", "list", "--project", &project_id],
+    );
+    assert_success(&listed);
+    assert!(
+        json_output(&listed)["data"]["results"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a refused launch recorded a result"
     );
 }
 

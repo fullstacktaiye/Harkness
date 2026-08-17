@@ -186,6 +186,31 @@ fn opening_creates_the_database_under_the_given_data_directory() {
     );
 }
 
+/// A read-only projection has to be able to ask a data directory what it holds
+/// without writing to it. `Store::open` answers "nothing recorded" by first
+/// creating the directory, the database, both WAL sidecars and every migration,
+/// which is not a read.
+#[test]
+fn opening_only_an_existing_database_leaves_an_untouched_data_directory_alone() {
+    let parent = TempDir::new().unwrap();
+    let data_dir = parent.path().join("nested").join("harkness");
+
+    assert!(Store::open_existing(&data_dir).unwrap().is_none());
+    assert!(
+        !data_dir.exists(),
+        "a read created the data directory: {}",
+        data_dir.display()
+    );
+
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    drop(stored_run(&fixture.store, &task));
+    let opened = Store::open_existing(fixture.data_dir.path())
+        .unwrap()
+        .expect("an existing database opens");
+    assert_eq!(opened.list_runs(RunPage::new(10)).unwrap().runs.len(), 1);
+}
+
 #[test]
 fn opening_an_existing_database_reuses_it_instead_of_replacing_it() {
     let fixture = Fixture::new();

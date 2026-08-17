@@ -120,6 +120,17 @@ impl RunCoordinator {
         }
     }
 
+    /// The run store this coordinator records into.
+    ///
+    /// A caller that has to build a projection out of the same records — or
+    /// redact a value the way this coordinator will — needs the store that
+    /// belongs to the coordinator rather than one it opened separately, so that
+    /// the two cannot be different stores.
+    #[must_use]
+    pub fn store(&self) -> &Arc<Store> {
+        &self.inner.store
+    }
+
     /// Persists a user task and returns its stable identity.
     pub fn start_task(&self, task: Task) -> Result<TaskId, RuntimeError> {
         let id = task.id();

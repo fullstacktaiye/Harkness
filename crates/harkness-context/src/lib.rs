@@ -92,7 +92,7 @@ pub use provenance::{
 pub use snapshot::{
     Capture, CaptureDiagnostics, CaptureRequest, FileDigestEntry, FreshnessState, PathDivergence,
     SkippedPath, SnapshotComponent, SnapshotDigest, SnapshotFiles, StalePath, UnverifiableReason,
-    Verification, WorkspaceSnapshot,
+    Verification, WorkspaceReading, WorkspaceSnapshot,
 };
 pub use wire::{
     CONTEXT_RECORD_SCHEMA_VERSION, MINIMUM_CONTEXT_RECORD_SCHEMA_VERSION, ProvenanceWire,

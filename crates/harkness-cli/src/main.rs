@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env,
     ffi::OsString,
     fs,
@@ -6,7 +7,10 @@ use std::{
     num::NonZeroU32,
     path::{Path, PathBuf},
     process::ExitCode,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::Duration,
 };
@@ -20,8 +24,8 @@ use clap::{
     error::{Error as ClapError, ErrorKind},
 };
 use harkness_core::{
-    EditorConfiguration, EditorError, EditorLaunchContext, EditorPosition, EditorPreset, Project,
-    ProjectError, ProjectSelector, ProjectService, ProjectSource, Worktree,
+    CheckConfiguration, EditorConfiguration, EditorError, EditorLaunchContext, EditorPosition,
+    EditorPreset, Project, ProjectError, ProjectSelector, ProjectService, ProjectSource, Worktree,
 };
 use harkness_git::{
     Branch, BranchCheckout, BranchKind, BranchListOptions, Cancellation, ChangeProvenance,
@@ -37,10 +41,16 @@ use harkness_git::{
     RefUpdate, StageOutcome, StagePathResult, StatusEntry, StatusRefreshOutcome,
     TrackedRestoreSource, UpstreamStatus, Whitespace, WhitespaceMode, WorktreeBase,
 };
-use harkness_runtime::policy::EXTERNAL_POLICY_DENIAL_KINDS;
+use harkness_runtime::{
+    approval::DecidedVia,
+    check::{CheckOutcome, CheckSummary, check_coordinator, project_checks, run_configured_check},
+    policy::EXTERNAL_POLICY_DENIAL_KINDS,
+    store::Store,
+    trust::{TrustState, WorkspaceTrust},
+};
 use serde::Serialize;
 use serde_json::{Value, json};
-use time::format_description::well_known::Rfc3339;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const ENVELOPE_VERSION: u8 = 1;
 const EXIT_OPERATION_FAILED: u8 = 1;
@@ -55,6 +65,9 @@ const CLI_ERROR_KINDS: &[&str] = &[
     "interrupt_handler_unavailable",
     "wire_projection_failed",
     "path_operation_failed",
+    "check_operation_failed",
+    "check_failed",
+    "check_cancelled",
     "confirmation_required",
     "managed_project_requires_delete",
     "local_project_requires_forget",
@@ -103,6 +116,11 @@ enum Command {
         #[command(subcommand)]
         command: WorktreeCommand,
     },
+    /// Run and inspect state-bound project checks.
+    Check {
+        #[command(subcommand)]
+        command: CheckCommand,
+    },
     /// Configure and launch an external editor without invoking a shell.
     Editor {
         #[command(subcommand)]
@@ -110,6 +128,55 @@ enum Command {
     },
     /// Describe the versioned machine-readable CLI contract.
     Contract,
+}
+
+#[derive(Debug, Subcommand)]
+enum CheckCommand {
+    /// List configured checks and their newest recorded results.
+    List(ProjectSelection),
+    /// Replace this project's explicit checks from a JSON document.
+    Configure(CheckConfigureArguments),
+    /// Discard explicit checks and restore the workspace defaults.
+    Clear(CheckClearArguments),
+    /// Run one configured check through the durable runtime.
+    Run(CheckRunArguments),
+}
+
+#[derive(Debug, Args)]
+struct CheckConfigureArguments {
+    #[command(flatten)]
+    selection: ProjectSelection,
+    /// JSON array of check definitions, or `-` to read standard input.
+    ///
+    /// A document is used rather than flags because a check is argv, a working
+    /// directory, an environment map, a parser and a timeout together, and a
+    /// half-specified one is not a thing this catalog can hold.
+    #[arg(long, value_name = "PATH")]
+    from: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct CheckClearArguments {
+    #[command(flatten)]
+    selection: ProjectSelection,
+    /// Confirm discarding the project's explicit check configuration.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Debug, Args)]
+struct CheckRunArguments {
+    #[command(flatten)]
+    selection: ProjectSelection,
+    /// Stable configured check identifier.
+    #[arg(value_name = "CHECK_ID")]
+    check_id: String,
+    /// Confirm execution of the exact configured command.
+    #[arg(long)]
+    yes: bool,
+    /// Explicitly trust this project identity and canonical root before running.
+    #[arg(long, requires = "yes")]
+    trust_workspace: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -658,7 +725,8 @@ struct DiffArguments {
             "max_files",
             "paths",
             "provenance",
-            "provenance_max_commits"
+            "provenance_max_commits",
+            "checks"
         ]
     )]
     context_from: Option<PathBuf>,
@@ -679,6 +747,9 @@ struct DiffArguments {
         requires = "provenance",
     )]
     provenance_max_commits: usize,
+    /// Include recorded project checks and their current staleness beside the diff.
+    #[arg(long)]
+    checks: bool,
     /// Largest old or new file whose content is included.
     #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_MAX_DIFF_FILE_SIZE)]
     max_file_size: u64,
@@ -1547,6 +1618,19 @@ impl RefusalKind {
 #[derive(Debug)]
 enum CliError {
     Project(ProjectError),
+    Check(String),
+    /// A check ran correctly and did not pass.
+    ///
+    /// Reported through the error envelope rather than as a success carrying a
+    /// negative verdict, so a caller can act on the exit status without parsing
+    /// stdout — the reason `cargo test` and `gh pr checks` both exit non-zero.
+    /// The whole recorded result travels in `details`, so nothing a success
+    /// envelope carried is lost.
+    CheckVerdict {
+        kind: &'static str,
+        message: String,
+        details: Value,
+    },
     Usage(String),
     CurrentDirectory(io::Error),
     InterruptHandler(io::Error),
@@ -1578,6 +1662,8 @@ impl CliError {
     fn kind(&self) -> &'static str {
         match self {
             Self::Project(error) => error.kind(),
+            Self::Check(_) => "check_operation_failed",
+            Self::CheckVerdict { kind, .. } => kind,
             Self::Usage(_) => "usage_error",
             Self::CurrentDirectory(_) => "current_directory_unavailable",
             Self::InterruptHandler(_) => "interrupt_handler_unavailable",
@@ -1590,6 +1676,7 @@ impl CliError {
     fn message(&self) -> String {
         match self {
             Self::Project(error) => error.to_string(),
+            Self::Check(message) | Self::CheckVerdict { message, .. } => message.clone(),
             Self::Usage(message) => message.clone(),
             Self::WireProjection(message) => message.clone(),
             Self::PathOperation { operation, .. } => {
@@ -1612,7 +1699,15 @@ impl CliError {
             Self::CurrentDirectory(_)
             | Self::InterruptHandler(_)
             | Self::WireProjection(_)
-            | Self::PathOperation { .. } => EXIT_OPERATION_FAILED,
+            | Self::PathOperation { .. }
+            | Self::Check(_) => EXIT_OPERATION_FAILED,
+            Self::CheckVerdict { kind, .. } => {
+                if *kind == "check_cancelled" {
+                    EXIT_CANCELLED
+                } else {
+                    EXIT_OPERATION_FAILED
+                }
+            }
             Self::Refused { .. } => EXIT_REFUSED,
         }
     }
@@ -1622,7 +1717,9 @@ impl CliError {
             Self::Project(error) => project_error_details(error),
             Self::Refused { details, .. } => details.clone(),
             Self::PathOperation { details, .. } => details.clone(),
-            Self::Usage(_)
+            Self::CheckVerdict { details, .. } => details.clone(),
+            Self::Check(_)
+            | Self::Usage(_)
             | Self::CurrentDirectory(_)
             | Self::InterruptHandler(_)
             | Self::WireProjection(_) => {
@@ -1791,9 +1888,294 @@ fn run(cli: Cli, cancellation: &Cancellation) -> Result<CommandResult, CliError>
         Command::Worktree { command } => {
             run_worktree(command, data_dir.as_deref(), json, cancellation)
         }
+        Command::Check { command } => run_check(command, data_dir.as_deref(), json, cancellation),
         Command::Editor { command } => run_editor(command, data_dir.as_deref(), json),
         Command::Contract => Ok(contract_result(json)),
     }
+}
+
+fn run_check(
+    command: CheckCommand,
+    data_dir: Option<&Path>,
+    json_output: bool,
+    cancellation: &Cancellation,
+) -> Result<CommandResult, CliError> {
+    let mut service = load_service(data_dir)?;
+    match command {
+        CheckCommand::List(selection) => {
+            let project = resolve_project(&service, selection.project.as_deref())?;
+            let checks = project.effective_checks();
+            let results = recorded_checks_without_creating_a_store(&service, &project)?;
+            check_list_result(json_output, &checks, &results)
+        }
+        CheckCommand::Configure(arguments) => {
+            let project = resolve_project(&service, arguments.selection.project.as_deref())?;
+            let document = read_selection_document(&arguments.from)?;
+            let checks =
+                serde_json::from_str::<Vec<CheckConfiguration>>(&document).map_err(|error| {
+                    CliError::Usage(format!(
+                        "the check document must be a JSON array of check definitions: {error}"
+                    ))
+                })?;
+            let configured = service.configure_checks(project.id, Some(checks))?;
+            let stored = configured.checks.clone().unwrap_or_default();
+            command_result(
+                json_output,
+                || {
+                    format!(
+                        "configured {} check{} for {}",
+                        stored.len(),
+                        if stored.len() == 1 { "" } else { "s" },
+                        single_line(&configured.display_name)
+                    )
+                },
+                || {
+                    Ok(json!({
+                        "kind": "check_configure",
+                        "project_id": configured.id,
+                        "checks": stored,
+                    }))
+                },
+            )
+        }
+        CheckCommand::Clear(arguments) => {
+            if !arguments.yes {
+                return Err(CliError::Refused {
+                    kind: RefusalKind::ConfirmationRequired,
+                    message: "clearing project checks discards their explicit configuration; retry with --yes"
+                        .to_owned(),
+                    details: json!({}),
+                });
+            }
+            let project = resolve_project(&service, arguments.selection.project.as_deref())?;
+            // `None`, not an empty list. The distinction is the whole point of
+            // the field: no explicit configuration falls back to the workspace
+            // defaults, while an empty list is a configured "run nothing".
+            let cleared = service.configure_checks(project.id, None)?;
+            command_result(
+                json_output,
+                || {
+                    format!(
+                        "cleared explicit checks for {}",
+                        single_line(&cleared.display_name)
+                    )
+                },
+                || {
+                    Ok(json!({
+                        "kind": "check_clear",
+                        "project_id": cleared.id,
+                        "checks": Value::Null,
+                        "effective_checks": cleared.effective_checks(),
+                    }))
+                },
+            )
+        }
+        CheckCommand::Run(arguments) => {
+            if !arguments.yes {
+                return Err(CliError::Refused {
+                    kind: RefusalKind::ConfirmationRequired,
+                    message: "running a project check requires --yes after reviewing its configured command"
+                        .to_owned(),
+                    details: json!({ "check_id": arguments.check_id }),
+                });
+            }
+            let project = resolve_project(&service, arguments.selection.project.as_deref())?;
+            let checks = project.effective_checks();
+            let check = checks
+                .iter()
+                .find(|check| check.id == arguments.check_id)
+                .ok_or_else(|| {
+                    CliError::Usage(format!(
+                        "project {} has no configured check {:?}",
+                        project.display_name, arguments.check_id
+                    ))
+                })?;
+            let store = Arc::new(
+                Store::open(service.data_dir())
+                    .map_err(|error| CliError::Check(error.to_string()))?,
+            );
+            if arguments.trust_workspace {
+                let trust = WorkspaceTrust::decide(
+                    project.id,
+                    &project.root,
+                    TrustState::Trusted,
+                    OffsetDateTime::now_utc(),
+                )
+                .map_err(|error| CliError::Check(error.to_string()))?;
+                store
+                    .put_workspace_trust(&trust)
+                    .map_err(|error| CliError::Check(error.to_string()))?;
+            }
+            if store
+                .resolve_workspace_trust(project.id, &project.root)
+                .map_err(|error| CliError::Check(error.to_string()))?
+                != TrustState::Trusted
+            {
+                return Err(CliError::Refused {
+                    kind: RefusalKind::ConfirmationRequired,
+                    message: "the selected workspace is untrusted; review the project root and retry with --trust-workspace --yes"
+                        .to_owned(),
+                    details: json!({
+                        "project_id": project.id,
+                        "root": project.root,
+                        "check_id": check.id,
+                        "command": check.command,
+                    }),
+                });
+            }
+            // One coordinator, and therefore one scheduler, for the process.
+            // This process runs exactly one check, so building it here is also
+            // building it once.
+            let coordinator = check_coordinator(Arc::clone(&store))
+                .map_err(|error| CliError::Check(error.to_string()))?;
+            let run_id =
+                run_configured_check(&coordinator, &project, check, DecidedVia::Cli, cancellation)
+                    .map_err(|error| match error {
+                        // A configuration this build cannot execute is the caller's
+                        // input, not a failed operation.
+                        harkness_runtime::check::CheckLaunchError::UndeclaredEnvironment {
+                            ..
+                        } => CliError::Usage(error.to_string()),
+                        other => CliError::Check(other.to_string()),
+                    })?;
+            let results = project_checks(&store, &project)
+                .map_err(|error| CliError::Check(error.to_string()))?;
+            let result = results
+                .iter()
+                .find(|result| result.run_id == run_id.to_string());
+            let data = json!({
+                "kind": "check_run",
+                "run_id": run_id,
+                "check": check,
+                "result": result,
+            });
+            // The verdict decides the exit status. Reporting a check that did not
+            // pass as a plain success left the only usable signal inside the JSON,
+            // so the CI-shaped caller this command exists for could not tell pass
+            // from fail without parsing it — and a run cancelled by Ctrl-C never
+            // produced the documented 130 at all.
+            if let Some(verdict) = check_verdict(check, result, &data) {
+                return Err(verdict);
+            }
+            command_result(
+                json_output,
+                || {
+                    result.map_or_else(
+                        || format!("check {} recorded as run {run_id}", check.label),
+                        check_summary_line,
+                    )
+                },
+                || Ok(data),
+            )
+        }
+    }
+}
+
+fn check_list_result(
+    json_output: bool,
+    checks: &[CheckConfiguration],
+    results: &[CheckSummary],
+) -> Result<CommandResult, CliError> {
+    command_result(
+        json_output,
+        || {
+            if checks.is_empty() {
+                return "no checks configured".to_owned();
+            }
+            checks
+                .iter()
+                .map(|check| {
+                    results
+                        .iter()
+                        .find(|result| result.check_id == check.id)
+                        .map_or_else(
+                            || format!("{}\tnever run\t{}", check.id, single_line(&check.label)),
+                            check_summary_line,
+                        )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+        || Ok(json!({ "kind": "check_list", "checks": checks, "results": results })),
+    )
+}
+
+/// Recorded check results for a read-only projection.
+///
+/// A read must not bring a run store into existence. `Store::open` creates
+/// `runtime.db`, its WAL sidecars and every migration as a side effect, so
+/// `check list` and `git diff --checks` — both of which only report — used to
+/// write to a data directory a caller had asked them to read. No database means
+/// nothing has been recorded, which is the empty projection.
+fn recorded_checks_without_creating_a_store(
+    service: &ProjectService,
+    project: &Project,
+) -> Result<Vec<CheckSummary>, CliError> {
+    let Some(store) = Store::open_existing(service.data_dir())
+        .map_err(|error| CliError::Check(error.to_string()))?
+    else {
+        return Ok(Vec::new());
+    };
+    project_checks(&store, project).map_err(|error| CliError::Check(error.to_string()))
+}
+
+/// The error a non-passing run reports, or `None` when the check passed.
+///
+/// An absent result is a verdict too: the command was asked to produce one and
+/// there is nothing recorded to read, which no caller should see as a pass.
+fn check_verdict(
+    check: &CheckConfiguration,
+    result: Option<&CheckSummary>,
+    data: &Value,
+) -> Option<CliError> {
+    let Some(result) = result else {
+        return Some(CliError::CheckVerdict {
+            kind: "check_failed",
+            message: format!(
+                "check {} recorded no result to report",
+                single_line(&check.label)
+            ),
+            details: data.clone(),
+        });
+    };
+    let (kind, verdict) = match result.outcome {
+        CheckOutcome::Passed => return None,
+        CheckOutcome::Cancelled => ("check_cancelled", "was cancelled"),
+        CheckOutcome::Interrupted => ("check_cancelled", "was interrupted"),
+        CheckOutcome::TimedOut => ("check_failed", "timed out"),
+        CheckOutcome::Denied => ("check_failed", "was denied"),
+        CheckOutcome::Failed => ("check_failed", "failed"),
+        // Neither is reachable from here: this runs after the supervising loop
+        // has seen the run reach a terminal state. Named rather than caught by a
+        // wildcard so a new outcome has to be classified here on purpose.
+        CheckOutcome::Queued | CheckOutcome::WaitingForApproval | CheckOutcome::Running => {
+            ("check_failed", "did not reach a verdict")
+        }
+    };
+    Some(CliError::CheckVerdict {
+        kind,
+        message: format!("check {} {verdict}", single_line(&result.label)),
+        details: data.clone(),
+    })
+}
+
+fn check_summary_line(summary: &CheckSummary) -> String {
+    let outcome = serde_json::to_value(summary.outcome)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned());
+    let freshness = match &summary.freshness {
+        harkness_runtime::check::CheckFreshness::Current => "current",
+        harkness_runtime::check::CheckFreshness::Stale { .. } => "stale",
+        harkness_runtime::check::CheckFreshness::Unverifiable { .. } => "unverifiable",
+    };
+    format!(
+        "{}\t{}\t{}\t{}",
+        summary.check_id,
+        outcome,
+        freshness,
+        single_line(&summary.label)
+    )
 }
 
 fn run_editor(
@@ -1992,7 +2374,12 @@ fn run_git(
                 mode: arguments.whitespace.into(),
                 ignore_blank_lines: arguments.ignore_blank_lines,
             };
-            let git = selected_git(&service, arguments.selection)?;
+            // Resolved once, whether or not the checks projection was asked for:
+            // `selected_git` resolves the same project internally and throws it
+            // away, so keeping it costs nothing and the two paths stop being two
+            // copies of one lookup.
+            let (project, git) = selected_project_git(&service, arguments.selection)?;
+            let check_project = arguments.checks.then_some(project);
             let options = DiffOptions::default()
                 .with_context_lines(arguments.context_lines)
                 .with_whitespace(whitespace)
@@ -2038,6 +2425,34 @@ fn run_git(
             } else {
                 None
             };
+            let recorded_checks = check_project
+                .as_ref()
+                .map(|project| recorded_checks_without_creating_a_store(&service, project))
+                .transpose()?;
+            let (checks, checks_excluded_for_target) =
+                recorded_checks.map_or(Ok::<_, CliError>((None, 0usize)), |recorded| {
+                    let total = recorded.len();
+                    let mut covering = Vec::new();
+                    // One resolver for the whole pass, and the first target that
+                    // is not covered ends this check. Resolving inside the target
+                    // loop asked Git for the same two or three revisions once per
+                    // recorded check.
+                    let mut revisions = RevisionCache::new(&git);
+                    for check in recorded {
+                        let mut covers_every_target = true;
+                        for target in &targets {
+                            if !check_covers_diff_target(&mut revisions, &check, target)? {
+                                covers_every_target = false;
+                                break;
+                            }
+                        }
+                        if covers_every_target {
+                            covering.push(check);
+                        }
+                    }
+                    let excluded = total.saturating_sub(covering.len());
+                    Ok((Some(covering), excluded))
+                })?;
             command_result(
                 json_output,
                 || diff_summary_line(&files, &targets, attribution.as_deref()),
@@ -2065,6 +2480,12 @@ fn run_git(
                                     .collect::<Vec<_>>()
                             )
                         }),
+                        // Null means the projection was not requested; an empty
+                        // list means the project has no recorded checks.
+                        "checks": checks,
+                        // Results are excluded unless their recorded state and
+                        // definition cover every target in this envelope.
+                        "checks_excluded_for_target": checks_excluded_for_target,
                         "files": projected,
                     }))
                 },
@@ -2753,12 +3174,25 @@ fn resolve_project(service: &ProjectService, selector: Option<&str>) -> Result<P
     service.resolve(&selector).map_err(Into::into)
 }
 
+/// Resolves the selected project and opens its Git service.
+///
+/// The project is worth keeping: the `--checks` projection needs it, and
+/// `selected_git` resolved one only to drop it, so the two call sites were two
+/// copies of this lookup waiting to disagree.
+fn selected_project_git(
+    service: &ProjectService,
+    selection: ProjectSelection,
+) -> Result<(Project, GitService), CliError> {
+    let project = resolve_project(service, selection.project.as_deref())?;
+    let git = service.git(project.id)?;
+    Ok((project, git))
+}
+
 fn selected_git(
     service: &ProjectService,
     selection: ProjectSelection,
 ) -> Result<GitService, CliError> {
-    let project = resolve_project(service, selection.project.as_deref())?;
-    service.git(project.id).map_err(Into::into)
+    selected_project_git(service, selection).map(|(_, git)| git)
 }
 
 fn refusal(kind: RefusalKind, message: String, details: Value) -> CliError {
@@ -2834,6 +3268,12 @@ fn project_value(project: &Project, status_checked: bool) -> Result<Value, CliEr
         "status_checked": status_checked,
         "available": available,
         "git": git,
+        // Null distinguishes "no explicit configuration, so the workspace
+        // defaults apply" from a configured empty list meaning "run nothing" —
+        // the same distinction the catalog stores, and the reason a caller
+        // cannot infer this field from `effective_checks` alone.
+        "checks": project.checks,
+        "effective_checks": project.effective_checks(),
     }))
 }
 
@@ -4350,6 +4790,75 @@ fn diff_target_value(target: &DiffTarget) -> Value {
     diff_target_details(target).unwrap_or_else(|| json!({ "kind": diff_target_name(target) }))
 }
 
+/// Resolves each named revision once for a whole coverage pass.
+///
+/// A recorded check is compared against the 40-hex commit a target names, and
+/// every recorded check asks about the same handful of targets. Resolving per
+/// (check, target) pair meant up to `checks x targets` Git invocations for two
+/// or three distinct revisions.
+struct RevisionCache<'a> {
+    git: &'a GitService,
+    resolved: HashMap<String, String>,
+}
+
+impl<'a> RevisionCache<'a> {
+    fn new(git: &'a GitService) -> Self {
+        Self {
+            git,
+            resolved: HashMap::new(),
+        }
+    }
+
+    fn resolve(&mut self, revision: &str) -> Result<String, CliError> {
+        if let Some(resolved) = self.resolved.get(revision) {
+            return Ok(resolved.clone());
+        }
+        let resolved = self.git.resolve_revision(revision)?.to_string();
+        self.resolved.insert(revision.to_owned(), resolved.clone());
+        Ok(resolved)
+    }
+}
+
+fn check_covers_diff_target(
+    revisions: &mut RevisionCache<'_>,
+    check: &CheckSummary,
+    target: &DiffTarget,
+) -> Result<bool, CliError> {
+    if !check.definition_current {
+        return Ok(false);
+    }
+    let live_state_is_current = matches!(
+        check.freshness,
+        harkness_runtime::check::CheckFreshness::Current
+    );
+    match target {
+        DiffTarget::Unstaged | DiffTarget::RevisionAgainstWorktree { .. } => {
+            Ok(live_state_is_current)
+        }
+        DiffTarget::Staged => {
+            Ok(live_state_is_current && check.workspace_matches_index == Some(true))
+        }
+        DiffTarget::Commit { revision, .. } => check_covers_commit(revisions, check, revision),
+        DiffTarget::Revisions { new_revision, .. } => {
+            check_covers_commit(revisions, check, new_revision)
+        }
+        DiffTarget::BranchAgainstBase { branch, .. } => {
+            check_covers_commit(revisions, check, branch)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn check_covers_commit(
+    revisions: &mut RevisionCache<'_>,
+    check: &CheckSummary,
+    revision: &str,
+) -> Result<bool, CliError> {
+    let resolved = revisions.resolve(revision)?;
+    Ok(check.workspace_clean == Some(true)
+        && check.state_head.as_deref() == Some(resolved.as_str()))
+}
+
 const fn diff_line_kind_name(kind: DiffLineKind) -> &'static str {
     match kind {
         DiffLineKind::Context => "context",
@@ -4642,7 +5151,8 @@ fn project_exit_code(error: &ProjectError) -> u8 {
         | ProjectError::WorktreeDestinationParentUnavailable { .. }
         | ProjectError::WorktreeDestinationInsideProject { .. }
         | ProjectError::WorktreeDestinationContainsProject { .. }
-        | ProjectError::WorktreeDestinationInsideDataDirectory { .. } => EXIT_REFUSED,
+        | ProjectError::WorktreeDestinationInsideDataDirectory { .. }
+        | ProjectError::InvalidCheckConfiguration { .. } => EXIT_REFUSED,
         ProjectError::Git(error) => git_exit_code(error),
         ProjectError::Editor(error) => editor_exit_code(error),
         ProjectError::DataDirectoryUnavailable
@@ -4871,6 +5381,7 @@ const PROJECT_KIND_EXIT_CODES: &[(&str, u8)] = &[
     ("project_selector_not_found", EXIT_NOT_FOUND),
     ("ambiguous_project_selector", EXIT_CONFLICT),
     ("project_not_found", EXIT_NOT_FOUND),
+    ("invalid_check_configuration", EXIT_REFUSED),
     ("project_unavailable", EXIT_OPERATION_FAILED),
     ("git_inspection", EXIT_OPERATION_FAILED),
     ("persistence", EXIT_OPERATION_FAILED),
@@ -4932,6 +5443,9 @@ const CLI_KIND_EXIT_CODES: &[(&str, u8)] = &[
     ("interrupt_handler_unavailable", EXIT_OPERATION_FAILED),
     ("wire_projection_failed", EXIT_OPERATION_FAILED),
     ("path_operation_failed", EXIT_OPERATION_FAILED),
+    ("check_operation_failed", EXIT_OPERATION_FAILED),
+    ("check_failed", EXIT_OPERATION_FAILED),
+    ("check_cancelled", EXIT_CANCELLED),
     ("confirmation_required", EXIT_REFUSED),
     ("managed_project_requires_delete", EXIT_REFUSED),
     ("local_project_requires_forget", EXIT_REFUSED),
@@ -5262,8 +5776,8 @@ fn git_error_details(error: &GitError) -> Value {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashSet,
-        io,
+        collections::{BTreeMap, HashSet},
+        fs, io,
         path::{Path, PathBuf},
     };
 
@@ -5272,11 +5786,13 @@ mod tests {
         EXIT_CONFLICT, EXIT_NOT_FOUND, EXIT_OPERATION_FAILED, EXIT_REFUSED, EXIT_USAGE,
         EXTERNAL_POLICY_DENIAL_KINDS, EditorError, GIT_KIND_EXIT_CODES, GitError, HunkSelection,
         LineSelection, POLICY_KIND_EXIT_CODES, PROJECT_KIND_EXIT_CODES, Project, ProjectError,
-        RefusalKind, Whitespace, WhitespaceMode, change_provenance_value,
+        RefusalKind, Whitespace, WhitespaceMode, change_provenance_value, check_covers_diff_target,
         distinct_hunk_selection_count, distinct_line_selection_counts, editor_exit_code,
         git_error_details, git_exit_code, parse_line_selection_document, parse_selection_document,
         project_exit_code, project_value, requested_json, single_line,
     };
+
+    use tempfile::tempdir;
 
     /// Attribution is advisory: a walk that could not be made degrades to a
     /// named reason inside the block, so the diff beside it still reaches the
@@ -5309,6 +5825,98 @@ mod tests {
         assert_eq!(value["producers"].as_array().unwrap().len(), 0);
         assert_eq!(value["walked_commits"], 0);
         assert_eq!(value["truncation"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_check_on_the_current_head_does_not_cover_an_older_commit_review() {
+        let workspace = tempdir().unwrap();
+        let data = tempdir().unwrap();
+        let repository = git2::Repository::init(workspace.path()).unwrap();
+        let first = commit_file(&repository, "first");
+        let second = commit_file(&repository, "second");
+        let git = super::GitService::new(workspace.path(), data.path());
+        let summary = harkness_runtime::check::CheckSummary {
+            run_id: "run".to_owned(),
+            check_id: "test".to_owned(),
+            label: "Test".to_owned(),
+            command: vec!["true".to_owned()],
+            recorded_cwd: None,
+            recorded_env: BTreeMap::new(),
+            recorded_timeout: None,
+            recorded_parser: "plain".to_owned(),
+            definition_current: true,
+            outcome: harkness_runtime::check::CheckOutcome::Passed,
+            evidence_class: harkness_runtime::check::ActivityClass::HarknessObserved,
+            created_at: "2026-08-17T00:00:00Z".to_owned(),
+            finished_at: Some("2026-08-17T00:00:01Z".to_owned()),
+            duration_ms: Some(1),
+            state_digest: Some("digest".to_owned()),
+            state_head: Some(second.to_string()),
+            workspace_clean: Some(true),
+            workspace_matches_index: Some(true),
+            freshness: harkness_runtime::check::CheckFreshness::Current,
+            diagnostics: Vec::new(),
+            diagnostics_omitted: 0,
+            diagnostics_scan_truncated: false,
+            diagnostics_unavailable: None,
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            artifact_byte_limit: 8 * 1024 * 1024,
+            stdout_artifact_truncated: false,
+            stderr_artifact_truncated: false,
+        };
+
+        let mut revisions = super::RevisionCache::new(&git);
+        assert!(
+            !check_covers_diff_target(
+                &mut revisions,
+                &summary,
+                &super::DiffTarget::Commit {
+                    revision: first.to_string(),
+                    parent: None,
+                },
+            )
+            .unwrap()
+        );
+        assert!(
+            check_covers_diff_target(
+                &mut revisions,
+                &summary,
+                &super::DiffTarget::Commit {
+                    revision: second.to_string(),
+                    parent: None,
+                },
+            )
+            .unwrap()
+        );
+    }
+
+    fn commit_file(repository: &git2::Repository, contents: &str) -> git2::Oid {
+        fs::write(repository.workdir().unwrap().join("file.txt"), contents).unwrap();
+        let mut index = repository.index().unwrap();
+        index.add_path(Path::new("file.txt")).unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repository.find_tree(tree_id).unwrap();
+        let signature = git2::Signature::now("Fixture", "fixture@example.com").unwrap();
+        let parents = repository
+            .head()
+            .ok()
+            .and_then(|head| head.peel_to_commit().ok())
+            .into_iter()
+            .collect::<Vec<_>>();
+        let parent_refs = parents.iter().collect::<Vec<_>>();
+        repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                contents,
+                &tree,
+                &parent_refs,
+            )
+            .unwrap()
     }
 
     #[test]
@@ -5975,6 +6583,17 @@ mod tests {
                 operation: "staging",
                 details: serde_json::json!({}),
             },
+            CliError::Check("fixture".to_owned()),
+            CliError::CheckVerdict {
+                kind: "check_failed",
+                message: "fixture".to_owned(),
+                details: serde_json::json!({}),
+            },
+            CliError::CheckVerdict {
+                kind: "check_cancelled",
+                message: "fixture".to_owned(),
+                details: serde_json::json!({}),
+            },
             refused(RefusalKind::ConfirmationRequired),
             refused(RefusalKind::ManagedProjectRequiresDelete),
             refused(RefusalKind::LocalProjectRequiresForget),
@@ -6003,6 +6622,7 @@ mod tests {
             last_opened: time::OffsetDateTime::UNIX_EPOCH,
             available: true,
             git: None,
+            checks: None,
         };
 
         let value = project_value(&project, true).unwrap();

@@ -34,6 +34,13 @@ ColumnLayout {
     readonly property var reviewProvenance: reviewReady && reviewState.provenance !== undefined
         ? reviewState.provenance
         : ({})
+    readonly property var checkState: backend.checks !== undefined
+        && String(backend.checks.projectId || "") === String(project.id)
+        ? backend.checks : ({})
+    readonly property var checkResults: checkState.results !== undefined
+        ? checkState.results : []
+    readonly property var coveredCheckResults: checksCoveringReview()
+    readonly property var checkDiagnostics: buildCheckDiagnostics()
     readonly property string repositoryLockScope: String(
         project.lockScope || project.parentId || project.id
     )
@@ -83,6 +90,143 @@ ColumnLayout {
         if (kind === "deletion")
             return Kirigami.Theme.negativeTextColor;
         return Kirigami.Theme.disabledTextColor;
+    }
+
+    function freshnessRank(freshness) {
+        if (String(freshness) === "unverifiable")
+            return 2;
+        if (String(freshness) === "stale")
+            return 1;
+        return 0;
+    }
+
+    function diagnosticIcon(freshness) {
+        if (String(freshness) === "unverifiable")
+            return "dialog-question";
+        if (String(freshness) === "stale")
+            return "data-warning";
+        return "data-error";
+    }
+
+    function diagnosticStateReference(diagnostic) {
+        if (diagnostic === null)
+            return "";
+        const head = String(diagnostic.stateHead || "");
+        const digest = String(diagnostic.stateDigest || "");
+        return qsTr("%1 check diagnostic · HEAD %2 · digest %3")
+            .arg(String(diagnostic.freshness || "unverifiable"))
+            .arg(head.length > 0 ? head : qsTr("unborn"))
+            .arg(digest.length > 0 ? digest : qsTr("unavailable"));
+    }
+
+    function checkCoversReview(result) {
+        if (!reviewReady || result.definitionCurrent !== true)
+            return false;
+        const kind = String(reviewState.checkTargetKind || "unavailable");
+        if (kind === "worktree")
+            return String(result.freshness || "unverifiable") === "current";
+        if (kind === "index")
+            return String(result.freshness || "unverifiable") === "current"
+                && result.workspaceMatchesIndexKnown === true
+                && result.workspaceMatchesIndex === true;
+        if (kind === "commit")
+            return result.workspaceCleanKnown === true
+                && result.workspaceClean === true
+                && String(result.stateHead || "")
+                    === String(reviewState.checkTargetHead || "");
+        return false;
+    }
+
+    function checksCoveringReview() {
+        const covered = [];
+        for (let index = 0; index < checkResults.length; ++index) {
+            if (checkCoversReview(checkResults[index]))
+                covered.push(checkResults[index]);
+        }
+        return covered;
+    }
+
+    function buildCheckDiagnostics() {
+        const files = {};
+        const fileFreshness = {};
+        const lines = {};
+        for (let resultIndex = 0; resultIndex < coveredCheckResults.length; ++resultIndex) {
+            const result = coveredCheckResults[resultIndex];
+            const diagnostics = result.diagnostics || [];
+            for (let index = 0; index < diagnostics.length; ++index) {
+                const diagnostic = diagnostics[index];
+                const path = String(diagnostic.path || "");
+                if (path.length === 0)
+                    continue;
+                files[path] = Number(files[path] || 0) + 1;
+                if (fileFreshness[path] === undefined
+                        || freshnessRank(result.freshness)
+                            > freshnessRank(fileFreshness[path]))
+                    fileFreshness[path] = String(result.freshness || "unverifiable");
+                const line = Number(diagnostic.line || 0);
+                if (line > 0) {
+                    const key = path + "\u0000" + line;
+                    const marker = {
+                        "path": path,
+                        "line": line,
+                        "column": Number(diagnostic.column || 0),
+                        "level": String(diagnostic.level || "unknown"),
+                        "message": String(diagnostic.message || ""),
+                        "freshness": String(result.freshness || "unverifiable"),
+                        "freshnessDetail": String(result.freshnessDetail || ""),
+                        "stateHead": String(result.stateHead || ""),
+                        "stateDigest": String(result.stateDigest || ""),
+                        "evidenceClass": String(result.evidenceClass || "unobserved")
+                    };
+                    if (lines[key] === undefined
+                            || freshnessRank(marker.freshness)
+                                > freshnessRank(lines[key].freshness))
+                        lines[key] = marker;
+                }
+            }
+        }
+        return ({
+            "files": files,
+            "fileFreshness": fileFreshness,
+            "lines": lines
+        });
+    }
+
+    function fileDiagnosticCount(path) {
+        return Number((checkDiagnostics.files || ({}))[String(path)] || 0);
+    }
+
+    function fileDiagnosticFreshness(path) {
+        return String((checkDiagnostics.fileFreshness || ({}))[String(path)] || "current");
+    }
+
+    function lineDiagnostic(path, line) {
+        return (checkDiagnostics.lines || ({}))[String(path) + "\u0000" + Number(line)] || null;
+    }
+
+    function checkHeadline() {
+        if (checkResults.length === 0)
+            return "";
+        if (coveredCheckResults.length === 0)
+            return qsTr("Checks: no recorded result covers this review target");
+        let passed = 0;
+        let failed = 0;
+        let stale = 0;
+        let unverifiable = 0;
+        for (let index = 0; index < coveredCheckResults.length; ++index) {
+            const result = coveredCheckResults[index];
+            if (String(result.outcome) === "passed")
+                ++passed;
+            else
+                ++failed;
+            if (String(result.freshness) === "stale")
+                ++stale;
+            else if (String(result.freshness) === "unverifiable")
+                ++unverifiable;
+        }
+        const excluded = checkResults.length - coveredCheckResults.length;
+        return qsTr("Checks: %1 passed · %2 not passing · %3 stale · %4 unverifiable · %5 not covering this review")
+            .arg(passed).arg(failed).arg(stale).arg(unverifiable).arg(excluded);
     }
 
     // Fills every `%N` in one pass over the template.
@@ -1005,6 +1149,16 @@ ColumnLayout {
                     textFormat: Text.PlainText
                     visible: text.length > 0
                 }
+
+                Controls.Label {
+                    Layout.fillWidth: true
+                    color: Kirigami.Theme.disabledTextColor
+                    elide: Text.ElideRight
+                    font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                    text: reviewSurface.checkHeadline()
+                    textFormat: Text.PlainText
+                    visible: text.length > 0
+                }
             }
 
             Controls.Label {
@@ -1265,6 +1419,27 @@ ColumnLayout {
                                         textFormat: Text.PlainText
                                         visible: reviewSurface.reviewProvenance.resolved === true
                                     }
+                                }
+
+                                Kirigami.Icon {
+                                    Accessible.name: qsTr("%1 check diagnostics")
+                                        .arg(reviewSurface.fileDiagnosticFreshness(
+                                            reviewFileDelegate.modelData.path
+                                        ))
+                                    Controls.ToolTip.text: Accessible.name
+                                    Controls.ToolTip.visible: fileDiagnosticHover.hovered
+                                    Layout.preferredHeight: Kirigami.Units.iconSizes.small
+                                    Layout.preferredWidth: Kirigami.Units.iconSizes.small
+                                    source: reviewSurface.diagnosticIcon(
+                                        reviewSurface.fileDiagnosticFreshness(
+                                            reviewFileDelegate.modelData.path
+                                        )
+                                    )
+                                    visible: reviewSurface.fileDiagnosticCount(
+                                        reviewFileDelegate.modelData.path
+                                    ) > 0
+
+                                    HoverHandler { id: fileDiagnosticHover }
                                 }
 
                                 Controls.Label {
@@ -1836,6 +2011,27 @@ ColumnLayout {
                         text: reviewLineDelegate.unified.marker
                     }
 
+                    Kirigami.Icon {
+                        readonly property var diagnostic: reviewSurface.lineDiagnostic(
+                            reviewSurface.reviewFile.path || "",
+                            reviewLineDelegate.unified.newLine > 0
+                                ? reviewLineDelegate.unified.newLine
+                                : reviewLineDelegate.row.openLine
+                        )
+                        Accessible.name: reviewSurface.diagnosticStateReference(diagnostic)
+                        Controls.ToolTip.text: Accessible.name
+                        Controls.ToolTip.visible: unifiedDiagnosticHover.hovered
+                        Layout.preferredHeight: diagnostic !== null
+                            ? Kirigami.Units.iconSizes.small : 0
+                        Layout.preferredWidth: diagnostic !== null
+                            ? Kirigami.Units.iconSizes.small : 0
+                        source: diagnostic !== null
+                            ? reviewSurface.diagnosticIcon(diagnostic.freshness) : ""
+                        visible: diagnostic !== null
+
+                        HoverHandler { id: unifiedDiagnosticHover }
+                    }
+
                     Controls.Label {
                         Layout.fillWidth: true
                         font.family: "monospace"
@@ -1932,6 +2128,27 @@ ColumnLayout {
                                 text: splitSide.modelData.present === true
                                     ? splitSide.modelData.marker
                                     : ""
+                            }
+
+                            Kirigami.Icon {
+                                readonly property var diagnostic: splitSide.index === 1
+                                    && splitSide.modelData.present === true
+                                    ? reviewSurface.lineDiagnostic(
+                                        reviewSurface.reviewFile.path || "",
+                                        Number(splitSide.modelData.line || 0)
+                                    ) : null
+                                Accessible.name: reviewSurface.diagnosticStateReference(diagnostic)
+                                Controls.ToolTip.text: Accessible.name
+                                Controls.ToolTip.visible: splitDiagnosticHover.hovered
+                                Layout.preferredHeight: diagnostic !== null
+                                    ? Kirigami.Units.iconSizes.small : 0
+                                Layout.preferredWidth: diagnostic !== null
+                                    ? Kirigami.Units.iconSizes.small : 0
+                                source: diagnostic !== null
+                                    ? reviewSurface.diagnosticIcon(diagnostic.freshness) : ""
+                                visible: diagnostic !== null
+
+                                HoverHandler { id: splitDiagnosticHover }
                             }
 
                             Controls.Label {

@@ -11,6 +11,11 @@ Controls.AbstractButton {
     property bool active: false
     /// Count drawn in the corner badge; anything below one hides it.
     property int badge: 0
+    /// Ground the badge is drawn on. A view whose count is a count of things
+    /// that are wrong — failing checks, rather than open issues — says so
+    /// here, so the bar distinguishes "there is work" from "something failed"
+    /// without the panel having to be open to find out which.
+    property color badgeColor: Kirigami.Theme.highlightColor
     /// Themed icon name for the view.
     property string iconName: ""
     /// Shortcut advertised in the tooltip, for example "Ctrl+Shift+G".
@@ -66,7 +71,7 @@ Controls.AbstractButton {
         Rectangle {
             anchors.horizontalCenter: viewIcon.right
             anchors.verticalCenter: viewIcon.bottom
-            color: Kirigami.Theme.highlightColor
+            color: item.badgeColor
             height: badgeLabel.implicitHeight + Math.round(Kirigami.Units.smallSpacing / 2)
             radius: height / 2
             visible: item.badge > 0

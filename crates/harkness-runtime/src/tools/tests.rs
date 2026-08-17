@@ -278,17 +278,21 @@ fn built_ins_register_at_version_one_with_honest_risk_and_process_metadata() {
             .map(|descriptor| descriptor.identity().to_string())
             .collect::<Vec<_>>(),
         [
+            "check.run@1.0.0",
             "fs.apply_patch@1.0.0",
             "process.exec@1.0.0",
             "test.run@1.0.0"
         ]
     );
-    assert_eq!(descriptors[0].risk(), RiskLevel::WorkspaceWrite);
-    assert!(!descriptors[0].spawns_processes());
-    for descriptor in &descriptors[1..] {
-        assert_eq!(descriptor.risk(), RiskLevel::Execute);
-        assert!(descriptor.spawns_processes());
-        assert_eq!(descriptor.capabilities()[0].as_str(), "process.spawn");
+    for descriptor in descriptors {
+        if descriptor.id().as_str() == "fs.apply_patch" {
+            assert_eq!(descriptor.risk(), RiskLevel::WorkspaceWrite);
+            assert!(!descriptor.spawns_processes());
+        } else {
+            assert_eq!(descriptor.risk(), RiskLevel::Execute);
+            assert!(descriptor.spawns_processes());
+            assert_eq!(descriptor.capabilities()[0].as_str(), "process.spawn");
+        }
     }
 }
 

@@ -529,6 +529,7 @@ Kirigami.ApplicationWindow {
         && whitespaceRenderDetected === true
         && whitespaceCopyDetected === true
         && revealScrollDetected === true
+        && checkPresentationDetected === true
         && realBridgePassed === true
         ? "GitPanelSmokePassed"
         : "GitPanelSmokeFailed-" + selectionDetected
@@ -555,6 +556,7 @@ Kirigami.ApplicationWindow {
             + "-" + whitespaceRenderDetected
             + "-" + whitespaceCopyDetected
             + "-" + revealScrollDetected
+            + "-" + checkPresentationDetected
             + "-" + reviewFixture.reviewCurrentIndex
             + "-" + realBridgePhase
             + "-" + realBridgePassed
@@ -583,6 +585,7 @@ Kirigami.ApplicationWindow {
     property bool whitespaceRenderDetected: false
     property bool whitespaceCopyDetected: false
     property bool revealScrollDetected: false
+    property bool checkPresentationDetected: false
     property bool screenshotSaved: false
     property bool screenshotReveal: __SCREENSHOT_REVEAL__
     property bool fakePassed: false
@@ -749,6 +752,8 @@ Kirigami.ApplicationWindow {
             "errorKind": "",
             "selectedFileId": current.selectedFileId,
             "commitId": current.commitId || "",
+            "checkTargetKind": current.checkTargetKind || "unavailable",
+            "checkTargetHead": current.checkTargetHead || "",
             "fileOffset": current.fileOffset || 0,
             "totalFiles": current.totalFiles || current.files.length,
             "files": current.files,
@@ -780,6 +785,8 @@ Kirigami.ApplicationWindow {
                 ? current.selectedFileId
                 : selectedFileId,
             "commitId": current.commitId || "",
+            "checkTargetKind": current.checkTargetKind || "unavailable",
+            "checkTargetHead": current.checkTargetHead || "",
             "fileOffset": offset,
             "totalFiles": total,
             "files": files,
@@ -1052,6 +1059,65 @@ Kirigami.ApplicationWindow {
                 "parentCount": 1
             }]
         })
+        property var checks: ({
+            "projectId": "00000000-0000-0000-0000-000000000000",
+            "loading": false,
+            "error": "",
+            "configured": [{
+                "id": "cargo.test",
+                "label": "Cargo tests",
+                "command": ["cargo", "test name", "%2", "<literal>"],
+                "cwd": "crate dir",
+                "environment": [{
+                    "name": "Z_LAST",
+                    "value": "last"
+                }, {
+                    "name": "A_FIRST",
+                    "value": "first value"
+                }],
+                "timeoutSeconds": 45,
+                "parser": "cargo_json"
+            }],
+            "results": [{
+                "runId": "check-run-fixture",
+                "checkId": "cargo.test",
+                "label": "Cargo tests",
+                "outcome": "failed",
+                "freshness": "stale",
+                "freshnessDetail": "src/main.rs changed",
+                "stateHead": "0123456789abcdef0123456789abcdef01234567",
+                "stateDigest": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+                "evidenceClass": "harkness_observed",
+                "definitionCurrent": true,
+                "workspaceCleanKnown": true,
+                "workspaceClean": true,
+                "workspaceMatchesIndexKnown": true,
+                "workspaceMatchesIndex": false,
+                "createdAt": "2026-08-15T12:00:00.000000000Z",
+                "durationMs": 1842,
+                "stdoutTail": "stdout tail",
+                "stderrTail": "stderr tail",
+                "stdoutTruncated": true,
+                "stderrTruncated": true,
+                "artifactByteLimit": 8388608,
+                "stdoutArtifactTruncated": true,
+                "stderrArtifactTruncated": false,
+                "recordedCommand": ["cargo", "test", "--workspace"],
+                "recordedCwd": "",
+                "recordedEnvironment": [],
+                "recordedTimeoutSeconds": 120,
+                "recordedParser": "cargo_json",
+                "diagnostics": [{
+                    "path": "src/main.rs",
+                    "line": 1,
+                    "column": 5,
+                    "level": "error",
+                    "message": "fixture check diagnostic"
+                }],
+                "diagnosticsOmitted": 3,
+                "diagnosticsScanTruncated": true
+            }]
+        })
         property var review: ({
             "projectId": "00000000-0000-0000-0000-000000000000",
             "title": "Working-tree changes",
@@ -1062,6 +1128,8 @@ Kirigami.ApplicationWindow {
             "errorKind": "",
             "selectedFileId": "review-file-fixture",
             "commitId": "",
+            "checkTargetKind": "commit",
+            "checkTargetHead": "0123456789abcdef0123456789abcdef01234567",
             "fileOffset": 0,
             "totalFiles": 1,
             "files": [{
@@ -1306,6 +1374,18 @@ Kirigami.ApplicationWindow {
         stateReady: true
     }
 
+    ChecksPanel {
+        id: checksFixture
+
+        backend: fixtureBackend
+        height: 720
+        project: projectFixture
+        visible: true
+        width: 520
+        x: -1000
+        y: -1000
+    }
+
     Timer {
         id: smokeTimeout
 
@@ -1341,6 +1421,41 @@ Kirigami.ApplicationWindow {
             return;
         }
         realBackend.openProject(realProjectId);
+
+        const configuredCheck = fixtureBackend.checks.configured[0];
+        const invocation = checksFixture.invocationPreview(configuredCheck);
+        const escapedInvocation = checksFixture.escapedRichMultiline(invocation);
+        const marker = reviewFixture.lineDiagnostic("src/main.rs", 1);
+        checkPresentationDetected = invocation.indexOf(
+                '["cargo", "test name", "%2", "<literal>"]'
+            ) !== -1
+            && invocation.indexOf("cwd: crate dir") !== -1
+            && invocation.indexOf('"A_FIRST": "first value"')
+                < invocation.indexOf('"Z_LAST": "last"')
+            && invocation.indexOf("timeout: 45 seconds") !== -1
+            && invocation.indexOf("parser: cargo_json") !== -1
+            && escapedInvocation.indexOf("&lt;literal&gt;") !== -1
+            && !checksFixture.invocationMatches(
+                configuredCheck,
+                fixtureBackend.checks.results[0]
+            )
+            && checksFixture.recordedInvocation(
+                fixtureBackend.checks.results[0]
+            ).indexOf('["cargo", "test", "--workspace"]') !== -1
+            && marker !== null
+            && marker.freshness === "stale"
+            && reviewFixture.fileDiagnosticFreshness("src/main.rs") === "stale"
+            && reviewFixture.diagnosticIcon(marker.freshness) === "data-warning"
+            && reviewFixture.diagnosticStateReference(marker)
+                .indexOf("0123456789abcdef") !== -1
+            && !reviewFixture.checkCoversReview({
+                "definitionCurrent": true,
+                "workspaceCleanKnown": true,
+                "workspaceClean": true,
+                "stateHead": "ffffffffffffffffffffffffffffffffffffffff",
+                "freshness": "current"
+            })
+            && reviewFixture.checkHeadline().indexOf("1 stale") !== -1;
 
         // Whitespace rendering, both ways round. The property is written
         // directly rather than through `setRevealWhitespace` so that nothing

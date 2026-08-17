@@ -7,6 +7,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::CheckConfiguration;
+
 /// A stable identifier for a project catalog entry.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -79,6 +81,9 @@ pub struct Project {
     pub root: PathBuf,
     /// How this project entered the catalog.
     pub source: ProjectSource,
+    /// Explicit check commands. `None` selects workspace defaults; an empty
+    /// explicit list deliberately disables every default.
+    pub checks: Option<Vec<CheckConfiguration>>,
     /// The last time the project was imported or successfully reopened.
     pub last_opened: OffsetDateTime,
     /// Whether the root currently exists and can be read.
@@ -112,6 +117,8 @@ struct ProjectWire {
     root: PathBuf,
     source: ProjectSourceKind,
     #[serde(default)]
+    checks: Option<Vec<CheckConfiguration>>,
+    #[serde(default)]
     remote: Option<String>,
     #[serde(default)]
     parent: Option<ProjectId>,
@@ -127,6 +134,8 @@ struct ProjectWireRef<'a> {
     root: &'a PathBuf,
     source: ProjectSourceKind,
     #[serde(skip_serializing_if = "Option::is_none")]
+    checks: Option<&'a [CheckConfiguration]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     remote: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent: Option<ProjectId>,
@@ -141,6 +150,9 @@ impl<'de> Deserialize<'de> for Project {
         D: Deserializer<'de>,
     {
         let wire = ProjectWire::deserialize(deserializer)?;
+        if let Some(checks) = wire.checks.as_deref() {
+            CheckConfiguration::validate_all(checks).map_err(de::Error::custom)?;
+        }
         let source = match wire.source {
             ProjectSourceKind::Local => {
                 if wire.remote.is_some() || wire.parent.is_some() || wire.worktree_branch.is_some()
@@ -182,6 +194,7 @@ impl<'de> Deserialize<'de> for Project {
             display_name: wire.display_name,
             root: wire.root,
             source,
+            checks: wire.checks,
             last_opened: wire.last_opened,
             available: false,
             git: None,
@@ -194,6 +207,9 @@ impl Serialize for Project {
     where
         S: Serializer,
     {
+        if let Some(checks) = self.checks.as_deref() {
+            CheckConfiguration::validate_all(checks).map_err(serde::ser::Error::custom)?;
+        }
         let (source, remote, parent, worktree_branch) = match &self.source {
             ProjectSource::Local => (ProjectSourceKind::Local, None, None, None),
             ProjectSource::ManagedRepository { remote } => (
@@ -217,11 +233,22 @@ impl Serialize for Project {
             display_name: &self.display_name,
             root: &self.root,
             source,
+            checks: self.checks.as_deref(),
             remote,
             parent,
             worktree_branch,
             last_opened: self.last_opened,
         }
         .serialize(serializer)
+    }
+}
+
+impl Project {
+    /// Returns explicit configuration, or defaults inferred from the workspace.
+    #[must_use]
+    pub fn effective_checks(&self) -> Vec<CheckConfiguration> {
+        self.checks
+            .clone()
+            .unwrap_or_else(|| crate::default_checks(&self.root))
     }
 }

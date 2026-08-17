@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 base64.workspace = true
 harkness-core.workspace = true
+harkness-context.workspace = true
 harkness-git.workspace = true
 jsonschema.workspace = true
 regex.workspace = true
