@@ -1609,35 +1609,16 @@ fn load_project_checks(
 
 /// This process's check coordinator for one data directory.
 ///
-/// A coordinator owns a `Scheduler`, and the scheduler is what serializes
-/// mutating tool calls per workspace and caps child processes across all of
-/// them. Building one per check gave every check a scheduler of its own, so two
-/// checks running for two different projects — which the job list permits, since
-/// it serializes by repository lock scope — were capped against nothing.
-///
-/// Keyed by data directory rather than held as a single value: the directory is
-/// chosen at startup, but a test process can drive more than one, and a
-/// coordinator belongs to exactly one store.
+/// The cache itself is `runs_backend::coordinator_for`, which is where it moved
+/// when the runs bridge arrived: a coordinator owns the scheduler that caps
+/// child processes across every workspace *and* the lease that says which runs
+/// this process is driving, so a second one would leave every run the checks
+/// panel started uncancellable from the runs panel. One process, one
+/// coordinator per data directory.
 fn check_coordinator_for(
     data_dir: &std::path::Path,
 ) -> Result<harkness_runtime::coordinator::RunCoordinator, String> {
-    static COORDINATORS: std::sync::OnceLock<
-        Mutex<HashMap<PathBuf, harkness_runtime::coordinator::RunCoordinator>>,
-    > = std::sync::OnceLock::new();
-    let mut coordinators = COORDINATORS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .map_err(|_| "the check coordinator cache is poisoned".to_owned())?;
-    if let Some(existing) = coordinators.get(data_dir) {
-        return Ok(existing.clone());
-    }
-    let store = Arc::new(
-        harkness_runtime::store::Store::open(data_dir).map_err(|error| error.to_string())?,
-    );
-    let coordinator =
-        harkness_runtime::check::check_coordinator(store).map_err(|error| error.to_string())?;
-    coordinators.insert(data_dir.to_path_buf(), coordinator.clone());
-    Ok(coordinator)
+    super::runs_backend::coordinator_for(data_dir).map_err(|failure| failure.message)
 }
 
 fn run_project_check(

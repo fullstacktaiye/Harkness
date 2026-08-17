@@ -1,7 +1,11 @@
+mod approval_model;
 mod backend;
 mod changes_model;
 mod file_tree_model;
 pub(crate) mod hotreload;
+mod run_list_model;
+mod run_timeline_model;
+pub(crate) mod runs_backend;
 
 use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QString, QUrl};
 
@@ -480,6 +484,109 @@ Kirigami.ApplicationWindow {
         assert_eq!(
             issues_name, "IssuesPanelSmokePassed",
             "IssuesPanel filter and projection check failed"
+        );
+
+        // Instantiate the run bridge from QML. cxx-qt does not camel-case
+        // names, so a `snake_case` member reaches QML spelled exactly as
+        // written and a camel-case call site resolves to `undefined` rather
+        // than failing to compile. No Rust test can see that: the spelling only
+        // exists once the type is registered and something looks it up. This
+        // block is that lookup, for every property and every invokable of all
+        // four objects, before #101 and #102 write any QML against them.
+        LOADED.store(false, Ordering::SeqCst);
+        static RUN_BRIDGE_ROOT: AtomicPtr<QObject> = AtomicPtr::new(ptr::null_mut());
+        if let Some(mut engine) = engine.as_mut() {
+            let _connection = engine.as_mut().on_object_created(|_engine, object, _url| {
+                LOADED.store(!object.is_null(), Ordering::SeqCst);
+                RUN_BRIDGE_ROOT.store(object, Ordering::SeqCst);
+            });
+            engine.as_mut().load_data(
+                &QByteArray::from(
+                    br#"
+import QtQuick
+import org.kde.kirigami as Kirigami
+import io.github.fullstacktaiye.harkness
+
+Kirigami.ApplicationWindow {
+    id: window
+
+    visible: false
+    width: 640
+    height: 480
+
+    RunsBackend { id: runs }
+    RunListModel { id: runList }
+    RunTimelineModel { id: timeline }
+    ApprovalModel { id: approvals }
+
+    ListView { id: runView; model: runList }
+    ListView { id: timelineView; model: timeline }
+    ListView { id: approvalView; model: approvals }
+
+    Component.onCompleted: {
+        const failures = [];
+        function check(name, passed) {
+            if (!passed)
+                failures.push(name);
+        }
+
+        check("runsBackendProperties",
+              runs.busy === false && runs.status === "Ready" && runs.kind === "");
+        check("runsBackendInvokables",
+              typeof runs.cancelRun === "function"
+              && typeof runs.retryRun === "function"
+              && typeof runs.approve === "function"
+              && typeof runs.deny === "function"
+              && typeof runs.loadApprovalInput === "function");
+
+        check("runListProperties",
+              runList.loading === false && runList.more === false && runList.status === "");
+        check("runListInvokables", typeof runList.refresh === "function");
+        check("runListStartsEmpty", runView.count === 0);
+
+        check("timelineProperties",
+              timeline.run === "" && timeline.loading === false
+              && timeline.live === false && timeline.more === false
+              && timeline.status === "");
+        check("timelineInvokables",
+              typeof timeline.select === "function"
+              && typeof timeline.refresh === "function"
+              && typeof timeline.loadOlder === "function"
+              && typeof timeline.loadDetail === "function");
+
+        check("approvalProperties",
+              approvals.count === 0 && approvals.loading === false
+              && approvals.status === "");
+        check("approvalInvokables", typeof approvals.refresh === "function");
+        check("approvalQueueStartsEmpty", approvalView.count === 0);
+
+        // Selecting nothing is the one bridge path that reads no store, so it
+        // is the one a smoke test with no event loop can drive end to end.
+        timeline.select("");
+        check("selectingNothingClearsTheTimeline",
+              timeline.run === "" && timelineView.count === 0
+              && timeline.live === false && timeline.loading === false);
+
+        window.objectName = failures.length === 0
+            ? "RunBridgeSmokePassed"
+            : "RunBridgeSmokeFailed[" + failures.join(",") + "]";
+    }
+}
+"#,
+                ),
+                &QUrl::from("qrc:/RunBridgeSmoke.qml"),
+            );
+        }
+        assert!(
+            LOADED.load(Ordering::SeqCst),
+            "the run bridge fixture failed to load; see QML warnings above"
+        );
+        let run_bridge_name = unsafe { RUN_BRIDGE_ROOT.load(Ordering::SeqCst).as_ref() }
+            .map(|object| object.object_name().to_string())
+            .unwrap_or_default();
+        assert_eq!(
+            run_bridge_name, "RunBridgeSmokePassed",
+            "run, timeline, approval, and runs-backend QML contract check failed"
         );
 
         // Exercise every GitPanel delegate with hand-written state. Main.qml

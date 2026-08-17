@@ -32,10 +32,14 @@ fn main() {
     .qt_module("Network")
     .include_dir("cxx")
     .files([
+        "src/approval_model.rs",
         "src/backend.rs",
         "src/changes_model.rs",
         "src/file_tree_model.rs",
         "src/hotreload.rs",
+        "src/run_list_model.rs",
+        "src/run_timeline_model.rs",
+        "src/runs_backend.rs",
     ])
     .build();
 }

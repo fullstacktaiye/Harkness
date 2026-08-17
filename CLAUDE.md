@@ -287,10 +287,20 @@ non-UTF-8 paths get lossy strings plus `path_is_lossy: true` and, where exactnes
 
 ### GUI structure
 
-`harkness-gui` is cxx-qt: `src/backend.rs` (`HarknessBackend`) and `src/file_tree_model.rs`
-(`FileTreeModel`) are the QObjects; `qml/` holds the Kirigami UI, registered as the static QML
-module `io.github.fullstacktaiye.harkness` by `build.rs` and force-linked in `main.rs`. New QML
-files must be added to `build.rs`'s file list.
+`harkness-gui` is cxx-qt: `src/backend.rs` (`HarknessBackend`) is the Git and catalog QObject, and
+`src/file_tree_model.rs`, `src/changes_model.rs`, `src/run_list_model.rs`,
+`src/run_timeline_model.rs`, `src/approval_model.rs`, and `src/runs_backend.rs` are the rest;
+`qml/` holds the Kirigami UI, registered as the static QML module
+`io.github.fullstacktaiye.harkness` by `build.rs` and force-linked in `main.rs`. New QML files —
+and every new bridge file — must be added to `build.rs`'s lists.
+
+- **The run bridge is deliberately outside `backend.rs`.** `runs_backend.rs` carries the mutations
+  (`cancelRun`, `retryRun`, `approve`, `deny`, `loadApprovalInput`) and owns the process's one
+  `RunCoordinator` per data directory — `backend.rs`'s `check_coordinator_for` delegates to it,
+  because a second coordinator would take a second lease and leave every run the checks panel
+  started uncancellable. The three models drive their own reads: cxx-qt gives one bridge object no
+  handle to another, so a model created in QML is not reachable from `RunsBackend`'s Rust.
+  A read never *creates* `runtime.db` — `read_coordinator` probes `Store::open_existing` first.
 
 - **cxx-qt does not camel-case names.** A `snake_case` member reaches QML spelled exactly as
   written, and a camel-case call site silently resolves to `undefined`. Every multi-word invokable
