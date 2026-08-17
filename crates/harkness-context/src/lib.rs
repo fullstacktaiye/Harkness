@@ -51,18 +51,38 @@
 //! [`index`] is the disposable per-repository cache beneath it. The engine
 //! returns typed values and persists nothing: a snapshot becomes evidence only
 //! when `harkness-runtime` records it, which is what keeps deleting
-//! `<data_dir>/context/` lossless (ADR-0004). Only
-//! [`snapshot`](ContextEngine::snapshot) of the eight facade methods is
-//! implemented; the rest return [`ContextEngineError::NotYetAvailable`] naming
-//! what is missing, so every later retrieval issue has a compiling seam.
+//! `<data_dir>/context/` lossless (ADR-0004). Of the eight facade methods,
+//! [`snapshot`](ContextEngine::snapshot) and
+//! [`inventory`](ContextEngine::inventory) are implemented; the rest return
+//! [`ContextEngineError::NotYetAvailable`] naming what is missing, so every
+//! later retrieval issue has a compiling seam.
+//!
+//! # The eligible-file inventory
+//!
+//! [`InventoryBuilder::build`] turns one captured snapshot into a
+//! [`FileInventory`]: the bounded, classified set of files that worktree offers
+//! as context. It is the only walk — chunking, indexing, search, the repository
+//! map, and instruction discovery all read its entries rather than the
+//! filesystem — which is what stops two retrieval features disagreeing about
+//! whether a file exists.
+//!
+//! Four layers decide what it holds, in order, first opinion winning: the
+//! built-in [`BUILT_IN_DENIALS`], the global user ignore file, the repository's
+//! own ignore file — which may only tighten — and the repository's `.gitignore`
+//! chain. A credential-bearing path is stopped by layer one, counted in
+//! [`FileInventory::denied_count`] and recorded nowhere, so no later stage has
+//! anything to retrieve. Each recorded path then carries exactly one
+//! [`FileClass`], assigned by [`FileSample::classify`].
+//!
+//! `docs/context-inventory.md` is the reference: the whole denial list, every
+//! class with its heuristics, and how a repository tightens what Harkness reads.
 //!
 //! # What is not here
 //!
-//! No file walking or ignore handling ([#112]), no chunking ([#113]), no index
-//! content tables ([#114]), no search ([#116]), no symbol extraction ([#117]),
-//! and no provider or token concepts ([#111], [#122]). The identifiers and the
-//! facade signatures those issues need are defined here so that none of them
-//! has to invent one.
+//! No chunking ([#113]), no index content tables ([#114]), no search ([#116]),
+//! no symbol extraction ([#117]), and no provider or token concepts ([#111],
+//! [#122]). The identifiers and the facade signatures those issues need are
+//! defined here so that none of them has to invent one.
 //!
 //! [#111]: https://github.com/fullstacktaiye/harkness/issues/111
 //! [#112]: https://github.com/fullstacktaiye/harkness/issues/112
@@ -80,22 +100,31 @@ mod engine;
 mod error;
 mod ids;
 pub mod index;
+mod inventory;
 mod path;
 mod probe;
 mod provenance;
 mod snapshot;
 mod wire;
 
-pub use classify::FileClass;
+pub use classify::{
+    BINARY_SNIFF_BYTES, CLASSIFY_VERSION, FileClass, FileSample, OVERSIZED_FILE_THRESHOLD,
+};
 pub use digest::{Sha256Hex, empty_path_set_digest};
 pub use engine::{
-    ChunkContent, ContextEngine, ContextEngineConfig, ContextPack, FileInventory, InstructionSet,
-    InventoryRequest, MapRequest, PackRequest, RepositoryMap, SearchQuery, SearchResults,
-    SettingGroup, SettingOrigin, SettingOrigins, SymbolQuery, SymbolResults,
+    ChunkContent, ContextEngine, ContextEngineConfig, ContextPack, InstructionSet, InventoryRequest,
+    MapRequest, PackRequest, RepositoryMap, SearchQuery, SearchResults, SettingGroup, SettingOrigin,
+    SettingOrigins, SymbolQuery, SymbolResults,
 };
 pub use error::{ContextDomainError, ContextEngineError};
 pub use ids::{
     ChunkId, ContextItemId, ContextPackId, ContextQueryId, FileVersionId, SnapshotId, SymbolId,
+};
+pub use inventory::{
+    BUILT_IN_DENIALS, Boundary, FileInventory, GLOBAL_IGNORE_FILE, IgnoreLayer, InventoryBuilder,
+    InventoryDiagnostic, InventoryEntry, InventoryError, InventoryPolicy, InventoryTruncation,
+    MAX_DIAGNOSTIC_TEXT_BYTES, MAX_IGNORE_FILE_BYTES, MAX_INVENTORY_DIAGNOSTICS,
+    MAX_INVENTORY_FILES, MAX_WALK_DURATION, REPOSITORY_IGNORE_FILE,
 };
 pub use path::RepoPath;
 pub use probe::{

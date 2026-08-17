@@ -55,6 +55,7 @@ use crate::index::{
     self, CacheRecreation, ExpectedVersions, IndexAvailability, IndexCache, IndexReport,
     IndexStatus, RecreationReason,
 };
+use crate::inventory::FileInventory;
 use crate::probe::FilesystemProbe;
 use crate::snapshot::{Capture, CaptureRequest, WorkspaceSnapshot};
 
@@ -896,19 +897,6 @@ impl PackRequest {
         }
     }
 }
-
-/// The classified, bounded set of files eligible for indexing and retrieval.
-///
-/// Declared here with no fields on purpose. [#112] owns its contents and the
-/// walk that produces them, and guessing at fields somebody else is about to
-/// specify would mean renaming them on arrival. A record no caller can build
-/// and no method yet returns cannot be mistaken for a real answer, and
-/// `#[non_exhaustive]` makes filling it in additive.
-///
-/// [#112]: https://github.com/fullstacktaiye/harkness/issues/112
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-#[non_exhaustive]
-pub struct FileInventory {}
 
 /// What a search found ([#116]).
 ///
