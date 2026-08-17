@@ -65,6 +65,15 @@ pub trait JsonRpcTransport: Send + Sync {
     /// Returns [`SendRejection::NoRoom`] with the message back when the peer's
     /// queue is full, and [`SendRejection::Failed`] when the connection cannot
     /// carry the message at all.
+    // `result_large_err` reads `SendRejection` as an oversized error, and it is
+    // neither oversized by accident nor an error: the `NoRoom` arm *is* the
+    // message coming back, and it is exactly as large as the `Message` the same
+    // call already takes by value. Boxing it would add an allocation per
+    // rejection to the backpressure loop for no saving. It crossed the lint's
+    // threshold when `agent-client-protocol-schema` unified
+    // `serde_json/preserve_order` onto the workspace (ADR-0010), which swaps the
+    // `BTreeMap` inside every `Value` for a larger `IndexMap`.
+    #[allow(clippy::result_large_err)]
     fn try_send(&self, message: Message) -> Result<(), SendRejection>;
 
     /// Takes the next message from the peer, waiting until `deadline`.

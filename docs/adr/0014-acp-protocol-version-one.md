@@ -68,6 +68,19 @@ compatibility question gets answered — whether Harkness offers 2 and falls bac
 or supports both, or moves — and none of those answers should be reached by
 someone fixing something else.
 
+## Outcome
+
+The negotiation shipped in
+[#149](https://github.com/fullstacktaiye/harkness/issues/149). `harkness-acp`
+offers `OFFERED_PROTOCOL_VERSION` and proceeds on any member of
+`SUPPORTED_PROTOCOL_VERSIONS`, which is the "latest we support" / "set we accept"
+split this ADR asks for rather than an equality test against `1`. A test holds
+the offered version equal to the schema crate's own `LATEST`, so an upstream
+release moving that constant is a failing assertion instead of Harkness silently
+offering a version it does not implement. The manifest test this ADR named as the
+enforcement mechanism exists, and refuses any `unstable_` string in the crate's
+`Cargo.toml`.
+
 ## Consequences
 
 - Harkness works against the agents that exist. v1 is what Gemini CLI and the

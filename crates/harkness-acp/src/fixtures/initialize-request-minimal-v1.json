@@ -1,0 +1,14 @@
+{
+  "protocolVersion": 1,
+  "clientCapabilities": {
+    "fs": {
+      "readTextFile": false,
+      "writeTextFile": false
+    },
+    "terminal": false
+  },
+  "clientInfo": {
+    "name": "harkness",
+    "version": "0.1.0"
+  }
+}

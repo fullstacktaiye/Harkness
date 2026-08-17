@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::json::canonical_json;
 use crate::tool::{ToolId, ToolVersion};
 
 use super::{AgentAction, AgentFailure, ApprovalOutcomeView, Observation, ObservationKind};
@@ -906,11 +907,22 @@ fn tool_failed(kind: &str) -> ObservationPattern {
     }
 }
 
+/// Builds one built-in scenario's tool call, with its input in key order.
+///
+/// The ten built-ins are Rust data mirrored byte-for-byte by frozen JSON
+/// fixtures, and `input` is the one part of that data whose serialized key order
+/// is not fixed by a struct's field declarations. Canonicalizing here makes the
+/// frozen bytes a property of the request rather than of how a `json!` literal
+/// happens to be laid out — and of the map type behind `serde_json::Value`,
+/// which is a cargo feature any crate in the workspace can flip for every other
+/// one. It changes nothing about what is requested: only the coordinator
+/// validates, authorizes, persists, schedules, and executes a call, and key
+/// order is not one of those.
 fn call(tool_id: &str, input: Value) -> AgentAction {
     AgentAction::CallTool {
         tool_id: ToolId::new(tool_id).expect("valid built-in tool id"),
         tool_version: ToolVersion::new("1.0.0").expect("valid built-in tool version"),
-        input,
+        input: canonical_json(input),
     }
 }
 

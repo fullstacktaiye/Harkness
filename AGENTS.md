@@ -9,7 +9,8 @@ Harkness is a Rust 2024 workspace split into thirteen crates under `crates/`:
 - `harkness-context`: the context engine's typed vocabulary — workspace snapshot identity, stable identifiers, provenance, and file classification.
 - `harkness-provider`: the provider-neutral model contract, the streaming turn assembler, and the deterministic scripted provider. Every concrete model adapter lives here and keeps its wire types private; nothing above learns what an endpoint's JSON looks like.
 - `harkness-transport`: the shared subprocess JSON-RPC engine both protocol adapters run on — hermetic allowlisted spawn, newline-delimited framing, request correlation, bounded messages, and the close-stdin/`SIGTERM`/`SIGKILL` teardown. Below every adapter and above nothing but `harkness-git`.
-- `harkness-acp`, `harkness-mcp`, `harkness-forge`, `harkness-recipe`: the v0.5 external-integration adapters — the Agent Client Protocol client, the Model Context Protocol client, forge-neutral contracts with the GitHub REST adapter, and the workflow-recipe source format and compiler. Currently skeletons; see the invariants below.
+- `harkness-acp`: the Agent Client Protocol client — the wire vocabulary, the `initialize` handshake, protocol-version and capability negotiation, and gated authentication. Sessions, mediation, and the rest of the v0.5 ACP surface land here beside them.
+- `harkness-mcp`, `harkness-forge`, `harkness-recipe`: the remaining v0.5 external-integration adapters — the Model Context Protocol client, forge-neutral contracts with the GitHub REST adapter, and the workflow-recipe source format and compiler. Currently skeletons; see the invariants below.
 - `harkness-test-fixtures`: hermetic repository, filesystem, and process fixtures shared only by crate tests.
 - `harkness-runtime`: typed task, run, step, and tool-call records, the typed tool contract and registry every executable operation implements, the execution contracts shared by front ends, and the SQLite run store that makes those records durable.
 - `harkness-cli`: the `harkness` command and its integration tests in `tests/`.
@@ -602,9 +603,11 @@ gate, the panic boundary, and both validation gates, while `harkness contract`
 still advertised it as validated — every guarantee in this section would be on the
 honour system.
 
-Tool output is re-serialized through `serde_json::Value`, whose object map is a
-`BTreeMap`, so a delivered result has canonical key order whatever order the tool
-declares its fields in. Approval and provenance hashing depends on that stability.
+Tool output is re-serialized through `serde_json::Value` and every object key is then sorted by its
+exact bytes, so a delivered result has canonical key order whatever order the tool declares its
+fields in. Approval and provenance hashing depends on that stability. The sort is explicit rather
+than inherited from the map type — see the canonical-key-order section below for why that
+distinction is load-bearing.
 
 Schemas are generated from the `Input` and `Output` associated types and never
 declared by hand, so a published contract cannot disagree with the type the tool
@@ -1308,8 +1311,10 @@ translating between two cancellation mechanisms.
 its manifest, and none may depend on another adapter — shared machinery goes below all four, not
 sideways between two of them, which is where `harkness-transport` is. Each crate carries a test that
 reads its own `Cargo.toml` and fails on any of those six names, so the rule breaks the build rather
-than a review; `harkness-transport` carries the same test against a longer list, since everything is
-above it. The sideways rule
+than a review; `harkness-acp` adds two more against the same file, for a draft protocol feature and
+for the async ACP SDK whose crate name is a prefix of the permitted schema crate's, and
+`harkness-transport` carries the layering test against a longer list, since everything is above it.
+The sideways rule
 needs that test most: no dependency cycle exists to catch an adapter-to-adapter edge while
 `harkness-runtime` does not yet name the adapters. ADR-0009 records why.
 
@@ -1411,6 +1416,97 @@ Every persisted activity row and every user-facing presentation carries exactly 
 `HarknessObserved`, `HarknessMediated`, `AcpReported`, `SnapshotInferred`, or `Unobserved`. An agent
 claim is never rendered as a verified Harkness observation, and `Unobserved` is a class rather than
 an omission — v0.5 has no OS-level sandbox and says so. ADR-0017 records why.
+
+## ACP Handshake Invariants
+
+`harkness-acp/src/wire.rs` is the only module in the workspace that names
+`agent-client-protocol-schema`, and no type it defines appears anywhere else — not in this crate's
+public API, not above it, not persisted. "Does a wire type escape" is answered by reading one `use`
+list rather than by trusting a convention. Method names and the two JSON-RPC codes the adapter
+branches on come from upstream too, checked against it by test, so a renumbering upstream is a
+failing assertion rather than a request no agent answers.
+
+Harkness offers `OFFERED_PROTOCOL_VERSION` — the latest it supports — and proceeds on any version in
+`SUPPORTED_PROTOCOL_VERSIONS`. The two are separate constants because negotiation is "is the answer
+one of ours", and that question does not change shape when the answer grows; a test holds the offered
+version equal to the schema crate's own `LATEST`, so an upstream release moving it cannot make
+Harkness silently offer a version it does not implement. Anything else closes the connection with
+`unsupported_protocol_version` naming both sides, sends no further request, and never retries: a
+mismatch is permanent until software changes. **The version is decided before any capability is
+read**, so an agent speaking a version this build does not know is refused for the version rather
+than for a capability shape that version was free to change.
+
+**Capability advertisement is input, never policy.** The adapter sends exactly the three flags it was
+handed and turns none of them on itself; each is a promise to mediate a request an agent may then
+make, and #153 is the single authority for those. `AdvertisedClientCapabilities::default()`
+advertises nothing.
+
+**An omitted capability is an unsupported capability**, held structurally: every field of
+`AcpAgentCapabilities` is a `bool` that is `false` unless the agent said otherwise, with no third
+state for silence. An `Option<bool>` would let a caller ask whether the agent was *silent* about
+`loadSession`, and the only honest answer to that is the one ACP already fixes. A capability whose
+value has the wrong type decodes the same way and that is correct rather than lenient: a capability
+object nobody can read is an agent with fewer features, not an agent that failed to answer.
+`protocolVersion` is the one field with no default, so a response missing it is
+`malformed_response` and not an ACP response at all.
+
+**`authenticate` is gated on the agent's own advertisement, before anything is written.** An empty
+`authMethods` means the agent wants no authentication, so sending one anyway is a request Harkness
+should not have made rather than a question for the peer. No credential material passes through the
+crate; v1's one method shape has the agent authenticate itself and Harkness only names which offered
+way to use. A rejection is `authentication_failed` and stays distinct from a transport failure,
+because #150 chooses between re-prompting a person and relaunching a program on exactly that
+difference.
+
+**Nothing may arrive from the agent during the handshake.** ACP gives it nothing to send before
+`initialize` returns — no session to update, no file to read, no terminal to create — so a request or
+notification in that window is `protocol_violation` and closes the connection. The check is exact
+rather than heuristic: the transport delivers one ordered stream through one pump, so a peer queue
+that is empty when the response arrives is proof the agent sent nothing.
+
+`AcpError::kind()` follows the `GitError` convention, and the published namespace is
+`AcpError::kinds()` — this crate's table followed by the transport's. A transport failure is carried
+whole and keeps the discriminant #147 gave it rather than being re-spelled, which makes the namespace
+a union exactly as `InvocationError` is; the two tables must not collide, and a test holds them
+disjoint. `is_terminal` answers whether the connection survived and every variant answers it
+deliberately.
+
+An agent's method name reaching a Harkness diagnostic is clamped, because a peer must not choose how
+long a Harkness message is. Its JSON-RPC `message` and `data` are not: they are prose whose whole
+value is being complete, they live in an `AgentRefusal` field rather than inside a sentence Harkness
+wrote, and the transport's `max_message_bytes` already bounds them. A caller making either durable
+owes it the store's inline bound.
+
+**The adapter launches nothing.** `AcpConnection::new` takes a connection that already exists,
+because which executable may run is a trust decision bound to a digest and that decision is #150's
+under ADR-0016.
+
+## Canonical JSON Key Order
+
+`serde_json::Map` is a `BTreeMap` — and therefore sorted — only until some crate anywhere in the
+workspace enables `preserve_order`, at which point it becomes an insertion-ordered `IndexMap` and
+Cargo unifies that choice onto every member. `agent-client-protocol-schema` requires that feature and
+ADR-0010 requires that crate, so the workspace has already lost the free version of this property
+once. Nothing may rely on it again.
+
+Unification is per build graph rather than per repository, and that is the sharp edge: `cargo test
+-p harkness-runtime` does not build `harkness-acp`, so it resolves `serde_json` *without*
+`preserve_order` and sees a `BTreeMap`, while `cargo test --workspace` sees an `IndexMap`. A
+byte-level assertion over an untyped `Value` can therefore pass under one command and fail under the
+other. Anything that freezes such bytes must sort them, and anything that merely reads them must not
+assume an order at all.
+
+`harkness_runtime::canonical_json` is the one definition: every object key sorted by its exact UTF-8
+bytes at every depth, arrays untouched, idempotent. Three places take it because their bytes are a
+contract rather than a value — a delivered tool result that a recorded hash is taken over, a built-in
+agent scenario mirrored byte-for-byte by a frozen fixture, and the CLI's published `--json` envelope.
+A fourth place that freezes the bytes of an untyped `Value` owes the same call.
+
+`approval::canonical` stays a separate encoder and must not be folded into it: that one writes a
+canonical byte string for hashing, refuses what it cannot encode, and is frozen by a published domain
+constant, while this one hands back a `Value` a caller goes on to serialize however it likes. Both
+sort by exact key bytes rather than by any locale or character-wise ordering, so the order is a
+property of the value and not of the platform that encoded it.
 
 ## Commit & Pull Request Guidelines
 

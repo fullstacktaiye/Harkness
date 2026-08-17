@@ -51,7 +51,11 @@ build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing lin
   warning still: run it only when a *new* approval hash domain is published, because every stored
   `input_hash` was derived under the encoding it pins.
   `cargo test -p harkness-context -- --ignored regenerate_the_frozen_v1_fixtures` rewrites
-  `crates/harkness-context/src/fixtures/*.json` the same way, and
+  `crates/harkness-context/src/fixtures/*.json` the same way,
+  `cargo test -p harkness-acp -- --ignored regenerate_the_frozen_v1_fixtures` rewrites the two
+  `initialize-request-*.json` fixtures under `crates/harkness-acp/src/fixtures/` — and only those
+  two, because the three response fixtures beside them are an *agent's* answers and this build
+  produces none of them — and
   `cargo test -p harkness-runtime -- --exact --ignored
   integration::wire::tests::regenerate_the_frozen_v1_fixtures` rewrites the four positive fixtures
   under `crates/harkness-runtime/src/integration/fixtures/`. Both carry the same warning: a released
@@ -70,7 +74,7 @@ build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing lin
 ### Frozen fixtures
 
 `crates/harkness-core/src/catalog/fixtures/*.json`, `crates/harkness-runtime/src/domain/fixtures/*.json`,
-`crates/harkness-context/src/fixtures/*.json`,
+`crates/harkness-context/src/fixtures/*.json`, `crates/harkness-acp/src/fixtures/*.json`,
 `crates/harkness-runtime/src/approval/fixtures/canonical-input-v1.json`,
 `crates/harkness-runtime/src/agent/fixtures/*.json`,
 `crates/harkness-runtime/src/integration/fixtures/*.json`,
@@ -105,7 +109,8 @@ harkness-gui ──┴─> harkness-core ─────────────
                    (contract | assemble | scripted)
 
 harkness-acp  ──┬─> harkness-transport ──> harkness-git
-harkness-mcp  ──┘
+harkness-mcp  ──┘   (harkness-acp also depends on agent-client-protocol-schema,
+                     the one external protocol crate in the workspace; ADR-0010)
 
 harkness-acp  ──┐
 harkness-mcp  ──┤
@@ -195,7 +200,15 @@ translating between two cancellation mechanisms.
   peer exit as `idle` because it does not know what anybody asked for, and `Connection` is what
   refines that into `exit_before_response`. Nothing here knows a method name; every protocol semantic
   is #149's and #157's.
-- **`harkness-acp`, `harkness-mcp`, `harkness-forge`, `harkness-recipe`** are the v0.5
+- **`harkness-acp`** is the ACP client. `wire.rs` is the only module in the workspace that names
+  `agent-client-protocol-schema`, and nothing it defines leaves it — that one `use` list is the whole
+  of ADR-0009's wire-privacy rule. `capabilities.rs` holds the Harkness-owned vocabulary the crate's
+  public API is written in, `connection.rs` the handshake, and `error.rs` a `kind()` namespace that
+  is the *union* of its own table and `harkness-transport`'s: a transport failure is carried whole
+  and keeps the discriminant #147 gave it, exactly as `InvocationError` delegates to `ToolError`.
+  Negotiation is total over the selected version and decided before any capability is read; an
+  unsupported one closes the connection and asks nothing more. `docs/acp.md` is the reference.
+- **`harkness-mcp`, `harkness-forge`, `harkness-recipe`** are the remaining v0.5
   external-integration adapters, currently compile-clean skeletons whose only code is the test each
   one runs against its own `Cargo.toml`. They may depend on `harkness-git` and `harkness-core`,
   never on `harkness-runtime`, a front end, or one another; protocol wire types stay private to the
@@ -309,6 +322,18 @@ and `InvocationError` as their union — `InvocationError::kinds()` is what #99 
 the error, so a caller that named no version can still record `tool_calls.tool_version` for a failed
 row without re-resolving. That is also why there is no `From<ToolError> for InvocationError`: a `?`
 would silently drop the identity, so constructing the variant requires naming the tool.
+
+### `serde_json` map ordering is a workspace-wide feature
+
+`serde_json::Map` is a sorted `BTreeMap` only while nothing enables `preserve_order`; that feature
+swaps it for an insertion-ordered `IndexMap`, and Cargo unifies features across every workspace
+member, so one crate's dependency decides it for all of them.
+`agent-client-protocol-schema` requires it, which means the workspace is on `IndexMap` today and any
+code that froze the bytes of a `Value` had to stop inheriting its key order.
+`harkness_runtime::canonical_json` is the one sorter; the three callers are `tool::erased`'s output
+gate, `agent::scenario`'s `call`, and `harkness-cli`'s envelope. The same feature also grew `Value`
+past `clippy::result_large_err`'s threshold, which is why `SendRejection` carries an `allow` and
+`AcpError` boxes its `AgentRefusal`.
 
 ## Data directory
 

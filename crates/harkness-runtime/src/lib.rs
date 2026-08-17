@@ -56,12 +56,15 @@ pub mod check;
 pub mod coordinator;
 pub mod domain;
 pub mod integration;
+mod json;
 pub mod policy;
 pub mod schedule;
 pub mod store;
 pub mod tool;
 pub mod tools;
 pub mod trust;
+
+pub use json::canonical_json;
 
 // Declared at the test binary's root so a scenario's frozen argv — a bare
 // program name plus `--exact <role>` — names the role with no module prefix,

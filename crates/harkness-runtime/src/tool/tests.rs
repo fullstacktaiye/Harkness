@@ -1145,11 +1145,11 @@ fn a_tool_can_return_an_artifact_reference_in_its_output() {
     // fail if the schema and the type disagreed.
     //
     // Note the key order: the delivered JSON is sorted, not in field-declaration
-    // order, because the output gate re-serializes through `serde_json::Value` and
-    // its object map is a `BTreeMap`. That canonicalization is a property worth
-    // relying on rather than an accident — it is what lets a hash taken over a
-    // tool's result be stable across builds and across tools that declare the same
-    // fields in a different order.
+    // order, because the output gate sorts every object key by its exact bytes.
+    // That canonicalization is a property worth relying on rather than an
+    // accident — it is what lets a hash taken over a tool's result be stable
+    // across builds and across tools that declare the same fields in a different
+    // order.
     let outcome = invoke(
         &registry,
         &id("fixture.stores"),
@@ -1169,11 +1169,25 @@ fn delivered_output_has_canonical_key_order() {
     // The property the artifact test observes, stated on its own so it is a
     // contract rather than an incidental detail of one assertion. #92 will hash
     // over recorded input and output, and a hash is only stable if the bytes are.
+    //
+    // Nesting is covered as well as the top level, and inside an array as well as
+    // inside an object, because the sort is an explicit recursive walk rather
+    // than a property of the map type: an implementation that only reordered the
+    // outermost object would satisfy a flat assertion and still hand a caller two
+    // spellings of one result.
     #[derive(Serialize, JsonSchema)]
     struct Unsorted {
         zebra: u8,
         apple: u8,
         mango: u8,
+        nested: Nested,
+        listed: Vec<Nested>,
+    }
+
+    #[derive(Serialize, JsonSchema)]
+    struct Nested {
+        yak: u8,
+        ant: u8,
     }
 
     struct Declares;
@@ -1200,6 +1214,8 @@ fn delivered_output_has_canonical_key_order() {
                 zebra: 1,
                 apple: 2,
                 mango: 3,
+                nested: Nested { yak: 4, ant: 5 },
+                listed: vec![Nested { yak: 6, ant: 7 }],
             })
         }
     }
@@ -1218,8 +1234,8 @@ fn delivered_output_has_canonical_key_order() {
     .unwrap();
     assert_eq!(
         outcome.output().get(),
-        r#"{"apple":2,"mango":3,"zebra":1}"#,
-        "the pipeline should deliver canonical key order"
+        r#"{"apple":2,"listed":[{"ant":7,"yak":6}],"mango":3,"nested":{"ant":5,"yak":4},"zebra":1}"#,
+        "the pipeline should deliver canonical key order at every depth"
     );
 }
 
