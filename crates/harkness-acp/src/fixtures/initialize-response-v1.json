@@ -1,0 +1,44 @@
+{
+  "protocolVersion": 1,
+  "agentCapabilities": {
+    "loadSession": true,
+    "promptCapabilities": {
+      "image": true,
+      "audio": true,
+      "embeddedContext": true
+    },
+    "mcpCapabilities": {
+      "http": true,
+      "sse": true
+    },
+    "sessionCapabilities": {
+      "list": {},
+      "delete": {},
+      "additionalDirectories": {},
+      "resume": {},
+      "close": {}
+    },
+    "auth": {
+      "logout": {}
+    }
+  },
+  "authMethods": [
+    {
+      "id": "oauth",
+      "name": "Sign in with the browser",
+      "description": "Opens a browser window"
+    },
+    {
+      "id": "api-key",
+      "name": "API key"
+    }
+  ],
+  "agentInfo": {
+    "name": "example-agent",
+    "title": "Example Agent",
+    "version": "3.2.1"
+  },
+  "_meta": {
+    "example.com/traceId": "8c5f1b2e"
+  }
+}

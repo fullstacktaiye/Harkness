@@ -34,16 +34,55 @@
 //! the agent's executable identity is a trust subject in its own right
 //! ([ADR-0016]).
 //!
+//! # The handshake
+//!
+//! ```no_run
+//! use harkness_acp::{
+//!     AcpConnection, AdvertisedClientCapabilities, ClientIdentity,
+//! };
+//! use harkness_transport::{Cancellation, Connection, SpawnSpec};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! // #150 decides which executable may run and builds the connection; this
+//! // crate never launches a program on its own initiative.
+//! let connection = Connection::spawn(
+//!     SpawnSpec::new("/usr/local/bin/some-agent", "/home/user/project").arg("--acp"),
+//!     Cancellation::default(),
+//! )?;
+//! let mut agent = AcpConnection::new(connection);
+//!
+//! let outcome = agent.initialize(
+//!     &ClientIdentity::new("harkness", env!("CARGO_PKG_VERSION")),
+//!     // #153 decides these three; the adapter advertises exactly what it is
+//!     // handed and turns none of them on by itself.
+//!     &AdvertisedClientCapabilities::default(),
+//! )?;
+//!
+//! if let Some(method) = outcome.capabilities.auth_methods.first() {
+//!     agent.authenticate(&method.id)?;
+//! }
+//! # let _ = agent.shutdown();
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Reading a failure
+//!
+//! [`AcpError::kind`] is the stable discriminant, and the namespace it draws
+//! from is the union of this crate's table and the transport's — a broken pipe
+//! during `initialize` stays `write_failed` rather than being re-spelled on the
+//! way up. [`AcpError::is_terminal`] answers the question a caller actually has:
+//! whether the agent is still there to talk to.
+//!
 //! # What is not here yet
 //!
-//! All of it. This crate is a compile-clean skeleton: the boundary exists before
-//! the code so that [#149] (wire types, initialization, negotiation), [#150]
-//! (registration, executable identity, health), [#151] (sessions, streaming,
-//! cancellation, resume), [#152] (permission requests into policy and
-//! approvals), [#153] (filesystem and terminal mediation), [#154] (workspace
-//! isolation and activity classification), [#155] (a reference agent), and
-//! [#156] (the conformance suite) each land against a decided contract instead
-//! of deciding one.
+//! Sessions, prompt turns, and streaming updates ([#151]); permission requests
+//! into policy and approvals ([#152]); filesystem and terminal mediation
+//! ([#153]); workspace isolation and activity classification ([#154]); the
+//! reference agent ([#155]) and the conformance suite ([#156]). Registration,
+//! executable identity, trust, and health checks are [#150]'s, and this crate's
+//! job there is to report what it observed rather than to decide anything about
+//! it.
 //!
 //! [ADR-0009]: https://github.com/fullstacktaiye/harkness/blob/main/docs/adr/0009-v05-adapter-crate-boundaries.md
 //! [ADR-0010]: https://github.com/fullstacktaiye/harkness/blob/main/docs/adr/0010-official-acp-schema-crate.md
@@ -52,7 +91,6 @@
 //! [ADR-0016]: https://github.com/fullstacktaiye/harkness/blob/main/docs/adr/0016-per-subject-trust-records.md
 //! [ADR-0017]: https://github.com/fullstacktaiye/harkness/blob/main/docs/adr/0017-honest-observability-activity-classes.md
 //! [#147]: https://github.com/fullstacktaiye/harkness/issues/147
-//! [#149]: https://github.com/fullstacktaiye/harkness/issues/149
 //! [#150]: https://github.com/fullstacktaiye/harkness/issues/150
 //! [#151]: https://github.com/fullstacktaiye/harkness/issues/151
 //! [#152]: https://github.com/fullstacktaiye/harkness/issues/152
@@ -62,6 +100,36 @@
 //! [#156]: https://github.com/fullstacktaiye/harkness/issues/156
 
 #![warn(missing_docs)]
+
+mod capabilities;
+mod connection;
+mod error;
+#[cfg(test)]
+mod testing;
+mod wire;
+
+pub use capabilities::{
+    AcpAgentCapabilities, AdvertisedClientCapabilities, AgentDescription, AuthCapabilities,
+    AuthMethod, AuthMethodId, ClientIdentity, McpCapabilities, PromptCapabilities,
+    SessionCapabilities,
+};
+pub use connection::{AcpConnection, AcpTimeouts, AuthenticateOutcome, InitializeOutcome};
+pub use error::{AcpError, AgentRefusal};
+
+/// The ACP protocol version Harkness offers in `initialize`.
+///
+/// The latest version it supports, which ADR-0014 phrases deliberately: when
+/// Harkness does adopt a later version, this number moves and the negotiation
+/// code does not.
+pub const OFFERED_PROTOCOL_VERSION: u16 = 1;
+
+/// Every ACP protocol version Harkness will proceed on.
+///
+/// A set rather than an equality test, for the same reason: accepting a selected
+/// version is "is it one of ours", and the shape of that question does not change
+/// when the answer grows. Adopting ACP v2 requires a superseding ADR, not an
+/// entry here.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[u16] = &[OFFERED_PROTOCOL_VERSION];
 
 #[cfg(test)]
 mod tests {
@@ -92,5 +160,56 @@ mod tests {
                  adapter crate from depending on anything above it or beside it",
             );
         }
+    }
+
+    /// ADR-0014 fixes Harkness at protocol version 1 and names this test as the
+    /// enforcement. Cargo features are additive from members, so the workspace
+    /// pin's `default-features = false` cannot veto a member that asks for one:
+    /// `unstable_protocol_v2` would compile in a draft protocol, and every other
+    /// `unstable_*` gate is a feature upstream says may still change shape.
+    /// Adopting any of them is an ADR, and this is what makes that friction
+    /// real rather than advisory.
+    #[test]
+    fn the_manifest_enables_no_unstable_protocol_feature() {
+        let manifest = include_str!("../Cargo.toml");
+        assert!(
+            !manifest.contains("unstable_"),
+            "an unstable_ feature appears in crates/harkness-acp/Cargo.toml; ADR-0014 fixes \
+             Harkness at ACP protocol version 1 and adopting a draft feature requires a \
+             superseding ADR",
+        );
+    }
+
+    /// ADR-0003 keeps the workspace synchronous, and ADR-0010 adopts the schema
+    /// crate rather than the SDK for exactly that reason: `agent-client-protocol`
+    /// and `agent-client-protocol-tokio` layer an async connection model on the
+    /// same types. Depending on either would drag a runtime in through a side
+    /// door, and the names differ from the permitted one by a suffix.
+    #[test]
+    fn the_manifest_names_no_async_runtime_and_no_acp_sdk() {
+        let manifest = include_str!("../Cargo.toml");
+        for forbidden in [
+            "tokio",
+            "async-std",
+            "smol",
+            "futures",
+            "agent-client-protocol-tokio",
+        ] {
+            assert!(
+                !manifest.contains(forbidden),
+                "{forbidden} appears in crates/harkness-acp/Cargo.toml; ADR-0003 keeps the \
+                 workspace synchronous and ADR-0010 adopts the schema crate rather than the SDK",
+            );
+        }
+
+        // The SDK's own name is a prefix of the schema crate's, so it is checked
+        // by counting rather than by absence: the manifest may name
+        // `agent-client-protocol-schema` and nothing else that starts that way.
+        assert_eq!(
+            manifest.matches("agent-client-protocol").count(),
+            manifest.matches("agent-client-protocol-schema").count(),
+            "crates/harkness-acp/Cargo.toml names an agent-client-protocol crate other than the \
+             schema crate; ADR-0010 permits only the schema artifacts",
+        );
     }
 }

@@ -71,6 +71,35 @@ The types stay **private to `harkness-acp`** under ADR-0009. That is what makes
 this reversible: the adoption is a decision about one crate's internals, not
 about Harkness's vocabulary.
 
+## Outcome
+
+Shipped in [#149](https://github.com/fullstacktaiye/harkness/issues/149) at
+`agent-client-protocol-schema` 1.6.0, with no `unstable_*` feature enabled. The
+types are reachable from exactly one module, `harkness-acp/src/wire.rs`, and a
+manifest test in the crate fails the build on an `unstable_` string, on the async
+SDK — whose name is a prefix of the permitted crate's, so the check counts
+occurrences rather than looking for absence — and on the six crates ADR-0009 puts
+above or beside this one. Upstream also supplies the two JSON-RPC error codes the
+adapter branches on and the `initialize`/`authenticate` method names, each
+asserted against the crate rather than typed locally.
+
+One consequence was not anticipated in the list below and is worth recording,
+because it landed two crates away from anything ACP-shaped. The schema crate
+requires `serde_json/preserve_order`, and Cargo unifies features across every
+workspace member: adding this dependency turned `serde_json::Map` from a sorted
+`BTreeMap` into an insertion-ordered `IndexMap` for `harkness-runtime`,
+`harkness-cli`, and everything else. Three places had frozen the bytes of an
+untyped `Value` and were inheriting their key order from that map type — a
+delivered tool result a recorded hash is taken over, a built-in agent scenario
+mirrored byte-for-byte by a fixture, and the CLI's published `--json` envelope.
+All three now sort explicitly through `harkness_runtime::canonical_json`, so the
+bytes are a property of the value rather than of a transitive feature, and the
+released output is unchanged. The same swap also made `serde_json::Value` large
+enough to trip `clippy::result_large_err`. Neither cost is an argument against
+the decision; both are the shape "an externally governed dependency" takes in
+practice, and the containment is that a workspace-wide property is now written
+down rather than inherited.
+
 ## Consequences
 
 - Harkness deserializes what the specification says, not what a reading of the

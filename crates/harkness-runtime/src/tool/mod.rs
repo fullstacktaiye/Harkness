@@ -41,12 +41,14 @@
 //! in flight still needs the tool to check
 //! [`ExecutionContext::check_cancelled`].
 //!
-//! Because step 4 goes through `serde_json::Value`, whose object map is a
-//! `BTreeMap`, the delivered result has **canonical key order** regardless of the
-//! order a tool declares its output fields in. That is worth relying on rather
-//! than rediscovering: a hash taken over a recorded result is stable across
-//! builds, and two tools declaring the same fields in different orders produce
-//! byte-identical output.
+//! Step 4 sorts every object key by its exact bytes, so the delivered result has
+//! **canonical key order** regardless of the order a tool declares its output
+//! fields in. That is worth relying on rather than rediscovering: a hash taken
+//! over a recorded result is stable across builds, and two tools declaring the
+//! same fields in different orders produce byte-identical output. The sort is
+//! explicit rather than inherited from `serde_json::Map` being a `BTreeMap`,
+//! because that map type is a Cargo feature any crate in the workspace can flip
+//! for every other one — and `agent-client-protocol-schema` does (ADR-0010).
 //!
 //! Both gates locate their findings. A [`SchemaViolation`] carries an RFC 6901
 //! JSON Pointer into the offending value and another into the schema rule it

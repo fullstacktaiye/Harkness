@@ -1,0 +1,10 @@
+{
+  "agentCapabilities": {
+    "loadSession": true
+  },
+  "agentInfo": {
+    "name": "example-agent",
+    "version": "4.0.0"
+  },
+  "protocolVersion": 2
+}

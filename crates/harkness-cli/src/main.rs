@@ -43,6 +43,7 @@ use harkness_git::{
 };
 use harkness_runtime::{
     approval::DecidedVia,
+    canonical_json,
     check::{CheckOutcome, CheckSummary, check_coordinator, project_checks, run_configured_check},
     policy::EXTERNAL_POLICY_DENIAL_KINDS,
     store::Store,
@@ -5022,7 +5023,7 @@ fn contract_result(json_output: bool) -> CommandResult {
         CommandResult::Json(data)
     } else {
         CommandResult::Human(
-            serde_json::to_string_pretty(&data)
+            serde_json::to_string_pretty(&canonical_json(data))
                 .unwrap_or_else(|_| "contract unavailable".to_owned()),
         )
     }
@@ -5035,7 +5036,7 @@ fn emit_success(data: &Value) -> io::Result<()> {
             v: ENVELOPE_VERSION,
             r#type: "success",
             ok: true,
-            data,
+            data: &canonical_json(data.clone()),
         },
     )
 }
@@ -5066,12 +5067,23 @@ fn emit_error(kind: &str, message: &str, details: &Value) -> io::Result<()> {
             error: ErrorBody {
                 kind,
                 message,
-                details,
+                details: &canonical_json(details.clone()),
             },
         },
     )
 }
 
+/// Writes one envelope, with the payload's object keys in one fixed order.
+///
+/// The envelope's own fields come from a struct and are in declaration order
+/// whatever happens; the payload is a hand-built `Value`, and its key order used
+/// to come from `serde_json::Map` being a `BTreeMap`. That map type is a cargo
+/// feature any crate in the workspace can turn on for every other one — one
+/// does, through `agent-client-protocol-schema` (ADR-0010) — so the order a
+/// released `harkness --json` has always emitted is sorted here rather than
+/// inherited. Nothing about the contract changes: JSON objects are unordered to
+/// a parser, and this is what keeps the bytes the same for anyone who did not
+/// read them that way.
 fn write_json_line(writer: &mut impl Write, value: &impl Serialize) -> io::Result<()> {
     serde_json::to_writer(&mut *writer, value).map_err(|error| {
         if let Some(kind) = error.io_error_kind() {

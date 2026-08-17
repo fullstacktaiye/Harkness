@@ -9,7 +9,16 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
-# No dependencies yet: this crate is the boundary ADR-0009 draws, and #149 is
-# what fills it. Whatever is added here, the runtime crate and the two front
-# ends are not eligible — see the manifest test in `src/lib.rs`, which reads
-# this file and fails on their names.
+# ADR-0009 draws the boundary this crate sits on: the runtime crate, the two
+# front ends, and the three sibling adapters are not eligible dependencies. The
+# manifest tests in `src/lib.rs` read this file and fail on their names, on any
+# draft protocol feature (ADR-0014), and on an async runtime or the ACP SDK
+# (ADR-0003, ADR-0010). The schema crate's version and feature selection are
+# inherited from the workspace pin.
+[dependencies]
+agent-client-protocol-schema = { workspace = true }
+harkness-transport = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_path_to_error = { workspace = true }
+thiserror = { workspace = true }

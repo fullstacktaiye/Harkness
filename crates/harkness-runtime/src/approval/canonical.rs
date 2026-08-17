@@ -236,9 +236,12 @@ fn write_value(
         Value::Object(fields) => {
             // Sorted by the exact key bytes rather than by any locale or
             // character-wise ordering, so the order is a property of the value
-            // and not of the platform that encoded it. `serde_json` already
-            // keeps its map ordered this way; sorting here is what keeps that
-            // true if the map type ever changes.
+            // and not of the platform that encoded it. Never inherited from the
+            // map type: `serde_json::Map` is a `BTreeMap` only until some crate
+            // in the workspace enables `preserve_order`, which Cargo then
+            // unifies onto every member — `agent-client-protocol-schema`
+            // requires it (ADR-0010), so the map here is an `IndexMap` and this
+            // sort is what every stored `input_hash` has always depended on.
             let mut keys = fields.keys().collect::<Vec<_>>();
             keys.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
             canonical.push('{');

@@ -14,6 +14,7 @@ use super::{
     ExecutionContext, MAX_FAILURE_MESSAGE_BYTES, RegistryError, SchemaDirection, SchemaViolation,
     ToolDescriptor, ToolError, ToolIdentity, ToolMetadata,
 };
+use crate::json::canonical_json;
 use crate::trust::{
     ContainedPath, PathAccess, PathBoundary, RequestClassification, RequestFlags, RequestPath,
     classify_request,
@@ -405,6 +406,13 @@ where
                 0,
             )
         })?;
+        // Every object key in byte order, so two tools declaring the same
+        // fields in a different order produce byte-identical output and one
+        // tool produces the same bytes on every build. A hash taken over a
+        // recorded result is only stable if the bytes are, and the map type
+        // this used to be inherited from is a cargo feature any crate in the
+        // workspace can flip for every other one.
+        let produced = canonical_json(produced);
         if let Err(rejection) =
             schema::validate(&self.output, identity, SchemaDirection::Output, &produced)
         {
