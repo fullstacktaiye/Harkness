@@ -31,7 +31,7 @@ pub use harkness_git::{
 pub use listing::{
     DirEntry, compare_directory_entries, directory_entry_is_visible, list_directory,
 };
-pub use paths::data_directory;
+pub use paths::{CONTEXT_DIRECTORY, data_directory};
 pub use project::{
     ProjectError, ProjectSelector, ProjectService, Worktree, WorktreeReconciliation,
     WorktreeReconciliationSkip,

@@ -99,6 +99,14 @@ jobs:
         run: cargo test --locked -p harkness-core
       - name: Test Git
         run: cargo test --locked -p harkness-git
+      # The context engine earned a matrix entry when it grew a second SQLite
+      # store. Its cache lifecycle renames and unlinks a database that was open
+      # a moment earlier, which Windows refuses while a handle is held, and it
+      # re-executes the test binary as a second process to prove two front ends
+      # can share one cache. Neither is exercised by building the crate for
+      # `harkness-runtime`, which is all the other legs used to do.
+      - name: Test context
+        run: cargo test --locked -p harkness-context
       - name: Test runtime
         run: cargo test --locked -p harkness-runtime
       # The shared JSON-RPC transport is where every ACP agent and MCP server

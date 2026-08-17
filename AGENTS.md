@@ -202,7 +202,10 @@ every other read on `GitService` does not.
 
 ## Run Store Schema & Connection Invariants
 
-Run history lives in `runtime.db` beside `projects.json`, never inside it. The
+Run history lives in `runtime.db` beside `projects.json`, never inside it. It is
+the *evidence* half of ADR-0004's split: the context index cache under
+`<data_dir>/context/` is disposable and this is not, so nothing derived belongs
+in these tables and nothing recorded belongs in that one. The
 two stores are versioned the same way and for the same reason: `PRAGMA
 user_version` is probed before any statement runs, so a database written by a
 newer build produces an upgrade message rather than a corruption message, and
@@ -456,6 +459,77 @@ worktree being read. Snapshots hold hashes and paths only, never file contents.
 The wire forms in `harkness-context` are frozen by committed fixtures because
 they become persisted columns; changing a field, a variant spelling, or a
 timestamp format after that is a `runtime.db` migration plus a new fixture.
+
+## Context Engine & Index Cache Invariants
+
+**The context engine persists nothing.** Every facade method returns a typed
+value and writes no row anywhere; a snapshot becomes evidence only through
+`Store::record_workspace_snapshot_for_run`, and that path is the sole producer
+of `snapshot_captured`. ADR-0001's dependency direction makes it structural
+rather than intended — `harkness-context` cannot name `harkness-runtime` — and
+that is what keeps deleting the cache lossless. The corollary binds the other
+way too: nothing in `harkness-context` may grow a route to `runtime.db`.
+
+**`<data_dir>/context/` is disposable and `runtime.db` is not.** Deleting the
+whole subtree at any moment costs warm-up time and no run history, provenance,
+approval, or artifact. It is a supported recovery action, so "reclaim disk" and
+"fix a weird index" are one command. The cache path is derived —
+`<data_dir>/context/<repository-key>/index.db`, where the key is the v5 UUID
+`harkness-git` already keys the repository lock by — never user-supplied, so
+every linked worktree of one repository maps to one cache and there is no
+traversal surface.
+
+**A cache is read before it is written.** The metadata probe opens read-only, so
+a cache written by a newer build is refused with `cache_version_conflict` and
+left byte-identical rather than downgraded, mirroring the store's
+`schema_too_new`. An older `schema_version` is quarantined and recreated —
+the cache is disposable, so there is no downgrade path and none may be added.
+A *component* version (parser, chunking, ranking) is the opposite: the file is
+kept, the stored version is **not** rewritten, and the skew is reported for
+incremental reconciliation, because overwriting it would erase exactly the
+knowledge reconciliation needs.
+
+**A busy cache is not a corrupt cache.** Contention, a permission bit, and an
+exhausted descriptor table are all `cache_open_failed`; only a statement about
+the file's *contents* may quarantine one. Reading a locked file as corruption
+would let one front end destroy the other's index simply by being slow. A cache
+recording a different repository identity is quarantined, because serving one
+checkout's rows for another is the bleed the derived path exists to prevent.
+
+**`index_generation` is a token, not a counter.** It is a component of the
+snapshot digest, so a snapshot taken against a rebuilt index must never compare
+equal to one taken against the index that produced it — and the counter lives in
+the file being deleted, so a plain increment cannot promise that. It is seeded
+from the wall clock in nanoseconds with `previous + 1` as a floor: a wiped
+directory cannot reissue a number a stored snapshot already recorded, and a clock
+that stepped backwards cannot either. Quarantine keeps at most two files, named
+with a fixed-width stamp so age order is name order, and takes the write-ahead
+log and shared-memory sidecars with it rather than leaving a replacement to
+recover somebody else's log.
+
+**One engine per project, one cache per repository, and neither lock is ever
+held across the other's work.** The engine registry's mutex is not held while an
+engine is opened, because opening one can wait out the cache's busy timeout. The
+cache's connection lock is leaf-level: never held while the repository lock or
+the catalog lock is acquired, so the repository-then-catalog ordering is
+untouched. `index_status` takes neither and never blocks on indexing.
+
+**Every facade method is blocking and cancellation-polled.** There is no async
+runtime and this crate starts none, so a caller on a UI thread moves the call to
+a worker itself. An already-cancelled token launches nothing. A method whose
+implementation has not landed returns `not_yet_available` naming the feature —
+a real, tested refusal, never a `todo!()` and never fabricated data.
+
+**A `workspace_snapshots` row carries two independent version ladders.** Its
+`schema_version` column is the runtime's and describes the envelope;
+`payload_json` carries `harkness-context`'s own inside the document and is probed
+against that ladder *before* its strict body is parsed, so a payload from a newer
+build reads as an upgrade request rather than as a corrupt column. The payload is
+not redacted, and must not be: it is bound by a digest the load path re-derives,
+so rewriting a path inside it would refuse the very row the rewrite was meant to
+protect. `id`, `project_id`, `snapshot_digest` and `captured_at` are lifted out
+of the payload for queries and are *compared* against it on every read, exactly
+as an artifact's `storage_path` is.
 
 ## Model Provider & Streaming Assembly Invariants
 

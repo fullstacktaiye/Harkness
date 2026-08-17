@@ -1,4 +1,12 @@
-//! The one error namespace this crate raises.
+//! The two error namespaces this crate raises.
+//!
+//! [`ContextDomainError`] is what capturing, verifying, and decoding a record
+//! can fail with. [`ContextEngineError`] is what the [engine](crate::engine)
+//! facade fails with, and it is the *union* of its own table and the domain's:
+//! a domain failure raised beneath a facade call is carried whole and keeps the
+//! discriminant it was given, exactly as `InvocationError` delegates to
+//! `ToolError` in the runtime. The two tables must stay disjoint, because
+//! [`ContextEngineError::kinds`] publishes their concatenation.
 
 use std::path::PathBuf;
 
@@ -156,11 +164,144 @@ impl ContextDomainError {
     }
 }
 
+/// Failures raised by the [`ContextEngine`](crate::ContextEngine) facade.
+///
+/// Two absences here are deliberate rather than oversights.
+///
+/// There is no `repository_unavailable` variant: [`ContextDomainError`] already
+/// publishes that kind, and re-spelling it would put one meaning in two
+/// namespaces whose concatenation [`kinds`](Self::kinds) publishes. A worktree
+/// that is not a repository, or one that has gone away, is reported as
+/// [`ContextDomainError::RepositoryUnavailable`] carried by
+/// [`Domain`](Self::Domain).
+///
+/// [`Cancelled`](Self::Cancelled) is *not* the same as
+/// [`ContextDomainError::SnapshotCancelled`], which is why the spellings
+/// differ. The domain kind says a workspace read was abandoned half-way; this
+/// one says the facade observed the token before it got that far, or that
+/// something with no workspace read in it — an index refresh, say — was
+/// stopped.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[non_exhaustive]
+pub enum ContextEngineError {
+    /// A facade method whose implementation has not landed yet.
+    ///
+    /// A real, tested refusal rather than a `todo!()`: a caller written against
+    /// the seam today gets a typed answer naming what is missing, and the issue
+    /// that implements the method deletes this path rather than a panic.
+    #[error("{feature} is not available in this build yet")]
+    NotYetAvailable {
+        /// Stable name of the missing feature.
+        feature: &'static str,
+    },
+
+    /// The index cache could not be opened, created, or written.
+    ///
+    /// The engine still serves everything that does not read the cache — the
+    /// workspace snapshot above all — so a read-only or missing cache directory
+    /// degrades retrieval instead of failing the engine.
+    #[error("the index cache at '{}' is unusable: {reason}", path.display())]
+    CacheOpenFailed {
+        /// Cache database the failure is about.
+        path: PathBuf,
+        /// Stable human-readable explanation.
+        reason: String,
+    },
+
+    /// The cache on disk was written by a newer build.
+    ///
+    /// Refused read-only and left byte-identical rather than downgraded, which
+    /// mirrors the run store's `schema_too_new`. A newer sibling process is
+    /// still using that cache; truncating it would be this build corrupting a
+    /// working one.
+    #[error(
+        "the index cache at '{}' is at schema version {found}, newer than the maximum supported version {maximum}; upgrade Harkness to use it",
+        path.display()
+    )]
+    CacheVersionConflict {
+        /// Cache database that was refused.
+        path: PathBuf,
+        /// Schema version found in `index_meta`.
+        found: u32,
+        /// Newest cache schema this build understands.
+        maximum: u32,
+    },
+
+    /// A cache found unusable mid-life was set aside and recreated.
+    ///
+    /// The call that met the fault does not succeed — the cache it addressed is
+    /// gone — but the engine is healthy again afterwards, and the quarantined
+    /// file is named so a person can look at it or delete it. `quarantined_to`
+    /// is absent when there was nothing left to keep, which is what a cache
+    /// another process deleted underneath this one looks like.
+    #[error(
+        "the index cache at '{}' was unusable and has been replaced: {reason}",
+        path.display()
+    )]
+    CacheCorruptQuarantined {
+        /// Cache database that was recreated.
+        path: PathBuf,
+        /// Where the unusable bytes were moved, when there were any.
+        quarantined_to: Option<PathBuf>,
+        /// Stable human-readable explanation.
+        reason: String,
+    },
+
+    /// The operation observed its cancellation token.
+    #[error("the context engine operation was cancelled")]
+    Cancelled,
+
+    /// A domain failure raised beneath the facade.
+    #[error(transparent)]
+    Domain(#[from] ContextDomainError),
+}
+
+impl ContextEngineError {
+    /// Every stable discriminant this namespace defines on its own.
+    ///
+    /// [`kinds`](Self::kinds) is what a caller enumerating the facade's whole
+    /// error surface wants; this table is the half that belongs to the engine.
+    pub const KINDS: &'static [&'static str] = &[
+        "not_yet_available",
+        "cache_open_failed",
+        "cache_version_conflict",
+        "cache_corrupt_quarantined",
+        "cancelled",
+    ];
+
+    /// Stable machine-readable discriminant for caller-facing error handling.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::NotYetAvailable { .. } => "not_yet_available",
+            Self::CacheOpenFailed { .. } => "cache_open_failed",
+            Self::CacheVersionConflict { .. } => "cache_version_conflict",
+            Self::CacheCorruptQuarantined { .. } => "cache_corrupt_quarantined",
+            Self::Cancelled => "cancelled",
+            Self::Domain(error) => error.kind(),
+        }
+    }
+
+    /// Every discriminant a facade call can report, in declaration order.
+    ///
+    /// The engine's own table followed by the domain's. A caller building an
+    /// exit-code or presentation table needs the union, because a facade call
+    /// can fail either way and the caller cannot tell which layer decided.
+    #[must_use]
+    pub fn kinds() -> Vec<&'static str> {
+        Self::KINDS
+            .iter()
+            .copied()
+            .chain(ContextDomainError::KINDS.iter().copied())
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use super::ContextDomainError;
+    use super::{ContextDomainError, ContextEngineError};
 
     #[test]
     fn every_variant_maps_to_a_listed_kind_in_declaration_order() {
@@ -246,5 +387,77 @@ mod tests {
         let count = sorted.len();
         sorted.dedup();
         assert_eq!(sorted.len(), count);
+    }
+
+    #[test]
+    fn every_engine_variant_maps_to_a_listed_kind_in_declaration_order() {
+        let cases = [
+            (
+                ContextEngineError::NotYetAvailable { feature: "search" },
+                "not_yet_available",
+            ),
+            (
+                ContextEngineError::CacheOpenFailed {
+                    path: PathBuf::from("/data/context/key/index.db"),
+                    reason: "permission denied".to_owned(),
+                },
+                "cache_open_failed",
+            ),
+            (
+                ContextEngineError::CacheVersionConflict {
+                    path: PathBuf::from("/data/context/key/index.db"),
+                    found: 2,
+                    maximum: 1,
+                },
+                "cache_version_conflict",
+            ),
+            (
+                ContextEngineError::CacheCorruptQuarantined {
+                    path: PathBuf::from("/data/context/key/index.db"),
+                    quarantined_to: Some(PathBuf::from("/data/context/key/index.db.corrupt-0")),
+                    reason: "file is not a database".to_owned(),
+                },
+                "cache_corrupt_quarantined",
+            ),
+            (ContextEngineError::Cancelled, "cancelled"),
+        ];
+
+        let kinds = cases.iter().map(|(_, kind)| *kind).collect::<Vec<_>>();
+        assert_eq!(kinds, ContextEngineError::KINDS);
+        for (error, expected) in cases {
+            assert_eq!(error.kind(), expected, "unexpected kind for {error:?}");
+        }
+    }
+
+    /// A domain failure raised beneath the facade keeps its own discriminant.
+    /// Re-spelling it would make one meaning have two names depending on which
+    /// layer a caller happened to reach it through.
+    #[test]
+    fn a_carried_domain_failure_keeps_its_own_kind() {
+        let carried = ContextEngineError::from(ContextDomainError::RepositoryUnavailable {
+            path: PathBuf::from("/tmp/gone"),
+            reason: "not a repository".to_owned(),
+        });
+
+        assert_eq!(carried.kind(), "repository_unavailable");
+        assert!(!ContextEngineError::KINDS.contains(&carried.kind()));
+        assert!(ContextEngineError::kinds().contains(&"repository_unavailable"));
+    }
+
+    /// The published namespace is a concatenation, so a spelling appearing in
+    /// both tables would make `kind()` ambiguous about which layer answered.
+    #[test]
+    fn the_engine_and_domain_kind_tables_are_disjoint_and_unique() {
+        let published = ContextEngineError::kinds();
+        assert_eq!(
+            published.len(),
+            ContextEngineError::KINDS.len() + ContextDomainError::KINDS.len()
+        );
+
+        let mut sorted = published;
+        sorted.sort_unstable();
+        let count = sorted.len();
+        sorted.dedup();
+        assert_eq!(sorted.len(), count, "the two kind tables collide");
     }
 }

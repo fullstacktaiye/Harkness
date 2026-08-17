@@ -15,6 +15,20 @@ pub(crate) const LOCKS_DIRECTORY: &str = "locks";
 pub(crate) const REPOSITORIES_DIRECTORY: &str = "repositories";
 pub(crate) const CHECKOUT_DIRECTORY: &str = "checkout";
 
+/// Root of the disposable per-repository context index caches.
+///
+/// A sibling of `repositories/`, `worktrees/`, `locks/` and `artifacts/`, and
+/// covered by the same [`DATA_DIRECTORY_ENV`] override. Everything beneath it
+/// is derivation rather than evidence: deleting the whole subtree costs
+/// warm-up time and loses no run history, provenance, or approval record
+/// (ADR-0004).
+///
+/// It is public because the crate that owns the caches is
+/// `harkness-context`, which sits beside this one rather than inside it. The
+/// names above stay crate-private because the catalog is the only thing that
+/// may resolve them.
+pub const CONTEXT_DIRECTORY: &str = "context";
+
 /// Resolves the Harkness data directory, honoring `HARKNESS_DATA_DIR`.
 ///
 /// The override exists so an isolated front end or an integration test can run

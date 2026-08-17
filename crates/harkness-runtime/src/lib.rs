@@ -41,6 +41,15 @@
 //! a [`policy::RunGrant`], which is what keeps "an approval exists for this
 //! call" a claim one module makes rather than one any caller can assert.
 //!
+//! [`context`] is where the context engine meets the runtime, and the meeting
+//! is deliberately thin. It owns one lazily created, `Arc`-shared
+//! [`ContextEngine`](harkness_context::ContextEngine) per open project, so both
+//! front ends answer context questions from one handle. The engine itself
+//! persists nothing: a workspace snapshot becomes evidence only through
+//! [`Store::record_workspace_snapshot_for_run`](store::Store::record_workspace_snapshot_for_run),
+//! which is what keeps the disposable index cache deletable without costing a
+//! run its audit trail (ADR-0004).
+//!
 //! [`integration`] carries the same idea across the process boundary. An ACP
 //! agent, an MCP server and its tool schemas, a recipe, a forge account and a
 //! forge repository are all controlled by somebody else and can change under a
@@ -53,6 +62,7 @@
 pub mod agent;
 pub mod approval;
 pub mod check;
+pub mod context;
 pub mod coordinator;
 pub mod domain;
 pub mod integration;

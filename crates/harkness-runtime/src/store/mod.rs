@@ -109,6 +109,7 @@ mod migration;
 mod recovery;
 mod redaction;
 mod repository;
+mod snapshot;
 mod workspace_trust;
 
 use std::fs;
@@ -117,6 +118,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use harkness_context::SnapshotId;
 use rusqlite::{Connection, TransactionBehavior};
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -145,6 +147,7 @@ pub use migration::SCHEMA_VERSION;
 pub use recovery::{InterruptionReason, RunInterruption};
 pub(crate) use redaction::redact_payload;
 pub use redaction::{PassThrough, Redactor};
+pub use snapshot::StoredSnapshot;
 
 /// Name of the run database inside the Harkness data directory.
 pub const DATABASE_FILE: &str = "runtime.db";
@@ -356,6 +359,77 @@ impl Store {
             .map_or(TrustState::Untrusted, |trust| {
                 trust.resolve(project_id, root)
             }))
+    }
+
+    // -- workspace snapshots ------------------------------------------------
+
+    /// Records a capture that belongs to no run.
+    ///
+    /// The shape a front end asking "what does this workspace look like right
+    /// now" produces. There is no event, because there is no timeline to put
+    /// one on; a snapshot that belongs to a run is recorded with
+    /// [`record_workspace_snapshot_for_run`](Self::record_workspace_snapshot_for_run)
+    /// instead, and that is the only thing that emits `snapshot_captured`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::AlreadyExists`] when the capture identity is taken
+    /// and [`StoreError::PayloadTooLarge`] when the encoded snapshot exceeds
+    /// [`MAX_INLINE_PAYLOAD_BYTES`].
+    pub fn record_workspace_snapshot(
+        &self,
+        snapshot: &harkness_context::WorkspaceSnapshot,
+    ) -> Result<(), StoreError> {
+        snapshot::insert(&guard(&self.writer), None, snapshot)
+    }
+
+    /// Records a capture as evidence for one run, with the event that says so.
+    ///
+    /// The row and its `snapshot_captured` event share one transaction, so
+    /// "this run read this workspace" and "the timeline says so" become true
+    /// together. There is deliberately no event-free variant for a run's
+    /// capture: the context engine reads the workspace and persists nothing, so
+    /// this is the only place a snapshot becomes evidence, and a snapshot no
+    /// timeline mentions is a run whose context arrived from nowhere.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::MissingParent`] when the run is not stored,
+    /// [`StoreError::AlreadyExists`] when the capture identity is taken, and
+    /// [`StoreError::PayloadTooLarge`] when the encoded snapshot exceeds
+    /// [`MAX_INLINE_PAYLOAD_BYTES`].
+    pub fn record_workspace_snapshot_for_run(
+        &self,
+        run_id: RunId,
+        snapshot: &harkness_context::WorkspaceSnapshot,
+    ) -> Result<EventSeq, StoreError> {
+        let prepared = self.prepare_event(run_id, snapshot::captured_event(snapshot))?;
+        self.commit_event(
+            "recording a workspace snapshot",
+            prepared,
+            |connection, prepared| {
+                snapshot::insert(connection, Some(run_id), snapshot)?;
+                prepared.append(connection, run_id)
+            },
+        )
+    }
+
+    /// Loads one recorded capture, or `None` when nothing is stored under `id`.
+    ///
+    /// The payload is re-validated by `harkness-context` and every
+    /// denormalized column is compared against it, so a hand-edited row fails to
+    /// load rather than entering the process claiming an identity its own
+    /// contents do not support.
+    pub fn workspace_snapshot(&self, id: SnapshotId) -> Result<Option<StoredSnapshot>, StoreError> {
+        self.with_reader(|connection| snapshot::load(connection, id))
+    }
+
+    /// Every capture recorded for one run, oldest first.
+    pub fn run_workspace_snapshots(
+        &self,
+        run_id: RunId,
+    ) -> Result<Vec<StoredSnapshot>, StoreError> {
+        self.with_reader(|connection| snapshot::for_run(connection, run_id))
     }
 
     // -- approvals ----------------------------------------------------------

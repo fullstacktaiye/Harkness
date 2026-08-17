@@ -45,7 +45,7 @@ build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing lin
   `.github/workflows/network-integration.yml`.
 - **Fixture regeneration**: `cargo test -p harkness-runtime regenerate_the_frozen_v1_fixture --
   --ignored` rewrites `crates/harkness-runtime/src/store/fixtures/runtime-v1.db`, and
-  `regenerate_the_frozen_v2_fixture` (through `v7`) rewrites the corresponding `runtime-v*.db`. Run
+  `regenerate_the_frozen_v2_fixture` (through `v8`) rewrites the corresponding `runtime-v*.db`. Run
   each only when that migration itself changes; a released migration is otherwise never edited. The
   v1 regenerator applies a truncated ladder rather than opening a `Store`, because opening one now
   climbs to the newest schema. `regenerate_the_frozen_canonicalization_fixture` rewrites
@@ -81,9 +81,12 @@ build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing lin
 `crates/harkness-runtime/src/agent/fixtures/*.json`,
 `crates/harkness-runtime/src/integration/fixtures/*.json`,
 `crates/harkness-provider/src/scripted/fixtures/*.json`, and
-`crates/harkness-runtime/src/store/fixtures/runtime-v{1..7}.db` pin released on-disk formats. A new
+`crates/harkness-runtime/src/store/fixtures/runtime-v{1..8}.db` pin released on-disk formats. A new
 persisted field, state spelling, or table means a version bump plus a *new* fixture, not an edit to
-an existing one. The provider's scripts are the one set that is *authored* as JSON rather than
+an existing one. The `v8` fixture is the one whose contents are not pinned by constants: a workspace
+snapshot's id is minted per capture and its digest covers a temporary worktree root, so the test
+asserts that the frozen payload still re-derives its own identity rather than that it holds
+particular values. The provider's scripts are the one set that is *authored* as JSON rather than
 mirrored from Rust data: the regenerator only re-canonicalizes their formatting, so a new scenario
 is a new file and a changed step is a new version beside v1.
 
@@ -91,8 +94,8 @@ A **new fixture directory needs a `.gitattributes` line** — `<path>/*.json tex
 file enumerates them one directory at a time rather than by a glob. Fixture tests compare
 `include_str!` against `serde_json::to_string_pretty`, which emits `\n`; without the attribute the
 Windows runner checks the file out with `\r\n` and the byte-for-byte assertion fails there and
-nowhere else. `harkness-context`'s fixtures are absent from that list because the `core` matrix job
-does not build that crate — adding it to the matrix means adding its line too.
+nowhere else. The frozen `runtime-v*.db` files need no entry: Git detects a SQLite file as binary
+and converts nothing in it.
 
 ## Architecture
 
@@ -181,13 +184,28 @@ translating between two cancellation mechanisms.
   `trust` and `policy`, which an adapter cannot see under ADR-0009. Note the two things called
   trust: `trust::TrustState` is about running one workspace's code, `integration::TrustState` about
   an external subject whose identity can change under a grant.
-- **`harkness-context`** owns the context engine's vocabulary and nothing that
-  uses it: identifiers, `WorkspaceSnapshot` identity, `Provenance`, and
-  `FileClass`. It deliberately does *not* depend on `harkness-runtime` — the
-  runtime will depend on it — so a snapshot can be captured and verified with no
-  database of runs in the process. Read `snapshot.rs`'s module doc before
-  changing anything a digest absorbs; the wire forms are frozen by fixtures under
-  `src/fixtures/` because #110 turns them into `runtime.db` columns.
+  `context` is the thin seam where `harkness-context` meets the runtime: one lazily created,
+  `Arc`-shared `ContextEngine` per open project, so the CLI and the GUI cannot disagree about what
+  the index says. Its mutex is never held while an engine is opened, because opening one can wait
+  out the cache's busy timeout. Persistence is the *store's*: `record_workspace_snapshot_for_run`
+  writes the `workspace_snapshots` row and its `snapshot_captured` event in one transaction, and it
+  is the only producer of that kind.
+- **`harkness-context`** owns the context engine's vocabulary *and* its service
+  boundary: identifiers, `WorkspaceSnapshot` identity, `Provenance`, `FileClass`,
+  the `ContextEngine` facade, and the disposable index cache beneath it. It
+  deliberately does *not* depend on `harkness-runtime` — the runtime depends on
+  it — so a snapshot can be captured and verified with no database of runs in the
+  process, which a doc-test on `ContextEngine` proves. Read `snapshot.rs`'s
+  module doc before changing anything a digest absorbs; the wire forms are frozen
+  by fixtures under `src/fixtures/` because they are `runtime.db` columns.
+  `engine.rs` is the eight-method facade every retrieval issue plugs into — only
+  `snapshot` is implemented, the rest return `ContextEngineError::NotYetAvailable`
+  naming the feature — and `index/` is the per-repository cache at
+  `<data_dir>/context/<repository-key>/index.db`: one `index_meta` row, four
+  version fields, a generation seeded from the clock so a wiped directory cannot
+  reissue a number a stored snapshot recorded, and quarantine-and-recreate for
+  anything unreadable. The engine writes nothing durable; `harkness-runtime`'s
+  `context` module owns the handles and the persistence.
 - **`harkness-provider`** is the model-endpoint boundary, created by #111 against ADR-0001 and
   ADR-0002. `contract` is the provider-neutral vocabulary — identities, capabilities, messages, the
   streamed `ModelEvent` model, `TurnOutcome`, and ten stable `ProviderError` kinds — and
@@ -380,7 +398,9 @@ past `clippy::result_large_err`'s threshold, which is why `SendRejection` carrie
 `HARKNESS_DATA_DIR` replaces the platform data directory outright; the CLI's `--data-dir` takes
 precedence over it. Tests and isolated front ends rely on this — use it rather than touching real
 user data. The directory holds `projects.json`, `projects.lock`, `runtime.db` (+ `-wal`/`-shm`),
-`artifacts/`, `locks/`, `repositories/`, and `worktrees/`. Artifact content lives at
+`artifacts/`, `context/`, `locks/`, `repositories/`, and `worktrees/`. `context/` is the one
+disposable subtree: it holds `<repository-key>/index.db` per repository and deleting the whole thing
+costs warm-up time and no evidence (ADR-0004). Artifact content lives at
 `artifacts/<run_id>/<artifact_id>`; the `artifacts` table records the metadata and re-derives that
 path rather than trusting the one it stored. `locks/` holds three unrelated families: the
 repository locks `harkness-git` keys by common directory, `managed-import-<project>.lock`, and the

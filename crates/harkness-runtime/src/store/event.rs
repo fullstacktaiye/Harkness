@@ -181,6 +181,19 @@ pub enum EventKind {
     AgentAction,
     /// The agent's resumable session checkpoint was recorded.
     AgentCheckpoint,
+    /// A workspace snapshot was made durable evidence for this run.
+    ///
+    /// Recorded by the persistence path and by nothing else. Capturing a
+    /// snapshot is a read of the workspace that writes nothing, so an engine
+    /// that emitted this would be claiming an audit trail it never stored.
+    SnapshotCaptured,
+    /// The disposable context index cache was thrown away and rebuilt.
+    ///
+    /// The payload names the old and new generations and one of `corrupt`,
+    /// `version`, or `disposed`. It is on the run's timeline because a
+    /// generation bump changes what every later snapshot digest means, not
+    /// because anything in `runtime.db` was touched — nothing was.
+    ContextCacheRecreated,
     /// Anything a run wants to say that no other kind covers.
     Diagnostic,
     /// A kind this build does not define, preserved exactly as stored.
@@ -214,6 +227,8 @@ impl EventKind {
         "agent_observation",
         "agent_action",
         "agent_checkpoint",
+        "snapshot_captured",
+        "context_cache_recreated",
         "diagnostic",
     ];
 
@@ -236,7 +251,9 @@ impl EventKind {
             Self::AgentObservation => Self::KINDS[12],
             Self::AgentAction => Self::KINDS[13],
             Self::AgentCheckpoint => Self::KINDS[14],
-            Self::Diagnostic => Self::KINDS[15],
+            Self::SnapshotCaptured => Self::KINDS[15],
+            Self::ContextCacheRecreated => Self::KINDS[16],
+            Self::Diagnostic => Self::KINDS[17],
             Self::Unrecognized(spelling) => spelling,
         }
     }
@@ -264,6 +281,8 @@ impl EventKind {
             "agent_observation" => Self::AgentObservation,
             "agent_action" => Self::AgentAction,
             "agent_checkpoint" => Self::AgentCheckpoint,
+            "snapshot_captured" => Self::SnapshotCaptured,
+            "context_cache_recreated" => Self::ContextCacheRecreated,
             "diagnostic" => Self::Diagnostic,
             other => Self::Unrecognized(other.to_owned()),
         }
@@ -826,6 +845,8 @@ mod tests {
             EventKind::AgentObservation,
             EventKind::AgentAction,
             EventKind::AgentCheckpoint,
+            EventKind::SnapshotCaptured,
+            EventKind::ContextCacheRecreated,
             EventKind::Diagnostic,
         ];
 

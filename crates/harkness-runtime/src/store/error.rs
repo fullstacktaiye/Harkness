@@ -217,6 +217,23 @@ pub enum StoreError {
         source: RunDomainError,
     },
 
+    /// A stored context record could not be decoded into a valid value.
+    ///
+    /// Separate from [`InvalidRecord`](Self::InvalidRecord) because the two
+    /// carry different domains and a caller acts on them differently. A context
+    /// record is versioned by `harkness-context`'s own ladder, independently of
+    /// the runtime's, so a payload written by a newer build asks for an upgrade
+    /// rather than reporting corruption — a distinction that would be lost by
+    /// flattening it into a column-encoding failure.
+    #[error("a stored {record} row is not a valid context record: {source}")]
+    InvalidContextRecord {
+        /// Kind of record being decoded.
+        record: &'static str,
+        /// Context rule the row violated.
+        #[source]
+        source: harkness_context::ContextDomainError,
+    },
+
     /// A column value could not be encoded to or decoded from its stored form.
     #[error("{record}.{field} cannot be exchanged with the run store: {reason}")]
     ColumnEncoding {
@@ -289,6 +306,7 @@ impl StoreError {
         "approval_refused",
         "approval_binding_mismatch",
         "invalid_record",
+        "invalid_context_record",
         "column_encoding",
         "invalid_page_limit",
         "query_failed",
@@ -316,6 +334,7 @@ impl StoreError {
             Self::Approval(_) => "approval_refused",
             Self::ApprovalBindingMismatch { .. } => "approval_binding_mismatch",
             Self::InvalidRecord { .. } => "invalid_record",
+            Self::InvalidContextRecord { .. } => "invalid_context_record",
             Self::ColumnEncoding { .. } => "column_encoding",
             Self::InvalidPageLimit { .. } => "invalid_page_limit",
             Self::Query { .. } => "query_failed",
@@ -535,6 +554,17 @@ mod tests {
                     },
                 },
                 "invalid_record",
+            ),
+            (
+                StoreError::InvalidContextRecord {
+                    record: "workspace_snapshot",
+                    source: harkness_context::ContextDomainError::SchemaVersionTooNew {
+                        record: "workspace_snapshot",
+                        found: 2,
+                        maximum: 1,
+                    },
+                },
+                "invalid_context_record",
             ),
             (
                 StoreError::ColumnEncoding {
