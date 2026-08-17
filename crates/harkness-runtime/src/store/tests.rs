@@ -36,7 +36,7 @@ use super::artifact::artifact_path;
 use super::migration::{MIGRATIONS, Migration, SCHEMA_VERSION, apply, recorded_version};
 use super::redaction::tests::{MASK, Masking, NonIdempotentValueOnly, SECRET, Shouting};
 use super::{
-    ARTIFACTS_DIRECTORY, Artifact, Availability, DATABASE_FILE, EventKind, EventSeq,
+    ARTIFACTS_DIRECTORY, Artifact, Availability, DATABASE_FILE, EventKind, EventPage, EventSeq,
     MAX_EVENT_PAGE_LIMIT, MAX_INLINE_PAYLOAD_BYTES, Redactor, RunCursor, RunEvent, RunPage, Store,
     StoreArtifacts, StoreError, guard,
 };
@@ -2336,7 +2336,205 @@ fn an_event_page_outside_the_supported_range_is_refused() {
     for limit in [0, MAX_EVENT_PAGE_LIMIT + 1] {
         let error = fixture.store.events(run.id(), None, limit).unwrap_err();
         assert_eq!(error.kind(), "invalid_page_limit");
+
+        let error = fixture
+            .store
+            .event_page(run.id(), EventPage::oldest(limit))
+            .unwrap_err();
+        assert_eq!(error.kind(), "invalid_page_limit");
     }
+}
+
+#[test]
+fn a_newest_first_page_opens_at_the_tip_and_walks_backwards() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    for index in 0..5 {
+        fixture
+            .store
+            .append_event(
+                run.id(),
+                RunEvent::new(EventKind::Diagnostic, at(20 + index)),
+            )
+            .unwrap();
+    }
+
+    let mut seen = Vec::new();
+    let mut page = EventPage::newest(2);
+    loop {
+        let listing = fixture.store.event_page(run.id(), page).unwrap();
+        seen.extend(listing.events.iter().map(|stored| stored.seq.get()));
+        let Some(next) = listing.next_cursor else {
+            break;
+        };
+        page = EventPage::newest(2).after(next);
+    }
+
+    assert_eq!(
+        seen,
+        vec![5, 4, 3, 2, 1],
+        "a newest-first walk must reach every event exactly once, in reverse"
+    );
+}
+
+#[test]
+fn a_page_that_reaches_the_end_of_the_log_offers_no_continuation() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    for index in 0..4 {
+        fixture
+            .store
+            .append_event(
+                run.id(),
+                RunEvent::new(EventKind::Diagnostic, at(20 + index)),
+            )
+            .unwrap();
+    }
+
+    // Exactly full and last: the distinction an under-full page cannot make,
+    // and the reason the continuation is a probe rather than a length check.
+    let exact = fixture
+        .store
+        .event_page(run.id(), EventPage::oldest(4))
+        .unwrap();
+    assert_eq!(exact.events.len(), 4);
+    assert_eq!(
+        exact.next_cursor, None,
+        "a full page with nothing behind it must not offer a continuation"
+    );
+
+    let partial = fixture
+        .store
+        .event_page(run.id(), EventPage::newest(3).after(EventSeq::new(2)))
+        .unwrap();
+    assert_eq!(
+        partial
+            .events
+            .iter()
+            .map(|stored| stored.seq.get())
+            .collect::<Vec<_>>(),
+        vec![1],
+        "the boundary is exclusive in the direction the order names"
+    );
+    assert_eq!(partial.next_cursor, None);
+}
+
+#[test]
+fn a_newest_first_page_is_unmoved_by_events_appended_at_the_tip() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    for index in 0..4 {
+        fixture
+            .store
+            .append_event(
+                run.id(),
+                RunEvent::new(EventKind::Diagnostic, at(20 + index)),
+            )
+            .unwrap();
+    }
+
+    let first = fixture
+        .store
+        .event_page(run.id(), EventPage::newest(2))
+        .unwrap();
+    assert_eq!(
+        first
+            .events
+            .iter()
+            .map(|stored| stored.seq.get())
+            .collect::<Vec<_>>(),
+        vec![4, 3]
+    );
+
+    // Scrolling back is a walk towards the beginning of the log, so appends at
+    // the far end must not shift what the next page contains. An offset page
+    // would return event 3 twice here.
+    for _ in 0..3 {
+        fixture
+            .store
+            .append_event(run.id(), RunEvent::new(EventKind::Diagnostic, at(40)))
+            .unwrap();
+    }
+
+    let older = fixture
+        .store
+        .event_page(
+            run.id(),
+            EventPage::newest(2).after(first.next_cursor.unwrap()),
+        )
+        .unwrap();
+    assert_eq!(
+        older
+            .events
+            .iter()
+            .map(|stored| stored.seq.get())
+            .collect::<Vec<_>>(),
+        vec![2, 1],
+        "an append at the tip displaced a page walking away from it"
+    );
+    assert_eq!(older.next_cursor, None);
+}
+
+#[test]
+fn both_page_directions_agree_on_the_events_of_a_run() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    for index in 0..7 {
+        fixture
+            .store
+            .append_event(
+                run.id(),
+                RunEvent::new(EventKind::Diagnostic, at(20 + index))
+                    .with_payload(json!({"index": index})),
+            )
+            .unwrap();
+    }
+
+    let mut forwards = Vec::new();
+    let mut page = EventPage::oldest(3);
+    loop {
+        let listing = fixture.store.event_page(run.id(), page).unwrap();
+        forwards.extend(listing.events.clone());
+        let Some(next) = listing.next_cursor else {
+            break;
+        };
+        page = EventPage::oldest(3).after(next);
+    }
+
+    let mut backwards = Vec::new();
+    let mut page = EventPage::newest(3);
+    loop {
+        let listing = fixture.store.event_page(run.id(), page).unwrap();
+        backwards.extend(listing.events.clone());
+        let Some(next) = listing.next_cursor else {
+            break;
+        };
+        page = EventPage::newest(3).after(next);
+    }
+    backwards.reverse();
+
+    assert_eq!(
+        forwards, backwards,
+        "the two directions disagreed about the same log"
+    );
+    assert_eq!(forwards, fixture.store.events(run.id(), None, 100).unwrap());
+}
+
+#[test]
+fn the_event_page_of_an_unstored_run_is_empty_rather_than_refused() {
+    let fixture = Fixture::new();
+
+    let listing = fixture
+        .store
+        .event_page(RunId::new(), EventPage::newest(10))
+        .unwrap();
+
+    assert!(listing.events.is_empty());
+    assert_eq!(listing.next_cursor, None);
 }
 
 #[test]

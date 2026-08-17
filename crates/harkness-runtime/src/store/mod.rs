@@ -135,8 +135,9 @@ use crate::trust::{TrustState, WorkspaceTrust};
 pub use artifact::{ARTIFACTS_DIRECTORY, Artifact, ArtifactSink, Availability, StoreArtifacts};
 pub use error::{OpenFailure, StoreError};
 pub use event::{
-    DEFAULT_EVENT_PAGE_LIMIT, EventKind, EventSeq, MAX_EVENT_PAGE_LIMIT, OVERFLOW_PAYLOAD_FIELD,
-    OVERFLOW_PAYLOAD_MEDIA_TYPE, OVERFLOW_PAYLOAD_NAME, OverflowedPayload, RunEvent, StoredEvent,
+    DEFAULT_EVENT_PAGE_LIMIT, EventKind, EventListing, EventOrder, EventPage, EventSeq,
+    MAX_EVENT_PAGE_LIMIT, OVERFLOW_PAYLOAD_FIELD, OVERFLOW_PAYLOAD_MEDIA_TYPE,
+    OVERFLOW_PAYLOAD_NAME, OverflowedPayload, RunEvent, StoredEvent,
 };
 pub use lease::LeaseRecord;
 pub use listing::{DEFAULT_RUN_PAGE_LIMIT, MAX_RUN_PAGE_LIMIT, RunCursor, RunListing, RunPage};
@@ -1642,6 +1643,27 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<StoredEvent>, StoreError> {
         self.with_reader(|connection| event::events(connection, run_id, after, limit))
+    }
+
+    /// Returns one page of a run's event log in either direction.
+    ///
+    /// The sibling of [`Store::events`] for a surface rather than a subscriber:
+    /// it can open at the newest end, and its
+    /// [`next_cursor`](EventListing::next_cursor) distinguishes a full page with
+    /// more behind it from a full page that is simply last. A page addresses a
+    /// position in the log, so events appended between two requests neither
+    /// repeat nor hide an entry the caller has yet to see.
+    ///
+    /// An unknown run is an empty page rather than an error: the log of a run
+    /// this store never held and the log of a run that recorded nothing are the
+    /// same statement here. A caller that must tell them apart loads the run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidPageLimit`] when the page size is zero or
+    /// above [`MAX_EVENT_PAGE_LIMIT`].
+    pub fn event_page(&self, run_id: RunId, page: EventPage) -> Result<EventListing, StoreError> {
+        self.with_reader(|connection| event::event_page(connection, run_id, page))
     }
 
     /// Returns the highest durable event sequence for `run_id`, if any.

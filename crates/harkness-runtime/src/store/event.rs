@@ -299,6 +299,90 @@ impl<'de> Deserialize<'de> for EventKind {
     }
 }
 
+/// Which end of a run's log a page is read from.
+///
+/// Both directions page by [`EventSeq`] and neither repeats or skips an event
+/// however many arrive at the tip between requests. They exist separately
+/// because the two readers of a timeline start at opposite ends: a replay
+/// follows the log forwards from where it left off, while a surface opens on
+/// the newest entries and asks for older ones as the reader scrolls. Serving
+/// the second from the first would mean reading the whole run to reach its end.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum EventOrder {
+    /// Oldest first, continuing towards the tip.
+    #[default]
+    Oldest,
+    /// Newest first, continuing towards the beginning of the run.
+    Newest,
+}
+
+/// Bounds and positions one page of a run's event log.
+///
+/// `from` is the exclusive boundary the page starts after, in the direction
+/// `order` names: the last sequence already seen reading forwards, or the
+/// oldest already seen reading backwards. Absent, the page starts at whichever
+/// end `order` selects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct EventPage {
+    /// Maximum number of events in the returned page.
+    pub limit: usize,
+    /// Direction the page is read in, and which end an unbounded page starts at.
+    pub order: EventOrder,
+    /// Exclusive boundary an earlier [`EventListing`] returned.
+    pub from: Option<EventSeq>,
+}
+
+impl EventPage {
+    /// Requests the oldest `limit` events.
+    #[must_use]
+    pub const fn oldest(limit: usize) -> Self {
+        Self {
+            limit,
+            order: EventOrder::Oldest,
+            from: None,
+        }
+    }
+
+    /// Requests the newest `limit` events.
+    #[must_use]
+    pub const fn newest(limit: usize) -> Self {
+        Self {
+            limit,
+            order: EventOrder::Newest,
+            from: None,
+        }
+    }
+
+    /// Continues this page's direction from `boundary`, exclusive.
+    #[must_use]
+    pub const fn after(mut self, boundary: EventSeq) -> Self {
+        self.from = Some(boundary);
+        self
+    }
+}
+
+impl Default for EventPage {
+    fn default() -> Self {
+        Self::oldest(DEFAULT_EVENT_PAGE_LIMIT)
+    }
+}
+
+/// One page of a run's event log, ordered as its [`EventPage`] asked for.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct EventListing {
+    /// At most [`EventPage::limit`] events, in the requested order.
+    pub events: Vec<StoredEvent>,
+    /// Boundary to continue from, present only when a further event exists.
+    ///
+    /// This is the sequence of the last event in `events`, so continuing is
+    /// [`EventPage::after`] with it. It is `None` for a page that reached the
+    /// end of the log in its direction — which is a stronger statement than an
+    /// under-full page, because a page can be exactly full and still be last.
+    pub next_cursor: Option<EventSeq>,
+}
+
 /// One thing worth recording about a run.
 ///
 /// The associations are optional because they are genuinely optional: a run
@@ -589,6 +673,82 @@ pub(super) fn events(
         events.push(row.map_err(|error| query_failed("reading a run event row", error))??);
     }
     Ok(events)
+}
+
+/// Returns one page of a run's log in either direction, with a continuation.
+///
+/// The bare [`events`] query above stays the replay primitive it was written to
+/// be: it answers "what came after this" and nothing else, which is all a
+/// subscriber catching up needs. This one adds the two things a surface needs
+/// and a replay does not — a page anchored at the newest end, and a
+/// continuation that distinguishes a full page with more behind it from a full
+/// page that happens to be last.
+pub(super) fn event_page(
+    connection: &Connection,
+    run_id: RunId,
+    page: EventPage,
+) -> Result<EventListing, StoreError> {
+    if page.limit == 0 || page.limit > MAX_EVENT_PAGE_LIMIT {
+        return Err(StoreError::InvalidPageLimit {
+            limit: page.limit,
+            maximum: MAX_EVENT_PAGE_LIMIT,
+        });
+    }
+
+    // One row beyond the page decides whether a continuation exists, without a
+    // second count query that a concurrent append could invalidate.
+    let probe = i64::try_from(page.limit)
+        .unwrap_or(i64::MAX)
+        .saturating_add(1);
+    let sql = match page.order {
+        EventOrder::Oldest => format!(
+            "SELECT {EVENT_COLUMNS} FROM run_events WHERE run_id = :run_id AND seq > :from \
+             ORDER BY seq LIMIT :limit"
+        ),
+        EventOrder::Newest => format!(
+            "SELECT {EVENT_COLUMNS} FROM run_events WHERE run_id = :run_id AND seq < :from \
+             ORDER BY seq DESC LIMIT :limit"
+        ),
+    };
+    // An absent boundary means "start at the end this order names", so it
+    // becomes the sentinel that admits every row in that direction.
+    let from = match (page.order, page.from) {
+        (_, Some(seq)) => i64::try_from(seq.get()).unwrap_or(i64::MAX),
+        (EventOrder::Oldest, None) => 0,
+        (EventOrder::Newest, None) => i64::MAX,
+    };
+
+    let mut statement = connection
+        .prepare_cached(&sql)
+        .map_err(|error| query_failed("preparing the run event page", error))?;
+    let rows = statement
+        .query_map(
+            named_params! {
+                ":run_id": run_id.to_string(),
+                ":from": from,
+                ":limit": probe,
+            },
+            |row| Ok(stored_event(row)),
+        )
+        .map_err(|error| query_failed("reading a page of the events of a run", error))?;
+
+    let mut events = Vec::with_capacity(page.limit.min(DEFAULT_EVENT_PAGE_LIMIT) + 1);
+    for row in rows {
+        events.push(row.map_err(|error| query_failed("reading a run event row", error))??);
+    }
+
+    // The probe row is discarded; what it proves is that the last event kept is
+    // a position worth handing back, so the continuation is that event's own
+    // sequence rather than the unreturned one's.
+    let has_more = events.len() > page.limit;
+    events.truncate(page.limit);
+    let next_cursor = has_more
+        .then(|| events.last().map(|event| event.seq))
+        .flatten();
+    Ok(EventListing {
+        events,
+        next_cursor,
+    })
 }
 
 fn stored_event(row: &Row<'_>) -> Result<StoredEvent, StoreError> {
