@@ -43,7 +43,7 @@ use harkness_git::{
 };
 use harkness_runtime::{
     approval::DecidedVia,
-    check::{CheckOutcome, CheckSummary, project_checks, run_configured_check},
+    check::{CheckOutcome, CheckSummary, check_coordinator, project_checks, run_configured_check},
     policy::EXTERNAL_POLICY_DENIAL_KINDS,
     store::Store,
     trust::{TrustState, WorkspaceTrust},
@@ -2023,21 +2023,21 @@ fn run_check(
                     }),
                 });
             }
-            let run_id = run_configured_check(
-                Arc::clone(&store),
-                &project,
-                check,
-                DecidedVia::Cli,
-                cancellation,
-            )
-            .map_err(|error| match error {
-                // A configuration this build cannot execute is the caller's
-                // input, not a failed operation.
-                harkness_runtime::check::CheckLaunchError::UndeclaredEnvironment { .. } => {
-                    CliError::Usage(error.to_string())
-                }
-                other => CliError::Check(other.to_string()),
-            })?;
+            // One coordinator, and therefore one scheduler, for the process.
+            // This process runs exactly one check, so building it here is also
+            // building it once.
+            let coordinator = check_coordinator(Arc::clone(&store))
+                .map_err(|error| CliError::Check(error.to_string()))?;
+            let run_id =
+                run_configured_check(&coordinator, &project, check, DecidedVia::Cli, cancellation)
+                    .map_err(|error| match error {
+                        // A configuration this build cannot execute is the caller's
+                        // input, not a failed operation.
+                        harkness_runtime::check::CheckLaunchError::UndeclaredEnvironment {
+                            ..
+                        } => CliError::Usage(error.to_string()),
+                        other => CliError::Check(other.to_string()),
+                    })?;
             let results = project_checks(&store, &project)
                 .map_err(|error| CliError::Check(error.to_string()))?;
             let result = results

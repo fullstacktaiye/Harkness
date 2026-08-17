@@ -81,6 +81,31 @@ pub enum CheckLaunchError {
     },
 }
 
+/// Builds the coordinator a caller runs project checks through.
+///
+/// One of these belongs to the *process*, not to a call. `RunCoordinator::new`
+/// constructs a `Scheduler`, and the scheduler is what serializes mutating calls
+/// per workspace and caps child processes across all of them. A coordinator
+/// built per check therefore shares a scheduler with nothing: two checks started
+/// for two different projects, or a check started beside any other coordinator
+/// already live, would be serialized against nothing and could exceed the global
+/// child-process limit together. Building the registry and reloading user policy
+/// per call was the smaller cost of the same mistake.
+///
+/// Policy is loaded once here for the user layer. The coordinator re-specializes
+/// it per run against that run's own workspace, so one coordinator serves every
+/// project in the process.
+///
+/// # Errors
+///
+/// Returns [`RegistryError`] when `check.run` cannot be declared.
+pub fn check_coordinator(store: Arc<Store>) -> Result<RunCoordinator, CheckLaunchError> {
+    let mut registry = ToolRegistry::new();
+    registry.register(CheckRun)?;
+    let policy = PolicyEngine::load(store.data_dir(), store.data_dir());
+    Ok(RunCoordinator::new(store, Arc::new(registry), policy))
+}
+
 /// Runs one configured check through the ordinary coordinator, policy,
 /// approval, scheduler, tool, event-log, and artifact-store path.
 ///
@@ -88,8 +113,11 @@ pub enum CheckLaunchError {
 /// function after an explicit action, and the workspace must already carry a
 /// separate positive trust decision. `via` is persisted on the exact-call
 /// approval this function grants once the coordinator publishes it.
+///
+/// `coordinator` is the process's own — see [`check_coordinator`] — so that
+/// every check in this process shares one scheduler and the caps it enforces.
 pub fn run_configured_check(
-    store: Arc<Store>,
+    coordinator: &RunCoordinator,
     project: &Project,
     check: &CheckConfiguration,
     via: DecidedVia,
@@ -114,10 +142,6 @@ pub fn run_configured_check(
             baseline: crate::trust::BASELINE_ENVIRONMENT.join(", "),
         });
     }
-    let mut registry = ToolRegistry::new();
-    registry.register(CheckRun)?;
-    let policy = PolicyEngine::load(store.data_dir(), &project.root);
-    let coordinator = RunCoordinator::new(Arc::clone(&store), Arc::new(registry), policy);
     let task = Task::new(
         format!("Check: {}", check.label),
         &project.root,
@@ -130,7 +154,7 @@ pub fn run_configured_check(
     // store opened with a redactor that rewrites any part of the workspace-root
     // text — which is what a redactor is for — rejected every check before it
     // started.
-    let workspace = WorkspaceRef::from_task(&task, &**store.redactor());
+    let workspace = WorkspaceRef::from_task(&task, &**coordinator.store().redactor());
     let task_id = coordinator.start_task(task)?;
     let parser = match check.parser {
         CheckParser::Plain => CheckOutputParser::Plain,
@@ -953,8 +977,8 @@ mod tests {
     use crate::trust::{TrustState, WorkspaceTrust};
 
     use super::{
-        CheckFreshness, CheckLaunchError, CheckOutcome, parse_cargo_stream, project_checks,
-        run_configured_check,
+        CheckFreshness, CheckLaunchError, CheckOutcome, check_coordinator, parse_cargo_stream,
+        project_checks, run_configured_check,
     };
 
     #[test]
@@ -1225,7 +1249,7 @@ mod tests {
             .unwrap();
 
         let run = run_configured_check(
-            Arc::clone(&store),
+            &check_coordinator(Arc::clone(&store)).unwrap(),
             &project,
             &check,
             DecidedVia::Cli,
@@ -1294,7 +1318,7 @@ mod tests {
         let store = Arc::new(Store::open(data.path()).unwrap());
         trust(&store, &project);
         run_configured_check(
-            Arc::clone(&store),
+            &check_coordinator(Arc::clone(&store)).unwrap(),
             &project,
             &original,
             DecidedVia::Cli,
@@ -1347,16 +1371,17 @@ mod tests {
         let store = Arc::new(Store::open(data.path()).unwrap());
         trust(&store, &project);
         run_configured_check(
-            Arc::clone(&store),
+            &check_coordinator(Arc::clone(&store)).unwrap(),
             &project,
             &older,
             DecidedVia::Cli,
             &Cancellation::default(),
         )
         .unwrap();
+        let coordinator = check_coordinator(Arc::clone(&store)).unwrap();
         for _ in 0..101 {
             run_configured_check(
-                Arc::clone(&store),
+                &coordinator,
                 &project,
                 &frequent,
                 DecidedVia::Cli,
@@ -1413,7 +1438,7 @@ mod tests {
         trust(&store, &project);
 
         let run = run_configured_check(
-            Arc::clone(&store),
+            &check_coordinator(Arc::clone(&store)).unwrap(),
             &project,
             &check,
             DecidedVia::Cli,
@@ -1498,7 +1523,7 @@ mod tests {
         trust(&store, &project);
 
         run_configured_check(
-            Arc::clone(&store),
+            &check_coordinator(Arc::clone(&store)).unwrap(),
             &project,
             &check,
             DecidedVia::Cli,
@@ -1582,7 +1607,7 @@ mod tests {
         trust(&store, &project);
 
         run_configured_check(
-            Arc::clone(&store),
+            &check_coordinator(Arc::clone(&store)).unwrap(),
             &project,
             &check,
             DecidedVia::Cli,
@@ -1628,7 +1653,7 @@ mod tests {
         trust(&store, &project);
 
         let error = run_configured_check(
-            Arc::clone(&store),
+            &check_coordinator(Arc::clone(&store)).unwrap(),
             &project,
             &check,
             DecidedVia::Cli,
@@ -1646,13 +1671,78 @@ mod tests {
         // A baseline name is still configurable, so the field is not inert.
         check.env = BTreeMap::from([("LANG".to_owned(), "C".to_owned())]);
         run_configured_check(
-            Arc::clone(&store),
+            &check_coordinator(Arc::clone(&store)).unwrap(),
             &project,
             &check,
             DecidedVia::Cli,
             &Cancellation::default(),
         )
         .unwrap();
+    }
+
+    /// The scheduler that serializes mutating calls per workspace and caps child
+    /// processes globally belongs to the coordinator, so a coordinator built per
+    /// check capped each check against nothing. One coordinator has to serve
+    /// every project in the process — which means its policy layer cannot be
+    /// pinned to whichever workspace happened to build it.
+    #[test]
+    fn one_coordinator_runs_checks_for_more_than_one_project() {
+        let data = tempdir().unwrap();
+        let store = Arc::new(Store::open(data.path()).unwrap());
+        let coordinator = check_coordinator(Arc::clone(&store)).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let workspaces = [tempdir().unwrap(), tempdir().unwrap()];
+        let projects = workspaces
+            .iter()
+            .enumerate()
+            .map(|(index, workspace)| {
+                initialize_repository(workspace.path());
+                let check = CheckConfiguration {
+                    id: format!("fixture-{index}"),
+                    label: format!("Fixture {index}"),
+                    command: vec![
+                        executable.to_string_lossy().into_owned(),
+                        "--ignored".to_owned(),
+                        "--exact".to_owned(),
+                        "scenario_process_fixture_pass_child".to_owned(),
+                        "--nocapture".to_owned(),
+                    ],
+                    cwd: None,
+                    env: BTreeMap::new(),
+                    parser: CheckParser::Plain,
+                    timeout_seconds: Some(30),
+                };
+                let project = Project {
+                    id: ProjectId::new(),
+                    display_name: format!("fixture-{index}"),
+                    root: workspace.path().canonicalize().unwrap(),
+                    source: ProjectSource::Local,
+                    checks: Some(vec![check.clone()]),
+                    last_opened: OffsetDateTime::UNIX_EPOCH,
+                    available: true,
+                    git: None,
+                };
+                trust(&store, &project);
+                (project, check)
+            })
+            .collect::<Vec<_>>();
+
+        for (project, check) in &projects {
+            run_configured_check(
+                &coordinator,
+                project,
+                check,
+                DecidedVia::Cli,
+                &Cancellation::default(),
+            )
+            .unwrap();
+        }
+
+        for (project, _) in &projects {
+            let summaries = project_checks(&store, project).unwrap();
+            assert_eq!(summaries.len(), 1);
+            assert_eq!(summaries[0].outcome, CheckOutcome::Passed);
+        }
     }
 
     fn trust(store: &Store, project: &Project) {
