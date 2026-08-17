@@ -60,7 +60,7 @@ use crate::domain::{
 use crate::policy::{PolicyEngine, PolicyRequest, PolicyVerdict};
 use crate::schedule::{ScheduledCall, Scheduler, WorkspaceKey};
 use crate::store::{
-    DEFAULT_EVENT_PAGE_LIMIT, EventKind, EventSeq, RunEvent, RunPage, Store, StoredEvent,
+    DEFAULT_EVENT_PAGE_LIMIT, EventKind, EventPage, EventSeq, RunEvent, RunPage, Store, StoredEvent,
 };
 use crate::tool::{
     CallOutcome, ExecutionError, MAX_FAILURE_MESSAGE_BYTES, ToolExecutor, ToolRegistry,
@@ -767,6 +767,47 @@ impl RunCoordinator {
     /// Delegates newest-first run listing to the durable store.
     pub fn list_runs(&self, page: RunPage) -> Result<crate::store::RunListing, RuntimeError> {
         Ok(self.inner.store.list_runs(page)?)
+    }
+
+    /// Reads one page of a run's timeline, in either direction.
+    ///
+    /// The paged counterpart of [`run_snapshot`](Self::run_snapshot), whose
+    /// `events` field is the whole log: a surface rendering a long run wants the
+    /// newest entries and then older ones on demand, and materializing every
+    /// event to show twenty of them is the cost this avoids.
+    ///
+    /// Unlike [`Store::event_page`], an unknown run is
+    /// [`RuntimeError`], not an empty page. A timeline is always asked for by a
+    /// caller that believes the run exists, and answering "no events" would let
+    /// a mistyped identifier read as an empty run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError`] when `run_id` names no stored run, and when the
+    /// page limit is outside the store's bounds.
+    pub fn event_page(
+        &self,
+        run_id: RunId,
+        page: EventPage,
+    ) -> Result<crate::store::EventListing, RuntimeError> {
+        self.inner.store.load_run(run_id)?;
+        Ok(self.inner.store.event_page(run_id, page)?)
+    }
+
+    /// Lists every unanswered approval request across every run, oldest first.
+    ///
+    /// This is what a front end reads on start-up and after any decision. The
+    /// listing is unpaged because the pending set is bounded by construction:
+    /// a request exists only while a call is parked waiting for it, and the
+    /// scheduler caps how many calls can be in flight at once. Answered
+    /// requests leave it immediately and are read back through
+    /// [`run_snapshot`](Self::run_snapshot) instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError`] when the listing statement fails.
+    pub fn pending_approvals(&self) -> Result<Vec<ApprovalRequest>, RuntimeError> {
+        Ok(self.inner.store.pending_approvals()?)
     }
 
     /// Whether a worker in this process is still driving `run`.

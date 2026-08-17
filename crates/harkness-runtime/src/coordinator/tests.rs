@@ -19,7 +19,7 @@ use crate::approval::{ApprovalDecision, ApprovalScope, ApprovalState, DecidedVia
 use crate::domain::{ExecutionState, Run, RunId, Step, Task, ToolCall};
 use crate::policy::{PolicyEngine, PolicyVerdict, RepositoryPolicy, UserPolicy};
 use crate::schedule::WorkspaceKey;
-use crate::store::{EventKind, PassThrough, Store};
+use crate::store::{EventKind, EventPage, PassThrough, Store};
 use crate::tool::{
     ExecutionContext, RiskLevel, Tool, ToolError, ToolIdentity, ToolMetadata, ToolRegistry,
     WorkspaceMetadata,
@@ -1654,6 +1654,88 @@ fn a_pending_approval_does_not_block_reads_in_the_same_workspace() {
     assert_eq!(parked_snapshot.approvals[0].state(), ApprovalState::Pending);
     fixture.coordinator.cancel_run(parked).unwrap();
     fixture.terminal(parked);
+}
+
+#[test]
+fn a_timeline_page_walks_a_finished_run_from_either_end() {
+    let fixture = Fixture::new();
+    let run = fixture.start(scenario(
+        "paged_timeline",
+        vec![
+            run_started(call(json!({"message": "hello"}))),
+            complete_after_result(),
+        ],
+    ));
+    let whole = fixture.terminal(run).events;
+    assert!(
+        whole.len() > 2,
+        "the scenario recorded too little to page over"
+    );
+
+    let mut newest_first = Vec::new();
+    let mut page = EventPage::newest(2);
+    loop {
+        let listing = fixture.coordinator.event_page(run, page).unwrap();
+        newest_first.extend(listing.events);
+        let Some(next) = listing.next_cursor else {
+            break;
+        };
+        page = EventPage::newest(2).after(next);
+    }
+    newest_first.reverse();
+
+    assert_eq!(
+        newest_first, whole,
+        "paging backwards did not reconstruct the snapshot timeline"
+    );
+}
+
+#[test]
+fn a_timeline_page_for_an_unknown_run_is_refused_rather_than_empty() {
+    let fixture = Fixture::new();
+
+    let error = fixture
+        .coordinator
+        .event_page(RunId::new(), EventPage::newest(10))
+        .unwrap_err();
+
+    assert_eq!(
+        error.kind(),
+        "not_found",
+        "a mistyped run must not read as a run with no history"
+    );
+}
+
+#[test]
+fn pending_approvals_are_listed_across_runs_and_leave_on_decision() {
+    let fixture = Fixture::new();
+    let run = fixture.start(gated_scenario("listed_pending_approval"));
+    let request = fixture.pending_approval(run);
+
+    let pending = fixture.coordinator.pending_approvals().unwrap();
+    assert_eq!(
+        pending
+            .iter()
+            .map(crate::approval::ApprovalRequest::id)
+            .collect::<Vec<_>>(),
+        vec![request.id()],
+        "the parked question is not in the cross-run listing"
+    );
+
+    fixture
+        .coordinator
+        .decide_approval(ApprovalDecision::deny(
+            request.id(),
+            DecidedVia::Cli,
+            OffsetDateTime::now_utc(),
+        ))
+        .unwrap();
+
+    assert!(
+        fixture.coordinator.pending_approvals().unwrap().is_empty(),
+        "an answered request stayed in the pending listing"
+    );
+    fixture.terminal(run);
 }
 
 #[test]
