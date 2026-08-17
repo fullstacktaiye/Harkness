@@ -435,10 +435,12 @@ pub struct HarknessBackendRust {
     next_review_path_identity: u64,
     history_state: Option<HistoryStateRow>,
     issues_state: Option<IssuesStateRow>,
+    checks_state: Option<ChecksStateRow>,
     review_state: Option<ReviewStateRow>,
     next_catalog_request: u64,
     next_history_request: u64,
     next_issues_request: u64,
+    next_checks_request: u64,
     next_branch_request: u64,
     next_worktree_request: u64,
     next_review_request: u64,
@@ -476,10 +478,12 @@ impl Default for HarknessBackendRust {
             next_review_path_identity: 0,
             history_state: None,
             issues_state: None,
+            checks_state: None,
             review_state: None,
             next_catalog_request: 0,
             next_history_request: 0,
             next_issues_request: 0,
+            next_checks_request: 0,
             next_branch_request: 0,
             next_worktree_request: 0,
             next_review_request: 0,
@@ -2058,6 +2062,110 @@ fn check_environment(environment: &std::collections::BTreeMap<String, String>) -
         projected.append(QVariant::from(&row));
     }
     projected
+}
+
+/// The checks projection last handed to QML.
+///
+/// It is kept because two surfaces read the same projection — the checks view
+/// and the review surface's per-file diagnostics — and a load has to be able to
+/// say "in flight" without withdrawing what they are already showing. Blanking
+/// the configured list for the length of a run-store read emptied the panel's
+/// selection and every diagnostic marker beside the diff, once per refresh.
+#[derive(Clone, Debug, Default)]
+struct ChecksStateRow {
+    project_id: String,
+    loading: bool,
+    error: String,
+    configured: Vec<harkness_core::CheckConfiguration>,
+    results: Vec<harkness_runtime::check::CheckSummary>,
+}
+
+impl ChecksStateRow {
+    /// Marks this projection as loading, keeping what it already describes.
+    fn loading(mut self, project_id: &str) -> Self {
+        self.project_id = project_id.to_owned();
+        self.loading = true;
+        self.error = String::new();
+        self
+    }
+
+    fn loaded(
+        project_id: &str,
+        configured: Vec<harkness_core::CheckConfiguration>,
+        results: Vec<harkness_runtime::check::CheckSummary>,
+    ) -> Self {
+        Self {
+            project_id: project_id.to_owned(),
+            loading: false,
+            error: String::new(),
+            configured,
+            results,
+        }
+    }
+
+    /// Reports a failed load without discarding the last successful one: the
+    /// recorded results a reader is looking at did not stop being what the run
+    /// store holds because the newest read failed, and each one still carries
+    /// its own freshness.
+    fn with_failure(mut self, error: &str) -> Self {
+        self.loading = false;
+        self.error = error.to_owned();
+        self
+    }
+}
+
+/// What to show while a load for this project runs. A different project has
+/// nothing worth keeping, so it starts empty.
+fn checks_state_for(backend: Pin<&ffi::HarknessBackend>, project_id: &str) -> ChecksStateRow {
+    backend
+        .rust()
+        .checks_state
+        .clone()
+        .filter(|row| row.project_id == project_id)
+        .unwrap_or_default()
+}
+
+fn set_checks_state(mut backend: Pin<&mut ffi::HarknessBackend>, row: ChecksStateRow) {
+    let checks = to_checks(
+        &row.project_id,
+        &row.configured,
+        &row.results,
+        row.loading,
+        &row.error,
+    );
+    backend.as_mut().rust_mut().get_mut().checks_state = Some(row);
+    backend.as_mut().set_checks(checks);
+}
+
+fn clear_checks_state(mut backend: Pin<&mut ffi::HarknessBackend>) {
+    // Claimed and then thrown away, which retires whatever is still in flight
+    // for the project being closed.
+    claim_checks_request(backend.as_mut());
+    backend.as_mut().rust_mut().get_mut().checks_state = None;
+    backend.as_mut().set_checks(empty_checks());
+}
+
+/// Claims the newest checks read, so an earlier one that has not come back yet
+/// is discarded instead of overwriting this one's answer.
+///
+/// A load and a run both end by publishing what the run store holds, and
+/// nothing serializes them against each other: the panel's refresh is not a
+/// conflicting job kind, so a refresh started before a run can return after it
+/// and put the pre-run results back on screen for good.
+fn claim_checks_request(mut backend: Pin<&mut ffi::HarknessBackend>) -> u64 {
+    let rust = backend.as_mut().rust_mut().get_mut();
+    rust.next_checks_request += 1;
+    rust.next_checks_request
+}
+
+/// Whether this reply is still the one being waited for, for this project.
+fn checks_reply_current(
+    backend: Pin<&ffi::HarknessBackend>,
+    request_id: u64,
+    project_id: &str,
+) -> bool {
+    backend.rust().next_checks_request == request_id
+        && opened_project_id(backend.opened()).as_deref() == Some(project_id)
 }
 
 fn to_checks(
@@ -6214,7 +6322,7 @@ impl ffi::HarknessBackend {
         self.as_mut().set_worktrees(QList::default());
         clear_history_state(self.as_mut());
         clear_issues_state(self.as_mut());
-        self.as_mut().set_checks(empty_checks());
+        clear_checks_state(self.as_mut());
         clear_review_state(self.as_mut());
     }
 
@@ -6548,35 +6656,27 @@ impl ffi::HarknessBackend {
         else {
             return;
         };
-        self.as_mut()
-            .set_checks(to_checks(&project_id, &[], &[], true, ""));
+        let request_id = claim_checks_request(self.as_mut());
+        let loading = checks_state_for(self.as_ref(), &project_id).loading(&project_id);
+        set_checks_state(self.as_mut(), loading);
         let qt_thread = self.qt_thread();
         std::thread::spawn(move || {
             let result = load_project_checks(&project_id);
             let _ = qt_thread.queue(move |mut backend| {
                 finish_job(backend.as_mut(), &job_id);
-                if opened_project_id(backend.as_ref().opened()).as_deref()
-                    != Some(project_id.as_str())
-                {
+                if !checks_reply_current(backend.as_ref(), request_id, &project_id) {
                     return;
                 }
                 match result {
-                    Ok((configured, results)) => backend.as_mut().set_checks(to_checks(
-                        &project_id,
-                        &configured,
-                        &results,
-                        false,
-                        "",
-                    )),
+                    Ok((configured, results)) => set_checks_state(
+                        backend.as_mut(),
+                        ChecksStateRow::loaded(&project_id, configured, results),
+                    ),
                     Err(error) => {
                         backend.as_mut().set_status(error.as_str().into());
-                        backend.as_mut().set_checks(to_checks(
-                            &project_id,
-                            &[],
-                            &[],
-                            false,
-                            &error,
-                        ));
+                        let failed =
+                            checks_state_for(backend.as_ref(), &project_id).with_failure(&error);
+                        set_checks_state(backend.as_mut(), failed);
                     }
                 }
             });
@@ -6611,26 +6711,25 @@ impl ffi::HarknessBackend {
                 {
                     return;
                 }
+                // Claimed on arrival rather than at launch, unlike a load. This
+                // read happened after the command it ran committed, so it is
+                // the freshest answer there can be and no later claim can beat
+                // it — while claiming at launch would have let a refresh
+                // started during a long run retire the run's own result.
+                claim_checks_request(backend.as_mut());
                 match result {
                     Ok((configured, results)) => {
-                        backend.as_mut().set_checks(to_checks(
-                            &project_id,
-                            &configured,
-                            &results,
-                            false,
-                            "",
-                        ));
+                        set_checks_state(
+                            backend.as_mut(),
+                            ChecksStateRow::loaded(&project_id, configured, results),
+                        );
                         backend.as_mut().set_status("Check completed".into());
                     }
                     Err(error) => {
                         backend.as_mut().set_status(error.as_str().into());
-                        backend.as_mut().set_checks(to_checks(
-                            &project_id,
-                            &[],
-                            &[],
-                            false,
-                            &error,
-                        ));
+                        let failed =
+                            checks_state_for(backend.as_ref(), &project_id).with_failure(&error);
+                        set_checks_state(backend.as_mut(), failed);
                     }
                 }
             });
