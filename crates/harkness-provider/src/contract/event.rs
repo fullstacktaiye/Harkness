@@ -21,11 +21,17 @@
 //! 4. [`Usage`](ModelEvent::Usage) may arrive at any point and more than once;
 //!    later reports override earlier ones field by field.
 
-use std::time::Duration;
+use std::{fmt, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
-use crate::assemble::{AssemblyDiagnostics, AssistantTurn};
+use crate::{
+    assemble::{AssemblyDiagnostics, AssistantTurn},
+    text::Preview,
+};
+
+/// Bytes of any one string a `Debug` rendering shows.
+const DEBUG_TEXT_BYTES: usize = 48;
 
 /// How often a blocking provider implementation must poll its cancellation.
 ///
@@ -40,7 +46,7 @@ pub const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// `#[non_exhaustive]`: a provider behavior nobody has seen yet is added here
 /// without breaking an adapter or the assembler, which is the same additive
 /// discipline the run event log uses for its kinds.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum ModelEvent {
@@ -127,8 +133,69 @@ impl ModelEvent {
     }
 }
 
+/// Truncated on purpose, for the same reason a turn's rendering is: an event
+/// *is* a piece of the conversation, and a sink implementation is the most
+/// likely thing in the system to log one. Bounding the assembled turn while
+/// leaving the events it was built from unbounded would move the same megabyte
+/// one type earlier rather than removing it.
+impl fmt::Debug for ModelEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TurnStarted {
+                provider_request_id,
+            } => formatter
+                .debug_struct("TurnStarted")
+                .field(
+                    "provider_request_id",
+                    &provider_request_id
+                        .as_deref()
+                        .map(|id| Preview::new(id, DEBUG_TEXT_BYTES)),
+                )
+                .finish(),
+            Self::TextDelta { text } => formatter
+                .debug_struct("TextDelta")
+                .field("text", &Preview::new(text, DEBUG_TEXT_BYTES))
+                .finish(),
+            Self::ToolCallStarted { index, id, name } => formatter
+                .debug_struct("ToolCallStarted")
+                .field("index", index)
+                .field("id", id)
+                .field(
+                    "name",
+                    &name
+                        .as_deref()
+                        .map(|name| Preview::new(name, DEBUG_TEXT_BYTES)),
+                )
+                .finish(),
+            Self::ToolCallArgumentsDelta { index, fragment } => formatter
+                .debug_struct("ToolCallArgumentsDelta")
+                .field("index", index)
+                .field("fragment", &Preview::new(fragment, DEBUG_TEXT_BYTES))
+                .finish(),
+            Self::ToolCallReady { index } => formatter
+                .debug_struct("ToolCallReady")
+                .field("index", index)
+                .finish(),
+            Self::Usage {
+                input_tokens,
+                output_tokens,
+                exact,
+            } => formatter
+                .debug_struct("Usage")
+                .field("input_tokens", input_tokens)
+                .field("output_tokens", output_tokens)
+                .field("exact", exact)
+                .finish(),
+            Self::TurnCompleted { stop } => formatter
+                .debug_struct("TurnCompleted")
+                .field("stop", stop)
+                .finish(),
+        }
+    }
+}
+
 /// Why a turn ended.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum StopReason {
@@ -145,6 +212,30 @@ pub enum StopReason {
     AbortedBySink,
     /// A spelling this build does not define, carried verbatim.
     Other(String),
+}
+
+/// Previewed too. A spelling outside the defined table is whatever the endpoint
+/// sent, and nothing bounds it on the way in.
+impl fmt::Debug for StopReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Other(spelling) => formatter
+                .debug_tuple("Other")
+                .field(&Preview::new(spelling, DEBUG_TEXT_BYTES))
+                .finish(),
+            // `Other` is matched above, and the arm below still answers for it
+            // rather than asserting it cannot arrive: a panic inside `Debug`
+            // would take down whatever was trying to report a problem.
+            defined => formatter.write_str(match defined {
+                Self::EndTurn => "EndTurn",
+                Self::ToolUse => "ToolUse",
+                Self::MaxOutput => "MaxOutput",
+                Self::Refusal => "Refusal",
+                Self::AbortedBySink => "AbortedBySink",
+                Self::Other(_) => "Other",
+            }),
+        }
+    }
 }
 
 impl StopReason {
@@ -259,10 +350,22 @@ pub const DEFAULT_RECORDED_EVENT_CAPACITY: usize = 4_096;
 /// the bound stops the turn — [`StopReason::AbortedBySink`] — rather than
 /// dropping events, so what was recorded is always a prefix of what happened
 /// and never a sample of it.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RecordedEvents {
     events: Vec<ModelEvent>,
     capacity: usize,
+}
+
+/// Summarized rather than previewed: a recorder holds thousands of events, and
+/// bounding each one still renders thousands of them.
+impl fmt::Debug for RecordedEvents {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecordedEvents")
+            .field("events", &self.events.len())
+            .field("capacity", &self.capacity)
+            .finish()
+    }
 }
 
 impl RecordedEvents {
@@ -530,6 +633,38 @@ mod tests {
             DiscardEvents.event(ModelEvent::ToolCallReady { index: 0 }),
             SinkControl::Continue
         );
+    }
+
+    /// An event *is* a piece of the conversation, and a sink is the most likely
+    /// thing to log one. Bounding the turn but not the events it was assembled
+    /// from would leave the same megabyte reachable one type earlier.
+    #[test]
+    fn debugging_an_event_previews_the_text_it_carries() {
+        let delta = ModelEvent::TextDelta {
+            text: "x".repeat(1024 * 1024),
+        };
+        let rendered = format!("{delta:?}");
+        assert!(rendered.len() < 1024, "{} bytes", rendered.len());
+
+        let arguments = ModelEvent::ToolCallArgumentsDelta {
+            index: 0,
+            fragment: "y".repeat(1024 * 1024),
+        };
+        assert!(format!("{arguments:?}").len() < 1024);
+    }
+
+    /// And a recorder holds thousands of them.
+    #[test]
+    fn debugging_a_recorder_summarizes_rather_than_printing_what_it_holds() {
+        let mut sink = RecordedEvents::with_capacity(4_096);
+        for _ in 0..2_000 {
+            sink.event(ModelEvent::TextDelta {
+                text: "z".repeat(1_024),
+            });
+        }
+        let rendered = format!("{sink:?}");
+        assert!(rendered.len() < 256, "{} bytes", rendered.len());
+        assert!(rendered.contains("2000"), "{rendered}");
     }
 
     #[test]
