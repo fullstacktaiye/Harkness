@@ -1,0 +1,25 @@
+{
+  "v": 1,
+  "id": "authentication_failure",
+  "capabilities": {
+    "context_window": 128000,
+    "max_output_tokens": 4096,
+    "supports_streaming": true,
+    "supports_tool_calls": true,
+    "supports_structured_output": false,
+    "supports_token_counting": false
+  },
+  "steps": [
+    {
+      "step": "advance",
+      "millis": 12
+    },
+    {
+      "step": "fail",
+      "failure": {
+        "kind": "authentication_failed",
+        "detail": "the endpoint rejected the offered credential"
+      }
+    }
+  ]
+}

@@ -1,0 +1,53 @@
+{
+  "v": 1,
+  "id": "malformed_tool_arguments",
+  "capabilities": {
+    "context_window": 128000,
+    "max_output_tokens": 4096,
+    "supports_streaming": true,
+    "supports_tool_calls": true,
+    "supports_structured_output": false,
+    "supports_token_counting": false
+  },
+  "steps": [
+    {
+      "step": "advance",
+      "millis": 30
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "turn_started",
+        "provider_request_id": "scripted-7"
+      }
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "tool_call_started",
+        "index": 0,
+        "id": "call_broken",
+        "name": "fs.read"
+      }
+    },
+    {
+      "step": "arguments",
+      "index": 0,
+      "text": "{\"path\": \"src/lib.rs\""
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "tool_call_ready",
+        "index": 0
+      }
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "turn_completed",
+        "stop": "tool_use"
+      }
+    }
+  ]
+}

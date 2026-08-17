@@ -1,0 +1,25 @@
+{
+  "v": 1,
+  "id": "context_overflow_rejection",
+  "capabilities": {
+    "context_window": 8192,
+    "max_output_tokens": 1024,
+    "supports_streaming": true,
+    "supports_tool_calls": true,
+    "supports_structured_output": false,
+    "supports_token_counting": false
+  },
+  "steps": [
+    {
+      "step": "advance",
+      "millis": 15
+    },
+    {
+      "step": "fail",
+      "failure": {
+        "kind": "context_overflow",
+        "detail": "the request is 9310 tokens and the model's window is 8192"
+      }
+    }
+  ]
+}

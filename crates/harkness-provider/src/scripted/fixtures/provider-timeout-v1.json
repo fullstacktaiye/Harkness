@@ -1,0 +1,43 @@
+{
+  "v": 1,
+  "id": "provider_timeout",
+  "capabilities": {
+    "context_window": 128000,
+    "max_output_tokens": 4096,
+    "supports_streaming": true,
+    "supports_tool_calls": true,
+    "supports_structured_output": false,
+    "supports_token_counting": false
+  },
+  "steps": [
+    {
+      "step": "advance",
+      "millis": 40
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "turn_started",
+        "provider_request_id": "scripted-17"
+      }
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "text_delta",
+        "text": "Let me think about"
+      }
+    },
+    {
+      "step": "advance",
+      "millis": 60000
+    },
+    {
+      "step": "fail",
+      "failure": {
+        "kind": "provider_timeout",
+        "detail": "no event arrived within the adapter's 60 second idle deadline"
+      }
+    }
+  ]
+}

@@ -4,3 +4,4 @@ crates/harkness-runtime/src/domain/fixtures/*.json text eol=lf
 crates/harkness-runtime/src/integration/fixtures/*.json text eol=lf
 crates/harkness-runtime/src/policy/fixtures/*.json text eol=lf
 crates/harkness-runtime/src/fixtures/*.json text eol=lf
+crates/harkness-provider/src/scripted/fixtures/*.json text eol=lf

@@ -64,6 +64,14 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked -p harkness-transport --no-deps
+      # ADR-0002 fixes the model-provider, native-agent and external-coding-agent
+      # vocabulary in rustdoc and in naming, which is weaker than a type check
+      # and is therefore worth failing a build over: an undocumented public item
+      # on this boundary is the one #125 and #126 are written against.
+      - name: Check provider documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked -p harkness-provider --no-deps
 
   core:
     name: Core (${{ matrix.os }})
@@ -102,6 +110,15 @@ jobs:
       # `/usr/bin/agent` is rooted but *not* absolute on Windows.
       - name: Test transport
         run: cargo test --locked -p harkness-transport
+      # The provider boundary is hermetic by construction — no network, no
+      # credential, and no wall clock in its scenarios — so every leg of the
+      # matrix runs all of it. The
+      # frozen script fixtures are compared byte for byte against a pretty
+      # encoding that emits `\n`, which is what the `.gitattributes` entry for
+      # their directory is for: without it this is the job that fails on
+      # Windows and nowhere else.
+      - name: Test provider
+        run: cargo test --locked -p harkness-provider
       # The v0.5 adapter crates are skeletons, so what these run is the ADR-0009
       # layering assertion each one makes about its own manifest. That check is
       # worth a matrix entry now precisely because the crates are empty: the
@@ -164,6 +181,15 @@ jobs:
           sh .github/scripts/run-ignored-exact-test.sh
           harkness-runtime
           tools::read_tests::registry_lookup_and_dispatch_overhead_stay_within_issue_budgets
+          --release
+      # Issue #111 budgets streaming assembly at ten microseconds per event,
+      # which every token of every model turn pays, so it belongs here for the
+      # same reason the others do.
+      - name: Measure streaming assembly overhead
+        run: >-
+          sh .github/scripts/run-ignored-exact-test.sh
+          harkness-provider
+          assemble::assembler::tests::event_dispatch_meets_the_latency_target
           --release
       # Issue #97 puts the coordinator on every protected tool call, so its
       # per-call budget is a release requirement too.

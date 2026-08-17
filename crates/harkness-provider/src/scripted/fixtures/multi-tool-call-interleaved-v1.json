@@ -1,0 +1,101 @@
+{
+  "v": 1,
+  "id": "multi_tool_call_interleaved",
+  "capabilities": {
+    "context_window": 128000,
+    "max_output_tokens": 4096,
+    "supports_streaming": true,
+    "supports_tool_calls": true,
+    "supports_structured_output": false,
+    "supports_token_counting": false
+  },
+  "steps": [
+    {
+      "step": "advance",
+      "millis": 40
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "turn_started",
+        "provider_request_id": "scripted-3"
+      }
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "tool_call_started",
+        "index": 0,
+        "id": "call_read_1",
+        "name": "fs.read"
+      }
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "tool_call_started",
+        "index": 1,
+        "id": "call_search_1",
+        "name": "workspace.search"
+      }
+    },
+    {
+      "step": "advance",
+      "millis": 25
+    },
+    {
+      "step": "arguments",
+      "index": 0,
+      "text": "{\"path\":"
+    },
+    {
+      "step": "arguments",
+      "index": 1,
+      "text": "{\"query\":"
+    },
+    {
+      "step": "arguments",
+      "index": 0,
+      "text": "\"src/lib.rs\"}"
+    },
+    {
+      "step": "arguments",
+      "index": 1,
+      "text": "\"needle\"}"
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "tool_call_ready",
+        "index": 1
+      }
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "tool_call_ready",
+        "index": 0
+      }
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "usage",
+        "input_tokens": 733,
+        "output_tokens": 58,
+        "exact": true
+      }
+    },
+    {
+      "step": "advance",
+      "millis": 50
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "turn_completed",
+        "stop": "tool_use"
+      }
+    }
+  ]
+}

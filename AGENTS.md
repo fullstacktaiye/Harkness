@@ -2,11 +2,12 @@
 
 ## Project Structure & Module Organization
 
-Harkness is a Rust 2024 workspace split into twelve crates under `crates/`:
+Harkness is a Rust 2024 workspace split into thirteen crates under `crates/`:
 
 - `harkness-core`: project catalog, storage layout, cross-domain project workflows, and directory-listing logic shared by front ends.
 - `harkness-git`: all production Git behavior: inspection, diffs and history, change provenance, file context and hunk staging, branch and worktree mutation, commits, clone and synchronization, hermetic process execution, and repository locking.
 - `harkness-context`: the context engine's typed vocabulary — workspace snapshot identity, stable identifiers, provenance, and file classification.
+- `harkness-provider`: the provider-neutral model contract, the streaming turn assembler, and the deterministic scripted provider. Every concrete model adapter lives here and keeps its wire types private; nothing above learns what an endpoint's JSON looks like.
 - `harkness-transport`: the shared subprocess JSON-RPC engine both protocol adapters run on — hermetic allowlisted spawn, newline-delimited framing, request correlation, bounded messages, and the close-stdin/`SIGTERM`/`SIGKILL` teardown. Below every adapter and above nothing but `harkness-git`.
 - `harkness-acp`, `harkness-mcp`, `harkness-forge`, `harkness-recipe`: the v0.5 external-integration adapters — the Agent Client Protocol client, the Model Context Protocol client, forge-neutral contracts with the GitHub REST adapter, and the workflow-recipe source format and compiler. Currently skeletons; see the invariants below.
 - `harkness-test-fixtures`: hermetic repository, filesystem, and process fixtures shared only by crate tests.
@@ -447,6 +448,68 @@ worktree being read. Snapshots hold hashes and paths only, never file contents.
 The wire forms in `harkness-context` are frozen by committed fixtures because
 they become persisted columns; changing a field, a variant spelling, or a
 timestamp format after that is a `runtime.db` migration plus a new fixture.
+
+## Model Provider & Streaming Assembly Invariants
+
+Three contracts, three names, and no type implements two of them: a **model
+provider** streams text and tool-call *requests* and executes nothing, the
+**native agent** owns the loop, and an **external coding agent** owns its own
+and arrives behind the ACP milestone. ADR-0002 fixes that vocabulary and it is
+enforced in rustdoc and in naming, which is weaker than a type check — a
+proposal reintroducing the merged abstraction under a new name has to be
+noticed by a reviewer. No public item in the workspace is named `AgentProvider`,
+and `harkness-provider` carries a test over its own sources that says so.
+
+`ModelProvider::stream` is **blocking and cancellation-polled**. It runs on the
+caller's worker thread, polls the shared `harkness_git::Cancellation` at the
+same 20 ms cadence every other blocking seam uses, returns kind `cancelled`,
+and delivers nothing to the sink after the poll that observed it. There is no
+async runtime and no HTTP client in this crate; #125 introduces the client, and
+the manifest test naming that is what makes its arrival deliberate.
+
+`ProviderError` publishes exactly ten kinds and `RetryHint` classifies them
+without policy: a hint answers *when* an identical request could be sent, never
+*whether* to send one. `retry_hint` is `After` only when the provider named a
+window, and `Never` for `cancelled` because the token that stopped the turn is
+still cancelled — starting the work again is a new decision, not a retry.
+
+**Assembly surfaces every call and drops none.** A call whose arguments do not
+parse, one the provider never named, and one a disconnect cut short are all
+recorded as `AssembledToolCall::Invalid` and never executed. A call the provider
+left unnamed gets a deterministic turn-scoped id marked `Synthesized`, and a
+call repeating an id an earlier call in the same turn used keeps both entries
+with the second marked `duplicate_of` — merging them would run one call twice or
+not at all. Provenance is recorded, never read back out of an id's spelling.
+
+An index names one call within a turn: a second call at one index, a delta or
+readiness for an index nothing started, and a second `TurnStarted` are each
+`malformed_response`. Every accumulation is bounded — 1 MiB of arguments per
+call, 8 MiB of text per turn, 256 calls per turn — and the bound is checked
+against what *would* be held rather than after the fact. Exceeding one refuses
+the turn by name; truncating instead would produce arguments the model never
+wrote.
+
+A turn that ends without the provider saying why is `disconnected` with the
+partial turn attached, and one that produced no events at all is
+`empty_response`; a sink answering `Stop` ends the turn as a *success* stopped
+`AbortedBySink`, because Harkness stopped it. `AssistantTurn::stop` is what the
+provider said and `TurnOutcome::stop` is what the call concluded, and the two
+are deliberately not one field.
+
+`ModelRequest`, `ModelMessage`, and `AssistantTurn` have hand-written `Debug`
+impls that preview strings and bound list entries, so `{:?}` on a megabyte of
+prompt stays under four kilobytes and cannot dump a conversation into a log
+before #103's redaction applies. Nothing in this crate can carry a credential:
+there is no endpoint, header, key, or profile type in it at all.
+
+Scripted scenarios are frozen v1 wire evidence. Their fixtures probe `v` before
+a strict `deny_unknown_fields` body, the committed file is compared byte for
+byte against the canonical pretty encoding, and changing a step, event, or
+spelling means publishing a new version beside v1 rather than editing what v1
+meant. Two replays of one scenario are identical down to `elapsed` and
+`first_event_latency`, because a script advances its own clock instead of
+reading a real one — a timing asserted with a sleep is not deterministic and a
+timing measured from the machine makes an outcome unequal to itself.
 
 ## Tool Contract & Registry Invariants
 
