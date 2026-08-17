@@ -22,5 +22,8 @@ time.workspace = true
 
 [dev-dependencies]
 git2.workspace = true
+# The mock-agent process scenarios name bare executables the fixture harness
+# installs as links to the running integration-test binary. Dev-only.
+harkness-test-fixtures.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

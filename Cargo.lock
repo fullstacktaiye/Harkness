@@ -822,6 +822,7 @@ dependencies = [
  "harkness-core",
  "harkness-git",
  "harkness-runtime",
+ "harkness-test-fixtures",
  "libc",
  "serde",
  "serde_json",

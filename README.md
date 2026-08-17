@@ -111,6 +111,22 @@ harkness --json editor set -- <executable> <argument>... {file}
 harkness --json editor clear
 harkness --json editor open <path> [--line <line>] [--column <column>] [--project <selector>]
 
+harkness --json run list [--limit <count>] [--cursor <token>]
+harkness --json run show <run-id> [--limit <count>] [--cursor <seq>] [--order <oldest|newest>]
+harkness --json run cancel <run-id>
+harkness --json run retry <run-id> --scenario <name> [--project <selector>] [--interactive] [--trust-workspace]
+
+harkness --json approvals list [--all] [--limit <count>] [--cursor <token>]
+harkness --json approvals approve <approval-id> [--scope <call|tool-this-run|capability-this-run>] [--reason <text>]
+harkness --json approvals deny <approval-id> [--reason <text>]
+
+harkness --json tool list
+harkness --json tool describe <tool-id> [--tool-version <semver>]
+harkness --json tool invoke <tool-id> --input <json|-> [--tool-version <semver>] [--project <selector>] [--interactive] [--trust-workspace]
+
+harkness --json agent scenarios
+harkness --json agent run --scenario <name> [--project <selector>] [--interactive] [--trust-workspace]
+
 harkness --json contract
 ```
 
@@ -122,8 +138,47 @@ JSON object per line, keeping standard output parseable. Help and version are
 deliberately plain text even when `--json` is present. `harkness --json contract`
 reports the current envelope version, exit codes, streams, and complete
 error-kind namespaces. It also reports `exit_code_by_kind`, which maps every
-CLI, project, Git, and editor error kind to the exit code it returns, so a
-caller reads the classification instead of hardcoding it.
+CLI, project, Git, editor, runtime, and tool error kind to the exit code it
+returns, so a caller reads the classification instead of hardcoding it. A kind
+that appears in two namespaces — `not_found`, `cancelled`, `timed_out` — reports
+the same exit code in both.
+
+The `run`, `approvals`, `tool`, and `agent` families expose the same runtime the
+application uses, with no business logic of their own. `tool invoke` is the
+path that proves a tool needs no model: it resolves the tool, validates the
+input against its published schema, evaluates policy, records the call, and
+executes it, all through the ordinary pipeline. It is not a bypass, and the
+recorded call is readable afterwards with `run show`.
+
+Approval requests are **denied by default**. Anything above `observe` requires
+an approval even in a trusted workspace, and a headless invocation has nobody to
+ask, so it refuses with kind `approval_required_noninteractive` and exit 3 rather
+than proceeding. `--interactive` asks instead: the question goes to standard
+error — as a progress envelope under `--json`, so standard output stays exactly
+one result — and one line of `approve`, `deny`, or `show-input` comes back on
+standard input. Closing standard input is a denial. Ctrl-C at a prompt cancels
+the run and exits 130.
+
+`run list` pages newest-first with an opaque `next_cursor`, exactly as `git log`
+does. A run's timeline pages separately, by the sequence number `run show`
+returns as its own `next_cursor`, in either direction. `agent run` and `tool
+invoke` stream the run's events to standard error as they are recorded, one
+progress envelope per event carrying the persisted record, and print one bounded
+result envelope on standard output; the whole timeline is read back with
+`run show`.
+
+`run cancel` and `approvals approve|deny` reach a *live* worker: the run's
+cancellation token and the thread parked on an approval both live in the process
+that started the run. A one-shot command invocation therefore answers only a run
+it is itself driving, and reports `run_not_active` or `approval_not_active` —
+both exit 3 — for anything else. Retrying needs no live worker: `run retry`
+starts a fresh attempt for the same task recording `retry_of`, and reports
+`workspace_may_be_modified` when the earlier attempt started work that could
+write. Nothing is resumed and no approval carries over.
+
+Runs above `observe` also require a positive workspace trust decision, recorded
+once with `--trust-workspace` after reviewing the project root. Without it the
+command refuses before a run is recorded at all.
 
 Editor commands store an argv template, not a shell command. Each argument is
 persisted separately and Harkness substitutes `{file}`, `{line}`, and

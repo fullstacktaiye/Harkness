@@ -45,13 +45,26 @@ use harkness_runtime::{
     approval::DecidedVia,
     canonical_json,
     check::{CheckOutcome, CheckSummary, check_coordinator, project_checks, run_configured_check},
+    coordinator::RuntimeError,
     policy::EXTERNAL_POLICY_DENIAL_KINDS,
-    store::Store,
+    store::{Store, StoreError},
+    tool::InvocationError,
     trust::{TrustState, WorkspaceTrust},
 };
 use serde::Serialize;
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+
+mod agent_commands;
+mod approval_commands;
+mod run_commands;
+mod runtime_support;
+mod tool_commands;
+
+use runtime_support::{
+    RUNTIME_KIND_EXIT_CODES, TOOL_KIND_EXIT_CODES, runtime_details, runtime_exit_code,
+    store_details, store_exit_code,
+};
 
 const ENVELOPE_VERSION: u8 = 1;
 const EXIT_OPERATION_FAILED: u8 = 1;
@@ -73,6 +86,19 @@ const CLI_ERROR_KINDS: &[&str] = &[
     "managed_project_requires_delete",
     "local_project_requires_forget",
     "worktree_requires_remove",
+    // Runtime outcomes the CLI itself concludes. Each one is a fact about a
+    // recorded run or call rather than a failure the runtime returned, so none
+    // of them belongs in the coordinator's own namespace.
+    "approval_required_noninteractive",
+    "policy_denied",
+    "approval_denied",
+    "tool_call_denied",
+    "tool_call_failed",
+    "tool_call_cancelled",
+    "tool_call_interrupted",
+    "run_failed",
+    "run_cancelled",
+    "run_interrupted",
 ];
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
@@ -126,6 +152,26 @@ enum Command {
     Editor {
         #[command(subcommand)]
         command: EditorCommand,
+    },
+    /// Inspect, cancel, and re-attempt recorded runs.
+    Run {
+        #[command(subcommand)]
+        command: run_commands::RunCommand,
+    },
+    /// List and answer approval requests.
+    Approvals {
+        #[command(subcommand)]
+        command: approval_commands::ApprovalsCommand,
+    },
+    /// Publish the typed tool contract and invoke one tool.
+    Tool {
+        #[command(subcommand)]
+        command: tool_commands::ToolCommand,
+    },
+    /// Replay a deterministic agent scenario through the runtime.
+    Agent {
+        #[command(subcommand)]
+        command: agent_commands::AgentCommand,
     },
     /// Describe the versioned machine-readable CLI contract.
     Contract,
@@ -1645,6 +1691,30 @@ enum CliError {
         message: String,
         details: Value,
     },
+    /// A coordinator or run-store failure, reported under the runtime namespace.
+    ///
+    /// The discriminant is `RuntimeError::kind()` verbatim, including the store
+    /// spellings it delegates to. In particular an unknown run, approval, or
+    /// task is the runtime's own `not_found` rather than a CLI-invented
+    /// `run_not_found`: the record kind and identifier travel in `details`, so
+    /// nothing is lost, and a caller reading a discriminant sees the same word
+    /// the application service produced.
+    Runtime(RuntimeError),
+    /// A run-store failure reached directly, without a coordinator verb.
+    Store(StoreError),
+    /// A recorded run or tool call that did not succeed.
+    ///
+    /// Distinct from [`Runtime`](Self::Runtime): nothing failed to *execute*
+    /// here. The runtime did exactly what it was asked and recorded an outcome,
+    /// and this is the CLI reporting that outcome through the error envelope so
+    /// a caller can act on the exit status without parsing standard output —
+    /// the same reason a project check reports its verdict this way.
+    RuntimeOutcome {
+        kind: &'static str,
+        code: u8,
+        message: String,
+        details: Value,
+    },
 }
 
 impl From<ProjectError> for CliError {
@@ -1671,6 +1741,9 @@ impl CliError {
             Self::WireProjection(_) => "wire_projection_failed",
             Self::PathOperation { .. } => "path_operation_failed",
             Self::Refused { kind, .. } => kind.as_str(),
+            Self::Runtime(error) => error.kind(),
+            Self::Store(error) => error.kind(),
+            Self::RuntimeOutcome { kind, .. } => kind,
         }
     }
 
@@ -1690,6 +1763,9 @@ impl CliError {
                 format!("the Ctrl-C cancellation handler could not be installed: {error}")
             }
             Self::Refused { message, .. } => message.clone(),
+            Self::Runtime(error) => error.to_string(),
+            Self::Store(error) => error.to_string(),
+            Self::RuntimeOutcome { message, .. } => message.clone(),
         }
     }
 
@@ -1710,6 +1786,9 @@ impl CliError {
                 }
             }
             Self::Refused { .. } => EXIT_REFUSED,
+            Self::Runtime(error) => runtime_exit_code(error),
+            Self::Store(error) => store_exit_code(error),
+            Self::RuntimeOutcome { code, .. } => *code,
         }
     }
 
@@ -1719,6 +1798,9 @@ impl CliError {
             Self::Refused { details, .. } => details.clone(),
             Self::PathOperation { details, .. } => details.clone(),
             Self::CheckVerdict { details, .. } => details.clone(),
+            Self::RuntimeOutcome { details, .. } => details.clone(),
+            Self::Runtime(error) => runtime_details(error),
+            Self::Store(error) => store_details(error),
             Self::Check(_)
             | Self::Usage(_)
             | Self::CurrentDirectory(_)
@@ -1758,6 +1840,16 @@ struct ProgressEnvelope<'a> {
     v: u8,
     r#type: &'static str,
     message: &'a str,
+    /// One persisted run event, when the progress line is a timeline entry.
+    ///
+    /// Additive within envelope version 1: every progress line that existed
+    /// before — clone, fetch, pull, and push — omits the field entirely, so a
+    /// consumer that never looked for it reads exactly the bytes it always
+    /// read. It exists because a run timeline is machine-readable evidence and
+    /// `message` alone would force a consumer to parse prose or re-read the
+    /// whole log with `run show` to recover what it just watched go past.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event: Option<&'a Value>,
 }
 
 fn main() -> ExitCode {
@@ -1891,6 +1983,18 @@ fn run(cli: Cli, cancellation: &Cancellation) -> Result<CommandResult, CliError>
         }
         Command::Check { command } => run_check(command, data_dir.as_deref(), json, cancellation),
         Command::Editor { command } => run_editor(command, data_dir.as_deref(), json),
+        Command::Run { command } => {
+            run_commands::run_run(command, data_dir.as_deref(), json, cancellation)
+        }
+        Command::Approvals { command } => {
+            approval_commands::run_approvals(command, data_dir.as_deref(), json, cancellation)
+        }
+        Command::Tool { command } => {
+            tool_commands::run_tool(command, data_dir.as_deref(), json, cancellation)
+        }
+        Command::Agent { command } => {
+            agent_commands::run_agent(command, data_dir.as_deref(), json, cancellation)
+        }
         Command::Contract => Ok(contract_result(json)),
     }
 }
@@ -5002,6 +5106,14 @@ fn contract_result(json_output: bool) -> CommandResult {
             "git": GitError::KINDS,
             "editor": EditorError::KINDS,
             "policy": EXTERNAL_POLICY_DENIAL_KINDS,
+            // The coordinator namespace is its own table followed by the
+            // store's, because `RuntimeError::Store` delegates its
+            // discriminant rather than spelling one of its own.
+            "runtime": RuntimeError::KINDS
+                .iter()
+                .chain(StoreError::KINDS)
+                .collect::<Vec<_>>(),
+            "tool": InvocationError::kinds(),
         },
         // The category map above names the codes; this names which code each
         // error kind actually reports. Without it a caller has to hardcode the
@@ -5013,6 +5125,8 @@ fn contract_result(json_output: bool) -> CommandResult {
             "git": kind_exit_codes(GIT_KIND_EXIT_CODES),
             "editor": kind_exit_codes(EDITOR_KIND_EXIT_CODES),
             "policy": kind_exit_codes(POLICY_KIND_EXIT_CODES),
+            "runtime": kind_exit_codes(RUNTIME_KIND_EXIT_CODES),
+            "tool": kind_exit_codes(TOOL_KIND_EXIT_CODES),
         },
         "streams": {
             "result": "stdout",
@@ -5057,6 +5171,19 @@ fn emit_success(data: Value) -> io::Result<()> {
 }
 
 fn emit_progress(json_output: bool, message: &str) {
+    emit_progress_line(json_output, message, None);
+}
+
+/// Emits one persisted run event as a progress line.
+///
+/// The payload is sorted for the reason [`emit_success`] sorts: a `Value` built
+/// by hand no longer inherits a key order from the map type.
+fn emit_event_progress(json_output: bool, message: &str, event: Value) {
+    let event = canonical_json(event);
+    emit_progress_line(json_output, message, Some(&event));
+}
+
+fn emit_progress_line(json_output: bool, message: &str, event: Option<&Value>) {
     let output = if json_output {
         write_json_line(
             &mut io::stderr().lock(),
@@ -5064,6 +5191,7 @@ fn emit_progress(json_output: bool, message: &str) {
                 v: ENVELOPE_VERSION,
                 r#type: "progress",
                 message,
+                event,
             },
         )
     } else {
@@ -5472,6 +5600,16 @@ const CLI_KIND_EXIT_CODES: &[(&str, u8)] = &[
     ("managed_project_requires_delete", EXIT_REFUSED),
     ("local_project_requires_forget", EXIT_REFUSED),
     ("worktree_requires_remove", EXIT_REFUSED),
+    ("approval_required_noninteractive", EXIT_REFUSED),
+    ("policy_denied", EXIT_REFUSED),
+    ("approval_denied", EXIT_REFUSED),
+    ("tool_call_denied", EXIT_REFUSED),
+    ("tool_call_failed", EXIT_OPERATION_FAILED),
+    ("tool_call_cancelled", EXIT_CANCELLED),
+    ("tool_call_interrupted", EXIT_OPERATION_FAILED),
+    ("run_failed", EXIT_OPERATION_FAILED),
+    ("run_cancelled", EXIT_CANCELLED),
+    ("run_interrupted", EXIT_OPERATION_FAILED),
 ];
 
 fn kind_exit_codes(table: &[(&str, u8)]) -> Value {
@@ -5804,11 +5942,13 @@ mod tests {
     };
 
     use super::{
-        CLI_ERROR_KINDS, CLI_KIND_EXIT_CODES, CliError, EDITOR_KIND_EXIT_CODES, EXIT_CANCELLED,
-        EXIT_CONFLICT, EXIT_NOT_FOUND, EXIT_OPERATION_FAILED, EXIT_REFUSED, EXIT_USAGE,
-        EXTERNAL_POLICY_DENIAL_KINDS, EditorError, GIT_KIND_EXIT_CODES, GitError, HunkSelection,
-        LineSelection, POLICY_KIND_EXIT_CODES, PROJECT_KIND_EXIT_CODES, Project, ProjectError,
-        RefusalKind, Whitespace, WhitespaceMode, change_provenance_value, check_covers_diff_target,
+        CLI_ERROR_KINDS, CLI_KIND_EXIT_CODES, CliError, CommandResult, EDITOR_KIND_EXIT_CODES,
+        EXIT_CANCELLED, EXIT_CONFLICT, EXIT_NOT_FOUND, EXIT_OPERATION_FAILED, EXIT_REFUSED,
+        EXIT_USAGE, EXTERNAL_POLICY_DENIAL_KINDS, EditorError, GIT_KIND_EXIT_CODES, GitError,
+        HunkSelection, InvocationError, LineSelection, POLICY_KIND_EXIT_CODES,
+        PROJECT_KIND_EXIT_CODES, Project, ProjectError, RUNTIME_KIND_EXIT_CODES, RefusalKind,
+        RuntimeError, StoreError, TOOL_KIND_EXIT_CODES, Whitespace, WhitespaceMode,
+        change_provenance_value, check_covers_diff_target, contract_result,
         distinct_hunk_selection_count, distinct_line_selection_counts, editor_exit_code,
         git_error_details, git_exit_code, parse_line_selection_document, parse_selection_document,
         project_exit_code, project_value, requested_json, single_line,
@@ -6573,6 +6713,41 @@ mod tests {
         assert_eq!(unique.len(), kinds.len(), "error kind collision: {kinds:?}");
     }
 
+    /// The runtime and tool namespaces are deliberately not in the uniqueness
+    /// set above, and cannot be: `harkness-runtime` and `harkness-git` both
+    /// spell a stopped operation `cancelled` and an expired one `timed_out`,
+    /// and both the store and the tool namespace spell a missing subject
+    /// `not_found`. Renaming one of them to keep the tables disjoint would
+    /// change a discriminant an application service already publishes, which is
+    /// worse than an overlap.
+    ///
+    /// What must hold instead is agreement: a caller holding one discriminant
+    /// and reading `exit_code_by_kind` must reach the same code whichever
+    /// namespace it looks under, or the published map is ambiguous for exactly
+    /// the callers it exists to serve.
+    #[test]
+    fn a_kind_published_by_two_namespaces_reports_one_exit_code() {
+        let mut published: BTreeMap<&str, (u8, &str)> = BTreeMap::new();
+        for (namespace, table) in [
+            ("cli", CLI_KIND_EXIT_CODES),
+            ("project", PROJECT_KIND_EXIT_CODES),
+            ("git", GIT_KIND_EXIT_CODES),
+            ("editor", EDITOR_KIND_EXIT_CODES),
+            ("policy", POLICY_KIND_EXIT_CODES),
+            ("runtime", RUNTIME_KIND_EXIT_CODES),
+            ("tool", TOOL_KIND_EXIT_CODES),
+        ] {
+            for (kind, code) in table {
+                if let Some((earlier, from)) = published.insert(kind, (*code, namespace)) {
+                    assert_eq!(
+                        earlier, *code,
+                        "{kind} is {earlier} under {from} and {code} under {namespace}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn every_external_policy_denial_is_a_guardrail_refusal() {
         assert_eq!(
@@ -6621,8 +6796,82 @@ mod tests {
             refused(RefusalKind::LocalProjectRequiresForget),
             refused(RefusalKind::WorktreeRequiresRemove),
         ];
-        let kinds = cases.iter().map(CliError::kind).collect::<Vec<_>>();
+        // Runtime outcomes are one variant carrying a `'static` discriminant,
+        // so their spellings are enumerated rather than constructed: the check
+        // that keeps them honest is the exit-code table below, which every
+        // outcome kind must also appear in.
+        let outcomes = [
+            "approval_required_noninteractive",
+            "policy_denied",
+            "approval_denied",
+            "tool_call_denied",
+            "tool_call_failed",
+            "tool_call_cancelled",
+            "tool_call_interrupted",
+            "run_failed",
+            "run_cancelled",
+            "run_interrupted",
+        ];
+        let kinds = cases
+            .iter()
+            .map(CliError::kind)
+            .chain(outcomes.iter().map(|kind| {
+                CliError::RuntimeOutcome {
+                    kind,
+                    code: EXIT_OPERATION_FAILED,
+                    message: "fixture".to_owned(),
+                    details: serde_json::json!({}),
+                }
+                .kind()
+            }))
+            .collect::<Vec<_>>();
         assert_eq!(kinds, CLI_ERROR_KINDS);
+    }
+
+    /// Every CLI-owned runtime outcome reports the exit code the published
+    /// table names for it, so a caller reading `exit_code_by_kind` and a caller
+    /// reading `$?` never disagree.
+    #[test]
+    fn runtime_outcome_kinds_report_their_published_exit_codes() {
+        for (kind, code) in CLI_KIND_EXIT_CODES {
+            let error = CliError::RuntimeOutcome {
+                kind,
+                code: *code,
+                message: "fixture".to_owned(),
+                details: serde_json::json!({}),
+            };
+            assert_eq!(error.kind(), *kind);
+            assert_eq!(error.exit_code(), *code);
+        }
+    }
+
+    /// The two runtime namespaces are published beside the four that came
+    /// before them, and `harkness contract` concatenates every one of them for
+    /// a caller holding a single discriminant.
+    #[test]
+    fn the_contract_publishes_both_runtime_namespaces() {
+        let CommandResult::Json(contract) = contract_result(true) else {
+            panic!("--json contract is a JSON result");
+        };
+        for kind in RuntimeError::KINDS.iter().chain(StoreError::KINDS) {
+            assert!(
+                contract["exit_code_by_kind"]["runtime"][kind].is_number(),
+                "{kind} has no published exit code"
+            );
+        }
+        for kind in InvocationError::kinds() {
+            assert!(
+                contract["exit_code_by_kind"]["tool"][kind].is_number(),
+                "{kind} has no published exit code"
+            );
+        }
+        assert_eq!(
+            contract["error_kinds"]["runtime"]
+                .as_array()
+                .expect("the runtime namespace is a list")
+                .len(),
+            RuntimeError::KINDS.len() + StoreError::KINDS.len()
+        );
     }
 
     #[test]
