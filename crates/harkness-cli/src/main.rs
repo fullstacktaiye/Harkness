@@ -134,8 +134,34 @@ enum Command {
 enum CheckCommand {
     /// List configured checks and their newest recorded results.
     List(ProjectSelection),
+    /// Replace this project's explicit checks from a JSON document.
+    Configure(CheckConfigureArguments),
+    /// Discard explicit checks and restore the workspace defaults.
+    Clear(CheckClearArguments),
     /// Run one configured check through the durable runtime.
     Run(CheckRunArguments),
+}
+
+#[derive(Debug, Args)]
+struct CheckConfigureArguments {
+    #[command(flatten)]
+    selection: ProjectSelection,
+    /// JSON array of check definitions, or `-` to read standard input.
+    ///
+    /// A document is used rather than flags because a check is argv, a working
+    /// directory, an environment map, a parser and a timeout together, and a
+    /// half-specified one is not a thing this catalog can hold.
+    #[arg(long, value_name = "PATH")]
+    from: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct CheckClearArguments {
+    #[command(flatten)]
+    selection: ProjectSelection,
+    /// Confirm discarding the project's explicit check configuration.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1874,13 +1900,75 @@ fn run_check(
     json_output: bool,
     cancellation: &Cancellation,
 ) -> Result<CommandResult, CliError> {
-    let service = load_service(data_dir)?;
+    let mut service = load_service(data_dir)?;
     match command {
         CheckCommand::List(selection) => {
             let project = resolve_project(&service, selection.project.as_deref())?;
             let checks = project.effective_checks();
             let results = recorded_checks_without_creating_a_store(&service, &project)?;
             check_list_result(json_output, &checks, &results)
+        }
+        CheckCommand::Configure(arguments) => {
+            let project = resolve_project(&service, arguments.selection.project.as_deref())?;
+            let document = read_selection_document(&arguments.from)?;
+            let checks =
+                serde_json::from_str::<Vec<CheckConfiguration>>(&document).map_err(|error| {
+                    CliError::Usage(format!(
+                        "the check document must be a JSON array of check definitions: {error}"
+                    ))
+                })?;
+            let configured = service.configure_checks(project.id, Some(checks))?;
+            let stored = configured.checks.clone().unwrap_or_default();
+            command_result(
+                json_output,
+                || {
+                    format!(
+                        "configured {} check{} for {}",
+                        stored.len(),
+                        if stored.len() == 1 { "" } else { "s" },
+                        single_line(&configured.display_name)
+                    )
+                },
+                || {
+                    Ok(json!({
+                        "kind": "check_configure",
+                        "project_id": configured.id,
+                        "checks": stored,
+                    }))
+                },
+            )
+        }
+        CheckCommand::Clear(arguments) => {
+            if !arguments.yes {
+                return Err(CliError::Refused {
+                    kind: RefusalKind::ConfirmationRequired,
+                    message: "clearing project checks discards their explicit configuration; retry with --yes"
+                        .to_owned(),
+                    details: json!({}),
+                });
+            }
+            let project = resolve_project(&service, arguments.selection.project.as_deref())?;
+            // `None`, not an empty list. The distinction is the whole point of
+            // the field: no explicit configuration falls back to the workspace
+            // defaults, while an empty list is a configured "run nothing".
+            let cleared = service.configure_checks(project.id, None)?;
+            command_result(
+                json_output,
+                || {
+                    format!(
+                        "cleared explicit checks for {}",
+                        single_line(&cleared.display_name)
+                    )
+                },
+                || {
+                    Ok(json!({
+                        "kind": "check_clear",
+                        "project_id": cleared.id,
+                        "checks": Value::Null,
+                        "effective_checks": cleared.effective_checks(),
+                    }))
+                },
+            )
         }
         CheckCommand::Run(arguments) => {
             if !arguments.yes {
@@ -3180,6 +3268,12 @@ fn project_value(project: &Project, status_checked: bool) -> Result<Value, CliEr
         "status_checked": status_checked,
         "available": available,
         "git": git,
+        // Null distinguishes "no explicit configuration, so the workspace
+        // defaults apply" from a configured empty list meaning "run nothing" —
+        // the same distinction the catalog stores, and the reason a caller
+        // cannot infer this field from `effective_checks` alone.
+        "checks": project.checks,
+        "effective_checks": project.effective_checks(),
     }))
 }
 
