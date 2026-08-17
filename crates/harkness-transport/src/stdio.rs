@@ -559,16 +559,31 @@ impl StdioTransport {
             return outcome.clone();
         }
 
-        // Unconditionally, and before the exit is inspected. The writer thread
+        let mut child = teardown.child.take().expect("the child is taken once");
+
+        // Sampled *before* the close below, because this is the only moment
+        // that can tell a peer which was already gone from one that exits
+        // because its standard input just closed. Asking afterwards cannot: a
+        // well-behaved peer's read loop ends the instant the pipe does, so it
+        // can be reaped inside the window between the two statements, and the
+        // rung would report "already exited" — a disconnect nobody noticed —
+        // for the healthiest shutdown there is.
+        //
+        // This does not weaken the close-first rule it appears to bend.
+        // `try_wait` blocks on nothing and joins nothing, so it cannot strand
+        // the writer thread parked on its queue, which is the whole reason the
+        // *waiting* has to come after the close.
+        let already_exited = child.try_wait().ok().flatten();
+
+        // Unconditionally, and before the exit is waited on. The writer thread
         // is parked on its queue until every sender is gone, so a peer that had
         // already exited would otherwise leave a thread this loop then waits on
         // forever.
         self.inner.close_stdin();
 
-        let mut child = teardown.child.take().expect("the child is taken once");
-        let (rung, exit_code) = match child.try_wait() {
-            Ok(Some(status)) => (ShutdownRung::AlreadyExited, status.code()),
-            _ => match wait_for_exit(&mut child, grace) {
+        let (rung, exit_code) = match already_exited {
+            Some(status) => (ShutdownRung::AlreadyExited, status.code()),
+            None => match wait_for_exit(&mut child, grace) {
                 Some(status) => (ShutdownRung::ClosedStdin, status),
                 None => escalate(&mut child),
             },
@@ -1265,6 +1280,44 @@ while true; do sleep 0.05; done
 
         assert_eq!(outcome.rung, ShutdownRung::ClosedStdin);
         assert_eq!(outcome.exit_code, Some(3));
+    }
+
+    /// The complement of the test above: a peer that died on its own is torn
+    /// down without a signal, and its status still reaches the caller.
+    ///
+    /// The exact rung is deliberately not asserted. A peer's standard output
+    /// closes during `exit` and its task becomes reapable only afterwards, so a
+    /// test that observed the disconnect and then demanded `AlreadyExited`
+    /// would be pinning an ordering the kernel does not promise — the same
+    /// shape of race teardown was changed to stop reporting. What is asserted
+    /// is what the caller relies on: nothing was signalled, and the status was
+    /// not lost.
+    #[test]
+    fn a_peer_that_died_on_its_own_is_torn_down_without_a_signal() {
+        let fixture = Fixture::new();
+        let workspace = fixture.directory("departed");
+        let departed_peer = fixture.shim(
+            "departed-peer",
+            "#!/bin/sh\nprintf '{\"jsonrpc\":\"2.0\",\"method\":\"ready\"}\\n'\nexit 5\n",
+        );
+        let transport = connect(&departed_peer, &workspace);
+        assert_eq!(
+            next(&transport).unwrap(),
+            Message::notification("ready", None)
+        );
+        assert!(matches!(
+            next(&transport).unwrap_err(),
+            TransportError::Disconnected { .. }
+        ));
+
+        let outcome = transport.shutdown(Duration::from_secs(5));
+
+        assert!(
+            outcome.rung < ShutdownRung::Signalled,
+            "a peer that is already gone needs no signal, but teardown reached {:?}",
+            outcome.rung
+        );
+        assert_eq!(outcome.exit_code, Some(5));
     }
 
     /// A teardown has to reach the peer's helpers too, or an agent's language

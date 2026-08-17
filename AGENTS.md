@@ -1160,8 +1160,13 @@ to disturb a working conversation.
 
 Teardown is `close stdin → wait → SIGTERM → wait → SIGKILL` against the process *group*, it runs on
 `Drop` as well as on `shutdown`, and it is idempotent. Standard input is closed unconditionally and
-before the child's exit is inspected — the writer thread parks on its queue until every sender is
-gone, so a peer that had already exited would otherwise strand a thread teardown then waits on. The
+before the child's exit is *waited on* — the writer thread parks on its queue until every sender is
+gone, so a peer that had already exited would otherwise strand a thread teardown then waits on.
+Whether the peer was *already* gone is sampled non-blockingly before that close, and has to be:
+a well-behaved peer's read loop ends the instant its input pipe does, so asking afterwards cannot
+tell a disconnect nobody noticed from the healthiest shutdown there is, and `AlreadyExited` would
+be reported for both. A `try_wait` waits on nothing and joins nothing, which is what makes the two
+orderings compatible rather than a contradiction. The
 group is then killed on **every** rung, not only when the escalation is reached: the direct child
 being gone is not the group being gone, and a peer that backgrounded a helper and exited politely
 leaves that helper on the workspace *and* holding the standard-output pipe, so the reader never sees
