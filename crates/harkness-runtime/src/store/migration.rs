@@ -56,6 +56,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: 6,
         statements: include_str!("migrations/006_approval_integration_identity.sql"),
     },
+    Migration {
+        version: 7,
+        statements: include_str!("migrations/007_run_leases_and_retry.sql"),
+    },
 ];
 
 /// Newest schema version this build understands.
@@ -182,6 +186,7 @@ mod tests {
                 "artifacts",
                 "run_events",
                 "runs",
+                "runtime_leases",
                 "steps",
                 "tasks",
                 "tool_calls",

@@ -255,6 +255,13 @@ of entering the process as an impossible record, and its `schema_version` is
 probed before any other column is decoded so a future row reads as an upgrade
 request rather than as a corrupt column.
 
+`owner_pid` is audit context and decides nothing. A process identifier is
+reused, so a row naming a live pid is not evidence that the process holding it
+is the one that wrote the row; `runs.lease_id` and the advisory lock file behind
+it are what answer that. `runtime_leases` carries no foreign key from `runs`
+either: a lease is the process that drove a run rather than a containment
+parent, and a run must stay loadable after its claim is collected.
+
 A WAL database is three files. Backups must copy `runtime.db`, `runtime.db-wal`,
 and `runtime.db-shm` together, or checkpoint first and copy `runtime.db` alone —
 and check that the checkpoint returned success. A checkpoint reports an
@@ -1051,6 +1058,73 @@ Shutdown cancels rather than abandons and then waits for its workers, so no chil
 process tree outlives the application. Dropping a `Scheduler` shuts it down; a
 caller wanting a different deadline calls `shutdown` first.
 
+## Interruption, Lease & Retry Invariants
+
+A run reaches `interrupted` because a *recovery sweep* proved its owning process
+gone, and for no other reason. Nothing inside a live process may write that
+state: a coordinator that marked its own run `interrupted` because one call
+ended without a verdict would be recording that the owning process stopped while
+demonstrably still running. A call whose worker thread died is a fact about the
+call — it becomes a `ToolFailed` observation carrying the `interrupted` kind, and
+what to do about it is the agent's decision, exactly as every other tool failure
+is.
+
+**A lock file is the death signal; a timestamp is not.** A crashed process
+writes nothing, so no column can be trusted to say its runs are abandoned. Every
+coordinator holds one advisory lock file under `locks/` that the kernel releases
+however the process ends, and a lock that can be taken is the proof. `renewed_at`
+may only ever *widen* the window in which a claim is treated as alive: a held
+lock outranks any timestamp, because a wedged-but-live process still holds the
+workspace its runs are mutating, and only a claim that cannot be probed at all
+falls back to the expiry grace. `LEASE_RENEW_INTERVAL` and `LEASE_EXPIRY_GRACE`
+are the two published constants; a rule that let a stale timestamp end a live
+process's runs would be the opposite of what this whole mechanism is for.
+
+The lock is taken *before* the row exists and the row is written with the first
+run that claims it. Reversing either would open a window: a row whose lock is not
+yet held reads as dead to a concurrent sweep, and a row written at construction
+would accumulate one per start of every read-only front end. A lease identity is
+never reused, so removing a proved-dead lock file cannot make two coordinators
+lock two inodes under one name.
+
+**A sweep claims only what it can prove.** It runs once, at coordinator
+construction, before any new work is accepted, under a short-lived exclusive
+recovery lock; a live sibling process — the command line beside a running
+application — is untouched. One transaction per run, so a poisoned record cannot
+block the recovery of the other ninety-nine; a run that fails to recover is
+reported in `RecoveryReport` rather than retried or silently skipped. The
+candidate query reads state spellings and lease identities, never timelines, so
+recovery is O(non-terminal runs) rather than O(events). A claim is read and
+probed once however many runs point at it — marking the first writes the claim
+off, and re-reading it would describe one death a hundred different ways.
+
+Recovery only appends. No event is deleted and none is rewritten: the timeline up
+to the moment the process stopped is exactly what that process wrote, and the
+markings are new states with new events after it. A pending approval becomes
+`Superseded` — the spelling the approval lifecycle already defines for "the run
+will not resume, so the question no longer has a subject" — which is terminal, so
+a prompt left open in a restarted front end authorizes nothing.
+
+**A retry is a new run, never a rewind.** `retry_run` creates a fresh run for the
+same task carrying `retry_of`, and appends one `run_retried` line to the
+original, whose own state and history are otherwise untouched. It is permitted
+from any terminal state but `succeeded`, and refused for a run whose record is
+not terminal — which is also how a run another process is driving stays refused.
+The decision is made on the persisted state alone and never on whether a worker
+in this process is still winding down, because a retry offered the instant a run
+shows `failed` must not succeed or fail by timing.
+
+Retry carries no authorization forward. Grants are matched on the run they were
+given for, so a fresh run id is what makes every protected call ask again;
+nothing needs to expire an inherited grant because none exists.
+`workspace_may_be_modified` is the honest half: true whenever the earlier attempt
+started a tool call that could write, computed from persisted lifecycle —
+`started_at` is set by the transition into `running` and by nothing else — and
+never from whether the tool "probably" finished. A tool this build no longer
+registers counts as one that could write, because the flag exists to warn rather
+than to reassure. Only a retry may carry it; a run that follows nothing has no
+earlier attempt to attribute a change to, and the wire form refuses the claim.
+
 ## Approval Invariants
 
 An approval is persisted and committed *before* any surface is notified, and the
@@ -1126,10 +1200,11 @@ the surface.
 
 Absence of an answer is never consent, and never a resolution either. Closing a
 window, dismissing a dialog, and losing a surface all leave the request pending.
-Only an explicit decision, an expiry, or a run cancellation resolves one, and the
-last two record `Expired` or `Cancelled` with **no** decision attached — the
-waiter still observes a denial, and the record still says no human answered.
-Synthesizing a decision there would make the audit claim one that was never made.
+Only an explicit decision, an expiry, a run cancellation, or a recovery sweep
+resolves one, and the last three record `Expired`, `Cancelled` or `Superseded`
+with **no** decision attached — the waiter still observes a denial, and the
+record still says no human answered. Synthesizing a decision there would make the
+audit claim one that was never made.
 
 `canonical_input_hash` is frozen and versioned by its domain constant. Object
 keys sort by UTF-8 bytes, arrays keep their order, integers and doubles have

@@ -103,8 +103,10 @@ mod artifact;
 mod column;
 mod error;
 mod event;
+mod lease;
 mod listing;
 mod migration;
+mod recovery;
 mod redaction;
 mod repository;
 mod workspace_trust;
@@ -124,7 +126,7 @@ use crate::approval::{
     canonical_input_hash,
 };
 use crate::domain::{
-    ArtifactId, Failure, Run, RunDomainError, RunId, Step, StepId, Task, TaskId, ToolCall,
+    ArtifactId, Failure, LeaseId, Run, RunDomainError, RunId, Step, StepId, Task, TaskId, ToolCall,
     ToolCallId,
 };
 use crate::tool::ToolIdentity;
@@ -136,8 +138,10 @@ pub use event::{
     DEFAULT_EVENT_PAGE_LIMIT, EventKind, EventSeq, MAX_EVENT_PAGE_LIMIT, OVERFLOW_PAYLOAD_FIELD,
     OVERFLOW_PAYLOAD_MEDIA_TYPE, OVERFLOW_PAYLOAD_NAME, OverflowedPayload, RunEvent, StoredEvent,
 };
+pub use lease::LeaseRecord;
 pub use listing::{DEFAULT_RUN_PAGE_LIMIT, MAX_RUN_PAGE_LIMIT, RunCursor, RunListing, RunPage};
 pub use migration::SCHEMA_VERSION;
+pub use recovery::{InterruptionReason, RunInterruption};
 pub(crate) use redaction::redact_payload;
 pub use redaction::{PassThrough, Redactor};
 
@@ -590,22 +594,36 @@ impl Store {
 
     // -- runs ---------------------------------------------------------------
 
-    /// Stores a run against an already-stored task.
+    /// Stores a run against an already-stored task, owned by nothing.
+    ///
+    /// A run with no lease is a run no coordinator is driving, so a later
+    /// start's recovery sweep is right to interrupt it if it is not already
+    /// terminal. Anything a coordinator is about to drive goes through
+    /// [`insert_run_with_event`](Self::insert_run_with_event) with its lease.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::MissingParent`] when the task is not stored and
-    /// [`StoreError::AlreadyExists`] when the identity is taken.
+    /// Returns [`StoreError::MissingParent`] when the task — or, for a retry,
+    /// the run it follows — is not stored, and [`StoreError::AlreadyExists`]
+    /// when the identity is taken.
     pub fn insert_run(&self, run: &Run) -> Result<(), StoreError> {
-        repository::insert_run(&guard(&self.writer), run)
+        repository::insert_run(&guard(&self.writer), run, None)
     }
 
-    /// Stores a run and its first event in one transaction.
+    /// Stores a run, the lease claiming it, and its first event in one
+    /// transaction.
     ///
-    /// A refused event leaves no inert queued run behind.
+    /// A refused event leaves no inert queued run behind, and the claim lands
+    /// with the row rather than after it: a queued run that existed for even an
+    /// instant with no lease is indistinguishable from one whose owner died,
+    /// and a sweep running in another process would be right to interrupt it.
+    ///
+    /// The lease row is written here too, on first use, so a coordinator that
+    /// never records anything leaves nothing behind to collect.
     pub fn insert_run_with_event(
         &self,
         run: &Run,
+        owner: Option<&LeaseRecord>,
         event: RunEvent,
     ) -> Result<EventSeq, StoreError> {
         let prepared = self.prepare_event(run.id(), event)?;
@@ -613,7 +631,10 @@ impl Store {
             "inserting a run with its first event",
             prepared,
             |connection, prepared| {
-                repository::insert_run(connection, run)?;
+                if let Some(owner) = owner {
+                    lease::ensure(connection, owner)?;
+                }
+                repository::insert_run(connection, run, owner.map(LeaseRecord::id))?;
                 prepared.append(connection, run.id())
             },
         )
@@ -713,6 +734,116 @@ impl Store {
     /// Returns [`StoreError::NotFound`] when no run has that identity.
     pub fn run_owner(&self, id: RunId) -> Result<Option<u32>, StoreError> {
         self.with_reader(|connection| repository::run_owner(connection, id))
+    }
+
+    // -- leases and recovery -------------------------------------------------
+
+    /// Refreshes a lease's "still here" timestamp.
+    ///
+    /// Reports whether a row moved: a lease that has taken no run has no row
+    /// yet, and a released one is never resurrected. Neither is an error, and
+    /// neither says anything about the holder being alive — the advisory lock
+    /// file is what answers that, and this store never opens one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Query`] when the statement fails.
+    pub(crate) fn renew_lease(&self, id: LeaseId, at: OffsetDateTime) -> Result<bool, StoreError> {
+        lease::renew(&guard(&self.writer), id, at).map(|updated| updated > 0)
+    }
+
+    /// Records that a lease is over.
+    ///
+    /// Idempotent, and deliberately unconditional on who is calling: a
+    /// coordinator releases its own on the way out, and a recovery sweep
+    /// releases one it proved dead.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::renew_lease`].
+    pub(crate) fn release_lease(&self, id: LeaseId, at: OffsetDateTime) -> Result<(), StoreError> {
+        lease::release(&guard(&self.writer), id, at)
+    }
+
+    /// Loads one lease record, reporting absence rather than failing.
+    ///
+    /// The record says what a claim *was*. Whether anybody still holds it is a
+    /// question about a lock file, which this store never opens.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Query`] when the statement fails.
+    pub fn lease(&self, id: LeaseId) -> Result<Option<LeaseRecord>, StoreError> {
+        self.with_reader(|connection| lease::load(connection, id))
+    }
+
+    /// Lists every claim that has not been released, oldest first.
+    ///
+    /// "Not released" is what the rows say, not what any process is doing: a
+    /// claim whose holder was killed stays here until a sweep writes it off.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::lease`].
+    pub fn live_leases(&self) -> Result<Vec<LeaseRecord>, StoreError> {
+        self.with_reader(lease::list_live)
+    }
+
+    /// Lists every run that has not reached a terminal state, with its claim.
+    ///
+    /// This is the recovery sweep's candidate query and it is deliberately not
+    /// a record load: the answer is a state spelling and a lease identity per
+    /// run, so a store holding a hundred abandoned runs costs one indexed scan
+    /// rather than a hundred timelines read into memory.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::lease`].
+    pub fn unfinished_runs(&self) -> Result<Vec<(RunId, Option<LeaseId>)>, StoreError> {
+        self.with_reader(repository::unfinished_runs)
+    }
+
+    /// Lists the runs recorded as retries of `run`, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::lease`].
+    pub fn retries_of(&self, run: RunId) -> Result<Vec<RunId>, StoreError> {
+        self.with_reader(|connection| repository::retries_of(connection, run))
+    }
+
+    /// Marks one abandoned run, everything under it, and its open questions.
+    ///
+    /// In one transaction: the run reaches `interrupted`, every unfinished step
+    /// and in-flight tool call reaches `interrupted`, every pending approval is
+    /// `superseded`, and each of those carries its own appended event beside a
+    /// `run_interrupted` entry naming what was detected. Nothing already
+    /// recorded is rewritten, so the timeline stays intact up to the moment the
+    /// owning process stopped.
+    ///
+    /// `Ok(None)` means the run was already terminal — another sweeper, or the
+    /// run's own process, got there first. That is what "exactly one set of
+    /// markings" looks like from the loser's side, and it is not a failure.
+    ///
+    /// Deciding *that* a run was abandoned is not this method's job and cannot
+    /// be: the store opens no lock file and probes no process. The caller
+    /// supplies the reason it already proved — which is why this is reachable
+    /// only from inside the crate. `interrupted` means the owning process
+    /// stopped, and a front end that could write it would be able to put a
+    /// claim about a dead process into the history of a live one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NotFound`] when no run has that identity, and
+    /// [`StoreError::InvalidRecord`] when a row of the run cannot be rebuilt.
+    pub(crate) fn interrupt_run(
+        &self,
+        run: RunId,
+        reason: InterruptionReason,
+        at: OffsetDateTime,
+    ) -> Result<Option<RunInterruption>, StoreError> {
+        let lease = self.with_reader(|connection| repository::run_lease_of(connection, run))?;
+        recovery::interrupt(self, run, lease, reason, at)
     }
 
     /// Returns one newest-first page of run history.

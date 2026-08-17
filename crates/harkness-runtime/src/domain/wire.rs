@@ -13,7 +13,7 @@ use super::{
 use crate::policy::{PolicyDecision, PolicyVerdict};
 
 /// Newest durable runtime-record schema understood by this build.
-pub const RUNTIME_RECORD_SCHEMA_VERSION: u32 = 3;
+pub const RUNTIME_RECORD_SCHEMA_VERSION: u32 = 4;
 /// Oldest durable runtime-record schema understood by this build.
 pub const MINIMUM_RUNTIME_RECORD_SCHEMA_VERSION: u32 = 1;
 
@@ -77,6 +77,12 @@ pub struct RunWire {
     /// Durable approval audit history.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approvals: Vec<Approval>,
+    /// The earlier attempt this run re-attempts, when it is a retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_of: Option<RunId>,
+    /// Whether an earlier attempt may already have changed the workspace.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub workspace_may_be_modified: bool,
 }
 
 /// Strict owned representation used to deserialize a [`Step`].
@@ -237,6 +243,12 @@ pub struct RunWireRef<'a> {
     /// Durable approval audit history.
     #[serde(skip_serializing_if = "slice_is_empty")]
     pub approvals: &'a [Approval],
+    /// The earlier attempt this run re-attempts, when it is a retry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_of: Option<RunId>,
+    /// Whether an earlier attempt may already have changed the workspace.
+    #[serde(skip_serializing_if = "is_false")]
+    pub workspace_may_be_modified: bool,
 }
 
 /// Borrowing representation used to serialize a [`Step`] without cloning it.
@@ -362,6 +374,8 @@ impl<'a> From<&'a Run> for RunWireRef<'a> {
             finished_at: run.finished_at(),
             failure: run.failure(),
             approvals: run.approvals(),
+            retry_of: run.retry_of(),
+            workspace_may_be_modified: run.workspace_may_be_modified(),
         }
     }
 }
@@ -454,12 +468,37 @@ impl TryFrom<RunWire> for Run {
             wire.revision,
             &wire.approvals,
         )?;
+        if wire.schema_version < 4 && (wire.retry_of.is_some() || wire.workspace_may_be_modified) {
+            return Err(invalid_lifecycle(
+                "run",
+                "schema versions before 4 cannot carry retry provenance",
+            ));
+        }
+        if wire.retry_of == Some(wire.id) {
+            return Err(invalid_lifecycle(
+                "run",
+                "a run cannot be a retry of itself",
+            ));
+        }
+        // The flag describes what an *earlier attempt* may have left behind, so
+        // a run that follows nothing has nothing to warn about. Without this a
+        // row could claim the warning with no run to attribute it to, and a
+        // front end surfacing it would be reporting a modification nobody can
+        // point at.
+        if wire.workspace_may_be_modified && wire.retry_of.is_none() {
+            return Err(invalid_lifecycle(
+                "run",
+                "only a retry may claim an earlier attempt modified the workspace",
+            ));
+        }
         Ok(Self {
             id: wire.id,
             task_id: wire.task_id,
             lifecycle,
             failure: wire.failure,
             approvals: wire.approvals,
+            retry_of: wire.retry_of,
+            workspace_may_be_modified: wire.workspace_may_be_modified,
         })
     }
 }
@@ -842,6 +881,11 @@ fn slice_is_empty<T>(values: &&[T]) -> bool {
     values.is_empty()
 }
 
+/// Omits a `false` flag, so an absent field and a written `false` are one form.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Deserialize)]
 struct SchemaVersionProbe {
     schema_version: u32,
@@ -912,6 +956,10 @@ struct RunWireStrict {
     failure: Option<Failure>,
     #[serde(default)]
     approvals: Vec<Approval>,
+    #[serde(default)]
+    retry_of: Option<RunId>,
+    #[serde(default)]
+    workspace_may_be_modified: bool,
 }
 
 impl From<RunWireStrict> for RunWire {
@@ -928,6 +976,8 @@ impl From<RunWireStrict> for RunWire {
             finished_at: wire.finished_at,
             failure: wire.failure,
             approvals: wire.approvals,
+            retry_of: wire.retry_of,
+            workspace_may_be_modified: wire.workspace_may_be_modified,
         }
     }
 }
@@ -1065,6 +1115,11 @@ mod tests {
 
     fn run_id() -> RunId {
         RunId::from_str("22222222-2222-4222-8222-222222222222").unwrap()
+    }
+
+    /// The earlier attempt the frozen v4 run fixture is a retry of.
+    fn original_run_id() -> RunId {
+        RunId::from_str("66666666-6666-4666-8666-666666666666").unwrap()
     }
 
     fn step_id() -> StepId {
@@ -1262,10 +1317,12 @@ mod tests {
     }
 
     #[test]
-    fn frozen_v3_json_fixtures_cover_every_record_type() {
+    fn frozen_v4_json_fixtures_cover_every_record_type() {
         let task = Task::try_from(task_wire()).unwrap();
 
-        let mut run = Run::with_id(run_id(), task.id(), at(0));
+        // A retry, so the fixture pins the two fields version 4 added rather
+        // than freezing them at their absent defaults.
+        let mut run = Run::retrying_with_id(run_id(), task.id(), original_run_id(), true, at(0));
         run.fail(
             Failure::new("workspace_missing", "workspace no longer exists"),
             at(1),
@@ -1291,25 +1348,29 @@ mod tests {
 
         assert_fixture(
             TaskWireRef::from(&task),
-            include_str!("fixtures/task-v3.json"),
+            include_str!("fixtures/task-v4.json"),
         );
-        assert_fixture(RunWireRef::from(&run), include_str!("fixtures/run-v3.json"));
+        assert_fixture(RunWireRef::from(&run), include_str!("fixtures/run-v4.json"));
         assert_fixture(
             StepWireRef::from(&step),
-            include_str!("fixtures/step-v3.json"),
+            include_str!("fixtures/step-v4.json"),
         );
         assert_fixture(
             ToolCallWireRef::from(&call),
-            include_str!("fixtures/tool-call-v3.json"),
+            include_str!("fixtures/tool-call-v4.json"),
         );
 
+        assert_owned_fixture::<TaskWire>(include_str!("fixtures/task-v4.json"));
+        assert_owned_fixture::<RunWire>(include_str!("fixtures/run-v4.json"));
+        assert_owned_fixture::<StepWire>(include_str!("fixtures/step-v4.json"));
+        assert_owned_fixture::<ToolCallWire>(include_str!("fixtures/tool-call-v4.json"));
+
+        // Previous frozen versions remain readable after the retry-provenance
+        // and record-version bump.
         assert_owned_fixture::<TaskWire>(include_str!("fixtures/task-v3.json"));
         assert_owned_fixture::<RunWire>(include_str!("fixtures/run-v3.json"));
         assert_owned_fixture::<StepWire>(include_str!("fixtures/step-v3.json"));
         assert_owned_fixture::<ToolCallWire>(include_str!("fixtures/tool-call-v3.json"));
-
-        // Previous frozen versions remain readable after the external policy
-        // decision fields and record-version bump.
         assert_owned_fixture::<TaskWire>(include_str!("fixtures/task-v2.json"));
         assert_owned_fixture::<RunWire>(include_str!("fixtures/run-v2.json"));
         assert_owned_fixture::<StepWire>(include_str!("fixtures/step-v2.json"));
@@ -1332,6 +1393,68 @@ mod tests {
                 .to_string()
                 .contains("policy decision contradicts the tool-call lifecycle")
         );
+    }
+
+    #[test]
+    fn a_v3_run_cannot_claim_v4_retry_provenance() {
+        for mutate in [
+            (|wire: &mut RunWire| wire.retry_of = Some(original_run_id())) as fn(&mut RunWire),
+            |wire: &mut RunWire| wire.workspace_may_be_modified = true,
+        ] {
+            let mut wire = run_wire(ExecutionState::Queued);
+            wire.schema_version = 3;
+            mutate(&mut wire);
+            let error = Run::try_from(wire).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("schema versions before 4 cannot carry retry provenance"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_that_follows_nothing_cannot_claim_an_earlier_attempt_modified_the_workspace() {
+        let mut wire = run_wire(ExecutionState::Queued);
+        wire.workspace_may_be_modified = true;
+
+        let error = Run::try_from(wire).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("only a retry may claim an earlier attempt modified the workspace"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_run_cannot_be_a_retry_of_itself() {
+        let mut wire = run_wire(ExecutionState::Queued);
+        wire.retry_of = Some(run_id());
+
+        let error = Run::try_from(wire).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("a run cannot be a retry of itself"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_retry_run_round_trips_its_provenance_through_the_wire() {
+        let run = Run::retrying_with_id(run_id(), task_id(), original_run_id(), true, at(0));
+        let wire: RunWire =
+            serde_json::from_value(serde_json::to_value(RunWireRef::from(&run)).unwrap()).unwrap();
+
+        let restored = Run::try_from(wire).unwrap();
+
+        assert_eq!(restored, run);
+        assert_eq!(restored.retry_of(), Some(original_run_id()));
+        assert!(restored.workspace_may_be_modified());
     }
 
     #[test]

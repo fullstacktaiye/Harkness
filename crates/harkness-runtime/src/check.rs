@@ -103,7 +103,7 @@ pub fn check_coordinator(store: Arc<Store>) -> Result<RunCoordinator, CheckLaunc
     let mut registry = ToolRegistry::new();
     registry.register(CheckRun)?;
     let policy = PolicyEngine::load(store.data_dir(), store.data_dir());
-    Ok(RunCoordinator::new(store, Arc::new(registry), policy))
+    Ok(RunCoordinator::new(store, Arc::new(registry), policy)?)
 }
 
 /// Runs one configured check through the ordinary coordinator, policy,

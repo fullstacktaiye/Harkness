@@ -38,6 +38,7 @@ wins as the instruction and the ADR supplies the rationale.
 | [0017](0017-honest-observability-activity-classes.md) | Every activity carries an evidence class, and a claim is never shown as a fact | Accepted |
 | [0018](0018-pinned-github-rest-api.md) | Pin `X-GitHub-Api-Version: 2026-03-10`, authenticate with a fine-grained PAT | Accepted |
 | [0019](0019-change-provenance-is-derived-from-git.md) | Change provenance is derived from Git, behind a read interface a recorded source can join | Accepted |
+| [0020](0020-process-liveness-is-an-advisory-lock.md) | Process liveness is an advisory lock, and a timestamp may only widen it | Accepted |
 
 This index is the ordering authority. If two ADRs conflict, the conflict is
 resolved before either merges; a lower number does not automatically win.

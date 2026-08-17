@@ -35,15 +35,17 @@ build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing lin
 
 `#[ignore]` marks four distinct categories; never assume an ignored test is dead.
 
-- **Child-process roles** (`*/testing.rs`, `store/tests.rs`): the parent test re-executes the test
-  binary with `--exact --ignored`. Run them only through their parent.
+- **Child-process roles** (`*/testing.rs`, `store/tests.rs`, `coordinator/tests/recovery.rs`): the
+  parent test re-executes the test binary with `--exact --ignored`. Run them only through their
+  parent. The recovery roles are re-executed *and then killed*, so a `SIGKILL` is the expected end
+  of `park_a_run_awaiting_approval` and `append_event_batches_until_killed`.
 - **Network tests** (`sync.rs`, `project.rs`): reach real GitHub. CI runs them on a self-hosted
   runner via `sh .github/scripts/run-ignored-exact-test.sh <package> <exact::test::name>`, which
   fails loudly if the named test no longer exists — so renaming one requires updating
   `.github/workflows/network-integration.yml`.
 - **Fixture regeneration**: `cargo test -p harkness-runtime regenerate_the_frozen_v1_fixture --
   --ignored` rewrites `crates/harkness-runtime/src/store/fixtures/runtime-v1.db`, and
-  `regenerate_the_frozen_v2_fixture` (through `v5`) rewrites the corresponding `runtime-v*.db`. Run
+  `regenerate_the_frozen_v2_fixture` (through `v7`) rewrites the corresponding `runtime-v*.db`. Run
   each only when that migration itself changes; a released migration is otherwise never edited. The
   v1 regenerator applies a truncated ladder rather than opening a `Store`, because opening one now
   climbs to the newest schema. `regenerate_the_frozen_canonicalization_fixture` rewrites
@@ -79,7 +81,7 @@ build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing lin
 `crates/harkness-runtime/src/agent/fixtures/*.json`,
 `crates/harkness-runtime/src/integration/fixtures/*.json`,
 `crates/harkness-provider/src/scripted/fixtures/*.json`, and
-`crates/harkness-runtime/src/store/fixtures/runtime-v{1..5}.db` pin released on-disk formats. A new
+`crates/harkness-runtime/src/store/fixtures/runtime-v{1..7}.db` pin released on-disk formats. A new
 persisted field, state spelling, or table means a version bump plus a *new* fixture, not an edit to
 an existing one. The provider's scripts are the one set that is *authored* as JSON rather than
 mirrored from Rust data: the regenerator only re-canonicalizes their formatting, so a new scenario
@@ -156,6 +158,16 @@ translating between two cancellation mechanisms.
   an existing grant covers a new call, and the condvar-backed gate a parked call is woken through.
   It is the only production source of a `policy::RunGrant` — policy cannot construct one — so an
   `Ask` becomes an `Allow` only because the matcher accepted a grant.
+  `coordinator` is the orchestration loop those pieces meet in, and it owns the
+  interruption story. Each coordinator holds one *lease*: an advisory lock file under `locks/`
+  that the kernel releases however the process ends, plus a `runtime_leases` row every run it
+  starts points at. Construction sweeps first — every run whose claim is provably dead is marked
+  `interrupted` along with its unfinished steps, in-flight calls and unanswered approvals, each
+  with its own appended event — and only then accepts work. `interrupted` is written by that sweep
+  and by nothing else, which is what makes it mean "the owning process stopped". `retry_run`
+  creates a *new* run for the same task carrying `retry_of` and, when the earlier attempt started
+  something that could write, `workspace_may_be_modified`; nothing is resumed and no grant carries
+  over.
   `agent` is the plain-data decision seam above those pieces: `Agent::next_action` consumes one
   redacted observation and returns one request. `MockAgent` replays one of ten versioned,
   deterministic scripts with no access to the registry, policy, approvals, store, scheduler, or
@@ -239,6 +251,12 @@ Getting these confused is the main source of deadlock risk:
 **Ordering: scheduler workspace slot, then repository lock, then catalog lock.** The store takes
 none of them, and no caller may hold a store transaction while acquiring any. The scheduler cannot
 violate the two beneath it because it calls no catalog or Git code at all.
+
+The coordinator's **lease and recovery locks** are not a fifth mechanism either. A lease lock is
+taken once at construction and held for the coordinator's life; the recovery lock is taken and
+released inside one startup sweep. Neither is held while any of the four above is acquired, and
+neither is taken while a store transaction is open — the sweep's per-run transaction is opened and
+committed underneath the recovery lock, never the other way round.
 
 A `harkness-transport` connection is not a fifth mechanism and must not become one: its locks are
 per connection, its own order is pump → correlation table, and it takes none of the four above —
@@ -342,4 +360,6 @@ precedence over it. Tests and isolated front ends rely on this — use it rather
 user data. The directory holds `projects.json`, `projects.lock`, `runtime.db` (+ `-wal`/`-shm`),
 `artifacts/`, `locks/`, `repositories/`, and `worktrees/`. Artifact content lives at
 `artifacts/<run_id>/<artifact_id>`; the `artifacts` table records the metadata and re-derives that
-path rather than trusting the one it stored.
+path rather than trusting the one it stored. `locks/` holds three unrelated families: the
+repository locks `harkness-git` keys by common directory, `managed-import-<project>.lock`, and the
+coordinator's `runtime-lease-<id>.lock` plus the single `runtime-recovery.lock`.

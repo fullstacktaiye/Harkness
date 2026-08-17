@@ -338,6 +338,28 @@ pub(super) fn decode_ordinal(record: &'static str, stored: i64) -> Result<u32, S
     })
 }
 
+/// Reads a stored boolean, refusing any spelling but `0` and `1`.
+///
+/// A `STRICT` integer column accepts every integer, so a row edited outside
+/// Harkness could hold `2`. Folding that to `true` would silently accept a
+/// value nothing here ever writes; naming the column and the value says which
+/// row went wrong.
+pub(super) fn decode_flag(
+    record: &'static str,
+    field: &'static str,
+    stored: i64,
+) -> Result<bool, StoreError> {
+    match stored {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(StoreError::ColumnEncoding {
+            record,
+            field,
+            reason: format!("{other} is not a stored boolean"),
+        }),
+    }
+}
+
 /// Narrows a stored owner process identifier back to its platform type.
 pub(super) fn decode_owner_pid(
     record: &'static str,

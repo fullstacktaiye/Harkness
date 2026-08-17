@@ -98,6 +98,19 @@ define_id!(
     /// [`Default`] generates a fresh random identity rather than an empty value.
     ArtifactId
 );
+define_id!(
+    /// A stable identifier for one coordinator's claim on the runs it drives.
+    ///
+    /// A lease names a *process's* ownership rather than a record in the
+    /// containment hierarchy, and it names it twice: as a row in
+    /// `runtime_leases` and as the advisory lock file the kernel releases when
+    /// the holder dies. Both are addressed by this identity, which is what lets
+    /// a later start decide whether the runs pointing at it were abandoned or
+    /// are still being driven.
+    ///
+    /// [`Default`] generates a fresh random identity rather than an empty value.
+    LeaseId
+);
 
 #[cfg(test)]
 mod tests {
@@ -105,7 +118,7 @@ mod tests {
 
     use serde::{Serialize, de::DeserializeOwned};
 
-    use super::{ApprovalId, ArtifactId, RunId, StepId, TaskId, ToolCallId};
+    use super::{ApprovalId, ArtifactId, LeaseId, RunId, StepId, TaskId, ToolCallId};
 
     const FIXTURE_ID: &str = "123e4567-e89b-42d3-a456-426614174000";
 
@@ -134,6 +147,7 @@ mod tests {
         assert_id_contract::<ToolCallId>();
         assert_id_contract::<ArtifactId>();
         assert_id_contract::<ApprovalId>();
+        assert_id_contract::<LeaseId>();
     }
 
     #[test]
