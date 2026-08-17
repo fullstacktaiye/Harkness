@@ -2245,7 +2245,7 @@ fn run_git(
             } else {
                 None
             };
-            let checks = check_project
+            let recorded_checks = check_project
                 .as_ref()
                 .map(|project| {
                     let store = Store::open(service.data_dir())
@@ -2254,6 +2254,24 @@ fn run_git(
                         .map_err(|error| CliError::Check(error.to_string()))
                 })
                 .transpose()?;
+            let (checks, checks_excluded_for_target) =
+                recorded_checks.map_or(Ok::<_, CliError>((None, 0usize)), |recorded| {
+                    let total = recorded.len();
+                    let mut covering = Vec::new();
+                    for check in recorded {
+                        if targets
+                            .iter()
+                            .map(|target| check_covers_diff_target(&git, &check, target))
+                            .collect::<Result<Vec<_>, _>>()?
+                            .into_iter()
+                            .all(|covers| covers)
+                        {
+                            covering.push(check);
+                        }
+                    }
+                    let excluded = total.saturating_sub(covering.len());
+                    Ok((Some(covering), excluded))
+                })?;
             command_result(
                 json_output,
                 || diff_summary_line(&files, &targets, attribution.as_deref()),
@@ -2284,6 +2302,9 @@ fn run_git(
                         // Null means the projection was not requested; an empty
                         // list means the project has no recorded checks.
                         "checks": checks,
+                        // Results are excluded unless their recorded state and
+                        // definition cover every target in this envelope.
+                        "checks_excluded_for_target": checks_excluded_for_target,
                         "files": projected,
                     }))
                 },
@@ -4569,6 +4590,42 @@ fn diff_target_value(target: &DiffTarget) -> Value {
     diff_target_details(target).unwrap_or_else(|| json!({ "kind": diff_target_name(target) }))
 }
 
+fn check_covers_diff_target(
+    git: &GitService,
+    check: &CheckSummary,
+    target: &DiffTarget,
+) -> Result<bool, CliError> {
+    if !check.definition_current {
+        return Ok(false);
+    }
+    let live_state_is_current = matches!(
+        check.freshness,
+        harkness_runtime::check::CheckFreshness::Current
+    );
+    match target {
+        DiffTarget::Unstaged | DiffTarget::RevisionAgainstWorktree { .. } => {
+            Ok(live_state_is_current)
+        }
+        DiffTarget::Staged => {
+            Ok(live_state_is_current && check.workspace_matches_index == Some(true))
+        }
+        DiffTarget::Commit { revision, .. } => check_covers_commit(git, check, revision),
+        DiffTarget::Revisions { new_revision, .. } => check_covers_commit(git, check, new_revision),
+        DiffTarget::BranchAgainstBase { branch, .. } => check_covers_commit(git, check, branch),
+        _ => Ok(false),
+    }
+}
+
+fn check_covers_commit(
+    git: &GitService,
+    check: &CheckSummary,
+    revision: &str,
+) -> Result<bool, CliError> {
+    let resolved = git.resolve_revision(revision)?.to_string();
+    Ok(check.workspace_clean == Some(true)
+        && check.state_head.as_deref() == Some(resolved.as_str()))
+}
+
 const fn diff_line_kind_name(kind: DiffLineKind) -> &'static str {
     match kind {
         DiffLineKind::Context => "context",
@@ -5484,8 +5541,8 @@ fn git_error_details(error: &GitError) -> Value {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashSet,
-        io,
+        collections::{BTreeMap, HashSet},
+        fs, io,
         path::{Path, PathBuf},
     };
 
@@ -5494,11 +5551,13 @@ mod tests {
         EXIT_CONFLICT, EXIT_NOT_FOUND, EXIT_OPERATION_FAILED, EXIT_REFUSED, EXIT_USAGE,
         EXTERNAL_POLICY_DENIAL_KINDS, EditorError, GIT_KIND_EXIT_CODES, GitError, HunkSelection,
         LineSelection, POLICY_KIND_EXIT_CODES, PROJECT_KIND_EXIT_CODES, Project, ProjectError,
-        RefusalKind, Whitespace, WhitespaceMode, change_provenance_value,
+        RefusalKind, Whitespace, WhitespaceMode, change_provenance_value, check_covers_diff_target,
         distinct_hunk_selection_count, distinct_line_selection_counts, editor_exit_code,
         git_error_details, git_exit_code, parse_line_selection_document, parse_selection_document,
         project_exit_code, project_value, requested_json, single_line,
     };
+
+    use tempfile::tempdir;
 
     /// Attribution is advisory: a walk that could not be made degrades to a
     /// named reason inside the block, so the diff beside it still reaches the
@@ -5531,6 +5590,96 @@ mod tests {
         assert_eq!(value["producers"].as_array().unwrap().len(), 0);
         assert_eq!(value["walked_commits"], 0);
         assert_eq!(value["truncation"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_check_on_the_current_head_does_not_cover_an_older_commit_review() {
+        let workspace = tempdir().unwrap();
+        let data = tempdir().unwrap();
+        let repository = git2::Repository::init(workspace.path()).unwrap();
+        let first = commit_file(&repository, "first");
+        let second = commit_file(&repository, "second");
+        let git = super::GitService::new(workspace.path(), data.path());
+        let summary = harkness_runtime::check::CheckSummary {
+            run_id: "run".to_owned(),
+            check_id: "test".to_owned(),
+            label: "Test".to_owned(),
+            command: vec!["true".to_owned()],
+            recorded_cwd: None,
+            recorded_env: BTreeMap::new(),
+            recorded_timeout: None,
+            recorded_parser: "plain".to_owned(),
+            definition_current: true,
+            outcome: harkness_runtime::check::CheckOutcome::Passed,
+            evidence_class: harkness_runtime::check::ActivityClass::HarknessObserved,
+            created_at: "2026-08-17T00:00:00Z".to_owned(),
+            finished_at: Some("2026-08-17T00:00:01Z".to_owned()),
+            duration_ms: Some(1),
+            state_digest: Some("digest".to_owned()),
+            state_head: Some(second.to_string()),
+            workspace_clean: Some(true),
+            workspace_matches_index: Some(true),
+            freshness: harkness_runtime::check::CheckFreshness::Current,
+            diagnostics: Vec::new(),
+            diagnostics_omitted: 0,
+            diagnostics_scan_truncated: false,
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            artifact_byte_limit: 8 * 1024 * 1024,
+            stdout_artifact_truncated: false,
+            stderr_artifact_truncated: false,
+        };
+
+        assert!(
+            !check_covers_diff_target(
+                &git,
+                &summary,
+                &super::DiffTarget::Commit {
+                    revision: first.to_string(),
+                    parent: None,
+                },
+            )
+            .unwrap()
+        );
+        assert!(
+            check_covers_diff_target(
+                &git,
+                &summary,
+                &super::DiffTarget::Commit {
+                    revision: second.to_string(),
+                    parent: None,
+                },
+            )
+            .unwrap()
+        );
+    }
+
+    fn commit_file(repository: &git2::Repository, contents: &str) -> git2::Oid {
+        fs::write(repository.workdir().unwrap().join("file.txt"), contents).unwrap();
+        let mut index = repository.index().unwrap();
+        index.add_path(Path::new("file.txt")).unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repository.find_tree(tree_id).unwrap();
+        let signature = git2::Signature::now("Fixture", "fixture@example.com").unwrap();
+        let parents = repository
+            .head()
+            .ok()
+            .and_then(|head| head.peel_to_commit().ok())
+            .into_iter()
+            .collect::<Vec<_>>();
+        let parent_refs = parents.iter().collect::<Vec<_>>();
+        repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                contents,
+                &tree,
+                &parent_refs,
+            )
+            .unwrap()
     }
 
     #[test]

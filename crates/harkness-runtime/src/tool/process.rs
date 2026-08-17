@@ -22,8 +22,9 @@
 //!   caller because a Git verb's output is small and structured. A tool's child
 //!   can emit a gigabyte, so each stream is streamed into an artifact as it
 //!   arrives and only [`ExecutionContext::stream_tail_bytes`] of it is retained
-//!   in memory. Peak memory is the tail plus one read buffer, whatever the child
-//!   produces.
+//!   in memory. A caller may also cap the artifact while the reader keeps
+//!   draining and counting the complete stream. Peak memory is the tail plus one
+//!   read buffer, whatever the child produces.
 //! - **The deadline is the call's, not the command's.** A tool does not get to
 //!   invent a limit; it inherits the one the executor put on the
 //!   [`ExecutionContext`], so a child cannot outlive the call that started it.
@@ -116,6 +117,16 @@ pub enum Capture {
         /// IANA media type the content is stored as.
         media_type: String,
     },
+
+    /// Streams at most `max_bytes` into an artifact while draining the rest.
+    BoundedArtifact {
+        /// Label the artifact is recorded under.
+        name: String,
+        /// IANA media type the content is stored as.
+        media_type: String,
+        /// Most child-controlled bytes admitted to artifact storage.
+        max_bytes: u64,
+    },
 }
 
 impl Capture {
@@ -136,6 +147,20 @@ impl Capture {
             media_type: media_type.into(),
         }
     }
+
+    /// Streams at most `max_bytes` into a `text/plain` artifact named `name`.
+    ///
+    /// Bytes beyond the cap are still drained from the child and included in
+    /// [`CapturedStream::byte_len`], so applying a storage bound cannot
+    /// deadlock the child on a full pipe or make its emitted-byte count lie.
+    #[must_use]
+    pub fn bounded_artifact(name: impl Into<String>, max_bytes: u64) -> Self {
+        Self::BoundedArtifact {
+            name: name.into(),
+            media_type: "text/plain".to_owned(),
+            max_bytes,
+        }
+    }
 }
 
 /// What one of a child's streams produced.
@@ -145,6 +170,7 @@ pub struct CapturedStream {
     byte_len: u64,
     truncated: bool,
     artifact: Option<ArtifactRef>,
+    artifact_truncated: bool,
 }
 
 impl CapturedStream {
@@ -171,10 +197,19 @@ impl CapturedStream {
         self.truncated
     }
 
-    /// The artifact holding every byte, when the stream was captured into one.
+    /// The artifact holding captured bytes, when the stream was stored in one.
+    ///
+    /// A bounded capture contains only the prefix admitted by its byte cap; use
+    /// [`Self::artifact_is_truncated`] to distinguish that from a complete one.
     #[must_use]
     pub const fn artifact(&self) -> Option<&ArtifactRef> {
         self.artifact.as_ref()
+    }
+
+    /// Whether a caller-selected byte cap omitted stream bytes from the artifact.
+    #[must_use]
+    pub const fn artifact_is_truncated(&self) -> bool {
+        self.artifact_truncated
     }
 }
 
@@ -761,11 +796,34 @@ impl ToolProcess {
 fn open_capture(
     context: &mut ExecutionContext,
     capture: &Capture,
-) -> Result<Option<Box<dyn ArtifactStream>>, ToolError> {
+) -> Result<OpenedCapture, ToolError> {
     match capture {
-        Capture::Tail => Ok(None),
-        Capture::Artifact { name, media_type } => context.open_artifact(name, media_type).map(Some),
+        Capture::Tail => Ok(OpenedCapture::default()),
+        Capture::Artifact { name, media_type } => {
+            context
+                .open_artifact(name, media_type)
+                .map(|artifact| OpenedCapture {
+                    artifact: Some(artifact),
+                    byte_limit: None,
+                })
+        }
+        Capture::BoundedArtifact {
+            name,
+            media_type,
+            max_bytes,
+        } => context
+            .open_artifact(name, media_type)
+            .map(|artifact| OpenedCapture {
+                artifact: Some(artifact),
+                byte_limit: Some(*max_bytes),
+            }),
     }
+}
+
+#[derive(Default)]
+struct OpenedCapture {
+    artifact: Option<Box<dyn ArtifactStream>>,
+    byte_limit: Option<u64>,
 }
 
 #[cfg(unix)]
@@ -926,6 +984,8 @@ fn terminate_process_group(child: &mut SupervisedChild) {
 struct Drained {
     tail: Tail,
     artifact: Option<Box<dyn ArtifactStream>>,
+    artifact_bytes_remaining: Option<u64>,
+    artifact_truncated: bool,
     failure: Option<String>,
 }
 
@@ -952,6 +1012,7 @@ impl Drained {
             byte_len: self.tail.total,
             truncated: self.tail.truncated,
             artifact,
+            artifact_truncated: self.artifact_truncated,
         })
     }
 }
@@ -965,7 +1026,7 @@ fn finish_stream(
     Ok(stream)
 }
 
-/// Reads one stream to its end, storing every byte and retaining the last few.
+/// Reads one stream to its end, storing its admitted prefix and retaining its tail.
 ///
 /// A read failure ends the drain with what arrived before it. The exit status
 /// and the child's own diagnostics decide the outcome of a command, never this —
@@ -975,7 +1036,7 @@ fn finish_stream(
 fn drain(
     stream: impl Read,
     tail_bytes: usize,
-    artifact: Option<Box<dyn ArtifactStream>>,
+    capture: OpenedCapture,
     segments: Option<SyncSender<String>>,
     stop: Arc<AtomicBool>,
 ) -> Drained {
@@ -983,7 +1044,9 @@ fn drain(
 
     let mut drained = Drained {
         tail: Tail::new(tail_bytes),
-        artifact,
+        artifact: capture.artifact,
+        artifact_bytes_remaining: capture.byte_limit,
+        artifact_truncated: false,
         failure: None,
     };
     let mut reader = std::io::BufReader::new(stream);
@@ -1030,11 +1093,26 @@ fn drain(
         };
         let chunk = &buffer[..read];
 
-        if let Some(artifact) = drained.artifact.as_mut()
-            && let Err(error) = artifact.write_all(chunk)
-        {
-            drained.failure = Some(format!("a captured stream could not be stored: {error}"));
-            drained.artifact = None;
+        if let Some(artifact) = drained.artifact.as_mut() {
+            let admitted = drained
+                .artifact_bytes_remaining
+                .map_or(chunk.len(), |remaining| {
+                    usize::try_from(remaining)
+                        .unwrap_or(usize::MAX)
+                        .min(chunk.len())
+                });
+            if admitted < chunk.len() {
+                drained.artifact_truncated = true;
+            }
+            if admitted > 0
+                && let Err(error) = artifact.write_all(&chunk[..admitted])
+            {
+                drained.failure = Some(format!("a captured stream could not be stored: {error}"));
+                drained.artifact = None;
+            }
+            if let Some(remaining) = drained.artifact_bytes_remaining.as_mut() {
+                *remaining = remaining.saturating_sub(admitted as u64);
+            }
         }
         drained.tail.push(chunk);
 
@@ -1151,9 +1229,41 @@ impl Tail {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
+    use std::io::{self, Cursor, Write};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex, mpsc};
 
-    use super::{MAX_SEGMENT_BYTES, PollAction, Tail, poll_action, split_segments};
+    use super::{
+        ArtifactRef, ArtifactStream, MAX_SEGMENT_BYTES, OpenedCapture, PollAction,
+        READ_BUFFER_BYTES, Tail, ToolError, drain, poll_action, split_segments,
+    };
+
+    #[derive(Clone, Default)]
+    struct RecordedBytes(Arc<Mutex<Vec<u8>>>);
+
+    struct RecordingArtifact(RecordedBytes);
+
+    impl Write for RecordingArtifact {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ArtifactStream for RecordingArtifact {
+        fn finish(self: Box<Self>) -> Result<ArtifactRef, ToolError> {
+            let byte_len = self.0.0.lock().unwrap().len() as u64;
+            Ok(ArtifactRef {
+                id: "recorded".to_owned(),
+                media_type: "text/plain".to_owned(),
+                byte_len,
+            })
+        }
+    }
 
     #[test]
     fn an_observed_exit_outranks_every_stop_signal_from_the_same_poll() {
@@ -1275,5 +1385,51 @@ mod tests {
         assert!(tail.retained().is_empty());
         assert_eq!(tail.total, 9);
         assert!(tail.truncated);
+    }
+
+    #[test]
+    fn bounded_artifact_stores_only_the_prefix_but_drains_and_counts_every_byte() {
+        let mut input = vec![b'x'; READ_BUFFER_BYTES * 3 + 17];
+        input[..6].copy_from_slice(b"012345");
+        let recorded = RecordedBytes::default();
+        let drained = drain(
+            Cursor::new(&input),
+            4,
+            OpenedCapture {
+                artifact: Some(Box::new(RecordingArtifact(recorded.clone()))),
+                byte_limit: Some(6),
+            },
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let stream = drained.finish().unwrap();
+
+        assert_eq!(recorded.0.lock().unwrap().as_slice(), b"012345");
+        assert_eq!(stream.artifact().unwrap().byte_len, 6);
+        assert_eq!(stream.byte_len(), input.len() as u64);
+        assert_eq!(stream.tail(), "xxxx");
+        assert!(stream.is_truncated());
+        assert!(stream.artifact_is_truncated());
+    }
+
+    #[test]
+    fn output_exactly_at_the_artifact_cap_is_complete() {
+        let recorded = RecordedBytes::default();
+        let stream = drain(
+            Cursor::new(b"abcdef"),
+            8,
+            OpenedCapture {
+                artifact: Some(Box::new(RecordingArtifact(recorded.clone()))),
+                byte_limit: Some(6),
+            },
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .finish()
+        .unwrap();
+
+        assert_eq!(recorded.0.lock().unwrap().as_slice(), b"abcdef");
+        assert_eq!(stream.byte_len(), 6);
+        assert!(!stream.artifact_is_truncated());
     }
 }

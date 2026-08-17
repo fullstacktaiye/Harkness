@@ -701,15 +701,17 @@ impl Store {
         self.with_reader(|connection| listing::list_runs(connection, page))
     }
 
-    /// Returns newest run identities for one tool and catalog project.
-    pub fn project_tool_run_ids(
+    /// Returns the newest `check.run` call for each requested configured id.
+    ///
+    /// The result is bounded by `check_ids`, whose catalog limit is 32, rather
+    /// than by an arbitrary page of unrelated newer runs.
+    pub fn project_latest_check_call_ids(
         &self,
         project_id: harkness_core::ProjectId,
-        tool_id: &str,
-        limit: usize,
-    ) -> Result<Vec<RunId>, StoreError> {
+        check_ids: &[String],
+    ) -> Result<Vec<ToolCallId>, StoreError> {
         self.with_reader(|connection| {
-            listing::project_tool_run_ids(connection, project_id, tool_id, limit)
+            listing::project_latest_tool_call_ids_by_check(connection, project_id, check_ids)
         })
     }
 

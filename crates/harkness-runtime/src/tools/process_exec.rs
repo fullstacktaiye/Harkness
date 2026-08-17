@@ -20,8 +20,10 @@ use crate::trust::{
 pub const DEFAULT_PROCESS_TIMEOUT_SECONDS: u64 = 120;
 /// Longest child-process timeout a request can select.
 pub const MAX_PROCESS_TIMEOUT_SECONDS: u64 = 600;
-/// Most text from either stream carried inline beside its full artifact.
+/// Most text from either stream carried inline beside its captured artifact.
 pub const MAX_INLINE_TAIL_BYTES: usize = 4 * 1024;
+/// Most bytes from each check output stream admitted to artifact storage.
+pub const MAX_CHECK_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
 /// Extra call time reserved for spawn, termination, draining, and persistence.
 const PROCESS_CALL_TIMEOUT_SECONDS: u64 = MAX_PROCESS_TIMEOUT_SECONDS + 10;
 
@@ -40,7 +42,7 @@ pub struct ProcessExecInput {
     pub timeout_seconds: Option<u64>,
 }
 
-/// A bounded inline view of one complete artifact-backed stream.
+/// A bounded inline view of one artifact-backed process stream.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BoundedText {
@@ -70,9 +72,9 @@ pub struct ProcessExecOutput {
     pub stdout_tail: BoundedText,
     /// Bounded tail of standard error.
     pub stderr_tail: BoundedText,
-    /// Artifact containing the full standard-output byte stream.
+    /// Artifact containing captured standard-output bytes.
     pub stdout_artifact: ArtifactRef,
-    /// Artifact containing the full standard-error byte stream.
+    /// Artifact containing captured standard-error bytes.
     pub stderr_artifact: ArtifactRef,
 }
 
@@ -112,9 +114,11 @@ impl Tool for ProcessExec {
             input.env,
             input.timeout_seconds,
             &[],
+            None,
             "process",
             context,
         )
+        .map(|output| output.process)
     }
 }
 
@@ -180,9 +184,11 @@ impl Tool for TestRun {
             input.env,
             input.timeout_seconds,
             &[],
+            None,
             "test",
             context,
-        )?;
+        )?
+        .process;
         Ok(TestRunOutput {
             passed: process.exit_code == Some(0) && !process.timed_out,
             process,
@@ -237,6 +243,21 @@ pub struct CheckWorkspaceState {
     pub snapshot_artifact: ArtifactRef,
 }
 
+/// Redaction-safe machine encoding of a strict snapshot wire record.
+///
+/// Artifact value redaction is deliberately free to rewrite string values.
+/// Encoding the original JSON as integers preserves the byte-exact durable
+/// identity while still passing through the ordinary value-redaction path;
+/// published object keys and numeric values are not secret-bearing text.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CheckSnapshotArtifact {
+    pub(crate) schema_version: u32,
+    pub(crate) snapshot_json_bytes: Vec<u8>,
+}
+
+pub(crate) const CHECK_SNAPSHOT_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+
 /// Result of `check.run@1.0.0`.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -251,6 +272,12 @@ pub struct CheckRunOutput {
     pub parser: CheckOutputParser,
     /// Exact workspace identity captured immediately before spawn.
     pub workspace_state: CheckWorkspaceState,
+    /// Per-stream byte cap applied to each check output artifact.
+    pub artifact_byte_limit: u64,
+    /// Whether standard output exceeded the artifact byte cap.
+    pub stdout_artifact_truncated: bool,
+    /// Whether standard error exceeded the artifact byte cap.
+    pub stderr_artifact_truncated: bool,
     /// Controlled child-process result and bounded inline tails.
     #[serde(flatten)]
     pub process: ProcessExecOutput,
@@ -268,7 +295,7 @@ impl Tool for CheckRun {
         process_metadata(
             "check.run",
             "Run a project check",
-            "Captures the composite workspace identity, executes one configured argv-only check, and stores complete bounded-output artifacts.",
+            "Captures the composite workspace identity, executes one configured argv-only check, and stores capped output artifacts with total-byte and truncation metadata.",
             &[],
         )
     }
@@ -299,34 +326,44 @@ impl Tool for CheckRun {
             context.cancellation(),
         )
         .map_err(ToolError::execution_failed)?;
-        let mut snapshot_stream = context.open_artifact(
-            "check-workspace-state.json",
-            "application/vnd.harkness.workspace-snapshot+json",
-        )?;
-        serde_json::to_writer(&mut snapshot_stream, &SnapshotWireRef::from(&snapshot))
+        let snapshot_json_bytes = serde_json::to_vec(&SnapshotWireRef::from(&snapshot))
             .map_err(ToolError::execution_failed)?;
-        let snapshot_artifact = snapshot_stream.finish()?;
+        let encoded = serde_json::to_value(CheckSnapshotArtifact {
+            schema_version: CHECK_SNAPSHOT_ARTIFACT_SCHEMA_VERSION,
+            snapshot_json_bytes,
+        })
+        .map_err(ToolError::execution_failed)?;
+        let snapshot_artifact = context.write_json_artifact(
+            "check-workspace-state.json",
+            "application/vnd.harkness.workspace-snapshot-bytes+json",
+            &encoded,
+        )?;
         let workspace_state = CheckWorkspaceState {
             digest: snapshot.digest().to_string(),
             head: snapshot.head().map(str::to_owned),
             branch: snapshot.branch().map(str::to_owned),
             snapshot_artifact,
         };
-        let process = run_process(
+        let controlled = run_process(
             input.command,
             input.cwd,
             input.env,
             input.timeout_seconds,
             &[],
+            Some(MAX_CHECK_ARTIFACT_BYTES),
             "check",
             context,
         )?;
+        let process = controlled.process;
         Ok(CheckRunOutput {
             check_id: input.check_id,
             label: input.label,
             passed: process.exit_code == Some(0) && !process.timed_out,
             parser: input.parser,
             workspace_state,
+            artifact_byte_limit: MAX_CHECK_ARTIFACT_BYTES,
+            stdout_artifact_truncated: controlled.stdout_artifact_truncated,
+            stderr_artifact_truncated: controlled.stderr_artifact_truncated,
             process,
         })
     }
@@ -368,9 +405,10 @@ fn run_process(
     overrides: Option<BTreeMap<String, String>>,
     timeout_seconds: Option<u64>,
     declared_environment: &[EnvironmentName],
+    artifact_byte_limit: Option<u64>,
     artifact_prefix: &str,
     context: &mut ExecutionContext,
-) -> Result<ProcessExecOutput, ToolError> {
+) -> Result<ControlledProcessOutput, ToolError> {
     let Some((program, arguments)) = argv.split_first() else {
         // The generated schema rejects this before the body in normal dispatch.
         // Keep the body total for a typed caller invoking it directly.
@@ -393,9 +431,13 @@ fn run_process(
     )
     .map_err(ToolError::execution_failed)?;
     let timeout_seconds = effective_timeout(timeout_seconds);
+    let stdout_capture =
+        artifact_capture(format!("{artifact_prefix}-stdout.log"), artifact_byte_limit);
+    let stderr_capture =
+        artifact_capture(format!("{artifact_prefix}-stderr.log"), artifact_byte_limit);
     let output = ToolProcess::new(spec)
-        .capture_stdout(Capture::artifact(format!("{artifact_prefix}-stdout.log")))
-        .capture_stderr(Capture::artifact(format!("{artifact_prefix}-stderr.log")))
+        .capture_stdout(stdout_capture)
+        .capture_stderr(stderr_capture)
         .within(Duration::from_secs(timeout_seconds))
         .run(context)?;
 
@@ -409,17 +451,34 @@ fn run_process(
         .artifact()
         .cloned()
         .expect("stderr was configured as an artifact");
-    Ok(ProcessExecOutput {
-        exit_code: output.code(),
-        signal: output.signal(),
-        timed_out: output.timed_out(),
-        timeout_seconds,
-        duration_ms: u64::try_from(output.duration().as_millis()).unwrap_or(u64::MAX),
-        stdout_tail: bounded_tail(output.stdout()),
-        stderr_tail: bounded_tail(output.stderr()),
-        stdout_artifact,
-        stderr_artifact,
+    Ok(ControlledProcessOutput {
+        stdout_artifact_truncated: output.stdout().artifact_is_truncated(),
+        stderr_artifact_truncated: output.stderr().artifact_is_truncated(),
+        process: ProcessExecOutput {
+            exit_code: output.code(),
+            signal: output.signal(),
+            timed_out: output.timed_out(),
+            timeout_seconds,
+            duration_ms: u64::try_from(output.duration().as_millis()).unwrap_or(u64::MAX),
+            stdout_tail: bounded_tail(output.stdout()),
+            stderr_tail: bounded_tail(output.stderr()),
+            stdout_artifact,
+            stderr_artifact,
+        },
     })
+}
+
+struct ControlledProcessOutput {
+    process: ProcessExecOutput,
+    stdout_artifact_truncated: bool,
+    stderr_artifact_truncated: bool,
+}
+
+fn artifact_capture(name: String, byte_limit: Option<u64>) -> Capture {
+    match byte_limit {
+        Some(max_bytes) => Capture::bounded_artifact(name, max_bytes),
+        None => Capture::artifact(name),
+    }
 }
 
 fn effective_timeout(requested: Option<u64>) -> u64 {
@@ -443,12 +502,27 @@ fn bounded_tail(stream: &CapturedStream) -> BoundedText {
 
 #[cfg(test)]
 mod tests {
-    use super::effective_timeout;
+    use super::{Capture, MAX_CHECK_ARTIFACT_BYTES, artifact_capture, effective_timeout};
 
     #[test]
     fn timeout_default_and_hard_cap_are_stable() {
         assert_eq!(effective_timeout(None), 120);
         assert_eq!(effective_timeout(Some(0)), 1);
         assert_eq!(effective_timeout(Some(601)), 600);
+    }
+
+    #[test]
+    fn check_capture_uses_the_named_artifact_cap() {
+        assert_eq!(
+            artifact_capture(
+                "check-stdout.log".to_owned(),
+                Some(MAX_CHECK_ARTIFACT_BYTES)
+            ),
+            Capture::BoundedArtifact {
+                name: "check-stdout.log".to_owned(),
+                media_type: "text/plain".to_owned(),
+                max_bytes: MAX_CHECK_ARTIFACT_BYTES,
+            }
+        );
     }
 }

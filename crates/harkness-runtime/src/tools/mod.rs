@@ -35,6 +35,7 @@ pub use process_exec::{
     BoundedText, CheckOutputParser, CheckRun, CheckRunInput, CheckRunOutput, CheckWorkspaceState,
     ProcessExec, ProcessExecInput, ProcessExecOutput, TestRun, TestRunInput, TestRunOutput,
 };
+pub(crate) use process_exec::{CHECK_SNAPSHOT_ARTIFACT_SCHEMA_VERSION, CheckSnapshotArtifact};
 pub use workspace_inspect::{
     DEFAULT_INSPECT_MAX_ENTRIES, InspectOmission, InspectedProject, MAX_INSPECT_ENTRIES,
     ProjectSourceKind, WorkspaceEntry, WorkspaceGitSummary, WorkspaceInspect,

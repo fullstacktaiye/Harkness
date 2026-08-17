@@ -2025,6 +2025,41 @@ fn check_outcome_name(outcome: harkness_runtime::check::CheckOutcome) -> &'stati
     }
 }
 
+fn check_evidence_class_name(evidence: harkness_runtime::check::ActivityClass) -> &'static str {
+    use harkness_runtime::check::ActivityClass;
+    match evidence {
+        ActivityClass::HarknessObserved => "harkness_observed",
+        ActivityClass::HarknessMediated => "harkness_mediated",
+        ActivityClass::AcpReported => "acp_reported",
+        ActivityClass::SnapshotInferred => "snapshot_inferred",
+        ActivityClass::Unobserved => "unobserved",
+    }
+}
+
+fn check_parser_name(parser: harkness_core::CheckParser) -> &'static str {
+    match parser {
+        harkness_core::CheckParser::Plain => "plain",
+        harkness_core::CheckParser::CargoJson => "cargo_json",
+    }
+}
+
+fn check_environment(environment: &std::collections::BTreeMap<String, String>) -> QList<QVariant> {
+    let mut projected = QList::<QVariant>::default();
+    for (name, value) in environment {
+        let mut row = QMap::<QMapPair_QString_QVariant>::default();
+        row.insert(
+            QString::from("name"),
+            QVariant::from(&QString::from(name.as_str())),
+        );
+        row.insert(
+            QString::from("value"),
+            QVariant::from(&QString::from(value.as_str())),
+        );
+        projected.append(QVariant::from(&row));
+    }
+    projected
+}
+
 fn to_checks(
     project_id: &str,
     configurations: &[harkness_core::CheckConfiguration],
@@ -2059,6 +2094,22 @@ fn to_checks(
             command.append(QVariant::from(&QString::from(part.as_str())));
         }
         row.insert(QString::from("command"), QVariant::from(&command));
+        row.insert(
+            QString::from("cwd"),
+            QVariant::from(&QString::from(check.cwd.as_deref().unwrap_or(""))),
+        );
+        row.insert(
+            QString::from("environment"),
+            QVariant::from(&check_environment(&check.env)),
+        );
+        row.insert(
+            QString::from("timeoutSeconds"),
+            QVariant::from(&i64::try_from(check.timeout_seconds.unwrap_or(0)).unwrap_or(i64::MAX)),
+        );
+        row.insert(
+            QString::from("parser"),
+            QVariant::from(&QString::from(check_parser_name(check.parser))),
+        );
         configured.append(QVariant::from(&row));
     }
     state.insert(QString::from("configured"), QVariant::from(&configured));
@@ -2082,6 +2133,12 @@ fn to_checks(
             QString::from("outcome"),
             QVariant::from(&QString::from(check_outcome_name(result.outcome))),
         );
+        row.insert(
+            QString::from("evidenceClass"),
+            QVariant::from(&QString::from(check_evidence_class_name(
+                result.evidence_class,
+            ))),
+        );
         let (freshness, freshness_detail) = match &result.freshness {
             harkness_runtime::check::CheckFreshness::Current => ("current", String::new()),
             harkness_runtime::check::CheckFreshness::Stale { changed } => {
@@ -2100,6 +2157,14 @@ fn to_checks(
             QVariant::from(&QString::from(freshness_detail.as_str())),
         );
         row.insert(
+            QString::from("stateHead"),
+            QVariant::from(&QString::from(result.state_head.as_deref().unwrap_or(""))),
+        );
+        row.insert(
+            QString::from("stateDigest"),
+            QVariant::from(&QString::from(result.state_digest.as_deref().unwrap_or(""))),
+        );
+        row.insert(
             QString::from("createdAt"),
             QVariant::from(&QString::from(result.created_at.as_str())),
         );
@@ -2114,6 +2179,72 @@ fn to_checks(
         row.insert(
             QString::from("stderrTail"),
             QVariant::from(&QString::from(result.stderr_tail.as_str())),
+        );
+        row.insert(
+            QString::from("stdoutTruncated"),
+            QVariant::from(&result.stdout_truncated),
+        );
+        row.insert(
+            QString::from("stderrTruncated"),
+            QVariant::from(&result.stderr_truncated),
+        );
+        row.insert(
+            QString::from("artifactByteLimit"),
+            QVariant::from(&i64::try_from(result.artifact_byte_limit).unwrap_or(i64::MAX)),
+        );
+        row.insert(
+            QString::from("stdoutArtifactTruncated"),
+            QVariant::from(&result.stdout_artifact_truncated),
+        );
+        row.insert(
+            QString::from("stderrArtifactTruncated"),
+            QVariant::from(&result.stderr_artifact_truncated),
+        );
+        let mut recorded_command = QList::<QVariant>::default();
+        for part in &result.command {
+            recorded_command.append(QVariant::from(&QString::from(part.as_str())));
+        }
+        row.insert(
+            QString::from("recordedCommand"),
+            QVariant::from(&recorded_command),
+        );
+        row.insert(
+            QString::from("recordedCwd"),
+            QVariant::from(&QString::from(result.recorded_cwd.as_deref().unwrap_or(""))),
+        );
+        row.insert(
+            QString::from("recordedEnvironment"),
+            QVariant::from(&check_environment(&result.recorded_env)),
+        );
+        row.insert(
+            QString::from("recordedTimeoutSeconds"),
+            QVariant::from(
+                &i64::try_from(result.recorded_timeout.unwrap_or(0)).unwrap_or(i64::MAX),
+            ),
+        );
+        row.insert(
+            QString::from("recordedParser"),
+            QVariant::from(&QString::from(result.recorded_parser.as_str())),
+        );
+        row.insert(
+            QString::from("definitionCurrent"),
+            QVariant::from(&result.definition_current),
+        );
+        row.insert(
+            QString::from("workspaceCleanKnown"),
+            QVariant::from(&result.workspace_clean.is_some()),
+        );
+        row.insert(
+            QString::from("workspaceClean"),
+            QVariant::from(&result.workspace_clean.unwrap_or(false)),
+        );
+        row.insert(
+            QString::from("workspaceMatchesIndexKnown"),
+            QVariant::from(&result.workspace_matches_index.is_some()),
+        );
+        row.insert(
+            QString::from("workspaceMatchesIndex"),
+            QVariant::from(&result.workspace_matches_index.unwrap_or(false)),
         );
         let mut diagnostics = QList::<QVariant>::default();
         for diagnostic in &result.diagnostics {
@@ -2144,6 +2275,10 @@ fn to_checks(
         row.insert(
             QString::from("diagnosticsOmitted"),
             QVariant::from(&i32::try_from(result.diagnostics_omitted).unwrap_or(i32::MAX)),
+        );
+        row.insert(
+            QString::from("diagnosticsScanTruncated"),
+            QVariant::from(&result.diagnostics_scan_truncated),
         );
         recorded.append(QVariant::from(&row));
     }
@@ -4163,6 +4298,26 @@ fn to_review(row: &ReviewStateRow, loaded_path_id: &str) -> QVariant {
         })
         .unwrap_or_default();
     insert("commitId", QVariant::from(&QString::from(commit_id)));
+    let (check_target_kind, check_target_head) =
+        row.target
+            .as_ref()
+            .map_or(("unavailable", ""), |target| match &target.target {
+                harkness_git::DiffTarget::Staged => ("index", ""),
+                harkness_git::DiffTarget::Unstaged => ("worktree", ""),
+                harkness_git::DiffTarget::Commit { revision, .. } => ("commit", revision.as_str()),
+                harkness_git::DiffTarget::Revisions { new_revision, .. } => {
+                    ("commit", new_revision.as_str())
+                }
+                _ => ("unsupported", ""),
+            });
+    insert(
+        "checkTargetKind",
+        QVariant::from(&QString::from(check_target_kind)),
+    );
+    insert(
+        "checkTargetHead",
+        QVariant::from(&QString::from(check_target_head)),
+    );
 
     let (file_start, file_end, file_total) = review_file_window(row);
     insert(
@@ -7847,8 +8002,8 @@ mod tests {
         retreat_review_file_window, retreat_review_row_window, review_content_summary,
         review_file_discard_description, review_file_window, review_hunk_exists_where, review_path,
         review_row_count, review_rows, run_git_operation_with_git, run_git_status_with_git,
-        selected_review_path, status_discard_description, text_segments, to_branches, to_git,
-        to_jobs, to_map, to_projects, to_review, to_review_line_row, update_job,
+        selected_review_path, status_discard_description, text_segments, to_branches, to_checks,
+        to_git, to_jobs, to_map, to_projects, to_review, to_review_line_row, update_job,
         working_tree_may_differ, worktree_base, worktree_job_lock_scope,
     };
 
@@ -7866,6 +8021,128 @@ mod tests {
             git,
             checks: None,
         }
+    }
+
+    #[test]
+    fn checks_projection_carries_the_complete_invocation_and_recorded_evidence() {
+        let configuration = harkness_core::CheckConfiguration {
+            id: "custom.verify".to_owned(),
+            label: "Custom verify".to_owned(),
+            command: vec!["custom tool".to_owned(), "%2".to_owned()],
+            cwd: Some("nested dir".to_owned()),
+            env: std::collections::BTreeMap::from([
+                ("A_FIRST".to_owned(), "first".to_owned()),
+                ("Z_LAST".to_owned(), "last".to_owned()),
+            ]),
+            parser: harkness_core::CheckParser::CargoJson,
+            timeout_seconds: Some(45),
+        };
+        let summary = harkness_runtime::check::CheckSummary {
+            run_id: "run-1".to_owned(),
+            check_id: configuration.id.clone(),
+            label: configuration.label.clone(),
+            command: vec!["old tool".to_owned(), "verify".to_owned()],
+            recorded_cwd: Some("old dir".to_owned()),
+            recorded_env: std::collections::BTreeMap::from([(
+                "MODE".to_owned(),
+                "strict".to_owned(),
+            )]),
+            recorded_timeout: Some(77),
+            recorded_parser: "plain".to_owned(),
+            definition_current: false,
+            outcome: harkness_runtime::check::CheckOutcome::Failed,
+            evidence_class: harkness_runtime::check::ActivityClass::HarknessObserved,
+            created_at: "2026-08-17T00:00:00.000000000Z".to_owned(),
+            finished_at: Some("2026-08-17T00:00:01.000000000Z".to_owned()),
+            duration_ms: Some(1_000),
+            state_digest: Some("digest-1".to_owned()),
+            state_head: Some("head-1".to_owned()),
+            workspace_clean: Some(false),
+            workspace_matches_index: Some(true),
+            freshness: harkness_runtime::check::CheckFreshness::Stale {
+                changed: vec!["src/main.rs".to_owned()],
+            },
+            diagnostics: Vec::new(),
+            diagnostics_omitted: 3,
+            diagnostics_scan_truncated: true,
+            stdout_tail: "stdout".to_owned(),
+            stderr_tail: "stderr".to_owned(),
+            stdout_truncated: true,
+            stderr_truncated: false,
+            artifact_byte_limit: 8 * 1024 * 1024,
+            stdout_artifact_truncated: true,
+            stderr_artifact_truncated: false,
+        };
+
+        let state = review_map(&to_checks(
+            "project-1",
+            &[configuration],
+            &[summary],
+            false,
+            "",
+        ));
+        let configured = review_field(&state, "configured")
+            .value::<QList<QVariant>>()
+            .expect("configured checks should flatten to a QVariantList");
+        let configured = review_map(configured.get(0).expect("one configured check"));
+        assert_eq!(review_text(&configured, "cwd"), "nested dir");
+        assert_eq!(review_text(&configured, "parser"), "cargo_json");
+        assert_eq!(
+            review_field(&configured, "timeoutSeconds").value::<i64>(),
+            Some(45)
+        );
+        let environment = review_field(&configured, "environment")
+            .value::<QList<QVariant>>()
+            .expect("environment should flatten to a QVariantList");
+        assert_eq!(
+            review_text(&review_map(environment.get(0).unwrap()), "name"),
+            "A_FIRST"
+        );
+        assert_eq!(
+            review_text(&review_map(environment.get(1).unwrap()), "name"),
+            "Z_LAST"
+        );
+
+        let results = review_field(&state, "results")
+            .value::<QList<QVariant>>()
+            .expect("recorded checks should flatten to a QVariantList");
+        let result = review_map(results.get(0).expect("one recorded check"));
+        let recorded_command = review_field(&result, "recordedCommand")
+            .value::<QList<QVariant>>()
+            .expect("recorded command should flatten to a QVariantList");
+        assert_eq!(
+            recorded_command
+                .iter()
+                .map(|part| part.value::<QString>().unwrap().to_string())
+                .collect::<Vec<_>>(),
+            ["old tool", "verify"]
+        );
+        assert_eq!(review_text(&result, "recordedCwd"), "old dir");
+        assert_eq!(review_text(&result, "recordedParser"), "plain");
+        assert_eq!(
+            review_field(&result, "recordedTimeoutSeconds").value::<i64>(),
+            Some(77)
+        );
+        let recorded_environment = review_field(&result, "recordedEnvironment")
+            .value::<QList<QVariant>>()
+            .expect("recorded environment should flatten to a QVariantList");
+        assert_eq!(
+            review_text(&review_map(recorded_environment.get(0).unwrap()), "value"),
+            "strict"
+        );
+        assert_eq!(review_text(&result, "stateHead"), "head-1");
+        assert_eq!(review_text(&result, "stateDigest"), "digest-1");
+        assert_eq!(review_text(&result, "evidenceClass"), "harkness_observed");
+        assert!(!review_flag(&result, "definitionCurrent"));
+        assert!(review_flag(&result, "workspaceCleanKnown"));
+        assert!(!review_flag(&result, "workspaceClean"));
+        assert!(review_flag(&result, "workspaceMatchesIndexKnown"));
+        assert!(review_flag(&result, "workspaceMatchesIndex"));
+        assert!(review_flag(&result, "stdoutTruncated"));
+        assert!(!review_flag(&result, "stderrTruncated"));
+        assert!(review_flag(&result, "stdoutArtifactTruncated"));
+        assert!(!review_flag(&result, "stderrArtifactTruncated"));
+        assert!(review_flag(&result, "diagnosticsScanTruncated"));
     }
 
     fn initialize_repository(root: &Path) {

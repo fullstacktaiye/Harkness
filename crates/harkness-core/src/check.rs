@@ -9,8 +9,16 @@ use serde::{Deserialize, Serialize};
 pub const MAX_PROJECT_CHECKS: usize = 32;
 /// Most argv elements one configured check may contain.
 pub const MAX_CHECK_ARGUMENTS: usize = 128;
+/// Most explicit environment overrides one configured check may contain.
+pub const MAX_CHECK_ENVIRONMENT_ENTRIES: usize = 128;
 /// Longest configured identifier, label, argument, path, or environment value.
 pub const MAX_CHECK_TEXT_BYTES: usize = 4 * 1024;
+/// Largest serialized check definition accepted by the catalog.
+///
+/// Runtime tool inputs have a 64 KiB durable-column limit. Keeping the catalog
+/// definition below 60 KiB leaves room for the `check.run` input field names,
+/// nullable fields, and parser spelling added by the runtime projection.
+pub const MAX_CHECK_SERIALIZED_BYTES: usize = 60 * 1024;
 
 /// How Harkness should interpret a check's machine-readable output.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -97,12 +105,20 @@ impl CheckConfiguration {
         {
             return Err("a project check cwd must be non-empty and at most 4096 bytes");
         }
+        if self.env.len() > MAX_CHECK_ENVIRONMENT_ENTRIES {
+            return Err("a project check environment may contain at most 128 entries");
+        }
         if self.env.iter().any(|(name, value)| {
             name.is_empty()
                 || name.len() > MAX_CHECK_TEXT_BYTES
                 || value.len() > MAX_CHECK_TEXT_BYTES
         }) {
             return Err("project check environment names and values must fit the 4096-byte bound");
+        }
+        let serialized = serde_json::to_vec(self)
+            .map_err(|_| "a project check definition must be JSON-serializable")?;
+        if serialized.len() > MAX_CHECK_SERIALIZED_BYTES {
+            return Err("a project check definition must serialize to at most 61440 bytes");
         }
         Ok(())
     }
@@ -163,7 +179,22 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{CheckConfiguration, CheckParser, default_checks};
+    use super::{
+        CheckConfiguration, CheckParser, MAX_CHECK_ENVIRONMENT_ENTRIES, MAX_CHECK_SERIALIZED_BYTES,
+        MAX_CHECK_TEXT_BYTES, default_checks,
+    };
+
+    fn configured_check() -> CheckConfiguration {
+        CheckConfiguration {
+            id: "test".to_owned(),
+            label: "Tests".to_owned(),
+            command: vec!["true".to_owned()],
+            cwd: None,
+            env: Default::default(),
+            parser: CheckParser::Plain,
+            timeout_seconds: None,
+        }
+    }
 
     #[test]
     fn cargo_defaults_are_explicit_argv_only_and_machine_readable_where_possible() {
@@ -200,19 +231,54 @@ mod tests {
         let mut check = default_checks(Path::new("."))
             .into_iter()
             .next()
-            .unwrap_or_else(|| CheckConfiguration {
-                id: "test".to_owned(),
-                label: "Tests".to_owned(),
-                command: vec!["true".to_owned()],
-                cwd: None,
-                env: Default::default(),
-                parser: CheckParser::Plain,
-                timeout_seconds: None,
-            });
+            .unwrap_or_else(configured_check);
         check.command = vec!["true".to_owned()];
         assert_eq!(
             CheckConfiguration::validate_all(&[check.clone(), check]),
             Err("project check identifiers must be unique")
+        );
+    }
+
+    #[test]
+    fn environment_entry_count_is_bounded_before_serialization() {
+        let mut check = configured_check();
+        for index in 0..=MAX_CHECK_ENVIRONMENT_ENTRIES {
+            check.env.insert(format!("CHECK_{index}"), String::new());
+        }
+
+        assert!(serde_json::to_vec(&check).unwrap().len() < MAX_CHECK_SERIALIZED_BYTES);
+        assert_eq!(
+            CheckConfiguration::validate_all(&[check]),
+            Err("a project check environment may contain at most 128 entries")
+        );
+    }
+
+    #[test]
+    fn aggregate_serialized_definition_stays_below_the_runtime_input_limit() {
+        let mut boundary = configured_check();
+        boundary.command = vec!["x".repeat(MAX_CHECK_TEXT_BYTES); 14];
+        let base_bytes = serde_json::to_vec(&boundary).unwrap().len();
+        // Appending one JSON string adds its bytes plus a comma and two quotes.
+        let final_argument_bytes = MAX_CHECK_SERIALIZED_BYTES - base_bytes - 3;
+        assert!((1..=MAX_CHECK_TEXT_BYTES).contains(&final_argument_bytes));
+        boundary.command.push("x".repeat(final_argument_bytes));
+        assert_eq!(
+            serde_json::to_vec(&boundary).unwrap().len(),
+            MAX_CHECK_SERIALIZED_BYTES
+        );
+        assert_eq!(
+            CheckConfiguration::validate_all(&[boundary.clone()]),
+            Ok(())
+        );
+
+        boundary.command.last_mut().unwrap().push('x');
+        assert_eq!(
+            serde_json::to_vec(&boundary).unwrap().len(),
+            MAX_CHECK_SERIALIZED_BYTES + 1
+        );
+        assert_eq!(
+            CheckConfiguration::validate_all(&[boundary]),
+            Err("a project check definition must serialize to at most 61440 bytes")
         );
     }
 }
