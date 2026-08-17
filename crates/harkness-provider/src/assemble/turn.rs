@@ -39,7 +39,7 @@ pub enum IdProvenance {
 /// to correct itself.
 ///
 /// [#126]: https://github.com/fullstacktaiye/harkness/issues/126
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "defect", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum ToolCallDefect {
@@ -66,7 +66,7 @@ pub enum ToolCallDefect {
 /// [`Invalid`](Self::Invalid) one has nothing that could be executed. Making
 /// that a compile-time distinction is what stops "check the flag" from becoming
 /// "forgot to check the flag".
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum AssembledToolCall {
@@ -180,6 +180,75 @@ impl AssembledToolCall {
         match self {
             Self::Ready { .. } => None,
             Self::Invalid { defect, .. } => Some(defect),
+        }
+    }
+}
+
+/// Truncated on purpose, and for the same reason [`AssistantTurn`]'s is: a call
+/// carries as much model-written text as the assembler's per-call cap allows,
+/// so a derived `Debug` here would put a megabyte of arguments into whatever
+/// logged the turn — or logged the [`Disconnected`](crate::contract::ProviderError::Disconnected)
+/// error that carries one. Bounding the *list* is not enough when one entry can
+/// be that large.
+impl fmt::Debug for AssembledToolCall {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ready {
+                index,
+                id,
+                id_provenance,
+                duplicate_of,
+                name,
+                arguments,
+            } => formatter
+                .debug_struct("Ready")
+                .field("index", index)
+                .field("id", id)
+                .field("id_provenance", id_provenance)
+                .field("duplicate_of", duplicate_of)
+                .field("name", name)
+                .field(
+                    "arguments",
+                    &Preview::new(&arguments.to_string(), DEBUG_TEXT_BYTES),
+                )
+                .finish(),
+            Self::Invalid {
+                index,
+                id,
+                id_provenance,
+                duplicate_of,
+                name,
+                raw_arguments,
+                defect,
+            } => formatter
+                .debug_struct("Invalid")
+                .field("index", index)
+                .field("id", id)
+                .field("id_provenance", id_provenance)
+                .field("duplicate_of", duplicate_of)
+                .field("name", name)
+                .field(
+                    "raw_arguments",
+                    &Preview::new(raw_arguments, DEBUG_TEXT_BYTES),
+                )
+                .field("defect", defect)
+                .finish(),
+        }
+    }
+}
+
+/// Previewed too: a parser's account of what it rejected quotes the input, and
+/// [`ErrorDetail`] bounds that at two kilobytes — enough for three entries to
+/// overrun a turn's whole rendering budget.
+impl fmt::Debug for ToolCallDefect {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnparsableArguments { detail } => formatter
+                .debug_struct("UnparsableArguments")
+                .field("detail", &Preview::new(detail.as_str(), DEBUG_TEXT_BYTES))
+                .finish(),
+            Self::MissingName => formatter.write_str("MissingName"),
+            Self::Truncated => formatter.write_str("Truncated"),
         }
     }
 }
@@ -336,6 +405,53 @@ mod tests {
         assert_eq!(turn.ready_calls().count(), 2);
         assert_eq!(turn.invalid_calls().count(), 1);
         assert_eq!(turn.tool_calls.len(), 3, "nothing is dropped");
+    }
+
+    /// Bounding the list is not enough when one entry holds a megabyte: a call's
+    /// arguments are model-written text of exactly the size the assembler's
+    /// per-call cap allows, and a disconnect mid-arguments is the case most
+    /// likely to be logged.
+    #[test]
+    fn debugging_a_turn_bounds_the_calls_inside_it_and_not_only_their_number() {
+        let huge = "x".repeat(900 * 1024);
+        let turn = AssistantTurn {
+            text: String::new(),
+            tool_calls: vec![
+                AssembledToolCall::Invalid {
+                    index: 0,
+                    id: ProviderToolCallId::new("call_1").unwrap(),
+                    id_provenance: IdProvenance::Provider,
+                    duplicate_of: None,
+                    name: Some("fs.read".to_owned()),
+                    raw_arguments: huge.clone(),
+                    defect: ToolCallDefect::UnparsableArguments {
+                        detail: ErrorDetail::new(huge.clone()),
+                    },
+                },
+                AssembledToolCall::Ready {
+                    index: 1,
+                    id: ProviderToolCallId::new("call_2").unwrap(),
+                    id_provenance: IdProvenance::Provider,
+                    duplicate_of: None,
+                    name: "fs.read".to_owned(),
+                    arguments: json!({ "blob": huge }),
+                },
+            ],
+            usage: None,
+            stop: None,
+        };
+
+        let rendered = format!("{turn:?}");
+        assert!(rendered.len() < 4 * 1024, "{} bytes", rendered.len());
+
+        // The same turn reached through the failure that carries it, which is
+        // the path a disconnect mid-arguments takes into a log.
+        let error = crate::contract::ProviderError::Disconnected {
+            detail: ErrorDetail::new("the endpoint went away"),
+            partial: Some(Box::new(turn)),
+        };
+        let rendered = format!("{error:?}");
+        assert!(rendered.len() < 4 * 1024, "{} bytes", rendered.len());
     }
 
     #[test]

@@ -103,13 +103,22 @@ impl<'a> TurnDriver<'a> {
 
     /// Ends the turn because the stream ended.
     ///
+    /// A sink that stopped the turn *after* the provider had already completed
+    /// it stopped nothing: the turn is reported exactly as the provider ended
+    /// it. Reading `aborted` alone would file a fully delivered turn as
+    /// [`AbortedBySink`](crate::contract::StopReason::AbortedBySink) — which a
+    /// sink bounded by its own capacity reaches by answering `Stop` on the last
+    /// event — and tell [#126] work was cut short when none was.
+    ///
     /// # Errors
     ///
     /// Returns [`ProviderError::EmptyResponse`] or
     /// [`ProviderError::Disconnected`] when the stream stopped short, unless
     /// the sink is what stopped it.
+    ///
+    /// [#126]: https://github.com/fullstacktaiye/harkness/issues/126
     pub fn finish(self) -> Result<TurnOutcome, ProviderError> {
-        if self.aborted {
+        if self.aborted && !self.assembler.is_completed() {
             return Ok(self.assembler.abort_by_sink());
         }
         self.assembler.finish()
@@ -212,6 +221,35 @@ mod tests {
             outcome.turn.stop, None,
             "the provider never said why; only the call did"
         );
+    }
+
+    /// A sink that stops on the last event stopped nothing. `RecordedEvents`
+    /// reaches this by construction — it answers `Stop` on the event that fills
+    /// it — so a turn whose length happens to equal a recorder's capacity must
+    /// not be filed as one somebody cut short.
+    #[test]
+    fn a_sink_stopping_on_the_final_event_does_not_make_a_completed_turn_aborted() {
+        let cancellation = Cancellation::default();
+        let mut sink = RecordedEvents::with_capacity(2);
+        let mut driver = TurnDriver::new(&mut sink, &cancellation);
+        assert_eq!(driver.deliver(text("done")).unwrap(), SinkControl::Continue);
+        assert_eq!(
+            driver
+                .deliver(ModelEvent::TurnCompleted {
+                    stop: StopReason::EndTurn
+                })
+                .unwrap(),
+            SinkControl::Stop
+        );
+        assert!(driver.aborted());
+
+        let outcome = driver.finish().unwrap();
+        assert_eq!(
+            outcome.stop,
+            StopReason::EndTurn,
+            "the provider completed the turn; the sink only stopped listening"
+        );
+        assert_eq!(outcome.turn.text, "done");
     }
 
     /// The deterministic half of the cancellation contract: the poll happens

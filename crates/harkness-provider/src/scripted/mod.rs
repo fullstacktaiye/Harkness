@@ -270,7 +270,14 @@ impl ModelProvider for ScriptedProvider {
             TurnAssembler::with_clock(Box::new(clock.clone())),
         );
 
+        // Polled here rather than only inside `deliver`, because a step is not
+        // always an event: a scenario that injects a failure and emits nothing
+        // would otherwise answer an already-cancelled token with its scripted
+        // error, and a retry loop reading `rate_limited` off a run somebody
+        // stopped would retry it.
+        driver.check_cancelled()?;
         for step in self.script.steps() {
+            driver.check_cancelled()?;
             match step {
                 ScriptStep::Advance { millis } => clock.advance(Duration::from_millis(*millis)),
                 ScriptStep::Emit { event } => {
@@ -673,6 +680,26 @@ mod tests {
         let mut published = ProviderError::KINDS.to_vec();
         published.sort_unstable();
         assert_eq!(reached, published, "every published kind is injectable");
+    }
+
+    /// Every scenario, not only the ones that emit events. A script's steps are
+    /// not all events, so a failure-only scenario polled nowhere would answer an
+    /// already-cancelled token with its scripted error — and a retry loop
+    /// reading `rate_limited` off a run somebody stopped would retry it.
+    #[test]
+    fn an_already_cancelled_token_stops_every_scenario_before_it_starts() {
+        for (name, _) in BUILTIN_SCRIPTS {
+            let provider = ScriptedProvider::scenario(name).unwrap();
+            let cancellation = Cancellation::default();
+            cancellation.cancel();
+            let mut sink = RecordedEvents::default();
+
+            let error = provider
+                .stream(&request(), &mut sink, &cancellation)
+                .unwrap_err();
+            assert_eq!(error.kind(), "cancelled", "{name} answered {error}");
+            assert!(sink.events().is_empty(), "{name} emitted an event");
+        }
     }
 
     /// The other half of the cancellation criterion: a token tripped *during* a

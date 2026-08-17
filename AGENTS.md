@@ -463,9 +463,14 @@ and `harkness-provider` carries a test over its own sources that says so.
 `ModelProvider::stream` is **blocking and cancellation-polled**. It runs on the
 caller's worker thread, polls the shared `harkness_git::Cancellation` at the
 same 20 ms cadence every other blocking seam uses, returns kind `cancelled`,
-and delivers nothing to the sink after the poll that observed it. There is no
-async runtime and no HTTP client in this crate; #125 introduces the client, and
-the manifest test naming that is what makes its arrival deliberate.
+and delivers nothing to the sink after the poll that observed it. An
+already-cancelled token launches nothing at all, and that has to be polled
+where the *work* is rather than only where events are: a turn that fails
+without emitting anything would otherwise answer a cancelled run with a
+provider failure, and a retry loop reading `rate_limited` off a run somebody
+stopped would retry it. There is no async runtime and no HTTP client in this
+crate; #125 introduces the client, and the manifest test naming that is what
+makes its arrival deliberate.
 
 `ProviderError` publishes exactly ten kinds and `RetryHint` classifies them
 without policy: a hint answers *when* an identical request could be sent, never
@@ -496,10 +501,13 @@ partial turn attached, and one that produced no events at all is
 provider said and `TurnOutcome::stop` is what the call concluded, and the two
 are deliberately not one field.
 
-`ModelRequest`, `ModelMessage`, and `AssistantTurn` have hand-written `Debug`
-impls that preview strings and bound list entries, so `{:?}` on a megabyte of
+Every type that holds model-written text has a hand-written `Debug` that
+previews its strings and bounds its list entries, so `{:?}` on a megabyte of
 prompt stays under four kilobytes and cannot dump a conversation into a log
-before #103's redaction applies. Nothing in this crate can carry a credential:
+before #103's redaction applies. Bounding a list is not enough on its own: an
+`AssembledToolCall` holds as much argument text as the per-call cap allows, so
+it and its defect are previewed too — the turn a disconnect attaches to its
+error is the rendering most likely to reach a log. Nothing in this crate can carry a credential:
 there is no endpoint, header, key, or profile type in it at all.
 
 Scripted scenarios are frozen v1 wire evidence. Their fixtures probe `v` before

@@ -30,6 +30,13 @@ pub const MAX_TOOL_CALLS_PER_TURN: usize = 256;
 /// [`ProviderError::MalformedResponse`] naming the cap, never a truncation —
 /// silently keeping the first megabyte of a tool call would produce arguments
 /// the model did not write, which is worse than refusing the turn.
+///
+/// The bounds are per accumulation, so what one turn may hold *at once* is
+/// their product: 256 calls of a megabyte each beside eight megabytes of text,
+/// or roughly 264 MiB from an endpoint determined to reach it. That ceiling is
+/// deliberate rather than overlooked — the alternative is a turn-wide argument
+/// budget, which refuses a legitimate turn on the strength of its neighbours —
+/// and a caller that needs a tighter one sets its own limits here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AssemblyLimits {
     /// Argument bytes one call may accumulate.

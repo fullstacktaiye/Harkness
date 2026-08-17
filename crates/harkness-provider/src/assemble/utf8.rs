@@ -18,9 +18,18 @@ use crate::contract::ProviderError;
 pub const MAX_PENDING_UTF8_BYTES: usize = 3;
 
 /// Accumulates bytes and releases only whole characters.
+///
+/// Bytes that begin no valid sequence poison the accumulator rather than being
+/// skipped past. That follows the transport's quarantine rule for the same
+/// reason: once a stream has bytes nobody can interpret, guessing where the
+/// next character starts is how one bad byte becomes text the model never
+/// wrote. A poisoned accumulator holds nothing and answers every later call
+/// with the same refusal, so an adapter that logs the error and keeps reading
+/// cannot accumulate the rest of the stream on the heap either.
 #[derive(Clone, Debug, Default)]
 pub struct Utf8Accumulator {
     pending: Vec<u8>,
+    poisoned: bool,
 }
 
 impl Utf8Accumulator {
@@ -38,9 +47,12 @@ impl Utf8Accumulator {
     /// # Errors
     ///
     /// Returns [`ProviderError::MalformedResponse`] for bytes that are not the
-    /// start of any valid sequence. An incomplete tail is not that: it is held
-    /// for the next chunk.
+    /// start of any valid sequence, and for every later call once that has
+    /// happened. An incomplete tail is not that: it is held for the next chunk.
     pub fn push(&mut self, bytes: &[u8]) -> Result<String, ProviderError> {
+        if self.poisoned {
+            return Err(Self::poisoned());
+        }
         self.pending.extend_from_slice(bytes);
         match std::str::from_utf8(&self.pending) {
             Ok(text) => {
@@ -56,11 +68,27 @@ impl Utf8Accumulator {
                 self.pending.drain(..boundary);
                 Ok(complete)
             }
-            Err(error) => Err(ProviderError::malformed_response(format!(
-                "the provider sent bytes that are not UTF-8 at offset {}",
-                error.valid_up_to()
-            ))),
+            Err(error) => {
+                // Nothing is retained: the bytes that cannot be interpreted are
+                // exactly the ones there is no safe way to carry forward, and
+                // keeping them would re-fail identically on every later chunk
+                // while the buffer grew past the three bytes this type
+                // documents as its ceiling.
+                self.pending.clear();
+                self.poisoned = true;
+                Err(ProviderError::malformed_response(format!(
+                    "the provider sent bytes that are not UTF-8 at offset {}",
+                    error.valid_up_to()
+                )))
+            }
         }
+    }
+
+    /// The refusal a poisoned accumulator answers with.
+    fn poisoned() -> ProviderError {
+        ProviderError::malformed_response(
+            "the stream carried bytes that are not UTF-8, and it is not resynchronized",
+        )
     }
 
     /// How many bytes are waiting for the rest of their character.
@@ -74,9 +102,14 @@ impl Utf8Accumulator {
     /// # Errors
     ///
     /// Returns [`ProviderError::MalformedResponse`] when a character was left
-    /// half-sent. A truncated character is evidence the stream was cut, and
-    /// silently dropping it would turn that into text the model never wrote.
+    /// half-sent, and for a poisoned accumulator. A truncated character is
+    /// evidence the stream was cut, and silently dropping it would turn that
+    /// into text the model never wrote — as would answering `Ok` for a stream
+    /// whose bad bytes were already refused once.
     pub fn finish(self) -> Result<(), ProviderError> {
+        if self.poisoned {
+            return Err(Self::poisoned());
+        }
         if self.pending.is_empty() {
             return Ok(());
         }
@@ -134,5 +167,29 @@ mod tests {
         let error = accumulator.push(&[0x61, 0xff, 0x62]).unwrap_err();
         assert_eq!(error.kind(), "malformed_response");
         assert!(error.to_string().contains("offset 1"), "{error}");
+    }
+
+    /// The refusal has to hold nothing and stay refused. An adapter that logs
+    /// the error and keeps feeding chunks — a plausible reading of a per-chunk
+    /// `Result` — would otherwise re-fail on the same byte forever while the
+    /// buffer grew to hold the whole rest of the stream.
+    #[test]
+    fn refused_bytes_are_not_retained_and_the_stream_is_never_resynchronized() {
+        let mut accumulator = Utf8Accumulator::new();
+        assert!(accumulator.push(&[0xff]).is_err());
+        assert_eq!(accumulator.pending(), 0);
+
+        for _ in 0..10 {
+            let error = accumulator.push(&[b'a'; 1024]).unwrap_err();
+            assert_eq!(error.kind(), "malformed_response");
+            assert!(
+                accumulator.pending() <= MAX_PENDING_UTF8_BYTES,
+                "{} bytes retained",
+                accumulator.pending()
+            );
+        }
+
+        let error = accumulator.finish().unwrap_err();
+        assert!(error.to_string().contains("not resynchronized"), "{error}");
     }
 }
