@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use harkness_context::{CaptureRequest, FilesystemProbe, SnapshotWireRef, WorkspaceSnapshot};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -245,18 +247,26 @@ pub struct CheckWorkspaceState {
 
 /// Redaction-safe machine encoding of a strict snapshot wire record.
 ///
-/// Artifact value redaction is deliberately free to rewrite string values.
-/// Encoding the original JSON as integers preserves the byte-exact durable
-/// identity while still passing through the ordinary value-redaction path;
-/// published object keys and numeric values are not secret-bearing text.
+/// The snapshot's own JSON is carried as one opaque base64 string rather than as
+/// the object it is. Artifact value redaction is deliberately free to rewrite
+/// string values, and this record has to survive byte-exact because the digest a
+/// check's freshness is bound to is recomputed from it.
+///
+/// Version 2 encodes those bytes as base64. Version 1 encoded them as a JSON
+/// array of decimal integers, which cost up to four characters per byte: a
+/// workspace with many untracked files produced a multi-megabyte wire record
+/// stored as tens of megabytes, and read back into memory in that form on every
+/// freshness check. Base64 is ~1.33x and is just as rewritable by a redactor,
+/// which was the only property the integer encoding was chosen for.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CheckSnapshotArtifact {
     pub(crate) schema_version: u32,
-    pub(crate) snapshot_json_bytes: Vec<u8>,
+    /// Base64 of the snapshot wire record's JSON, at schema version 2.
+    pub(crate) snapshot_json_base64: String,
 }
 
-pub(crate) const CHECK_SNAPSHOT_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+pub(crate) const CHECK_SNAPSHOT_ARTIFACT_SCHEMA_VERSION: u32 = 2;
 
 /// Result of `check.run@1.0.0`.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -326,11 +336,11 @@ impl Tool for CheckRun {
             context.cancellation(),
         )
         .map_err(ToolError::execution_failed)?;
-        let snapshot_json_bytes = serde_json::to_vec(&SnapshotWireRef::from(&snapshot))
+        let snapshot_json = serde_json::to_vec(&SnapshotWireRef::from(&snapshot))
             .map_err(ToolError::execution_failed)?;
         let encoded = serde_json::to_value(CheckSnapshotArtifact {
             schema_version: CHECK_SNAPSHOT_ARTIFACT_SCHEMA_VERSION,
-            snapshot_json_bytes,
+            snapshot_json_base64: BASE64.encode(&snapshot_json),
         })
         .map_err(ToolError::execution_failed)?;
         let snapshot_artifact = context.write_json_artifact(

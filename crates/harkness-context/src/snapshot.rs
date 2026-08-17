@@ -684,27 +684,25 @@ impl WorkspaceSnapshot {
         probe: &dyn WorkspaceProbe,
         cancellation: &Cancellation,
     ) -> Result<Verification, ContextDomainError> {
-        let started = Instant::now();
-        let mut diagnostics = CaptureDiagnostics::default();
-        let collected = match collect(git, probe, cancellation, &mut diagnostics) {
+        let reading = WorkspaceReading::capture(git, probe, cancellation)?;
+        Ok(Verification {
+            state: self.verify_against(&reading),
+            diagnostics: reading.diagnostics,
+        })
+    }
+
+    /// Compares this snapshot with a workspace read somebody else performed.
+    ///
+    /// Pure: the reading is the only I/O, and it is already done. A caller
+    /// holding several snapshots of one workspace — a projection of every
+    /// recorded check, say — reads once and answers all of them, instead of
+    /// running one `git status` and one hash of the dirty set per snapshot.
+    #[must_use]
+    pub fn verify_against(&self, reading: &WorkspaceReading) -> FreshnessState {
+        let collected = match &reading.outcome {
             Ok(collected) => collected,
-            Err(CollectFailure::Hashing { path, reason }) => {
-                return Err(ContextDomainError::HashingFailed {
-                    path: path.display(),
-                    reason,
-                });
-            }
-            Err(failure) => {
-                diagnostics.duration = started.elapsed();
-                return Ok(Verification {
-                    state: FreshnessState::Unverifiable {
-                        reason: failure.into_unverifiable_reason(),
-                    },
-                    diagnostics,
-                });
-            }
+            Err(reason) => return FreshnessState::Unverifiable { reason: *reason },
         };
-        diagnostics.duration = started.elapsed();
 
         let mut changed = Vec::new();
         if collected.repository_identity != self.repository_identity {
@@ -752,12 +750,66 @@ impl WorkspaceSnapshot {
             &mut changed,
         );
 
-        let state = if changed.is_empty() {
+        if changed.is_empty() {
             FreshnessState::Fresh
         } else {
             FreshnessState::Stale { changed }
+        }
+    }
+}
+
+/// One re-read of a workspace, reusable by every snapshot compared against it.
+///
+/// [`WorkspaceSnapshot::verify`] performs this read itself, which is right when
+/// there is one snapshot and wasteful when there are many: the read is a `git
+/// status` plus a hash of everything Git calls dirty or untracked, and it is the
+/// same read for every snapshot of the same workspace at the same moment.
+///
+/// A failed read is a value here rather than an error, because verification
+/// always owes a verdict — every snapshot compared against an unreadable
+/// workspace is `Unverifiable` for the same reason.
+#[derive(Debug)]
+pub struct WorkspaceReading {
+    outcome: Result<Collected, UnverifiableReason>,
+    diagnostics: CaptureDiagnostics,
+}
+
+impl WorkspaceReading {
+    /// Reads the workspace once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextDomainError::HashingFailed`] when a path Git named could
+    /// not be hashed. Every other failure to read is carried as an
+    /// `Unverifiable` verdict rather than an error.
+    pub fn capture(
+        git: &GitService,
+        probe: &dyn WorkspaceProbe,
+        cancellation: &Cancellation,
+    ) -> Result<Self, ContextDomainError> {
+        let started = Instant::now();
+        let mut diagnostics = CaptureDiagnostics::default();
+        let outcome = match collect(git, probe, cancellation, &mut diagnostics) {
+            Ok(collected) => Ok(collected),
+            Err(CollectFailure::Hashing { path, reason }) => {
+                return Err(ContextDomainError::HashingFailed {
+                    path: path.display(),
+                    reason,
+                });
+            }
+            Err(failure) => Err(failure.into_unverifiable_reason()),
         };
-        Ok(Verification { state, diagnostics })
+        diagnostics.duration = started.elapsed();
+        Ok(Self {
+            outcome,
+            diagnostics,
+        })
+    }
+
+    /// What this read involved.
+    #[must_use]
+    pub const fn diagnostics(&self) -> &CaptureDiagnostics {
+        &self.diagnostics
     }
 }
 
@@ -825,6 +877,7 @@ fn push_set_divergence(
 }
 
 /// The workspace facts one read of the worktree produces.
+#[derive(Debug)]
 struct Collected {
     repository_identity: String,
     worktree_root: PathBuf,
@@ -1131,7 +1184,8 @@ mod tests {
 
     use super::{
         CaptureRequest, FileDigestEntry, FreshnessState, PathDivergence, SnapshotComponent,
-        SnapshotFiles, StalePath, UnverifiableReason, WorkspaceSnapshot, path_set_digest,
+        SnapshotFiles, StalePath, UnverifiableReason, WorkspaceReading, WorkspaceSnapshot,
+        path_set_digest,
     };
     use crate::digest::empty_path_set_digest;
     use crate::path::RepoPath;
@@ -1176,6 +1230,11 @@ mod tests {
             snapshot
                 .verify(&self.service(), &probe, &Cancellation::default())
                 .unwrap()
+        }
+
+        fn read(&self) -> WorkspaceReading {
+            let probe = FilesystemProbe::new(&self.root);
+            WorkspaceReading::capture(&self.service(), &probe, &Cancellation::default()).unwrap()
         }
 
         fn write(&self, relative: &str, content: &str) {
@@ -1761,6 +1820,40 @@ mod tests {
         let mut permissions = fs::metadata(&closed).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&closed, permissions).unwrap();
+    }
+
+    /// A caller holding several snapshots of one workspace reads it once and
+    /// answers all of them. `verify` reads for each snapshot it is asked about,
+    /// which for a projection of every recorded check meant one `git status` and
+    /// one hash of the dirty set per check, of the same workspace at the same
+    /// moment.
+    #[test]
+    fn one_reading_answers_every_snapshot_taken_of_the_same_workspace() {
+        let workspace = Workspace::new("repo");
+        workspace.write("notes.txt", "first\n");
+        let before = workspace.capture();
+        workspace.write("notes.txt", "second\n");
+        let after = workspace.capture();
+
+        let reading = workspace.read();
+
+        // One read, two different verdicts, each the one `verify` gives alone.
+        assert!(matches!(
+            before.verify_against(&reading),
+            FreshnessState::Stale { .. }
+        ));
+        assert_eq!(after.verify_against(&reading), FreshnessState::Fresh);
+        assert_eq!(before.verify_against(&reading), workspace.verify(&before));
+        assert_eq!(after.verify_against(&reading), workspace.verify(&after));
+
+        // The reading is a moment, not a subscription: the workspace moving
+        // afterwards does not change what it already read.
+        workspace.write("notes.txt", "third\n");
+        assert_eq!(after.verify_against(&reading), FreshnessState::Fresh);
+        assert!(matches!(
+            workspace.verify(&after),
+            FreshnessState::Stale { .. }
+        ));
     }
 
     #[cfg(unix)]

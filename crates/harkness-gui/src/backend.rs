@@ -4412,15 +4412,31 @@ fn to_review(row: &ReviewStateRow, loaded_path_id: &str) -> QVariant {
         })
         .unwrap_or_default();
     insert("commitId", QVariant::from(&QString::from(commit_id)));
+    // What a recorded check has to describe for its verdict to cover what is on
+    // screen. The head is always a resolved 40-hex commit, because
+    // `prepare_review_target` resolves every revision before building the
+    // target — QML compares this against a check's recorded `state_head`, which
+    // is resolved, and comparing a branch name or a short id against one would
+    // silently never match.
+    //
+    // The two targets this GUI does not currently produce are named anyway. They
+    // are reachable through `DiffTarget`, the CLI's `check_covers_diff_target`
+    // already classifies them, and leaving them to fall into `unsupported` would
+    // make the two front ends disagree about the same evidence the moment a
+    // review selection grew to reach one.
     let (check_target_kind, check_target_head) =
         row.target
             .as_ref()
             .map_or(("unavailable", ""), |target| match &target.target {
                 harkness_git::DiffTarget::Staged => ("index", ""),
-                harkness_git::DiffTarget::Unstaged => ("worktree", ""),
+                harkness_git::DiffTarget::Unstaged
+                | harkness_git::DiffTarget::RevisionAgainstWorktree { .. } => ("worktree", ""),
                 harkness_git::DiffTarget::Commit { revision, .. } => ("commit", revision.as_str()),
                 harkness_git::DiffTarget::Revisions { new_revision, .. } => {
                     ("commit", new_revision.as_str())
+                }
+                harkness_git::DiffTarget::BranchAgainstBase { branch, .. } => {
+                    ("commit", branch.as_str())
                 }
                 _ => ("unsupported", ""),
             });

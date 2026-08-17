@@ -12,7 +12,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use harkness_context::{FilesystemProbe, FreshnessState, SnapshotWire, WorkspaceSnapshot};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use harkness_context::{
+    FilesystemProbe, FreshnessState, SnapshotWire, WorkspaceReading, WorkspaceSnapshot,
+};
 use harkness_core::CheckConfiguration;
 use harkness_core::{CheckParser, Project};
 use harkness_git::{Cancellation, GitService};
@@ -324,6 +328,20 @@ pub fn project_checks(store: &Store, project: &Project) -> Result<Vec<CheckSumma
         .iter()
         .map(|check| check.id.clone())
         .collect::<Vec<_>>();
+    // One read of the workspace for the whole projection.
+    //
+    // Freshness is "does this recorded snapshot still describe the workspace",
+    // and answering it needs the workspace read once — a `git status` plus a
+    // hash of everything dirty or untracked. Asking each snapshot to verify
+    // itself repeated that read once per configured check, so opening this panel
+    // on a project with the three Cargo defaults paid for three full
+    // verifications of one unchanged workspace, and a 32-check project paid for
+    // 32, on every open and every refresh.
+    //
+    // Lazy because a project whose checks have never run needs no read at all,
+    // and deliberately not cached beyond this call: a projection taken now must
+    // describe the workspace now.
+    let mut reading = None;
     for call_id in store.project_latest_check_call_ids(project.id, &ids)? {
         let call = store.load_tool_call(call_id)?;
         let run_id = call.run_id();
@@ -381,7 +399,7 @@ pub fn project_checks(store: &Store, project: &Project) -> Result<Vec<CheckSumma
         let definition_current = input.is_some_and(|input| definition_matches(input, current));
         let (state, parsed_diagnostics) = match output.as_ref() {
             Some(output) => (
-                verify_output_state(store, project, run_id, call.id(), output),
+                verify_output_state(store, project, run_id, call.id(), output, &mut reading),
                 parse_diagnostics(store, project, run_id, call.id(), input, output),
             ),
             None => (
@@ -507,6 +525,7 @@ fn verify_output_state(
     run_id: RunId,
     call_id: ToolCallId,
     output: &CheckRunOutput,
+    reading: &mut Option<WorkspaceReading>,
 ) -> StateVerification {
     let failed = |reason: String| StateVerification {
         freshness: unverifiable(reason),
@@ -551,7 +570,11 @@ fn verify_output_state(
             encoded.schema_version
         ));
     }
-    let wire = match serde_json::from_slice::<SnapshotWire>(&encoded.snapshot_json_bytes) {
+    let snapshot_json = match BASE64.decode(&encoded.snapshot_json_base64) {
+        Ok(bytes) => bytes,
+        Err(error) => return failed(format!("invalid encoded snapshot: {error}")),
+    };
+    let wire = match serde_json::from_slice::<SnapshotWire>(&snapshot_json) {
         Ok(wire) => wire,
         Err(error) => return failed(format!("invalid encoded snapshot: {error}")),
     };
@@ -565,11 +588,20 @@ fn verify_output_state(
     let workspace_clean = snapshot.files().is_empty();
     let workspace_matches_index =
         snapshot.files().tracked_dirty().is_empty() && snapshot.files().untracked().is_empty();
-    let git = GitService::new(&project.root, store.data_dir());
-    let probe = FilesystemProbe::new(&project.root);
-    let freshness = match snapshot.verify(&git, &probe, &Cancellation::default()) {
-        Ok(FreshnessState::Fresh) => CheckFreshness::Current,
-        Ok(FreshnessState::Stale { changed }) => CheckFreshness::Stale {
+    let workspace = match reading {
+        Some(reading) => reading,
+        None => {
+            let git = GitService::new(&project.root, store.data_dir());
+            let probe = FilesystemProbe::new(&project.root);
+            match WorkspaceReading::capture(&git, &probe, &Cancellation::default()) {
+                Ok(captured) => reading.insert(captured),
+                Err(error) => return failed(error.to_string()),
+            }
+        }
+    };
+    let freshness = match snapshot.verify_against(workspace) {
+        FreshnessState::Fresh => CheckFreshness::Current,
+        FreshnessState::Stale { changed } => CheckFreshness::Stale {
             changed: changed
                 .into_iter()
                 .take(MAX_CHECK_DIAGNOSTICS)
@@ -580,8 +612,7 @@ fn verify_output_state(
                 })
                 .collect(),
         },
-        Ok(FreshnessState::Unverifiable { reason }) => unverifiable(reason.as_str().to_owned()),
-        Err(error) => unverifiable(error.to_string()),
+        FreshnessState::Unverifiable { reason } => unverifiable(reason.as_str().to_owned()),
         _ => unverifiable("unknown freshness state".to_owned()),
     };
     StateVerification {
