@@ -17,6 +17,7 @@
 use std::path::Path;
 
 use clap::{Args, Subcommand};
+use harkness_core::{Project, ProjectService};
 use harkness_git::Cancellation;
 use harkness_runtime::agent::MockAgent;
 use harkness_runtime::coordinator::{RunCoordinator, RuntimeError};
@@ -29,7 +30,7 @@ use serde_json::json;
 
 use crate::runtime_support::{
     ApprovalMode, apply_workspace_trust, approval_value, artifact_value, decode_run_cursor,
-    encode_run_cursor, event_line, event_value, open_existing_runtime, open_runtime,
+    encode_run_cursor, event_line, event_value, load_run_view, open_existing_runtime, open_runtime,
     parse_event_limit, parse_run_limit, run_line, run_value, run_verdict, step_value,
     supervise_run, task_value, tool_call_value, workspace_ref,
 };
@@ -128,9 +129,6 @@ pub(crate) struct RetryArguments {
     /// Mock-agent scenario the new attempt replays.
     #[arg(long, value_name = "NAME", value_parser = crate::agent_commands::parse_scenario)]
     scenario: String,
-    /// Select by full ID, UUID prefix (8+ characters), explicit path, or display name.
-    #[arg(long, value_name = "SELECTOR")]
-    project: Option<String>,
     /// Answer approval requests on the terminal instead of denying them.
     #[arg(long)]
     interactive: bool,
@@ -253,13 +251,12 @@ fn show(
     let Some(coordinator) = open_existing_runtime(service.data_dir())? else {
         return Err(missing_run(run_id));
     };
-    // The snapshot carries the run, its task, steps, calls, approvals, and
-    // artifact metadata. Its own `events` field is the whole log, which is
-    // exactly what a long run must not have to materialize to be read, so the
-    // timeline comes from the paged reader beside it.
-    let snapshot = coordinator
-        .run_snapshot(run_id)
-        .map_err(CliError::Runtime)?;
+    // The view carries the run, its task, steps, calls, approvals, and artifact
+    // metadata; the timeline comes from the paged reader beside it. Deliberately
+    // not `run_snapshot`, whose `events` field is the *whole* log — reading one
+    // page of a hundred-thousand-event run must not materialize the other
+    // ninety-nine thousand first.
+    let view = load_run_view(&coordinator, run_id)?;
     let mut page = arguments.order.page(arguments.limit);
     if let Some(cursor) = arguments.cursor {
         page = page.after(EventSeq::new(cursor));
@@ -269,16 +266,16 @@ fn show(
         .map_err(CliError::Runtime)?;
     let data = json!({
         "kind": "run_show",
-        "run": run_value(&snapshot.run),
-        "task": task_value(&snapshot.task),
-        "steps": snapshot.steps.iter().map(step_value).collect::<Vec<_>>(),
-        "tool_calls": snapshot.tool_calls.iter().map(tool_call_value).collect::<Vec<_>>(),
-        "approvals": snapshot
+        "run": run_value(&view.run),
+        "task": task_value(&view.task),
+        "steps": view.steps.iter().map(step_value).collect::<Vec<_>>(),
+        "tool_calls": view.tool_calls.iter().map(tool_call_value).collect::<Vec<_>>(),
+        "approvals": view
             .approvals
             .iter()
             .map(|request| approval_value(request, None))
             .collect::<Vec<_>>(),
-        "artifacts": snapshot.artifacts.iter().map(artifact_value).collect::<Vec<_>>(),
+        "artifacts": view.artifacts.iter().map(artifact_value).collect::<Vec<_>>(),
         "events": timeline.events.iter().map(event_value).collect::<Vec<_>>(),
         "order": arguments.order.as_str(),
         "next_cursor": timeline.next_cursor.map(EventSeq::get),
@@ -286,8 +283,8 @@ fn show(
     command_result(
         json_output,
         || {
-            let mut lines = vec![run_line(&snapshot.run, Some(snapshot.task.title()))];
-            lines.extend(snapshot.tool_calls.iter().map(|call| {
+            let mut lines = vec![run_line(&view.run, Some(view.task.title()))];
+            lines.extend(view.tool_calls.iter().map(|call| {
                 format!(
                     "call\t{}\t{}\t{}",
                     call.tool_id(),
@@ -295,7 +292,7 @@ fn show(
                     call.state().as_str()
                 )
             }));
-            lines.extend(snapshot.approvals.iter().map(|request| {
+            lines.extend(view.approvals.iter().map(|request| {
                 format!(
                     "approval\t{}\t{}\t{}",
                     request.id(),
@@ -303,7 +300,7 @@ fn show(
                     single_line(request.input_summary())
                 )
             }));
-            lines.extend(snapshot.artifacts.iter().map(|artifact| {
+            lines.extend(view.artifacts.iter().map(|artifact| {
                 format!(
                     "artifact\t{}\t{}\t{}\t{}\t{}",
                     artifact.id(),
@@ -363,21 +360,27 @@ fn retry(
 ) -> Result<CommandResult, CliError> {
     let original = parse_run_id(&arguments.run_id)?;
     let service = load_service(data_dir)?;
-    let project = resolve_project(&service, arguments.project.as_deref())?;
     let coordinator = open_runtime(service.data_dir())?;
+    let agent = MockAgent::scenario(&arguments.scenario).map_err(|error| {
+        CliError::Usage(format!(
+            "--scenario is not a built-in mock agent script: {error}"
+        ))
+    })?;
+    // The workspace comes from the run being re-attempted, never from
+    // `--project` or the current directory. A retry is a fresh attempt at a task
+    // that already names its workspace, so asking the caller to name it again
+    // only creates ways to name a different one: the coordinator would refuse
+    // with `workspace_mismatch` after `--trust-workspace` had already written a
+    // durable positive decision for whatever project was named by mistake.
+    let task = task_of(&coordinator, original)?;
+    let project = project_of(&service, &task)?;
     apply_workspace_trust(
         &coordinator,
         &project,
         arguments.trust_workspace,
         "re-attempting a run",
     )?;
-    let agent = MockAgent::scenario(&arguments.scenario).map_err(|error| {
-        CliError::Usage(format!(
-            "--scenario is not a built-in mock agent script: {error}"
-        ))
-    })?;
-    let task = task_of(&coordinator, original)?;
-    let workspace = workspace_ref(coordinator.store(), &task);
+    let workspace = workspace_ref(&task);
     let run_id = coordinator
         .retry_run_with_workspace_metadata(
             original,
@@ -400,29 +403,35 @@ fn retry(
         json_output,
         cancellation,
     )?;
-    let snapshot = outcome.snapshot;
+    let view = outcome.view;
     // `retry_of` and `workspace_may_be_modified` are read back off the new
     // run's own record rather than restated here, so what is printed is what
     // was persisted.
-    let warning = snapshot.run.workspace_may_be_modified();
+    let warning = view.run.workspace_may_be_modified();
     let data = json!({
         "kind": "run_retry",
         "retry_of": original,
         "run_id": run_id,
         "scenario": arguments.scenario,
-        "run": run_value(&snapshot.run),
-        "task": task_value(&snapshot.task),
-        "steps": snapshot.steps.iter().map(step_value).collect::<Vec<_>>(),
-        "tool_calls": snapshot.tool_calls.iter().map(tool_call_value).collect::<Vec<_>>(),
-        "approvals": snapshot
+        "run": run_value(&view.run),
+        "task": task_value(&view.task),
+        "steps": view.steps.iter().map(step_value).collect::<Vec<_>>(),
+        "tool_calls": view.tool_calls.iter().map(tool_call_value).collect::<Vec<_>>(),
+        "approvals": view
             .approvals
             .iter()
             .map(|request| approval_value(request, None))
             .collect::<Vec<_>>(),
-        "artifacts": snapshot.artifacts.iter().map(artifact_value).collect::<Vec<_>>(),
-        "event_count": snapshot.events.len(),
+        "artifacts": view.artifacts.iter().map(artifact_value).collect::<Vec<_>>(),
+        "event_count": outcome.streamed.count,
+        "timeline_complete": outcome.streamed.complete,
     });
-    if let Some(verdict) = run_verdict(&snapshot.run, outcome.denied_noninteractively, &data) {
+    if let Some(verdict) = run_verdict(
+        &view.run,
+        &view.tool_calls,
+        &outcome.denied_noninteractively,
+        &data,
+    ) {
         return Err(verdict);
     }
     command_result(
@@ -430,7 +439,7 @@ fn retry(
         move || {
             let mut line = format!(
                 "{run_id}\t{}\tretry of {original}",
-                snapshot.run.state().as_str()
+                view.run.state().as_str()
             );
             if warning {
                 line.push_str(
@@ -451,6 +460,20 @@ fn task_of(coordinator: &RunCoordinator, run: RunId) -> Result<Task, CliError> {
         .store()
         .load_task(record.task_id())
         .map_err(CliError::Store)
+}
+
+/// The catalogued project a recorded task's workspace belongs to.
+///
+/// A task with no project identity cannot be scheduled at all — the coordinator
+/// refuses with `workspace_identity_required` — so a retry says the same thing
+/// here rather than resolving something else and failing later.
+fn project_of(service: &ProjectService, task: &Task) -> Result<Project, CliError> {
+    let Some(project_id) = task.project_id() else {
+        return Err(CliError::Runtime(RuntimeError::WorkspaceIdentityRequired {
+            task: task.id(),
+        }));
+    };
+    resolve_project(service, Some(&project_id.to_string()))
 }
 
 /// The refusal a command reports when no run store exists at all.

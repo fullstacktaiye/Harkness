@@ -39,10 +39,10 @@ use harkness_runtime::approval::{
     ApprovalDecision, ApprovalId, ApprovalRequest, ApprovalScope, ApprovalState, DecidedVia,
 };
 use harkness_runtime::coordinator::{
-    EventDelivery, EventReceiver, RunCoordinator, RunSnapshot, RuntimeError, TryReceiveError,
+    EventDelivery, EventReceiver, ReceiveTimeoutError, RunCoordinator, RuntimeError,
 };
 use harkness_runtime::domain::{
-    Approval, ExecutionState, Failure, Run, RunId, Step, Task, ToolCall, ToolCallState,
+    Approval, ExecutionState, Failure, Run, RunId, Step, Task, ToolCall, ToolCallId, ToolCallState,
 };
 use harkness_runtime::policy::PolicyEngine;
 use harkness_runtime::store::{
@@ -73,26 +73,38 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DRAIN_GRACE: Duration = Duration::from_millis(500);
 
 /// The line protocol `--interactive` reads from standard input.
-const INTERACTIVE_HELP: &str = "answer approve, deny, or show-input";
+///
+/// `approve` is `approve-call`: this one call and nothing else. The two wider
+/// answers have to be typed in full, and each is still narrowed against what
+/// the stored request permits.
+const INTERACTIVE_HELP: &str = "answer approve (this call only), approve-tool, \
+     approve-capability, deny, or show-input";
+
+/// How often durable run state is re-read when no event has arrived.
+///
+/// A backstop rather than the mechanism: an approval request and its
+/// `approval_requested` event share one transaction, so the event is what says
+/// there is a question to look for, and this only bounds how long a state
+/// change with no event of its own can go unnoticed.
+const STATE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Builds the full production registry: the five read-only tools and the four
 /// mutating ones.
 ///
 /// Both sets, always. A `tool list` that published only half the contract would
-/// be a second dialect of what a run can actually call.
-fn production_registry() -> Result<ToolRegistry, CliError> {
+/// be a second dialect of what a run can actually call. Needs no data directory
+/// and opens no store, so `tool list` and `tool describe` have no side effect at
+/// all.
+///
+/// Registration compiles a schema validator per `Input` and `Output` type, so
+/// this is the expensive part of starting a runtime command. A caller that also
+/// needs to resolve a tool keeps the `Arc` it hands the coordinator rather than
+/// building a second identical registry — see [`open_runtime_with`].
+pub(crate) fn production_registry() -> Result<ToolRegistry, CliError> {
     let mut registry = ToolRegistry::new();
     register_read_only_tools(&mut registry).map_err(registry_failure)?;
     register_mutating_tools(&mut registry).map_err(registry_failure)?;
     Ok(registry)
-}
-
-/// The tool registry `tool list` and `tool describe` publish.
-///
-/// Needs no data directory and opens no store, so describing the contract has
-/// no side effect at all.
-pub(crate) fn contract_registry() -> Result<ToolRegistry, CliError> {
-    production_registry()
 }
 
 fn registry_failure(error: RegistryError) -> CliError {
@@ -106,8 +118,16 @@ fn registry_failure(error: RegistryError) -> CliError {
 
 /// Opens the run store, creating it when absent, and takes this process's lease.
 pub(crate) fn open_runtime(data_dir: &Path) -> Result<RunCoordinator, CliError> {
+    open_runtime_with(data_dir, Arc::new(production_registry()?))
+}
+
+/// Opens the run store around a registry the caller already built.
+pub(crate) fn open_runtime_with(
+    data_dir: &Path,
+    registry: Arc<ToolRegistry>,
+) -> Result<RunCoordinator, CliError> {
     let store = Arc::new(Store::open(data_dir).map_err(CliError::Store)?);
-    coordinator_for(store)
+    coordinator_for(store, registry)
 }
 
 /// Opens an existing run store without bringing one into existence.
@@ -115,11 +135,13 @@ pub(crate) fn open_existing_runtime(data_dir: &Path) -> Result<Option<RunCoordin
     let Some(store) = Store::open_existing(data_dir).map_err(CliError::Store)? else {
         return Ok(None);
     };
-    coordinator_for(Arc::new(store)).map(Some)
+    coordinator_for(Arc::new(store), Arc::new(production_registry()?)).map(Some)
 }
 
-fn coordinator_for(store: Arc<Store>) -> Result<RunCoordinator, CliError> {
-    let registry = Arc::new(production_registry()?);
+fn coordinator_for(
+    store: Arc<Store>,
+    registry: Arc<ToolRegistry>,
+) -> Result<RunCoordinator, CliError> {
     // One coordinator, and therefore one scheduler, for the process — the
     // reason `check_coordinator` exists rather than a per-call constructor. A
     // CLI invocation drives at most one run, so building it here is also
@@ -518,6 +540,48 @@ pub(crate) fn store_details(error: &StoreError) -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// Reading one run
+// ---------------------------------------------------------------------------
+
+/// Everything about one run except its timeline.
+///
+/// The same six reads [`RunSnapshot`](harkness_runtime::coordinator::RunSnapshot)
+/// makes, without the seventh.
+/// `RunCoordinator::run_snapshot` materializes the *whole* event log — that is
+/// what makes it a snapshot — and every command here pages the timeline
+/// separately or has already streamed it, so loading it costs a full table scan
+/// nothing then reads. `harkness run show --limit 1` on a hundred-thousand-event
+/// run is the case that makes the difference stop being academic.
+///
+/// `RunCoordinator::store` exists for exactly this: a caller building a
+/// projection out of the same records needs the coordinator's own store rather
+/// than one it opened separately, so the two cannot be different stores.
+pub(crate) struct RunView {
+    pub(crate) task: Task,
+    pub(crate) run: Run,
+    pub(crate) steps: Vec<Step>,
+    pub(crate) tool_calls: Vec<ToolCall>,
+    pub(crate) approvals: Vec<ApprovalRequest>,
+    pub(crate) artifacts: Vec<Artifact>,
+}
+
+pub(crate) fn load_run_view(
+    coordinator: &RunCoordinator,
+    run_id: RunId,
+) -> Result<RunView, CliError> {
+    let store = coordinator.store();
+    let run = store.load_run(run_id).map_err(CliError::Store)?;
+    Ok(RunView {
+        task: store.load_task(run.task_id()).map_err(CliError::Store)?,
+        run,
+        steps: store.load_run_steps(run_id).map_err(CliError::Store)?,
+        tool_calls: store.load_run_tool_calls(run_id).map_err(CliError::Store)?,
+        approvals: store.run_approvals(run_id).map_err(CliError::Store)?,
+        artifacts: store.run_artifacts(run_id).map_err(CliError::Store)?,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Run supervision
 // ---------------------------------------------------------------------------
 
@@ -536,19 +600,48 @@ pub(crate) enum ApprovalMode {
 /// What supervising one run observed.
 pub(crate) struct RunOutcome {
     /// Durable view of the run once it reached a terminal state.
-    pub(crate) snapshot: RunSnapshot,
-    /// Whether this process denied a request because it could not ask anybody.
-    pub(crate) denied_noninteractively: bool,
+    pub(crate) view: RunView,
+    /// The calls whose approval *this process* denied for want of a terminal.
+    ///
+    /// A set rather than a flag, because the flag was wrong in both directions.
+    /// It was set even when the decision never landed, and once set it applied
+    /// to every later failure of the run: a scenario that recovered from one
+    /// denial and then failed on a failing test suite reported
+    /// `approval_required_noninteractive` at exit 3, telling a CI script to go
+    /// find a human for a run no human could fix. Naming the calls makes the
+    /// kind a statement about the call that actually failed.
+    pub(crate) denied_noninteractively: HashSet<ToolCallId>,
+    /// How many events reached this process's timeline.
+    pub(crate) streamed: EventStream,
+}
+
+/// What the live timeline delivered.
+pub(crate) struct EventStream {
+    /// Events emitted as progress.
+    pub(crate) count: usize,
+    /// Sequence of the last one, when any arrived.
+    pub(crate) last_seq: Option<u64>,
+    /// Whether the subscription was lost before the run ended.
+    ///
+    /// Reported rather than hidden: a consumer that was told nothing would read
+    /// a truncated stream as a complete one. `run show` still reproduces every
+    /// entry from the durable log.
+    pub(crate) complete: bool,
 }
 
 /// Streams one run's events, answers its approvals, and waits for it to finish.
 ///
-/// The loop is poll-based rather than driven purely by the subscription, and
-/// deliberately so. A subscriber that falls behind is *disconnected* with a
-/// `Lagged` marker — which is the right behavior for a live timeline and the
-/// wrong one for a supervisor, since an interactive prompt blocks on a human
-/// for as long as it takes. The durable run record is the authority on when the
-/// run finished; the subscription is only how the timeline is streamed.
+/// The wait is the subscription's own [`recv_timeout`](EventReceiver::recv_timeout)
+/// rather than a sleep, so an event is consumed as it arrives instead of in
+/// whatever batch a poll interval happened to accumulate. That matters: a
+/// subscriber that reaches [`SUBSCRIBER_CAPACITY`](harkness_runtime::coordinator::SUBSCRIBER_CAPACITY)
+/// is *disconnected* with a lag marker, so a burst larger than the queue between
+/// two drains would cost the rest of the run's live timeline.
+///
+/// Durable state is re-read on a slower beat than the stream is drained. Every
+/// question a run parks on appends an `approval_requested` event first — the
+/// approval record and its event share one transaction — so an arriving event is
+/// the signal to look, and the heartbeat is only a backstop.
 pub(crate) fn supervise_run(
     coordinator: &RunCoordinator,
     run_id: RunId,
@@ -558,9 +651,13 @@ pub(crate) fn supervise_run(
     cancellation: &Cancellation,
 ) -> Result<RunOutcome, CliError> {
     let mut answered: HashSet<ApprovalId> = HashSet::new();
-    let mut denied_noninteractively = false;
+    let mut denied_noninteractively = HashSet::new();
     let mut cancel_requested = false;
-    let mut lagged = false;
+    let mut stream = EventStream {
+        count: 0,
+        last_seq: None,
+        complete: true,
+    };
     // The reader is created only for a mode that can ask. A noninteractive
     // invocation must not read standard input at all: a hook that piped a
     // document into a sibling command has no answer in it.
@@ -568,8 +665,9 @@ pub(crate) fn supervise_run(
         ApprovalMode::Noninteractive => Asker::Deny,
         ApprovalMode::Interactive => Asker::Ask(AnswerReader::spawn()),
     };
+    let mut state_read_at = Instant::now() - STATE_INTERVAL;
     loop {
-        lagged |= drain_events(receiver, json_output);
+        let arrived = drain_events(receiver, json_output, &mut stream);
         if cancellation.is_cancelled() && !cancel_requested {
             // Asked once, then waited for, exactly as a configured check waits.
             // Returning the moment cancellation was requested hands back a run
@@ -580,6 +678,10 @@ pub(crate) fn supervise_run(
             }
             cancel_requested = true;
         }
+        if !arrived && state_read_at.elapsed() < STATE_INTERVAL {
+            continue;
+        }
+        state_read_at = Instant::now();
         let run = coordinator
             .store()
             .load_run(run_id)
@@ -595,59 +697,81 @@ pub(crate) fn supervise_run(
             if request.state() != ApprovalState::Pending || !answered.insert(request.id()) {
                 continue;
             }
-            let denied = decide(coordinator, &request, &asker, json_output, cancellation)?;
-            denied_noninteractively |= denied;
+            if decide(
+                coordinator,
+                &request,
+                &asker,
+                json_output,
+                receiver,
+                &mut stream,
+                cancellation,
+            )? {
+                denied_noninteractively.insert(request.tool_call_id());
+            }
         }
-        std::thread::sleep(POLL_INTERVAL);
     }
     // The worker records the terminal state before it closes the delivery, so
     // the last entries of the timeline arrive after the state that ended it.
     let deadline = Instant::now() + DRAIN_GRACE;
-    while !lagged && Instant::now() < deadline {
-        match receiver.try_recv() {
-            Ok(delivery) => lagged |= emit_delivery(&delivery, json_output),
-            Err(TryReceiveError::Disconnected) => break,
-            Err(TryReceiveError::Empty) => std::thread::sleep(POLL_INTERVAL),
+    while stream.complete && Instant::now() < deadline {
+        match receiver.recv_timeout(POLL_INTERVAL) {
+            Ok(delivery) => emit_delivery(&delivery, json_output, &mut stream),
+            Err(ReceiveTimeoutError::Disconnected) => break,
+            Err(ReceiveTimeoutError::Timeout) => {}
         }
     }
-    let snapshot = coordinator
-        .run_snapshot(run_id)
-        .map_err(CliError::Runtime)?;
     Ok(RunOutcome {
-        snapshot,
+        view: load_run_view(coordinator, run_id)?,
         denied_noninteractively,
+        streamed: stream,
     })
 }
 
-/// Drains every event currently ready, returning whether the stream was lost.
-fn drain_events(receiver: &EventReceiver, json_output: bool) -> bool {
-    loop {
-        match receiver.try_recv() {
-            Ok(delivery) => {
-                if emit_delivery(&delivery, json_output) {
-                    return true;
-                }
-            }
-            Err(TryReceiveError::Empty | TryReceiveError::Disconnected) => return false,
+/// Waits one poll interval for events and emits everything ready.
+///
+/// Returns whether anything arrived, which is what tells the supervision loop
+/// there is a reason to re-read durable state before its heartbeat is due.
+fn drain_events(receiver: &EventReceiver, json_output: bool, stream: &mut EventStream) -> bool {
+    let mut arrived = match receiver.recv_timeout(POLL_INTERVAL) {
+        Ok(delivery) => {
+            emit_delivery(&delivery, json_output, stream);
+            true
         }
+        Err(ReceiveTimeoutError::Timeout | ReceiveTimeoutError::Disconnected) => return false,
+    };
+    // Whatever else is already queued, without waiting again: the queue is
+    // bounded and a subscriber that fills it is disconnected, so leaving events
+    // behind for the next interval is how a burst becomes a lost timeline.
+    while let Ok(delivery) = receiver.try_recv() {
+        emit_delivery(&delivery, json_output, stream);
+        arrived = true;
     }
+    arrived
 }
 
-/// Emits one delivery as a progress line, returning whether the stream ended.
-fn emit_delivery(delivery: &EventDelivery, json_output: bool) -> bool {
+/// Emits one delivery as a progress line and records what it was.
+fn emit_delivery(delivery: &EventDelivery, json_output: bool, stream: &mut EventStream) {
     match delivery {
         EventDelivery::Event(stored) => {
-            crate::emit_event_progress(json_output, &event_line(stored), event_value(stored));
-            false
+            // The JSON projection is built only for the destination that
+            // carries it. Human output prints the one-line form and discards
+            // the value, so building and canonically sorting a payload clone
+            // per event would be work thrown away on every event of the run.
+            if json_output {
+                crate::emit_event_progress(true, &event_line(stored), event_value(stored));
+            } else {
+                emit_progress(false, &event_line(stored));
+            }
+            stream.count += 1;
+            stream.last_seq = Some(stored.seq.get());
         }
+        // Reported rather than swallowed. The run is unaffected — `run show`
+        // reproduces the whole timeline from the log — but a consumer that was
+        // told nothing would read a truncated stream as a complete one.
+        //
         // `EventDelivery` is `#[non_exhaustive]`, so a delivery this build does
-        // not know is reported as a gap rather than silently ignored: a
-        // consumer told nothing would read a truncated stream as a complete
-        // one, which is the same mistake as swallowing a lag.
+        // not recognize is reported the same way for the same reason.
         EventDelivery::Lagged { last_available, .. } => {
-            // Reported rather than swallowed. The run is unaffected — `run show`
-            // reproduces the whole timeline from the log — but a consumer that
-            // was told nothing would read a truncated stream as a complete one.
             emit_progress(
                 json_output,
                 &format!(
@@ -655,7 +779,7 @@ fn emit_delivery(delivery: &EventDelivery, json_output: bool) -> bool {
                      read the full log with harkness run show"
                 ),
             );
-            true
+            stream.complete = false;
         }
         _ => {
             emit_progress(
@@ -663,7 +787,7 @@ fn emit_delivery(delivery: &EventDelivery, json_output: bool) -> bool {
                 "the live timeline reported a delivery this build does not recognize; \
                  read the full log with harkness run show",
             );
-            true
+            stream.complete = false;
         }
     }
 }
@@ -678,18 +802,29 @@ enum Asker {
 }
 
 /// Answers one pending request, returning whether it was a noninteractive deny.
+#[allow(clippy::too_many_arguments)]
 fn decide(
     coordinator: &RunCoordinator,
     request: &ApprovalRequest,
     asker: &Asker,
     json_output: bool,
+    receiver: &EventReceiver,
+    stream: &mut EventStream,
     cancellation: &Cancellation,
 ) -> Result<bool, CliError> {
     let answer = match asker {
         Asker::Deny => Answer::Deny {
             reason: "noninteractive execution cannot answer an approval request".to_owned(),
         },
-        Asker::Ask(answers) => prompt(coordinator, request, json_output, answers, cancellation),
+        Asker::Ask(answers) => prompt(
+            coordinator,
+            request,
+            json_output,
+            answers,
+            receiver,
+            stream,
+            cancellation,
+        ),
     };
     // Cancellation is the run's to resolve. The next turn of the supervision
     // loop asks the coordinator to stop the run, which resolves this request as
@@ -699,34 +834,61 @@ fn decide(
     }
     let now = OffsetDateTime::now_utc();
     let decision = match &answer {
-        Answer::Approve => ApprovalDecision::grant(
-            request.id(),
-            // Never wider than the record asked for. A decision may narrow to
-            // the one call in front of a human and may never widen, and the
-            // stored request already carries the ceiling its risk imposes.
-            request.effective_scope(),
-            DecidedVia::Cli,
-            now,
-        )
-        .because("approved on the Harkness command line"),
+        Answer::Approve(scope) => {
+            // Narrowed against the stored request, never widened past it: a
+            // decision may narrow to the single call in front of a human, and
+            // the record already carries the ceiling its risk imposed. A bare
+            // `approve` names the *narrowest* scope, matching what `approvals
+            // approve` defaults to — granting the record's own breadth would
+            // mean one keystroke silently authorized every later call of that
+            // tool in the run.
+            ApprovalDecision::grant(
+                request.id(),
+                narrowest(*scope, request.effective_scope()),
+                DecidedVia::Cli,
+                now,
+            )
+            .because("approved on the Harkness command line")
+        }
         Answer::Deny { reason } => {
             ApprovalDecision::deny(request.id(), DecidedVia::Cli, now).because(reason.clone())
         }
         Answer::Abandoned => unreachable!("an abandoned prompt returns before a decision is built"),
     };
+    let noninteractive_denial = matches!(asker, Asker::Deny);
     match coordinator.decide_approval(decision) {
         Ok(()) => {}
         // The run stopped between reading the request and answering it. The
         // request is resolved by whatever stopped it, and the waiter has
-        // already been released, so there is nothing left to answer.
-        Err(RuntimeError::ApprovalNotActive { .. }) => {}
+        // already been released, so there is nothing left to answer — and
+        // nothing this process denied, which is why the answer below is `false`
+        // rather than the mode it was asked in.
+        Err(RuntimeError::ApprovalNotActive { .. }) => return Ok(false),
         Err(error) => return Err(CliError::Runtime(error)),
     }
-    Ok(matches!(asker, Asker::Deny))
+    Ok(noninteractive_denial)
+}
+
+/// The narrower of a requested scope and the one a record permits.
+///
+/// `ExactCall` is the narrowest and `CapabilityForRun` the widest. A request
+/// already downgraded to an exact call — every remote write and every
+/// destructive one is — cannot be answered more broadly than that.
+pub(crate) fn narrowest(requested: ApprovalScope, permitted: ApprovalScope) -> ApprovalScope {
+    let rank = |scope: ApprovalScope| match scope {
+        ApprovalScope::ExactCall => 0_u8,
+        ApprovalScope::ToolForRun => 1,
+        ApprovalScope::CapabilityForRun => 2,
+    };
+    if rank(requested) <= rank(permitted) {
+        requested
+    } else {
+        permitted
+    }
 }
 
 enum Answer {
-    Approve,
+    Approve(ApprovalScope),
     Deny {
         reason: String,
     },
@@ -778,10 +940,25 @@ impl AnswerReader {
     }
 
     /// Waits for one line, polling cancellation at the workspace's cadence.
-    fn next_answer(&self, cancellation: &Cancellation) -> Option<io::Result<String>> {
+    ///
+    /// The run keeps recording while a human reads, and its subscription queue
+    /// is bounded: a subscriber that fills it is disconnected for the rest of
+    /// the run. So the wait drains the timeline between polls rather than
+    /// standing still — a prompt is exactly the moment the stream is least
+    /// likely to be read otherwise.
+    fn next_answer(
+        &self,
+        receiver: &EventReceiver,
+        stream: &mut EventStream,
+        json_output: bool,
+        cancellation: &Cancellation,
+    ) -> Option<io::Result<String>> {
         loop {
             if cancellation.is_cancelled() {
                 return None;
+            }
+            while let Ok(delivery) = receiver.try_recv() {
+                emit_delivery(&delivery, json_output, stream);
             }
             match self.lines.recv_timeout(POLL_INTERVAL) {
                 Ok(line) => return Some(line),
@@ -800,15 +977,18 @@ impl AnswerReader {
 /// — so a machine reading standard output still sees exactly one result
 /// object. Closing standard input is a denial rather than a hang: absence of an
 /// answer is never consent.
+#[allow(clippy::too_many_arguments)]
 fn prompt(
     coordinator: &RunCoordinator,
     request: &ApprovalRequest,
     json_output: bool,
     answers: &AnswerReader,
+    receiver: &EventReceiver,
+    stream: &mut EventStream,
     cancellation: &Cancellation,
 ) -> Answer {
     let summary = format!(
-        "approval {} requested: {} {} ({} risk, scope {}) — {}",
+        "approval {} requested: {} {} ({} risk, at most scope {}) — {}",
         request.id(),
         request.tool().id.as_str(),
         request.tool().version,
@@ -819,7 +999,7 @@ fn prompt(
     emit_progress(json_output, &summary);
     emit_progress(json_output, INTERACTIVE_HELP);
     loop {
-        let line = match answers.next_answer(cancellation) {
+        let line = match answers.next_answer(receiver, stream, json_output, cancellation) {
             Some(Ok(line)) if line.is_empty() => {
                 // End of input. A caller that closed the stream is not
                 // answering, and the mandate says an unanswered request is
@@ -837,7 +1017,12 @@ fn prompt(
             None => return Answer::Abandoned,
         };
         match line.trim() {
-            "approve" => return Answer::Approve,
+            // The bare answer is the narrowest one. Widening is a separate word
+            // a person has to type, so nobody grants a tool for the rest of a
+            // run by answering the question in front of them.
+            "approve" | "approve-call" => return Answer::Approve(ApprovalScope::ExactCall),
+            "approve-tool" => return Answer::Approve(ApprovalScope::ToolForRun),
+            "approve-capability" => return Answer::Approve(ApprovalScope::CapabilityForRun),
             "deny" => {
                 return Answer::Deny {
                     reason: "denied on the Harkness command line".to_owned(),
@@ -879,43 +1064,83 @@ pub(crate) fn recorded_input(coordinator: &RunCoordinator, request: &ApprovalReq
 // Terminal outcomes
 // ---------------------------------------------------------------------------
 
+/// Every CLI-owned runtime outcome kind, with the exit code it reports.
+///
+/// One table, read by both verdict functions rather than restated in each. A
+/// literal code beside each kind in the two matches below could drift from the
+/// published `exit_code_by_kind` while every test still passed, because a test
+/// that builds a `RuntimeOutcome` from the table's own code proves nothing
+/// about what the verdicts choose.
+/// `cli_outcome_kinds_are_published_with_the_same_exit_code` binds this to
+/// `CLI_KIND_EXIT_CODES`, so the contract and the process status cannot
+/// disagree.
+pub(crate) const OUTCOME_KIND_EXIT_CODES: &[(&str, u8)] = &[
+    ("approval_required_noninteractive", EXIT_REFUSED),
+    ("policy_denied", EXIT_REFUSED),
+    ("approval_denied", EXIT_REFUSED),
+    ("tool_call_denied", EXIT_REFUSED),
+    ("tool_call_failed", EXIT_OPERATION_FAILED),
+    ("tool_call_cancelled", EXIT_CANCELLED),
+    ("tool_call_interrupted", EXIT_OPERATION_FAILED),
+    ("run_failed", EXIT_OPERATION_FAILED),
+    ("run_cancelled", EXIT_CANCELLED),
+    ("run_interrupted", EXIT_OPERATION_FAILED),
+];
+
+/// The published exit code for one CLI-owned outcome kind.
+fn outcome_code(kind: &'static str) -> u8 {
+    OUTCOME_KIND_EXIT_CODES
+        .iter()
+        .find(|(published, _)| *published == kind)
+        .map_or(EXIT_OPERATION_FAILED, |(_, code)| *code)
+}
+
+fn outcome(kind: &'static str, message: String, data: &Value) -> CliError {
+    CliError::RuntimeOutcome {
+        kind,
+        code: outcome_code(kind),
+        message,
+        details: data.clone(),
+    }
+}
+
 /// The error a run that did not succeed reports, or `None` when it did.
 ///
 /// The verdict decides the exit status for the same reason a project check's
 /// does: a caller must be able to act on the process status without parsing
 /// standard output.
+///
+/// `approval_required_noninteractive` is reported only when a call this process
+/// actually denied for want of a terminal is among the run's denied calls. A
+/// run that recovered from one such denial and then failed for its own reasons
+/// reports `run_failed`: telling a CI script to find a human is only useful
+/// when a human is what the run is missing.
 pub(crate) fn run_verdict(
     run: &Run,
-    denied_noninteractively: bool,
+    tool_calls: &[ToolCall],
+    denied_noninteractively: &HashSet<ToolCallId>,
     data: &Value,
 ) -> Option<CliError> {
-    let (kind, code, verdict) = match run.state() {
+    let stopped_for_want_of_an_answer = tool_calls.iter().any(|call| {
+        call.state() == ToolCallState::Denied && denied_noninteractively.contains(&call.id())
+    });
+    let (kind, verdict) = match run.state() {
         ExecutionState::Succeeded => return None,
-        ExecutionState::Cancelled => ("run_cancelled", EXIT_CANCELLED, "was cancelled"),
-        ExecutionState::Interrupted => {
-            ("run_interrupted", EXIT_OPERATION_FAILED, "was interrupted")
-        }
-        ExecutionState::Failed if denied_noninteractively => (
+        ExecutionState::Cancelled => ("run_cancelled", "was cancelled"),
+        ExecutionState::Interrupted => ("run_interrupted", "was interrupted"),
+        ExecutionState::Failed if stopped_for_want_of_an_answer => (
             "approval_required_noninteractive",
-            EXIT_REFUSED,
             "stopped because an approval could not be answered without a terminal",
         ),
-        ExecutionState::Failed => ("run_failed", EXIT_OPERATION_FAILED, "failed"),
+        ExecutionState::Failed => ("run_failed", "failed"),
         // The supervision loop exits only on a terminal state, so these are
         // unreachable. Named rather than caught by a wildcard so a new
         // lifecycle state has to be classified here on purpose.
-        ExecutionState::Queued | ExecutionState::Running | ExecutionState::WaitingForApproval => (
-            "run_failed",
-            EXIT_OPERATION_FAILED,
-            "did not reach a verdict",
-        ),
+        ExecutionState::Queued | ExecutionState::Running | ExecutionState::WaitingForApproval => {
+            ("run_failed", "did not reach a verdict")
+        }
     };
-    Some(CliError::RuntimeOutcome {
-        kind,
-        code,
-        message: format!("run {} {verdict}", run.id()),
-        details: data.clone(),
-    })
+    Some(outcome(kind, format!("run {} {verdict}", run.id()), data))
 }
 
 /// The error one recorded tool call reports, or `None` when it succeeded.
@@ -923,41 +1148,50 @@ pub(crate) fn run_verdict(
 /// A failed call reports the kind the runtime recorded, so a caller reading
 /// `invalid_input` learns the same thing whether the call came from an agent or
 /// from `tool invoke`. A denial reports which gate denied it, because "policy
-/// refused" and "a human refused" are different facts about the same call.
+/// refused", "a human refused", and "there was nobody to ask" are three
+/// different facts about the same call.
 pub(crate) fn tool_call_verdict(
     call: &ToolCall,
-    denied_noninteractively: bool,
+    denied_noninteractively: &HashSet<ToolCallId>,
     data: &Value,
 ) -> Option<CliError> {
     let failure = call.failure();
     let recorded = failure.map(Failure::kind).unwrap_or_default();
-    let (kind, code) = match call.state() {
-        ToolCallState::Succeeded => return None,
-        ToolCallState::Failed => (tool_kind(recorded), tool_exit_code(recorded)),
-        ToolCallState::Denied if denied_noninteractively => {
-            ("approval_required_noninteractive", EXIT_REFUSED)
-        }
-        ToolCallState::Denied => match recorded {
-            "policy" => ("policy_denied", EXIT_REFUSED),
-            "approval_denied" => ("approval_denied", EXIT_REFUSED),
-            _ => ("tool_call_denied", EXIT_REFUSED),
-        },
-        ToolCallState::Cancelled => ("tool_call_cancelled", EXIT_CANCELLED),
-        ToolCallState::Interrupted => ("tool_call_interrupted", EXIT_OPERATION_FAILED),
-        // A supervised call has reached a terminal state by the time this runs.
-        ToolCallState::Pending | ToolCallState::AwaitingApproval | ToolCallState::Running => {
-            ("tool_call_failed", EXIT_OPERATION_FAILED)
-        }
-    };
-    Some(CliError::RuntimeOutcome {
-        kind,
-        code,
-        message: failure.map_or_else(
+    let message = || {
+        failure.map_or_else(
             || format!("tool call {} is {}", call.id(), call.state().as_str()),
             |failure| single_line(failure.message()),
-        ),
-        details: data.clone(),
-    })
+        )
+    };
+    let kind = match call.state() {
+        ToolCallState::Succeeded => return None,
+        // A recorded failure keeps the runtime's own discriminant, looked up in
+        // the published tool namespace so the envelope cannot carry a spelling
+        // `harkness contract` never announced.
+        ToolCallState::Failed => {
+            return Some(CliError::RuntimeOutcome {
+                kind: tool_kind(recorded),
+                code: tool_exit_code(recorded),
+                message: message(),
+                details: data.clone(),
+            });
+        }
+        ToolCallState::Denied if denied_noninteractively.contains(&call.id()) => {
+            "approval_required_noninteractive"
+        }
+        ToolCallState::Denied => match recorded {
+            "policy" => "policy_denied",
+            "approval_denied" => "approval_denied",
+            _ => "tool_call_denied",
+        },
+        ToolCallState::Cancelled => "tool_call_cancelled",
+        ToolCallState::Interrupted => "tool_call_interrupted",
+        // A supervised call has reached a terminal state by the time this runs.
+        ToolCallState::Pending | ToolCallState::AwaitingApproval | ToolCallState::Running => {
+            "tool_call_failed"
+        }
+    };
+    Some(outcome(kind, message(), data))
 }
 
 /// Records the requested trust decision, then refuses an untrusted workspace.
@@ -1013,10 +1247,12 @@ pub(crate) fn apply_workspace_trust(
 /// store's *own* redactor and refuses the run when either field differs, so the
 /// two have to agree. A store this crate opened has the default redactor, which
 /// is [`PassThrough`], and there is no route from here to a store configured
-/// with another one: `Store::redacting` is never called in this binary. Should
-/// that ever change, this is where it would have to change too — the failure
-/// would be every run refused before it started, not a wrong redaction.
-pub(crate) fn workspace_ref(_store: &Store, task: &Task) -> WorkspaceRef {
+/// with another one: `Store::redacting` is never called in this binary, and
+/// `Store::redactor` is crate-private to `harkness-runtime` so there is nothing
+/// to read the real one from. Should a redacting store ever be opened here,
+/// this is where it would have to change too — the failure would be every run
+/// refused before it started, which is loud rather than silent.
+pub(crate) fn workspace_ref(task: &Task) -> WorkspaceRef {
     WorkspaceRef::from_task(task, &PassThrough)
 }
 

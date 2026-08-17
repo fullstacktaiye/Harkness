@@ -222,8 +222,6 @@ fn retrying_records_a_new_attempt_that_names_the_run_it_follows() {
         &original,
         "--scenario",
         "read_only_success",
-        "--project",
-        "ws",
     ]);
 
     assert_success(&output);
@@ -266,8 +264,6 @@ fn retrying_a_run_that_succeeded_is_refused_with_the_runtimes_own_kind() {
         &run,
         "--scenario",
         "read_only_success",
-        "--project",
-        "ws",
     ]);
 
     assert_eq!(output.status.code(), Some(3));
@@ -669,26 +665,35 @@ fn agent_run_streams_progress_on_stderr_and_prints_one_result_on_stdout() {
     for line in &lines {
         assert_eq!(line["v"], 1);
         assert_eq!(line["type"], "progress");
+    }
+    // The envelope says whether the live stream was complete, so the assertion
+    // is that it *was* rather than an assumption that it always is.
+    assert_eq!(data["timeline_complete"], true, "the live stream was lost");
+    let events = lines
+        .iter()
+        .filter(|line| !line["event"].is_null())
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), lines.len(), "every line carried its event");
+    for line in &events {
         assert_eq!(line["event"]["run_id"], run);
     }
-    assert_eq!(lines.len() as u64, data["event_count"].as_u64().unwrap());
+    assert_eq!(events.len() as u64, data["event_count"].as_u64().unwrap());
     assert_eq!(
-        lines.last().unwrap()["event"]["seq"],
+        events.last().unwrap()["event"]["seq"],
         data["last_event_seq"]
     );
 
     // A follow-up read reproduces the same timeline from the durable log.
     let shown = world.harkness(&["--json", "run", "show", run, "--limit", "1000"]);
     assert_success(&shown);
-    let events = json_output(&shown)["data"]["events"].clone();
-    let replayed = events
+    let replayed = json_output(&shown)["data"]["events"]
         .as_array()
-        .unwrap()
+        .expect("the timeline is a list")
         .iter()
         .map(|event| event["seq"].as_u64().unwrap())
         .collect::<Vec<_>>();
-    let streamed = lines
-        .iter()
+    let streamed = events
+        .into_iter()
         .map(|line| line["event"]["seq"].as_u64().unwrap())
         .collect::<Vec<_>>();
     assert_eq!(replayed, streamed);
@@ -780,8 +785,8 @@ fn interactive_mode_denies_on_an_explicit_answer_and_records_who_decided() {
     // The prompt, the shown input and the help all went to standard error.
     let progress = String::from_utf8(output.stderr).unwrap();
     assert!(
-        progress.contains("answer approve, deny, or show-input"),
-        "the line protocol is announced"
+        progress.contains("approve (this call only)"),
+        "the line protocol announces that the bare answer is the narrow one"
     );
     assert!(
         progress.contains("base_sha256"),
@@ -857,14 +862,94 @@ fn the_flagship_scenario_runs_end_to_end_and_is_reproducible_from_the_log() {
         shown["events"].as_array().unwrap().len() as u64,
         data["event_count"].as_u64().unwrap()
     );
+    assert_eq!(data["timeline_complete"], true);
     assert_eq!(shown["tool_calls"].as_array().unwrap().len(), 5);
     assert_eq!(shown["approvals"].as_array().unwrap().len(), 2);
+    for approval in shown["approvals"].as_array().unwrap() {
+        assert_eq!(approval["decision"]["verdict"], "granted");
+        // A bare `approve` authorizes the call in front of the reader and
+        // nothing else, even though the stored request would have permitted the
+        // tool for the rest of the run.
+        assert_eq!(approval["decision"]["scope"], "exact_call");
+        assert_eq!(approval["requested_scope"], "tool_for_run");
+    }
+}
+
+#[test]
+fn a_wider_grant_has_to_be_asked_for_by_name() {
+    let world = World::new();
+    world.trust();
+
+    let output = world.harkness_with_stdin(
+        &[
+            "--json",
+            "agent",
+            "run",
+            "--scenario",
+            "approval_denied",
+            "--project",
+            "ws",
+            "--interactive",
+        ],
+        "approve-tool\n",
+    );
+
+    // The scenario scripts a denial and diverges when the call succeeds, so the
+    // run fails — what is being asserted is the recorded breadth of the grant.
+    assert!(!output.status.success());
+    let approvals = json_output(&output)["error"]["details"]["approvals"].clone();
+    assert_eq!(approvals[0]["decision"]["verdict"], "granted");
+    assert_eq!(approvals[0]["decision"]["scope"], "tool_for_run");
+}
+
+#[test]
+fn answering_an_approval_never_brings_a_run_store_into_existence() {
+    let world = World::new();
+
+    let output = world.harkness(&[
+        "--json",
+        "approvals",
+        "approve",
+        "00000000-0000-4000-8000-000000000001",
+    ]);
+
+    assert_eq!(output.status.code(), Some(4));
+    let error = &json_output(&output)["error"];
+    assert_eq!(error["kind"], "not_found");
+    assert_eq!(error["details"]["record"], "approval");
+    // A mistyped identifier must not create the schema, or the next `run list`
+    // stops taking the "no database means the empty projection" path.
+    assert!(!world.data_dir().join("runtime.db").exists());
+}
+
+#[test]
+fn a_piped_input_document_and_an_interactive_prompt_cannot_share_standard_input() {
+    let world = World::new();
+    world.trust();
+
+    let output = world.harkness_with_stdin(
+        &[
+            "--json",
+            "tool",
+            "invoke",
+            "fs.read",
+            "--input",
+            "-",
+            "--project",
+            "ws",
+            "--interactive",
+        ],
+        "{\"path\":\"src/lib.rs\"}\napprove\n",
+    );
+
+    // Refused by name rather than ending as "standard input closed before the
+    // approval was answered", which is a denial whose real cause is a conflict.
+    assert_eq!(output.status.code(), Some(2));
+    let message = json_output(&output)["error"]["message"].clone();
+    assert_eq!(json_output(&output)["error"]["kind"], "usage_error");
     assert!(
-        shown["approvals"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|approval| approval["decision"]["verdict"] == "granted")
+        message.as_str().unwrap().contains("--interactive"),
+        "the refusal names both flags: {message}"
     );
 }
 

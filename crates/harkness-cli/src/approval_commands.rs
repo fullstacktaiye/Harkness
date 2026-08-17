@@ -28,12 +28,12 @@ use harkness_runtime::approval::{
     ApprovalDecision, ApprovalId, ApprovalRequest, ApprovalScope, DecidedVia,
 };
 use harkness_runtime::coordinator::RunCoordinator;
-use harkness_runtime::store::{DEFAULT_RUN_PAGE_LIMIT, RunPage};
+use harkness_runtime::store::{DEFAULT_RUN_PAGE_LIMIT, RunPage, StoreError};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 
 use crate::runtime_support::{
-    approval_value, decode_run_cursor, encode_run_cursor, open_existing_runtime, open_runtime,
+    approval_value, decode_run_cursor, encode_run_cursor, narrowest, open_existing_runtime,
     parse_run_limit, recorded_input,
 };
 use crate::{CliError, CommandResult, command_result, load_service, single_line};
@@ -109,13 +109,16 @@ pub(crate) struct ApproveArguments {
     reason: Option<String>,
 }
 
+/// Neither listing nor answering is interruptible, and neither needs to be:
+/// every read here is one bounded store query and a decision is one short
+/// write. The parameter is the dispatcher's shape rather than this family's
+/// need.
 pub(crate) fn run_approvals(
     command: ApprovalsCommand,
     data_dir: Option<&Path>,
     json_output: bool,
-    cancellation: &Cancellation,
+    _cancellation: &Cancellation,
 ) -> Result<CommandResult, CliError> {
-    let _ = cancellation;
     match command {
         ApprovalsCommand::List(arguments) => list(arguments, data_dir, json_output),
         ApprovalsCommand::Approve(arguments) => approve(arguments, data_dir, json_output),
@@ -234,7 +237,7 @@ fn approve(
 ) -> Result<CommandResult, CliError> {
     let approval = parse_approval_id(&arguments.approval_id)?;
     let service = load_service(data_dir)?;
-    let coordinator = open_runtime(service.data_dir())?;
+    let coordinator = answering_runtime(service.data_dir(), approval)?;
     let request = coordinator
         .store()
         .approval(approval)
@@ -264,7 +267,7 @@ fn deny(
 ) -> Result<CommandResult, CliError> {
     let approval = parse_approval_id(approval_id)?;
     let service = load_service(data_dir)?;
-    let coordinator = open_runtime(service.data_dir())?;
+    let coordinator = answering_runtime(service.data_dir(), approval)?;
     let mut decision = ApprovalDecision::deny(approval, DecidedVia::Cli, OffsetDateTime::now_utc());
     if let Some(reason) = reason {
         decision = decision.because(reason);
@@ -275,22 +278,21 @@ fn deny(
     decided_result(&coordinator, approval, json_output, "denied")
 }
 
-/// The narrower of what was asked for and what the record permits.
+/// Opens the store an approval could exist in, without creating one.
 ///
-/// `ExactCall` is the narrowest and `CapabilityForRun` the widest. A stored
-/// request that was already downgraded to an exact call — every remote write
-/// and every destructive request is — cannot be answered more broadly here.
-fn narrowest(requested: ApprovalScope, permitted: ApprovalScope) -> ApprovalScope {
-    let rank = |scope: ApprovalScope| match scope {
-        ApprovalScope::ExactCall => 0_u8,
-        ApprovalScope::ToolForRun => 1,
-        ApprovalScope::CapabilityForRun => 2,
-    };
-    if rank(requested) <= rank(permitted) {
-        requested
-    } else {
-        permitted
-    }
+/// Answering is a write, but a data directory with no `runtime.db` has recorded
+/// no approval to answer, so building the whole schema and taking a lease to
+/// discover that is a side effect nobody asked for — and it permanently changes
+/// what a later `run list` reports, since it would no longer take the "no
+/// database means the empty projection" path. A mistyped identifier must not be
+/// able to do that.
+fn answering_runtime(data_dir: &Path, approval: ApprovalId) -> Result<RunCoordinator, CliError> {
+    open_existing_runtime(data_dir)?.ok_or_else(|| {
+        CliError::Store(StoreError::NotFound {
+            record: "approval",
+            id: approval.to_string(),
+        })
+    })
 }
 
 fn decided_result(

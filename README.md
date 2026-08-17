@@ -114,7 +114,7 @@ harkness --json editor open <path> [--line <line>] [--column <column>] [--projec
 harkness --json run list [--limit <count>] [--cursor <token>]
 harkness --json run show <run-id> [--limit <count>] [--cursor <seq>] [--order <oldest|newest>]
 harkness --json run cancel <run-id>
-harkness --json run retry <run-id> --scenario <name> [--project <selector>] [--interactive] [--trust-workspace]
+harkness --json run retry <run-id> --scenario <name> [--interactive] [--trust-workspace]
 
 harkness --json approvals list [--all] [--limit <count>] [--cursor <token>]
 harkness --json approvals approve <approval-id> [--scope <call|tool-this-run|capability-this-run>] [--reason <text>]
@@ -155,9 +155,18 @@ an approval even in a trusted workspace, and a headless invocation has nobody to
 ask, so it refuses with kind `approval_required_noninteractive` and exit 3 rather
 than proceeding. `--interactive` asks instead: the question goes to standard
 error — as a progress envelope under `--json`, so standard output stays exactly
-one result — and one line of `approve`, `deny`, or `show-input` comes back on
-standard input. Closing standard input is a denial. Ctrl-C at a prompt cancels
-the run and exits 130.
+one result — and one line comes back on standard input. Closing standard input
+is a denial, and Ctrl-C at a prompt cancels the run and exits 130.
+
+The answers are `approve`, `deny`, and `show-input`. A bare `approve` authorizes
+**that call and nothing else**, matching what `approvals approve --scope call`
+defaults to; `approve-tool` and `approve-capability` widen it for the rest of the
+run and have to be typed in full. Every answer is still narrowed against what the
+stored request permits, so a remote-write or destructive request — already
+downgraded to a single call when it was created — cannot be widened at all.
+Because `--input -` also reads standard input to end of file, it cannot be
+combined with `--interactive`; the pair is refused as a usage error rather than
+silently ending in a denial.
 
 `run list` pages newest-first with an opaque `next_cursor`, exactly as `git log`
 does. A run's timeline pages separately, by the sequence number `run show`
@@ -169,16 +178,27 @@ result envelope on standard output; the whole timeline is read back with
 
 `run cancel` and `approvals approve|deny` reach a *live* worker: the run's
 cancellation token and the thread parked on an approval both live in the process
-that started the run. A one-shot command invocation therefore answers only a run
-it is itself driving, and reports `run_not_active` or `approval_not_active` —
-both exit 3 — for anything else. Retrying needs no live worker: `run retry`
-starts a fresh attempt for the same task recording `retry_of`, and reports
-`workspace_may_be_modified` when the earlier attempt started work that could
-write. Nothing is resumed and no approval carries over.
+that started the run, and a decision persisted anywhere else would never wake
+either. A one-shot command invocation drives at most the run it started itself,
+so in practice these two verbs report `run_not_active` or `approval_not_active`
+— both exit 3 — and answering happens where the run is: at an `--interactive`
+prompt, or in the application, which holds its coordinator open. They are kept as
+commands because the refusal is the honest answer and because the application
+uses the same coordinator calls.
 
-Runs above `observe` also require a positive workspace trust decision, recorded
-once with `--trust-workspace` after reviewing the project root. Without it the
-command refuses before a run is recorded at all.
+Retrying needs no live worker. `run retry` starts a fresh attempt at the same
+task recording `retry_of`, taking the workspace from the run being re-attempted
+rather than from `--project` or the current directory — a recorded task already
+names its workspace, and naming a second one could only name a different one. It
+reports `workspace_may_be_modified` when the earlier attempt started work that
+could write. Nothing is resumed and no approval carries over.
+
+Every run also requires a positive workspace trust decision, recorded once with
+`--trust-workspace` after reviewing the project root, exactly as `check run`
+requires one. Without it the command refuses before a run is recorded at all —
+an untrusted workspace denies everything above `observe` and asks about
+everything below it, so the alternative is a run that is persisted and then
+refused.
 
 Editor commands store an argv template, not a shell command. Each argument is
 persisted separately and Harkness substitutes `{file}`, `{line}`, and

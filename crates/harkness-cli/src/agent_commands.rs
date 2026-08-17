@@ -118,7 +118,7 @@ fn run(
         Some(project.id),
         OffsetDateTime::now_utc(),
     );
-    let workspace = workspace_ref(coordinator.store(), &task);
+    let workspace = workspace_ref(&task);
     let task_id = coordinator.start_task(task).map_err(CliError::Runtime)?;
     let run_id = coordinator
         .start_run_with_workspace_metadata(
@@ -144,33 +144,39 @@ fn run(
         json_output,
         cancellation,
     )?;
-    let snapshot = outcome.snapshot;
+    let view = outcome.view;
     let data = json!({
         "kind": "agent_run",
         "run_id": run_id,
         "scenario": arguments.scenario,
         "scenario_version": scenario_version,
-        "run": run_value(&snapshot.run),
-        "task": task_value(&snapshot.task),
-        "steps": snapshot.steps.iter().map(step_value).collect::<Vec<_>>(),
-        "tool_calls": snapshot.tool_calls.iter().map(tool_call_value).collect::<Vec<_>>(),
-        "approvals": snapshot
+        "run": run_value(&view.run),
+        "task": task_value(&view.task),
+        "steps": view.steps.iter().map(step_value).collect::<Vec<_>>(),
+        "tool_calls": view.tool_calls.iter().map(tool_call_value).collect::<Vec<_>>(),
+        "approvals": view
             .approvals
             .iter()
             .map(|request| approval_value(request, None))
             .collect::<Vec<_>>(),
-        "artifacts": snapshot.artifacts.iter().map(artifact_value).collect::<Vec<_>>(),
+        "artifacts": view.artifacts.iter().map(artifact_value).collect::<Vec<_>>(),
         // Streamed, not repeated. Every event went to standard error as it was
         // recorded and `run show` reads the whole log back; a result envelope
         // that grew with the run would be the one thing this command promises
         // not to be.
-        "event_count": snapshot.events.len(),
-        "last_event_seq": snapshot.events.last().map(|event| event.seq.get()),
+        "event_count": outcome.streamed.count,
+        "last_event_seq": outcome.streamed.last_seq,
+        "timeline_complete": outcome.streamed.complete,
     });
     // The run's own verdict decides the exit status, exactly as a project
     // check's does: a caller must be able to act on the process status without
     // parsing standard output.
-    if let Some(verdict) = run_verdict(&snapshot.run, outcome.denied_noninteractively, &data) {
+    if let Some(verdict) = run_verdict(
+        &view.run,
+        &view.tool_calls,
+        &outcome.denied_noninteractively,
+        &data,
+    ) {
         return Err(verdict);
     }
     command_result(
@@ -179,7 +185,7 @@ fn run(
             format!(
                 "{}\t{}\t{}",
                 run_id,
-                snapshot.run.state().as_str(),
+                view.run.state().as_str(),
                 arguments.scenario
             )
         },

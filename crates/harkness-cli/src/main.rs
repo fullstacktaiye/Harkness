@@ -5954,6 +5954,7 @@ mod tests {
         project_exit_code, project_value, requested_json, single_line,
     };
 
+    use crate::runtime_support::OUTCOME_KIND_EXIT_CODES;
     use tempfile::tempdir;
 
     /// Attribution is advisory: a walk that could not be made degrades to a
@@ -6828,21 +6829,38 @@ mod tests {
         assert_eq!(kinds, CLI_ERROR_KINDS);
     }
 
-    /// Every CLI-owned runtime outcome reports the exit code the published
-    /// table names for it, so a caller reading `exit_code_by_kind` and a caller
-    /// reading `$?` never disagree.
+    /// The kinds `run_verdict` and `tool_call_verdict` choose from must carry
+    /// the exit code `harkness contract` publishes for them.
+    ///
+    /// Asserting that a `RuntimeOutcome` built from the table's own code reports
+    /// that code proves nothing — the variant stores it verbatim. What can
+    /// actually drift is the pair the verdicts pick, so the table they read is
+    /// what is compared here, entry for entry, against the published one.
     #[test]
-    fn runtime_outcome_kinds_report_their_published_exit_codes() {
-        for (kind, code) in CLI_KIND_EXIT_CODES {
-            let error = CliError::RuntimeOutcome {
-                kind,
-                code: *code,
-                message: "fixture".to_owned(),
-                details: serde_json::json!({}),
-            };
-            assert_eq!(error.kind(), *kind);
-            assert_eq!(error.exit_code(), *code);
+    fn cli_outcome_kinds_are_published_with_the_same_exit_code() {
+        for (kind, code) in OUTCOME_KIND_EXIT_CODES {
+            let published = CLI_KIND_EXIT_CODES
+                .iter()
+                .find(|(published, _)| published == kind)
+                .unwrap_or_else(|| panic!("{kind} is chosen by a verdict but never published"));
+            assert_eq!(
+                published.1, *code,
+                "{kind} exits {code} but is published as {}",
+                published.1
+            );
         }
+        // And the other way, structurally: the outcome kinds are the tail of
+        // the published namespace, so a kind added to one table and forgotten
+        // in the other is a failing assertion rather than a contract that
+        // advertises a spelling nothing reports.
+        let outcomes = OUTCOME_KIND_EXIT_CODES
+            .iter()
+            .map(|(kind, _)| *kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &CLI_ERROR_KINDS[CLI_ERROR_KINDS.len() - outcomes.len()..],
+            outcomes
+        );
     }
 
     /// The two runtime namespaces are published beside the four that came

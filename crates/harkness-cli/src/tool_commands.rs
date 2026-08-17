@@ -30,6 +30,7 @@
 
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 
 use clap::{Args, Subcommand};
 use harkness_git::Cancellation;
@@ -44,7 +45,7 @@ use serde_json::{Value, json};
 use time::OffsetDateTime;
 
 use crate::runtime_support::{
-    ApprovalMode, artifact_value, contract_registry, open_runtime, run_value, step_value,
+    ApprovalMode, artifact_value, open_runtime_with, production_registry, run_value, step_value,
     supervise_run, task_value, tool_call_value, tool_call_verdict, workspace_ref,
 };
 use crate::{CliError, CommandResult, command_result, load_service, resolve_project, single_line};
@@ -78,6 +79,11 @@ pub(crate) struct InvokeArguments {
     #[arg(long, value_name = "SEMVER")]
     tool_version: Option<String>,
     /// Tool input as JSON, or `-` to read the document from standard input.
+    ///
+    /// `-` reads standard input to end of file, which is the same stream
+    /// `--interactive` reads an approval answer from, so the two cannot both be
+    /// used: a piped document leaves the answer channel already closed, and a
+    /// closed answer channel is a denial.
     #[arg(long, value_name = "JSON")]
     input: String,
     /// Select by full ID, UUID prefix (8+ characters), explicit path, or display name.
@@ -123,7 +129,7 @@ fn parse_tool_version(value: &str) -> Result<ToolVersion, CliError> {
 }
 
 fn list(json_output: bool) -> Result<CommandResult, CliError> {
-    let registry = contract_registry()?;
+    let registry = production_registry()?;
     // Ordered by identifier and then by version precedence, which the registry
     // guarantees, so the projection is diff-stable regardless of registration
     // order.
@@ -158,7 +164,7 @@ fn list(json_output: bool) -> Result<CommandResult, CliError> {
 }
 
 fn describe(arguments: DescribeArguments, json_output: bool) -> Result<CommandResult, CliError> {
-    let registry = contract_registry()?;
+    let registry = production_registry()?;
     let descriptor = resolve(
         &registry,
         &arguments.tool_id,
@@ -250,26 +256,35 @@ fn invoke(
     json_output: bool,
     cancellation: &Cancellation,
 ) -> Result<CommandResult, CliError> {
+    // Refused rather than silently resolved. Both read standard input to end of
+    // file, so the combination always ends in "standard input closed before the
+    // approval was answered" — a denial whose real cause is a flag conflict.
+    if arguments.input == "-" && arguments.interactive {
+        return Err(CliError::Usage(
+            "--input - reads standard input to end of file, which leaves --interactive no answer \
+             to read; pass the document inline or drop --interactive"
+                .to_owned(),
+        ));
+    }
     let input = read_input(&arguments.input)?;
     let service = load_service(data_dir)?;
     let project = resolve_project(&service, arguments.project.as_deref())?;
-    let coordinator = open_runtime(service.data_dir())?;
-    // Resolved before anything is recorded, so a wrong name or a stale pin
-    // costs no task, run, or step. This registry and the coordinator's are
-    // separate values built by one function, so resolving here and dispatching
-    // there cannot pick different tools — and pinning the resolved `(id,
-    // version)` into the request is what stops a second resolution disagreeing
-    // with the first once the call is recorded.
-    let identity = {
-        let registry = contract_registry()?;
-        resolve(
-            &registry,
-            &arguments.tool_id,
-            arguments.tool_version.as_deref(),
-        )?
-        .identity()
-        .clone()
-    };
+    // One registry, resolved from and then dispatched through. Registration
+    // compiles a schema validator per tool, so building a second identical one
+    // just to read an identity is the most expensive line in the command — and
+    // sharing it also makes "resolved here, dispatched there" one lookup in one
+    // table rather than two that could in principle disagree.
+    let registry = Arc::new(production_registry()?);
+    // Resolved before anything is recorded, so a wrong name or a stale pin costs
+    // no task, run, or step.
+    let identity = resolve(
+        &registry,
+        &arguments.tool_id,
+        arguments.tool_version.as_deref(),
+    )?
+    .identity()
+    .clone();
+    let coordinator = open_runtime_with(service.data_dir(), Arc::clone(&registry))?;
     crate::runtime_support::apply_workspace_trust(
         &coordinator,
         &project,
@@ -310,7 +325,7 @@ fn invoke(
         Some(project.id),
         OffsetDateTime::now_utc(),
     );
-    let workspace = workspace_ref(coordinator.store(), &task);
+    let workspace = workspace_ref(&task);
     let task_id = coordinator.start_task(task).map_err(CliError::Runtime)?;
     let run_id = coordinator
         .start_run_with_workspace_metadata(
@@ -334,38 +349,39 @@ fn invoke(
         json_output,
         cancellation,
     )?;
-    let snapshot = outcome.snapshot;
+    let view = outcome.view;
     // Exactly one call: the script requests one tool and stops. Absent means
     // the run never reached the request, which is reported as the run's own
     // failure rather than as a missing tool call.
-    let Some(call) = snapshot.tool_calls.first() else {
+    let Some(call) = view.tool_calls.first() else {
         return Err(CliError::RuntimeOutcome {
             kind: "run_failed",
             code: crate::EXIT_OPERATION_FAILED,
             message: format!("run {run_id} recorded no tool call to report"),
-            details: json!({ "run": run_value(&snapshot.run) }),
+            details: json!({ "run": run_value(&view.run) }),
         });
     };
     let data = json!({
         "kind": "tool_invoke",
         "run_id": run_id,
-        "task": task_value(&snapshot.task),
+        "task": task_value(&view.task),
         "tool_call": tool_call_value(call),
-        "run": run_value(&snapshot.run),
-        "steps": snapshot.steps.iter().map(step_value).collect::<Vec<_>>(),
-        "approvals": snapshot
+        "run": run_value(&view.run),
+        "steps": view.steps.iter().map(step_value).collect::<Vec<_>>(),
+        "approvals": view
             .approvals
             .iter()
             .map(|request| crate::runtime_support::approval_value(request, None))
             .collect::<Vec<_>>(),
-        "artifacts": snapshot.artifacts.iter().map(artifact_value).collect::<Vec<_>>(),
+        "artifacts": view.artifacts.iter().map(artifact_value).collect::<Vec<_>>(),
         // The timeline itself is not in the envelope. It was streamed as
         // progress while the call ran and `run show` reproduces every entry of
         // it from the log; repeating it here would make one invocation's result
         // grow with how much the tool had to say.
-        "event_count": snapshot.events.len(),
+        "event_count": outcome.streamed.count,
+        "timeline_complete": outcome.streamed.complete,
     });
-    if let Some(verdict) = tool_call_verdict(call, outcome.denied_noninteractively, &data) {
+    if let Some(verdict) = tool_call_verdict(call, &outcome.denied_noninteractively, &data) {
         return Err(verdict);
     }
     command_result(
