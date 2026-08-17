@@ -54,6 +54,12 @@ Item {
                 active: activityBar.panelExpanded
                     && activityBar.currentViewId === modelData.viewId
                 badge: modelData.viewBadge
+                // Optional in the view contract: a view that does not name a
+                // colour is counting something ordinary, so the count keeps
+                // the accent every other badge in the bar uses.
+                badgeColor: modelData.viewBadgeColor !== undefined
+                    ? modelData.viewBadgeColor
+                    : Kirigami.Theme.highlightColor
                 iconName: modelData.viewIcon
                 shortcutText: modelData.viewShortcut
                 text: modelData.viewTitle

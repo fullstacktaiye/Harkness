@@ -83,6 +83,24 @@ QtObject {
             || job("remove_managed") !== null;
     }
 
+    /// The mutations that act on one path or hunk rather than on the repository
+    /// as a whole.
+    ///
+    /// Kept apart from `repositoryMutationRunning` because the two answer
+    /// different questions. A staging control asks "may I stage?", and disabling
+    /// the whole file list because one discard is in flight would be wrong. But
+    /// the backend's own `jobs_conflict` refuses these alongside anything else
+    /// that mutates, so a caller asking "would a mutation be accepted right
+    /// now?" has to count them, and gets both.
+    function pathMutationRunning() {
+        return job("stage") !== null
+            || job("unstage") !== null
+            || job("stage_hunk") !== null
+            || job("unstage_hunk") !== null
+            || job("discard_path") !== null
+            || job("discard_hunk") !== null;
+    }
+
     function reviewReadRunning() {
         return job("review") !== null
             || job("review_file") !== null
