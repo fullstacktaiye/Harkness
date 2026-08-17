@@ -4642,6 +4642,7 @@ fn regenerate_the_frozen_v7_fixture() {
     store
         .interrupt_run(
             run.id(),
+            Some(lease.id()),
             crate::store::InterruptionReason::LeaseLockReleased,
             at(20),
         )

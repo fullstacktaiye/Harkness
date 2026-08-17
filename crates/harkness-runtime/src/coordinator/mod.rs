@@ -109,7 +109,22 @@ struct CoordinatorInner {
     /// advisory lock, which is what the next start reads as "abandoned".
     lease: RuntimeLease,
     /// Trips once, on the first shutdown; a second is a no-op.
+    ///
+    /// Read under [`claim`](Self::claim) by anything that is about to record a
+    /// run, never on its own: the flag alone is a moment in the past by the
+    /// time the row is written.
     stopping: AtomicBool,
+    /// Held shared while a run is being recorded and started, exclusively while
+    /// the claim is given up.
+    ///
+    /// Reading `stopping` and then inserting a run is two steps, and shutdown
+    /// fits between them: the row would land naming a lease whose row was
+    /// already released and whose lock file was already unlinked, so the next
+    /// sweep would interrupt a run this process is actively driving — and a
+    /// user could then retry it while the original worker still holds the
+    /// worktree. That is the outcome ADR-0020 exists to prevent, so the check
+    /// and the write it guards happen under one guard.
+    claim: std::sync::RwLock<()>,
     /// Woken by shutdown so housekeeping exits at once rather than at the end
     /// of its renewal interval.
     housekeeping: Condvar,
@@ -219,6 +234,7 @@ impl RunCoordinator {
             deliveries: Mutex::new(HashMap::new()),
             lease,
             stopping: AtomicBool::new(false),
+            claim: std::sync::RwLock::new(()),
             housekeeping: Condvar::new(),
             housekeeping_state: Mutex::new(()),
         });
@@ -259,6 +275,19 @@ impl RunCoordinator {
                         .housekeeping_state
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner);
+                    // Re-read *under* the mutex. Checking only at the top of the
+                    // loop leaves a window in which shutdown sets the flag and
+                    // signals before this thread parks, and the wake-up is then
+                    // lost for a whole renewal interval.
+                    if inner.stopping.load(Ordering::Acquire) {
+                        return;
+                    }
+                    // This thread necessarily holds a strong reference while it
+                    // waits — the mutex and the condition variable live inside
+                    // it — so a lost wake-up would keep the store and the
+                    // scheduler alive, with their files open, for a further
+                    // interval after the coordinator's last handle went away.
+                    // That is the second thing the re-read above buys.
                     let (_guard, _timeout) = inner
                         .housekeeping
                         .wait_timeout(guard, lease::LEASE_RENEW_INTERVAL)
@@ -409,7 +438,27 @@ impl RunCoordinator {
                 state: record.state(),
             });
         }
-        let workspace_may_be_modified = self.workspace_may_be_modified(original)?;
+        // Refused on recorded state, like the check above, and for the same
+        // reason: two live attempts at one task would be two agents editing one
+        // worktree, and the scheduler serializing their writes makes that
+        // survivable rather than intended. This is a guard and not a
+        // uniqueness guarantee — two calls racing this read can still both pass
+        // — because the durable half of that would be a partial unique index on
+        // a column runs move through, and the case it would buy is narrower
+        // than the one it would constrain.
+        for existing in self.inner.store.retries_of(original)? {
+            if !self.inner.store.load_run(existing)?.state().is_terminal() {
+                return Err(RuntimeError::RunStillActive { run: existing });
+            }
+        }
+        // The flag is cumulative down a chain of attempts, not a fact about the
+        // immediate predecessor. Attempt A writes and fails; attempt B is
+        // interrupted before it calls anything; a retry of B has no started
+        // call of its own to find, and A's partial write is still on disk. Only
+        // carrying the predecessor's own answer forward keeps the warning
+        // attached to the workspace it is actually about.
+        let workspace_may_be_modified =
+            record.workspace_may_be_modified() || self.workspace_may_be_modified(original)?;
         self.start_run_inner(
             record.task_id(),
             agent,
@@ -458,6 +507,17 @@ impl RunCoordinator {
         workspace_metadata: Option<WorkspaceMetadata>,
         retry: Option<(RunId, bool)>,
     ) -> Result<RunId, RuntimeError> {
+        // Held for the whole of this function rather than around the check
+        // alone. The row is not the only thing that must land before the claim
+        // can be given up: the worker has to be registered as active too, or
+        // shutdown would return having cancelled nothing while a thread was
+        // still about to start. Shutdown therefore waits for a start already in
+        // progress, which is the honest reading of "stop accepting work".
+        let _claim = self
+            .inner
+            .claim
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
         // A shut-down coordinator has given its claim up, so a run started
         // under it would be recorded as owned by something nothing is holding —
         // and the very next sweep would be right to interrupt it. Refusing says
@@ -509,23 +569,32 @@ impl RunCoordinator {
             None => Run::new(task_id, now),
         };
         let run_id = run.id();
-        self.inner.store.insert_run_with_event(
-            &run,
-            Some(self.inner.lease.record()),
-            RunEvent::new(EventKind::RunStateChanged, now)
-                .with_payload(json!({"state": ExecutionState::Queued.as_str()})),
-        )?;
-        if let Some((original, workspace_may_be_modified)) = retry {
+        let queued = RunEvent::new(EventKind::RunStateChanged, now)
+            .with_payload(json!({"state": ExecutionState::Queued.as_str()}));
+        let owner = Some(self.inner.lease.record());
+        match retry {
             // Appended to the *original*, whose own state is untouched: a
             // terminal run's timeline is evidence, and the only honest way to
-            // say "this was re-attempted" is to add a line to it.
-            self.inner.store.append_event(
-                original,
-                RunEvent::new(EventKind::RunRetried, now).with_payload(json!({
-                    "retry_run_id": run_id.to_string(),
-                    "workspace_may_be_modified": workspace_may_be_modified,
-                })),
-            )?;
+            // say "this was re-attempted" is to add a line to it. Both writes
+            // commit together, so a retry can never exist without the attempt
+            // it follows saying so.
+            Some((original, workspace_may_be_modified)) => {
+                self.inner.store.insert_retry_with_events(
+                    &run,
+                    owner,
+                    queued,
+                    original,
+                    RunEvent::new(EventKind::RunRetried, now).with_payload(json!({
+                        "retry_run_id": run_id.to_string(),
+                        "workspace_may_be_modified": workspace_may_be_modified,
+                    })),
+                )?;
+            }
+            None => {
+                self.inner
+                    .store
+                    .insert_run_with_event(&run, owner, queued)?;
+            }
         }
         self.delivery(run_id);
         if let Err(error) = self.publish(run_id) {
@@ -742,10 +811,27 @@ impl CoordinatorInner {
     /// did *not* finish findable: the next start reads the released claim and
     /// ends them, rather than leaving them looking live for good.
     fn shutdown(&self) {
-        if self.stopping.swap(true, Ordering::AcqRel) {
-            return;
+        {
+            // Exclusive, so a start that already passed its own check has
+            // finished recording and registering its run before the claim is
+            // given up, and one that has not yet begun sees the flag.
+            let _claim = self.claim.write().unwrap_or_else(PoisonError::into_inner);
+            if self.stopping.swap(true, Ordering::AcqRel) {
+                return;
+            }
         }
-        // Wakes the housekeeping thread out of its renewal wait immediately.
+        // Taking the housekeeping mutex before signalling is what makes the
+        // wake-up reliable: the renewal thread re-reads `stopping` while
+        // holding it, so it either observes the flag or is already parked on
+        // the condition variable when this notification arrives. Signalling
+        // without it loses the wake-up whenever the thread is between those two
+        // points, and the coordinator then keeps a store open for a further
+        // renewal interval after its last handle is gone.
+        drop(
+            self.housekeeping_state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
         self.housekeeping.notify_all();
 
         let active = self

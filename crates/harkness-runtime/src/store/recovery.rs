@@ -135,6 +135,7 @@ impl RunInterruption {
 /// Everything the sweep needs about one run before it takes the write lock.
 struct Planned {
     run: RunId,
+    lease: Option<LeaseId>,
     interrupted: PreparedEvent,
     run_state: PreparedEvent,
     steps: Vec<(StepId, PreparedEvent)>,
@@ -179,7 +180,13 @@ pub(super) fn interrupt(
     // Every payload here is a fixed handful of fields, so none of them can
     // overflow into an artifact. Cleaning up anyway is what keeps that true by
     // construction rather than by inspection of the payloads above.
-    if result.is_err() {
+    //
+    // `Ok(None)` needs it as much as `Err` does, and is the likelier of the
+    // two: it is what a sweep racing another one gets, and the loser has
+    // already written and synced whatever its events spilled. Cleaning up only
+    // on failure would leave those bytes in `artifacts/` with no row referring
+    // to them, in a store whose orphan collector is deliberately absent.
+    if !matches!(result, Ok(Some(_))) {
         planned.discard_spills(store);
     }
     result
@@ -254,6 +261,7 @@ fn plan(
 
     Ok(Planned {
         run,
+        lease,
         interrupted,
         run_state,
         steps,
@@ -309,9 +317,7 @@ fn apply(
         // the run will not resume, so the question no longer has a subject. It
         // is terminal, which is what stops a prompt left open in a restarted
         // front end from authorizing anything.
-        stored
-            .resolve(ApprovalState::Superseded, at)
-            .map_err(StoreError::Approval)?;
+        stored.supersede(at).map_err(StoreError::Approval)?;
         approval::update_resolution(connection, &stored)?;
         event.append(connection, planned.run)?;
         approvals.push(stored);
@@ -323,8 +329,10 @@ fn apply(
     planned.run_state.append(connection, planned.run)?;
     // The dead owner is written off in the same transaction that marks its
     // last run, so a later start neither probes its lock file again nor finds
-    // a live-looking claim with nothing left to claim.
-    if let Some(id) = repository::run_lease_of(connection, planned.run)? {
+    // a live-looking claim with nothing left to claim. The identity came from
+    // the candidate scan and is carried here rather than read again: the sweep
+    // already knows which claim it proved dead.
+    if let Some(id) = planned.lease {
         lease::release(connection, id, at)?;
     }
 

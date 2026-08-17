@@ -640,6 +640,55 @@ impl Store {
         )
     }
 
+    /// Stores a retry, its own first event, and the line it adds to the attempt
+    /// it follows — all in one transaction.
+    ///
+    /// The pairing is the point. A retry exists exactly when the run it follows
+    /// says it was re-attempted: recording the new row and then appending to
+    /// the original as a second step would, on a refused append, leave a queued
+    /// run owned by a live claim that no sweep will touch and no worker will
+    /// ever drive, while its caller has been told the retry failed. Provenance
+    /// that reads in both directions has to commit in one.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::insert_run_with_event`], plus [`StoreError::NotFound`] when
+    /// the run being retried is not stored.
+    pub fn insert_retry_with_events(
+        &self,
+        run: &Run,
+        owner: Option<&LeaseRecord>,
+        event: RunEvent,
+        original: RunId,
+        retried: RunEvent,
+    ) -> Result<EventSeq, StoreError> {
+        // Both payloads are redacted, encoded, and — in the impossible case —
+        // spilled before the transaction opens, exactly as every other paired
+        // write in this module prepares its own.
+        let prepared = self.prepare_event(run.id(), event)?;
+        let announced = match self.prepare_event(original, retried) {
+            Ok(announced) => announced,
+            Err(error) => {
+                prepared.discard_spill(self);
+                return Err(error);
+            }
+        };
+        let result = self.in_write_transaction("inserting a retry with its events", |connection| {
+            if let Some(owner) = owner {
+                lease::ensure(connection, owner)?;
+            }
+            repository::insert_run(connection, run, owner.map(LeaseRecord::id))?;
+            let seq = prepared.append(connection, run.id())?;
+            announced.append(connection, original)?;
+            Ok(seq)
+        });
+        if result.is_err() {
+            prepared.discard_spill(self);
+            announced.discard_spill(self);
+        }
+        result
+    }
+
     /// Loads one run.
     ///
     /// # Errors
@@ -827,7 +876,8 @@ impl Store {
     ///
     /// Deciding *that* a run was abandoned is not this method's job and cannot
     /// be: the store opens no lock file and probes no process. The caller
-    /// supplies the reason it already proved — which is why this is reachable
+    /// supplies both the claim it read from the candidate scan and the reason
+    /// it already proved — which is why this is reachable
     /// only from inside the crate. `interrupted` means the owning process
     /// stopped, and a front end that could write it would be able to put a
     /// claim about a dead process into the history of a live one.
@@ -839,11 +889,11 @@ impl Store {
     pub(crate) fn interrupt_run(
         &self,
         run: RunId,
+        owner: Option<LeaseId>,
         reason: InterruptionReason,
         at: OffsetDateTime,
     ) -> Result<Option<RunInterruption>, StoreError> {
-        let lease = self.with_reader(|connection| repository::run_lease_of(connection, run))?;
-        recovery::interrupt(self, run, lease, reason, at)
+        recovery::interrupt(self, run, owner, reason, at)
     }
 
     /// Returns one newest-first page of run history.
@@ -1702,6 +1752,14 @@ impl Store {
     /// The redactor every recorded byte passes through.
     pub(super) fn redactor(&self) -> &Arc<dyn Redactor> {
         &self.redactor
+    }
+
+    /// The write connection, for a test that has to author a row this store
+    /// would never write — a hand edit, in other words, which is exactly the
+    /// input the load-time validation exists to refuse.
+    #[cfg(test)]
+    pub(crate) fn writer_for_test(&self) -> MutexGuard<'_, Connection> {
+        guard(&self.writer)
     }
 
     /// Runs a prepared event's write, cleaning up its spill if the write fails.

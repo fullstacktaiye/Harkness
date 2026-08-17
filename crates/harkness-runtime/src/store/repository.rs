@@ -14,8 +14,9 @@
 use rusqlite::{Connection, Row, named_params};
 
 use crate::domain::{
-    LeaseId, RUNTIME_RECORD_SCHEMA_VERSION, Run, RunId, RunWire, Step, StepId, StepWire, Task,
-    TaskId, TaskWire, ToolCall, ToolCallId, ToolCallWire, validate_record_schema_version,
+    ExecutionState, LeaseId, RUNTIME_RECORD_SCHEMA_VERSION, Run, RunId, RunWire, Step, StepId,
+    StepWire, Task, TaskId, TaskWire, ToolCall, ToolCallId, ToolCallWire,
+    validate_record_schema_version,
 };
 use crate::policy::PolicyDecision;
 
@@ -150,22 +151,46 @@ pub(super) fn insert_run(
         )
         .map(|_| ())
         .map_err(|error| {
-            // A retry names two parents — its task and the attempt it follows —
-            // and SQLite reports only that *a* foreign key failed. The one
-            // worth naming is the run: a retry's task identity is copied from
-            // the original this caller just loaded, so the task is the half
-            // that cannot have gone missing between the two statements.
-            let parent = if run.retry_of().is_some() { RUN } else { TASK };
             insert_failed(
                 Containment {
                     record: RUN,
-                    parent,
+                    parent: missing_run_parent(connection, run),
                 },
                 &run.id(),
                 "inserting a run",
                 error,
             )
         })
+}
+
+/// Names which of a run's parents is actually absent.
+///
+/// A retry names two — its task and the attempt it follows — and SQLite reports
+/// only that *a* foreign key failed. Guessing from the shape of the record
+/// would be right for the coordinator, whose retry copies its task identity
+/// from the original it just loaded, and wrong for every other caller of the
+/// public insert: a retry with an unstored task would be reported as a missing
+/// run. One indexed lookup on the error path answers it instead of assuming.
+fn missing_run_parent(connection: &Connection, run: &Run) -> &'static str {
+    let Some(original) = run.retry_of() else {
+        return TASK;
+    };
+    let present = |table: &str, id: String| {
+        connection
+            .query_row(
+                &format!("SELECT 1 FROM {table} WHERE id = ?1"),
+                [id],
+                |_| Ok(()),
+            )
+            .is_ok()
+    };
+    // Task first: it is the parent every run has, so an absent one is the
+    // answer whether or not the original is there too.
+    if present("tasks", run.task_id().to_string()) && !present("runs", original.to_string()) {
+        RUN
+    } else {
+        TASK
+    }
 }
 
 pub(super) fn update_run(connection: &Connection, run: &Run) -> Result<(), StoreError> {
@@ -287,35 +312,33 @@ pub(super) fn run_lease(row: &Row<'_>) -> Result<Option<LeaseId>, StoreError> {
         .transpose()
 }
 
-/// Reads the lease one run currently names.
-pub(super) fn run_lease_of(
-    connection: &Connection,
-    id: RunId,
-) -> Result<Option<LeaseId>, StoreError> {
-    let mut statement = connection
-        .prepare_cached("SELECT lease_id FROM runs WHERE id = :id")
-        .map_err(|error| query_failed("preparing the run lease query", error))?;
-    statement
-        .query_row(named_params! { ":id": id.to_string() }, |row| {
-            Ok(run_lease(row))
-        })
-        .map_err(|error| row_failed(RUN, &id, "loading a run lease", error))?
-}
-
 /// Reads every run that has not reached a terminal state, with its lease.
 ///
 /// Deliberately *not* a record load: recovery decides from a state spelling and
 /// a lease identity, so a store holding a hundred abandoned runs with a
 /// thousand events each is one indexed scan rather than a hundred timeline
 /// reads. The transition that follows re-loads each run under the write lock.
+///
+/// The state list is derived from [`ExecutionState`] rather than written out,
+/// so a state added later is swept without anyone remembering to come here. A
+/// hardcoded list would make a new non-terminal state invisible to recovery
+/// with no compile error and no failing test — a run frozen for ever, which is
+/// the exact bug this whole pass exists to remove. The values are
+/// `&'static str` from the enum's own table, never caller input.
 pub(super) fn unfinished_runs(
     connection: &Connection,
 ) -> Result<Vec<(RunId, Option<LeaseId>)>, StoreError> {
+    let non_terminal = ExecutionState::ALL
+        .iter()
+        .filter(|state| !state.is_terminal())
+        .map(|state| format!("'{}'", state.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
     let mut statement = connection
-        .prepare_cached(
-            "SELECT id, lease_id FROM runs WHERE state IN ('queued', 'running', \
-             'waiting_for_approval') ORDER BY created_at, id",
-        )
+        .prepare_cached(&format!(
+            "SELECT id, lease_id FROM runs WHERE state IN ({non_terminal}) \
+             ORDER BY created_at, id"
+        ))
         .map_err(|error| query_failed("preparing the unfinished run query", error))?;
     let rows = statement
         .query_map([], |row| {

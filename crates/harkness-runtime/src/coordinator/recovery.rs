@@ -68,10 +68,15 @@ impl RecoveryReport {
         self.contended
     }
 
-    /// Whether the sweep found nothing to do.
+    /// Whether the sweep ran and found nothing to do.
+    ///
+    /// False for a contended report, which found nothing because it never
+    /// looked. A caller that gated a "runs were interrupted while Harkness was
+    /// not running" notice on emptiness alone would stay silent while another
+    /// process was marking exactly those runs.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.interrupted_runs.is_empty() && self.failures.is_empty()
+        !self.contended && self.interrupted_runs.is_empty() && self.failures.is_empty()
     }
 }
 
@@ -140,16 +145,31 @@ pub(super) fn sweep(
                 Entry::Occupied(examined) => examined.get().clone(),
                 // Not `or_insert_with`: reading the row can fail, and a closure
                 // has nowhere to put that failure but a panic.
-                Entry::Vacant(slot) => slot
-                    .insert((store.lease(id)?, lease::probe(&data_dir, id)))
-                    .clone(),
+                //
+                // A claim whose row cannot be rebuilt is reported against the
+                // run that named it and the sweep moves on, for the same reason
+                // the marking itself is per-run. Propagating here would fail
+                // `RunCoordinator::open`, so one unreadable lease row would
+                // stop the process starting at all — strictly worse than the
+                // frozen run this pass exists to end.
+                Entry::Vacant(slot) => match store.lease(id) {
+                    Ok(record) => slot.insert((record, lease::probe(&data_dir, id))).clone(),
+                    Err(error) => {
+                        report.failures.push(RecoveryFailure {
+                            run,
+                            kind: error.kind(),
+                            message: error.to_string(),
+                        });
+                        continue;
+                    }
+                },
             },
             None => (None, Liveness::Released),
         };
         let Some(reason) = lease::interruption_reason(record.as_ref(), &liveness, at) else {
             continue;
         };
-        match store.interrupt_run(run, reason, at) {
+        match store.interrupt_run(run, owner, reason, at) {
             Ok(Some(interruption)) => {
                 report.interrupted_runs.push(interruption.run());
                 report.expired_approvals.extend(interruption.approval_ids());
@@ -183,6 +203,11 @@ pub(super) fn sweep(
             lease::discard(&data_dir, id);
         }
     }
+    // And the files no run ever pointed at: a process killed before it started
+    // anything, or a front end whose coordinator lives in a `static` and is
+    // never dropped. The loop above cannot see either, so without this pass
+    // `locks/` gains a file per start that nothing ever removes.
+    lease::collect_dead_files(&data_dir, std::time::SystemTime::now());
 
     Ok(report)
 }

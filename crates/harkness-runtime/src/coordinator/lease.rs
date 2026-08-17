@@ -222,6 +222,56 @@ pub(super) fn discard(data_dir: &Path, lease: LeaseId) {
     let _ = fs::remove_file(lease_path(data_dir, lease));
 }
 
+/// Removes lease files nobody holds and no run points at.
+///
+/// [`discard`] only reaches claims some *unfinished run* named, which leaves
+/// two kinds of file behind for good: one from a process killed before it
+/// started any run, and one per session of a front end whose coordinator lives
+/// in a `static` and is therefore never dropped. Neither is ever revisited, so
+/// without this `locks/` grows by a file per start, forever.
+///
+/// The age guard is the only reason this is safe to run beside a starting
+/// coordinator. [`RuntimeLease::acquire`] creates its file and locks it as two
+/// steps, and a file unlinked between them would leave that coordinator holding
+/// a lock on a path nothing can find — its own runs would then read as
+/// abandoned while it drove them. A file younger than [`LEASE_EXPIRY_GRACE`] is
+/// therefore left alone, which is forty-five seconds against a window of
+/// microseconds. Deciding hygiene from a timestamp is safe in a way deciding
+/// *liveness* from one is not: the worst outcome here is a file that survives
+/// to the next sweep.
+pub(super) fn collect_dead_files(data_dir: &Path, now: std::time::SystemTime) {
+    let Ok(entries) = fs::read_dir(locks_directory(data_dir)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(LEASE_FILE_PREFIX) || !name.ends_with(LEASE_FILE_SUFFIX) {
+            continue;
+        }
+        let young = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| {
+                now.duration_since(modified)
+                    .is_ok_and(|age| age < LEASE_EXPIRY_GRACE)
+            });
+        if young {
+            continue;
+        }
+        let path = entry.path();
+        // Opened and locked rather than merely stat-ed: a held lock is the only
+        // thing that says the file is still doing its job.
+        let Ok(file) = File::options().read(true).write(true).open(&path) else {
+            continue;
+        };
+        if file.try_lock().is_ok() {
+            drop(file);
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
 /// The short-lived exclusive lock one recovery sweep runs under.
 ///
 /// Two processes starting at once would otherwise both walk the same candidate
@@ -285,8 +335,13 @@ fn locks_directory(data_dir: &Path) -> PathBuf {
     data_dir.join(LOCKS_DIRECTORY)
 }
 
+/// Names every lease lock file, so the collector recognizes exactly what
+/// [`lease_path`] writes and nothing else in the shared `locks/` directory.
+const LEASE_FILE_PREFIX: &str = "runtime-lease-";
+const LEASE_FILE_SUFFIX: &str = ".lock";
+
 fn lease_path(data_dir: &Path, lease: LeaseId) -> PathBuf {
-    locks_directory(data_dir).join(format!("runtime-lease-{lease}.lock"))
+    locks_directory(data_dir).join(format!("{LEASE_FILE_PREFIX}{lease}{LEASE_FILE_SUFFIX}"))
 }
 
 #[cfg(test)]
@@ -377,6 +432,47 @@ mod tests {
             interruption_reason(Some(&record(false)), &Liveness::Released, at(0)),
             Some(InterruptionReason::LeaseLockReleased)
         );
+    }
+
+    #[test]
+    fn dead_lease_files_are_collected_and_live_or_young_ones_are_left() {
+        let data_dir = TempDir::new().unwrap();
+        let held = RuntimeLease::acquire(data_dir.path(), at(0)).unwrap();
+        // Exactly what a killed holder leaves behind: the kernel gave the lock
+        // back, and the file it was taken on is still there. A process that
+        // died before starting any run leaves no row pointing at it either, so
+        // nothing but this pass will ever look at it again.
+        let abandoned_id = LeaseId::new();
+        std::fs::write(lease_file(data_dir.path(), abandoned_id), b"").unwrap();
+        let unrelated = data_dir.path().join("locks").join("repository.lock");
+        std::fs::write(&unrelated, b"").unwrap();
+
+        // Nothing is old enough yet, which is the guard that stops this racing
+        // a coordinator between creating its lease file and locking it.
+        super::collect_dead_files(data_dir.path(), std::time::SystemTime::now());
+        assert_eq!(probe(data_dir.path(), abandoned_id), Liveness::Released);
+        assert!(lease_file(data_dir.path(), abandoned_id).exists());
+
+        super::collect_dead_files(
+            data_dir.path(),
+            std::time::SystemTime::now() + LEASE_EXPIRY_GRACE * 2,
+        );
+
+        assert!(
+            !lease_file(data_dir.path(), abandoned_id).exists(),
+            "an unheld lease file nothing points at was kept"
+        );
+        assert_eq!(
+            probe(data_dir.path(), held.id()),
+            Liveness::Held,
+            "a live claim's file was collected out from under it"
+        );
+        assert!(lease_file(data_dir.path(), held.id()).exists());
+        assert!(unrelated.exists(), "another owner's lock file was removed");
+    }
+
+    fn lease_file(data_dir: &Path, lease: LeaseId) -> std::path::PathBuf {
+        super::lease_path(data_dir, lease)
     }
 
     #[test]

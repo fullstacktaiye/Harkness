@@ -499,6 +499,43 @@ fn a_run_whose_claim_has_no_lock_is_interrupted_at_the_next_start() {
 }
 
 #[test]
+fn one_unreadable_claim_is_reported_without_stopping_the_rest_of_the_sweep() {
+    let harness = Harness::new();
+    let store = harness.store();
+    let task = harness.task("poisoned claim");
+    store.insert_task(&task).unwrap();
+    let poisoned = LeaseId::new();
+    let blocked = abandoned_run(&store, &task, poisoned).id();
+    let healthy = abandoned_run(&store, &task, LeaseId::new()).id();
+    // A `pid` no `u32` can hold is one hand edit away, and it is the whole row:
+    // rebuilding the claim fails, and nothing else about the store is wrong.
+    store
+        .writer_for_test()
+        .execute(
+            "UPDATE runtime_leases SET pid = -1 WHERE id = ?1",
+            [poisoned.to_string()],
+        )
+        .unwrap();
+    drop(store);
+
+    let (coordinator, report) = harness.open();
+
+    assert_eq!(
+        report.interrupted_runs(),
+        [healthy],
+        "a poisoned claim stopped an unrelated run being recovered"
+    );
+    assert_eq!(report.failures().len(), 1);
+    assert_eq!(report.failures()[0].run(), blocked);
+    assert!(!report.is_empty());
+    assert_eq!(
+        coordinator.run_snapshot(blocked).unwrap().run.state(),
+        ExecutionState::Queued,
+        "the run whose claim could not be read must be left as it stands"
+    );
+}
+
+#[test]
 fn a_second_sweep_over_the_same_store_marks_nothing_again() {
     let harness = Harness::new();
     let store = harness.store();
@@ -716,6 +753,45 @@ fn a_clean_shutdown_leaves_no_live_claim_and_no_unfinished_run() {
 }
 
 #[test]
+fn a_run_recorded_beside_a_concurrent_shutdown_is_never_left_owned_by_a_dead_claim() {
+    // The window is between reading "am I shutting down" and committing the
+    // row. If shutdown fits inside it, the run lands naming a claim whose lock
+    // file is already gone, and the very next sweep interrupts a run this
+    // process is actively driving.
+    for _ in 0..40 {
+        let harness = Harness::new();
+        let coordinator = harness.coordinator();
+        let task = harness.task("racing shutdown");
+        let workspace = WorkspaceRef::from_task(&task, &PassThrough);
+        let task_id = coordinator.start_task(task).unwrap();
+
+        let starter = coordinator.clone();
+        let stopper = coordinator.clone();
+        let started = std::thread::spawn(move || {
+            starter.start_run(task_id, Box::new(parking_agent()), workspace)
+        });
+        let stopped = std::thread::spawn(move || stopper.shutdown());
+        let outcome = started.join().unwrap();
+        stopped.join().unwrap();
+
+        // Either the start lost and was refused, or it won and its run is
+        // terminal by now — shutdown cancels what it finds. What must never
+        // happen is a non-terminal run left behind for a sweep to claim.
+        if let Ok(run) = outcome {
+            let state = harness.store().load_run(run).unwrap().state();
+            assert!(
+                state.is_terminal(),
+                "run {run} survived its coordinator's shutdown as {state}"
+            );
+        }
+        assert!(
+            harness.store().unfinished_runs().unwrap().is_empty(),
+            "a run outlived the claim it was recorded under"
+        );
+    }
+}
+
+#[test]
 fn a_coordinator_that_has_shut_down_refuses_to_start_anything_else() {
     let harness = Harness::new();
     let coordinator = harness.coordinator();
@@ -881,6 +957,88 @@ fn a_retry_warns_only_when_the_earlier_attempt_started_something_that_could_writ
             .run
             .workspace_may_be_modified(),
         "a call refused before execution cannot have written anything"
+    );
+}
+
+#[test]
+fn the_workspace_warning_survives_a_retry_of_a_retry() {
+    let harness = Harness::new();
+    let coordinator = harness.coordinator();
+
+    // Attempt one executes a write and fails, so its retry is warned.
+    let first = run_to_terminal(&harness, &coordinator, failing_write_agent(), Answer::Grant);
+    let workspace = harness.workspace_ref(&coordinator, first);
+    let second = coordinator
+        .retry_run(first, Box::new(parking_agent()), workspace.clone())
+        .unwrap();
+    await_parked(&coordinator, second);
+    assert!(
+        coordinator
+            .run_snapshot(second)
+            .unwrap()
+            .run
+            .workspace_may_be_modified()
+    );
+
+    // Attempt two is cancelled while still waiting to be allowed to write, so
+    // it started nothing of its own. The bytes attempt one left are still on
+    // disk, and nothing in v0.3 put them back.
+    coordinator.cancel_run(second).unwrap();
+    await_terminal(&coordinator, second);
+    assert!(
+        coordinator
+            .run_snapshot(second)
+            .unwrap()
+            .tool_calls
+            .iter()
+            .all(|call| call.started_at().is_none()),
+        "the second attempt must not have started a call of its own"
+    );
+
+    let third = coordinator
+        .retry_run(second, Box::new(parking_agent()), workspace)
+        .unwrap();
+    await_parked(&coordinator, third);
+
+    assert!(
+        coordinator
+            .run_snapshot(third)
+            .unwrap()
+            .run
+            .workspace_may_be_modified(),
+        "the warning was dropped one attempt after the write that earned it"
+    );
+}
+
+#[test]
+fn a_second_retry_is_refused_while_the_first_is_still_running() {
+    let harness = Harness::new();
+    let coordinator = harness.coordinator();
+    let original = run_to_terminal(&harness, &coordinator, failing_write_agent(), Answer::Grant);
+    let workspace = harness.workspace_ref(&coordinator, original);
+    let first = coordinator
+        .retry_run(original, Box::new(parking_agent()), workspace.clone())
+        .unwrap();
+    await_parked(&coordinator, first);
+
+    let error = coordinator
+        .retry_run(original, Box::new(parking_agent()), workspace.clone())
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "run_still_active");
+    assert!(matches!(error, RuntimeError::RunStillActive { run } if run == first));
+    assert_eq!(coordinator.store().retries_of(original).unwrap(), [first]);
+
+    // Once that attempt is over, the same original is retryable again.
+    coordinator.cancel_run(first).unwrap();
+    await_terminal(&coordinator, first);
+    let second = coordinator
+        .retry_run(original, Box::new(parking_agent()), workspace)
+        .unwrap();
+    await_parked(&coordinator, second);
+    assert_eq!(
+        coordinator.store().retries_of(original).unwrap(),
+        [first, second]
     );
 }
 
