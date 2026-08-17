@@ -1,0 +1,59 @@
+{
+  "v": 1,
+  "id": "text_only_turn",
+  "capabilities": {
+    "context_window": 128000,
+    "max_output_tokens": 4096,
+    "supports_streaming": true,
+    "supports_tool_calls": true,
+    "supports_structured_output": false,
+    "supports_token_counting": false
+  },
+  "steps": [
+    {
+      "step": "advance",
+      "millis": 35
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "turn_started",
+        "provider_request_id": "scripted-1"
+      }
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "text_delta",
+        "text": "Nothing in this workspace"
+      }
+    },
+    {
+      "step": "advance",
+      "millis": 15
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "text_delta",
+        "text": " needs changing."
+      }
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "usage",
+        "input_tokens": 412,
+        "output_tokens": 9,
+        "exact": true
+      }
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "turn_completed",
+        "stop": "end_turn"
+      }
+    }
+  ]
+}

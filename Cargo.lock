@@ -744,6 +744,16 @@ name = "harkness-mcp"
 version = "0.1.0"
 
 [[package]]
+name = "harkness-provider"
+version = "0.1.0"
+dependencies = [
+ "harkness-git",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "harkness-recipe"
 version = "0.1.0"
 

@@ -1,0 +1,22 @@
+[package]
+name = "harkness-provider"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# ADR-0001 puts this crate above `harkness-git` and below the runtime, beside
+# the context engine. It depends on `harkness-git` for one type —
+# `Cancellation` — and on nothing else in the workspace: the runtime crate, the
+# context engine, the two front ends, and all four adapter crates are
+# ineligible. See the manifest tests in `src/lib.rs`, which read this file and
+# fail on any of their names, on an HTTP client, and on anything asynchronous.
+[dependencies]
+harkness-git.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,39 @@
+{
+  "v": 1,
+  "id": "refusal",
+  "capabilities": {
+    "context_window": 128000,
+    "max_output_tokens": 4096,
+    "supports_streaming": true,
+    "supports_tool_calls": true,
+    "supports_structured_output": false,
+    "supports_token_counting": false
+  },
+  "steps": [
+    {
+      "step": "advance",
+      "millis": 28
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "turn_started",
+        "provider_request_id": "scripted-13"
+      }
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "text_delta",
+        "text": "I can't help with that."
+      }
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "turn_completed",
+        "stop": "refusal"
+      }
+    }
+  ]
+}

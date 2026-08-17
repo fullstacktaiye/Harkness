@@ -1,0 +1,76 @@
+{
+  "v": 1,
+  "id": "single_tool_call",
+  "capabilities": {
+    "context_window": 128000,
+    "max_output_tokens": 4096,
+    "supports_streaming": true,
+    "supports_tool_calls": true,
+    "supports_structured_output": false,
+    "supports_token_counting": false
+  },
+  "steps": [
+    {
+      "step": "advance",
+      "millis": 30
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "turn_started",
+        "provider_request_id": "scripted-2"
+      }
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "text_delta",
+        "text": "Reading the file first."
+      }
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "tool_call_started",
+        "index": 0,
+        "id": "call_read_1",
+        "name": "fs.read"
+      }
+    },
+    {
+      "step": "arguments",
+      "index": 0,
+      "text": "{\"path\":\"src/lib.rs\"}",
+      "split_at": [
+        8
+      ]
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "tool_call_ready",
+        "index": 0
+      }
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "usage",
+        "input_tokens": 508,
+        "output_tokens": 31,
+        "exact": true
+      }
+    },
+    {
+      "step": "advance",
+      "millis": 20
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "turn_completed",
+        "stop": "tool_use"
+      }
+    }
+  ]
+}

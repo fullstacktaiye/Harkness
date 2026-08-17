@@ -4,6 +4,7 @@ members = [
     "crates/harkness-git",
     "crates/harkness-core",
     "crates/harkness-context",
+    "crates/harkness-provider",
     "crates/harkness-acp",
     "crates/harkness-mcp",
     "crates/harkness-forge",
@@ -39,6 +40,7 @@ harkness-mcp = { path = "crates/harkness-mcp" }
 harkness-recipe = { path = "crates/harkness-recipe" }
 harkness-core = { path = "crates/harkness-core" }
 harkness-git = { path = "crates/harkness-git" }
+harkness-provider = { path = "crates/harkness-provider" }
 harkness-runtime = { path = "crates/harkness-runtime" }
 harkness-test-fixtures = { path = "crates/harkness-test-fixtures" }
 harkness-transport = { path = "crates/harkness-transport" }

@@ -1,0 +1,46 @@
+{
+  "v": 1,
+  "id": "usage_estimated_only",
+  "capabilities": {
+    "context_window": 32768,
+    "max_output_tokens": 2048,
+    "supports_streaming": true,
+    "supports_tool_calls": true,
+    "supports_structured_output": false,
+    "supports_token_counting": false
+  },
+  "steps": [
+    {
+      "step": "advance",
+      "millis": 22
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "turn_started"
+      }
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "text_delta",
+        "text": "This endpoint estimates its token counts."
+      }
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "usage",
+        "output_tokens": 24,
+        "exact": false
+      }
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "turn_completed",
+        "stop": "end_turn"
+      }
+    }
+  ]
+}

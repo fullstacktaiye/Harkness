@@ -58,8 +58,14 @@ build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing lin
   wire form is replaced by a new versioned fixture, never edited in place. The integration
   regenerator deliberately leaves `trust-record-future-schema.json` and
   `trust-record-unknown-field.json` alone — neither is a wire form this build can produce, so they
-  are hand-maintained beside the frozen set they probe.
-- **Latency targets** (`store/tests.rs`, `tool/tests.rs`): meaningful only under `--release`.
+  are hand-maintained beside the frozen set they probe. `cargo test -p harkness-provider --
+  --ignored regenerate_the_frozen_v1_fixtures` rewrites
+  `crates/harkness-provider/src/scripted/fixtures/*.json`, and is the one regenerator that is
+  routine: those scripts are authored as JSON, so it only re-canonicalizes the formatting of a
+  hand-written scenario. It still cannot invent one — a fixture that does not parse is not
+  rewritten.
+- **Latency targets** (`store/tests.rs`, `tool/tests.rs`, `assemble/assembler.rs`): meaningful only
+  under `--release`.
 
 ### Frozen fixtures
 
@@ -67,10 +73,13 @@ build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing lin
 `crates/harkness-context/src/fixtures/*.json`,
 `crates/harkness-runtime/src/approval/fixtures/canonical-input-v1.json`,
 `crates/harkness-runtime/src/agent/fixtures/*.json`,
-`crates/harkness-runtime/src/integration/fixtures/*.json`, and
+`crates/harkness-runtime/src/integration/fixtures/*.json`,
+`crates/harkness-provider/src/scripted/fixtures/*.json`, and
 `crates/harkness-runtime/src/store/fixtures/runtime-v{1..5}.db` pin released on-disk formats. A new
 persisted field, state spelling, or table means a version bump plus a *new* fixture, not an edit to
-an existing one.
+an existing one. The provider's scripts are the one set that is *authored* as JSON rather than
+mirrored from Rust data: the regenerator only re-canonicalizes their formatting, so a new scenario
+is a new file and a changed step is a new version beside v1.
 
 A **new fixture directory needs a `.gitattributes` line** — `<path>/*.json text eol=lf` — and the
 file enumerates them one directory at a time rather than by a glob. Fixture tests compare
@@ -90,8 +99,10 @@ harkness-cli ──┐                              ┌─> harkness-git
 harkness-gui ──┴─> harkness-core ─────────────┤
                    harkness-runtime ──────────┤
                    (domain | store | tool)    │
-                   harkness-context ──────────┘
+                   harkness-context ──────────┤
                    (also depends on harkness-core, for ProjectId)
+                   harkness-provider ─────────┘
+                   (contract | assemble | scripted)
 
 harkness-acp  ──┬─> harkness-transport ──> harkness-git
 harkness-mcp  ──┘
@@ -160,6 +171,19 @@ translating between two cancellation mechanisms.
   database of runs in the process. Read `snapshot.rs`'s module doc before
   changing anything a digest absorbs; the wire forms are frozen by fixtures under
   `src/fixtures/` because #110 turns them into `runtime.db` columns.
+- **`harkness-provider`** is the model-endpoint boundary, created by #111 against ADR-0001 and
+  ADR-0002. `contract` is the provider-neutral vocabulary — identities, capabilities, messages, the
+  streamed `ModelEvent` model, `TurnOutcome`, and ten stable `ProviderError` kinds — and
+  `ModelProvider::stream` is blocking and cancellation-polled, because the workspace has no async
+  runtime. `assemble` turns raw events into a validated `AssistantTurn`: `TurnDriver` is the loop an
+  implementation actually runs, and it owns the rules that are easy to get subtly wrong — poll
+  before delivering, ignore events after the turn completed, treat a sink's `Stop` as a success,
+  attach the partial turn to a disconnect. `scripted` is the same trait backed by frozen JSON, so
+  every streaming and tool-call shape is exercised with no network and no credential; two replays
+  of a scenario are identical down to their timings because a script advances its own clock. It
+  depends on `harkness-git` for `Cancellation` alone and must not depend on `harkness-runtime` or
+  `harkness-context`; #125 adds the OpenAI-compatible adapter *inside* this crate, keeping its wire
+  types private to its module.
 - **`harkness-transport`** is the subprocess JSON-RPC engine `harkness-acp` and `harkness-mcp` both
   run on, created by #147 against ADR-0012. `JsonRpcTransport` is the seam adapters see — send a
   message, receive one with a deadline, quarantine, shut down with an outcome — and `StdioTransport`

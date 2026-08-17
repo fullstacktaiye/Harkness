@@ -1,0 +1,26 @@
+{
+  "v": 1,
+  "id": "rate_limited_with_retry_after",
+  "capabilities": {
+    "context_window": 128000,
+    "max_output_tokens": 4096,
+    "supports_streaming": true,
+    "supports_tool_calls": true,
+    "supports_structured_output": false,
+    "supports_token_counting": false
+  },
+  "steps": [
+    {
+      "step": "advance",
+      "millis": 20
+    },
+    {
+      "step": "fail",
+      "failure": {
+        "kind": "rate_limited",
+        "retry_after_millis": 2000,
+        "detail": "this account has spent its per-minute request allowance"
+      }
+    }
+  ]
+}

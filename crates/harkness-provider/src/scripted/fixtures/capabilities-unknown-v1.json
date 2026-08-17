@@ -1,0 +1,38 @@
+{
+  "v": 1,
+  "id": "capabilities_unknown",
+  "capabilities": {
+    "context_window": null,
+    "max_output_tokens": null,
+    "supports_streaming": false,
+    "supports_tool_calls": false,
+    "supports_structured_output": false,
+    "supports_token_counting": false
+  },
+  "steps": [
+    {
+      "step": "advance",
+      "millis": 33
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "turn_started"
+      }
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "text_delta",
+        "text": "This endpoint announces nothing about itself."
+      }
+    },
+    {
+      "step": "emit",
+      "event": {
+        "kind": "turn_completed",
+        "stop": "end_turn"
+      }
+    }
+  ]
+}
