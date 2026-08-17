@@ -32,6 +32,21 @@ pub enum RuntimeError {
     /// The approval was not found or did not belong to an active run.
     #[error("approval {approval} is not attached to an active run")]
     ApprovalNotActive { approval: ApprovalId },
+    /// This process could not take, or prove, its claim on the runs it drives.
+    #[error("the runtime lease is unavailable: {reason}")]
+    LeaseUnavailable { reason: String },
+    /// A retry was asked for while the run it names is still going.
+    ///
+    /// Distinct from [`RunNotActive`](Self::RunNotActive), which reports the
+    /// opposite complaint about the opposite operation.
+    #[error("run {run} has not finished; a retry re-attempts a run that has stopped")]
+    RunStillActive { run: RunId },
+    /// A retry was asked for on a run there is nothing to re-attempt.
+    #[error("run {run} is {state}; only a failed, cancelled or interrupted run can be retried")]
+    RunNotRetryable {
+        run: RunId,
+        state: crate::domain::ExecutionState,
+    },
 }
 
 impl RuntimeError {
@@ -41,13 +56,16 @@ impl RuntimeError {
     /// [`StoreError::KINDS`](crate::store::StoreError::KINDS) rather than
     /// naming a spelling of its own; the two tables are concatenated by the
     /// front ends that publish `exit_code_by_kind`, so they must not collide.
-    pub const KINDS: [&'static str; 6] = [
+    pub const KINDS: [&'static str; 9] = [
         "workspace_identity_required",
         "workspace_mismatch",
         "workspace_unavailable",
         "worker_spawn_failed",
         "run_not_active",
         "approval_not_active",
+        "lease_unavailable",
+        "run_still_active",
+        "run_not_retryable",
     ];
 
     /// Stable machine-readable discriminant.
@@ -61,6 +79,9 @@ impl RuntimeError {
             Self::WorkerSpawn { .. } => "worker_spawn_failed",
             Self::RunNotActive { .. } => "run_not_active",
             Self::ApprovalNotActive { .. } => "approval_not_active",
+            Self::LeaseUnavailable { .. } => "lease_unavailable",
+            Self::RunStillActive { .. } => "run_still_active",
+            Self::RunNotRetryable { .. } => "run_not_retryable",
         }
     }
 }
@@ -90,6 +111,14 @@ mod tests {
             RuntimeError::RunNotActive { run },
             RuntimeError::ApprovalNotActive {
                 approval: ApprovalId::new(),
+            },
+            RuntimeError::LeaseUnavailable {
+                reason: "no lock directory".to_owned(),
+            },
+            RuntimeError::RunStillActive { run },
+            RuntimeError::RunNotRetryable {
+                run,
+                state: crate::domain::ExecutionState::Succeeded,
             },
         ];
         assert_eq!(declared.len(), RuntimeError::KINDS.len());

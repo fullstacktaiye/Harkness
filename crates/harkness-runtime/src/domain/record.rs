@@ -422,6 +422,8 @@ pub struct Run {
     pub(super) lifecycle: Lifecycle<ExecutionState>,
     pub(super) failure: Option<Failure>,
     pub(super) approvals: Vec<Approval>,
+    pub(super) retry_of: Option<RunId>,
+    pub(super) workspace_may_be_modified: bool,
 }
 
 impl Run {
@@ -440,6 +442,55 @@ impl Run {
             lifecycle: Lifecycle::new(created_at),
             failure: None,
             approvals: Vec::new(),
+            retry_of: None,
+            workspace_may_be_modified: false,
+        }
+    }
+
+    /// Creates a queued run that re-attempts `original` for the same task.
+    ///
+    /// A retry is a *new* run and never a rewrite of the one it follows: the
+    /// original keeps its own timeline, its own terminal state, and its own
+    /// approvals, and this record merely names it. The relationship is stored
+    /// here rather than derived, because a front end reading one run has to be
+    /// able to say "this is attempt two" without paging every run of the task.
+    ///
+    /// `workspace_may_be_modified` is the honest half of that provenance:
+    /// v0.3 never rolls back or re-applies what an interrupted attempt already
+    /// wrote, so a retry may be starting against a worktree the earlier attempt
+    /// changed. See
+    /// [`RunCoordinator::retry_run`](crate::coordinator::RunCoordinator::retry_run)
+    /// for how it is computed — from persisted tool-call lifecycle, never from
+    /// whether a tool "probably" finished.
+    #[must_use]
+    pub fn retrying(
+        task_id: TaskId,
+        original: RunId,
+        workspace_may_be_modified: bool,
+        created_at: OffsetDateTime,
+    ) -> Self {
+        Self::retrying_with_id(
+            RunId::new(),
+            task_id,
+            original,
+            workspace_may_be_modified,
+            created_at,
+        )
+    }
+
+    /// Creates a retry run with a caller-chosen stable ID.
+    #[must_use]
+    pub fn retrying_with_id(
+        id: RunId,
+        task_id: TaskId,
+        original: RunId,
+        workspace_may_be_modified: bool,
+        created_at: OffsetDateTime,
+    ) -> Self {
+        Self {
+            retry_of: Some(original),
+            workspace_may_be_modified,
+            ..Self::with_id(id, task_id, created_at)
         }
     }
 
@@ -453,6 +504,23 @@ impl Run {
     #[must_use]
     pub const fn task_id(&self) -> TaskId {
         self.task_id
+    }
+
+    /// The earlier attempt this run re-attempts, when it is a retry.
+    #[must_use]
+    pub const fn retry_of(&self) -> Option<RunId> {
+        self.retry_of
+    }
+
+    /// Whether an earlier attempt may already have changed the workspace.
+    ///
+    /// Only ever true on a retry, and true whenever the run it follows started
+    /// any tool call that could write — which is a claim about what was
+    /// recorded, not a claim that anything was actually written. A front end
+    /// must surface it: nothing in v0.3 undoes a partial mutation.
+    #[must_use]
+    pub const fn workspace_may_be_modified(&self) -> bool {
+        self.workspace_may_be_modified
     }
 
     lifecycle_accessors!(ExecutionState);

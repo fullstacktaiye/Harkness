@@ -14,17 +14,18 @@
 use rusqlite::{Connection, Row, named_params};
 
 use crate::domain::{
-    RUNTIME_RECORD_SCHEMA_VERSION, Run, RunId, RunWire, Step, StepId, StepWire, Task, TaskId,
-    TaskWire, ToolCall, ToolCallId, ToolCallWire, validate_record_schema_version,
+    ExecutionState, LeaseId, RUNTIME_RECORD_SCHEMA_VERSION, Run, RunId, RunWire, Step, StepId,
+    StepWire, Task, TaskId, TaskWire, ToolCall, ToolCallId, ToolCallWire,
+    validate_record_schema_version,
 };
 use crate::policy::PolicyDecision;
 
 use super::column::{
-    decode_approvals, decode_execution_state, decode_failure, decode_id, decode_optional_payload,
-    decode_optional_timestamp, decode_ordinal, decode_owner_pid, decode_payload, decode_revision,
-    decode_timestamp, decode_tool_call_state, encode_approvals, encode_failure,
-    encode_optional_payload, encode_optional_timestamp, encode_path, encode_payload,
-    encode_revision, encode_text, encode_timestamp, within_inline_limit,
+    decode_approvals, decode_execution_state, decode_failure, decode_flag, decode_id,
+    decode_optional_payload, decode_optional_timestamp, decode_ordinal, decode_owner_pid,
+    decode_payload, decode_revision, decode_timestamp, decode_tool_call_state, encode_approvals,
+    encode_failure, encode_optional_payload, encode_optional_timestamp, encode_path,
+    encode_payload, encode_revision, encode_text, encode_timestamp, within_inline_limit,
 };
 use super::error::{Containment, StoreError, insert_failed, query_failed};
 
@@ -34,7 +35,8 @@ const STEP: &str = "step";
 const TOOL_CALL: &str = "tool_call";
 
 pub(super) const RUN_COLUMNS: &str = "schema_version, id, task_id, state, revision, created_at, \
-     updated_at, started_at, finished_at, failure_kind, failure_message, approvals_json, owner_pid";
+     updated_at, started_at, finished_at, failure_kind, failure_message, approvals_json, \
+     owner_pid, lease_id, retry_of, workspace_may_be_modified";
 
 const STEP_COLUMNS: &str = "schema_version, id, run_id, ordinal, title, state, revision, \
      created_at, updated_at, started_at, finished_at, failure_kind, failure_message, \
@@ -110,14 +112,19 @@ fn task_wire(row: &Row<'_>) -> Result<TaskWire, StoreError> {
 
 // -- runs -------------------------------------------------------------------
 
-pub(super) fn insert_run(connection: &Connection, run: &Run) -> Result<(), StoreError> {
+pub(super) fn insert_run(
+    connection: &Connection,
+    run: &Run,
+    owner: Option<LeaseId>,
+) -> Result<(), StoreError> {
     let (failure_kind, failure_message) = encode_failure(RUN, run.failure())?;
     connection
         .execute(
             &format!(
                 "INSERT INTO runs ({RUN_COLUMNS}) VALUES (:schema_version, :id, :task_id, :state, \
                  :revision, :created_at, :updated_at, :started_at, :finished_at, :failure_kind, \
-                 :failure_message, :approvals_json, :owner_pid)"
+                 :failure_message, :approvals_json, :owner_pid, :lease_id, :retry_of, \
+                 :workspace_may_be_modified)"
             ),
             named_params! {
                 ":schema_version": RUNTIME_RECORD_SCHEMA_VERSION,
@@ -133,6 +140,13 @@ pub(super) fn insert_run(connection: &Connection, run: &Run) -> Result<(), Store
                 ":failure_message": failure_message,
                 ":approvals_json": encode_approvals(RUN, run.approvals())?,
                 ":owner_pid": None::<i64>,
+                // Written with the row rather than stamped onto it afterwards.
+                // A queued run that existed for even an instant with no lease
+                // would be indistinguishable from one whose owner is gone, and
+                // a concurrent sweep would be right to interrupt it.
+                ":lease_id": owner.map(|lease| lease.to_string()),
+                ":retry_of": run.retry_of().map(|original| original.to_string()),
+                ":workspace_may_be_modified": i64::from(run.workspace_may_be_modified()),
             },
         )
         .map(|_| ())
@@ -140,13 +154,43 @@ pub(super) fn insert_run(connection: &Connection, run: &Run) -> Result<(), Store
             insert_failed(
                 Containment {
                     record: RUN,
-                    parent: TASK,
+                    parent: missing_run_parent(connection, run),
                 },
                 &run.id(),
                 "inserting a run",
                 error,
             )
         })
+}
+
+/// Names which of a run's parents is actually absent.
+///
+/// A retry names two — its task and the attempt it follows — and SQLite reports
+/// only that *a* foreign key failed. Guessing from the shape of the record
+/// would be right for the coordinator, whose retry copies its task identity
+/// from the original it just loaded, and wrong for every other caller of the
+/// public insert: a retry with an unstored task would be reported as a missing
+/// run. One indexed lookup on the error path answers it instead of assuming.
+fn missing_run_parent(connection: &Connection, run: &Run) -> &'static str {
+    let Some(original) = run.retry_of() else {
+        return TASK;
+    };
+    let present = |table: &str, id: String| {
+        connection
+            .query_row(
+                &format!("SELECT 1 FROM {table} WHERE id = ?1"),
+                [id],
+                |_| Ok(()),
+            )
+            .is_ok()
+    };
+    // Task first: it is the parent every run has, so an absent one is the
+    // answer whether or not the original is there too.
+    if present("tasks", run.task_id().to_string()) && !present("runs", original.to_string()) {
+        RUN
+    } else {
+        TASK
+    }
 }
 
 pub(super) fn update_run(connection: &Connection, run: &Run) -> Result<(), StoreError> {
@@ -246,7 +290,86 @@ pub(super) fn run_wire(row: &Row<'_>) -> Result<RunWire, StoreError> {
             optional_text(row, RUN, "failure_message")?,
         )?,
         approvals: decode_approvals(RUN, &text(row, RUN, "approvals_json")?)?,
+        retry_of: optional_text(row, RUN, "retry_of")?
+            .map(|stored| decode_id(RUN, "retry_of", &stored))
+            .transpose()?,
+        workspace_may_be_modified: decode_flag(
+            RUN,
+            "workspace_may_be_modified",
+            integer(row, RUN, "workspace_may_be_modified")?,
+        )?,
     })
+}
+
+/// Reads the lease a run's row currently names, if any.
+///
+/// Separate from [`run_wire`] because it is not part of the durable record: a
+/// lease says which process is driving the run *now*, which is a fact about
+/// this machine rather than about the attempt.
+pub(super) fn run_lease(row: &Row<'_>) -> Result<Option<LeaseId>, StoreError> {
+    optional_text(row, RUN, "lease_id")?
+        .map(|stored| decode_id(RUN, "lease_id", &stored))
+        .transpose()
+}
+
+/// Reads every run that has not reached a terminal state, with its lease.
+///
+/// Deliberately *not* a record load: recovery decides from a state spelling and
+/// a lease identity, so a store holding a hundred abandoned runs with a
+/// thousand events each is one indexed scan rather than a hundred timeline
+/// reads. The transition that follows re-loads each run under the write lock.
+///
+/// The state list is derived from [`ExecutionState`] rather than written out,
+/// so a state added later is swept without anyone remembering to come here. A
+/// hardcoded list would make a new non-terminal state invisible to recovery
+/// with no compile error and no failing test — a run frozen for ever, which is
+/// the exact bug this whole pass exists to remove. The values are
+/// `&'static str` from the enum's own table, never caller input.
+pub(super) fn unfinished_runs(
+    connection: &Connection,
+) -> Result<Vec<(RunId, Option<LeaseId>)>, StoreError> {
+    let non_terminal = ExecutionState::ALL
+        .iter()
+        .filter(|state| !state.is_terminal())
+        .map(|state| format!("'{}'", state.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut statement = connection
+        .prepare_cached(&format!(
+            "SELECT id, lease_id FROM runs WHERE state IN ({non_terminal}) \
+             ORDER BY created_at, id"
+        ))
+        .map_err(|error| query_failed("preparing the unfinished run query", error))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((|| {
+                let id = decode_id::<RunId>(RUN, "id", &text(row, RUN, "id")?)?;
+                Ok::<_, StoreError>((id, run_lease(row)?))
+            })())
+        })
+        .map_err(|error| query_failed("listing unfinished runs", error))?;
+    let mut runs = Vec::new();
+    for row in rows {
+        runs.push(row.map_err(|error| query_failed("reading an unfinished run row", error))??);
+    }
+    Ok(runs)
+}
+
+/// Lists the retries recorded against one run, oldest first.
+pub(super) fn retries_of(connection: &Connection, run: RunId) -> Result<Vec<RunId>, StoreError> {
+    let mut statement = connection
+        .prepare_cached("SELECT id FROM runs WHERE retry_of = :run ORDER BY created_at, id")
+        .map_err(|error| query_failed("preparing the retry listing", error))?;
+    let rows = statement
+        .query_map(named_params! { ":run": run.to_string() }, |row| {
+            Ok((|| decode_id::<RunId>(RUN, "id", &text(row, RUN, "id")?))())
+        })
+        .map_err(|error| query_failed("listing the retries of a run", error))?;
+    let mut retries = Vec::new();
+    for row in rows {
+        retries.push(row.map_err(|error| query_failed("reading a retry row", error))??);
+    }
+    Ok(retries)
 }
 
 // -- steps ------------------------------------------------------------------

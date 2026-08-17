@@ -28,6 +28,8 @@ use crate::trust::{TrustState, WorkspaceTrust};
 
 use super::{RunCoordinator, RunSnapshot};
 
+mod recovery;
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ObserveInput {
@@ -390,7 +392,8 @@ impl Fixture {
             Arc::clone(&store),
             Arc::new(registry),
             PolicyEngine::new(UserPolicy::default(), None),
-        );
+        )
+        .unwrap();
         Self {
             _data_dir: data_dir,
             workspace,
@@ -1161,7 +1164,8 @@ fn subscribing_to_a_finished_run_this_coordinator_never_drove_disconnects() {
         Arc::clone(&fixture.store),
         Arc::clone(&fixture.coordinator.inner.registry),
         PolicyEngine::new(UserPolicy::default(), None),
-    );
+    )
+    .unwrap();
     let receiver = observer.subscribe(snapshot.run.id()).unwrap();
     while receiver.try_recv().is_ok() {}
 
@@ -1949,7 +1953,8 @@ fn flagship_edit_test_diff_child() {
         Arc::clone(&store),
         Arc::new(registry),
         PolicyEngine::new(UserPolicy::default(), None),
-    );
+    )
+    .unwrap();
     let task = Task::new(
         "flagship edit test diff",
         workspace.path(),

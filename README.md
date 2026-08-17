@@ -327,6 +327,18 @@ reconcile` safely removes UUID-named managed directories with no catalog row.
 Per-import locks make it skip live clones, and unrelated files or directories
 under managed storage are left untouched.
 
+Runs are recovered the same way, and by the same kind of evidence. Every
+Harkness process holds an advisory lock file for as long as it is driving runs,
+and the next start marks anything left behind by a process that no longer holds
+one as interrupted: the run, its unfinished steps, its in-flight tool calls, and
+any approval nobody can answer any more, each recorded in the timeline rather
+than in place of it. A second Harkness sharing the data directory is never
+disturbed, because the proof is a lock the kernel released and not a timestamp
+that stopped moving. Interrupted runs stay fully inspectable and can be retried,
+which starts a *new* run for the same task: nothing is resumed, no approval
+carries over, and a retry whose earlier attempt had begun a change to the
+workspace says so, because Harkness never undoes a partial edit on your behalf.
+
 The GUI opens a Kirigami window on the project launcher backed by the Rust
 `HarknessBackend` and `FileTreeModel` QML objects. Its project shell exposes the
 same creation modes, live linked-worktree inventory, selective reconciliation,

@@ -145,6 +145,18 @@ impl fmt::Display for EventSeq {
 pub enum EventKind {
     /// A run entered a new lifecycle state.
     RunStateChanged,
+    /// A recovery sweep found the run's owning process gone.
+    ///
+    /// Distinct from the `run_state_changed` entry that follows it: that one
+    /// says the run reached `interrupted`, this one says why it was detected
+    /// and which claim was found dead.
+    RunInterrupted,
+    /// A later run was created to re-attempt this one.
+    ///
+    /// Recorded on the *original*, which is never otherwise touched again — a
+    /// terminal run's timeline is evidence, and a retry is a new run rather
+    /// than a continuation of it.
+    RunRetried,
     /// A step began executing.
     StepStarted,
     /// A step reached a terminal state.
@@ -188,6 +200,8 @@ impl EventKind {
     /// Every kind this build defines, in declaration order.
     pub const KINDS: &'static [&'static str] = &[
         "run_state_changed",
+        "run_interrupted",
+        "run_retried",
         "step_started",
         "step_finished",
         "tool_call_state_changed",
@@ -208,19 +222,21 @@ impl EventKind {
     pub fn as_str(&self) -> &str {
         match self {
             Self::RunStateChanged => Self::KINDS[0],
-            Self::StepStarted => Self::KINDS[1],
-            Self::StepFinished => Self::KINDS[2],
-            Self::ToolCallStateChanged => Self::KINDS[3],
-            Self::PolicyDecision => Self::KINDS[4],
-            Self::ToolProgress => Self::KINDS[5],
-            Self::ApprovalRequested => Self::KINDS[6],
-            Self::ApprovalDecided => Self::KINDS[7],
-            Self::ApprovalIdentityDrift => Self::KINDS[8],
-            Self::ArtifactCreated => Self::KINDS[9],
-            Self::AgentObservation => Self::KINDS[10],
-            Self::AgentAction => Self::KINDS[11],
-            Self::AgentCheckpoint => Self::KINDS[12],
-            Self::Diagnostic => Self::KINDS[13],
+            Self::RunInterrupted => Self::KINDS[1],
+            Self::RunRetried => Self::KINDS[2],
+            Self::StepStarted => Self::KINDS[3],
+            Self::StepFinished => Self::KINDS[4],
+            Self::ToolCallStateChanged => Self::KINDS[5],
+            Self::PolicyDecision => Self::KINDS[6],
+            Self::ToolProgress => Self::KINDS[7],
+            Self::ApprovalRequested => Self::KINDS[8],
+            Self::ApprovalDecided => Self::KINDS[9],
+            Self::ApprovalIdentityDrift => Self::KINDS[10],
+            Self::ArtifactCreated => Self::KINDS[11],
+            Self::AgentObservation => Self::KINDS[12],
+            Self::AgentAction => Self::KINDS[13],
+            Self::AgentCheckpoint => Self::KINDS[14],
+            Self::Diagnostic => Self::KINDS[15],
             Self::Unrecognized(spelling) => spelling,
         }
     }
@@ -234,6 +250,8 @@ impl EventKind {
     pub fn parse(spelling: &str) -> Self {
         match spelling {
             "run_state_changed" => Self::RunStateChanged,
+            "run_interrupted" => Self::RunInterrupted,
+            "run_retried" => Self::RunRetried,
             "step_started" => Self::StepStarted,
             "step_finished" => Self::StepFinished,
             "tool_call_state_changed" => Self::ToolCallStateChanged,
@@ -634,6 +652,8 @@ mod tests {
     fn event_kinds_round_trip_through_the_kinds_table() {
         let defined = [
             EventKind::RunStateChanged,
+            EventKind::RunInterrupted,
+            EventKind::RunRetried,
             EventKind::StepStarted,
             EventKind::StepFinished,
             EventKind::ToolCallStateChanged,

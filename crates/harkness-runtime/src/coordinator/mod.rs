@@ -9,8 +9,26 @@
 //!         -> park with no store transaction or scheduler slot held
 //!         -> persisted decision -> gate wake -> re-check binding -> schedule
 //! ```
+//!
+//! # Interruption is an outcome, not a gap
+//!
+//! A coordinator holds one lease: an advisory lock file the kernel
+//! releases when this process dies, plus a row every run it starts points at.
+//! Construction sweeps the store first, and every run whose claim is provably
+//! dead is marked `interrupted` — the run, its unfinished steps, its in-flight
+//! calls, and the questions nobody can answer any more — with the timeline
+//! before that moment left exactly as the dead process wrote it. A live
+//! sibling's runs are never touched, because the proof is the lock rather than
+//! a timestamp.
+//!
+//! Nothing is resumed. [`RunCoordinator::retry_run`] starts a *new* run for the
+//! same task, recording which attempt it follows and whether that attempt may
+//! already have changed the workspace; the original keeps its own history, and
+//! no approval it was granted carries over.
 
 mod error;
+mod lease;
+mod recovery;
 mod snapshot;
 mod subscription;
 #[cfg(test)]
@@ -19,7 +37,8 @@ mod tests;
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::thread;
 
 use harkness_git::Cancellation;
@@ -49,8 +68,18 @@ use crate::tool::{
 };
 use crate::trust::{ExecutionMode, PathBoundary};
 
+use lease::RuntimeLease;
+
 const MAX_AGENT_TURNS: usize = 1_024;
 const WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// How long a dropped coordinator waits for its own workers to stop.
+///
+/// A run still executing at exit is cancelled cooperatively and then let go: the
+/// lease is released either way, so what this bounds is how long an exiting
+/// process is willing to wait before the next start finds those runs
+/// `interrupted` instead.
+const SHUTDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 struct ActiveRun {
     cancellation: Cancellation,
@@ -76,18 +105,76 @@ struct CoordinatorInner {
     scheduler: Arc<Scheduler>,
     active: Mutex<HashMap<RunId, ActiveRun>>,
     deliveries: Mutex<HashMap<RunId, Arc<RunDelivery>>>,
+    /// This process's claim on the runs it starts. Dropping it releases the
+    /// advisory lock, which is what the next start reads as "abandoned".
+    lease: RuntimeLease,
+    /// Trips once, on the first shutdown; a second is a no-op.
+    ///
+    /// Read under [`claim`](Self::claim) by anything that is about to record a
+    /// run, never on its own: the flag alone is a moment in the past by the
+    /// time the row is written.
+    stopping: AtomicBool,
+    /// Held shared while a run is being recorded and started, exclusively while
+    /// the claim is given up.
+    ///
+    /// Reading `stopping` and then inserting a run is two steps, and shutdown
+    /// fits between them: the row would land naming a lease whose row was
+    /// already released and whose lock file was already unlinked, so the next
+    /// sweep would interrupt a run this process is actively driving — and a
+    /// user could then retry it while the original worker still holds the
+    /// worktree. That is the outcome ADR-0020 exists to prevent, so the check
+    /// and the write it guards happen under one guard.
+    claim: std::sync::RwLock<()>,
+    /// Woken by shutdown so housekeeping exits at once rather than at the end
+    /// of its renewal interval.
+    housekeeping: Condvar,
+    housekeeping_state: Mutex<()>,
 }
 
 /// Shared application service that owns every run's orchestration loop.
 #[derive(Clone)]
 pub struct RunCoordinator {
     inner: Arc<CoordinatorInner>,
+    /// Shuts the coordinator down when the last *handle* is dropped.
+    ///
+    /// It cannot live on [`CoordinatorInner`], and the reason is the case that
+    /// matters most: a run worker holds an `Arc` to the inner for as long as it
+    /// is driving, and a worker parked on an approval nobody will ever answer
+    /// holds one for ever. Hanging teardown off the inner would therefore mean
+    /// the coordinator is torn down exactly when there is nothing to tear down.
+    /// Workers never hold this, so the last handle going away is what trips it,
+    /// and the shutdown it runs is what releases those workers.
+    _shutdown: Arc<ShutdownGuard>,
+}
+
+struct ShutdownGuard {
+    inner: Weak<CoordinatorInner>,
+}
+
+impl Drop for ShutdownGuard {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.upgrade() {
+            inner.shutdown();
+        }
+    }
 }
 
 impl RunCoordinator {
     /// Builds a coordinator with the production executor and scheduler.
-    #[must_use]
-    pub fn new(store: Arc<Store>, registry: Arc<ToolRegistry>, policy: PolicyEngine) -> Self {
+    ///
+    /// Takes this process's run claim and sweeps the store before returning, so
+    /// no new work is accepted while runs abandoned by a dead process still
+    /// look live. See [`RunCoordinator::open`] for the sweep's own report.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::LeaseUnavailable`] when the claim cannot be
+    /// taken, and [`RuntimeError::Store`] when the sweep cannot read the store.
+    pub fn new(
+        store: Arc<Store>,
+        registry: Arc<ToolRegistry>,
+        policy: PolicyEngine,
+    ) -> Result<Self, RuntimeError> {
         let executor = ToolExecutor::new(Arc::clone(&store), Arc::clone(&registry));
         Self::with_scheduler(
             store,
@@ -99,25 +186,137 @@ impl RunCoordinator {
     }
 
     /// Builds a coordinator from explicitly shared runtime services.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// As [`RunCoordinator::new`].
     pub fn with_scheduler(
         store: Arc<Store>,
         registry: Arc<ToolRegistry>,
         policy: Arc<PolicyEngine>,
         approvals: Arc<ApprovalGate>,
         scheduler: Arc<Scheduler>,
-    ) -> Self {
-        Self {
-            inner: Arc::new(CoordinatorInner {
-                store,
-                registry,
-                policy,
-                approvals,
-                scheduler,
-                active: Mutex::new(HashMap::new()),
-                deliveries: Mutex::new(HashMap::new()),
+    ) -> Result<Self, RuntimeError> {
+        Self::open(store, registry, policy, approvals, scheduler)
+            .map(|(coordinator, _)| coordinator)
+    }
+
+    /// Builds a coordinator and returns what its startup sweep found.
+    ///
+    /// The sweep is not optional and there is deliberately no constructor that
+    /// skips it: a process that started accepting work while an abandoned run
+    /// still read as `running` would be one that never notices, since detection
+    /// happens at startup and nowhere else. What is optional is *caring* — a
+    /// front end that wants to tell the user "three runs were interrupted while
+    /// Harkness was not running" uses this, and everything else uses
+    /// [`with_scheduler`](Self::with_scheduler) and ignores the report.
+    ///
+    /// # Errors
+    ///
+    /// As [`RunCoordinator::new`].
+    pub fn open(
+        store: Arc<Store>,
+        registry: Arc<ToolRegistry>,
+        policy: Arc<PolicyEngine>,
+        approvals: Arc<ApprovalGate>,
+        scheduler: Arc<Scheduler>,
+    ) -> Result<(Self, RecoveryReport), RuntimeError> {
+        let now = OffsetDateTime::now_utc();
+        let lease = RuntimeLease::acquire(store.data_dir(), now)?;
+        let report = recovery::sweep(&store, &approvals, &lease, now)?;
+        let inner = Arc::new(CoordinatorInner {
+            store,
+            registry,
+            policy,
+            approvals,
+            scheduler,
+            active: Mutex::new(HashMap::new()),
+            deliveries: Mutex::new(HashMap::new()),
+            lease,
+            stopping: AtomicBool::new(false),
+            claim: std::sync::RwLock::new(()),
+            housekeeping: Condvar::new(),
+            housekeeping_state: Mutex::new(()),
+        });
+        let coordinator = Self {
+            _shutdown: Arc::new(ShutdownGuard {
+                inner: Arc::downgrade(&inner),
             }),
-        }
+            inner,
+        };
+        coordinator.start_housekeeping();
+        Ok((coordinator, report))
+    }
+
+    /// Runs the lease-renewal loop on a thread that cannot keep this alive.
+    ///
+    /// It holds a [`Weak`], so the coordinator is dropped exactly when its last
+    /// clone goes away rather than when this thread next wakes; the thread then
+    /// observes the dead pointer and exits.
+    fn start_housekeeping(&self) {
+        let inner = Arc::downgrade(&self.inner);
+        let spawned = thread::Builder::new()
+            .name("harkness-run-lease".to_owned())
+            .spawn(move || {
+                loop {
+                    let Some(inner) = inner.upgrade() else {
+                        return;
+                    };
+                    if inner.stopping.load(Ordering::Acquire) {
+                        return;
+                    }
+                    // Renewing can only widen the window in which this claim is
+                    // treated as alive, so a failure is a diagnostic rather than
+                    // a reason to stop: the lock file is what proves liveness.
+                    let _ = inner
+                        .store
+                        .renew_lease(inner.lease.id(), OffsetDateTime::now_utc());
+                    let guard = inner
+                        .housekeeping_state
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    // Re-read *under* the mutex. Checking only at the top of the
+                    // loop leaves a window in which shutdown sets the flag and
+                    // signals before this thread parks, and the wake-up is then
+                    // lost for a whole renewal interval.
+                    if inner.stopping.load(Ordering::Acquire) {
+                        return;
+                    }
+                    // This thread necessarily holds a strong reference while it
+                    // waits — the mutex and the condition variable live inside
+                    // it — so a lost wake-up would keep the store and the
+                    // scheduler alive, with their files open, for a further
+                    // interval after the coordinator's last handle went away.
+                    // That is the second thing the re-read above buys.
+                    let (_guard, _timeout) = inner
+                        .housekeeping
+                        .wait_timeout(guard, lease::LEASE_RENEW_INTERVAL)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+            });
+        // A coordinator with no housekeeping thread is still correct: it simply
+        // stops refreshing a timestamp that only ever widens its own survival
+        // window, and its lock file goes on proving liveness by itself.
+        drop(spawned);
+    }
+
+    /// Stops accepting work, cancels what is in flight, and gives up the claim.
+    ///
+    /// Idempotent, and run by [`Drop`] as well, so a process that exits without
+    /// calling it still leaves its runs findable rather than silently lost: the
+    /// claim is released, and whatever was still executing is marked
+    /// `interrupted` by the next start.
+    ///
+    /// The wait is bounded, at thirty seconds. A run that outlives it is
+    /// not abandoned quietly — it is exactly the run the next sweep ends.
+    pub fn shutdown(&self) {
+        self.inner.shutdown();
+    }
+
+    /// What this coordinator's claim on its runs is recorded as.
+    #[must_use]
+    pub fn lease_id(&self) -> crate::domain::LeaseId {
+        self.inner.lease.id()
     }
 
     /// The run store this coordinator records into.
@@ -145,7 +344,7 @@ impl RunCoordinator {
         agent: Box<dyn Agent>,
         workspace: WorkspaceRef,
     ) -> Result<RunId, RuntimeError> {
-        self.start_run_inner(task_id, agent, workspace, None)
+        self.start_run_inner(task_id, agent, workspace, None, None)
     }
 
     /// Starts a run with authoritative project catalog metadata available to
@@ -157,7 +356,147 @@ impl RunCoordinator {
         workspace: WorkspaceRef,
         metadata: WorkspaceMetadata,
     ) -> Result<RunId, RuntimeError> {
-        self.start_run_inner(task_id, agent, workspace, Some(metadata))
+        self.start_run_inner(task_id, agent, workspace, Some(metadata), None)
+    }
+
+    /// Starts a fresh attempt at the task `run` was an attempt at.
+    ///
+    /// A retry is a new run and never a continuation. The original's timeline is
+    /// left exactly as it stands and gains one `run_retried` entry naming its
+    /// successor; the new run records which attempt it follows, so provenance
+    /// reads in both directions without either record being rewritten.
+    ///
+    /// # What "safe to retry" means
+    ///
+    /// It does not mean the workspace is as the task first found it. Nothing in
+    /// v0.3 rolls back or re-applies a partial mutation, so if the earlier
+    /// attempt started any tool call that could write, the new run carries
+    /// [`Run::workspace_may_be_modified`] and a front end must say so. The flag
+    /// is computed from persisted lifecycle — a call that entered `running` —
+    /// and never from whether the tool "probably" finished.
+    ///
+    /// No approval carries over. Grants are matched on the run they were given
+    /// for, so every protected call in the new run is evaluated and answered
+    /// again from scratch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::RunStillActive`] when the run's record has not
+    /// reached a terminal state — which is also how a run another process is
+    /// driving stays refused — [`RuntimeError::RunNotRetryable`] when it
+    /// succeeded and there is nothing to re-attempt, and
+    /// [`RuntimeError::WorkspaceUnavailable`] when the task's workspace no
+    /// longer resolves.
+    pub fn retry_run(
+        &self,
+        run: RunId,
+        agent: Box<dyn Agent>,
+        workspace: WorkspaceRef,
+    ) -> Result<RunId, RuntimeError> {
+        self.retry_run_inner(run, agent, workspace, None)
+    }
+
+    /// Retries a run with authoritative project catalog metadata.
+    ///
+    /// # Errors
+    ///
+    /// As [`RunCoordinator::retry_run`].
+    pub fn retry_run_with_workspace_metadata(
+        &self,
+        run: RunId,
+        agent: Box<dyn Agent>,
+        workspace: WorkspaceRef,
+        metadata: WorkspaceMetadata,
+    ) -> Result<RunId, RuntimeError> {
+        self.retry_run_inner(run, agent, workspace, Some(metadata))
+    }
+
+    fn retry_run_inner(
+        &self,
+        original: RunId,
+        agent: Box<dyn Agent>,
+        workspace: WorkspaceRef,
+        workspace_metadata: Option<WorkspaceMetadata>,
+    ) -> Result<RunId, RuntimeError> {
+        let record = self.inner.store.load_run(original)?;
+        // The persisted state is the whole test, deliberately, and a live
+        // worker in *this* process is not consulted. A run that has recorded a
+        // terminal state has finished every tool body it started; what is left
+        // of its worker is bookkeeping that touches no workspace and no new
+        // run. Refusing during that window would make a retry offered the
+        // instant a run shows `failed` succeed or fail by timing.
+        //
+        // The check still covers the case it has to. A run another process is
+        // driving has a non-terminal record, and stays refused until that
+        // process finishes it or a sweep ends it.
+        if !record.state().is_terminal() {
+            return Err(RuntimeError::RunStillActive { run: original });
+        }
+        if record.state() == ExecutionState::Succeeded {
+            return Err(RuntimeError::RunNotRetryable {
+                run: original,
+                state: record.state(),
+            });
+        }
+        // Refused on recorded state, like the check above, and for the same
+        // reason: two live attempts at one task would be two agents editing one
+        // worktree, and the scheduler serializing their writes makes that
+        // survivable rather than intended. This is a guard and not a
+        // uniqueness guarantee — two calls racing this read can still both pass
+        // — because the durable half of that would be a partial unique index on
+        // a column runs move through, and the case it would buy is narrower
+        // than the one it would constrain.
+        for existing in self.inner.store.retries_of(original)? {
+            if !self.inner.store.load_run(existing)?.state().is_terminal() {
+                return Err(RuntimeError::RunStillActive { run: existing });
+            }
+        }
+        // The flag is cumulative down a chain of attempts, not a fact about the
+        // immediate predecessor. Attempt A writes and fails; attempt B is
+        // interrupted before it calls anything; a retry of B has no started
+        // call of its own to find, and A's partial write is still on disk. Only
+        // carrying the predecessor's own answer forward keeps the warning
+        // attached to the workspace it is actually about.
+        let workspace_may_be_modified =
+            record.workspace_may_be_modified() || self.workspace_may_be_modified(original)?;
+        self.start_run_inner(
+            record.task_id(),
+            agent,
+            workspace,
+            workspace_metadata,
+            Some((original, workspace_may_be_modified)),
+        )
+    }
+
+    /// Whether any call of `run` reached the point of being able to write.
+    ///
+    /// Two questions, both answered from what was persisted. Did the call ever
+    /// enter `running` — `started_at` is set by that transition and by nothing
+    /// else, so it is exactly "past `awaiting_approval`" — and does the tool it
+    /// named declare a risk that can change the workspace.
+    ///
+    /// A tool this build no longer registers counts as one that could write.
+    /// The honest answer to "what did that call do" is "this build cannot say",
+    /// and the flag exists to warn rather than to reassure.
+    fn workspace_may_be_modified(&self, run: RunId) -> Result<bool, RuntimeError> {
+        for call in self.inner.store.load_run_tool_calls(run)? {
+            if call.started_at().is_none() {
+                continue;
+            }
+            let risk = crate::tool::ToolIdentity::parse(call.tool_id(), call.tool_version())
+                .ok()
+                .and_then(|identity| {
+                    self.inner
+                        .registry
+                        .get(&identity.id, Some(&identity.version))
+                        .map(|tool| tool.descriptor().risk())
+                });
+            match risk {
+                Some(risk) if risk < crate::tool::RiskLevel::WorkspaceWrite => {}
+                _ => return Ok(true),
+            }
+        }
+        Ok(false)
     }
 
     fn start_run_inner(
@@ -166,7 +505,28 @@ impl RunCoordinator {
         agent: Box<dyn Agent>,
         workspace: WorkspaceRef,
         workspace_metadata: Option<WorkspaceMetadata>,
+        retry: Option<(RunId, bool)>,
     ) -> Result<RunId, RuntimeError> {
+        // Held for the whole of this function rather than around the check
+        // alone. The row is not the only thing that must land before the claim
+        // can be given up: the worker has to be registered as active too, or
+        // shutdown would return having cancelled nothing while a thread was
+        // still about to start. Shutdown therefore waits for a start already in
+        // progress, which is the honest reading of "stop accepting work".
+        let _claim = self
+            .inner
+            .claim
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        // A shut-down coordinator has given its claim up, so a run started
+        // under it would be recorded as owned by something nothing is holding —
+        // and the very next sweep would be right to interrupt it. Refusing says
+        // that plainly rather than persisting a run with no future.
+        if self.inner.stopping.load(Ordering::Acquire) {
+            return Err(RuntimeError::LeaseUnavailable {
+                reason: "this coordinator has shut down and no longer claims runs".to_owned(),
+            });
+        }
         let task = self.inner.store.load_task(task_id)?;
         let Some(project_id) = task.project_id() else {
             return Err(RuntimeError::WorkspaceIdentityRequired { task: task_id });
@@ -202,13 +562,40 @@ impl RunCoordinator {
             .for_workspace(workspace_key.canonical_root());
 
         let now = OffsetDateTime::now_utc();
-        let run = Run::new(task_id, now);
+        let run = match retry {
+            Some((original, workspace_may_be_modified)) => {
+                Run::retrying(task_id, original, workspace_may_be_modified, now)
+            }
+            None => Run::new(task_id, now),
+        };
         let run_id = run.id();
-        self.inner.store.insert_run_with_event(
-            &run,
-            RunEvent::new(EventKind::RunStateChanged, now)
-                .with_payload(json!({"state": ExecutionState::Queued.as_str()})),
-        )?;
+        let queued = RunEvent::new(EventKind::RunStateChanged, now)
+            .with_payload(json!({"state": ExecutionState::Queued.as_str()}));
+        let owner = Some(self.inner.lease.record());
+        match retry {
+            // Appended to the *original*, whose own state is untouched: a
+            // terminal run's timeline is evidence, and the only honest way to
+            // say "this was re-attempted" is to add a line to it. Both writes
+            // commit together, so a retry can never exist without the attempt
+            // it follows saying so.
+            Some((original, workspace_may_be_modified)) => {
+                self.inner.store.insert_retry_with_events(
+                    &run,
+                    owner,
+                    queued,
+                    original,
+                    RunEvent::new(EventKind::RunRetried, now).with_payload(json!({
+                        "retry_run_id": run_id.to_string(),
+                        "workspace_may_be_modified": workspace_may_be_modified,
+                    })),
+                )?;
+            }
+            None => {
+                self.inner
+                    .store
+                    .insert_run_with_event(&run, owner, queued)?;
+            }
+        }
         self.delivery(run_id);
         if let Err(error) = self.publish(run_id) {
             let _ = self.inner.store.append_event(
@@ -411,6 +798,80 @@ impl RunCoordinator {
 
     fn close_delivery(&self, run: RunId) {
         close_delivery(&self.inner, run);
+    }
+}
+
+impl CoordinatorInner {
+    /// Cooperatively stops everything this coordinator owns, then lets the
+    /// claim go.
+    ///
+    /// The order is the whole point. Cancelling first gives a live run the
+    /// chance to record its own ending, which is always better evidence than an
+    /// inferred one. Releasing the lease afterwards is what makes the runs that
+    /// did *not* finish findable: the next start reads the released claim and
+    /// ends them, rather than leaving them looking live for good.
+    fn shutdown(&self) {
+        {
+            // Exclusive, so a start that already passed its own check has
+            // finished recording and registering its run before the claim is
+            // given up, and one that has not yet begun sees the flag.
+            let _claim = self.claim.write().unwrap_or_else(PoisonError::into_inner);
+            if self.stopping.swap(true, Ordering::AcqRel) {
+                return;
+            }
+        }
+        // Taking the housekeeping mutex before signalling is what makes the
+        // wake-up reliable: the renewal thread re-reads `stopping` while
+        // holding it, so it either observes the flag or is already parked on
+        // the condition variable when this notification arrives. Signalling
+        // without it loses the wake-up whenever the thread is between those two
+        // points, and the coordinator then keeps a store open for a further
+        // renewal interval after its last handle is gone.
+        drop(
+            self.housekeeping_state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        self.housekeeping.notify_all();
+
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|(run, state)| (*run, state.cancellation.clone()))
+            .collect::<Vec<_>>();
+        for (run, cancellation) in &active {
+            cancellation.cancel();
+            self.scheduler.cancel_run(*run);
+        }
+
+        let deadline = std::time::Instant::now() + SHUTDOWN_DEADLINE;
+        while std::time::Instant::now() < deadline {
+            if self
+                .active
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+            {
+                break;
+            }
+            thread::sleep(WAIT_SLICE);
+        }
+
+        // Recorded before the lock is dropped, so a reader that sees the row
+        // released is never told "live" by a file this process is about to let
+        // go of. The reverse order would leave a window answering the opposite.
+        let _ = self
+            .store
+            .release_lease(self.lease.id(), OffsetDateTime::now_utc());
+        self.lease.release();
+    }
+}
+
+impl Drop for CoordinatorInner {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -1266,20 +1727,27 @@ impl RunWorker {
                 self.finish_cancelled(Some(step.id()))?;
                 Ok(None)
             }
+            // One call ended without a verdict — its worker thread died, which
+            // the executor cannot arrange and cannot explain. That is a fact
+            // about the *call*, and this run's process is demonstrably alive:
+            // it is the one reading this. Marking the run `interrupted` here
+            // would make the record claim the owning process stopped, which is
+            // the exact lie recovery exists to remove — `interrupted` is
+            // written for a run by the startup sweep and by nothing else.
+            //
+            // So the step ends and the agent is told, in the same shape every
+            // other tool failure reaches it. What to do about a call nobody can
+            // account for is a decision, and decisions belong to the agent.
             CallOutcome::Interrupted => {
                 self.finish_step(step.id(), ExecutionState::Interrupted)?;
-                let at = OffsetDateTime::now_utc();
-                self.inner
-                    .store
-                    .transition_run_with_event(
-                        self.run,
-                        ExecutionState::Interrupted,
-                        at,
-                        run_state_event(ExecutionState::Interrupted, at),
-                    )
-                    .map_err(store_fault)?;
-                self.publish()?;
-                Ok(None)
+                Ok(Some(Observation::ToolFailed {
+                    call,
+                    error: ToolErrorView::new(
+                        crate::tool::ToolError::Interrupted.kind(),
+                        "the tool call was interrupted before it reported an outcome",
+                        &**self.inner.store.redactor(),
+                    ),
+                }))
             }
         }
     }
@@ -1471,6 +1939,8 @@ fn store_fault(error: crate::store::StoreError) -> WorkerFault {
 }
 
 pub use error::RuntimeError;
+pub use lease::{LEASE_EXPIRY_GRACE, LEASE_RENEW_INTERVAL};
+pub use recovery::{RecoveryFailure, RecoveryReport};
 pub use snapshot::RunSnapshot;
 pub use subscription::{
     EventDelivery, EventReceiver, ReceiveTimeoutError, SUBSCRIBER_CAPACITY, TryReceiveError,

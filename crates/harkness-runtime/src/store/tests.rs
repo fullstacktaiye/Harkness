@@ -762,6 +762,7 @@ fn inserting_a_run_and_first_event_rolls_back_both_on_event_refusal() {
         .store
         .insert_run_with_event(
             &run,
+            None,
             RunEvent::new(EventKind::Diagnostic, at(20)).for_step(foreign_step.id()),
         )
         .unwrap_err();
@@ -4007,6 +4008,13 @@ const FROZEN_V5_DATABASE: &[u8] = include_bytes!("fixtures/runtime-v5.db");
 /// The frozen v6 database carrying an external identity-bound approval.
 const FROZEN_V6_DATABASE: &[u8] = include_bytes!("fixtures/runtime-v6.db");
 
+/// The frozen v7 database carrying a dead lease and the retry that followed it.
+const FROZEN_V7_DATABASE: &[u8] = include_bytes!("fixtures/runtime-v7.db");
+
+/// The lease and retry identities the v7 fixture was written with.
+const FIXTURE_LEASE_ID: &str = "99999999-9999-4999-8999-999999999999";
+const FIXTURE_RETRY_RUN_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
 /// The approval identities the v5 fixture was written with.
 const FIXTURE_PENDING_APPROVAL_ID: &str = "77777777-7777-4777-8777-777777777777";
 const FIXTURE_GRANTED_APPROVAL_ID: &str = "88888888-8888-4888-8888-888888888888";
@@ -4039,6 +4047,10 @@ const LATER_MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 7,
+        statements: include_str!("migrations/007_run_leases_and_retry.sql"),
+    },
+    Migration {
+        version: 8,
         statements: "ALTER TABLE runs ADD COLUMN cancelled_by TEXT;",
     },
 ];
@@ -4261,6 +4273,50 @@ fn a_frozen_v6_database_opens_and_reads_its_external_identity_binding() {
 }
 
 #[test]
+fn a_frozen_v7_database_opens_and_reads_its_lease_and_retry_provenance() {
+    let data_dir = restore_frozen_database(FROZEN_V7_DATABASE);
+    let store = Store::open(data_dir.path()).unwrap();
+    assert_eq!(
+        recorded_version(&guard(&store.writer)).unwrap(),
+        SCHEMA_VERSION
+    );
+
+    // The interrupted attempt kept its lease, so a reader can still say which
+    // process drove it even though that process is long gone.
+    let original = RunId::from_str(FIXTURE_RUN_ID).unwrap();
+    let lease_id = FIXTURE_LEASE_ID.parse::<crate::domain::LeaseId>().unwrap();
+    let lease = store.lease(lease_id).unwrap().unwrap();
+    assert_eq!(lease.id(), lease_id);
+    assert!(
+        lease.is_released(),
+        "the sweep that ended its run must have written the claim off"
+    );
+    let interrupted = store.load_run(original).unwrap();
+    assert_eq!(interrupted.state(), ExecutionState::Interrupted);
+    assert_eq!(interrupted.retry_of(), None);
+    assert!(!interrupted.workspace_may_be_modified());
+
+    let retry = store
+        .load_run(RunId::from_str(FIXTURE_RETRY_RUN_ID).unwrap())
+        .unwrap();
+    assert_eq!(retry.retry_of(), Some(original));
+    assert!(
+        retry.workspace_may_be_modified(),
+        "the frozen retry pins the warning a front end has to surface"
+    );
+    assert_eq!(store.retries_of(original).unwrap(), vec![retry.id()]);
+
+    // A released lease is a claim nobody is making, so nothing about it makes
+    // the retry look owned.
+    assert!(store.live_leases().unwrap().is_empty());
+    assert_eq!(
+        store.unfinished_runs().unwrap(),
+        vec![(retry.id(), None)],
+        "only the queued retry is still unfinished, and it names no live claim"
+    );
+}
+
+#[test]
 fn a_frozen_v2_database_opens_after_future_migrations() {
     let data_dir = restore_frozen_database(FROZEN_V2_DATABASE);
     let path = data_dir.path().join(DATABASE_FILE);
@@ -4271,7 +4327,7 @@ fn a_frozen_v2_database_opens_after_future_migrations() {
 
     apply(&mut connection, LATER_MIGRATIONS).unwrap();
 
-    assert_eq!(recorded_version(&connection).unwrap(), 7);
+    assert_eq!(recorded_version(&connection).unwrap(), 8);
     let run =
         super::repository::load_run(&connection, RunId::from_str(FIXTURE_RUN_ID).unwrap()).unwrap();
     assert_eq!(run.state(), ExecutionState::Running);
@@ -4320,7 +4376,7 @@ fn regenerate_the_frozen_v1_fixture() {
     );
     super::repository::insert_task(&connection, &task).unwrap();
     let mut run = Run::with_id(RunId::from_str(FIXTURE_RUN_ID).unwrap(), task.id(), at(1));
-    super::repository::insert_run(&connection, &run).unwrap();
+    super::repository::insert_run(&connection, &run, None).unwrap();
     let mut step = Step::with_id(
         StepId::from_str(FIXTURE_STEP_ID).unwrap(),
         run.id(),
@@ -4548,6 +4604,79 @@ fn regenerate_the_frozen_v6_fixture() {
     freeze(&guard(&store.writer), "runtime-v6.db");
 }
 
+/// Writes the frozen v7 fixture: a dead lease, the run it abandoned, and the
+/// retry that followed.
+///
+/// Run deliberately, and only when migration 7 changes:
+/// `cargo test -p harkness-runtime regenerate_the_frozen_v7_fixture -- --ignored`.
+#[test]
+#[ignore = "rewrites a committed fixture; run only when migration 7 changes"]
+fn regenerate_the_frozen_v7_fixture() {
+    let data_dir = TempDir::new().unwrap();
+    let store = store_with_migrations(data_dir.path(), &MIGRATIONS[..7]);
+    let task = stored_task(&store);
+    let lease =
+        crate::store::LeaseRecord::acquired(FIXTURE_LEASE_ID.parse().unwrap(), 4_242, at(1));
+    let run = Run::with_id(RunId::from_str(FIXTURE_RUN_ID).unwrap(), task.id(), at(1));
+    store
+        .insert_run_with_event(
+            &run,
+            Some(&lease),
+            RunEvent::new(EventKind::RunStateChanged, at(1))
+                .with_payload(json!({"state": "queued"})),
+        )
+        .unwrap();
+    let step = stored_step(&store, &run);
+    let call = stored_tool_call(&store, &step);
+    store
+        .transition_run(run.id(), ExecutionState::Running, at(10))
+        .unwrap();
+    store
+        .transition_step(step.id(), ExecutionState::Running, at(11))
+        .unwrap();
+    store
+        .transition_tool_call(call.id(), ToolCallState::Running, at(12))
+        .unwrap();
+
+    // Exactly the shape a restart finds and ends.
+    store
+        .interrupt_run(
+            run.id(),
+            Some(lease.id()),
+            crate::store::InterruptionReason::LeaseLockReleased,
+            at(20),
+        )
+        .unwrap()
+        .unwrap();
+
+    let retry = Run::retrying_with_id(
+        RunId::from_str(FIXTURE_RETRY_RUN_ID).unwrap(),
+        task.id(),
+        run.id(),
+        true,
+        at(30),
+    );
+    store
+        .insert_run_with_event(
+            &retry,
+            None,
+            RunEvent::new(EventKind::RunStateChanged, at(30))
+                .with_payload(json!({"state": "queued"})),
+        )
+        .unwrap();
+    store
+        .append_event(
+            run.id(),
+            RunEvent::new(EventKind::RunRetried, at(30)).with_payload(json!({
+                "retry_run_id": retry.id().to_string(),
+                "workspace_may_be_modified": true,
+            })),
+        )
+        .unwrap();
+
+    freeze(&guard(&store.writer), "runtime-v7.db");
+}
+
 /// Builds a store stopped at an older migration for fixture regeneration.
 fn store_with_migrations(data_dir: &std::path::Path, migrations: &[Migration]) -> Store {
     std::fs::create_dir_all(data_dir).unwrap();
@@ -4578,8 +4707,8 @@ fn freeze(connection: &Connection, name: &str) {
 
 #[test]
 fn every_migration_in_this_build_is_recorded_in_order() {
-    assert_eq!(MIGRATIONS.len(), 6, "add coverage for a new migration");
-    assert_eq!(SCHEMA_VERSION, 6);
+    assert_eq!(MIGRATIONS.len(), 7, "add coverage for a new migration");
+    assert_eq!(SCHEMA_VERSION, 7);
 }
 
 // -- performance -------------------------------------------------------------
