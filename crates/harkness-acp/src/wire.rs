@@ -37,6 +37,7 @@ pub(crate) use agent_client_protocol_schema::{
 };
 
 use crate::{
+    OFFERED_PROTOCOL_VERSION,
     capabilities::{AdvertisedClientCapabilities, ClientIdentity},
     error::AcpError,
 };
@@ -69,7 +70,13 @@ pub(crate) fn initialize_request(
     client: &ClientIdentity,
     capabilities: &AdvertisedClientCapabilities,
 ) -> InitializeRequest {
-    InitializeRequest::new(ProtocolVersion::LATEST)
+    // Harkness's own constant rather than upstream's `LATEST`. The two agree
+    // today and a test below says so, but a test is not what puts the number on
+    // the wire: an upstream release moving `LATEST` would otherwise make a
+    // release build offer a version `SUPPORTED_PROTOCOL_VERSIONS` refuses, so
+    // every conformant agent that honoured the offer would be turned away for a
+    // version Harkness itself proposed.
+    InitializeRequest::new(ProtocolVersion::from(OFFERED_PROTOCOL_VERSION))
         .client_capabilities(
             ClientCapabilities::new()
                 .fs(FileSystemCapabilities::new()
@@ -122,7 +129,10 @@ mod tests {
     use super::{
         AUTH_REQUIRED_CODE, AUTHENTICATE, INITIALIZE, METHOD_NOT_FOUND_CODE, ProtocolVersion,
     };
-    use crate::OFFERED_PROTOCOL_VERSION;
+    use crate::{
+        OFFERED_PROTOCOL_VERSION,
+        capabilities::{AdvertisedClientCapabilities, ClientIdentity},
+    };
 
     /// The two codes this crate branches on are upstream's, spelled locally so
     /// they can be compared against a wire `i64`. A release that renumbered
@@ -141,14 +151,24 @@ mod tests {
     }
 
     /// ADR-0014 says the client offers the latest version it supports, and
-    /// upstream's `LATEST` is what that phrase resolves to. The two are asserted
-    /// equal rather than assumed, because a future schema release moving
-    /// `LATEST` would otherwise make Harkness silently offer a version it does
-    /// not implement — the exact failure the negotiation boundary exists to
-    /// prevent.
+    /// upstream's `LATEST` is what that phrase resolves to today. This is a
+    /// notice rather than a guard — the wire carries `OFFERED_PROTOCOL_VERSION`
+    /// either way, so a schema release moving `LATEST` fails here and changes
+    /// nothing a user sees, which is the order those two things should happen
+    /// in. Adopting the newer version is then a decision with an ADR behind it.
     #[test]
-    fn the_offered_version_is_the_latest_upstream_calls_stable() {
+    fn the_offered_version_is_still_the_latest_upstream_calls_stable() {
         assert_eq!(ProtocolVersion::LATEST.as_u16(), OFFERED_PROTOCOL_VERSION);
+    }
+
+    /// And what actually goes on the wire is the crate's own constant.
+    #[test]
+    fn the_request_carries_the_version_this_crate_publishes() {
+        let request = super::initialize_request(
+            &ClientIdentity::new("harkness", "0.1.0"),
+            &AdvertisedClientCapabilities::default(),
+        );
+        assert_eq!(request.protocol_version.as_u16(), OFFERED_PROTOCOL_VERSION);
     }
 
     /// Method names come from upstream so a rename is a compile error rather

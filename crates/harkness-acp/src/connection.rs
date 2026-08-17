@@ -22,6 +22,7 @@ use std::{
 
 use harkness_transport::{
     Connection, DEFAULT_STARTUP_DEADLINE, PeerError, PeerMessage, ShutdownOutcome, ShutdownRung,
+    TransportError,
 };
 
 use crate::{
@@ -30,7 +31,7 @@ use crate::{
         AcpAgentCapabilities, AdvertisedClientCapabilities, AgentDescription, AuthMethodId,
         ClientIdentity, agent_capabilities, agent_description,
     },
-    error::{AcpError, AgentRefusal},
+    error::{AcpError, AgentRefusal, quoted},
     wire,
 };
 
@@ -132,14 +133,21 @@ const PENDING_TEARDOWN: ShutdownOutcome = ShutdownOutcome {
     stderr_bytes: 0,
 };
 
-/// Bytes of an agent-chosen method name repeated back in a diagnostic.
+/// How long a wait becomes when a caller's timeout cannot be added to a clock.
 ///
-/// A method name is an identifier with a natural length, and the agent picks it,
-/// so a sentence built around one is bounded. An agent's *message* on a JSON-RPC
-/// error is not bounded here and is deliberately different: prose whose whole
-/// value is being complete goes in a field of its own, where a caller can decide
-/// what to do with it, rather than into a sentence this crate wrote.
-const MAX_METHOD_NAME_BYTES: usize = 128;
+/// `Instant + Duration` panics on overflow, and every field of [`AcpTimeouts`]
+/// is public, so `Duration::MAX` is a spelling a caller reaching for "wait
+/// indefinitely" will actually write. A year is not indefinite and is not meant
+/// to be: it is far past any deadline anybody means, and it keeps the invariant
+/// that every wait is bounded.
+const EFFECTIVELY_UNBOUNDED: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+/// Turns one caller-supplied timeout into a deadline that cannot panic.
+fn deadline_from(started: Instant, timeout: Duration) -> Instant {
+    started
+        .checked_add(timeout)
+        .unwrap_or_else(|| started + EFFECTIVELY_UNBOUNDED)
+}
 
 impl AcpConnection {
     /// Speaks ACP over an existing connection, with the default timeouts.
@@ -189,13 +197,16 @@ impl AcpConnection {
 
         let request = wire::initialize_request(client, capabilities);
         let params = wire::encode(wire::INITIALIZE, &request)?;
-        let deadline = started + self.timeouts.initialize;
+        let deadline = deadline_from(started, self.timeouts.initialize);
 
         let answered = {
             let connection = self.open()?;
             connection.request(wire::INITIALIZE, Some(params), deadline)
         };
-        let body = self.collect(wire::INITIALIZE, answered, peer_error)?;
+        let body = match self.collect(wire::INITIALIZE, answered, peer_error) {
+            Ok(body) => body,
+            Err(error) => return Err(self.refuse_handshake_stall(wire::INITIALIZE, error)),
+        };
 
         let response = match wire::decode::<wire::InitializeResponse>(wire::INITIALIZE, body) {
             Ok(response) => response,
@@ -271,7 +282,7 @@ impl AcpConnection {
 
         let request = wire::AuthenticateRequest::new(method.as_str().to_owned());
         let params = wire::encode(wire::AUTHENTICATE, &request)?;
-        let deadline = started + self.timeouts.authenticate;
+        let deadline = deadline_from(started, self.timeouts.authenticate);
 
         let answered = {
             let connection = self.open()?;
@@ -286,10 +297,18 @@ impl AcpConnection {
         // over that spelling would be Harkness inventing a conformance rule the
         // specification does not have. An `initialize` response is different and
         // is decoded, because `protocolVersion` is a field the negotiation needs.
-        let _ignored = self.collect(wire::AUTHENTICATE, answered, move |_, refusal| {
-            AcpError::AuthenticationFailed {
-                method_id: attempted,
-                refusal: Box::new(refused(refusal)),
+        let _ignored = self.collect(wire::AUTHENTICATE, answered, move |method, refusal| {
+            match refusal.code {
+                // An agent that advertised this method and then does not
+                // implement the call is not refusing a credential — it is not
+                // serving `authenticate` at all, and telling a caller its
+                // credentials were rejected sends it to re-prompt a person over
+                // a conformance bug no answer of theirs can fix.
+                wire::METHOD_NOT_FOUND_CODE => AcpError::MethodNotSupported { method },
+                _ => AcpError::AuthenticationFailed {
+                    method_id: attempted,
+                    refusal: Box::new(refused(refusal)),
+                },
             }
         })?;
 
@@ -362,7 +381,7 @@ impl AcpConnection {
     fn collect(
         &mut self,
         method: &'static str,
-        answered: Result<Result<serde_json::Value, PeerError>, harkness_transport::TransportError>,
+        answered: Result<Result<serde_json::Value, PeerError>, TransportError>,
         on_refusal: impl FnOnce(&'static str, PeerError) -> AcpError,
     ) -> Result<serde_json::Value, AcpError> {
         match answered {
@@ -378,6 +397,32 @@ impl AcpConnection {
                 Err(error)
             }
         }
+    }
+
+    /// Re-reads a handshake failure the connection called recoverable.
+    ///
+    /// `peer_queue_full` is not terminal in general, and correctly so: the
+    /// connection resumes the moment somebody drains it. Nobody can drain it
+    /// here. ACP gives an agent nothing to send before `initialize` returns, so
+    /// a queue that filled holds `capacity` messages that should not exist, and
+    /// this crate offers no way to read them because there is nothing legitimate
+    /// in there to read. Left as the transport reported it, the failure would
+    /// tell every caller the agent is fine while no retry could ever get past
+    /// the same full queue and the child process was never torn down.
+    ///
+    /// It is reported as the protocol violation it is — one message arriving
+    /// during the handshake is already a violation, and this is `capacity` of
+    /// them — rather than as a new kind, so a caller has one thing to recognize.
+    fn refuse_handshake_stall(&mut self, during: &'static str, error: AcpError) -> AcpError {
+        let Some(TransportError::PeerQueueFull { capacity }) = error.transport() else {
+            return error;
+        };
+        let violation = AcpError::ProtocolViolation {
+            during,
+            detail: format!("{capacity} messages before answering"),
+        };
+        self.close(violation.kind());
+        violation
     }
 
     /// Refuses an agent that called a method before the handshake finished.
@@ -470,20 +515,7 @@ fn describe(message: &PeerMessage) -> String {
         PeerMessage::Request(request) => ("request", request.method.as_str()),
         PeerMessage::Notification(notification) => ("notification", notification.method.as_str()),
     };
-    format!("a '{}' {shape}", bounded(method))
-}
-
-/// Clamps an agent-chosen name to [`MAX_METHOD_NAME_BYTES`] on a character
-/// boundary, so a peer cannot choose how long a Harkness diagnostic is.
-fn bounded(name: &str) -> String {
-    if name.len() <= MAX_METHOD_NAME_BYTES {
-        return name.to_owned();
-    }
-    let mut end = MAX_METHOD_NAME_BYTES;
-    while end > 0 && !name.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &name[..end])
+    format!("a '{}' {shape}", quoted(method))
 }
 
 #[cfg(test)]
@@ -496,11 +528,12 @@ mod tests {
     };
     use serde_json::{Value, json};
 
-    use super::{AcpConnection, AcpTimeouts, InitializeOutcome, MAX_METHOD_NAME_BYTES, bounded};
+    use super::{AcpConnection, AcpTimeouts, InitializeOutcome};
     use crate::{
         AcpAgentCapabilities, AcpError, AdvertisedClientCapabilities, AgentDescription,
         AgentRefusal, AuthCapabilities, AuthMethod, AuthMethodId, ClientIdentity, McpCapabilities,
         PromptCapabilities, SessionCapabilities,
+        error::{MAX_QUOTED_AGENT_BYTES, quoted},
         testing::{Recorded, ScriptedAgent, Step, scripted},
     };
 
@@ -572,7 +605,8 @@ mod tests {
 
         let sent = recorded
             .request_params("initialize")
-            .expect("initialize was sent");
+            .expect("initialize was sent")
+            .expect("initialize carries params");
         assert_eq!(
             serde_json::to_string_pretty(&sent).unwrap(),
             REQUEST_FIXTURE.trim_end(),
@@ -592,7 +626,7 @@ mod tests {
             )
             .unwrap();
 
-        let sent = recorded.request_params("initialize").unwrap();
+        let sent = recorded.request_params("initialize").unwrap().unwrap();
         assert_eq!(
             serde_json::to_string_pretty(&sent).unwrap(),
             MINIMAL_REQUEST_FIXTURE.trim_end(),
@@ -631,7 +665,7 @@ mod tests {
         ] {
             let (mut agent, recorded) = scripted(agreeing());
             agent.initialize(&harkness(), &advertised).unwrap();
-            let sent = recorded.request_params("initialize").unwrap();
+            let sent = recorded.request_params("initialize").unwrap().unwrap();
             assert_eq!(sent["clientCapabilities"], expected);
         }
     }
@@ -1106,7 +1140,7 @@ mod tests {
 
         assert_eq!(
             recorded.request_params("authenticate"),
-            Some(json!({"methodId": "api-key"})),
+            Some(Some(json!({"methodId": "api-key"}))),
         );
         assert_eq!(outcome.method, AuthMethodId::new("api-key"));
         assert_eq!(recorded.request_count(), 2);
@@ -1176,6 +1210,28 @@ mod tests {
             .unwrap_err();
         assert_eq!(died.kind(), "disconnected");
         assert!(died.is_terminal());
+    }
+
+    /// An agent that advertised a method and then does not implement the call is
+    /// not refusing a credential. Reporting that as `authentication_failed`
+    /// would send a caller to re-prompt a person over a conformance bug no
+    /// answer of theirs can fix.
+    #[test]
+    fn an_agent_that_does_not_serve_authenticate_is_not_refusing_a_credential() {
+        let (mut agent, _recorded) = scripted(vec![
+            Step::Reply(fixture(RESPONSE_FIXTURE)),
+            Step::Refuse(PeerError {
+                code: -32601,
+                message: "unknown method".to_owned(),
+                data: None,
+            }),
+        ]);
+        agent.initialize(&harkness(), &everything()).unwrap();
+
+        let error = agent.authenticate(&AuthMethodId::new("oauth")).unwrap_err();
+        assert_eq!(error.kind(), "method_not_supported");
+        assert!(!error.is_terminal());
+        assert!(!agent.is_closed());
     }
 
     /// Authentication before a handshake has no advertisement to check against,
@@ -1292,6 +1348,50 @@ mod tests {
         }
     }
 
+    /// A peer queue that fills during the handshake is a stall nobody can clear:
+    /// nothing legitimate is in there to read, so `peer_queue_full`'s promise
+    /// that "the connection resumes the moment somebody drains" is one this
+    /// crate cannot keep. Reported as it arrives, it would tell every retry the
+    /// agent is fine while no retry could get past the same full queue and the
+    /// child was never torn down.
+    #[test]
+    fn a_peer_queue_that_fills_during_the_handshake_is_the_violation_it_is() {
+        let (mut agent, recorded) = scripted(vec![
+            Step::Fault(TransportError::PeerQueueFull { capacity: 4096 }),
+            Step::Reply(fixture(RESPONSE_FIXTURE)),
+        ]);
+        let error = agent.initialize(&harkness(), &everything()).unwrap_err();
+
+        assert_eq!(error.kind(), "protocol_violation");
+        assert!(
+            error.is_terminal(),
+            "no retry can drain what nobody may read"
+        );
+        assert!(error.to_string().contains("4096"), "{error}");
+        assert!(agent.is_closed());
+        assert_eq!(recorded.shutdowns(), 1, "the child is torn down");
+    }
+
+    /// Every field of `AcpTimeouts` is public, so a caller reaching for "wait
+    /// indefinitely" will write `Duration::MAX` — and `Instant + Duration`
+    /// panics on overflow. The adapter is not a place to panic from.
+    #[test]
+    fn an_unaddable_timeout_becomes_a_long_wait_rather_than_a_panic() {
+        let (connection, _recorded) = ScriptedAgent::connect(agreeing());
+        let mut agent = AcpConnection::with_timeouts(
+            connection,
+            AcpTimeouts {
+                initialize: Duration::MAX,
+                authenticate: Duration::MAX,
+                shutdown_grace: Duration::MAX,
+            },
+        );
+
+        agent
+            .initialize(&harkness(), &everything())
+            .expect("an unaddable deadline is still a deadline");
+    }
+
     /// A peer choosing a method name a megabyte long must not choose how long a
     /// Harkness diagnostic is.
     #[test]
@@ -1314,14 +1414,42 @@ mod tests {
     /// A multi-byte name is cut on a character boundary rather than in the
     /// middle of one, because the result is a `String`.
     #[test]
-    fn a_bounded_name_is_cut_on_a_character_boundary() {
+    fn quoted_agent_text_is_cut_on_a_character_boundary() {
         let short = "session/prompt";
-        assert_eq!(bounded(short), short);
+        assert_eq!(quoted(short), short);
 
-        let wide = "é".repeat(MAX_METHOD_NAME_BYTES);
-        let clamped = bounded(&wide);
-        assert!(clamped.len() <= MAX_METHOD_NAME_BYTES + '…'.len_utf8());
+        let wide = "é".repeat(MAX_QUOTED_AGENT_BYTES);
+        let clamped = quoted(&wide);
+        assert!(clamped.len() <= MAX_QUOTED_AGENT_BYTES + '…'.len_utf8());
         assert!(clamped.ends_with('…'));
+    }
+
+    /// The same bound covers an agent's JSON-RPC message, which reaches a log
+    /// line, a CLI envelope, and a `{error}` in a panic through `Display`. The
+    /// field beside it keeps the whole thing — that split is the promise, and
+    /// interpolating the message into the sentence would have quietly broken the
+    /// half of it that matters.
+    #[test]
+    fn an_agents_message_is_bounded_in_a_diagnostic_and_whole_in_its_field() {
+        let sprawling = "x".repeat(1_000_000);
+        let (mut agent, _recorded) = scripted(vec![Step::Refuse(PeerError {
+            code: -32603,
+            message: sprawling.clone(),
+            data: None,
+        })]);
+        let error = agent.initialize(&harkness(), &everything()).unwrap_err();
+
+        assert!(
+            error.to_string().len() < 512,
+            "the diagnostic grew with the agent's message: {} bytes",
+            error.to_string().len(),
+        );
+        match &error {
+            AcpError::AgentRejectedRequest { refusal, .. } => {
+                assert_eq!(refusal.message, sprawling, "the field keeps it whole");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     /// A silent agent is bounded by the caller's deadline and nothing else, and
@@ -1476,7 +1604,7 @@ mod tests {
         ] {
             let (mut agent, recorded) = scripted(agreeing());
             agent.initialize(&client, &advertised).unwrap();
-            let sent = recorded.request_params("initialize").unwrap();
+            let sent = recorded.request_params("initialize").unwrap().unwrap();
             let json = serde_json::to_string_pretty(&sent).unwrap();
             std::fs::write(directory.join(name), format!("{json}\n")).unwrap();
         }

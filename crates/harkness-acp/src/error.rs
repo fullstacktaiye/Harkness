@@ -60,9 +60,39 @@ pub struct AgentRefusal {
 }
 
 impl fmt::Display for AgentRefusal {
+    /// Quotes the agent's message *clamped*, while the field beside it keeps the
+    /// whole thing.
+    ///
+    /// The two are not in tension, they are the point: a caller that wants the
+    /// complete diagnosis reads `message`, and a log line, a CLI envelope, or a
+    /// `{error}` in a panic gets a sentence whose length Harkness chose. Without
+    /// the clamp a peer picks how many bytes every one of those is — the same
+    /// hazard the method-name clamp exists for, arriving by the wider door.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{} (code {})", self.message, self.code)
+        write!(formatter, "{} (code {})", quoted(&self.message), self.code)
     }
+}
+
+/// Bytes of agent-chosen text a sentence Harkness wrote may repeat back.
+///
+/// One bound for every such quotation — a method name, an error message —
+/// because they are one hazard: the peer picks the string, so without a bound
+/// the peer picks the length of a Harkness diagnostic. Prose whose whole value
+/// is being complete still travels intact, in a field of its own, where a caller
+/// decides what to do with it.
+pub(crate) const MAX_QUOTED_AGENT_BYTES: usize = 256;
+
+/// Clamps agent-chosen text to [`MAX_QUOTED_AGENT_BYTES`] on a character
+/// boundary.
+pub(crate) fn quoted(text: &str) -> String {
+    if text.len() <= MAX_QUOTED_AGENT_BYTES {
+        return text.to_owned();
+    }
+    let mut end = MAX_QUOTED_AGENT_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
 }
 
 /// Why an ACP exchange did not produce an answer.

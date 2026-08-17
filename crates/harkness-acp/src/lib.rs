@@ -116,6 +116,16 @@ pub use capabilities::{
 pub use connection::{AcpConnection, AcpTimeouts, AuthenticateOutcome, InitializeOutcome};
 pub use error::{AcpError, AgentRefusal};
 
+/// The transport this adapter speaks over, re-exported.
+///
+/// The public API here takes a [`Connection`](harkness_transport::Connection),
+/// returns a [`ShutdownOutcome`](harkness_transport::ShutdownOutcome), and hands
+/// back a [`TransportError`](harkness_transport::TransportError), so a consumer
+/// needs those types whatever happens. Re-exporting them makes the seam one
+/// dependency rather than two that have to resolve to the same version — two
+/// that did not would produce a type error naming the same path twice.
+pub use harkness_transport;
+
 /// The ACP protocol version Harkness offers in `initialize`.
 ///
 /// The latest version it supports, which ADR-0014 phrases deliberately: when
@@ -169,15 +179,39 @@ mod tests {
     /// `unstable_*` gate is a feature upstream says may still change shape.
     /// Adopting any of them is an ADR, and this is what makes that friction
     /// real rather than advisory.
+    ///
+    /// Every member's manifest is read, not this crate's alone, because that is
+    /// what the mechanism requires: a feature `harkness-mcp` or `harkness-runtime`
+    /// asked for would be unified onto *this* crate, `AuthMethod` would grow the
+    /// variants `capabilities.rs` promises cannot appear, and a check scoped to
+    /// one file would pass. The manifests are read from disk rather than through
+    /// `include_str!` for the same reason: a new member must be covered by
+    /// existing on disk, not by somebody remembering to add a line here.
     #[test]
-    fn the_manifest_enables_no_unstable_protocol_feature() {
-        let manifest = include_str!("../Cargo.toml");
-        assert!(
-            !manifest.contains("unstable_"),
-            "an unstable_ feature appears in crates/harkness-acp/Cargo.toml; ADR-0014 fixes \
-             Harkness at ACP protocol version 1 and adopting a draft feature requires a \
-             superseding ADR",
-        );
+    fn no_member_enables_an_unstable_protocol_feature() {
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("this crate lives under crates/");
+
+        let mut checked = 0;
+        for entry in std::fs::read_dir(crates).expect("the crates directory is readable") {
+            let manifest = entry
+                .expect("a readable directory entry")
+                .path()
+                .join("Cargo.toml");
+            let Ok(text) = std::fs::read_to_string(&manifest) else {
+                continue;
+            };
+            checked += 1;
+            assert!(
+                !text.contains("unstable_"),
+                "an unstable_ feature appears in {}; ADR-0014 fixes Harkness at ACP protocol \
+                 version 1, cargo unifies a feature any member asks for onto harkness-acp, and \
+                 adopting a draft feature requires a superseding ADR",
+                manifest.display(),
+            );
+        }
+        assert!(checked > 1, "only {checked} manifests were read");
     }
 
     /// ADR-0003 keeps the workspace synchronous, and ADR-0010 adopts the schema

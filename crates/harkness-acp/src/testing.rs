@@ -8,8 +8,13 @@
 //! with no executable, no timing, and no platform involved — which is what makes
 //! them assertions rather than observations.
 //!
-//! [#156] grows this into a fake agent that serves whole sessions. What is here
-//! is the handshake's worth of it.
+//! It is `#[cfg(test)]` and crate-private, so nothing outside this crate's unit
+//! tests can reach it, and that is deliberate: a production crate should not
+//! export test machinery, and there is no second consumer yet to shape it for.
+//! When [#156] builds a fake agent that serves whole sessions, the shape here is
+//! what it starts from — promoted to `harkness-test-fixtures`, which is where
+//! the workspace already keeps fixtures shared between crates, rather than
+//! un-gated in place.
 //!
 //! [#156]: https://github.com/fullstacktaiye/harkness/issues/156
 
@@ -64,9 +69,14 @@ impl Recorded {
     }
 
     /// The parameters of the `method` request, if one was sent.
-    pub(crate) fn request_params(&self, method: &str) -> Option<Value> {
+    ///
+    /// Nested rather than flattened, so "sent with no params" and "never sent"
+    /// stay two answers. Collapsing them would make an assertion about a
+    /// parameterless request fail with a message claiming the request was never
+    /// made, which is the opposite of what happened.
+    pub(crate) fn request_params(&self, method: &str) -> Option<Option<Value>> {
         self.sent().into_iter().find_map(|message| match message {
-            Message::Request(request) if request.method == method => request.params,
+            Message::Request(request) if request.method == method => Some(request.params),
             _ => None,
         })
     }

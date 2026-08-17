@@ -98,7 +98,13 @@ No credential material passes through this crate. ACP v1 has one method shape �
 the agent handles authentication itself — and Harkness only names which of the
 offered ways to use.
 
-A rejected attempt is `AcpError::AuthenticationFailed`, deliberately distinct
+An agent that advertised a method and then answers `-32601` to `authenticate`
+is not refusing a credential — it is not serving the call at all, and that is
+`AcpError::MethodNotSupported`. Telling a caller its credentials were rejected
+would send it to re-prompt a person over a conformance bug no answer of theirs
+can fix.
+
+Every other rejection is `AcpError::AuthenticationFailed`, deliberately distinct
 from a transport failure: "your credentials were refused" and "the agent died
 mid-call" are the same outcome to a caller that only checks for `Err`, and #150
 has to tell them apart to choose between re-prompting a person and relaunching a
@@ -120,8 +126,8 @@ concatenation.
 | `malformed_response` | The answer is not the response this method defines | no |
 | `protocol_violation` | The agent called a method before the handshake finished | no |
 | `agent_rejected_request` | A JSON-RPC error, carried whole | yes |
-| `method_not_supported` | `-32601` for a method ACP requires | yes |
-| `authentication_required` | `-32000`; authenticate and retry | yes |
+| `method_not_supported` | `-32601` for a method ACP requires, or for `authenticate` after the agent advertised one | yes |
+| `authentication_required` | `-32000` from a call that authentication would unblock | yes |
 | `authentication_failed` | The agent rejected the attempt | yes |
 | `auth_method_not_advertised` | Nothing was written; the agent never offered it | yes |
 | `not_initialized` | A method was called before `initialize` | yes |
@@ -132,6 +138,13 @@ concatenation.
 `AcpError::is_terminal()` answers the "connection survives" column, and
 `AcpError::transport()` hands back the underlying `TransportError` when there is
 one.
+
+`authentication_required` is reachable from `initialize` only from an agent that
+is out of spec: `-32000` is the code for a call authentication would unblock, and
+nothing has been advertised to authenticate *with* until `initialize` answers. It
+is reported accurately rather than translated, but there is no retry that helps —
+the method set an agent will accept is in the response it declined to send. The
+kind exists for the session methods #151 adds.
 
 ## Nothing arrives during the handshake
 

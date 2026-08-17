@@ -1413,6 +1413,13 @@ Cargo unifies that choice onto every member. `agent-client-protocol-schema` requ
 ADR-0010 requires that crate, so the workspace has already lost the free version of this property
 once. Nothing may rely on it again.
 
+Unification is per build graph rather than per repository, and that is the sharp edge: `cargo test
+-p harkness-runtime` does not build `harkness-acp`, so it resolves `serde_json` *without*
+`preserve_order` and sees a `BTreeMap`, while `cargo test --workspace` sees an `IndexMap`. A
+byte-level assertion over an untyped `Value` can therefore pass under one command and fail under the
+other. Anything that freezes such bytes must sort them, and anything that merely reads them must not
+assume an order at all.
+
 `harkness_runtime::canonical_json` is the one definition: every object key sorted by its exact UTF-8
 bytes at every depth, arrays untouched, idempotent. Three places take it because their bytes are a
 contract rather than a value — a delivered tool result that a recorded hash is taken over, a built-in

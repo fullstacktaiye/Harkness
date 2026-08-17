@@ -1781,7 +1781,7 @@ fn main() -> ExitCode {
                 emit_error(
                     "usage_error",
                     &clap_error_message(&error),
-                    &clap_error_details(&error),
+                    clap_error_details(&error),
                 )
             } else {
                 error.print()
@@ -1846,7 +1846,7 @@ fn finish_result(result: CommandResult) -> ExitCode {
     let output = match result {
         CommandResult::Human(human) if human.is_empty() => Ok(()),
         CommandResult::Human(human) => write_line(&mut io::stdout().lock(), human.as_bytes()),
-        CommandResult::Json(data) => emit_success(&data),
+        CommandResult::Json(data) => emit_success(data),
     };
     finish_output(output, 0)
 }
@@ -1854,7 +1854,7 @@ fn finish_result(result: CommandResult) -> ExitCode {
 fn finish_error(json_output: bool, error: CliError) -> ExitCode {
     let code = error.exit_code();
     let output = if json_output {
-        emit_error(error.kind(), &error.message(), &error.details())
+        emit_error(error.kind(), &error.message(), error.details())
     } else {
         write_line(&mut io::stderr().lock(), error.message().as_bytes())
     };
@@ -5029,14 +5029,29 @@ fn contract_result(json_output: bool) -> CommandResult {
     }
 }
 
-fn emit_success(data: &Value) -> io::Result<()> {
+/// Writes the success envelope, with the payload's object keys in one fixed
+/// order.
+///
+/// The envelope's own fields come from a struct and are in declaration order
+/// whatever happens; the payload is a hand-built `Value`, and its key order used
+/// to come from `serde_json::Map` being a `BTreeMap`. That map type is a cargo
+/// feature any crate in the workspace can turn on for every other one — one
+/// does, through `agent-client-protocol-schema` (ADR-0010) — so the order a
+/// released `harkness --json` has always emitted is sorted here rather than
+/// inherited. Nothing about the contract changes: JSON objects are unordered to
+/// a parser, and this is what keeps the bytes the same for anyone who did not
+/// read them that way.
+///
+/// Takes the payload by value because every caller already owns one, and
+/// sorting a borrowed tree would mean cloning the whole thing first.
+fn emit_success(data: Value) -> io::Result<()> {
     write_json_line(
         &mut io::stdout().lock(),
         &SuccessEnvelope {
             v: ENVELOPE_VERSION,
             r#type: "success",
             ok: true,
-            data: &canonical_json(data.clone()),
+            data: &canonical_json(data),
         },
     )
 }
@@ -5057,7 +5072,8 @@ fn emit_progress(json_output: bool, message: &str) {
     let _ = output;
 }
 
-fn emit_error(kind: &str, message: &str, details: &Value) -> io::Result<()> {
+/// Writes the error envelope, sorted for the reason [`emit_success`] is.
+fn emit_error(kind: &str, message: &str, details: Value) -> io::Result<()> {
     write_json_line(
         &mut io::stdout().lock(),
         &ErrorEnvelope {
@@ -5067,23 +5083,17 @@ fn emit_error(kind: &str, message: &str, details: &Value) -> io::Result<()> {
             error: ErrorBody {
                 kind,
                 message,
-                details: &canonical_json(details.clone()),
+                details: &canonical_json(details),
             },
         },
     )
 }
 
-/// Writes one envelope, with the payload's object keys in one fixed order.
+/// Writes one envelope and a newline.
 ///
-/// The envelope's own fields come from a struct and are in declaration order
-/// whatever happens; the payload is a hand-built `Value`, and its key order used
-/// to come from `serde_json::Map` being a `BTreeMap`. That map type is a cargo
-/// feature any crate in the workspace can turn on for every other one — one
-/// does, through `agent-client-protocol-schema` (ADR-0010) — so the order a
-/// released `harkness --json` has always emitted is sorted here rather than
-/// inherited. Nothing about the contract changes: JSON objects are unordered to
-/// a parser, and this is what keeps the bytes the same for anyone who did not
-/// read them that way.
+/// Does no key ordering of its own: a payload's canonical order is applied by
+/// whoever built it, in `emit_success`, `emit_error`, and `contract_result`. A
+/// new envelope writer owes that call too.
 fn write_json_line(writer: &mut impl Write, value: &impl Serialize) -> io::Result<()> {
     serde_json::to_writer(&mut *writer, value).map_err(|error| {
         if let Some(kind) = error.io_error_kind() {
