@@ -65,6 +65,50 @@ impl CacheFixture {
     }
 }
 
+/// A directory made unwritable for the life of the guard.
+///
+/// Two things a bare `set_permissions` call gets wrong. The mode bits are
+/// ignored for `root`, which is the ordinary shape of a CI container and of a
+/// local `docker run`, so a test asserting "this write must fail" has to *check*
+/// that the seal took rather than assume it — [`seal`](Self::seal) answers
+/// `None` when it did not, and the caller skips. And the restore has to happen
+/// on the panicking path too: left sealed, the directory's children outlive the
+/// `TempDir` that cannot remove them.
+#[cfg(unix)]
+pub(crate) struct ReadOnlyDirectory {
+    path: PathBuf,
+    restore: fs::Permissions,
+}
+
+#[cfg(unix)]
+impl ReadOnlyDirectory {
+    /// Seals `path`, or answers `None` when this process can write it anyway.
+    pub(crate) fn seal(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let restore = fs::metadata(path).unwrap().permissions();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o500)).unwrap();
+        let sealed = Self {
+            path: path.to_path_buf(),
+            restore,
+        };
+        // Probed rather than assumed: the mode bits mean nothing to root.
+        let probe = path.join("seal-probe");
+        if fs::write(&probe, b"").is_ok() {
+            let _ = fs::remove_file(&probe);
+            return None;
+        }
+        Some(sealed)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReadOnlyDirectory {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(&self.path, self.restore.clone());
+    }
+}
+
 fn quarantined_in(directory: &Path) -> Vec<String> {
     let Ok(entries) = fs::read_dir(directory) else {
         return Vec::new();
@@ -447,9 +491,39 @@ fn quarantine_rotation_keeps_the_newest_two() {
 fn a_generation_never_repeats_even_when_the_clock_goes_backwards() {
     let far_future = u64::MAX - 1;
 
-    assert_eq!(next_generation(Some(far_future)), u64::MAX);
-    assert!(next_generation(None) > 0);
-    assert!(next_generation(Some(0)) > 1);
+    assert_eq!(next_generation(Some(far_future)).unwrap(), u64::MAX);
+    assert!(next_generation(None).unwrap() > 0);
+    assert!(next_generation(Some(0)).unwrap() > 1);
+
+    // One step further there is no number left, and saturating would hand back
+    // the generation being replaced — the single failure the token exists to
+    // prevent. It refuses instead.
+    let exhausted = next_generation(Some(u64::MAX)).unwrap_err();
+    assert_eq!(exhausted.kind(), "cache_open_failed");
+}
+
+/// Microseconds rather than nanoseconds, so the value survives a JSON round
+/// trip through a consumer that parses numbers into doubles. Two generations
+/// rounded onto one would read a stale snapshot as fresh.
+#[test]
+fn a_generation_is_exact_in_an_ieee_754_double() {
+    const EXACT_INTEGER_LIMIT: u64 = 1 << 53;
+
+    let generation = next_generation(None).unwrap();
+
+    assert!(generation > 0);
+    assert!(
+        generation < EXACT_INTEGER_LIMIT,
+        "{generation} is past the integers a double represents exactly"
+    );
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the round trip is exactly what this asserts"
+    )]
+    let round_tripped = generation as f64 as u64;
+    assert_eq!(round_tripped, generation);
 }
 
 /// Two handles share one cache; WAL and the busy timeout are what make that
@@ -591,13 +665,12 @@ fn an_impossible_schema_version_is_quarantined_rather_than_refused_forever() {
 #[cfg(unix)]
 #[test]
 fn a_disposal_that_cannot_finish_reports_the_cache_closed_and_refresh_repairs_it() {
-    use std::os::unix::fs::PermissionsExt;
-
     let fixture = CacheFixture::new();
     let cache = fixture.open().unwrap();
     let generation = cache.generation();
-    let readable = fs::metadata(&fixture.root).unwrap().permissions();
-    fs::set_permissions(&fixture.root, fs::Permissions::from_mode(0o500)).unwrap();
+    let Some(sealed) = crate::index::tests::ReadOnlyDirectory::seal(&fixture.root) else {
+        return;
+    };
 
     let error = cache.dispose(&Cancellation::default()).unwrap_err();
 
@@ -614,7 +687,7 @@ fn a_disposal_that_cannot_finish_reports_the_cache_closed_and_refresh_repairs_it
     );
     assert_eq!(cache.generation(), 0);
 
-    fs::set_permissions(&fixture.root, readable).unwrap();
+    drop(sealed);
     let report = cache.refresh(&Cancellation::default()).unwrap();
 
     assert_eq!(
@@ -623,6 +696,62 @@ fn a_disposal_that_cannot_finish_reports_the_cache_closed_and_refresh_repairs_it
     );
     assert_eq!(cache.status().availability, IndexAvailability::Ready);
     assert_eq!(cache.generation(), generation);
+}
+
+/// The cold-start race a CLI beside a GUI hits: creation is not one operation,
+/// and a prober that caught the middle of it used to quarantine a cache its
+/// author was still writing.
+#[test]
+fn concurrent_creations_converge_on_one_cache_without_quarantining_it() {
+    let fixture = CacheFixture::new();
+
+    let generations = std::thread::scope(|scope| {
+        let openers = (0..8)
+            .map(|_| scope.spawn(|| fixture.open().unwrap().generation()))
+            .collect::<Vec<_>>();
+        openers
+            .into_iter()
+            .map(|opener| opener.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+
+    assert!(
+        fixture.quarantined().is_empty(),
+        "a cache being built is not a corrupt cache"
+    );
+    let first = generations[0];
+    assert!(
+        generations.iter().all(|generation| *generation == first),
+        "every opener must agree on the cache's generation: {generations:?}"
+    );
+    assert_eq!(integrity_of(&fixture.database()), "ok");
+}
+
+/// The quarantine name is chosen, not assumed free. `fs::rename` overwrites its
+/// destination silently, and the copy it would destroy is the one worth having.
+#[test]
+fn a_quarantine_never_overwrites_an_earlier_one() {
+    let fixture = CacheFixture::new();
+    for _ in 0..3 {
+        let cache = fixture.open().unwrap();
+        drop(cache);
+        fixture.corrupt_on_disk();
+        fixture.open().unwrap();
+    }
+
+    let quarantined = fixture.quarantined();
+
+    assert_eq!(quarantined.len(), MAX_QUARANTINED_CACHES);
+    let mut distinct = quarantined.clone();
+    distinct.dedup();
+    assert_eq!(distinct.len(), quarantined.len());
+    for name in quarantined {
+        assert_eq!(
+            fs::read(fixture.root.join(&name)).unwrap(),
+            b"not a data",
+            "{name} is not the evidence it was set aside to keep"
+        );
+    }
 }
 
 fn integrity_of(database: &Path) -> String {

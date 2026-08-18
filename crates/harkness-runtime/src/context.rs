@@ -190,10 +190,27 @@ impl ContextEngines {
         self.len() == 0
     }
 
+    /// The held engine for `project_id`, if it serves this exact workspace.
+    ///
+    /// The comparison is canonical on both sides. `ContextEngine::open`
+    /// canonicalizes the root it records, and a caller's `/w/foo`, `/w/foo/`,
+    /// relative path, or path through a symlink all name one checkout — so a
+    /// raw comparison would build a second engine, insert it over the first,
+    /// and leave callers holding the earlier `Arc` answering from a different
+    /// handle. That is the "the command line and the application disagree about
+    /// what the index says" failure this registry exists to prevent, and it
+    /// would also pay for a full repository inspection and SQLite open on every
+    /// alternating call.
+    ///
+    /// A root that cannot be canonicalized is compared as it stands: the engine
+    /// open that follows will fail on it anyway, and inventing a match here
+    /// would be worse than paying for that.
     fn held(&self, project_id: ProjectId, worktree_root: &Path) -> Option<Arc<ContextEngine>> {
+        let canonical =
+            std::fs::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.to_path_buf());
         let engines = lock(&self.engines);
         let held = engines.get(&project_id)?;
-        (held.worktree_root() == worktree_root).then(|| Arc::clone(held))
+        (held.worktree_root() == canonical).then(|| Arc::clone(held))
     }
 }
 

@@ -37,7 +37,7 @@
 //! cannot promise that, because the counter lives *in the file being deleted*:
 //! wiping `<data_dir>/context/` and starting again at one would make every
 //! stale snapshot verify as fresh. A new generation therefore seeds from the
-//! wall clock in nanoseconds and keeps `previous + 1` as a floor, so a
+//! wall clock in microseconds and keeps `previous + 1` as a floor, so a
 //! recreation is strictly greater than the value it replaces and a clock that
 //! steps backwards cannot reissue a number some snapshot already recorded.
 //!
@@ -66,7 +66,9 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use harkness_git::Cancellation;
-use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, named_params};
+use rusqlite::{
+    Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior, named_params,
+};
 use time::format_description::BorrowedFormatItem;
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset, macros::format_description};
@@ -120,6 +122,17 @@ const WAL_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 /// every contended read here is given this much patience at a time and the loop
 /// around it is what answers a cancelled caller inside the 250 ms target.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// How long a database with no metadata is given to turn out to be a cache
+/// somebody else is still creating.
+///
+/// Short, because the window it covers is the microseconds between another
+/// process opening the file and its one creation transaction taking the write
+/// lock — everything after that is contention, which the busy wait already
+/// answers. It is not zero, because a cache being built and a cache that is
+/// broken are indistinguishable in a single read, and quarantining the first is
+/// far more expensive than waiting out the second.
+const CREATION_GRACE: Duration = Duration::from_millis(200);
 
 /// Filename-safe, fixed-width, lexicographically chronological stamp.
 ///
@@ -432,12 +445,14 @@ struct CacheState {
     stale_components: Vec<VersionSkew>,
     last_recreation: Option<CacheRecreation>,
     last_refreshed_at: Option<OffsetDateTime>,
-    /// How many refreshes are in flight, not whether one is.
+    /// The operations running right now, innermost last.
     ///
-    /// A bare `Option` cleared by whichever call finishes first reports the
-    /// cache idle while the other is still running, which is exactly the lie
-    /// the poll-friendly status exists to avoid.
-    refreshes: usize,
+    /// A stack rather than a flag, and it names every long operation rather
+    /// than refreshes alone. A bare `Option` cleared by whichever call finishes
+    /// first reports the cache idle while another is still running, and a
+    /// refresh-only flag renders a disposal — the slowest thing the cache does,
+    /// since it unlinks a database and builds a replacement — as idle.
+    in_flight: Vec<&'static str>,
 }
 
 /// One repository's disposable index cache.
@@ -516,10 +531,16 @@ impl IndexCache {
                     &database,
                     expected,
                     repository_identity,
-                    next_generation(None),
+                    next_generation(None)?,
                     cancellation,
                 )?;
-                (connection, meta, Vec::new(), None)
+                // Computed from the stored row rather than assumed empty: a
+                // racing process's row may have won, and it may have been
+                // written by another build. Publishing no skew for a cache
+                // whose rows this build did not produce would silently skip the
+                // reconciliation that skew exists to trigger.
+                let stale = expected.skew(&meta);
+                (connection, meta, stale, None)
             }
             Probe::Replace {
                 reason,
@@ -531,7 +552,7 @@ impl IndexCache {
                     &database,
                     expected,
                     repository_identity,
-                    next_generation(previous_generation),
+                    next_generation(previous_generation)?,
                     cancellation,
                 )?;
                 let recreation = CacheRecreation {
@@ -541,7 +562,8 @@ impl IndexCache {
                     generation: meta.index_generation,
                     quarantined_to,
                 };
-                (connection, meta, Vec::new(), Some(recreation))
+                let stale = expected.skew(&meta);
+                (connection, meta, stale, Some(recreation))
             }
         };
 
@@ -557,7 +579,7 @@ impl IndexCache {
                 stale_components,
                 last_recreation,
                 last_refreshed_at: None,
-                refreshes: 0,
+                in_flight: Vec::new(),
             }),
         })
     }
@@ -613,8 +635,8 @@ impl IndexCache {
             last_recreation: state.last_recreation.clone(),
             stale_components: state.stale_components.clone(),
             last_refreshed_at: state.last_refreshed_at,
-            in_progress: (state.refreshes > 0).then_some(IndexOperation {
-                name: "refresh",
+            in_progress: state.in_flight.first().map(|name| IndexOperation {
+                name,
                 percent_complete: None,
             }),
             counts: None,
@@ -639,8 +661,14 @@ impl IndexCache {
         &self,
         cancellation: &Cancellation,
     ) -> Result<CacheRecreation, ContextEngineError> {
+        let _operation = self.begin("dispose");
         let mut connection = lock(&self.connection);
-        let previous = self.generation();
+        // Read from the state rather than through `generation()`, which answers
+        // `0` for a cache that is already closed. A retried disposal would
+        // otherwise take `0` as its floor — losing the whole `previous + 1`
+        // protection against a backwards clock — and report a previous
+        // generation no cache ever held.
+        let previous = lock(&self.state).meta.index_generation;
         // Closed before the file is unlinked: Windows refuses to remove a file
         // that is still open, and a replacement created beside a live handle
         // would inherit the old write-ahead log. Everything after this point
@@ -652,7 +680,7 @@ impl IndexCache {
             &self.database,
             &self.expected,
             &self.repository_identity,
-            next_generation(Some(previous)),
+            next_generation(Some(previous))?,
             cancellation,
         )?;
         let recreation = CacheRecreation {
@@ -665,8 +693,8 @@ impl IndexCache {
         *connection = Some(fresh);
         let mut state = lock(&self.state);
         state.availability = IndexAvailability::Ready;
+        state.stale_components = self.expected.skew(&meta);
         state.meta = meta;
-        state.stale_components.clear();
         // A refresh time that predates the cache it is reported beside would
         // tell a surface this index was brought up to date before it existed.
         state.last_refreshed_at = None;
@@ -708,10 +736,8 @@ impl IndexCache {
             return Err(ContextEngineError::Cancelled);
         }
         let started = Instant::now();
-        self.enter_refresh();
-        let outcome = self.refresh_locked(cancellation, started);
-        self.leave_refresh();
-        outcome
+        let _operation = self.begin("refresh");
+        self.refresh_locked(cancellation, started)
     }
 
     fn refresh_locked(
@@ -765,6 +791,13 @@ impl IndexCache {
         if connection.is_none() || meta.index_generation != lock(&self.state).meta.index_generation
         {
             drop(connection.take());
+            // Marked before the open, not after it. The handle is already gone
+            // by this line, so an open that fails — a momentary descriptor
+            // exhaustion, a contended write-ahead-log transition — would
+            // otherwise return through `?` leaving the cache reporting itself
+            // ready and handing out the generation of a database it cannot
+            // reach. Every path that closes the connection owes this marking.
+            self.mark_closed("a refresh could not reopen the cache");
             *connection = Some(open_writable(&self.database, cancellation)?);
         }
         let stale_components = self.expected.skew(&meta);
@@ -805,7 +838,10 @@ impl IndexCache {
             &self.database,
             &self.expected,
             &self.repository_identity,
-            next_generation(Some(previous.max(previous_generation.unwrap_or(0)))),
+            match next_generation(Some(previous.max(previous_generation.unwrap_or(0)))) {
+                Ok(generation) => generation,
+                Err(error) => return error,
+            },
             cancellation,
         ) {
             Ok(created) => created,
@@ -821,8 +857,8 @@ impl IndexCache {
             generation: meta.index_generation,
             quarantined_to: quarantined_to.clone(),
         });
+        state.stale_components = self.expected.skew(&meta);
         state.meta = meta;
-        state.stale_components.clear();
         state.last_refreshed_at = None;
         ContextEngineError::CacheCorruptQuarantined {
             path: self.database.clone(),
@@ -839,13 +875,28 @@ impl IndexCache {
         };
     }
 
-    fn enter_refresh(&self) {
-        lock(&self.state).refreshes += 1;
+    /// Publishes `name` as in flight until the returned guard is dropped.
+    fn begin(&self, name: &'static str) -> Operation<'_> {
+        lock(&self.state).in_flight.push(name);
+        Operation { cache: self }
     }
+}
 
-    fn leave_refresh(&self) {
-        let mut state = lock(&self.state);
-        state.refreshes = state.refreshes.saturating_sub(1);
+/// Keeps [`IndexStatus::in_progress`] true only while work really is running.
+///
+/// A `Drop` implementation rather than a call at the end of the method, for the
+/// reason the scheduler's worker guard exists: an unwind past the clearing
+/// statement would leave a UI rendering a permanently spinning index with
+/// nothing behind it, which is the same lie the counter was introduced to
+/// prevent, in the other direction and for good.
+struct Operation<'a> {
+    cache: &'a IndexCache,
+}
+
+impl Drop for Operation<'_> {
+    fn drop(&mut self) {
+        let mut state = lock(&self.cache.state);
+        state.in_flight.pop();
     }
 }
 
@@ -915,19 +966,26 @@ fn probe_existing(
                 reason: error.to_string(),
             });
         }
-        Ok(None) => {
-            return Ok(Probe::Replace {
-                reason: RecreationReason::Corrupt,
-                previous_generation: None,
-                detail: "index_meta holds no row".to_owned(),
-            });
-        }
-        Err(error) => {
-            return Ok(Probe::Replace {
-                reason: RecreationReason::Corrupt,
-                previous_generation: None,
-                detail: format!("index_meta is missing or unreadable: {error}"),
-            });
+        // A database with no metadata in it is either corrupt or *being built*
+        // by another process that has opened the file and not yet committed its
+        // one transaction. Those look identical in a single read and lead to
+        // opposite actions, so the answer is re-read for a bounded grace before
+        // a cache somebody is still writing gets quarantined out from under
+        // them. A build that has not finished within the grace is treated as
+        // corruption, which is the honest end of a distinction that cannot be
+        // made perfectly from outside the other process.
+        outcome => {
+            let Some(meta) = await_creation(&connection, cancellation)? else {
+                return Ok(Probe::Replace {
+                    reason: RecreationReason::Corrupt,
+                    previous_generation: None,
+                    detail: match outcome {
+                        Ok(_) => "index_meta holds no row".to_owned(),
+                        Err(error) => format!("index_meta is missing or unreadable: {error}"),
+                    },
+                });
+            };
+            meta
         }
     };
 
@@ -993,6 +1051,27 @@ fn read_meta_waiting(
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// Re-reads metadata that is absent, in case a cache is mid-creation.
+///
+/// `Ok(None)` means the grace expired with still no row, which is the answer
+/// that licences a quarantine.
+fn await_creation(
+    connection: &Connection,
+    cancellation: &Cancellation,
+) -> Result<Option<IndexMeta>, ContextEngineError> {
+    let deadline = Instant::now() + CREATION_GRACE;
+    while Instant::now() < deadline {
+        if cancellation.is_cancelled() {
+            return Err(ContextEngineError::Cancelled);
+        }
+        std::thread::sleep(POLL_INTERVAL);
+        if let Ok(Some(meta)) = read_meta_waiting(connection, cancellation)? {
+            return Ok(Some(meta));
+        }
+    }
+    Ok(None)
 }
 
 /// Whether a `rusqlite` failure is about the environment rather than the file's
@@ -1141,6 +1220,14 @@ fn request_wal(connection: &Connection) -> Result<String, rusqlite::Error> {
 }
 
 /// Creates an empty cache and its single metadata row.
+///
+/// The table and the row are written in **one** transaction, and that is not a
+/// tidiness preference. A second process probing between them would find a
+/// database with no `index_meta` in it, conclude corruption, and quarantine a
+/// cache this one is still building — so the whole creation is held under the
+/// write lock a concurrent reader already waits out. The residual window is
+/// between the file being opened and the transaction starting, which
+/// [`probe_existing`] covers with a bounded grace rather than a guess.
 fn create(
     database: &Path,
     expected: &ExpectedVersions,
@@ -1152,8 +1239,11 @@ fn create(
         path: database.to_path_buf(),
         reason,
     };
-    let connection = open_writable(database, cancellation)?;
-    connection
+    let mut connection = open_writable(database, cancellation)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| failed(error.to_string()))?;
+    transaction
         .execute_batch(INDEX_META_SCHEMA)
         .map_err(|error| failed(error.to_string()))?;
     let meta = IndexMeta {
@@ -1171,10 +1261,10 @@ fn create(
         .created_at
         .format(&Rfc3339)
         .map_err(|error| failed(error.to_string()))?;
-    // A second process may have created the row between the two statements.
-    // Its row is as good as this one would have been, so the insert yields to
-    // it and the caller reads whatever is actually there.
-    connection
+    // A second process may have created the row before this transaction took
+    // the lock. Its row is as good as this one would have been, so the insert
+    // yields to it and the caller reads whatever is actually there.
+    transaction
         .execute(
             "INSERT INTO index_meta \
              (id, schema_version, parser_version, chunking_version, ranking_version, \
@@ -1192,6 +1282,9 @@ fn create(
                 ":created_at": created_at,
             },
         )
+        .map_err(|error| failed(error.to_string()))?;
+    transaction
+        .commit()
         .map_err(|error| failed(error.to_string()))?;
     let stored = read_meta(&connection)
         .map_err(|error| failed(error.to_string()))?
@@ -1222,6 +1315,16 @@ fn create(
 /// beside them would try to recover them as its own, and a quarantined file is
 /// kept to be *looked at* rather than to be reopened.
 ///
+/// # What that costs a concurrent older build
+///
+/// The `schema_version` too-old branch is reachable while an older Harkness is
+/// still running against this cache — an upgrade in place, or two installs. Its
+/// committed-but-uncheckpointed pages live in the log this removes, so it loses
+/// them. That is the trade ADR-0004 already licenses and it is bounded to
+/// exactly what this subtree is for: warm-up time, never evidence. The
+/// alternative — leaving the sidecars for a replacement to recover as its own —
+/// corrupts the new cache, which is worse in the case that actually matters.
+///
 /// Returns where the bytes went, or `None` when there were none to keep.
 fn quarantine(database: &Path) -> Result<Option<PathBuf>, ContextEngineError> {
     if !database.exists() {
@@ -1238,6 +1341,22 @@ fn quarantine(database: &Path) -> Result<Option<PathBuf>, ContextEngineError> {
     remove_sidecars(database);
     prune_quarantines(database);
     Ok(Some(destination))
+}
+
+/// Deletes the cache under `cache_root` without opening it.
+///
+/// The one way to be rid of a cache this build cannot address at all — one
+/// written by a newer build, whose `index_meta` is refused before a handle
+/// exists. [`IndexCache::dispose`] cannot serve that case because it needs the
+/// cache open to dispose of it, and "delete this to reclaim disk" has to work
+/// on the file that is hardest to read.
+///
+/// # Errors
+///
+/// Returns [`ContextEngineError::CacheOpenFailed`] when the file could not be
+/// removed.
+pub fn discard(cache_root: &Path) -> Result<(), ContextEngineError> {
+    remove_database(&cache_root.join(INDEX_DATABASE_FILE))
 }
 
 /// Removes a database and its sidecars outright.
@@ -1265,6 +1384,14 @@ fn remove_sidecars(database: &Path) {
     }
 }
 
+/// Picks a quarantine name nothing is already using.
+///
+/// `fs::rename` overwrites its destination without complaint on every platform,
+/// so a name that is already taken destroys the evidence it was chosen to keep
+/// — and two processes quarantining one cache in the same clock tick is exactly
+/// the case where the older copy is most worth having. The discriminator is
+/// only reached on a collision, so the ordinary name stays fixed width and
+/// sorts chronologically.
 fn quarantine_path(database: &Path) -> Result<PathBuf, ContextEngineError> {
     let directory = database.parent().unwrap_or_else(|| Path::new("."));
     let stamp = OffsetDateTime::now_utc()
@@ -1273,7 +1400,20 @@ fn quarantine_path(database: &Path) -> Result<PathBuf, ContextEngineError> {
             path: database.to_path_buf(),
             reason: error.to_string(),
         })?;
-    Ok(directory.join(format!("{QUARANTINE_PREFIX}{stamp}")))
+    let plain = directory.join(format!("{QUARANTINE_PREFIX}{stamp}"));
+    if !plain.exists() {
+        return Ok(plain);
+    }
+    for attempt in 1..u32::MAX {
+        let candidate = directory.join(format!("{QUARANTINE_PREFIX}{stamp}.{attempt}"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(ContextEngineError::CacheOpenFailed {
+        path: database.to_path_buf(),
+        reason: "no quarantine name is available".to_owned(),
+    })
 }
 
 /// Keeps at most [`MAX_QUARANTINED_CACHES`], deleting the oldest first.
@@ -1302,18 +1442,44 @@ fn prune_quarantines(database: &Path) {
 
 /// The generation a newly created cache takes.
 ///
-/// Seeded from the wall clock in nanoseconds and floored at `previous + 1`. The
-/// clock is what keeps a cache that was *deleted along with its directory* from
-/// reissuing a number a stored snapshot already recorded, and the floor is what
-/// keeps a clock that stepped backwards from doing the same.
+/// Seeded from the wall clock in **microseconds** and floored at `previous + 1`.
+/// The clock is what keeps a cache that was *deleted along with its directory*
+/// from reissuing a number a stored snapshot already recorded, and the floor is
+/// what keeps a clock that stepped backwards from doing the same.
 ///
-/// `previous` is `None` exactly when the replaced cache could not be read at
-/// all, which is the residual case the module documentation states: with no
-/// floor available, a backwards clock could hand back a number already in use.
-fn next_generation(previous: Option<u64>) -> u64 {
-    let clock = u64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos()).unwrap_or(0);
-    let floor = previous.map_or(0, |previous| previous.saturating_add(1));
-    clock.max(floor)
+/// # Why microseconds
+///
+/// Nanoseconds since the epoch is about `1.8e18`, past the `2^53` an IEEE-754
+/// double represents exactly, and this value travels as a JSON number in both
+/// the frozen snapshot wire form and the `context_cache_recreated` payload. A
+/// consumer that parses JSON into doubles — every JavaScript front end — would
+/// round two distinct generations onto one and read a stale snapshot as fresh.
+/// Microseconds is about `1.8e15`, exact in a double until the twenty-third
+/// century, and still finer than the file operations a recreation performs; the
+/// floor covers two recreations inside one microsecond.
+///
+/// # Errors
+///
+/// Returns [`ContextEngineError::CacheOpenFailed`] when `previous` is already
+/// `u64::MAX`, which a hand-edited row can produce. Saturating there would hand
+/// back the generation being replaced, and a replacement that shares its
+/// predecessor's token is the one failure this whole mechanism exists to
+/// prevent — better to refuse the cache than to answer with a number that lies.
+fn next_generation(previous: Option<u64>) -> Result<u64, ContextEngineError> {
+    let clock =
+        u64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000).unwrap_or(0);
+    let floor = match previous {
+        Some(previous) => previous
+            .checked_add(1)
+            .ok_or_else(|| ContextEngineError::CacheOpenFailed {
+                path: PathBuf::from(INDEX_DATABASE_FILE),
+                reason: format!(
+                    "the cache records generation {previous}, leaving none above it to replace it with"
+                ),
+            })?,
+        None => 0,
+    };
+    Ok(clock.max(floor))
 }
 
 /// Takes a lock, adopting the contents even if a previous holder panicked.
@@ -1327,4 +1493,4 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

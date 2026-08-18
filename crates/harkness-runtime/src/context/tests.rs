@@ -195,6 +195,36 @@ fn releasing_a_project_drops_the_registrys_reference_and_nothing_else() {
     );
 }
 
+/// Two spellings of one checkout are one workspace. Keyed on the raw path they
+/// would be two engines evicting each other, and a caller holding the earlier
+/// `Arc` would answer from a different handle — the disagreement between front
+/// ends this registry exists to prevent.
+#[test]
+fn two_spellings_of_one_worktree_share_the_projects_engine() {
+    let workspace = Workspace::new("workspace");
+    let registry = workspace.registry();
+    let trailing = workspace.root.join("");
+    let indirect = workspace.root.join("..").join("workspace");
+
+    let held = registry
+        .engine(
+            workspace.project_id,
+            &workspace.root,
+            &Cancellation::default(),
+        )
+        .unwrap();
+    let through_slash = registry
+        .engine(workspace.project_id, &trailing, &Cancellation::default())
+        .unwrap();
+    let through_parent = registry
+        .engine(workspace.project_id, &indirect, &Cancellation::default())
+        .unwrap();
+
+    assert!(Arc::ptr_eq(&held, &through_slash));
+    assert!(Arc::ptr_eq(&held, &through_parent));
+    assert_eq!(registry.len(), 1);
+}
+
 /// A configuration naming another data directory would put the cache outside
 /// the tree `HARKNESS_DATA_DIR` covers while the registry went on reporting its
 /// own for it.

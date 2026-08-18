@@ -52,7 +52,8 @@ use crate::digest::{Sha256Hex, empty_path_set_digest};
 use crate::error::{ContextDomainError, ContextEngineError};
 use crate::ids::ChunkId;
 use crate::index::{
-    CacheRecreation, ExpectedVersions, IndexAvailability, IndexCache, IndexReport, IndexStatus,
+    self, CacheRecreation, ExpectedVersions, IndexAvailability, IndexCache, IndexReport,
+    IndexStatus, RecreationReason,
 };
 use crate::probe::FilesystemProbe;
 use crate::snapshot::{Capture, CaptureRequest, WorkspaceSnapshot};
@@ -387,6 +388,19 @@ impl ContextEngine {
             }
             .into());
         }
+        // Canonicalized once, here, for the reason `WorkspaceKey` is never
+        // built from a lexical path: `/w/foo`, `/w/foo/` and a path through a
+        // symlink are one checkout, and an engine registry comparing the raw
+        // spellings would hold two engines for it and evict each with the
+        // other. `WorkspaceSnapshot::capture` canonicalizes too, so the
+        // recorded root already reads this way in every snapshot.
+        let mut config = config;
+        config.worktree_root = std::fs::canonicalize(&config.worktree_root).map_err(|error| {
+            ContextDomainError::RepositoryUnavailable {
+                path: config.worktree_root.clone(),
+                reason: error.to_string(),
+            }
+        })?;
         let repository_key =
             harkness_git::repository_identity(&config.worktree_root).map_err(|error| {
                 ContextDomainError::RepositoryUnavailable {
@@ -688,29 +702,71 @@ impl ContextEngine {
         &self,
         cancellation: &Cancellation,
     ) -> Result<CacheRecreation, ContextEngineError> {
-        self.reopen_if_unavailable(cancellation)?;
+        if self.reopen_if_unavailable(cancellation).is_err() {
+            // A cache this build cannot even *read* — one written by a newer
+            // build, refused before a handle exists — is the weirdest index
+            // there is, and `IndexCache::dispose` cannot serve it because it
+            // needs the cache open to dispose of it. Deleting the file outright
+            // is the whole of the fix, and refusing to do it here would leave a
+            // user editing the data directory by hand for the one case the
+            // action is documented to cover.
+            return self.discard_and_reopen(cancellation);
+        }
         self.with_cache(|cache| cache.dispose(cancellation))
     }
 
-    /// Retries the cache open when the engine is holding a failure.
-    ///
-    /// The read lock is released before the write lock is taken, and the state
-    /// is re-checked underneath it, so two callers racing to recover end up
-    /// with one cache rather than one each.
-    fn reopen_if_unavailable(&self, cancellation: &Cancellation) -> Result<(), ContextEngineError> {
-        if let Cache::Ready(_) = &*read(&self.cache) {
-            return Ok(());
-        }
+    /// Deletes an unreadable cache and opens a replacement in its place.
+    fn discard_and_reopen(
+        &self,
+        cancellation: &Cancellation,
+    ) -> Result<CacheRecreation, ContextEngineError> {
         let mut cache = write(&self.cache);
-        if let Cache::Ready(_) = &*cache {
-            return Ok(());
-        }
+        index::discard(&self.cache_root)?;
         *cache = open_cache(
             &self.cache_root,
             &self.config.expected_versions,
             &self.repository_key,
             cancellation,
         );
+        match &*cache {
+            Cache::Ready(fresh) => Ok(CacheRecreation {
+                reason: RecreationReason::Disposed,
+                detail: "a caller discarded a cache this build could not read".to_owned(),
+                // The discarded cache's own generation was never readable —
+                // that is why it had to be deleted rather than disposed — so
+                // there is nothing honest to report for it.
+                previous_generation: None,
+                generation: fresh.generation(),
+                quarantined_to: None,
+            }),
+            Cache::Unavailable(error) => Err(error.clone()),
+        }
+    }
+
+    /// Retries the cache open when the engine is holding a failure.
+    ///
+    /// **The open runs with no lock held.** Preparing a contended cache waits
+    /// out the busy timeout, and holding the write lock across it would block
+    /// [`index_status`](Self::index_status) — documented as never waiting on
+    /// the index writer — for the whole of it, in exactly the scenario recovery
+    /// exists for. The lock is taken afterwards, the state re-checked
+    /// underneath it, and a caller that lost the race drops its own engine
+    /// rather than replacing the winner's.
+    fn reopen_if_unavailable(&self, cancellation: &Cancellation) -> Result<(), ContextEngineError> {
+        if let Cache::Ready(_) = &*read(&self.cache) {
+            return Ok(());
+        }
+        let opened = open_cache(
+            &self.cache_root,
+            &self.config.expected_versions,
+            &self.repository_key,
+            cancellation,
+        );
+        let mut cache = write(&self.cache);
+        if let Cache::Ready(_) = &*cache {
+            return Ok(());
+        }
+        *cache = opened;
         match &*cache {
             Cache::Ready(_) => Ok(()),
             Cache::Unavailable(error) => Err(error.clone()),

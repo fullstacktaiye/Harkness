@@ -12,7 +12,9 @@ use super::{
     ContextEngine, ContextEngineConfig, InventoryRequest, MapRequest, PackRequest, SearchQuery,
     SettingGroup, SettingOrigin, SettingOrigins, SymbolQuery,
 };
-use crate::index::{INDEX_DATABASE_FILE, INDEX_SCHEMA_VERSION, IndexAvailability};
+use crate::index::{
+    INDEX_DATABASE_FILE, INDEX_SCHEMA_VERSION, IndexAvailability, RecreationReason,
+};
 use crate::probe::FilesystemProbe;
 use crate::{ChunkId, FreshnessState, RepoPath};
 
@@ -340,13 +342,12 @@ fn a_cache_written_by_a_newer_build_degrades_retrieval_and_nothing_else() {
 #[cfg(unix)]
 #[test]
 fn an_engine_recovers_a_cache_that_could_not_be_prepared_at_open() {
-    use std::os::unix::fs::PermissionsExt;
-
     let workspace = Workspace::new();
     let context_root = workspace.fixture.data_dir.join(CONTEXT_DIRECTORY);
     fs::create_dir_all(&context_root).unwrap();
-    let writable = fs::metadata(&context_root).unwrap().permissions();
-    fs::set_permissions(&context_root, fs::Permissions::from_mode(0o500)).unwrap();
+    let Some(sealed) = crate::index::tests::ReadOnlyDirectory::seal(&context_root) else {
+        return;
+    };
 
     let engine = workspace.engine();
 
@@ -368,7 +369,7 @@ fn an_engine_recovers_a_cache_that_could_not_be_prepared_at_open() {
         0
     );
 
-    fs::set_permissions(&context_root, writable).unwrap();
+    drop(sealed);
     let report = engine.refresh_index(&Cancellation::default()).unwrap();
 
     assert!(report.generation > 0);
@@ -376,6 +377,77 @@ fn an_engine_recovers_a_cache_that_could_not_be_prepared_at_open() {
     assert_eq!(engine.index_generation(), report.generation);
     // And the documented "fix a weird index" action works from here too.
     engine.dispose_index(&Cancellation::default()).unwrap();
+}
+
+/// The action documented as the fix for a weird index has to work on the one
+/// cache that cannot be opened at all — otherwise a user's only recourse is
+/// deleting the data directory by hand.
+#[test]
+fn disposing_discards_a_cache_this_build_cannot_even_read() {
+    let workspace = Workspace::new();
+    let engine = workspace.engine();
+    let database = engine.cache_root().join(INDEX_DATABASE_FILE);
+    drop(engine);
+    Connection::open(&database)
+        .unwrap()
+        .execute(
+            "UPDATE index_meta SET schema_version = ?1",
+            [i64::from(INDEX_SCHEMA_VERSION + 1)],
+        )
+        .unwrap();
+
+    let engine = workspace.engine();
+    assert_eq!(
+        engine
+            .refresh_index(&Cancellation::default())
+            .unwrap_err()
+            .kind(),
+        "cache_version_conflict",
+        "a refresh must not silently destroy a cache a newer build is using"
+    );
+
+    let recreation = engine.dispose_index(&Cancellation::default()).unwrap();
+
+    assert_eq!(recreation.reason, RecreationReason::Disposed);
+    assert_eq!(
+        recreation.previous_generation, None,
+        "a cache that could not be read cannot report what generation it held"
+    );
+    assert!(recreation.generation > 0);
+    assert_eq!(engine.index_status().availability, IndexAvailability::Ready);
+    assert_eq!(engine.index_generation(), recreation.generation);
+    engine.refresh_index(&Cancellation::default()).unwrap();
+}
+
+/// Two spellings of one checkout are one workspace. An engine that recorded the
+/// caller's raw path would let a registry hold two engines for it.
+#[test]
+fn the_worktree_root_an_engine_records_is_canonical() {
+    let workspace = Workspace::new();
+    let trailing = workspace.root.join("");
+    let indirect = workspace.root.join("..").join(
+        workspace
+            .root
+            .file_name()
+            .expect("the fixture root is named"),
+    );
+
+    let direct = workspace.engine();
+    let engine = ContextEngine::open(
+        ContextEngineConfig::new(ProjectId::new(), &indirect, &workspace.fixture.data_dir),
+        &Cancellation::default(),
+    )
+    .unwrap();
+    let slashed = ContextEngine::open(
+        ContextEngineConfig::new(ProjectId::new(), &trailing, &workspace.fixture.data_dir),
+        &Cancellation::default(),
+    )
+    .unwrap();
+
+    let canonical = fs::canonicalize(&workspace.root).unwrap();
+    assert_eq!(direct.worktree_root(), canonical);
+    assert_eq!(engine.worktree_root(), canonical);
+    assert_eq!(slashed.worktree_root(), canonical);
 }
 
 #[test]
