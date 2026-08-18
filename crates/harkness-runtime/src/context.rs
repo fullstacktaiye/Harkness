@@ -48,6 +48,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use harkness_context::index::CacheRecreation;
 use harkness_context::{ContextEngine, ContextEngineConfig, ContextEngineError};
 use harkness_core::ProjectId;
+use harkness_git::Cancellation;
 use serde_json::json;
 use time::OffsetDateTime;
 
@@ -95,12 +96,12 @@ impl ContextEngines {
         &self,
         project_id: ProjectId,
         worktree_root: &Path,
+        cancellation: &Cancellation,
     ) -> Result<Arc<ContextEngine>, ContextEngineError> {
-        self.engine_from(ContextEngineConfig::new(
-            project_id,
-            worktree_root,
-            &self.data_dir,
-        ))
+        self.engine_from(
+            ContextEngineConfig::new(project_id, worktree_root, &self.data_dir),
+            cancellation,
+        )
     }
 
     /// The engine for `config`'s project, opening one from `config` if this is
@@ -113,11 +114,30 @@ impl ContextEngines {
     ///
     /// # Errors
     ///
-    /// The failures of [`ContextEngine::open`].
+    /// The failures of [`ContextEngine::open`], and
+    /// [`ContextEngineError::CacheOpenFailed`] when `config` names a different
+    /// data directory than this registry serves.
     pub fn engine_from(
         &self,
         config: ContextEngineConfig,
+        cancellation: &Cancellation,
     ) -> Result<Arc<ContextEngine>, ContextEngineError> {
+        // A configuration naming another data directory would put this
+        // project's cache outside the tree `HARKNESS_DATA_DIR` covers and
+        // outside the one `release`-then-delete recovers, while the registry
+        // went on reporting its own `data_dir` for it. Refusing is the only
+        // honest answer: silently rewriting the caller's explicit value would
+        // be worse than refusing it.
+        if config.data_dir() != self.data_dir {
+            return Err(ContextEngineError::CacheOpenFailed {
+                path: config.data_dir().join(harkness_core::CONTEXT_DIRECTORY),
+                reason: format!(
+                    "this registry serves '{}' and the configuration names '{}'",
+                    self.data_dir.display(),
+                    config.data_dir().display()
+                ),
+            });
+        }
         let project_id = config.project_id();
         if let Some(held) = self.held(project_id, config.worktree_root()) {
             return Ok(held);
@@ -126,7 +146,7 @@ impl ContextEngines {
         // Opened with no lock held: this inspects a repository and can wait out
         // the cache's busy timeout, and one project's slow open must not stop
         // every other project being looked up.
-        let opened = Arc::new(ContextEngine::open(config)?);
+        let opened = Arc::new(ContextEngine::open(config, cancellation)?);
         let mut engines = lock(&self.engines);
         match engines.entry(project_id) {
             // Somebody won the race. Their handle is the one the project

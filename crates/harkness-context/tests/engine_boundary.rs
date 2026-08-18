@@ -39,11 +39,10 @@ impl Workspace {
     }
 
     fn engine(&self) -> ContextEngine {
-        ContextEngine::open(ContextEngineConfig::new(
-            ProjectId::new(),
-            &self.root,
-            &self.fixture.data_dir,
-        ))
+        ContextEngine::open(
+            ContextEngineConfig::new(ProjectId::new(), &self.root, &self.fixture.data_dir),
+            &Cancellation::default(),
+        )
         .unwrap()
     }
 
@@ -185,13 +184,14 @@ fn the_cache_lifecycle_is_reachable_without_an_engine() {
         &cache_root,
         &harkness_context::index::ExpectedVersions::current(),
         "11111111-1111-5111-8111-111111111111",
+        &Cancellation::default(),
     )
     .unwrap();
 
     assert_eq!(cache.path(), cache_root.join(INDEX_DATABASE_FILE));
     let report = cache.refresh(&Cancellation::default()).unwrap();
     assert_eq!(report.generation, cache.generation());
-    let recreation = cache.dispose().unwrap();
+    let recreation = cache.dispose(&Cancellation::default()).unwrap();
     assert_eq!(recreation.reason, RecreationReason::Disposed);
     assert!(cache.generation() > report.generation);
 }

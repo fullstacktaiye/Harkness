@@ -39,7 +39,7 @@ impl Workspace {
     }
 
     fn engine(&self) -> ContextEngine {
-        ContextEngine::open(self.config()).unwrap()
+        ContextEngine::open(self.config(), &Cancellation::default()).unwrap()
     }
 }
 
@@ -99,17 +99,15 @@ fn two_linked_worktrees_of_one_repository_share_a_cache_root() {
         .unwrap();
     let project_id = ProjectId::new();
 
-    let main = ContextEngine::open(ContextEngineConfig::new(
-        project_id,
-        &main_root,
-        &fixture.data_dir,
-    ))
+    let main = ContextEngine::open(
+        ContextEngineConfig::new(project_id, &main_root, &fixture.data_dir),
+        &Cancellation::default(),
+    )
     .unwrap();
-    let linked = ContextEngine::open(ContextEngineConfig::new(
-        project_id,
-        &linked_root,
-        &fixture.data_dir,
-    ))
+    let linked = ContextEngine::open(
+        ContextEngineConfig::new(project_id, &linked_root, &fixture.data_dir),
+        &Cancellation::default(),
+    )
     .unwrap();
 
     assert_eq!(main.repository_key(), linked.repository_key());
@@ -219,7 +217,7 @@ fn a_snapshot_carries_the_cache_generation_and_a_rebuild_makes_it_stale() {
         FreshnessState::Fresh
     );
 
-    engine.dispose_index().unwrap();
+    engine.dispose_index(&Cancellation::default()).unwrap();
     let after = engine.snapshot(&cancellation).unwrap();
 
     assert!(after.index_generation() > before.index_generation());
@@ -251,11 +249,10 @@ fn a_directory_that_is_not_a_repository_gets_no_engine() {
     let fixture = Fixture::new();
     let plain = fixture.directory("just-a-folder");
 
-    let error = ContextEngine::open(ContextEngineConfig::new(
-        ProjectId::new(),
-        &plain,
-        &fixture.data_dir,
-    ))
+    let error = ContextEngine::open(
+        ContextEngineConfig::new(ProjectId::new(), &plain, &fixture.data_dir),
+        &Cancellation::default(),
+    )
     .unwrap_err();
 
     assert_eq!(error.kind(), "repository_unavailable");
@@ -269,11 +266,14 @@ fn a_directory_that_is_not_a_repository_gets_no_engine() {
 fn a_missing_worktree_root_is_named_as_such() {
     let fixture = Fixture::new();
 
-    let error = ContextEngine::open(ContextEngineConfig::new(
-        ProjectId::new(),
-        fixture.root.path().join("never-created"),
-        &fixture.data_dir,
-    ))
+    let error = ContextEngine::open(
+        ContextEngineConfig::new(
+            ProjectId::new(),
+            fixture.root.path().join("never-created"),
+            &fixture.data_dir,
+        ),
+        &Cancellation::default(),
+    )
     .unwrap_err();
 
     assert_eq!(error.kind(), "worktree_root_missing");
@@ -333,6 +333,51 @@ fn a_cache_written_by_a_newer_build_degrades_retrieval_and_nothing_else() {
     );
 }
 
+/// A cache that could not be prepared is remembered, not sealed in. The
+/// commonest way to reach that state is a few seconds of contention at exactly
+/// the wrong moment, and losing retrieval for the engine's whole life over it
+/// would make the failure far more expensive than the cause.
+#[cfg(unix)]
+#[test]
+fn an_engine_recovers_a_cache_that_could_not_be_prepared_at_open() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let workspace = Workspace::new();
+    let context_root = workspace.fixture.data_dir.join(CONTEXT_DIRECTORY);
+    fs::create_dir_all(&context_root).unwrap();
+    let writable = fs::metadata(&context_root).unwrap().permissions();
+    fs::set_permissions(&context_root, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let engine = workspace.engine();
+
+    assert!(
+        matches!(
+            engine.index_status().availability,
+            IndexAvailability::Unavailable { kind, .. } if kind == "cache_open_failed"
+        ),
+        "unexpected availability: {:?}",
+        engine.index_status().availability
+    );
+    assert_eq!(engine.index_generation(), 0);
+    // Identity still works while retrieval does not.
+    assert_eq!(
+        engine
+            .snapshot(&Cancellation::default())
+            .unwrap()
+            .index_generation(),
+        0
+    );
+
+    fs::set_permissions(&context_root, writable).unwrap();
+    let report = engine.refresh_index(&Cancellation::default()).unwrap();
+
+    assert!(report.generation > 0);
+    assert_eq!(engine.index_status().availability, IndexAvailability::Ready);
+    assert_eq!(engine.index_generation(), report.generation);
+    // And the documented "fix a weird index" action works from here too.
+    engine.dispose_index(&Cancellation::default()).unwrap();
+}
+
 #[test]
 fn setting_origins_record_a_refused_widening_per_group() {
     let origins = SettingOrigins::default()
@@ -360,7 +405,7 @@ fn a_configuration_carries_its_provenance_into_the_engine() {
         .with_config_generation(7)
         .with_setting_origin(SettingGroup::Ignore, SettingOrigin::RepositoryTightened);
 
-    let engine = ContextEngine::open(config).unwrap();
+    let engine = ContextEngine::open(config, &Cancellation::default()).unwrap();
 
     assert_eq!(engine.config().config_generation(), 7);
     assert_eq!(

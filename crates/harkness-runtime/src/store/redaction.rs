@@ -23,6 +23,18 @@
 //! Only string *values* of a payload are rewritten, never object keys. A key is
 //! a field name from a published schema: rewriting it would change what the
 //! record means to every consumer, and a secret is a value, not a field name.
+//!
+//! # The one durable column that does not come through here
+//!
+//! `workspace_snapshots.payload_json` is written without redaction, and it is
+//! the only caller-supplied *document* that is. The column is bound by a digest
+//! `harkness-context` re-derives on load, so rewriting a path inside it would
+//! move that digest and refuse the very row the rewrite was meant to protect —
+//! redaction there does not make the record safer, it makes it unreadable. A
+//! snapshot holds hashes and paths and never file contents, which is what makes
+//! that trade acceptable; `store::snapshot`'s module documentation states it at
+//! the write site too. Anything *new* that persists caller content still comes
+//! through here.
 
 use std::borrow::Cow;
 use std::fmt;

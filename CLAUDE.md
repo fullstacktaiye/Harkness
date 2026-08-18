@@ -35,7 +35,8 @@ build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing lin
 
 `#[ignore]` marks four distinct categories; never assume an ignored test is dead.
 
-- **Child-process roles** (`*/testing.rs`, `store/tests.rs`, `coordinator/tests/recovery.rs`): the
+- **Child-process roles** (`*/testing.rs`, `store/tests.rs`, `coordinator/tests/recovery.rs`,
+  `harkness-context/src/index/tests.rs`): the
   parent test re-executes the test binary with `--exact --ignored`. Run them only through their
   parent. The recovery roles are re-executed *and then killed*, so a `SIGKILL` is the expected end
   of `park_a_run_awaiting_approval` and `append_event_batches_until_killed`.

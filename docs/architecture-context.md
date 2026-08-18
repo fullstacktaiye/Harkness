@@ -200,6 +200,13 @@ the Git-backed half — workspace identity above all — keeps answering. Losing
 retrieval is a degradation; losing the ability to say which workspace a run read
 would stop the run.
 
+It is not remembered *forever*, either. The commonest way to reach `Busy` is
+another front end holding the cache for a few seconds at exactly the wrong
+moment, so `refresh_index` and `dispose_index` retry the open before doing
+anything else — an engine that answered "no index" for its whole life because of
+five seconds at startup would make the failure far more expensive than its
+cause.
+
 ## The provider boundary
 
 Three distinct contracts, and no type unifies them (ADR-0002):

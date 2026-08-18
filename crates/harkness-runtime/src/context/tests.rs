@@ -43,10 +43,18 @@ fn a_project_gets_one_engine_however_many_times_it_is_asked_for() {
     let registry = workspace.registry();
 
     let first = registry
-        .engine(workspace.project_id, &workspace.root)
+        .engine(
+            workspace.project_id,
+            &workspace.root,
+            &Cancellation::default(),
+        )
         .unwrap();
     let second = registry
-        .engine(workspace.project_id, &workspace.root)
+        .engine(
+            workspace.project_id,
+            &workspace.root,
+            &Cancellation::default(),
+        )
         .unwrap();
 
     assert!(Arc::ptr_eq(&first, &second));
@@ -65,7 +73,11 @@ fn concurrent_callers_converge_on_one_engine() {
                 let registry = Arc::clone(&registry);
                 let root = workspace.root.clone();
                 let project_id = workspace.project_id;
-                scope.spawn(move || registry.engine(project_id, &root).unwrap())
+                scope.spawn(move || {
+                    registry
+                        .engine(project_id, &root, &Cancellation::default())
+                        .unwrap()
+                })
             })
             .collect::<Vec<_>>();
         handles
@@ -101,8 +113,12 @@ fn two_worktrees_of_one_repository_get_two_engines_over_one_cache() {
         .unwrap();
     let registry = ContextEngines::new(&fixture.data_dir);
 
-    let main = registry.engine(ProjectId::new(), &main_root).unwrap();
-    let linked = registry.engine(ProjectId::new(), &linked_root).unwrap();
+    let main = registry
+        .engine(ProjectId::new(), &main_root, &Cancellation::default())
+        .unwrap();
+    let linked = registry
+        .engine(ProjectId::new(), &linked_root, &Cancellation::default())
+        .unwrap();
 
     assert_eq!(registry.len(), 2);
     assert!(!Arc::ptr_eq(&main, &linked));
@@ -117,12 +133,18 @@ fn a_project_whose_worktree_moved_gets_a_fresh_engine() {
     let workspace = Workspace::new("workspace");
     let registry = workspace.registry();
     let held = registry
-        .engine(workspace.project_id, &workspace.root)
+        .engine(
+            workspace.project_id,
+            &workspace.root,
+            &Cancellation::default(),
+        )
         .unwrap();
     let moved = workspace.fixture.directory("moved-workspace");
     initialize_repository(&moved);
 
-    let reopened = registry.engine(workspace.project_id, &moved).unwrap();
+    let reopened = registry
+        .engine(workspace.project_id, &moved, &Cancellation::default())
+        .unwrap();
 
     assert!(!Arc::ptr_eq(&held, &reopened));
     assert_eq!(reopened.worktree_root(), moved);
@@ -130,7 +152,9 @@ fn a_project_whose_worktree_moved_gets_a_fresh_engine() {
     assert!(
         Arc::ptr_eq(
             &reopened,
-            &registry.engine(workspace.project_id, &moved).unwrap()
+            &registry
+                .engine(workspace.project_id, &moved, &Cancellation::default())
+                .unwrap()
         ),
         "the replacement is the handle the project now shares"
     );
@@ -143,7 +167,11 @@ fn releasing_a_project_drops_the_registrys_reference_and_nothing_else() {
     let workspace = Workspace::new("workspace");
     let registry = workspace.registry();
     let held = registry
-        .engine(workspace.project_id, &workspace.root)
+        .engine(
+            workspace.project_id,
+            &workspace.root,
+            &Cancellation::default(),
+        )
         .unwrap();
 
     assert!(registry.release(workspace.project_id));
@@ -153,7 +181,11 @@ fn releasing_a_project_drops_the_registrys_reference_and_nothing_else() {
     // The caller's handle still answers.
     held.snapshot(&Cancellation::default()).unwrap();
     let reopened = registry
-        .engine(workspace.project_id, &workspace.root)
+        .engine(
+            workspace.project_id,
+            &workspace.root,
+            &Cancellation::default(),
+        )
         .unwrap();
     assert!(!Arc::ptr_eq(&held, &reopened));
     assert_eq!(
@@ -163,13 +195,43 @@ fn releasing_a_project_drops_the_registrys_reference_and_nothing_else() {
     );
 }
 
+/// A configuration naming another data directory would put the cache outside
+/// the tree `HARKNESS_DATA_DIR` covers while the registry went on reporting its
+/// own for it.
+#[test]
+fn a_configuration_naming_another_data_directory_is_refused() {
+    let workspace = Workspace::new("workspace");
+    let elsewhere = workspace.fixture.directory("elsewhere");
+    let registry = workspace.registry();
+
+    let error = registry
+        .engine_from(
+            harkness_context::ContextEngineConfig::new(
+                workspace.project_id,
+                &workspace.root,
+                &elsewhere,
+            ),
+            &Cancellation::default(),
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "cache_open_failed");
+    assert!(registry.is_empty());
+    assert!(
+        !elsewhere.join(harkness_core::CONTEXT_DIRECTORY).exists(),
+        "a refused configuration must not leave a cache behind"
+    );
+}
+
 #[test]
 fn a_folder_that_is_not_a_repository_is_refused_and_not_remembered() {
     let fixture = Fixture::new();
     let plain = fixture.directory("just-a-folder");
     let registry = ContextEngines::new(&fixture.data_dir);
 
-    let error = registry.engine(ProjectId::new(), &plain).unwrap_err();
+    let error = registry
+        .engine(ProjectId::new(), &plain, &Cancellation::default())
+        .unwrap_err();
 
     assert_eq!(error.kind(), "repository_unavailable");
     assert!(registry.is_empty());
@@ -184,7 +246,11 @@ fn every_cache_lives_beneath_the_registrys_data_directory() {
     let registry = workspace.registry();
 
     let engine = registry
-        .engine(workspace.project_id, &workspace.root)
+        .engine(
+            workspace.project_id,
+            &workspace.root,
+            &Cancellation::default(),
+        )
         .unwrap();
 
     assert!(engine.cache_root().starts_with(registry.data_dir()));
@@ -209,7 +275,11 @@ fn deleting_the_whole_context_directory_loses_no_run_evidence() {
 
     let registry = workspace.registry();
     let engine = registry
-        .engine(workspace.project_id, &workspace.root)
+        .engine(
+            workspace.project_id,
+            &workspace.root,
+            &Cancellation::default(),
+        )
         .unwrap();
     let generation = engine.index_generation();
     let snapshot = engine.snapshot(&Cancellation::default()).unwrap();
@@ -229,7 +299,11 @@ fn deleting_the_whole_context_directory_loses_no_run_evidence() {
     .unwrap();
 
     let reopened = registry
-        .engine(workspace.project_id, &workspace.root)
+        .engine(
+            workspace.project_id,
+            &workspace.root,
+            &Cancellation::default(),
+        )
         .unwrap();
 
     assert!(
@@ -279,7 +353,11 @@ fn capturing_a_snapshot_persists_nothing_until_the_runtime_records_it() {
     store.insert_run(&run).unwrap();
     let registry = workspace.registry();
     let engine = registry
-        .engine(workspace.project_id, &workspace.root)
+        .engine(
+            workspace.project_id,
+            &workspace.root,
+            &Cancellation::default(),
+        )
         .unwrap();
 
     let snapshot = engine.snapshot(&Cancellation::default()).unwrap();
@@ -308,11 +386,15 @@ fn a_cache_rebuild_becomes_a_timeline_entry_with_both_generations() {
     let workspace = Workspace::new("workspace");
     let registry = workspace.registry();
     let engine = registry
-        .engine(workspace.project_id, &workspace.root)
+        .engine(
+            workspace.project_id,
+            &workspace.root,
+            &Cancellation::default(),
+        )
         .unwrap();
     let previous = engine.index_generation();
 
-    let recreation = engine.dispose_index().unwrap();
+    let recreation = engine.dispose_index(&Cancellation::default()).unwrap();
     let event = cache_recreated_event(&recreation, OffsetDateTime::UNIX_EPOCH);
 
     assert_eq!(event.kind(), &EventKind::ContextCacheRecreated);

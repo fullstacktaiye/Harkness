@@ -37,3 +37,9 @@ CREATE TABLE workspace_snapshots (
 ) STRICT;
 
 CREATE INDEX snapshots_by_run ON workspace_snapshots (run_id, captured_at, id);
+
+-- Serves the seek `snapshot_digest` is denormalized for. Without it the column
+-- would be a promise the schema does not keep: answering "has this workspace
+-- been captured before" would scan every row and read every 64 KiB-capped
+-- payload off disk to do it.
+CREATE INDEX snapshots_by_digest ON workspace_snapshots (snapshot_digest, captured_at, id);

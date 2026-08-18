@@ -43,6 +43,7 @@
 //! [#123]: https://github.com/fullstacktaiye/harkness/issues/123
 
 use std::path::{Path, PathBuf};
+use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use harkness_core::{CONTEXT_DIRECTORY, ProjectId};
 use harkness_git::{Cancellation, GitService};
@@ -284,6 +285,15 @@ impl ContextEngineConfig {
 }
 
 /// The state of the engine's cache handle.
+///
+/// It is behind a lock rather than a plain field because
+/// [`Unavailable`](Self::Unavailable) has to be recoverable. The commonest way
+/// to reach it is another front end holding the cache past the busy timeout at
+/// exactly the wrong moment, and a transient five seconds must not disable
+/// retrieval — and report every snapshot as taken against no index — for the
+/// whole life of the engine. [`ContextEngine::refresh_index`] and
+/// [`ContextEngine::dispose_index`] retry the open, which is what makes the
+/// second of those the "fix a weird index" action its documentation claims.
 #[derive(Debug)]
 enum Cache {
     /// Open and usable.
@@ -317,11 +327,11 @@ enum Cache {
 /// let worktree = fixture.directory("workspace");
 /// initialize_repository(&worktree);
 ///
-/// let engine = ContextEngine::open(ContextEngineConfig::new(
-///     ProjectId::new(),
-///     &worktree,
-///     &fixture.data_dir,
-/// ))?;
+/// let cancellation = Cancellation::default();
+/// let engine = ContextEngine::open(
+///     ContextEngineConfig::new(ProjectId::new(), &worktree, &fixture.data_dir),
+///     &cancellation,
+/// )?;
 ///
 /// // The cache was created beneath the data directory, keyed by the
 /// // repository rather than by this worktree's path.
@@ -329,7 +339,7 @@ enum Cache {
 /// assert!(engine.index_generation() > 0);
 ///
 /// // Workspace identity needs nothing else in the process.
-/// let snapshot = engine.snapshot(&Cancellation::default())?;
+/// let snapshot = engine.snapshot(&cancellation)?;
 /// assert_eq!(snapshot.worktree_root(), std::fs::canonicalize(&worktree)?);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
@@ -339,7 +349,7 @@ pub struct ContextEngine {
     repository_key: String,
     cache_root: PathBuf,
     git: GitService,
-    cache: Cache,
+    cache: RwLock<Cache>,
 }
 
 impl ContextEngine {
@@ -350,10 +360,16 @@ impl ContextEngine {
     /// derivation the repository lock uses — so every linked worktree of one
     /// repository resolves to one cache.
     ///
+    /// Blocking, and cancellation-polled: preparing a cache another front end
+    /// is writing waits out that contention, so a caller that gave up is not
+    /// made to wait it out too.
+    ///
     /// A cache that cannot be prepared does **not** fail this call. The failure
     /// is remembered and reported by every cache-backed method and by
     /// [`index_status`](Self::index_status); a read-only data directory or a
     /// cache written by a newer build costs retrieval, not workspace identity.
+    /// It is not permanent either — [`refresh_index`](Self::refresh_index) and
+    /// [`dispose_index`](Self::dispose_index) retry the open.
     ///
     /// # Errors
     ///
@@ -361,7 +377,10 @@ impl ContextEngine {
     /// a directory and [`ContextDomainError::RepositoryUnavailable`] when it is
     /// not a Git worktree — which is also the answer for a `ProjectSource::Local`
     /// folder that was never a repository.
-    pub fn open(config: ContextEngineConfig) -> Result<Self, ContextEngineError> {
+    pub fn open(
+        config: ContextEngineConfig,
+        cancellation: &Cancellation,
+    ) -> Result<Self, ContextEngineError> {
         if !config.worktree_root.is_dir() {
             return Err(ContextDomainError::WorktreeRootMissing {
                 path: config.worktree_root.clone(),
@@ -379,21 +398,19 @@ impl ContextEngine {
             .data_dir
             .join(CONTEXT_DIRECTORY)
             .join(&repository_key);
-        let cache = match IndexCache::open_or_create(
+        let cache = open_cache(
             &cache_root,
             &config.expected_versions,
             &repository_key,
-        ) {
-            Ok(cache) => Cache::Ready(Box::new(cache)),
-            Err(error) => Cache::Unavailable(error),
-        };
+            cancellation,
+        );
         let git = GitService::new(&config.worktree_root, &config.data_dir);
         Ok(Self {
             config,
             repository_key,
             cache_root,
             git,
-            cache,
+            cache: RwLock::new(cache),
         })
     }
 
@@ -437,7 +454,7 @@ impl ContextEngine {
     /// none.
     #[must_use]
     pub fn index_generation(&self) -> u64 {
-        match &self.cache {
+        match &*read(&self.cache) {
             Cache::Ready(cache) => cache.generation(),
             Cache::Unavailable(_) => 0,
         }
@@ -619,7 +636,7 @@ impl ContextEngine {
     /// failure rather than looking like an empty index.
     #[must_use]
     pub fn index_status(&self) -> IndexStatus {
-        match &self.cache {
+        match &*read(&self.cache) {
             Cache::Ready(cache) => cache.status(),
             Cache::Unavailable(error) => IndexStatus {
                 generation: 0,
@@ -639,37 +656,102 @@ impl ContextEngine {
 
     /// Re-checks the cache and reconciles what this build can.
     ///
+    /// A cache that could not be prepared at [`open`](Self::open) is retried
+    /// here first, so contention that has since cleared is recovered from
+    /// rather than remembered forever.
+    ///
     /// # Errors
     ///
-    /// The cache's own failures, and the remembered failure from
-    /// [`open`](Self::open) when the cache could not be prepared at all.
+    /// The cache's own failures, and the open failure again when the cache
+    /// still cannot be prepared.
     pub fn refresh_index(
         &self,
         cancellation: &Cancellation,
     ) -> Result<IndexReport, ContextEngineError> {
-        self.cache()?.refresh(cancellation)
+        self.reopen_if_unavailable(cancellation)?;
+        self.with_cache(|cache| cache.refresh(cancellation))
     }
 
     /// Throws the cache away and starts an empty one.
     ///
     /// This is the supported "reclaim disk" and "fix a weird index" action, and
     /// it is the same action: nothing here is evidence, so there is nothing to
-    /// lose but warm-up time.
+    /// lose but warm-up time. A cache that could not be prepared at all is the
+    /// weirdest index there is, so it is retried here before anything else —
+    /// an action documented as the fix has to be able to fix that case.
     ///
     /// # Errors
     ///
-    /// The cache's own failures, and the remembered failure from
-    /// [`open`](Self::open) when the cache could not be prepared at all.
-    pub fn dispose_index(&self) -> Result<CacheRecreation, ContextEngineError> {
-        self.cache()?.dispose()
+    /// The cache's own failures, and the open failure again when the cache
+    /// still cannot be prepared.
+    pub fn dispose_index(
+        &self,
+        cancellation: &Cancellation,
+    ) -> Result<CacheRecreation, ContextEngineError> {
+        self.reopen_if_unavailable(cancellation)?;
+        self.with_cache(|cache| cache.dispose(cancellation))
     }
 
-    fn cache(&self) -> Result<&IndexCache, ContextEngineError> {
-        match &self.cache {
-            Cache::Ready(cache) => Ok(cache),
+    /// Retries the cache open when the engine is holding a failure.
+    ///
+    /// The read lock is released before the write lock is taken, and the state
+    /// is re-checked underneath it, so two callers racing to recover end up
+    /// with one cache rather than one each.
+    fn reopen_if_unavailable(&self, cancellation: &Cancellation) -> Result<(), ContextEngineError> {
+        if let Cache::Ready(_) = &*read(&self.cache) {
+            return Ok(());
+        }
+        let mut cache = write(&self.cache);
+        if let Cache::Ready(_) = &*cache {
+            return Ok(());
+        }
+        *cache = open_cache(
+            &self.cache_root,
+            &self.config.expected_versions,
+            &self.repository_key,
+            cancellation,
+        );
+        match &*cache {
+            Cache::Ready(_) => Ok(()),
             Cache::Unavailable(error) => Err(error.clone()),
         }
     }
+
+    fn with_cache<T>(
+        &self,
+        call: impl FnOnce(&IndexCache) -> Result<T, ContextEngineError>,
+    ) -> Result<T, ContextEngineError> {
+        match &*read(&self.cache) {
+            Cache::Ready(cache) => call(cache),
+            Cache::Unavailable(error) => Err(error.clone()),
+        }
+    }
+}
+
+/// Prepares the cache, keeping a failure rather than propagating it.
+fn open_cache(
+    cache_root: &Path,
+    expected: &ExpectedVersions,
+    repository_key: &str,
+    cancellation: &Cancellation,
+) -> Cache {
+    match IndexCache::open_or_create(cache_root, expected, repository_key, cancellation) {
+        Ok(cache) => Cache::Ready(Box::new(cache)),
+        Err(error) => Cache::Unavailable(error),
+    }
+}
+
+/// Takes a read lock, adopting the contents even if a previous holder panicked.
+///
+/// A panic in a caller says nothing about which cache this engine holds, and
+/// refusing to use it afterwards would turn one failure into an engine that can
+/// never serve retrieval again.
+fn read(cache: &RwLock<Cache>) -> RwLockReadGuard<'_, Cache> {
+    cache.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn write(cache: &RwLock<Cache>) -> RwLockWriteGuard<'_, Cache> {
+    cache.write().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn unavailable(feature: &'static str) -> ContextEngineError {

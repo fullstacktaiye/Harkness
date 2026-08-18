@@ -6,8 +6,8 @@ use harkness_test_fixtures::{Fixture, child_path, park, signal_ready, spawn_chil
 use rusqlite::Connection;
 
 use super::{
-    ExpectedVersions, INDEX_DATABASE_FILE, INDEX_SCHEMA_VERSION, IndexCache, IndexComponent,
-    MAX_QUARANTINED_CACHES, QUARANTINE_PREFIX, RecreationReason, next_generation,
+    ExpectedVersions, INDEX_DATABASE_FILE, INDEX_SCHEMA_VERSION, IndexAvailability, IndexCache,
+    IndexComponent, MAX_QUARANTINED_CACHES, QUARANTINE_PREFIX, RecreationReason, next_generation,
     prune_quarantines,
 };
 use crate::error::ContextEngineError;
@@ -39,7 +39,7 @@ impl CacheFixture {
         &self,
         expected: &ExpectedVersions,
     ) -> Result<IndexCache, ContextEngineError> {
-        IndexCache::open_or_create(&self.root, expected, IDENTITY)
+        IndexCache::open_or_create(&self.root, expected, IDENTITY, &Cancellation::default())
     }
 
     fn database(&self) -> PathBuf {
@@ -200,6 +200,7 @@ fn a_cache_recording_another_repository_is_quarantined() {
         &fixture.root,
         &ExpectedVersions::current(),
         "22222222-2222-5222-8222-222222222222",
+        &Cancellation::default(),
     )
     .unwrap();
     let generation = other.generation();
@@ -253,13 +254,12 @@ fn a_newer_cache_is_refused_and_left_byte_identical() {
 #[test]
 fn an_older_cache_is_replaced_rather_than_migrated() {
     let fixture = CacheFixture::new();
-    let older = ExpectedVersions {
-        schema_version: INDEX_SCHEMA_VERSION,
-        ..ExpectedVersions::current()
-    };
-    let cache = fixture.open_expecting(&older).unwrap();
+    let cache = fixture.open().unwrap();
     let generation = cache.generation();
     drop(cache);
+    // The downgrade is written into the file rather than expressed as a
+    // different `ExpectedVersions`: this build has only one cache schema, so
+    // there is no older one to ask for.
     let connection = Connection::open(fixture.database()).unwrap();
     connection
         .execute("UPDATE index_meta SET schema_version = 0", [])
@@ -319,7 +319,7 @@ fn disposing_replaces_the_cache_and_advances_the_generation() {
     let cache = fixture.open().unwrap();
     let generation = cache.generation();
 
-    let recreation = cache.dispose().unwrap();
+    let recreation = cache.dispose(&Cancellation::default()).unwrap();
 
     assert_eq!(recreation.reason, RecreationReason::Disposed);
     assert_eq!(recreation.previous_generation, Some(generation));
@@ -398,7 +398,7 @@ fn refreshing_adopts_a_cache_another_process_rebuilt() {
     let generation = held.generation();
     let other = fixture.open().unwrap();
 
-    let rebuilt = other.dispose().unwrap();
+    let rebuilt = other.dispose(&Cancellation::default()).unwrap();
     assert!(rebuilt.generation > generation);
     assert_eq!(
         held.generation(),
@@ -477,9 +477,13 @@ fn process_child() {
     let cache_root = child_path(PROCESS_CACHE_ROOT_ENV);
     match role.as_str() {
         "hold-open-cache" => {
-            let cache =
-                IndexCache::open_or_create(&cache_root, &ExpectedVersions::current(), IDENTITY)
-                    .unwrap();
+            let cache = IndexCache::open_or_create(
+                &cache_root,
+                &ExpectedVersions::current(),
+                IDENTITY,
+                &Cancellation::default(),
+            )
+            .unwrap();
             cache.refresh(&Cancellation::default()).unwrap();
             signal_ready(PROCESS_READY_FILE_ENV);
             park();
@@ -555,6 +559,70 @@ fn a_cache_another_writer_holds_is_refused_rather_than_quarantined() {
     drop(blocker);
     assert_eq!(fs::read(fixture.database()).unwrap(), before);
     assert_eq!(integrity_of(&fixture.database()), "ok");
+}
+
+/// A version nobody could have written is corruption, not a newer build. Read
+/// as a version conflict it would be refused *permanently*, and the quarantine
+/// path that exists for exactly this row would never run.
+#[test]
+fn an_impossible_schema_version_is_quarantined_rather_than_refused_forever() {
+    let fixture = CacheFixture::new();
+    let cache = fixture.open().unwrap();
+    drop(cache);
+    let connection = Connection::open(fixture.database()).unwrap();
+    connection
+        .execute("UPDATE index_meta SET schema_version = -1", [])
+        .unwrap();
+    drop(connection);
+
+    let replaced = fixture.open().unwrap();
+
+    let recreation = replaced.status().last_recreation.expect("a recreation");
+    assert_eq!(recreation.reason, RecreationReason::Corrupt);
+    assert_eq!(replaced.meta().schema_version, INDEX_SCHEMA_VERSION);
+    assert_eq!(fixture.quarantined().len(), 1);
+    // And the replacement is usable rather than refused again.
+    replaced.refresh(&Cancellation::default()).unwrap();
+}
+
+/// A recreation closes the connection before it unlinks the file. Everything
+/// after that point owes the state an honest answer if it fails, because a
+/// generation handed to a capture has to name a database that exists.
+#[cfg(unix)]
+#[test]
+fn a_disposal_that_cannot_finish_reports_the_cache_closed_and_refresh_repairs_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = CacheFixture::new();
+    let cache = fixture.open().unwrap();
+    let generation = cache.generation();
+    let readable = fs::metadata(&fixture.root).unwrap().permissions();
+    fs::set_permissions(&fixture.root, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let error = cache.dispose(&Cancellation::default()).unwrap_err();
+
+    assert_eq!(error.kind(), "cache_open_failed");
+    let status = cache.status();
+    assert!(
+        matches!(status.availability, IndexAvailability::Unavailable { .. }),
+        "a cache holding no connection must not report itself ready: {:?}",
+        status.availability
+    );
+    assert_eq!(
+        status.generation, 0,
+        "a closed cache has no generation to take a snapshot against"
+    );
+    assert_eq!(cache.generation(), 0);
+
+    fs::set_permissions(&fixture.root, readable).unwrap();
+    let report = cache.refresh(&Cancellation::default()).unwrap();
+
+    assert_eq!(
+        report.generation, generation,
+        "the database was never removed, so refresh reopens the one that is there"
+    );
+    assert_eq!(cache.status().availability, IndexAvailability::Ready);
+    assert_eq!(cache.generation(), generation);
 }
 
 fn integrity_of(database: &Path) -> String {

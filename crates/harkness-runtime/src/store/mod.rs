@@ -2105,6 +2105,16 @@ fn connect(path: &Path) -> Result<Connection, OpenFailure> {
 /// failing, so a filesystem that cannot support WAL would otherwise leave the
 /// store silently running in rollback-journal mode.
 ///
+/// # The context cache has a twin of this
+///
+/// `harkness_context::index` runs the same three routines against its own
+/// database. They are deliberately not shared — the only crate beneath both is
+/// `harkness-git`, which has no business gaining a SQLite dependency, and
+/// ADR-0004 already accepts "two databases, two connection disciplines" — but
+/// **a change to the contention handling below has to be made in both places.**
+/// The retry exists for a Windows-only failure, so a divergence is invisible on
+/// two of the three matrix legs.
+///
 /// # Why this retries
 ///
 /// Moving a database into WAL takes an exclusive lock, and SQLite does not

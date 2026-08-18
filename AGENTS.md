@@ -502,10 +502,24 @@ equal to one taken against the index that produced it — and the counter lives 
 the file being deleted, so a plain increment cannot promise that. It is seeded
 from the wall clock in nanoseconds with `previous + 1` as a floor: a wiped
 directory cannot reissue a number a stored snapshot already recorded, and a clock
-that stepped backwards cannot either. Quarantine keeps at most two files, named
+that stepped backwards cannot either. The floor needs the previous value to be
+readable, so a *corrupt* cache combined with a backwards clock is the residual
+case where a generation could repeat; it is stated rather than closed, because
+closing it means keeping the counter somewhere a user is invited to delete.
+Quarantine keeps at most two files, named
 with a fixed-width stamp so age order is name order, and takes the write-ahead
 log and shared-memory sidecars with it rather than leaving a replacement to
 recover somebody else's log.
+
+**A cache that holds no connection says so.** A recreation closes the handle
+before it unlinks the file, so a removal or a create that fails leaves the cache
+open in name only. It reports `Unavailable` and generation `0` from that moment
+— handing out the generation of a database that was just deleted would make a
+capture record an identity nothing on disk supports — and the next `refresh`
+reopens it. For the same reason an engine's remembered open failure is
+*retried* by `refresh_index` and `dispose_index` rather than kept for the
+engine's life: the commonest cause is a few seconds of contention, and an action
+documented as the fix for a weird index has to be able to fix that one.
 
 **One engine per project, one cache per repository, and neither lock is ever
 held across the other's work.** The engine registry's mutex is not held while an
