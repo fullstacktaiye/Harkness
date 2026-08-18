@@ -187,8 +187,19 @@ it is being asked one question and needs no project to answer it.
 
 The record is persisted whether or not the check succeeded, because an agent that
 failed yesterday and has not been checked since is a different thing from an agent
-nobody ever asked. Only the refusals *before* the program is launched skip it:
-there is nothing about the agent to record, because nothing ran.
+nobody ever asked. That includes a command that is missing or is not a program:
+nothing ran, but it is still something the check found out about the agent, and a
+registry that said nothing had happened would be the least useful answer
+available.
+
+What is *not* recorded is the registry's own state — an agent that is unknown,
+disabled, or untrusted, and one whose digest no longer matches its grant. The
+last has its own durable consequence in the trust record and would only be
+repeated here.
+
+A record that carries a teardown rung is one where a program really did run,
+which is how "your agent crashed on startup" stays distinguishable from "that
+file is not a program".
 
 | Status | Meaning |
 | --- | --- |

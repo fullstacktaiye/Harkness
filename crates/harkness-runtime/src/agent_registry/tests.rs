@@ -78,6 +78,25 @@ impl Harness {
     }
 }
 
+/// A file that can be hashed and would be accepted as a program.
+///
+/// Not a shim: `Fixture::shim` writes a `#!/bin/sh` script and exists only on
+/// Unix, and the tests that need a *trustable* file rather than a *conversing*
+/// one are the platform-independent ones. On Unix it still needs the executable
+/// bit, because `verify_executable` checks for it.
+fn trustable_file(fixture: &Fixture, name: &str) -> PathBuf {
+    #[cfg(unix)]
+    {
+        fixture.shim(name, "#!/bin/sh\nexit 0\n")
+    }
+    #[cfg(not(unix))]
+    {
+        let path = fixture.root.path().join(name);
+        std::fs::write(&path, b"exit\n").unwrap();
+        path
+    }
+}
+
 fn registration(id: &str, command: &str) -> AgentRegistration {
     AgentRegistration::new(
         AgentId::new(id).unwrap(),
@@ -506,9 +525,7 @@ fn an_enabled_registration_round_tripped_through_the_api_still_lands_disabled() 
         .unwrap();
     // Reach an enabled value the only way the API allows: enable it legitimately
     // — which needs a grant — and read it back.
-    let executable = harness
-        .fixture
-        .shim("round-trip-agent", "#!/bin/sh\nexit 0\n");
+    let executable = trustable_file(&harness.fixture, "round-trip-agent");
     harness
         .service
         .update(
@@ -955,11 +972,11 @@ fn a_candidate_name_that_is_not_one_file_name_is_dropped() {
 #[test]
 fn a_trailing_path_separator_does_not_report_a_complete_probe_as_truncated() {
     let fixture = Fixture::new();
-    let mut entries = std::env::join_paths([fixture.root.path(), fixture.root.path()])
-        .unwrap()
-        .into_string()
-        .expect("a temporary path is valid UTF-8");
-    entries.push(':');
+    // Built through `join_paths` with an empty final entry rather than by
+    // appending a separator character, because which character that is depends
+    // on the platform and a hard-coded one would test nothing on the other.
+    let entries =
+        std::env::join_paths([fixture.root.path(), fixture.root.path(), Path::new("")]).unwrap();
 
     let report = Discovery::default()
         .on_path(entries)
@@ -1318,14 +1335,25 @@ fn an_agent_advertising_authentication_refuses_to_launch_until_a_sign_in_is_reco
     );
 }
 
-#[cfg(unix)]
+/// A command that is not a runnable file is refused with the operating system's
+/// reason, and — because it is something the check found out about the agent —
+/// it is *recorded* rather than merely returned.
+///
+/// A directory rather than a file whose bytes are not a program: whether an
+/// `exec` of a non-program fails in the parent or in the child is the operating
+/// system's business (Linux reports `ENOEXEC` synchronously, macOS reports a
+/// successful spawn and a child that dies), and a test that pinned one of those
+/// answers would be asserting a platform rather than a property.
 #[test]
-fn a_program_that_cannot_be_run_is_recorded_as_an_invalid_executable() {
+fn a_command_that_is_not_a_runnable_file_is_recorded_as_an_invalid_executable() {
     let harness = Harness::new();
-    // A file with the executable bit and no interpreter: it exists, it passes
-    // every check that does not run it, and `exec` fails.
-    let broken = harness.fixture.shim("broken-agent", "\u{0}not a program\n");
-    let id = harness.ready("broken", &broken, &[]);
+    // Trusted while it is a file, and a directory by the time the check runs —
+    // which is how a path stops being a program in the wild, and which is the
+    // one shape every platform agrees about.
+    let path = trustable_file(&harness.fixture, "becomes-a-directory");
+    let id = harness.ready("directory", &path, &[]);
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
 
     let error = harness
         .service
@@ -1333,13 +1361,91 @@ fn a_program_that_cannot_be_run_is_recorded_as_an_invalid_executable() {
         .unwrap_err();
 
     assert_eq!(error.kind(), "invalid_executable");
-    let record = harness.service.get(&id).unwrap();
-    let health = record.state().last_health().unwrap();
-    assert_eq!(health.status(), HealthStatus::Failed);
-    assert_eq!(health.failure_kind(), Some("invalid_executable"));
+    let health = harness.service.get(&id).unwrap();
+    let record = health.state().last_health().unwrap();
+    assert_eq!(record.status(), HealthStatus::Failed);
+    assert_eq!(record.failure_kind(), Some("invalid_executable"));
     assert!(
-        health.detail().is_some_and(|detail| !detail.is_empty()),
-        "the operating system's reason is what makes this actionable"
+        record.detail().is_some_and(|detail| !detail.is_empty()),
+        "the reason is what makes this actionable"
+    );
+    assert_eq!(
+        record.teardown(),
+        None,
+        "nothing was launched, so nothing was torn down"
+    );
+}
+
+/// The Unix half of the same rule: a file that is there and is not executable.
+#[cfg(unix)]
+#[test]
+fn a_command_without_the_executable_bit_is_recorded_as_an_invalid_executable() {
+    let harness = Harness::new();
+    let path = harness.fixture.root.path().join("not-executable");
+    std::fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+    // Trusting it needs the bit; the registration is made and trusted while it
+    // is executable, and the bit is removed afterwards — which is how this looks
+    // in the wild.
+    let executable = trustable_file(&harness.fixture, "was-executable");
+    let id = harness.ready("bitless", &executable, &[]);
+    std::fs::set_permissions(
+        &executable,
+        std::os::unix::fs::PermissionsExt::from_mode(0o644),
+    )
+    .unwrap();
+
+    let error = harness
+        .service
+        .health_check(&HealthCheck::new(id.clone()), &Cancellation::default())
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "invalid_executable");
+    assert!(error.to_string().contains("not executable"), "{error}");
+    assert_eq!(
+        harness
+            .service
+            .get(&id)
+            .unwrap()
+            .state()
+            .last_health()
+            .unwrap()
+            .failure_kind(),
+        Some("invalid_executable")
+    );
+}
+
+/// A program that starts and says nothing is a *conversation* that failed rather
+/// than a file that could not be run, and the record says so by carrying a
+/// teardown rung — the contrast with the test above, where nothing was launched
+/// and nothing was torn down.
+///
+/// Which failure it is deliberately goes unasserted. Whether Harkness notices
+/// the peer is gone while writing the request or while waiting for the answer is
+/// a race between two pipes, so `write_failed` and `disconnected` are both
+/// correct and neither is the property. What is asserted is what a surface
+/// relies on: the check failed, it was recorded, and the record says a program
+/// really did run.
+#[cfg(unix)]
+#[test]
+fn a_program_that_exits_without_speaking_records_a_launched_failure() {
+    let harness = Harness::new();
+    let quiet = harness.fixture.shim("quiet-agent", "#!/bin/sh\nexit 0\n");
+    let id = harness.ready("quiet", &quiet, &[]);
+
+    let error = check(&harness.service, &HealthCheck::new(id.clone())).unwrap_err();
+
+    let health = harness.service.get(&id).unwrap();
+    let record = health.state().last_health().unwrap();
+    assert_eq!(record.status(), HealthStatus::Failed);
+    assert_eq!(record.failure_kind(), Some(error.kind()));
+    assert_ne!(
+        record.failure_kind(),
+        Some("invalid_executable"),
+        "the program ran; calling it unrunnable would send a user to the wrong place"
+    );
+    assert!(
+        record.teardown().is_some(),
+        "something was launched, so how it ended is part of the record"
     );
 }
 

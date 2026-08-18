@@ -881,8 +881,13 @@ impl AgentRegistryService {
     /// The record is persisted whether the check succeeded or not, which is the
     /// whole point of having one: an agent that failed yesterday and has not
     /// been checked since is a different thing from an agent nobody ever asked.
-    /// Only the refusals *before* the program is launched skip it, because there
-    /// is nothing about the agent to record — nothing ran.
+    /// The line is what the failure is *about*. Anything learned about the
+    /// executable or the conversation is recorded — including a command that is
+    /// missing or is not a program, which is a fact about the agent even though
+    /// nothing ran. What is not recorded is the registry's own state: an
+    /// unknown, disabled or untrusted agent, and a digest that no longer matches
+    /// its grant, which has its own durable consequence in the trust record and
+    /// would only be repeated here.
     ///
     /// The connection advertises no client capability at all. Each one is a
     /// promise to mediate a request the agent may then make, and a health check
@@ -890,18 +895,40 @@ impl AgentRegistryService {
     ///
     /// # Errors
     ///
-    /// Returns the launch gates' refusals before anything is spawned, and after
-    /// that the typed failure the check recorded:
-    /// [`AgentRegistryError::InvalidExecutable`] when the program will not
-    /// start, [`AgentRegistryError::InitializeTimeout`] when it says nothing in
+    /// Returns the registry-state refusals unrecorded, and every other failure
+    /// after recording it: [`AgentRegistryError::ExecutableNotFound`] and
+    /// [`AgentRegistryError::InvalidExecutable`] when the command will not run,
+    /// [`AgentRegistryError::InitializeTimeout`] when the agent says nothing in
     /// time, and [`AgentRegistryError::Acp`] carrying whatever else went wrong.
     pub fn health_check(
         &self,
         options: &HealthCheck,
         cancel: &Cancellation,
     ) -> Result<HealthOutcome, AgentRegistryError> {
+        let started = Instant::now();
         let (registration, digest) =
-            self.admit(&options.id, &options.context, DriftDetection::HealthCheck)?;
+            match self.admit(&options.id, &options.context, DriftDetection::HealthCheck) {
+                Ok(admitted) => admitted,
+                // A command that is missing or unrunnable is something the check
+                // *found out about the agent*, so it lands in the record like
+                // any other outcome. Reaching this without one would leave a
+                // user staring at a registry that says nothing happened.
+                Err(
+                    error @ (AgentRegistryError::ExecutableNotFound { .. }
+                    | AgentRegistryError::InvalidExecutable { .. }),
+                ) => {
+                    return self.record_health(
+                        options,
+                        ProbeOutcome {
+                            initialize: None,
+                            teardown: None,
+                            failure: Some(error),
+                        },
+                        started.elapsed(),
+                    );
+                }
+                Err(error) => return Err(error),
+            };
         let launch = launch(&registration, digest);
 
         // A fresh directory rather than a workspace: the agent is asked one
@@ -919,7 +946,6 @@ impl AgentRegistryService {
             }
         };
 
-        let started = Instant::now();
         let outcome = self.run_health_check(options, &launch, &working_dir, cancel);
         let elapsed = started.elapsed();
         drop(scratch);

@@ -1842,8 +1842,16 @@ table followed by the store's, the integration domain's, and ACP's, each carryin
 discriminant. Exactly two failures are re-classified rather than passed through, and both answer a
 question the layer beneath cannot — `initialize_timeout` says *which* deadline expired during a
 handshake, and `invalid_executable` says the program is not runnable at all — with the original
-failure kept as the source. A health record is written for every check that launched something and
-for none that refused before it did; a refusal before launch has nothing about the agent to record.
+failure kept as the source. Neither may be pinned to one operating system's answer: whether an
+`exec` of a non-program fails in the parent or in the child differs by platform, so a test asserting
+which is asserting a platform rather than a property.
+
+A health record is written for everything a check learns *about the agent* — including a command
+that is missing or is not a program, where nothing ran — and for none of the registry's own state:
+an unknown, disabled or untrusted agent, and a digest that no longer matches its grant, which has
+its own durable consequence in the trust record. A record carrying a teardown rung is one where a
+program really did run, which is what keeps "the agent crashed on startup" distinguishable from
+"that file is not a program".
 
 ## Canonical JSON Key Order
 
