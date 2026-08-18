@@ -650,13 +650,25 @@ impl IndexCache {
     /// disposal is not reporting a fault, and keeping a copy of a cache
     /// somebody asked to be rid of would defeat "delete this to reclaim disk".
     ///
+    /// # Emptied, not unlinked
+    ///
+    /// The content is dropped and the metadata reissued inside the file rather
+    /// than the file being removed and rebuilt. Windows refuses to unlink a
+    /// database *any* handle still has open, and the second front end sharing
+    /// this cache is precisely the situation "reclaim disk" has to work in; on
+    /// every platform an unlink also strands a live reader on an inode nothing
+    /// can reach again. Emptying says the same thing to that reader — the cache
+    /// was rebuilt — and its next [`refresh`](Self::refresh) adopts the new
+    /// generation. The pages go back to the filesystem through `VACUUM`, which
+    /// is best effort: a reader can hold it off, and returning the disk a
+    /// moment later is worth less than the disposal itself.
+    ///
     /// # Errors
     ///
-    /// Returns [`ContextEngineError::CacheOpenFailed`] when the replacement
-    /// could not be created — which is what a second process holding the file
-    /// open looks like on Windows. The cache is left **closed** in that case,
-    /// says so through [`status`](Self::status), and reports generation `0`
-    /// until a [`refresh`](Self::refresh) reopens it.
+    /// Returns [`ContextEngineError::CacheOpenFailed`] when the cache could not
+    /// be reopened or emptied. The file is left as it was in that case — a
+    /// refused transaction rolls back — so a failed disposal costs nothing but
+    /// the disposal.
     pub fn dispose(
         &self,
         cancellation: &Cancellation,
@@ -669,20 +681,15 @@ impl IndexCache {
         // protection against a backwards clock — and report a previous
         // generation no cache ever held.
         let previous = lock(&self.state).meta.index_generation;
-        // Closed before the file is unlinked: Windows refuses to remove a file
-        // that is still open, and a replacement created beside a live handle
-        // would inherit the old write-ahead log. Everything after this point
-        // therefore owes the state an honest answer if it fails.
-        drop(connection.take());
-        self.mark_closed("a disposal did not finish");
-        remove_database(&self.database)?;
-        let (fresh, meta) = create(
-            &self.database,
-            &self.expected,
-            &self.repository_identity,
-            next_generation(Some(previous))?,
-            cancellation,
-        )?;
+        let generation = next_generation(Some(previous))?;
+        if connection.is_none() {
+            *connection = Some(open_writable(&self.database, cancellation)?);
+        }
+        let open = connection
+            .as_mut()
+            .expect("a connection was opened a line above");
+        let meta = empty_in_place(open, &self.expected, &self.repository_identity, generation)?;
+
         let recreation = CacheRecreation {
             reason: RecreationReason::Disposed,
             detail: "a caller discarded the cache".to_owned(),
@@ -690,7 +697,6 @@ impl IndexCache {
             generation: meta.index_generation,
             quarantined_to: None,
         };
-        *connection = Some(fresh);
         let mut state = lock(&self.state);
         state.availability = IndexAvailability::Ready;
         state.stale_components = self.expected.skew(&meta);
@@ -1246,43 +1252,7 @@ fn create(
     transaction
         .execute_batch(INDEX_META_SCHEMA)
         .map_err(|error| failed(error.to_string()))?;
-    let meta = IndexMeta {
-        schema_version: expected.schema_version,
-        parser_version: expected.parser_version.clone(),
-        chunking_version: expected.chunking_version.clone(),
-        ranking_version: expected.ranking_version.clone(),
-        index_generation: generation,
-        repository_identity: repository_identity.to_owned(),
-        created_at: OffsetDateTime::now_utc(),
-    };
-    let stored_generation = i64::try_from(meta.index_generation)
-        .map_err(|_| failed(format!("generation {generation} is not representable")))?;
-    let created_at = meta
-        .created_at
-        .format(&Rfc3339)
-        .map_err(|error| failed(error.to_string()))?;
-    // A second process may have created the row before this transaction took
-    // the lock. Its row is as good as this one would have been, so the insert
-    // yields to it and the caller reads whatever is actually there.
-    transaction
-        .execute(
-            "INSERT INTO index_meta \
-             (id, schema_version, parser_version, chunking_version, ranking_version, \
-              index_generation, repository_identity, created_at) \
-             VALUES (1, :schema_version, :parser_version, :chunking_version, :ranking_version, \
-              :index_generation, :repository_identity, :created_at) \
-             ON CONFLICT(id) DO NOTHING",
-            named_params! {
-                ":schema_version": meta.schema_version,
-                ":parser_version": meta.parser_version,
-                ":chunking_version": meta.chunking_version,
-                ":ranking_version": meta.ranking_version,
-                ":index_generation": stored_generation,
-                ":repository_identity": meta.repository_identity,
-                ":created_at": created_at,
-            },
-        )
-        .map_err(|error| failed(error.to_string()))?;
+    insert_meta(&transaction, expected, repository_identity, generation)?;
     transaction
         .commit()
         .map_err(|error| failed(error.to_string()))?;
@@ -1341,6 +1311,112 @@ fn quarantine(database: &Path) -> Result<Option<PathBuf>, ContextEngineError> {
     remove_sidecars(database);
     prune_quarantines(database);
     Ok(Some(destination))
+}
+
+/// Writes the single metadata row, yielding to one that is already there.
+///
+/// A second process may have written it before this transaction took the lock,
+/// and its row is as good as this one would have been — so the insert yields
+/// and the caller reads whatever is actually stored rather than what it asked
+/// for.
+fn insert_meta(
+    transaction: &rusqlite::Transaction<'_>,
+    expected: &ExpectedVersions,
+    repository_identity: &str,
+    generation: u64,
+) -> Result<IndexMeta, ContextEngineError> {
+    let failed = |reason: String| ContextEngineError::CacheOpenFailed {
+        path: PathBuf::from(INDEX_DATABASE_FILE),
+        reason,
+    };
+    let meta = IndexMeta {
+        schema_version: expected.schema_version,
+        parser_version: expected.parser_version.clone(),
+        chunking_version: expected.chunking_version.clone(),
+        ranking_version: expected.ranking_version.clone(),
+        index_generation: generation,
+        repository_identity: repository_identity.to_owned(),
+        created_at: OffsetDateTime::now_utc(),
+    };
+    let stored_generation = i64::try_from(meta.index_generation)
+        .map_err(|_| failed(format!("generation {generation} is not representable")))?;
+    let created_at = meta
+        .created_at
+        .format(&Rfc3339)
+        .map_err(|error| failed(error.to_string()))?;
+    transaction
+        .execute(
+            "INSERT INTO index_meta \
+             (id, schema_version, parser_version, chunking_version, ranking_version, \
+              index_generation, repository_identity, created_at) \
+             VALUES (1, :schema_version, :parser_version, :chunking_version, :ranking_version, \
+              :index_generation, :repository_identity, :created_at) \
+             ON CONFLICT(id) DO NOTHING",
+            named_params! {
+                ":schema_version": meta.schema_version,
+                ":parser_version": meta.parser_version,
+                ":chunking_version": meta.chunking_version,
+                ":ranking_version": meta.ranking_version,
+                ":index_generation": stored_generation,
+                ":repository_identity": meta.repository_identity,
+                ":created_at": created_at,
+            },
+        )
+        .map_err(|error| failed(error.to_string()))?;
+    Ok(meta)
+}
+
+/// Drops every table and reissues the metadata, in one transaction.
+///
+/// The disposal an open handle can survive. `DROP TABLE` names come from this
+/// database's own schema — [#114]'s content tables and nothing else — and are
+/// quoted rather than interpolated raw, because a name is still a name.
+///
+/// [#114]: https://github.com/fullstacktaiye/harkness/issues/114
+fn empty_in_place(
+    connection: &mut Connection,
+    expected: &ExpectedVersions,
+    repository_identity: &str,
+    generation: u64,
+) -> Result<IndexMeta, ContextEngineError> {
+    let database = PathBuf::from(connection.path().unwrap_or_default());
+    let failed = move |reason: String| ContextEngineError::CacheOpenFailed {
+        path: database.clone(),
+        reason,
+    };
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| failed(error.to_string()))?;
+    let tables = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT name FROM sqlite_schema \
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            )
+            .map_err(|error| failed(error.to_string()))?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| failed(error.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| failed(error.to_string()))?
+    };
+    for table in tables {
+        let quoted = table.replace('"', "\"\"");
+        transaction
+            .execute_batch(&format!("DROP TABLE IF EXISTS \"{quoted}\""))
+            .map_err(|error| failed(error.to_string()))?;
+    }
+    transaction
+        .execute_batch(INDEX_META_SCHEMA)
+        .map_err(|error| failed(error.to_string()))?;
+    let meta = insert_meta(&transaction, expected, repository_identity, generation)?;
+    transaction
+        .commit()
+        .map_err(|error| failed(error.to_string()))?;
+    // Best effort: a concurrent reader can hold a vacuum off, and an emptied
+    // cache that has not yet given its pages back is still an emptied cache.
+    let _ = connection.execute_batch("VACUUM");
+    Ok(meta)
 }
 
 /// Deletes the cache under `cache_root` without opening it.

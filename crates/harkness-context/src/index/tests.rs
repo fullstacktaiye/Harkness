@@ -51,6 +51,12 @@ impl CacheFixture {
     /// The write-ahead log goes too. A cache is three files, and truncating one
     /// of them while the other two still describe a healthy database is not a
     /// corrupt cache — it is a cache SQLite reads perfectly well out of the log.
+    ///
+    /// **Only valid with every handle closed.** Windows refuses to unlink a
+    /// file SQLite still has open, so with a live cache the log would survive
+    /// and the "corruption" would read fine out of it. A test that has to
+    /// corrupt a cache underneath a live handle edits it through SQLite
+    /// instead.
     fn corrupt_on_disk(&self) {
         fs::write(self.database(), &b"not a database"[..10]).unwrap();
         for suffix in ["-wal", "-shm"] {
@@ -416,10 +422,15 @@ fn a_cache_that_faults_mid_life_is_quarantined_and_the_call_fails() {
     let fixture = CacheFixture::new();
     let cache = fixture.open().unwrap();
     let generation = cache.generation();
-    // What another process, or a filesystem, can do to the files underneath a
-    // live handle. Refresh re-reads them rather than this process's page cache,
-    // which is what makes it notice.
-    fixture.corrupt_on_disk();
+    // What another process, or a hand edit, can do to the cache underneath a
+    // live handle. It goes through SQLite rather than over the file, because a
+    // cache is three files and truncating one of them leaves the log holding
+    // the whole database — and Windows will not let the log be unlinked while
+    // this handle is open. Refresh re-reads what is *stored* rather than this
+    // process's page cache, which is what makes it notice either way.
+    let editor = Connection::open(fixture.database()).unwrap();
+    editor.execute("DELETE FROM index_meta", []).unwrap();
+    drop(editor);
 
     let error = cache.refresh(&Cancellation::default()).unwrap_err();
 
@@ -434,7 +445,10 @@ fn a_cache_that_faults_mid_life_is_quarantined_and_the_call_fails() {
 }
 
 /// Two front ends share one cache, so the file behind a live handle can be
-/// rebuilt by somebody else. Refresh is where that is noticed.
+/// rebuilt by somebody else. Refresh is where that is noticed — and the
+/// disposal has to succeed with that handle open at all, which is why it
+/// empties the cache rather than unlinking a file Windows would refuse to
+/// remove.
 #[test]
 fn refreshing_adopts_a_cache_another_process_rebuilt() {
     let fixture = CacheFixture::new();
@@ -454,6 +468,7 @@ fn refreshing_adopts_a_cache_another_process_rebuilt() {
 
     assert_eq!(report.generation, rebuilt.generation);
     assert_eq!(held.generation(), rebuilt.generation);
+    assert_eq!(integrity_of(&fixture.database()), "ok");
 }
 
 /// Rotation keeps the newest two. A repeatedly failing cache must not be able
@@ -659,20 +674,25 @@ fn an_impossible_schema_version_is_quarantined_rather_than_refused_forever() {
     replaced.refresh(&Cancellation::default()).unwrap();
 }
 
-/// A recreation closes the connection before it unlinks the file. Everything
+/// A recreation closes the connection before it sets the file aside. Everything
 /// after that point owes the state an honest answer if it fails, because a
 /// generation handed to a capture has to name a database that exists.
 #[cfg(unix)]
 #[test]
-fn a_disposal_that_cannot_finish_reports_the_cache_closed_and_refresh_repairs_it() {
+fn a_recreation_that_cannot_finish_reports_the_cache_closed_and_refresh_repairs_it() {
     let fixture = CacheFixture::new();
     let cache = fixture.open().unwrap();
     let generation = cache.generation();
+    // Unreadable, so the next refresh has to replace it — and then unable to
+    // *do* that, because quarantining needs to write the directory.
+    let editor = Connection::open(fixture.database()).unwrap();
+    editor.execute("DELETE FROM index_meta", []).unwrap();
+    drop(editor);
     let Some(sealed) = crate::index::tests::ReadOnlyDirectory::seal(&fixture.root) else {
         return;
     };
 
-    let error = cache.dispose(&Cancellation::default()).unwrap_err();
+    let error = cache.refresh(&Cancellation::default()).unwrap_err();
 
     assert_eq!(error.kind(), "cache_open_failed");
     let status = cache.status();
@@ -688,14 +708,16 @@ fn a_disposal_that_cannot_finish_reports_the_cache_closed_and_refresh_repairs_it
     assert_eq!(cache.generation(), 0);
 
     drop(sealed);
-    let report = cache.refresh(&Cancellation::default()).unwrap();
+    let repaired = cache.refresh(&Cancellation::default()).unwrap_err();
 
     assert_eq!(
-        report.generation, generation,
-        "the database was never removed, so refresh reopens the one that is there"
+        repaired.kind(),
+        "cache_corrupt_quarantined",
+        "the retry can finish the replacement the sealed directory stopped"
     );
     assert_eq!(cache.status().availability, IndexAvailability::Ready);
-    assert_eq!(cache.generation(), generation);
+    assert!(cache.generation() > generation);
+    cache.refresh(&Cancellation::default()).unwrap();
 }
 
 /// The cold-start race a CLI beside a GUI hits: creation is not one operation,

@@ -147,7 +147,13 @@ fn a_project_whose_worktree_moved_gets_a_fresh_engine() {
         .unwrap();
 
     assert!(!Arc::ptr_eq(&held, &reopened));
-    assert_eq!(reopened.worktree_root(), moved);
+    // Canonical, because the engine records the root that way — on macOS the
+    // fixture's `/var/...` is `/private/var/...` and comparing the raw path
+    // would fail there and nowhere else.
+    assert_eq!(
+        reopened.worktree_root(),
+        std::fs::canonicalize(&moved).unwrap()
+    );
     assert_eq!(registry.len(), 1);
     assert!(
         Arc::ptr_eq(
