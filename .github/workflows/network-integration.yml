@@ -103,8 +103,11 @@ jobs:
       # store. Its cache lifecycle renames and unlinks a database that was open
       # a moment earlier, which Windows refuses while a handle is held, and it
       # re-executes the test binary as a second process to prove two front ends
-      # can share one cache. Neither is exercised by building the crate for
-      # `harkness-runtime`, which is all the other legs used to do.
+      # can share one cache. It now walks a real filesystem too, where the
+      # answers that differ per platform are exactly the ones the walk depends
+      # on: whether two names differing only by case are two files, and what a
+      # directory listing hands back. The tests needing a Unix-only capability —
+      # a mode-000 path, a symlink, a non-UTF-8 name — are `cfg(unix)`.
       - name: Test context
         run: cargo test --locked -p harkness-context
       - name: Test runtime
@@ -198,6 +201,15 @@ jobs:
           sh .github/scripts/run-ignored-exact-test.sh
           harkness-provider
           assemble::assembler::tests::event_dispatch_meets_the_latency_target
+          --release
+      # Issue #112 budgets a medium repository's inventory walk at 1.5 seconds,
+      # and every retrieval feature waits behind it, so it belongs here for the
+      # same reason the others do.
+      - name: Measure inventory walk
+        run: >-
+          sh .github/scripts/run-ignored-exact-test.sh
+          harkness-context
+          inventory::tests::a_medium_repository_meets_the_walk_latency_target
           --release
       # Issue #97 puts the coordinator on every protected tool call, so its
       # per-call budget is a release requirement too.

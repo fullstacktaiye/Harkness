@@ -592,11 +592,10 @@ fn clamp(mut text: String) -> String {
     if text.len() <= MAX_PROVENANCE_TEXT_BYTES {
         return text;
     }
-    let mut boundary = MAX_PROVENANCE_TEXT_BYTES;
-    while boundary > 0 && !text.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    text.truncate(boundary);
+    text.truncate(crate::text::floor_char_boundary(
+        &text,
+        MAX_PROVENANCE_TEXT_BYTES,
+    ));
     text
 }
 

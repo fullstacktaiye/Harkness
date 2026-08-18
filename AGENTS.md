@@ -544,6 +544,96 @@ so rewriting a path inside it would refuse the very row the rewrite was meant to
 protect. `id`, `project_id`, `snapshot_digest` and `captured_at` are lifted out
 of the payload for queries and are *compared* against it on every read, exactly
 as an artifact's `storage_path` is.
+## Context Inventory & Classification Invariants
+
+**One walk, four layers, first opinion wins.** Built-in denials, the global user
+ignore file, the repository's own ignore file, then the repository's `.gitignore`
+chain — and every later retrieval feature reads the inventory rather than the
+filesystem, so two of them cannot disagree about whether a file exists. A layer
+answers exclude, explicitly re-include, or nothing; an explicit re-inclusion
+stops the descent, which is what gives the order meaning in both directions. The
+repository layer may only tighten: its negations are discarded line by line and
+reported, never merely outranked, because ADR-0006's rule is that repository
+content narrows what Harkness reads and can never widen it. Nothing outranks
+layer 1, which is checked against every parent directory as well as the path.
+
+**A denied path is a count and never a name.** It is not an entry, not a
+diagnostic, not a count keyed by path, and its content is never opened — the
+whole point of denying at the walk is that no later stage has anything to
+retrieve. A denied directory counts once and is not descended into, so
+`denied_count` counts rules applied rather than files that exist. The test that
+matters scans the *whole* rendered inventory rather than its entries. A symlink
+is matched against layer 1 as both a file and a directory, because the walk will
+not follow one to find out which it is and a directory-only denial would
+otherwise let a link standing where a credential directory belongs be recorded
+under its own name.
+
+**A rule file is read on terms the repository does not choose.** The repository's
+own file may not be *reached through* a symlink — neither the file nor any
+directory on the way to it, because `lstat` on `.harkness/context-ignore`
+resolves `.harkness` first and a check on the leaf alone answers about a file
+outside the worktree while reporting that nothing was a link. That is how a
+repository would aim the reader at `~/.ssh/id_rsa` and read the target back
+through a diagnostic quoting the "pattern" that would not compile. The global
+file, whose path the user supplied, is followed, and `.gitmodules` is read on the
+same terms as a rule file even though its answer only picks a boundary spelling.
+A `.gitignore` that is not a readable regular file is *reported*: dropping it on
+its kind alone loses every rule it held with nobody told. The size bound is enforced on the bytes *read*
+rather than on a stat, because a file grows between the two and procfs reports
+zero for content that is not. A leading byte-order mark is stripped, since
+leaving it in compiles a first pattern that matches nothing: a tightening rule
+that silently stopped applying is the failure this whole layer exists to prevent,
+and one reader serves all three configurable layers so the halves cannot drift.
+
+**What a walk records is decided by the last stat, not the first.** A path listed
+as a regular file and replaced by a symlink before it is opened is recorded as
+the link it now is and never read — `File::open` follows one, and eight kilobytes
+of somewhere else would otherwise reach a classification. The open is then
+checked back against that stat, on Unix by inode and device, because narrowing a
+race is not closing one; the platforms without a cheap identity keep the residual
+and say so. A path that became a directory is reported rather than recorded,
+since no entry about it would be true.
+
+**A budget answers only while there is work left.** The walk asks whether its
+stack is empty before it asks the clock, so an inventory that recorded every path
+is never handed back marked truncated — a caller told to treat it as partial
+would degrade a complete answer.
+
+**The walk is ours and the rule engine is `ignore`'s**, and that split is
+deliberate. `WalkBuilder` decides exclusion inside its own iterator, which would
+hide from layers 1 to 3 whatever layer 4 removed, make `ignored_count`
+unobservable, and let a `.gitignore` decide whether a credential was counted as
+denied. Only `ignore::gitignore` is used, so glob semantics are not hand-rolled
+either.
+
+**The root comes from a captured snapshot, never from a caller's string.** There
+is no entry point taking a bare path, so containment is answered once where the
+workspace was read, and `ContextEngine::inventory` captures and walks in one call
+so the id an inventory carries always names the capture it was built from. The
+walk policy comes from the engine's configuration and never from the request,
+which is why `InventoryRequest` holds no ignore settings: a request that could
+widen the walk would be input deciding what the engine may read. Symlinks are recorded and never followed; a directory holding
+its own `.git` is a boundary the walk stops at; the repository's own `.git` is
+skipped rather than counted, because nothing excluded it.
+
+**Truncation and cancellation fail differently, for the same reason capture and
+verification do.** A file or time budget stops the walk and returns a *partial*
+inventory carrying a typed truncation, which nothing may read as "the repository
+has this many files". A cancelled walk returns `cancelled` and no inventory at
+all, because a caller that stopped it did not ask for a subset.
+
+**`eligible` is derived and never stored**, so it cannot go stale against the
+class, the symlink flag, the boundary, or the unreadable flag it summarizes.
+Classification itself is pure and total over exactly three inputs — a path, a
+size, and at most `BINARY_SNIFF_BYTES` of opening bytes — so a persisted class
+can be re-derived and compared rather than trusted. No file is read past that
+window, and a file whose *name* already classifies it secret-sensitive is not
+opened at all. `CLASSIFY_VERSION` covers the denial list and the classification
+rules together; bumping it invalidates what was derived, and never silently
+reclassifies evidence recorded under the old rules.
+
+`docs/context-inventory.md` is the reference for the denial list, the class
+precedence, and the bounds.
 
 ## Model Provider & Streaming Assembly Invariants
 

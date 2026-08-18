@@ -191,22 +191,32 @@ translating between two cancellation mechanisms.
   out the cache's busy timeout. Persistence is the *store's*: `record_workspace_snapshot_for_run`
   writes the `workspace_snapshots` row and its `snapshot_captured` event in one transaction, and it
   is the only producer of that kind.
-- **`harkness-context`** owns the context engine's vocabulary *and* its service
-  boundary: identifiers, `WorkspaceSnapshot` identity, `Provenance`, `FileClass`,
-  the `ContextEngine` facade, and the disposable index cache beneath it. It
-  deliberately does *not* depend on `harkness-runtime` — the runtime depends on
-  it — so a snapshot can be captured and verified with no database of runs in the
-  process, which a doc-test on `ContextEngine` proves. Read `snapshot.rs`'s
-  module doc before changing anything a digest absorbs; the wire forms are frozen
-  by fixtures under `src/fixtures/` because they are `runtime.db` columns.
-  `engine.rs` is the eight-method facade every retrieval issue plugs into — only
-  `snapshot` is implemented, the rest return `ContextEngineError::NotYetAvailable`
-  naming the feature — and `index/` is the per-repository cache at
-  `<data_dir>/context/<repository-key>/index.db`: one `index_meta` row, four
-  version fields, a generation seeded from the clock so a wiped directory cannot
-  reissue a number a stored snapshot recorded, and quarantine-and-recreate for
-  anything unreadable. The engine writes nothing durable; `harkness-runtime`'s
-  `context` module owns the handles and the persistence.
+- **`harkness-context`** owns the context engine's vocabulary, its service
+  boundary, and the first feature behind it: identifiers, `WorkspaceSnapshot`
+  identity, `Provenance`, `FileClass`, the `ContextEngine` facade, the disposable
+  index cache, and the eligible-file inventory. It deliberately does *not* depend
+  on `harkness-runtime` — the runtime depends on it — so a snapshot can be
+  captured and an inventory built with no database of runs in the process, which
+  a doc-test on `ContextEngine` proves. Read `snapshot.rs`'s module doc before
+  changing anything a digest absorbs; the wire forms are frozen by fixtures under
+  `src/fixtures/` because they are `runtime.db` columns.
+  `engine.rs` is the eight-method facade every retrieval issue plugs into —
+  `snapshot` and `inventory` are implemented, the rest return
+  `ContextEngineError::NotYetAvailable` naming the feature — and `index/` is the
+  per-repository cache at `<data_dir>/context/<repository-key>/index.db`: one
+  `index_meta` row, four version fields, a generation seeded from the clock so a
+  wiped directory cannot reissue a number a stored snapshot recorded, and
+  quarantine-and-recreate for anything unreadable. `inventory.rs` is the walk
+  every retrieval feature reads instead of the filesystem, so read its module doc
+  before touching it: four exclusion layers with built-in denials on top that no
+  configuration can undo, a repository layer that may only tighten and is never
+  reached through a symlink, symlinks recorded but never followed, nested
+  repositories recorded as boundaries, and typed truncation where a bound is
+  reached. `ignore` is used for its gitignore matcher only — the walk itself is
+  ours, because `WalkBuilder` filters inside its iterator and the layer above it
+  has to see what the layer below would have removed. The engine writes nothing
+  durable; `harkness-runtime`'s `context` module owns the handles and the
+  persistence, and `docs/context-inventory.md` is the user-facing reference.
 - **`harkness-provider`** is the model-endpoint boundary, created by #111 against ADR-0001 and
   ADR-0002. `contract` is the provider-neutral vocabulary — identities, capabilities, messages, the
   streamed `ModelEvent` model, `TurnOutcome`, and ten stable `ProviderError` kinds — and

@@ -12,6 +12,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::inventory::InventoryError;
+
 /// Failures raised while capturing, verifying, or decoding context records.
 ///
 /// Every variant maps to a stable discriminant in [`ContextDomainError::KINDS`],
@@ -254,6 +256,31 @@ pub enum ContextEngineError {
     /// A domain failure raised beneath the facade.
     #[error(transparent)]
     Domain(#[from] ContextDomainError),
+
+    /// An inventory walk failed beneath the facade.
+    ///
+    /// Carried whole rather than re-spelled, exactly as [`Self::Domain`] is: a
+    /// caller that needs to tell a missing worktree root from an invalid ignore
+    /// rule needs the discriminant the walk gave it, and re-mapping onto the
+    /// engine's own vocabulary would erase the distinction the walk was careful
+    /// to draw.
+    #[error(transparent)]
+    Inventory(InventoryError),
+}
+
+impl From<InventoryError> for ContextEngineError {
+    /// Written by hand for one variant's sake.
+    ///
+    /// A cancelled walk and a cancelled facade call are one event, and a caller
+    /// polling its own token wants one answer: `#[from]` would carry a second
+    /// `cancelled` spelling into the published namespace and make the two
+    /// indistinguishable-but-unequal.
+    fn from(error: InventoryError) -> Self {
+        match error {
+            InventoryError::Cancelled => Self::Cancelled,
+            carried => Self::Inventory(carried),
+        }
+    }
 }
 
 impl ContextEngineError {
@@ -279,20 +306,33 @@ impl ContextEngineError {
             Self::CacheCorruptQuarantined { .. } => "cache_corrupt_quarantined",
             Self::Cancelled => "cancelled",
             Self::Domain(error) => error.kind(),
+            Self::Inventory(error) => error.kind(),
         }
     }
 
     /// Every discriminant a facade call can report, in declaration order.
     ///
-    /// The engine's own table followed by the domain's. A caller building an
-    /// exit-code or presentation table needs the union, because a facade call
-    /// can fail either way and the caller cannot tell which layer decided.
+    /// The engine's own table, then the domain's, then the walk's. A caller
+    /// building an exit-code or presentation table needs the union, because a
+    /// facade call can fail at any of the three layers and the caller cannot
+    /// tell which one decided.
+    ///
+    /// `cancelled` is published once. A walk that observed the token and a
+    /// facade call that observed it are the same answer, which is why
+    /// [`From<InventoryError>`](Self::from) maps one onto the other rather than
+    /// letting two tables spell it twice.
     #[must_use]
     pub fn kinds() -> Vec<&'static str> {
         Self::KINDS
             .iter()
             .copied()
             .chain(ContextDomainError::KINDS.iter().copied())
+            .chain(
+                InventoryError::KINDS
+                    .iter()
+                    .copied()
+                    .filter(|kind| !Self::KINDS.contains(kind)),
+            )
             .collect()
     }
 }
@@ -451,7 +491,12 @@ mod tests {
         let published = ContextEngineError::kinds();
         assert_eq!(
             published.len(),
-            ContextEngineError::KINDS.len() + ContextDomainError::KINDS.len()
+            ContextEngineError::KINDS.len()
+                + ContextDomainError::KINDS.len()
+                // Every walk kind but `cancelled`, which the engine's own table
+                // already publishes for the same event.
+                + crate::InventoryError::KINDS.len()
+                - 1
         );
 
         let mut sorted = published;
