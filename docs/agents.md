@@ -146,7 +146,9 @@ Two things are deliberately **not** compared when the grant is checked:
   path is the same program, while a different binary at the same path is not.
 
 A grant can be **global** or confined to **one workspace**. A workspace-scoped
-grant is invalid outside the root it names.
+grant does not reach outside the root it names — a launch from anywhere else is
+*refused*, and the grant is left exactly as it was. Being used in the wrong place
+is not evidence that anything changed, so it never costs you the grant.
 
 ### Re-trust after a change
 
@@ -199,6 +201,15 @@ A successful check records the version the agent reports for itself, the
 negotiated protocol version, and the capability snapshot, so a session start does
 not have to re-negotiate to find out what the agent can do.
 
+### Authentication is something you tell Harkness
+
+ACP v1 has the agent authenticate itself, so an agent you are signed in to and
+one you are not advertise exactly the same methods — nothing on the wire tells
+them apart. A health check therefore records `required` for either, and launching
+is refused until somebody says which it was. Completing the agent's own sign-in
+and then recording it (`record_authentication`) is what clears it; a later health
+check does not undo that, because still offering a way in is not asking again.
+
 The record also keeps how far teardown had to go — `already_exited`,
 `closed_stdin`, `signalled`, `killed`. "This agent had to be killed" is a bug
 report about somebody's program rather than an implementation detail.
@@ -216,7 +227,7 @@ Every failure carries a stable `kind()`. The ones you are most likely to see:
 | `executable_hash_mismatch` | The program at the path is not the one that was trusted. Both digests are in the message. | Re-trust if you expected the change; investigate if you did not. |
 | `executable_not_found` | Nothing is at the configured path. | Fix the path, or install the agent. The registration is kept. |
 | `invalid_executable` | Something is there and cannot be run. The operating system's reason is in the message. | Check that it is a program and that it is executable. |
-| `agent_authentication_required` | The agent advertised authentication and nobody has completed it. | Sign in through the agent's own flow. |
+| `agent_authentication_required` | The agent advertised authentication and nobody has recorded completing it. | Sign in through the agent's own flow, then record it. |
 | `agent_incompatible` | The last handshake selected a protocol version this build does not speak. | Use a build of the agent that speaks ACP v1. |
 | `initialize_timeout` | It was launched, said nothing usable, and was terminated. | Check that the command really starts an ACP agent, and that any required arguments are in `args`. |
 | `agents_file_version_too_new` | `agents.json` was written by a newer Harkness. | Upgrade Harkness. The file is untouched. |

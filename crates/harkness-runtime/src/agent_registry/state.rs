@@ -37,9 +37,17 @@ pub const AGENT_OBSERVATION_SCHEMA_VERSION: u32 = 1;
 /// Most authentication methods one snapshot records.
 pub const MAX_AGENT_AUTH_METHODS: usize = 16;
 /// Longest an authentication method's identifier or name may be, in bytes.
-pub const MAX_AUTH_METHOD_TEXT_LENGTH: usize = 512;
+pub const MAX_AUTH_METHOD_TEXT_LENGTH: usize = 256;
 /// Longest an authentication method's description may be, in bytes.
-pub const MAX_AUTH_METHOD_DESCRIPTION_LENGTH: usize = 4096;
+///
+/// This and the two constants above bound one value *together*, and it is their
+/// product that matters: the encoded snapshot becomes one `runtime.db` column,
+/// so a peer able to push the worst case past the store's inline threshold
+/// could make its own health record unwritable — taking away the "a check is
+/// always recorded" promise by doing nothing worse than advertising verbosely.
+/// `the_largest_snapshot_a_peer_can_produce_fits_one_column` holds the
+/// arithmetic; changing any of the three means re-running it.
+pub const MAX_AUTH_METHOD_DESCRIPTION_LENGTH: usize = 1024;
 /// Longest a recorded health-failure detail may be, in bytes.
 pub const MAX_HEALTH_DETAIL_LENGTH: usize = 4096;
 /// Longest a version an agent reports for itself may be, in bytes.
@@ -688,6 +696,17 @@ impl AgentObservations {
         self.compatibility = compatibility;
     }
 
+    /// Records the outcome of a sign-in a person completed outside Harkness.
+    ///
+    /// The only way [`AuthStatus::Authenticated`] is reached. ACP v1 has the
+    /// agent authenticate itself, so nothing on the wire distinguishes a signed
+    /// in agent from one that is not — both advertise the same methods — and a
+    /// handshake alone can therefore only ever answer "it offers a way in".
+    pub fn record_authentication(&mut self, status: AuthStatus, at: OffsetDateTime) {
+        self.auth_status = status;
+        self.updated_at = at.to_offset(UtcOffset::UTC);
+    }
+
     /// Records how one health check ended, successful or not.
     pub fn record_health(&mut self, health: HealthRecord, at: OffsetDateTime) {
         self.last_health = Some(health);
@@ -914,6 +933,53 @@ fn validate_observation_version(found: u32) -> Result<(), AgentRegistryError> {
     Ok(())
 }
 
+/// Re-applies on load every bound the encoder applied on write.
+///
+/// A row this build wrote satisfies all of them, so a row that does not was
+/// hand-edited or written by something else — and the store's rule is that a
+/// record is rebuilt through its own validation on the way in rather than
+/// trusted because it parsed. Refusing rather than clamping is the choice the
+/// integration module beside this one makes for the same reason: a value nobody
+/// here produced should not be silently rewritten into one that looks like it.
+fn validate_capabilities(capabilities: &AgentCapabilitySnapshot) -> Result<(), AgentRegistryError> {
+    let refuse = |reason| {
+        Err(AgentRegistryError::InvalidRegistration {
+            field: "last_initialize_json",
+            reason,
+        })
+    };
+    if capabilities.auth_methods.len() > MAX_AGENT_AUTH_METHODS {
+        return refuse("more authentication methods are stored than a snapshot may carry");
+    }
+    for method in &capabilities.auth_methods {
+        if method.id.len() > MAX_AUTH_METHOD_TEXT_LENGTH
+            || method.name.len() > MAX_AUTH_METHOD_TEXT_LENGTH
+        {
+            return refuse("a stored authentication method identifier or name is too long");
+        }
+        if method
+            .description
+            .as_ref()
+            .is_some_and(|description| description.len() > MAX_AUTH_METHOD_DESCRIPTION_LENGTH)
+        {
+            return refuse("a stored authentication method description is too long");
+        }
+    }
+    Ok(())
+}
+
+fn validate_length(
+    field: &'static str,
+    value: Option<&str>,
+    maximum: usize,
+    reason: &'static str,
+) -> Result<(), AgentRegistryError> {
+    if value.is_some_and(|value| value.len() > maximum) {
+        return Err(AgentRegistryError::InvalidRegistration { field, reason });
+    }
+    Ok(())
+}
+
 /// Encodes the last successful handshake for its `runtime.db` column.
 pub(crate) fn encode_initialize(record: &InitializeRecord) -> Value {
     serde_json::to_value(InitializeRecordWireRef {
@@ -932,7 +998,8 @@ pub(crate) fn encode_initialize(record: &InitializeRecord) -> Value {
 /// # Errors
 ///
 /// Returns [`AgentRegistryError::InvalidRegistration`] when the version is
-/// outside this build's range or the strict body does not parse.
+/// outside this build's range, the strict body does not parse, or a stored
+/// value exceeds a bound the encoder applies.
 pub(crate) fn decode_initialize(value: &Value) -> Result<InitializeRecord, AgentRegistryError> {
     let probe: SchemaVersionProbe =
         serde_json::from_value(value.clone()).map_err(|_| malformed("last_initialize_json"))?;
@@ -940,6 +1007,19 @@ pub(crate) fn decode_initialize(value: &Value) -> Result<InitializeRecord, Agent
     let wire: InitializeRecordWire =
         serde_json::from_value(value.clone()).map_err(|_| malformed("last_initialize_json"))?;
     debug_assert_eq!(wire.schema_version, probe.schema_version);
+    validate_capabilities(&wire.capabilities)?;
+    validate_length(
+        "last_initialize_json",
+        wire.agent_name.as_deref(),
+        MAX_AGENT_REPORTED_TEXT_LENGTH,
+        "the stored agent name is longer than one this build writes",
+    )?;
+    validate_length(
+        "last_initialize_json",
+        wire.agent_version.as_deref(),
+        MAX_AGENT_REPORTED_TEXT_LENGTH,
+        "the stored agent version is longer than one this build writes",
+    )?;
     Ok(InitializeRecord {
         agent_name: wire.agent_name,
         agent_version: wire.agent_version,
@@ -971,8 +1051,9 @@ pub(crate) fn encode_health(record: &HealthRecord) -> Value {
 /// # Errors
 ///
 /// Returns [`AgentRegistryError::InvalidRegistration`] when the version is
-/// outside this build's range, the strict body does not parse, or a status or
-/// teardown spelling is one this build does not define.
+/// outside this build's range, the strict body does not parse, a status or
+/// teardown spelling is one this build does not define, or a stored value
+/// exceeds a bound the encoder applies.
 pub(crate) fn decode_health(value: &Value) -> Result<HealthRecord, AgentRegistryError> {
     let probe: SchemaVersionProbe =
         serde_json::from_value(value.clone()).map_err(|_| malformed("last_health_json"))?;
@@ -980,6 +1061,18 @@ pub(crate) fn decode_health(value: &Value) -> Result<HealthRecord, AgentRegistry
     let wire: HealthRecordWire =
         serde_json::from_value(value.clone()).map_err(|_| malformed("last_health_json"))?;
     debug_assert_eq!(wire.schema_version, probe.schema_version);
+    validate_length(
+        "last_health_json",
+        wire.detail.as_deref(),
+        MAX_HEALTH_DETAIL_LENGTH,
+        "the stored health detail is longer than one this build writes",
+    )?;
+    validate_length(
+        "last_health_json",
+        wire.failure_kind.as_deref(),
+        MAX_AGENT_REPORTED_TEXT_LENGTH,
+        "the stored failure kind is longer than any this build declares",
+    )?;
     let status = HealthStatus::from_stored(&wire.status).ok_or_else(|| {
         AgentRegistryError::InvalidRegistration {
             field: "last_health_json",

@@ -8,7 +8,7 @@
 //! one, letting an upsert overwrite the single decision the state machine exists
 //! to preserve.
 
-use rusqlite::{Connection, named_params};
+use rusqlite::{Connection, OptionalExtension, named_params};
 use time::OffsetDateTime;
 
 use crate::domain::RUNTIME_RECORD_SCHEMA_VERSION;
@@ -140,6 +140,17 @@ pub(super) fn update(
     missing_row(RECORD, &id, updated)
 }
 
+/// How the records about one subject are ordered, oldest first.
+///
+/// `rowid` is the tiebreak rather than `id`, and the difference is load-bearing:
+/// `id` is a random UUID, so two rows written in the same instant would order by
+/// coin flip and "the most recent record about this subject" would have two
+/// answers. `rowid` is insertion order, which is the thing actually being asked
+/// about. Reversing this ordering is what
+/// [`latest_for_subject`](latest_for_subject) does, so the two must stay one
+/// definition.
+const ORDER: &str = "recorded_at, rowid";
+
 /// Every record about one subject, oldest first.
 pub(super) fn for_subject(
     connection: &Connection,
@@ -150,7 +161,7 @@ pub(super) fn for_subject(
         .prepare_cached(&format!(
             "SELECT {COLUMNS} FROM integration_trust_records \
              WHERE subject_kind = :subject_kind AND subject_ref = :subject_ref \
-             ORDER BY recorded_at, id"
+             ORDER BY {ORDER}"
         ))
         .map_err(|error| query_failed("preparing the trust record query", error))?;
     let rows = statement
@@ -167,6 +178,37 @@ pub(super) fn for_subject(
         records.push(row.map_err(|error| query_failed("reading a trust record", error))??);
     }
     Ok(records)
+}
+
+/// The most recently recorded grant about one subject.
+///
+/// One indexed seek rather than the whole history. Deciding this by loading
+/// every record and dropping all but the last is the query a launch runs, and a
+/// subject re-trusted weekly for a year would make it decode and re-validate
+/// fifty grants to answer one question.
+pub(super) fn latest_for_subject(
+    connection: &Connection,
+    subject_kind: SubjectKind,
+    subject_ref: &str,
+) -> Result<Option<StoredTrustRecord>, StoreError> {
+    let mut statement = connection
+        .prepare_cached(&format!(
+            "SELECT {COLUMNS} FROM integration_trust_records \
+             WHERE subject_kind = :subject_kind AND subject_ref = :subject_ref \
+             ORDER BY recorded_at DESC, rowid DESC LIMIT 1"
+        ))
+        .map_err(|error| query_failed("preparing the latest trust record query", error))?;
+    let stored = statement
+        .query_row(
+            named_params! {
+                ":subject_kind": subject_kind.as_str(),
+                ":subject_ref": subject_ref,
+            },
+            |row| Ok(decode(row)),
+        )
+        .optional()
+        .map_err(|error| query_failed("loading the latest trust record", error))?;
+    stored.transpose()
 }
 
 pub(super) fn delete_for_subject(

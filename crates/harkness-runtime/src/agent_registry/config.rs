@@ -14,7 +14,7 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,13 @@ pub const MINIMUM_AGENTS_SCHEMA_VERSION: u32 = 1;
 
 /// Most registrations one `agents.json` may hold.
 pub const MAX_REGISTERED_AGENTS: usize = 256;
+/// Largest `agents.json` this build will read, in bytes.
+///
+/// Generous beside the format — [`MAX_REGISTERED_AGENTS`] entries at their
+/// maximum field lengths is a fraction of it — and small enough that the one
+/// file Harkness parses out of an untrusted repository cannot decide this
+/// process's memory.
+pub const MAX_AGENTS_FILE_BYTES: usize = 4 * 1024 * 1024;
 /// Most arguments one registration may pass to its agent.
 pub const MAX_AGENT_ARGUMENTS: usize = 64;
 /// Longest one argument may be, in bytes.
@@ -455,16 +462,25 @@ struct PersistedRegistry<'a> {
 
 /// Reads `agents.json`, treating a missing file as an empty registry.
 ///
+/// The read is **bounded**, which matters most for the one caller whose file is
+/// untrusted: the same parser reads `.harkness/agents.json` out of a checked-out
+/// repository, and ADR-0006 says repository content decides nothing — including
+/// how much memory this process spends looking at it. A file over
+/// [`MAX_AGENTS_FILE_BYTES`] is refused rather than buffered, and the limit is
+/// enforced on the *read* rather than on the metadata, so a symlink to something
+/// enormous or a file that grows between the two cannot get past it.
+///
 /// # Errors
 ///
 /// Returns [`AgentRegistryError::ConfigurationRead`] when the file cannot be
-/// read, the two version errors when it names a schema outside this build's
-/// range, [`AgentRegistryError::MalformedConfiguration`] when the body does not
-/// parse, and [`AgentRegistryError::InvalidRegistration`] when a parsed entry
-/// violates an invariant or two entries share an identifier.
+/// read or is larger than the bound, the two version errors when it names a
+/// schema outside this build's range,
+/// [`AgentRegistryError::MalformedConfiguration`] when the body does not parse,
+/// and [`AgentRegistryError::InvalidRegistration`] when a parsed entry violates
+/// an invariant or two entries share an identifier.
 pub(super) fn read_registry(path: &Path) -> Result<AgentRegistryFile, AgentRegistryError> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(AgentRegistryFile::default());
         }
@@ -475,6 +491,24 @@ pub(super) fn read_registry(path: &Path) -> Result<AgentRegistryFile, AgentRegis
             });
         }
     };
+    let mut bytes = Vec::new();
+    // One byte past the limit, so a file *at* the limit reads whole and the
+    // first byte over it is what proves the refusal rather than a separate stat
+    // whose answer could already be stale.
+    Read::take(file, MAX_AGENTS_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| AgentRegistryError::ConfigurationRead {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() > MAX_AGENTS_FILE_BYTES {
+        return Err(AgentRegistryError::ConfigurationRead {
+            path: path.to_path_buf(),
+            source: std::io::Error::other(format!(
+                "the agent registry is larger than the {MAX_AGENTS_FILE_BYTES} byte maximum"
+            )),
+        });
+    }
 
     let malformed = |source| AgentRegistryError::MalformedConfiguration {
         path: path.to_path_buf(),

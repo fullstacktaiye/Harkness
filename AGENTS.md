@@ -1751,7 +1751,40 @@ value that proves they passed, `AgentLaunch`, has no public constructor.
 **A registration is created disabled and only a trust decision takes it out of that state.** That is
 what makes "a repository suggestion never auto-enables" a property of every registration path rather
 than a rule the repository path remembers. `set_enabled(true)` refuses an agent no grant covers, an
-update lands disabled, and detected drift disables before it refuses.
+update lands disabled, and detected drift disables before it refuses. The flag is forced off at the
+*write*, not merely at the constructor: `AgentRegistration` is `Clone` and `AgentRegistryFile::get`
+hands one out, so an already-enabled value can be round-tripped back into `register` or `update`, and
+after a `remove` that dropped its grant, storing it verbatim would file an enabled agent nothing
+trusts.
+
+**`WorkspacePathChanged` is a refusal, never an invalidation, and this is the one `TrustCheck::Invalidate`
+reason that gets its own branch.** It is first in `InvalidationReason::PRECEDENCE` precisely because
+it decides whether the record governs the situation at all: the subject has not changed, the grant
+simply does not reach here. Treating it as drift would destroy a grant that is still perfectly good
+in the workspace it was made for — every time a caller forgot to name the workspace.
+
+**A trust transition re-reads its record under the registry lock.** The record `admit` read was read
+outside the lock, so between it and the write another caller may have re-granted trust against the
+very bytes this call is complaining about; writing the stale clone would undo their decision.
+Re-reading serializes the whole read-modify-write against `trust` and `revoke_trust`, which hold the
+same lock across theirs. Observation writes take it for their own window too — a health check that
+kept a stale read would put an agent somebody had just signed in back out of reach — but never
+across the check itself, which waits on somebody else's program.
+
+**`recorded_at` is Harkness's clock and `granted_at` is the user's decision, and the two must not be
+conflated.** Row order is what decides which record is the latest one, so a caller naming an older
+`granted_at` would otherwise file a fresh decision *behind* the revocation it replaces and leave an
+enabled agent whose most recent record said `revoked`. The ordering tiebreak is `rowid` rather than
+the row's random UUID, for the same reason: two rows written in one instant must not order by coin
+flip.
+
+**Revoking is idempotent and authenticating is recordable.** "Make sure this is not trusted" is a
+call a surface makes without first asking whether it already is, so an already-revoked record reports
+its state instead of refusing the terminal edge. And because ACP v1 has the agent authenticate
+itself, a signed-in agent advertises exactly what an unsigned one does — no handshake can tell them
+apart, so `AgentRegistryService::record_authentication` is how a surface says which it was. Without
+it, running a health check on an agent that offers a sign-in would permanently take away an agent
+that was launchable before it.
 
 **Discovery enumerates and never executes.** No candidate is spawned, opened, read, or hashed;
 `DiscoveredCandidate` carries a name and a path and deliberately has no digest or capability field,
@@ -1772,6 +1805,19 @@ content may tighten and never widen — are held structurally here.
 against the encoder that writes the file, and no read that rewrites — or creates — anything. Runtime
 state stays out of it entirely: a digest, a capability snapshot, a health record and a grant are
 `runtime.db` rows, so losing the database costs a re-trust rather than a registration.
+
+The read is bounded by `MAX_AGENTS_FILE_BYTES`, and the bound is on the read rather than on a stat,
+because the same parser reads `.harkness/agents.json` out of a checked-out repository. ADR-0006 says
+repository content decides nothing, and how much memory this process spends looking at it is one of
+the things it does not get to decide; a symlink to something enormous, or a file that grows between
+a stat and a read, must not get past it.
+
+Every bound the encoder applies to a stored observation is re-applied on load. A row this build wrote
+satisfies all of them, so a row that does not was hand-edited or written by something else, and the
+store's rule is that a record is rebuilt through its own validation rather than trusted because it
+parsed. The three constants bounding a capability snapshot bound one *column* together: their worst
+case has to fit the store's inline threshold, or an agent takes away its own health record by doing
+nothing worse than advertising verbosely.
 
 The environment allowlist is **exhaustive and verbatim**. The child starts from an empty environment
 and sees exactly the named variables this process holds, with no implicit baseline — not even the one

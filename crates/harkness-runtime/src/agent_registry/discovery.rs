@@ -14,7 +14,7 @@
 //! here.
 
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use harkness_git::Cancellation;
@@ -148,10 +148,16 @@ impl Discovery {
     /// Replaces the candidate names, keeping at most
     /// [`MAX_DISCOVERY_CANDIDATES`] of them.
     ///
-    /// A name carrying a path separator is dropped rather than refused: the
-    /// value is joined onto a search-path directory, and a caller that wrote
-    /// `../../bin/agent` would otherwise have discovery report a path outside
-    /// the directory it claims to have searched.
+    /// A name that is anything but one ordinary file name is dropped rather
+    /// than refused: the value is joined onto a search-path directory, and a
+    /// caller that wrote `../../bin/agent` would otherwise have discovery report
+    /// a path outside the directory it claims to have searched.
+    ///
+    /// The check is that the name is exactly one [`Component::Normal`], not
+    /// merely one component of any kind. `..`, `.`, `/` and `C:` are each a
+    /// single component too, and each of them leaves the directory being
+    /// searched — `..` most obviously, and a bare prefix or root most quietly,
+    /// because joining an absolute path *discards* the directory entirely.
     #[must_use]
     pub fn looking_for<I, S>(mut self, names: I) -> Self
     where
@@ -161,7 +167,7 @@ impl Discovery {
         self.candidates = names
             .into_iter()
             .map(Into::into)
-            .filter(|name| !name.is_empty() && Path::new(name).components().count() == 1)
+            .filter(|name| is_one_file_name(name))
             .take(MAX_DISCOVERY_CANDIDATES)
             .collect();
         self
@@ -221,15 +227,22 @@ impl Discovery {
             if remaining.is_empty() {
                 break;
             }
-            if report.directories_searched == self.max_directories {
-                report.truncation = Some(DiscoveryTruncation::DirectoryBudget);
-                break;
-            }
+            // Skipped *before* the budget is consulted, and the order matters.
+            // A trailing separator is an ordinary way to write a `PATH`, and
+            // asking about the budget first would let that empty final entry
+            // report a probe as truncated when every real directory had in fact
+            // been searched — the one thing `DiscoveryTruncation` exists to
+            // keep honest.
+            //
             // An empty entry means "the current directory" to a shell, and the
             // current directory of a Harkness process invoked from a Git hook is
             // not a place a suggestion may come from.
             if directory.as_os_str().is_empty() {
                 continue;
+            }
+            if report.directories_searched == self.max_directories {
+                report.truncation = Some(DiscoveryTruncation::DirectoryBudget);
+                break;
             }
             report.directories_searched += 1;
 
@@ -260,6 +273,16 @@ impl Discovery {
 
         report
     }
+}
+
+/// Whether `name` is exactly one ordinary file name.
+///
+/// `Path::components` normalizes `.` away entirely, so a bare `"."` yields *no*
+/// components and a count-based check would have to special-case it; asking for
+/// one `Normal` component answers every case at once.
+fn is_one_file_name(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
 }
 
 /// Whether a path names something a shell would be willing to execute.

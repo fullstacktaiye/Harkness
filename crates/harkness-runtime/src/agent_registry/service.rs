@@ -203,8 +203,10 @@ pub struct LaunchContext {
 impl LaunchContext {
     /// Names the workspace the agent is being launched for.
     ///
-    /// A workspace-scoped grant is invalid outside the root it names, and a
+    /// A workspace-scoped grant does not reach outside the root it names, and a
     /// caller that supplies nothing gets that refusal rather than a silent pass.
+    /// The refusal costs the grant nothing: being used in the wrong place is not
+    /// evidence that anything about the agent changed.
     #[must_use]
     pub fn in_workspace(mut self, root: impl Into<PathBuf>) -> Self {
         self.workspace = Some(root.into());
@@ -507,6 +509,15 @@ impl AgentRegistryService {
                 id: registration.id().clone(),
             });
         }
+        // Disabled here rather than trusting the value that arrived. A fresh
+        // `AgentRegistration` is built disabled, but the type is `Clone` and
+        // `AgentRegistryFile::get` hands one out, so a caller can round-trip an
+        // *enabled* registration back in — and after a `remove` that dropped
+        // its grant, storing it verbatim would put an enabled agent in the file
+        // that no trust decision covers. The invariant is enforced where the
+        // write happens, not where the value is usually built.
+        let mut registration = registration;
+        registration.set_enabled(false);
         file.insert(registration.clone())?;
         persist_registry(&self.data_dir, &self.path(), &file)?;
         Ok(RegistrationOutcome {
@@ -546,8 +557,18 @@ impl AgentRegistryService {
                 changed: false,
             });
         }
-        file.remove(registration.id());
-        file.insert(registration.clone())?;
+        // Replaced in place rather than removed and appended. The file is one a
+        // user keeps in version control, and reordering every later entry to
+        // change one field is exactly the churn the idempotency rule above
+        // exists to avoid.
+        let mut registration = registration;
+        registration.set_enabled(false);
+        let slot =
+            file.get_mut(registration.id())
+                .ok_or_else(|| AgentRegistryError::UnknownAgent {
+                    id: registration.id().clone(),
+                })?;
+        *slot = registration.clone();
         persist_registry(&self.data_dir, &self.path(), &file)?;
         Ok(RegistrationOutcome {
             registration,
@@ -662,7 +683,14 @@ impl AgentRegistryService {
                     SubjectKind::AgentExecutable,
                     options.id.as_str(),
                     &record,
-                    options.at,
+                    // `recorded_at` is when the *row* was written and is read
+                    // by nothing but the ordering that decides which record is
+                    // the latest one. It is this clock rather than the caller's
+                    // `granted_at` for exactly that reason: a caller naming an
+                    // older grant time would otherwise file a fresh decision
+                    // behind the revocation it replaces, and the agent would be
+                    // enabled while its most recent record said `revoked`.
+                    OffsetDateTime::now_utc(),
                 )?;
                 record
             }
@@ -686,10 +714,15 @@ impl AgentRegistryService {
     /// is a new decision and a new record, so the refusal stays in the audit
     /// trail instead of being overwritten by the next answer.
     ///
+    /// **Idempotent.** "Make sure this agent is not trusted" is a call a surface
+    /// makes without first asking whether it already is, so an agent with no
+    /// record and an agent whose latest record is already revoked both report
+    /// the state rather than refusing. Only the transition is skipped; the
+    /// registration is still switched off either way.
+    ///
     /// # Errors
     ///
     /// Returns [`AgentRegistryError::UnknownAgent`],
-    /// [`AgentRegistryError::Integration`] when the record is already revoked,
     /// [`AgentRegistryError::Store`], and the file's own write failures.
     pub fn revoke_trust(&self, id: &AgentId) -> Result<TrustOutcome, AgentRegistryError> {
         let _lock = lock_exclusive(&self.data_dir)?;
@@ -698,15 +731,20 @@ impl AgentRegistryService {
             .store
             .latest_trust_record(SubjectKind::AgentExecutable, id.as_str())?;
         let trust = match stored {
+            // Already the answer. `TrustRecord::revoke` would refuse the edge —
+            // correctly, since `Revoked` is terminal — and turning "it is
+            // already what you asked for" into an error would make a surface
+            // check the state before every call it makes to set it.
+            Some(stored) if stored.record().state() == TrustState::Revoked => {
+                AgentTrust::from_record(stored.record())
+            }
             Some(stored) => {
                 let mut record = stored.record().clone();
                 record.revoke()?;
                 self.store.update_trust_record(stored.id(), &record)?;
                 AgentTrust::from_record(&record)
             }
-            // Nothing to withdraw. Reporting the absence rather than refusing
-            // keeps "make sure this agent is not trusted" a call a surface can
-            // make without first asking whether it already is.
+            // Nothing to withdraw, and nothing to complain about either.
             None => AgentTrust::untrusted(),
         };
         let registration = self.set_enabled_locked(id, false)?.registration;
@@ -714,6 +752,44 @@ impl AgentRegistryService {
             registration,
             trust,
         })
+    }
+
+    /// Records that a person has, or has not, authenticated this agent.
+    ///
+    /// ACP v1 has the agent handle authentication itself, so Harkness never
+    /// learns the outcome from the wire: an agent that is signed in and an agent
+    /// that is not both advertise the same `authMethods`, and a health check
+    /// therefore records [`AuthStatus::Required`] for either. This is how a
+    /// surface that walked a person through the agent's own sign-in tells the
+    /// registry, and it is the only way [`AuthStatus::Authenticated`] is ever
+    /// reached.
+    ///
+    /// Without it, running a health check on an agent that offers a sign-in
+    /// would make that agent permanently unlaunchable — a check is a
+    /// convenience, and one that could take an agent away would be a trap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentRegistryError::UnknownAgent`] when nothing carries `id`,
+    /// and [`AgentRegistryError::Store`].
+    pub fn record_authentication(
+        &self,
+        id: &AgentId,
+        status: AuthStatus,
+    ) -> Result<AgentRuntimeState, AgentRegistryError> {
+        let _lock = lock_exclusive(&self.data_dir)?;
+        let _registration = self.registration_locked(id)?;
+        let at = OffsetDateTime::now_utc();
+        let mut observations = self
+            .store
+            .agent_observations(id)?
+            .unwrap_or_else(|| AgentObservations::unobserved(at));
+        observations.record_authentication(status, at);
+        self.store.put_agent_observations(id, &observations)?;
+        Ok(AgentRuntimeState::new(
+            self.trust_state(id)?,
+            Some(observations),
+        ))
     }
 
     // -- discovery ----------------------------------------------------------
@@ -777,12 +853,19 @@ impl AgentRegistryService {
         context: &LaunchContext,
     ) -> Result<AgentLaunch, AgentRegistryError> {
         let (registration, digest) = self.admit(id, context, DriftDetection::Launch)?;
-        let state = self.runtime_state(id)?;
-        if state.auth_status() == AuthStatus::Required {
+        // The observations alone, not the composed runtime state: that one
+        // re-reads the trust record `admit` has just read and validated, which
+        // is both a wasted query and a second moment at which the answer could
+        // differ from the one the trust gate was decided on.
+        let observed = self.store.agent_observations(id)?;
+        let auth = observed
+            .as_ref()
+            .map_or(AuthStatus::Unknown, AgentObservations::auth_status);
+        if auth == AuthStatus::Required {
             return Err(AgentRegistryError::AuthenticationRequired { id: id.clone() });
         }
-        if let CompatibilityStatus::UnsupportedProtocolVersion { advertised } =
-            state.compatibility()
+        if let Some(CompatibilityStatus::UnsupportedProtocolVersion { advertised }) =
+            observed.as_ref().map(AgentObservations::compatibility)
         {
             return Err(AgentRegistryError::IncompatibleAgent {
                 id: id.clone(),
@@ -964,6 +1047,14 @@ impl AgentRegistryService {
         probe: ProbeOutcome,
         elapsed: Duration,
     ) -> Result<HealthOutcome, AgentRegistryError> {
+        // Taken for the read-modify-write and *not* for the check itself: an
+        // agent gets up to a full deadline to answer, and holding the registry
+        // lock across that would stop every other registry operation for as long
+        // as somebody else's program felt like taking. What it does close is the
+        // window in which a concurrent `record_authentication` is read, kept,
+        // and then written back stale — which would put an agent somebody just
+        // signed in to back into `Required` and out of reach.
+        let _lock = lock_exclusive(&self.data_dir)?;
         let at = OffsetDateTime::now_utc();
         let mut observations = self
             .store
@@ -1092,6 +1183,21 @@ impl AgentRegistryService {
             TrustCheck::NotTrusted => {
                 Err(not_trusted(id, &AgentTrust::from_record(stored.record())))
             }
+            // A workspace-scoped grant used somewhere else is the one answer
+            // that is *not* drift, and it must not be treated as drift. It is
+            // first in `InvalidationReason::PRECEDENCE` precisely because it
+            // decides whether this record governs the situation at all — the
+            // subject has not changed, the record simply does not reach here.
+            // Invalidating on it would destroy a grant that is still perfectly
+            // valid in the workspace it was given for, and would do it every
+            // time a caller forgot to name the workspace.
+            TrustCheck::Invalidate(InvalidationReason::WorkspacePathChanged) => {
+                Err(AgentRegistryError::AgentNotTrusted {
+                    id: id.clone(),
+                    state: stored.record().state(),
+                    reason: Some(InvalidationReason::WorkspacePathChanged.explanation()),
+                })
+            }
             TrustCheck::Invalidate(reason) => {
                 Err(self.invalidate(id, &stored, reason, digest, context, detected_at)?)
             }
@@ -1105,6 +1211,16 @@ impl AgentRegistryService {
     /// grant is invalidated in durable state *before* the registration is
     /// disabled, so a failure between the two leaves an agent every launch path
     /// already refuses.
+    ///
+    /// The record `admit` read is deliberately **not** the one that is written.
+    /// That read happened outside the lock, so between it and here another
+    /// caller may have re-granted trust against the very bytes this call is
+    /// about to complain about; writing the stale clone would silently undo
+    /// their decision. Re-reading under the lock makes the whole
+    /// read-modify-write serialize against `trust` and `revoke_trust`, which
+    /// hold the same lock across theirs — the discipline the run store states
+    /// for its own transactions, applied to a pair of writes no single
+    /// transaction spans.
     fn invalidate(
         &self,
         id: &AgentId,
@@ -1115,6 +1231,27 @@ impl AgentRegistryService {
         detected_at: DriftDetection,
     ) -> Result<AgentRegistryError, AgentRegistryError> {
         let _lock = lock_exclusive(&self.data_dir)?;
+        let current = self
+            .store
+            .latest_trust_record(SubjectKind::AgentExecutable, id.as_str())?;
+        let stored = match current {
+            // Still the same row, still standing: the drift is real and is ours
+            // to record.
+            Some(current)
+                if current.id() == stored.id()
+                    && current.record().state() == TrustState::Trusted =>
+            {
+                current
+            }
+            // Somebody moved it while this call was hashing. Whatever they
+            // decided is newer than what this call observed, so it is reported
+            // rather than overwritten, and the caller re-checks against it.
+            Some(current) => {
+                return Ok(not_trusted(id, &AgentTrust::from_record(current.record())));
+            }
+            None => return Ok(not_trusted(id, &AgentTrust::untrusted())),
+        };
+
         let trusted = stored
             .record()
             .identity_basis()

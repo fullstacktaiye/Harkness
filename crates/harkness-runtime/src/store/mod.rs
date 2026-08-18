@@ -505,12 +505,18 @@ impl Store {
     }
 
     /// The most recently recorded grant about one subject, if there is one.
+    ///
+    /// One indexed seek rather than the history with everything but its last
+    /// row thrown away — this is the query every launch and every health check
+    /// runs, and a subject with a long decision history must not make it slower.
     pub fn latest_trust_record(
         &self,
         subject_kind: SubjectKind,
         subject_ref: &str,
     ) -> Result<Option<StoredTrustRecord>, StoreError> {
-        Ok(self.trust_records(subject_kind, subject_ref)?.pop())
+        self.with_reader(|connection| {
+            trust_record::latest_for_subject(connection, subject_kind, subject_ref)
+        })
     }
 
     /// Replaces everything observed about one registered agent.

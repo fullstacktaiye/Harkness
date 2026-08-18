@@ -492,6 +492,106 @@ fn concurrent_registrations_all_survive() {
     }
 }
 
+/// `AgentRegistration` is `Clone` and `AgentRegistryFile::get` hands one out, so
+/// an *enabled* value can be round-tripped back into the public API. Neither
+/// write path may take it at its word: the gate is "a grant somebody made", and
+/// a value carrying `enabled: true` is not one.
+#[test]
+fn an_enabled_registration_round_tripped_through_the_api_still_lands_disabled() {
+    let harness = Harness::new();
+    let id = AgentId::new("gemini-cli").unwrap();
+    harness
+        .service
+        .register(registration("gemini-cli", "/usr/bin/gemini"))
+        .unwrap();
+    // Reach an enabled value the only way the API allows: enable it legitimately
+    // — which needs a grant — and read it back.
+    let executable = harness
+        .fixture
+        .shim("round-trip-agent", "#!/bin/sh\nexit 0\n");
+    harness
+        .service
+        .update(
+            AgentRegistration::new(id.clone(), "Gemini CLI", executable, AgentSource::User)
+                .unwrap(),
+        )
+        .unwrap();
+    harness
+        .service
+        .trust(TrustAgent::new(id.clone(), at(0)).and_enable())
+        .unwrap();
+    let enabled = harness.service.get(&id).unwrap().registration().clone();
+    assert!(enabled.is_enabled());
+
+    // Removing drops the grant; re-registering the enabled value must not put an
+    // enabled agent back that nothing trusts.
+    harness.service.remove(&id).unwrap();
+    let outcome = harness.service.register(enabled.clone()).unwrap();
+
+    assert!(!outcome.registration().is_enabled());
+    assert!(
+        !harness
+            .service
+            .get(&id)
+            .unwrap()
+            .registration()
+            .is_enabled()
+    );
+    assert_eq!(
+        harness
+            .service
+            .prepare_launch(&id, &LaunchContext::default())
+            .unwrap_err()
+            .kind(),
+        "agent_disabled"
+    );
+
+    // And an update carrying the same value cannot re-enable it either.
+    harness
+        .service
+        .update(enabled.clone().with_args(["--acp"]).unwrap())
+        .unwrap();
+    assert!(
+        !harness
+            .service
+            .get(&id)
+            .unwrap()
+            .registration()
+            .is_enabled()
+    );
+}
+
+/// The file is one a user keeps in version control, so changing one entry must
+/// not move every entry after it.
+#[test]
+fn an_update_keeps_the_registration_where_it_was_in_the_file() {
+    let harness = Harness::new();
+    for name in ["alpha", "beta", "gamma"] {
+        harness
+            .service
+            .register(registration(name, &format!("/usr/bin/{name}")))
+            .unwrap();
+    }
+
+    harness
+        .service
+        .update(
+            registration("alpha", "/usr/bin/alpha")
+                .with_args(["--acp"])
+                .unwrap(),
+        )
+        .unwrap();
+
+    let order = harness
+        .service
+        .registrations()
+        .unwrap()
+        .agents()
+        .map(|agent| agent.id().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(order, ["alpha", "beta", "gamma"]);
+}
+
 #[test]
 fn removing_an_agent_that_was_never_registered_changes_nothing() {
     let harness = Harness::new();
@@ -638,6 +738,89 @@ fn a_repeated_trust_record_identity_is_refused_rather_than_upserted() {
     assert_eq!(error.kind(), "already_exists");
 }
 
+/// The three constants that bound a capability snapshot bound one *column*
+/// together, so the worst case a peer can produce has to fit the store's inline
+/// threshold. If it does not, an agent takes away its own health record by doing
+/// nothing worse than advertising verbosely.
+#[test]
+fn the_largest_snapshot_a_peer_can_produce_fits_one_column() {
+    let harness = Harness::new();
+    let id = AgentId::new("verbose").unwrap();
+    let auth_methods = (0..MAX_AGENT_AUTH_METHODS)
+        .map(|index| AgentAuthMethod {
+            id: format!("{index:0>width$}", width = MAX_AUTH_METHOD_TEXT_LENGTH),
+            name: "n".repeat(MAX_AUTH_METHOD_TEXT_LENGTH),
+            description: Some("d".repeat(MAX_AUTH_METHOD_DESCRIPTION_LENGTH)),
+        })
+        .collect();
+    let mut observations = AgentObservations::unobserved(at(1));
+    observations.record_initialize(InitializeRecord::new(
+        None,
+        1,
+        AgentCapabilitySnapshot {
+            auth_methods,
+            auth_methods_truncated: true,
+            ..AgentCapabilitySnapshot::default()
+        },
+        at(2),
+    ));
+    observations.record_health(
+        HealthRecord::failed(
+            HealthStatus::Failed,
+            "initialize_timeout",
+            "x".repeat(MAX_HEALTH_DETAIL_LENGTH),
+            Duration::from_millis(1),
+            at(2),
+        ),
+        at(2),
+    );
+
+    harness
+        .store
+        .put_agent_observations(&id, &observations)
+        .expect("the worst case a peer can advertise must still be recordable");
+    assert_eq!(
+        harness.store.agent_observations(&id).unwrap().unwrap(),
+        observations
+    );
+}
+
+/// Every bound the encoder applies is re-applied on load, so a row nothing here
+/// wrote cannot enter the process carrying more than one this build produced.
+#[test]
+fn a_stored_snapshot_beyond_the_bounds_is_refused_on_load() {
+    let oversized = serde_json::json!({
+        "schema_version": 1,
+        "protocol_version": 1,
+        "capabilities": {
+            "auth_methods": (0..MAX_AGENT_AUTH_METHODS + 1)
+                .map(|index| serde_json::json!({"id": index.to_string(), "name": "n"}))
+                .collect::<Vec<_>>(),
+        },
+        "recorded_at": "2023-11-14T22:13:20Z",
+    });
+    let error = super::state::decode_initialize(&oversized).unwrap_err();
+    assert_eq!(error.kind(), "invalid_agent_registration");
+    assert!(
+        error.to_string().contains("authentication methods"),
+        "{error}"
+    );
+
+    let long_detail = serde_json::json!({
+        "schema_version": 1,
+        "status": "failed",
+        "detail": "x".repeat(MAX_HEALTH_DETAIL_LENGTH + 1),
+        "elapsed_ms": 1,
+        "checked_at": "2023-11-14T22:13:20Z",
+    });
+    assert_eq!(
+        super::state::decode_health(&long_detail)
+            .unwrap_err()
+            .kind(),
+        "invalid_agent_registration"
+    );
+}
+
 #[test]
 fn every_authentication_status_spelling_round_trips() {
     for status in AuthStatus::ALL {
@@ -732,18 +915,63 @@ fn an_already_cancelled_probe_reports_the_cancellation() {
     assert_eq!(report.truncation(), Some(DiscoveryTruncation::Cancelled));
 }
 
-/// A candidate name is joined onto a search-path directory, so one carrying a
-/// path separator would make the probe report a path outside the directory it
-/// claims to have searched.
+/// A candidate name is joined onto a search-path directory, so anything but one
+/// ordinary file name would make the probe report a path outside the directory
+/// it claims to have searched — `..` most obviously, and a bare root or prefix
+/// most quietly, because joining an absolute path discards the directory.
+#[cfg(unix)]
 #[test]
-fn a_candidate_name_that_is_a_path_is_dropped() {
+fn a_candidate_name_that_is_not_one_file_name_is_dropped() {
+    let fixture = Fixture::new();
+    let outside = fixture.directory("outside");
+    let inside = fixture.directory("outside/bin");
+    fixture.shim("outside/reachable", "#!/bin/sh\nexit 0\n");
+    let unreachable = inside.join("../reachable");
+    assert!(unreachable.exists(), "the escape target really is there");
+
     let report = Discovery::default()
-        .looking_for(["../../bin/agent", "", "gemini"])
-        .on_path(String::new())
+        .looking_for(["../reachable", "..", ".", "/", "gemini"])
+        .on_path(inside.clone())
         .run(&Cancellation::default());
 
-    assert_eq!(report.directories_searched(), 0);
+    assert_eq!(
+        report.candidates().count(),
+        0,
+        "only `gemini` survived the filter, and nothing is installed under it"
+    );
     assert!(report.is_complete());
+    assert!(outside.exists());
+
+    // The filter itself: only the plain name is kept.
+    let kept = Discovery::default()
+        .looking_for(["../reachable", "..", ".", "/", "gemini"])
+        .on_path(String::new())
+        .run(&Cancellation::default());
+    assert_eq!(kept.directories_searched(), 0);
+}
+
+/// A trailing separator is an ordinary way to write a `PATH`, and the empty
+/// entry it produces must not be what reports a complete probe as truncated.
+#[test]
+fn a_trailing_path_separator_does_not_report_a_complete_probe_as_truncated() {
+    let fixture = Fixture::new();
+    let mut entries = std::env::join_paths([fixture.root.path(), fixture.root.path()])
+        .unwrap()
+        .into_string()
+        .expect("a temporary path is valid UTF-8");
+    entries.push(':');
+
+    let report = Discovery::default()
+        .on_path(entries)
+        .across_at_most(2)
+        .run(&Cancellation::default());
+
+    assert_eq!(report.directories_searched(), 2);
+    assert_eq!(
+        report.truncation(),
+        None,
+        "both real directories were searched, so nothing was truncated"
+    );
 }
 
 // -- repository suggestions --------------------------------------------------
@@ -1036,7 +1264,7 @@ fn an_agent_that_hangs_is_force_terminated_and_records_an_initialize_timeout() {
 
 #[cfg(unix)]
 #[test]
-fn an_agent_advertising_authentication_is_healthy_to_check_and_refuses_to_launch() {
+fn an_agent_advertising_authentication_refuses_to_launch_until_a_sign_in_is_recorded() {
     let harness = Harness::new();
     let shim = auth_required_shim(&harness.fixture, "auth-agent");
     let id = harness.ready("auth", &shim, &[]);
@@ -1058,6 +1286,36 @@ fn an_agent_advertising_authentication_is_healthy_to_check_and_refuses_to_launch
         .prepare_launch(&id, &LaunchContext::default())
         .unwrap_err();
     assert_eq!(refusal.kind(), "agent_authentication_required");
+
+    // And there is a way out of that state. ACP v1 has the agent authenticate
+    // itself, so a signed-in agent advertises exactly what an unsigned one does
+    // and no handshake can tell them apart — without this, running a health
+    // check would permanently take away an agent that was launchable before it.
+    let state = harness
+        .service
+        .record_authentication(&id, AuthStatus::Authenticated)
+        .unwrap();
+    assert_eq!(state.auth_status(), AuthStatus::Authenticated);
+    assert!(
+        harness
+            .service
+            .prepare_launch(&id, &LaunchContext::default())
+            .is_ok()
+    );
+
+    // A later check does not undo it: the agent still offers the method it was
+    // authenticated through, and still advertising a way in is not asking again.
+    check(&harness.service, &HealthCheck::new(id.clone())).unwrap();
+    assert_eq!(
+        harness.service.get(&id).unwrap().state().auth_status(),
+        AuthStatus::Authenticated
+    );
+    assert!(
+        harness
+            .service
+            .prepare_launch(&id, &LaunchContext::default())
+            .is_ok()
+    );
 }
 
 #[cfg(unix)]
@@ -1343,6 +1601,74 @@ fn a_revoked_grant_is_terminal_and_a_later_decision_is_a_new_record() {
     );
     assert_eq!(history[0].record().state(), TrustState::Revoked);
     assert_eq!(history[1].record().state(), TrustState::Trusted);
+    assert_eq!(
+        harness.service.get(&id).unwrap().state().trust().state(),
+        TrustState::Trusted,
+        "the newer decision is the one in force, whatever grant time it carries"
+    );
+}
+
+/// Revoking twice is not an error. "Make sure this is not trusted" is a call a
+/// surface makes without first asking whether it already is.
+#[cfg(unix)]
+#[test]
+fn revoking_an_already_revoked_grant_reports_the_state_rather_than_refusing() {
+    let harness = Harness::new();
+    let shim = healthy_shim(&harness.fixture, "twice-revoked-agent");
+    let id = harness.ready("twice", &shim, &[]);
+
+    harness.service.revoke_trust(&id).unwrap();
+    let second = harness.service.revoke_trust(&id).unwrap();
+
+    assert_eq!(second.trust().state(), TrustState::Revoked);
+    assert!(!second.registration().is_enabled());
+    assert_eq!(
+        harness.service.trust_history(&id).unwrap().len(),
+        1,
+        "a repeat is a no-op, not a second record"
+    );
+
+    // And an agent nobody ever trusted is the same no-op.
+    harness
+        .service
+        .register(registration("never", "/usr/bin/never"))
+        .unwrap();
+    let never = harness
+        .service
+        .revoke_trust(&AgentId::new("never").unwrap())
+        .unwrap();
+    assert_eq!(never.trust().state(), TrustState::Untrusted);
+}
+
+/// The grant time is the user's decision and the row order is Harkness's
+/// bookkeeping. Conflating them lets a caller naming an old `granted_at` file a
+/// fresh decision behind the revocation it replaces.
+#[cfg(unix)]
+#[test]
+fn a_grant_time_older_than_the_record_it_replaces_is_still_the_latest_record() {
+    let harness = Harness::new();
+    let shim = healthy_shim(&harness.fixture, "backdated-agent");
+    let id = harness.ready("backdated", &shim, &[]);
+    harness.service.revoke_trust(&id).unwrap();
+
+    // A grant time *before* the revoked record's, which is what a caller reading
+    // a clock that disagrees with this machine's would produce.
+    harness
+        .service
+        .trust(TrustAgent::new(id.clone(), at(-500)).and_enable())
+        .unwrap();
+
+    let state = harness.service.get(&id).unwrap();
+    assert_eq!(state.state().trust().state(), TrustState::Trusted);
+    assert!(state.registration().is_enabled());
+    assert!(
+        harness
+            .service
+            .prepare_launch(&id, &LaunchContext::default())
+            .is_ok(),
+        "an enabled agent whose latest record read `revoked` would be the worst \
+         of both answers"
+    );
 }
 
 #[cfg(unix)]
@@ -1443,7 +1769,7 @@ fn a_workspace_scoped_grant_does_not_reach_another_workspace() {
     assert!(
         harness
             .service
-            .prepare_launch(&id, &LaunchContext::default().in_workspace(project))
+            .prepare_launch(&id, &LaunchContext::default().in_workspace(&project))
             .is_ok()
     );
 
@@ -1454,6 +1780,67 @@ fn a_workspace_scoped_grant_does_not_reach_another_workspace() {
 
     assert_eq!(error.kind(), "agent_not_trusted");
     assert!(error.to_string().contains("different workspace"), "{error}");
+
+    // And the grant it does not reach is *untouched*. Being used in the wrong
+    // place is not drift: nothing about the subject changed, so treating it as
+    // drift would destroy a decision that is still perfectly good where it was
+    // made — and would do it whenever a caller forgot to name the workspace.
+    let state = harness.service.get(&id).unwrap();
+    assert_eq!(state.state().trust().state(), TrustState::Trusted);
+    assert_eq!(state.state().trust().invalidation_reason(), None);
+    assert!(
+        state.registration().is_enabled(),
+        "a refusal must not switch the agent off"
+    );
+    assert!(
+        harness
+            .service
+            .prepare_launch(&id, &LaunchContext::default().in_workspace(project))
+            .is_ok(),
+        "the workspace the grant was given for still launches"
+    );
+}
+
+/// A caller that forgets to name the workspace gets a refusal, not a wrecked
+/// grant. This is the same property as above and the likeliest way to hit it.
+#[cfg(unix)]
+#[test]
+fn a_launch_that_names_no_workspace_cannot_reach_a_workspace_scoped_grant() {
+    let harness = Harness::new();
+    let shim = healthy_shim(&harness.fixture, "unscoped-agent");
+    let project = harness.fixture.directory("unscoped-project");
+    let id = AgentId::new("unscoped").unwrap();
+    harness
+        .service
+        .register(
+            AgentRegistration::new(id.clone(), "Scoped Agent", shim, AgentSource::User).unwrap(),
+        )
+        .unwrap();
+    harness
+        .service
+        .trust(
+            TrustAgent::new(id.clone(), at(0))
+                .in_workspace(project.clone())
+                .and_enable(),
+        )
+        .unwrap();
+
+    let error = harness
+        .service
+        .prepare_launch(&id, &LaunchContext::default())
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "agent_not_trusted");
+    assert_eq!(
+        harness.service.get(&id).unwrap().state().trust().state(),
+        TrustState::Trusted
+    );
+    assert!(
+        harness
+            .service
+            .prepare_launch(&id, &LaunchContext::default().in_workspace(project))
+            .is_ok()
+    );
 }
 
 // -- events ------------------------------------------------------------------
