@@ -35,7 +35,7 @@ pub mod ffi {
         include!("cxx-qt-lib/core/qlist/qlist_QVariant.h");
         type QList_QVariant = cxx_qt_lib::QList<QVariant>;
 
-        include!("changesmodelbase.h");
+        include!("listmodelbase.h");
         type ChangesModelBase;
 
         #[rust_name = "begin_insert"]
@@ -92,12 +92,14 @@ pub mod ffi {
     }
 }
 
-use std::{collections::HashSet, pin::Pin};
+use std::pin::Pin;
 
 use cxx_qt::{CxxQtType, casting::Upcast};
 use cxx_qt_lib::{
     QByteArray, QHash, QHashPair_i32_QByteArray, QList, QModelIndex, QString, QVariant,
 };
+
+use super::reconcile::{Edit, Keyed, plan};
 
 /// `Qt::DisplayRole`, so a row reads as its path in accessibility tooling.
 const DISPLAY_ROLE: i32 = 0;
@@ -133,124 +135,20 @@ impl ChangeRow {
     }
 }
 
+impl Keyed for ChangeRow {
+    /// The backend's `pathId`, which is stable for as long as a path keeps its
+    /// place in the status projection.
+    fn key(&self) -> &str {
+        &self.key
+    }
+}
+
 fn entry_field(entry: &QVariant, key: &str) -> Option<String> {
     entry
         .value::<cxx_qt_lib::QMap<cxx_qt_lib::QMapPair_QString_QVariant>>()?
         .get(&QString::from(key))?
         .value::<QString>()
         .map(|value| value.to_string())
-}
-
-/// One step of a reconciliation, in the row coordinates that hold when the
-/// step is applied. Steps are recorded in the order they must be applied.
-#[derive(Clone, Debug, PartialEq)]
-enum ModelEdit {
-    Remove { first: usize, last: usize },
-    Insert { first: usize, rows: Vec<ChangeRow> },
-    Update { first: usize, rows: Vec<ChangeRow> },
-}
-
-fn has_duplicate_keys(rows: &[ChangeRow]) -> bool {
-    let mut seen = HashSet::with_capacity(rows.len());
-    !rows.iter().all(|row| seen.insert(row.key.as_str()))
-}
-
-/// Extends the run that ends at `position`, or starts a new one there.
-fn extend_run(
-    run: &mut Option<(usize, Vec<ChangeRow>)>,
-    edits: &mut Vec<ModelEdit>,
-    wrap: fn(usize, Vec<ChangeRow>) -> ModelEdit,
-    position: usize,
-    row: ChangeRow,
-) {
-    match run {
-        Some((first, rows)) if *first + rows.len() == position => rows.push(row),
-        _ => {
-            flush_run(run, edits, wrap);
-            *run = Some((position, vec![row]));
-        }
-    }
-}
-
-fn flush_run(
-    run: &mut Option<(usize, Vec<ChangeRow>)>,
-    edits: &mut Vec<ModelEdit>,
-    wrap: fn(usize, Vec<ChangeRow>) -> ModelEdit,
-) {
-    if let Some((first, rows)) = run.take() {
-        edits.push(wrap(first, rows));
-    }
-}
-
-fn insert_edit(first: usize, rows: Vec<ChangeRow>) -> ModelEdit {
-    ModelEdit::Insert { first, rows }
-}
-
-fn update_edit(first: usize, rows: Vec<ChangeRow>) -> ModelEdit {
-    ModelEdit::Update { first, rows }
-}
-
-/// Plans the edits that turn `current` into `incoming`, or `None` when the
-/// rows have been reordered or carry ambiguous keys and only a reset is
-/// honest about what happened.
-fn plan_edits(current: &[ChangeRow], incoming: &[ChangeRow]) -> Option<Vec<ModelEdit>> {
-    if has_duplicate_keys(current) || has_duplicate_keys(incoming) {
-        return None;
-    }
-    let wanted = incoming
-        .iter()
-        .map(|row| row.key.as_str())
-        .collect::<HashSet<_>>();
-    let mut edits = Vec::new();
-
-    // Removals are recorded back to front, so the index each one names is
-    // still the index it has when the edits are applied in order.
-    let mut retained = current.iter().collect::<Vec<_>>();
-    let mut index = retained.len();
-    while index > 0 {
-        index -= 1;
-        if wanted.contains(retained[index].key.as_str()) {
-            continue;
-        }
-        let last = index;
-        while index > 0 && !wanted.contains(retained[index - 1].key.as_str()) {
-            index -= 1;
-        }
-        edits.push(ModelEdit::Remove { first: index, last });
-        retained.drain(index..=last);
-    }
-
-    // Every surviving row now has to appear in the incoming order. Walking
-    // both in step identifies each incoming row as either the next survivor —
-    // unchanged or updated in place — or an insertion.
-    let mut cursor = 0;
-    let mut insertion = None;
-    let mut update = None;
-    for (position, row) in incoming.iter().enumerate() {
-        if cursor < retained.len() && retained[cursor].key == row.key {
-            flush_run(&mut insertion, &mut edits, insert_edit);
-            if retained[cursor].value == row.value {
-                flush_run(&mut update, &mut edits, update_edit);
-            } else {
-                extend_run(&mut update, &mut edits, update_edit, position, row.clone());
-            }
-            cursor += 1;
-        } else {
-            flush_run(&mut update, &mut edits, update_edit);
-            extend_run(
-                &mut insertion,
-                &mut edits,
-                insert_edit,
-                position,
-                row.clone(),
-            );
-        }
-    }
-    flush_run(&mut insertion, &mut edits, insert_edit);
-    flush_run(&mut update, &mut edits, update_edit);
-
-    // A survivor the incoming order never reached means the rows moved.
-    (cursor == retained.len()).then_some(edits)
 }
 
 #[derive(Default)]
@@ -305,7 +203,7 @@ impl ffi::ChangesModel {
             // nothing: a notification here is what rebuilt the list on a timer.
             return;
         }
-        match plan_edits(&self.as_ref().rust().rows, &incoming) {
+        match plan(&self.as_ref().rust().rows, &incoming) {
             Some(edits) => {
                 for edit in edits {
                     self.as_mut().apply(edit);
@@ -328,9 +226,9 @@ impl ffi::ChangesModel {
 
     /// Applies one planned edit, wrapping the row mutation in the notification
     /// Qt requires for it.
-    fn apply(mut self: Pin<&mut Self>, edit: ModelEdit) {
+    fn apply(mut self: Pin<&mut Self>, edit: Edit<ChangeRow>) {
         match edit {
-            ModelEdit::Remove { first, last } => {
+            Edit::Remove { first, last } => {
                 {
                     let base: Pin<&mut ffi::ChangesModelBase> = self.as_mut().upcast_pin();
                     base.begin_remove(first as i32, last as i32);
@@ -339,7 +237,7 @@ impl ffi::ChangesModel {
                 let base: Pin<&mut ffi::ChangesModelBase> = self.as_mut().upcast_pin();
                 base.end_remove();
             }
-            ModelEdit::Insert { first, rows } => {
+            Edit::Insert { first, rows } => {
                 let last = first + rows.len() - 1;
                 {
                     let base: Pin<&mut ffi::ChangesModelBase> = self.as_mut().upcast_pin();
@@ -353,7 +251,7 @@ impl ffi::ChangesModel {
                 let base: Pin<&mut ffi::ChangesModelBase> = self.as_mut().upcast_pin();
                 base.end_insert();
             }
-            ModelEdit::Update { first, rows } => {
+            Edit::Update { first, rows } => {
                 let last = first + rows.len() - 1;
                 self.as_mut()
                     .rust_mut()
@@ -371,9 +269,8 @@ impl ffi::ChangesModel {
 mod tests {
     use cxx_qt_lib::{QByteArray, QMap, QMapPair_QString_QVariant, QString, QVariant};
 
-    use super::{
-        ChangeRow, DISPLAY_ROLE, ENTRY_ROLE, ModelEdit, PATH_ID_ROLE, model_roles, plan_edits,
-    };
+    use super::super::reconcile::{Edit, plan};
+    use super::{ChangeRow, DISPLAY_ROLE, ENTRY_ROLE, PATH_ID_ROLE, model_roles};
 
     fn entry(path_id: &str, path: &str, unstaged: &str) -> QVariant {
         let mut map = QMap::<QMapPair_QString_QVariant>::default();
@@ -421,7 +318,7 @@ mod tests {
             row("path-2", "b.txt", ""),
         ];
 
-        assert_eq!(plan_edits(&rows, &rows.clone()), Some(Vec::new()));
+        assert_eq!(plan(&rows, &rows.clone()), Some(Vec::new()));
     }
 
     #[test]
@@ -434,8 +331,8 @@ mod tests {
         let incoming = vec![current[0].clone(), current[2].clone()];
 
         assert_eq!(
-            plan_edits(&current, &incoming),
-            Some(vec![ModelEdit::Remove { first: 1, last: 1 }])
+            plan(&current, &incoming),
+            Some(vec![Edit::Remove { first: 1, last: 1 }])
         );
     }
 
@@ -449,8 +346,8 @@ mod tests {
         let incoming = vec![current[2].clone()];
 
         assert_eq!(
-            plan_edits(&current, &incoming),
-            Some(vec![ModelEdit::Remove { first: 0, last: 1 }])
+            plan(&current, &incoming),
+            Some(vec![Edit::Remove { first: 0, last: 1 }])
         );
     }
 
@@ -464,8 +361,8 @@ mod tests {
         let incoming = vec![current[0].clone(), inserted.clone(), current[1].clone()];
 
         assert_eq!(
-            plan_edits(&current, &incoming),
-            Some(vec![ModelEdit::Insert {
+            plan(&current, &incoming),
+            Some(vec![Edit::Insert {
                 first: 1,
                 rows: vec![inserted],
             }])
@@ -482,8 +379,8 @@ mod tests {
         let incoming = vec![current[0].clone(), changed.clone()];
 
         assert_eq!(
-            plan_edits(&current, &incoming),
-            Some(vec![ModelEdit::Update {
+            plan(&current, &incoming),
+            Some(vec![Edit::Update {
                 first: 1,
                 rows: vec![changed],
             }])
@@ -501,17 +398,17 @@ mod tests {
         let added = row("path-4", "d.txt", "untracked");
         let incoming = vec![current[0].clone(), changed.clone(), added.clone()];
 
-        let edits = plan_edits(&current, &incoming).expect("the order is unchanged");
+        let edits = plan(&current, &incoming).expect("the order is unchanged");
 
         assert_eq!(
             edits,
             vec![
-                ModelEdit::Remove { first: 1, last: 1 },
-                ModelEdit::Update {
+                Edit::Remove { first: 1, last: 1 },
+                Edit::Update {
                     first: 1,
                     rows: vec![changed],
                 },
-                ModelEdit::Insert {
+                Edit::Insert {
                     first: 2,
                     rows: vec![added],
                 },
@@ -527,7 +424,7 @@ mod tests {
         ];
         let incoming = vec![current[1].clone(), current[0].clone()];
 
-        assert_eq!(plan_edits(&current, &incoming), None);
+        assert_eq!(plan(&current, &incoming), None);
     }
 
     #[test]
@@ -537,6 +434,6 @@ mod tests {
         ));
         let incoming = vec![untokenized.clone(), untokenized];
 
-        assert_eq!(plan_edits(&[], &incoming), None);
+        assert_eq!(plan(&[], &incoming), None);
     }
 }

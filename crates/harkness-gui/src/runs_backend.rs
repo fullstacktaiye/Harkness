@@ -16,6 +16,16 @@
 //! `cancelRun`, `retryRun`, `approve`, `deny`, and the on-demand
 //! `loadApprovalInput`.
 //!
+//! # Reading and attaching are different things
+//!
+//! Everything this process shares about one data directory lives in
+//! [`Attached`]: one `Store`, and at most one `RunCoordinator` above it.
+//! A read takes the store ([`read_store`]) and a decision to drive work takes
+//! the coordinator ([`coordinator_for`]), and the split is the point — building
+//! a coordinator takes this process's lease and runs the recovery sweep, which
+//! writes. Looking at run history must not do that; cancelling, retrying, or
+//! answering an approval is exactly when it should.
+//!
 //! # The Qt-thread mutation invariant
 //!
 //! Every `RunsBackendRust` field is read and written on the Qt thread and
@@ -132,6 +142,7 @@ use harkness_runtime::approval::{ApprovalDecision, ApprovalId, ApprovalScope, De
 use harkness_runtime::coordinator::{RunCoordinator, RuntimeError};
 use harkness_runtime::domain::{RunId, ToolCall, ToolCallState};
 use harkness_runtime::store::{PassThrough, Store, StoreError};
+use harkness_runtime::tool::WorkspaceMetadata;
 
 /// Largest approval input this bridge hands to QML.
 ///
@@ -213,54 +224,93 @@ impl From<StoreError> for RunsFailure {
     }
 }
 
-/// This process's run coordinator for one data directory.
+/// What this process has attached to one data directory.
 ///
-/// A coordinator owns a `Scheduler`, and the scheduler is what serializes
-/// mutating tool calls per workspace and caps child processes across all of
-/// them; it also owns the *lease* that says which runs this process is driving.
-/// Both make it a process-wide resource rather than a per-caller one, which is
-/// why the checks panel and the runs bridge address it through this one cache
-/// instead of building one each. Two coordinators in one process would take two
-/// leases, cap child processes against each other, and — because
-/// `RunCoordinator::cancel_run` only knows the runs its own coordinator started
-/// — leave every run started by the other one uncancellable.
+/// One `Store` per directory and at most one `RunCoordinator` above it, behind
+/// one lock so there is no order to get wrong between them. Two stores would
+/// mean two write mutexes inside one process, which is safe — SQLite serializes
+/// them — but turns an in-process wait into a `busy_timeout` for no reason. Two
+/// coordinators would be worse: two leases, child-process caps that do not see
+/// each other, and — because `RunCoordinator::cancel_run` only knows the runs
+/// its own coordinator started — every run one of them started uncancellable
+/// from the other.
 ///
-/// Keyed by data directory rather than held as a single value: the directory is
-/// chosen at startup, but a test process can drive more than one, and a
-/// coordinator belongs to exactly one store.
+/// Keyed by data directory rather than held as single values: the directory is
+/// chosen at startup, but a test process can drive more than one.
+#[derive(Default)]
+struct Attached {
+    stores: HashMap<PathBuf, Arc<Store>>,
+    coordinators: HashMap<PathBuf, RunCoordinator>,
+}
+
+static ATTACHED: OnceLock<Mutex<Attached>> = OnceLock::new();
+
+fn attached() -> Result<std::sync::MutexGuard<'static, Attached>, RunsFailure> {
+    ATTACHED
+        .get_or_init(|| Mutex::new(Attached::default()))
+        .lock()
+        .map_err(|_| {
+            RunsFailure::new(
+                COORDINATOR_UNAVAILABLE,
+                "the run store cache is poisoned; restart Harkness",
+            )
+        })
+}
+
+/// The store this process reads run history out of.
+///
+/// `None` means the data directory has recorded nothing at all. A read must
+/// never be what brings a run store into existence — the same rule the checks
+/// panel follows — so a directory with no `runtime.db` is left exactly as it
+/// was.
+///
+/// # A read attaches to a store and nothing else
+///
+/// This deliberately does *not* build a `RunCoordinator`. Constructing one
+/// takes this process's lease and runs the startup sweep, which marks every run
+/// whose owning process is provably dead as `interrupted` and appends an event
+/// saying so — writes, on a path a user reached by opening a panel to look at
+/// something. The reads this bridge performs need none of it: paging runs,
+/// paging a timeline, listing pending approvals and reading one call's input
+/// are all `Store` queries, and the one read that genuinely needs a coordinator
+/// — subscribing to a live run — settles for [`cached_coordinator`] instead.
+///
+/// The cost is that a run abandoned by a dead process keeps reading as
+/// `running` until something in this process actually drives work. That is what
+/// is recorded, and correcting it is a decision with side effects rather than a
+/// side effect of looking.
+pub(crate) fn read_store(data_dir: &Path) -> Result<Option<Arc<Store>>, RunsFailure> {
+    assert_off_qt_thread();
+    let mut attached = attached()?;
+    open_store(&mut attached, data_dir, false)
+}
+
+/// The coordinator already built for a directory, never building one.
+///
+/// The subscription seam. A run this process is not driving cannot publish to
+/// it anyway — `RunCoordinator::subscribe` hands back a receiver that replays
+/// the durable history and then waits for a worker that does not exist — so
+/// declining to build one here costs a timeline nothing it could have had.
+pub(crate) fn cached_coordinator(data_dir: &Path) -> Result<Option<RunCoordinator>, RunsFailure> {
+    assert_off_qt_thread();
+    Ok(attached()?.coordinators.get(data_dir).cloned())
+}
+
+/// This process's run coordinator for one data directory, built if needed.
+///
+/// Reserved for the paths that drive work: starting a check, cancelling,
+/// retrying, and answering an approval. Each of those is a decision the user
+/// made, which is the right moment to take the lease and sweep.
 pub(crate) fn coordinator_for(data_dir: &Path) -> Result<RunCoordinator, RunsFailure> {
     coordinator_in(data_dir, true).map(|coordinator| {
         coordinator.expect("a coordinator asked to be created is returned or refused")
     })
 }
 
-/// The coordinator for a data directory that has already recorded something.
-///
-/// A read must not be what brings a run store into existence — the same rule
-/// the checks panel follows. A directory with no `runtime.db` answers `None` and
-/// is left exactly as it was; a coordinator already built for it is returned
-/// without probing, because at that point the store demonstrably exists.
-///
-/// # Attaching to an existing store is not itself a read
-///
-/// Building the *first* coordinator for a directory takes this process's lease
-/// and runs the startup sweep, which marks every run whose owning process is
-/// provably dead as `interrupted` and appends an event saying so. That is a
-/// write, and it happens on whichever call gets there first — the runs panel
-/// opening, or a check being started. It is deliberate rather than incidental:
-/// a front end attaching to run history is exactly the moment abandoned runs
-/// should stop reading as live, and ADR-0020 makes the sweep a precondition of
-/// accepting work rather than something a caller may skip. What it must never
-/// do is disturb a *live* sibling process, and it cannot: the proof is an
-/// advisory lock rather than a timestamp.
-pub(crate) fn existing_coordinator(data_dir: &Path) -> Result<Option<RunCoordinator>, RunsFailure> {
-    coordinator_in(data_dir, false)
-}
-
 /// The thread every bridge method runs on.
 ///
-/// Recorded from the Qt thread itself — see [`note_qt_thread`] — so the one
-/// place a store is reached from can assert it is somewhere else. There is no
+/// Recorded from the Qt thread itself — see [`note_qt_thread`] — so the places
+/// a store is reached from can assert they are somewhere else. There is no
 /// portable way to ask Qt from Rust which thread a `QObject` lives in, and the
 /// invariant is about this process's threads rather than about Qt anyway.
 static QT_THREAD: OnceLock<std::thread::ThreadId> = OnceLock::new();
@@ -277,9 +327,9 @@ pub(crate) fn note_qt_thread() {
 ///
 /// Blocking the Qt thread on SQLite is the failure this whole file's threading
 /// is arranged to prevent, and it is invisible in a release build until a user
-/// with a large history watches the window freeze. Asserting at the one place
-/// every read and write passes through is what turns "we were careful" into
-/// something a test run can fail on.
+/// with a large history watches the window freeze. Asserting where every read
+/// and write passes through is what turns "we were careful" into something a
+/// test run can fail on.
 fn assert_off_qt_thread() {
     debug_assert!(
         QT_THREAD.get() != Some(&std::thread::current().id()),
@@ -288,25 +338,18 @@ fn assert_off_qt_thread() {
     );
 }
 
-fn coordinator_in(data_dir: &Path, create: bool) -> Result<Option<RunCoordinator>, RunsFailure> {
-    assert_off_qt_thread();
-    static COORDINATORS: OnceLock<Mutex<HashMap<PathBuf, RunCoordinator>>> = OnceLock::new();
-    let mut coordinators = COORDINATORS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .map_err(|_| {
-            RunsFailure::new(
-                COORDINATOR_UNAVAILABLE,
-                "the run coordinator cache is poisoned; restart Harkness",
-            )
-        })?;
-    if let Some(existing) = coordinators.get(data_dir) {
-        return Ok(Some(existing.clone()));
+/// Opens and caches the one store for `data_dir`, creating it only if asked.
+fn open_store(
+    attached: &mut Attached,
+    data_dir: &Path,
+    create: bool,
+) -> Result<Option<Arc<Store>>, RunsFailure> {
+    if let Some(existing) = attached.stores.get(data_dir) {
+        return Ok(Some(Arc::clone(existing)));
     }
-    // Opened once and handed on. `Store::open_existing` is not a cheap probe —
-    // it opens the connection, enables WAL, and climbs the whole migration
-    // ladder — so discarding it and calling `Store::open` would pay for all of
-    // that twice on the first read.
+    // Opened once and kept. `Store::open_existing` is not a cheap probe — it
+    // opens the connection, enables WAL, and climbs the whole migration ladder
+    // — so discarding it and opening again would pay for all of that twice.
     let store = if create {
         Store::open(data_dir)?
     } else {
@@ -315,9 +358,27 @@ fn coordinator_in(data_dir: &Path, create: bool) -> Result<Option<RunCoordinator
             None => return Ok(None),
         }
     };
-    let coordinator = harkness_runtime::check::check_coordinator(Arc::new(store))
+    let store = Arc::new(store);
+    attached
+        .stores
+        .insert(data_dir.to_path_buf(), Arc::clone(&store));
+    Ok(Some(store))
+}
+
+fn coordinator_in(data_dir: &Path, create: bool) -> Result<Option<RunCoordinator>, RunsFailure> {
+    assert_off_qt_thread();
+    let mut attached = attached()?;
+    if let Some(existing) = attached.coordinators.get(data_dir) {
+        return Ok(Some(existing.clone()));
+    }
+    let Some(store) = open_store(&mut attached, data_dir, create)? else {
+        return Ok(None);
+    };
+    let coordinator = harkness_runtime::check::check_coordinator(store)
         .map_err(|error| RunsFailure::new(COORDINATOR_UNAVAILABLE, error.to_string()))?;
-    coordinators.insert(data_dir.to_path_buf(), coordinator.clone());
+    attached
+        .coordinators
+        .insert(data_dir.to_path_buf(), coordinator.clone());
     Ok(Some(coordinator))
 }
 
@@ -338,18 +399,15 @@ pub(crate) fn data_dir() -> Result<PathBuf, RunsFailure> {
     })
 }
 
-/// The coordinator a read goes through, or `None` when nothing was ever run.
-pub(crate) fn read_coordinator() -> Result<Option<RunCoordinator>, RunsFailure> {
-    existing_coordinator(&data_dir()?)
-}
-
 /// The coordinator a mutation goes through.
 ///
 /// A mutation names a run or an approval, so a data directory with no run store
 /// cannot be holding either; saying so is more useful than creating a store to
-/// discover it is empty.
+/// discover it is empty. Where one *does* exist, this is the call that attaches
+/// to it — takes the lease, sweeps — because cancelling, retrying, or answering
+/// an approval is this process deciding to drive work.
 fn write_coordinator() -> Result<RunCoordinator, RunsFailure> {
-    read_coordinator()?.ok_or_else(|| {
+    coordinator_in(&data_dir()?, false)?.ok_or_else(|| {
         RunsFailure::new(NO_RUN_STORE, "this data directory has recorded no runs yet")
     })
 }
@@ -440,12 +498,20 @@ fn clamp(text: String, budget: usize) -> (String, bool) {
     (text[..end].to_owned(), true)
 }
 
-fn approval_input(
-    coordinator: &RunCoordinator,
-    approval: ApprovalId,
-) -> Result<Completion, RunsFailure> {
-    let request = coordinator.store().approval(approval)?;
-    let call = coordinator.store().load_tool_call(request.tool_call_id())?;
+/// Reads the input one pending approval is holding.
+///
+/// A read, so it goes through the store rather than attaching a coordinator:
+/// opening the dialog that asks a question must not be what takes this
+/// process's lease on the runs somebody else is driving.
+fn approval_input(approval: ApprovalId) -> Result<Completion, RunsFailure> {
+    let Some(store) = read_store(&data_dir()?)? else {
+        return Err(RunsFailure::new(
+            NO_RUN_STORE,
+            "this data directory has recorded no runs yet",
+        ));
+    };
+    let request = store.approval(approval)?;
+    let call = store.load_tool_call(request.tool_call_id())?;
     let rendered =
         serde_json::to_string_pretty(call.input()).unwrap_or_else(|_| call.input().to_string());
     let (input, truncated) = clamp(rendered, MAX_APPROVAL_INPUT_BYTES);
@@ -517,6 +583,41 @@ fn retry_scenario(run: RunId, calls: &[ToolCall]) -> Result<Scenario, RunsFailur
             format!("run {run} cannot be re-attempted from its recorded calls: {error}"),
         )
     })
+}
+
+/// The catalog's own view of the project a task named, when it still has one.
+///
+/// Best effort by design: a retry must not be refused because the catalog has
+/// moved on, and every failure here — no catalog, no such project, an
+/// unreadable file — means the same thing, that there is no authoritative
+/// metadata to pass.
+fn catalog_metadata(project: harkness_core::ProjectId) -> Option<WorkspaceMetadata> {
+    let service = harkness_core::ProjectService::load().ok()?;
+    let project = service
+        .resolve(&harkness_core::ProjectSelector::from(project.to_string()))
+        .ok()?;
+    Some(WorkspaceMetadata::from_project(&project))
+}
+
+/// Names the one failure a reader would otherwise have to guess at.
+///
+/// `WorkspaceMismatch` means the reference this bridge built is not the one the
+/// coordinator rebuilt from the same task, and there is exactly one way that
+/// happens: the store acquired a redactor, so the recorded workspace text no
+/// longer round-trips through `PassThrough`. `Store::redactor` is not public,
+/// so a front end cannot ask what the store would produce — the mismatch is the
+/// only signal there is, and it is worth spending it on saying so.
+fn retry_failure(error: RuntimeError) -> RunsFailure {
+    match error {
+        RuntimeError::WorkspaceMismatch { .. } => RunsFailure::new(
+            error.kind(),
+            format!(
+                "{error}; the run store redacts workspace text this build cannot \
+                 reproduce, so retrying from the application is not available"
+            ),
+        ),
+        other => RunsFailure::from(other),
+    }
 }
 
 pub struct RunsBackendRust {
@@ -656,15 +757,21 @@ impl ffi::RunsBackend {
             let scenario = retry_scenario(run, &coordinator.store().load_run_tool_calls(run)?)?;
             // `PassThrough` is what `Store::open` installs and this process
             // never replaces it, so this reference is byte-identical to the one
-            // the coordinator rebuilds from the same task. A build that starts
-            // redacting would fail this comparison by name rather than quietly
-            // retrying against a different workspace.
+            // the coordinator rebuilds from the same task.
             let workspace = WorkspaceRef::from_task(&task, &PassThrough);
-            let retry = coordinator.retry_run(
-                run,
-                Box::new(MockAgent::from_scenario(scenario)),
-                workspace,
-            )?;
+            let agent = Box::new(MockAgent::from_scenario(scenario));
+            // Catalog metadata when the task names a project the catalog still
+            // knows, which is what makes the coordinator canonicalize and check
+            // the workspace root rather than take the recorded path on trust.
+            // A task with no project identity, or one the catalog has since
+            // forgotten, retries without it exactly as it ran without it.
+            let retry = match task.project_id().and_then(catalog_metadata) {
+                Some(metadata) => {
+                    coordinator.retry_run_with_workspace_metadata(run, agent, workspace, metadata)
+                }
+                None => coordinator.retry_run(run, agent, workspace),
+            }
+            .map_err(retry_failure)?;
             Ok(Completion::message(format!(
                 "Started run {retry}, re-attempting {run}"
             )))
@@ -716,10 +823,7 @@ impl ffi::RunsBackend {
 
     fn load_approval_input(self: Pin<&mut Self>, approval_id: &QString) {
         let approval_id = approval_id.to_string();
-        self.dispatch(move || {
-            let approval = parse_approval(&approval_id)?;
-            approval_input(&write_coordinator()?, approval)
-        });
+        self.dispatch(move || approval_input(parse_approval(&approval_id)?));
     }
 }
 

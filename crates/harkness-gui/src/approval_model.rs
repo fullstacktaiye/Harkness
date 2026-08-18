@@ -56,7 +56,7 @@ pub mod ffi {
         include!("cxx-qt-lib/qvariant.h");
         type QVariant = cxx_qt_lib::QVariant;
 
-        include!("approvalmodelbase.h");
+        include!("listmodelbase.h");
         type ApprovalModelBase;
 
         #[rust_name = "begin_insert"]
@@ -117,7 +117,6 @@ pub mod ffi {
     impl cxx_qt::Threading for ApprovalModel {}
 }
 
-use std::collections::HashSet;
 use std::pin::Pin;
 
 use cxx_qt::{CxxQtType, Threading, casting::Upcast};
@@ -125,8 +124,10 @@ use cxx_qt_lib::{QByteArray, QHash, QHashPair_i32_QByteArray, QModelIndex, QStri
 
 use harkness_runtime::approval::ApprovalRequest;
 
+use super::reconcile::{Edit, Keyed, plan};
+
 use super::runs_backend::{
-    RunsFailure, data_dir, existing_coordinator, note_qt_thread, optional_rfc3339, rfc3339,
+    RunsFailure, data_dir, note_qt_thread, optional_rfc3339, read_store, rfc3339,
 };
 
 /// `Qt::DisplayRole`, so a row reads as its tool in accessibility tooling.
@@ -192,6 +193,15 @@ pub(crate) struct ApprovalRow {
     project_id: String,
 }
 
+impl Keyed for ApprovalRow {
+    /// The approval's own identity, which is stable for as long as the question
+    /// is unanswered — and an answered one leaves the queue rather than
+    /// changing key.
+    fn key(&self) -> &str {
+        &self.approval_id
+    }
+}
+
 /// Projects one durable request into a row.
 ///
 /// `scope` is the *effective* scope — what an answer may actually authorize —
@@ -241,138 +251,14 @@ fn load_pending() -> Result<Vec<ApprovalRow>, RunsFailure> {
 /// Split from [`load_pending`] so a test can seed a temporary store and read it
 /// back without touching `HARKNESS_DATA_DIR`, which is process-wide.
 fn load_pending_in(data_dir: &std::path::Path) -> Result<Vec<ApprovalRow>, RunsFailure> {
-    let Some(coordinator) = existing_coordinator(data_dir)? else {
+    let Some(store) = read_store(data_dir)? else {
         return Ok(Vec::new());
     };
-    Ok(coordinator
+    Ok(store
         .pending_approvals()?
         .iter()
         .map(approval_row)
         .collect())
-}
-
-/// One step of a reconciliation, in the row coordinates that hold when the step
-/// is applied. Steps are recorded in the order they must be applied.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ModelEdit {
-    Remove {
-        first: usize,
-        last: usize,
-    },
-    Insert {
-        first: usize,
-        rows: Vec<ApprovalRow>,
-    },
-    Update {
-        first: usize,
-        rows: Vec<ApprovalRow>,
-    },
-}
-
-fn has_duplicate_keys(rows: &[ApprovalRow]) -> bool {
-    let mut seen = HashSet::with_capacity(rows.len());
-    !rows.iter().all(|row| seen.insert(row.approval_id.as_str()))
-}
-
-/// Extends the run that ends at `position`, or starts a new one there.
-fn extend_run(
-    run: &mut Option<(usize, Vec<ApprovalRow>)>,
-    edits: &mut Vec<ModelEdit>,
-    wrap: fn(usize, Vec<ApprovalRow>) -> ModelEdit,
-    position: usize,
-    row: ApprovalRow,
-) {
-    match run {
-        Some((first, rows)) if *first + rows.len() == position => rows.push(row),
-        _ => {
-            flush_run(run, edits, wrap);
-            *run = Some((position, vec![row]));
-        }
-    }
-}
-
-fn flush_run(
-    run: &mut Option<(usize, Vec<ApprovalRow>)>,
-    edits: &mut Vec<ModelEdit>,
-    wrap: fn(usize, Vec<ApprovalRow>) -> ModelEdit,
-) {
-    if let Some((first, rows)) = run.take() {
-        edits.push(wrap(first, rows));
-    }
-}
-
-fn insert_edit(first: usize, rows: Vec<ApprovalRow>) -> ModelEdit {
-    ModelEdit::Insert { first, rows }
-}
-
-fn update_edit(first: usize, rows: Vec<ApprovalRow>) -> ModelEdit {
-    ModelEdit::Update { first, rows }
-}
-
-/// Plans the edits that turn `current` into `incoming`, or `None` when the rows
-/// have been reordered or carry ambiguous keys and only a reset is honest about
-/// what happened.
-pub(crate) fn plan_edits(
-    current: &[ApprovalRow],
-    incoming: &[ApprovalRow],
-) -> Option<Vec<ModelEdit>> {
-    if has_duplicate_keys(current) || has_duplicate_keys(incoming) {
-        return None;
-    }
-    let wanted = incoming
-        .iter()
-        .map(|row| row.approval_id.as_str())
-        .collect::<HashSet<_>>();
-    let mut edits = Vec::new();
-
-    // Removals are recorded back to front, so the index each one names is still
-    // the index it has when the edits are applied in order.
-    let mut retained = current.iter().collect::<Vec<_>>();
-    let mut index = retained.len();
-    while index > 0 {
-        index -= 1;
-        if wanted.contains(retained[index].approval_id.as_str()) {
-            continue;
-        }
-        let last = index;
-        while index > 0 && !wanted.contains(retained[index - 1].approval_id.as_str()) {
-            index -= 1;
-        }
-        edits.push(ModelEdit::Remove { first: index, last });
-        retained.drain(index..=last);
-    }
-
-    // Every surviving row now has to appear in the incoming order. Walking both
-    // in step identifies each incoming row as either the next survivor —
-    // unchanged or updated in place — or an insertion.
-    let mut cursor = 0;
-    let mut insertion = None;
-    let mut update = None;
-    for (position, row) in incoming.iter().enumerate() {
-        if cursor < retained.len() && retained[cursor].approval_id == row.approval_id {
-            flush_run(&mut insertion, &mut edits, insert_edit);
-            if *retained[cursor] == *row {
-                flush_run(&mut update, &mut edits, update_edit);
-            } else {
-                extend_run(&mut update, &mut edits, update_edit, position, row.clone());
-            }
-            cursor += 1;
-        } else {
-            flush_run(&mut update, &mut edits, update_edit);
-            extend_run(
-                &mut insertion,
-                &mut edits,
-                insert_edit,
-                position,
-                row.clone(),
-            );
-        }
-    }
-    flush_run(&mut insertion, &mut edits, insert_edit);
-    flush_run(&mut update, &mut edits, update_edit);
-
-    // A survivor the incoming order never reached means the rows moved.
-    (cursor == retained.len()).then_some(edits)
 }
 
 #[derive(Default)]
@@ -447,9 +333,9 @@ impl ffi::ApprovalModel {
 
     /// Applies one planned edit, wrapping the row mutation in the notification
     /// Qt requires for it.
-    fn edit(mut self: Pin<&mut Self>, edit: ModelEdit) {
+    fn edit(mut self: Pin<&mut Self>, edit: Edit<ApprovalRow>) {
         match edit {
-            ModelEdit::Remove { first, last } => {
+            Edit::Remove { first, last } => {
                 {
                     let base: Pin<&mut ffi::ApprovalModelBase> = self.as_mut().upcast_pin();
                     base.begin_remove(first as i32, last as i32);
@@ -458,7 +344,7 @@ impl ffi::ApprovalModel {
                 let base: Pin<&mut ffi::ApprovalModelBase> = self.as_mut().upcast_pin();
                 base.end_remove();
             }
-            ModelEdit::Insert { first, rows } => {
+            Edit::Insert { first, rows } => {
                 let last = first + rows.len() - 1;
                 {
                     let base: Pin<&mut ffi::ApprovalModelBase> = self.as_mut().upcast_pin();
@@ -472,7 +358,7 @@ impl ffi::ApprovalModel {
                 let base: Pin<&mut ffi::ApprovalModelBase> = self.as_mut().upcast_pin();
                 base.end_insert();
             }
-            ModelEdit::Update { first, rows } => {
+            Edit::Update { first, rows } => {
                 let last = first + rows.len() - 1;
                 self.as_mut()
                     .rust_mut()
@@ -516,7 +402,7 @@ fn apply_queue(
     model.as_mut().set_kind(QString::default());
     // Bound before the loop: a temporary in a `for` head lives for the whole
     // loop, and this one borrows the object the body mutates.
-    let planned = plan_edits(&model.as_ref().rust().rows, &incoming);
+    let planned = plan(&model.as_ref().rust().rows, &incoming);
     match planned {
         Some(edits) => {
             for edit in edits {
@@ -554,11 +440,12 @@ mod tests {
     use harkness_runtime::tool::{Capability, RiskLevel, ToolIdentity};
     use tempfile::TempDir;
 
+    use super::super::reconcile::{Edit, plan};
     use super::{
         APPROVAL_ID_ROLE, CAPABILITIES_ROLE, DISPLAY_ROLE, DOWNGRADED_ROLE, EXPIRES_ROLE,
-        ModelEdit, PROJECT_ROLE, REQUESTED_ROLE, REQUESTED_SCOPE_ROLE, RISK_ROLE, RUN_ID_ROLE,
-        SCOPE_ROLE, SUMMARY_ROLE, TOOL_CALL_ID_ROLE, TOOL_ID_ROLE, TOOL_ROLE, TOOL_VERSION_ROLE,
-        WORKSPACE_ROLE, approval_row, load_pending_in, model_roles, plan_edits,
+        PROJECT_ROLE, REQUESTED_ROLE, REQUESTED_SCOPE_ROLE, RISK_ROLE, RUN_ID_ROLE, SCOPE_ROLE,
+        SUMMARY_ROLE, TOOL_CALL_ID_ROLE, TOOL_ID_ROLE, TOOL_ROLE, TOOL_VERSION_ROLE,
+        WORKSPACE_ROLE, approval_row, load_pending_in, model_roles,
     };
 
     fn at(seconds: i64) -> OffsetDateTime {
@@ -663,7 +550,7 @@ mod tests {
             approval_row(&request("fs.apply_patch")),
         ];
 
-        assert_eq!(plan_edits(&rows, &rows.clone()), Some(Vec::new()));
+        assert_eq!(plan(&rows, &rows.clone()), Some(Vec::new()));
     }
 
     #[test]
@@ -676,8 +563,8 @@ mod tests {
         let incoming = vec![current[0].clone(), current[2].clone()];
 
         assert_eq!(
-            plan_edits(&current, &incoming),
-            Some(vec![ModelEdit::Remove { first: 1, last: 1 }])
+            plan(&current, &incoming),
+            Some(vec![Edit::Remove { first: 1, last: 1 }])
         );
     }
 
@@ -688,8 +575,8 @@ mod tests {
         let incoming = vec![current[0].clone(), added.clone()];
 
         assert_eq!(
-            plan_edits(&current, &incoming),
-            Some(vec![ModelEdit::Insert {
+            plan(&current, &incoming),
+            Some(vec![Edit::Insert {
                 first: 1,
                 rows: vec![added],
             }])
@@ -704,8 +591,8 @@ mod tests {
         ];
 
         assert_eq!(
-            plan_edits(&current, &[]),
-            Some(vec![ModelEdit::Remove { first: 0, last: 1 }])
+            plan(&current, &[]),
+            Some(vec![Edit::Remove { first: 0, last: 1 }])
         );
     }
 
@@ -717,14 +604,14 @@ mod tests {
         ];
         let incoming = vec![current[1].clone(), current[0].clone()];
 
-        assert_eq!(plan_edits(&current, &incoming), None);
+        assert_eq!(plan(&current, &incoming), None);
     }
 
     #[test]
     fn ambiguous_keys_fall_back_to_a_reset() {
         let row = approval_row(&request("process.exec"));
 
-        assert_eq!(plan_edits(&[], &[row.clone(), row]), None);
+        assert_eq!(plan(&[], &[row.clone(), row]), None);
     }
 
     #[test]
@@ -776,8 +663,6 @@ mod tests {
         )
         .unwrap();
         store.open_approval(opened.clone()).unwrap();
-        // Terminal, so the coordinator this read goes through does not supersede
-        // the question during its startup sweep.
         store
             .transition_run(run.id(), ExecutionState::Running, at(3))
             .unwrap();

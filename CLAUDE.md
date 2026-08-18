@@ -295,12 +295,24 @@ non-UTF-8 paths get lossy strings plus `path_is_lossy: true` and, where exactnes
 and every new bridge file — must be added to `build.rs`'s lists.
 
 - **The run bridge is deliberately outside `backend.rs`.** `runs_backend.rs` carries the mutations
-  (`cancelRun`, `retryRun`, `approve`, `deny`, `loadApprovalInput`) and owns the process's one
-  `RunCoordinator` per data directory — `backend.rs`'s `check_coordinator_for` delegates to it,
-  because a second coordinator would take a second lease and leave every run the checks panel
-  started uncancellable. The three models drive their own reads: cxx-qt gives one bridge object no
-  handle to another, so a model created in QML is not reachable from `RunsBackend`'s Rust.
-  A read never *creates* `runtime.db` — `read_coordinator` probes `Store::open_existing` first.
+  (`cancelRun`, `retryRun`, `approve`, `deny`, `loadApprovalInput`) and owns everything this
+  process attaches to one data directory: one `Store`, and at most one `RunCoordinator` above it.
+  `backend.rs`'s `check_coordinator_for` delegates to it, because a second coordinator would take a
+  second lease and leave every run the checks panel started uncancellable. The three models drive
+  their own reads: cxx-qt gives one bridge object no handle to another, so a model created in QML
+  is not reachable from `RunsBackend`'s Rust.
+- **A read takes the store; driving work takes the coordinator.** `read_store` never creates
+  `runtime.db` and never builds a coordinator, because building one takes the lease and runs the
+  recovery sweep — writes, on a path a user reached by opening a panel to look at something. A
+  timeline subscribes only through a coordinator that already exists (`cached_coordinator`), which
+  loses nothing: a run this process is not driving cannot publish to it anyway. The consequence is
+  stated rather than hidden — a run abandoned by a dead process keeps reading as `running` until
+  something in this process actually drives work.
+- **`reconcile.rs` is the one keyed-list walk.** `ChangesModel` and `ApprovalModel` both reconcile
+  a whole projection into the smallest set of row edits; the walk is generic over a `Keyed` row and
+  lives in one place. `cxx/listmodelbase.h` is the same idea for the C++ side: one set of
+  `beginInsertRows`-family wrappers, with an empty subclass per model because cxx requires each
+  bridge to declare its own extern type.
 
 - **cxx-qt does not camel-case names.** A `snake_case` member reaches QML spelled exactly as
   written, and a camel-case call site silently resolves to `undefined`. Every multi-word invokable

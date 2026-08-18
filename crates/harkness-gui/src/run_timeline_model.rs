@@ -73,7 +73,7 @@ pub mod ffi {
         include!("cxx-qt-lib/qvariant.h");
         type QVariant = cxx_qt_lib::QVariant;
 
-        include!("runtimelinemodelbase.h");
+        include!("listmodelbase.h");
         type RunTimelineModelBase;
 
         #[rust_name = "begin_insert"]
@@ -169,7 +169,7 @@ use harkness_runtime::domain::RunId;
 use harkness_runtime::store::{EventListing, EventPage, EventSeq, RunEvent};
 
 use super::runs_backend::{
-    RunsFailure, data_dir, existing_coordinator, note_qt_thread, parse_run, rfc3339,
+    RunsFailure, cached_coordinator, data_dir, note_qt_thread, parse_run, read_store, rfc3339,
 };
 
 /// Events loaded per page, in either direction.
@@ -503,8 +503,8 @@ fn timeline_page(listing: EventListing, live: bool) -> TimelinePage {
     }
 }
 
-/// Reads the newest page and opens the live subscription for one run.
-fn open_timeline(run: RunId) -> Result<Option<(EventReceiver, TimelinePage)>, RunsFailure> {
+/// Reads the newest page and, where there is one to have, opens the live stream.
+fn open_timeline(run: RunId) -> Result<Option<(Option<EventReceiver>, TimelinePage)>, RunsFailure> {
     open_timeline_in(&data_dir()?, run)
 }
 
@@ -514,23 +514,39 @@ fn open_timeline(run: RunId) -> Result<Option<(EventReceiver, TimelinePage)>, Ru
 /// back without touching `HARKNESS_DATA_DIR`, which is process-wide. `None`
 /// means the directory has recorded nothing at all, which is a read answering
 /// honestly rather than a read creating a store.
+///
+/// # Why the receiver is optional
+///
+/// A subscription is worth opening for exactly one kind of run: a non-terminal
+/// one this process is already driving. A finished run will never publish
+/// again, and a run some *other* process is driving cannot publish here —
+/// `RunCoordinator::subscribe` would hand back a receiver that replays the
+/// durable history and then waits forever for a worker that does not exist in
+/// this process. Both cases read their page and stop, which is also what keeps
+/// looking at a timeline from attaching this process's lease to the store.
 fn open_timeline_in(
     data_dir: &std::path::Path,
     run: RunId,
-) -> Result<Option<(EventReceiver, TimelinePage)>, RunsFailure> {
-    let Some(coordinator) = existing_coordinator(data_dir)? else {
+) -> Result<Option<(Option<EventReceiver>, TimelinePage)>, RunsFailure> {
+    let Some(store) = read_store(data_dir)? else {
         return Ok(None);
     };
+    // An unknown run is an error rather than an empty page. A timeline is
+    // always asked for by a caller that believes the run exists, and answering
+    // "no events" would let a mistyped identifier read as an empty run.
+    let record = store.load_run(run)?;
+    let coordinator = cached_coordinator(data_dir)?;
     // Subscribed before the page is read, so an event recorded between the two
     // arrives on the stream instead of falling into the gap between them.
-    let receiver = coordinator.subscribe(run)?;
-    // A subscription to a run that already finished is closed before it is
-    // handed over, and only says so once its whole replay has drained. Asking
-    // the record instead is what stops a run that ended hours ago showing as
-    // live for as long as its log takes to walk; a run that finishes while it
-    // is being watched still flips to false when the stream disconnects.
-    let live = !coordinator.store().load_run(run)?.state().is_terminal();
-    let listing = coordinator.event_page(run, EventPage::newest(TIMELINE_PAGE_SIZE))?;
+    let receiver = match coordinator {
+        Some(coordinator) if !record.state().is_terminal() => Some(coordinator.subscribe(run)?),
+        _ => None,
+    };
+    let listing = store.event_page(run, EventPage::newest(TIMELINE_PAGE_SIZE))?;
+    // `live` is whether something is actually delivering, not whether the run
+    // looks unfinished: a subscription that was never opened publishes nothing
+    // however the run is recorded.
+    let live = receiver.is_some();
     Ok(Some((receiver, timeline_page(listing, live))))
 }
 
@@ -544,15 +560,15 @@ fn load_older_page_in(
     run: RunId,
     cursor: EventSeq,
 ) -> Result<TimelinePage, RunsFailure> {
-    let Some(coordinator) = existing_coordinator(data_dir)? else {
+    let Some(store) = read_store(data_dir)? else {
         return Ok(TimelinePage {
             rows: Vec::new(),
             beginning: true,
             live: false,
         });
     };
-    let listing =
-        coordinator.event_page(run, EventPage::newest(TIMELINE_PAGE_SIZE).after(cursor))?;
+    store.load_run(run)?;
+    let listing = store.event_page(run, EventPage::newest(TIMELINE_PAGE_SIZE).after(cursor))?;
     Ok(timeline_page(listing, false))
 }
 
@@ -573,11 +589,12 @@ fn load_event_detail_in(
     run: RunId,
     seq: u64,
 ) -> Result<Option<String>, RunsFailure> {
-    let Some(coordinator) = existing_coordinator(data_dir)? else {
+    let Some(store) = read_store(data_dir)? else {
         return Ok(None);
     };
+    store.load_run(run)?;
     let page = EventPage::oldest(1).after(EventSeq::new(seq.saturating_sub(1)));
-    let listing = coordinator.event_page(run, page)?;
+    let listing = store.event_page(run, page)?;
     Ok(listing
         .events
         .first()
@@ -723,7 +740,9 @@ impl ffi::RunTimelineModel {
             // history off the Qt thread's queue entirely.
             let floor = page.rows.last().map_or(0, |row| row.seq);
             let _ = qt_thread.queue(move |model| apply_page(model, request, page));
-            deliver(&receiver, run, floor, request, &selection, &qt_thread);
+            if let Some(receiver) = receiver {
+                deliver(&receiver, run, floor, request, &selection, &qt_thread);
+            }
         });
     }
 
@@ -1416,11 +1435,7 @@ mod tests {
         assert!(timeline.plan_detail(2, "{}".to_owned()).is_none());
     }
 
-    /// Records one terminal run carrying `events` progress entries.
-    ///
-    /// Terminal because the coordinator a read goes through sweeps at
-    /// construction, and an unfinished run with no live claim is exactly what
-    /// recovery ends.
+    /// Records one finished run carrying `events` progress entries.
     fn seed(data_dir: &std::path::Path, events: u64) -> RunId {
         let store = Store::open(data_dir).unwrap();
         let task = Task::with_id(

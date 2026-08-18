@@ -3,6 +3,7 @@ mod backend;
 mod changes_model;
 mod file_tree_model;
 pub(crate) mod hotreload;
+mod reconcile;
 mod run_list_model;
 mod run_timeline_model;
 pub(crate) mod runs_backend;

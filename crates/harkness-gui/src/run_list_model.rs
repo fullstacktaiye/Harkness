@@ -50,7 +50,7 @@ pub mod ffi {
         include!("cxx-qt-lib/qvariant.h");
         type QVariant = cxx_qt_lib::QVariant;
 
-        include!("runlistmodelbase.h");
+        include!("listmodelbase.h");
         type RunListModelBase;
 
         #[rust_name = "begin_insert"]
@@ -131,7 +131,7 @@ use harkness_runtime::domain::{Run, Task, TaskId};
 use harkness_runtime::store::{RunCursor, RunPage};
 
 use super::runs_backend::{
-    RunsFailure, data_dir, existing_coordinator, note_qt_thread, optional_rfc3339, rfc3339,
+    RunsFailure, data_dir, note_qt_thread, optional_rfc3339, read_store, rfc3339,
 };
 
 /// Rows loaded per `fetchMore`.
@@ -278,15 +278,14 @@ fn load_page_in(
     data_dir: &std::path::Path,
     cursor: Option<RunCursor>,
 ) -> Result<RunPageResult, RunsFailure> {
-    let Some(coordinator) = existing_coordinator(data_dir)? else {
+    let Some(store) = read_store(data_dir)? else {
         return Ok(RunPageResult::default());
     };
     let page = match cursor {
         Some(cursor) => RunPage::after(cursor, RUN_PAGE_SIZE),
         None => RunPage::new(RUN_PAGE_SIZE),
     };
-    let listing = coordinator.list_runs(page)?;
-    let store = coordinator.store();
+    let listing = store.list_runs(page)?;
     Ok(RunPageResult {
         rows: page_rows(&listing.runs, |task_id| store.load_task(task_id).ok()),
         next: listing.next_cursor,
@@ -661,7 +660,7 @@ mod tests {
     }
 
     #[test]
-    fn attaching_to_a_store_ends_the_runs_no_live_process_is_driving() {
+    fn a_read_reports_what_is_recorded_and_corrects_nothing() {
         let fixture = TempDir::new().unwrap();
         let data_dir = fixture.path().join("data");
         let store = Store::open(&data_dir).unwrap();
@@ -685,11 +684,12 @@ mod tests {
         let page = load_page_in(&data_dir, None).unwrap();
 
         assert_eq!(
-            page.rows[0].state, "interrupted",
-            "building the coordinator a read goes through sweeps first, and a run \
-             whose owning process is provably gone is what that sweep claims"
+            page.rows[0].state, "running",
+            "a read attaches a store and nothing else: ending a run whose owner \
+             is gone is the recovery sweep's job, and the sweep belongs to \
+             deciding to drive work rather than to looking at it"
         );
-        assert!(page.rows[0].terminal);
+        assert!(!page.rows[0].terminal);
     }
 
     #[test]
@@ -709,9 +709,6 @@ mod tests {
             .map(|index| {
                 let run = Run::with_id(RunId::new(), task.id(), at(index * 10 + 1));
                 store.insert_run(&run).unwrap();
-                // Driven to a terminal state, because the coordinator this read
-                // goes through sweeps at construction and an unfinished run
-                // with no live claim is exactly what recovery ends.
                 store
                     .transition_run(run.id(), ExecutionState::Running, at(index * 10 + 2))
                     .unwrap();
