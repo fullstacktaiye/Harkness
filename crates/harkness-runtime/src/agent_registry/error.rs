@@ -79,6 +79,28 @@ pub enum AgentRegistryError {
         reason: Option<&'static str>,
     },
 
+    /// A grant covers the agent and does not reach where it is being used.
+    ///
+    /// Distinct from [`AgentNotTrusted`](Self::AgentNotTrusted), and it has to
+    /// be: the record really is `Trusted`, so reporting this through that
+    /// variant produces "agent X is trusted" followed by a refusal, which is a
+    /// sentence that contradicts itself. Nothing is wrong with the grant — it
+    /// simply says somewhere else — and a surface reading this can offer to
+    /// widen it rather than sending a user to look for a fault.
+    #[error(
+        "agent {id} is trusted for {}, and is being launched in {}",
+        granted_for.as_ref().map_or_else(|| "one workspace".to_owned(), |root| root.display().to_string()),
+        observed_in.as_ref().map_or_else(|| "no workspace".to_owned(), |root| root.display().to_string()),
+    )]
+    GrantOutOfScope {
+        /// Identifier that was asked for.
+        id: AgentId,
+        /// Workspace root the grant is confined to.
+        granted_for: Option<PathBuf>,
+        /// Workspace the launch named, when it named one.
+        observed_in: Option<PathBuf>,
+    },
+
     /// The executable on disk is not the one the grant was made about.
     #[error(
         "the executable for agent {id} has changed: it was trusted as {trusted} and is now {observed}"
@@ -245,6 +267,7 @@ impl AgentRegistryError {
         "too_many_registered_agents",
         "agent_disabled",
         "agent_not_trusted",
+        "agent_grant_out_of_scope",
         "executable_hash_mismatch",
         "executable_not_found",
         "invalid_executable",
@@ -268,6 +291,7 @@ impl AgentRegistryError {
             Self::TooManyAgents { .. } => "too_many_registered_agents",
             Self::AgentDisabled { .. } => "agent_disabled",
             Self::AgentNotTrusted { .. } => "agent_not_trusted",
+            Self::GrantOutOfScope { .. } => "agent_grant_out_of_scope",
             Self::ExecutableHashMismatch { .. } => "executable_hash_mismatch",
             Self::ExecutableNotFound { .. } => "executable_not_found",
             Self::InvalidExecutable { .. } => "invalid_executable",
@@ -336,6 +360,11 @@ mod tests {
                 id: id.clone(),
                 state: crate::integration::TrustState::Untrusted,
                 reason: None,
+            },
+            AgentRegistryError::GrantOutOfScope {
+                id: id.clone(),
+                granted_for: Some("/workspace/project".into()),
+                observed_in: None,
             },
             AgentRegistryError::ExecutableHashMismatch {
                 id: id.clone(),

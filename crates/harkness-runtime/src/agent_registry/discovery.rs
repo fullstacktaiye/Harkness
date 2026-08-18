@@ -164,10 +164,16 @@ impl Discovery {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        // Deduplicated as well as filtered, and in the caller's order. A name
+        // given twice would match the same file twice and put the same
+        // executable in the report twice, while quietly spending two of the
+        // candidate slots on one question.
+        let mut seen = std::collections::HashSet::new();
         self.candidates = names
             .into_iter()
             .map(Into::into)
             .filter(|name| is_one_file_name(name))
+            .filter(|name| seen.insert(name.clone()))
             .take(MAX_DISCOVERY_CANDIDATES)
             .collect();
         self

@@ -50,6 +50,13 @@ pub const DEFAULT_HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long teardown waits at each rung before escalating.
 pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
+/// Where a health check's working directories live inside the data directory.
+///
+/// One named place rather than one temporary directory per check loose in the
+/// data directory root: a check removes its own, a process killed mid-check
+/// cannot, and what is left behind is whatever the agent wrote.
+pub const AGENT_SCRATCH_DIRECTORY: &str = "agent-scratch";
+
 /// One registration and everything known about it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RegisteredAgent {
@@ -663,7 +670,17 @@ impl AgentRegistryService {
             // An invalidated grant is re-affirmed on the same record: nobody
             // decided to withdraw it, so moving the basis and the grant time is
             // what "trust it again" means.
-            Some(stored) if stored.record().state() == TrustState::Invalidated => {
+            //
+            // The scope has to match for that to be true. `TrustRecord::regrant`
+            // rebases the identity and touches nothing else — correctly, since
+            // re-affirming is about *what* was trusted rather than about how far
+            // the grant reaches — so a caller asking for a different scope is
+            // making a different decision, and it gets a record of its own
+            // rather than having the request quietly dropped.
+            Some(stored)
+                if stored.record().state() == TrustState::Invalidated
+                    && stored.record().scope() == &options.scope =>
+            {
                 let mut record = stored.record().clone();
                 record.regrant(basis, options.at)?;
                 self.store.update_trust_record(stored.id(), &record)?;
@@ -861,7 +878,12 @@ impl AgentRegistryService {
         let auth = observed
             .as_ref()
             .map_or(AuthStatus::Unknown, AgentObservations::auth_status);
-        if auth == AuthStatus::Required {
+        // `Failed` blocks as firmly as `Required` does. It means a sign-in was
+        // attempted and the agent rejected it, which is strictly worse news than
+        // nobody having tried — a gate that only recognized `Required` would let
+        // recording an honest failure be the thing that unblocked the launch.
+        // `Unknown` passes, because nothing has asked the agent anything yet.
+        if matches!(auth, AuthStatus::Required | AuthStatus::Failed) {
             return Err(AgentRegistryError::AuthenticationRequired { id: id.clone() });
         }
         if let Some(CompatibilityStatus::UnsupportedProtocolVersion { advertised }) =
@@ -1095,7 +1117,7 @@ impl AgentRegistryService {
                 } else {
                     HealthStatus::Healthy
                 };
-                observations.record_initialize(record.clone());
+                observations.record_initialize(record.clone(), at);
                 (
                     status,
                     HealthRecord::succeeded(status, elapsed, at),
@@ -1110,6 +1132,7 @@ impl AgentRegistryService {
                                 CompatibilityStatus::UnsupportedProtocolVersion {
                                     advertised: agent_selected,
                                 },
+                                at,
                             );
                             HealthStatus::Incompatible
                         }
@@ -1218,10 +1241,10 @@ impl AgentRegistryService {
             // valid in the workspace it was given for, and would do it every
             // time a caller forgot to name the workspace.
             TrustCheck::Invalidate(InvalidationReason::WorkspacePathChanged) => {
-                Err(AgentRegistryError::AgentNotTrusted {
+                Err(AgentRegistryError::GrantOutOfScope {
                     id: id.clone(),
-                    state: stored.record().state(),
-                    reason: Some(InvalidationReason::WorkspacePathChanged.explanation()),
+                    granted_for: stored.record().scope().root().map(Path::to_path_buf),
+                    observed_in: context.workspace.clone(),
                 })
             }
             TrustCheck::Invalidate(reason) => {
@@ -1440,19 +1463,28 @@ impl AgentRegistryService {
 
     /// A private, empty directory for one health check to run in.
     fn scratch_directory(&self) -> Result<tempfile::TempDir, AgentRegistryError> {
-        std::fs::create_dir_all(&self.data_dir).map_err(|source| {
-            AgentRegistryError::ConfigurationWrite {
-                path: self.data_dir.clone(),
-                source,
-            }
-        })?;
+        // Under a directory of its own rather than loose in the data directory
+        // beside `projects.json` and `runtime.db`. A check normally removes its
+        // own scratch, but a process killed mid-check cannot, and the leftovers
+        // hold whatever the agent wrote into its working directory — so they
+        // belong somewhere a sweep can be pointed at, and somewhere the
+        // documented layout of the data directory does not have to grow an entry
+        // per run.
+        let root = self.data_dir.join(AGENT_SCRATCH_DIRECTORY);
+        let failed = |source| AgentRegistryError::ConfigurationWrite {
+            path: root.clone(),
+            source,
+        };
+        std::fs::create_dir_all(&root).map_err(failed)?;
+        // Owner-only: process output, an agent's stray files, and whatever a
+        // program somebody else wrote decided to leave behind all land here.
+        #[cfg(unix)]
+        std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .map_err(failed)?;
         tempfile::Builder::new()
-            .prefix("agent-health-")
-            .tempdir_in(&self.data_dir)
-            .map_err(|source| AgentRegistryError::ConfigurationWrite {
-                path: self.data_dir.clone(),
-                source,
-            })
+            .prefix("check-")
+            .tempdir_in(&root)
+            .map_err(failed)
     }
 }
 

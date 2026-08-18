@@ -5385,16 +5385,19 @@ fn regenerate_the_frozen_v9_fixture() {
 
     let agent = AgentId::new(FIXTURE_AGENT_ID).unwrap();
     let mut observations = AgentObservations::unobserved(at(1));
-    observations.record_initialize(InitializeRecord::new(
-        None,
-        1,
-        AgentCapabilitySnapshot {
-            load_session: true,
-            session_resume: true,
-            ..AgentCapabilitySnapshot::default()
-        },
+    observations.record_initialize(
+        InitializeRecord::new(
+            None,
+            1,
+            AgentCapabilitySnapshot {
+                load_session: true,
+                session_resume: true,
+                ..AgentCapabilitySnapshot::default()
+            },
+            at(2),
+        ),
         at(2),
-    ));
+    );
     observations.record_health(
         HealthRecord::succeeded(
             HealthStatus::Healthy,

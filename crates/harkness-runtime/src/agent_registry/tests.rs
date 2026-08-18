@@ -638,7 +638,10 @@ fn agent_observations_round_trip_through_the_store() {
         ..AgentCapabilitySnapshot::default()
     };
     let mut observations = AgentObservations::unobserved(at(1));
-    observations.record_initialize(InitializeRecord::new(None, 1, capabilities.clone(), at(2)));
+    observations.record_initialize(
+        InitializeRecord::new(None, 1, capabilities.clone(), at(2)),
+        at(2),
+    );
     observations.record_health(
         HealthRecord::failed(
             HealthStatus::Failed,
@@ -677,8 +680,10 @@ fn an_unsupported_protocol_version_round_trips_with_the_version_it_names() {
     let harness = Harness::new();
     let id = AgentId::new("gemini-cli").unwrap();
     let mut observations = AgentObservations::unobserved(at(1));
-    observations
-        .record_compatibility(CompatibilityStatus::UnsupportedProtocolVersion { advertised: 2 });
+    observations.record_compatibility(
+        CompatibilityStatus::UnsupportedProtocolVersion { advertised: 2 },
+        at(1),
+    );
 
     harness
         .store
@@ -771,16 +776,19 @@ fn the_largest_snapshot_a_peer_can_produce_fits_one_column() {
         })
         .collect();
     let mut observations = AgentObservations::unobserved(at(1));
-    observations.record_initialize(InitializeRecord::new(
-        None,
-        1,
-        AgentCapabilitySnapshot {
-            auth_methods,
-            auth_methods_truncated: true,
-            ..AgentCapabilitySnapshot::default()
-        },
+    observations.record_initialize(
+        InitializeRecord::new(
+            None,
+            1,
+            AgentCapabilitySnapshot {
+                auth_methods,
+                auth_methods_truncated: true,
+                ..AgentCapabilitySnapshot::default()
+            },
+            at(2),
+        ),
         at(2),
-    ));
+    );
     observations.record_health(
         HealthRecord::failed(
             HealthStatus::Failed,
@@ -836,6 +844,143 @@ fn a_stored_snapshot_beyond_the_bounds_is_refused_on_load() {
             .kind(),
         "invalid_agent_registration"
     );
+}
+
+/// Every clamp on the write path has to mean the same number as the validator on
+/// the read path. It did not: the shared truncation helper appends a marker
+/// *after* clamping, so a value this build truncated wrote successfully and was
+/// then refused for good — taking the whole row, and the agent, with it.
+#[test]
+fn a_value_this_build_truncates_still_reads_back() {
+    let harness = Harness::new();
+    let id = AgentId::new("verbose").unwrap();
+
+    // Through the real conversion, because that is what does the clamping: an
+    // agent is free to advertise a description of any length it likes.
+    let advertised = harkness_acp::AcpAgentCapabilities {
+        auth_methods: vec![harkness_acp::AuthMethod {
+            id: harkness_acp::AuthMethodId::new("i".repeat(MAX_AUTH_METHOD_TEXT_LENGTH * 3)),
+            name: "n".repeat(MAX_AUTH_METHOD_TEXT_LENGTH * 3),
+            description: Some("d".repeat(MAX_AUTH_METHOD_DESCRIPTION_LENGTH * 3)),
+        }],
+        ..harkness_acp::AcpAgentCapabilities::default()
+    };
+    let described = harkness_acp::AgentDescription {
+        name: "n".repeat(MAX_AGENT_REPORTED_TEXT_LENGTH * 3),
+        title: None,
+        version: "v".repeat(MAX_AGENT_REPORTED_TEXT_LENGTH * 3),
+    };
+
+    let mut observations = AgentObservations::unobserved(at(1));
+    observations.record_initialize(
+        InitializeRecord::new(
+            Some(&described),
+            1,
+            AgentCapabilitySnapshot::from(&advertised),
+            at(2),
+        ),
+        at(2),
+    );
+    observations.record_health(
+        HealthRecord::failed(
+            HealthStatus::Failed,
+            "initialize_timeout",
+            "x".repeat(MAX_HEALTH_DETAIL_LENGTH * 3),
+            Duration::from_millis(1),
+            at(2),
+        ),
+        at(2),
+    );
+
+    harness
+        .store
+        .put_agent_observations(&id, &observations)
+        .unwrap();
+    let loaded = harness
+        .store
+        .agent_observations(&id)
+        .expect("a row this build wrote must be a row this build can read")
+        .unwrap();
+
+    assert_eq!(loaded, observations);
+    let initialize = loaded.last_initialize().unwrap();
+    assert!(initialize.agent_name().unwrap().len() <= MAX_AGENT_REPORTED_TEXT_LENGTH);
+    assert!(initialize.agent_version().unwrap().len() <= MAX_AGENT_REPORTED_TEXT_LENGTH);
+    let method = &initialize.capabilities().auth_methods[0];
+    assert!(method.id.len() <= MAX_AUTH_METHOD_TEXT_LENGTH);
+    assert!(method.name.len() <= MAX_AUTH_METHOD_TEXT_LENGTH);
+    assert!(method.description.as_ref().unwrap().len() <= MAX_AUTH_METHOD_DESCRIPTION_LENGTH);
+    assert!(loaded.last_health().unwrap().detail().unwrap().len() <= MAX_HEALTH_DETAIL_LENGTH);
+    assert!(
+        method
+            .description
+            .as_ref()
+            .unwrap()
+            .ends_with("(truncated)"),
+        "the clamp stays visible in the value"
+    );
+}
+
+/// `AgentCapabilitySnapshot`'s fields are public, so a caller can assemble one
+/// the load path would refuse. The write refuses it too, rather than producing a
+/// row that can never be read back.
+#[test]
+fn an_observation_beyond_the_bounds_is_refused_by_the_writer() {
+    let harness = Harness::new();
+    let id = AgentId::new("hand-built").unwrap();
+    let mut observations = AgentObservations::unobserved(at(1));
+    observations.record_initialize(
+        InitializeRecord::new(
+            None,
+            1,
+            AgentCapabilitySnapshot {
+                auth_methods: vec![AgentAuthMethod {
+                    id: "i".repeat(MAX_AUTH_METHOD_TEXT_LENGTH + 1),
+                    name: "n".to_owned(),
+                    description: None,
+                }],
+                ..AgentCapabilitySnapshot::default()
+            },
+            at(2),
+        ),
+        at(2),
+    );
+
+    let error = harness
+        .store
+        .put_agent_observations(&id, &observations)
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "column_encoding");
+    assert!(harness.store.agent_observations(&id).unwrap().is_none());
+}
+
+/// A registry of entirely legal entries can still be larger than the reader will
+/// accept, so the writer refuses it rather than producing a file it cannot read.
+#[test]
+fn a_registry_too_large_for_the_reader_is_refused_by_the_writer() {
+    let harness = Harness::new();
+    let argument = "a".repeat(MAX_AGENT_ARGUMENT_LENGTH);
+    for index in 0.. {
+        let id = format!("bulky-{index}");
+        let registration = registration(&id, &format!("/usr/bin/{id}"))
+            .with_args(std::iter::repeat_n(argument.clone(), MAX_AGENT_ARGUMENTS))
+            .unwrap();
+        match harness.service.register(registration) {
+            Ok(_) => assert!(
+                index < 64,
+                "the write bound should have been reached by now"
+            ),
+            Err(error) => {
+                assert_eq!(error.kind(), "invalid_agent_registration");
+                assert!(error.to_string().contains("agents.json size"), "{error}");
+                break;
+            }
+        }
+    }
+
+    // And what is on disk is still readable — the refused write left it alone.
+    assert!(harness.service.registrations().is_ok());
 }
 
 #[test]
@@ -965,6 +1110,22 @@ fn a_candidate_name_that_is_not_one_file_name_is_dropped() {
         .on_path(String::new())
         .run(&Cancellation::default());
     assert_eq!(kept.directories_searched(), 0);
+}
+
+/// A name given twice would match one file twice and put one executable in the
+/// report twice, while quietly spending two of the candidate slots on it.
+#[cfg(unix)]
+#[test]
+fn a_repeated_candidate_name_is_reported_once() {
+    let fixture = Fixture::new();
+    fixture.shim("gemini", "#!/bin/sh\nexit 0\n");
+
+    let report = Discovery::default()
+        .looking_for(["gemini", "gemini", "gemini"])
+        .on_path(fixture.root.path().to_path_buf())
+        .run(&Cancellation::default());
+
+    assert_eq!(report.candidates().count(), 1);
 }
 
 /// A trailing separator is an ordinary way to write a `PATH`, and the empty
@@ -1522,12 +1683,31 @@ fn a_disabled_agent_refuses_every_launch_path_and_spawns_nothing() {
 #[cfg(unix)]
 #[test]
 fn the_agent_sees_only_the_variables_the_registration_admits() {
-    // SAFETY: single-threaded setup before any child is spawned, and both names
-    // are unique to this test.
-    unsafe {
-        std::env::set_var("HARKNESS_AGENT_ALLOWED", "yes");
-        std::env::set_var("HARKNESS_AGENT_DENIED", "leak");
-    }
+    // Two variables this process already holds, one admitted and one not.
+    //
+    // Deliberately *discovered* rather than set: `setenv` is not thread-safe
+    // against the `getenv` and `fork`/`exec` other tests in this binary are
+    // doing concurrently, which is why Rust made it `unsafe`, and a teardown
+    // that only runs when every assertion passed would leave the environment
+    // altered for whatever ran next. The same reasoning is why
+    // `tools::tests::process_exec_does_not_inherit_an_undeclared_parent_canary`
+    // picks its canary out of the environment instead of putting one there.
+    let mut names = std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .filter(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+                && !name.as_bytes()[0].is_ascii_digit()
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    let (admitted, denied) = match names.split_first() {
+        Some((admitted, [denied, ..])) => (admitted.clone(), denied.clone()),
+        _ => panic!("the test process carries at least two usable environment variables"),
+    };
 
     let harness = Harness::new();
     let shim = harness.fixture.shim(
@@ -1545,7 +1725,7 @@ while IFS= read -r line; do
 done
 "#,
     );
-    let id = harness.ready("env", &shim, &["HARKNESS_AGENT_ALLOWED"]);
+    let id = harness.ready("env", &shim, &[admitted.as_str()]);
     let workspace = harness.fixture.directory("env-workspace");
 
     let outcome = check(
@@ -1557,18 +1737,108 @@ done
 
     let observed = std::fs::read_to_string(workspace.join("environment.txt")).unwrap();
     assert!(
-        observed.contains("HARKNESS_AGENT_ALLOWED"),
+        observed.contains(&admitted),
         "an admitted variable must reach the agent: {observed}"
     );
     assert!(
-        !observed.contains("HARKNESS_AGENT_DENIED"),
-        "a variable nobody admitted must not: {observed}"
+        !observed.contains(&denied),
+        "{denied} is in this process's environment and nobody admitted it: {observed}"
+    );
+}
+
+/// Recording an *honest failure* must not be what unblocks a launch. Only
+/// `Required` blocking would make `Failed` the more permissive answer.
+#[cfg(unix)]
+#[test]
+fn a_failed_sign_in_blocks_a_launch_as_firmly_as_an_unattempted_one() {
+    let harness = Harness::new();
+    let shim = auth_required_shim(&harness.fixture, "rejecting-agent");
+    let id = harness.ready("rejecting", &shim, &[]);
+    check(&harness.service, &HealthCheck::new(id.clone())).unwrap();
+
+    harness
+        .service
+        .record_authentication(&id, AuthStatus::Failed)
+        .unwrap();
+
+    let error = harness
+        .service
+        .prepare_launch(&id, &LaunchContext::default())
+        .unwrap_err();
+    assert_eq!(error.kind(), "agent_authentication_required");
+}
+
+/// Re-granting rebases the identity and nothing else, so a caller asking for a
+/// different reach is making a different decision and gets its own record —
+/// rather than having the scope it named silently dropped.
+#[cfg(unix)]
+#[test]
+fn a_re_grant_that_changes_the_scope_is_a_new_record() {
+    let harness = Harness::new();
+    let shim = healthy_shim(&harness.fixture, "rescoped-agent");
+    let project = harness.fixture.directory("rescoped-project");
+    let id = harness.ready("rescoped", &shim, &[]);
+    assert_eq!(harness.service.trust_history(&id).unwrap().len(), 1);
+
+    // Drift, so the record is invalidated and a re-grant is what follows.
+    std::fs::write(&shim, "#!/bin/sh\nexit 7\n").unwrap();
+    assert_eq!(
+        harness
+            .service
+            .prepare_launch(&id, &LaunchContext::default())
+            .unwrap_err()
+            .kind(),
+        "executable_hash_mismatch"
     );
 
-    unsafe {
-        std::env::remove_var("HARKNESS_AGENT_ALLOWED");
-        std::env::remove_var("HARKNESS_AGENT_DENIED");
-    }
+    harness
+        .service
+        .trust(
+            TrustAgent::new(id.clone(), at(30))
+                .in_workspace(project.clone())
+                .and_enable(),
+        )
+        .unwrap();
+
+    let history = harness.service.trust_history(&id).unwrap();
+    assert_eq!(
+        history.len(),
+        2,
+        "a narrower grant is a decision of its own, not a re-affirmation"
+    );
+    assert_eq!(
+        history[1].record().scope().root(),
+        Some(project.as_path()),
+        "and it is the scope the caller asked for"
+    );
+    assert!(
+        harness
+            .service
+            .prepare_launch(&id, &LaunchContext::default())
+            .is_err(),
+        "the narrowing really took effect"
+    );
+}
+
+/// A grant re-affirmed at the same reach continues its own record, which is what
+/// keeps a drift-and-retrust from filling the audit trail with duplicates.
+#[cfg(unix)]
+#[test]
+fn a_re_grant_at_the_same_scope_continues_the_record_it_re_affirms() {
+    let harness = Harness::new();
+    let shim = healthy_shim(&harness.fixture, "reaffirmed-agent");
+    let id = harness.ready("reaffirmed", &shim, &[]);
+    std::fs::write(&shim, "#!/bin/sh\nexit 7\n").unwrap();
+    let _ = harness
+        .service
+        .prepare_launch(&id, &LaunchContext::default());
+
+    harness
+        .service
+        .trust(TrustAgent::new(id.clone(), at(30)).and_enable())
+        .unwrap();
+
+    assert_eq!(harness.service.trust_history(&id).unwrap().len(), 1);
 }
 
 // -- trust lifecycle ---------------------------------------------------------
@@ -1884,8 +2154,11 @@ fn a_workspace_scoped_grant_does_not_reach_another_workspace() {
         .prepare_launch(&id, &LaunchContext::default().in_workspace(elsewhere))
         .unwrap_err();
 
-    assert_eq!(error.kind(), "agent_not_trusted");
-    assert!(error.to_string().contains("different workspace"), "{error}");
+    assert_eq!(error.kind(), "agent_grant_out_of_scope");
+    assert!(
+        error.to_string().contains("is trusted for"),
+        "the grant is fine; it just says somewhere else: {error}"
+    );
 
     // And the grant it does not reach is *untouched*. Being used in the wrong
     // place is not drift: nothing about the subject changed, so treating it as
@@ -1936,7 +2209,11 @@ fn a_launch_that_names_no_workspace_cannot_reach_a_workspace_scoped_grant() {
         .prepare_launch(&id, &LaunchContext::default())
         .unwrap_err();
 
-    assert_eq!(error.kind(), "agent_not_trusted");
+    assert_eq!(error.kind(), "agent_grant_out_of_scope");
+    assert!(
+        error.to_string().contains("no workspace"),
+        "a launch that named none should say so: {error}"
+    );
     assert_eq!(
         harness.service.get(&id).unwrap().state().trust().state(),
         TrustState::Trusted

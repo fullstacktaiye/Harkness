@@ -23,8 +23,8 @@ use tempfile::NamedTempFile;
 use crate::integration::{ConfigurationSource, IdentityBasis, is_rooted_anywhere};
 use crate::tool::MAX_ENVIRONMENT_NAME_LENGTH;
 
-use super::AgentId;
 use super::error::{AgentRegistryError, invalid_registration};
+use super::{AgentId, SchemaVersionProbe};
 
 /// Name of the agent registry inside the Harkness data directory.
 pub const AGENTS_FILE: &str = "agents.json";
@@ -38,12 +38,19 @@ pub const MINIMUM_AGENTS_SCHEMA_VERSION: u32 = 1;
 
 /// Most registrations one `agents.json` may hold.
 pub const MAX_REGISTERED_AGENTS: usize = 256;
-/// Largest `agents.json` this build will read, in bytes.
+/// Largest `agents.json` this build will read *or write*, in bytes.
 ///
-/// Generous beside the format — [`MAX_REGISTERED_AGENTS`] entries at their
-/// maximum field lengths is a fraction of it — and small enough that the one
-/// file Harkness parses out of an untrusted repository cannot decide this
-/// process's memory.
+/// Small enough that the one file Harkness parses out of an untrusted repository
+/// cannot decide this process's memory, and enforced on the **write** as well —
+/// which it has to be, because it is far below what the per-field bounds alone
+/// permit. [`MAX_REGISTERED_AGENTS`] entries each carrying
+/// [`MAX_AGENT_ARGUMENTS`] arguments of [`MAX_AGENT_ARGUMENT_LENGTH`] is about
+/// seventy megabytes, so a registry built entirely of legal entries could
+/// otherwise be written and then refused for good by the reader that owns it.
+/// A bound checked in one direction is not a bound.
+///
+/// Ordinary registries are nowhere near it: a hundred agents with real commands
+/// and a handful of arguments each is a few tens of kilobytes.
 pub const MAX_AGENTS_FILE_BYTES: usize = 4 * 1024 * 1024;
 /// Most arguments one registration may pass to its agent.
 pub const MAX_AGENT_ARGUMENTS: usize = 64;
@@ -423,11 +430,6 @@ impl AgentRegistryFile {
 }
 
 #[derive(Deserialize)]
-struct SchemaVersionProbe {
-    schema_version: u32,
-}
-
-#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentRegistryFileWire {
     schema_version: u32,
@@ -465,10 +467,11 @@ struct PersistedRegistry<'a> {
 /// The read is **bounded**, which matters most for the one caller whose file is
 /// untrusted: the same parser reads `.harkness/agents.json` out of a checked-out
 /// repository, and ADR-0006 says repository content decides nothing — including
-/// how much memory this process spends looking at it. A file over
-/// [`MAX_AGENTS_FILE_BYTES`] is refused rather than buffered, and the limit is
-/// enforced on the *read* rather than on the metadata, so a symlink to something
-/// enormous or a file that grows between the two cannot get past it.
+/// how much memory this process spends looking at it, nor how long it spends
+/// there. Anything that is not a regular file is refused from its metadata
+/// before it is opened, because `open(2)` on a FIFO with no writer never
+/// returns; the size limit is then enforced on the *read* rather than on that
+/// metadata, so a file that grows between the two cannot get past it.
 ///
 /// # Errors
 ///
@@ -479,6 +482,32 @@ struct PersistedRegistry<'a> {
 /// and [`AgentRegistryError::InvalidRegistration`] when a parsed entry violates
 /// an invariant or two entries share an identifier.
 pub(super) fn read_registry(path: &Path) -> Result<AgentRegistryFile, AgentRegistryError> {
+    // Decided from the metadata *before* the file is opened, which is the same
+    // rule a workspace probe follows and for the same reason: `open(2)` on a
+    // FIFO with no writer never returns, and a repository can ship
+    // `.harkness/agents.json` as a symlink to one. A read with a size bound and
+    // no deadline would let untrusted content decide this process's liveness
+    // instead of its memory, which is not an improvement. `metadata` follows
+    // symlinks, so what is checked is what would be opened.
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Err(AgentRegistryError::ConfigurationRead {
+                path: path.to_path_buf(),
+                source: std::io::Error::other("the agent registry is not a regular file"),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AgentRegistryFile::default());
+        }
+        Err(source) => {
+            return Err(AgentRegistryError::ConfigurationRead {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    }
+
     let file = match fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -608,6 +637,16 @@ pub(super) fn persist_registry(
 
     let encoded =
         encode_registry(registry).map_err(|error| failed(std::io::Error::other(error)))?;
+    // Refused before anything is written, because the reader enforces the same
+    // number: a registry of entirely legal entries can still exceed it, and
+    // writing one would produce a file this build could never read again. The
+    // caller keeps the registry it had and is told what happened.
+    if encoded.len() > MAX_AGENTS_FILE_BYTES {
+        return Err(invalid_registration(
+            "agents",
+            "the registry is larger than the maximum agents.json size",
+        ));
+    }
 
     fs::create_dir_all(data_dir).map_err(failed)?;
     let mut temporary = NamedTempFile::new_in(data_dir).map_err(failed)?;

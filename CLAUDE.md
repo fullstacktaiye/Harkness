@@ -436,7 +436,10 @@ user data. The directory holds `projects.json`, `projects.lock`, `agents.json`, 
 `runtime.db` (+ `-wal`/`-shm`), `artifacts/`, `agent-scratch/`, `context/`, `locks/`,
 `repositories/`, and `worktrees/`. `context/` is the one
 disposable subtree: it holds `<repository-key>/index.db` per repository and deleting the whole thing
-costs warm-up time and no evidence (ADR-0004). Artifact content lives at
+costs warm-up time and no evidence (ADR-0004). `agent-scratch/` holds one temporary working
+directory per health check, removed when the check returns; a process killed mid-check leaves one
+behind, which is why they are under a name a sweep can be pointed at rather than loose in the root.
+Artifact content lives at
 `artifacts/<run_id>/<artifact_id>`; the `artifacts` table records the metadata and re-derives that
 path rather than trusting the one it stored. `locks/` holds three unrelated families: the
 repository locks `harkness-git` keys by common directory, `managed-import-<project>.lock`, and the

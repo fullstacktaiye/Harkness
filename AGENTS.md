@@ -1761,7 +1761,14 @@ trusts.
 reason that gets its own branch.** It is first in `InvalidationReason::PRECEDENCE` precisely because
 it decides whether the record governs the situation at all: the subject has not changed, the grant
 simply does not reach here. Treating it as drift would destroy a grant that is still perfectly good
-in the workspace it was made for — every time a caller forgot to name the workspace.
+in the workspace it was made for — every time a caller forgot to name the workspace. It reports
+`agent_grant_out_of_scope` rather than `agent_not_trusted`, because the record really is `Trusted`
+and a message reading "agent X is trusted" followed by a refusal contradicts itself.
+
+**A re-grant rebases the identity and nothing else, so a scope change is a new record.**
+`TrustRecord::regrant` does not touch `TrustScope` — correctly, since re-affirming is about *what*
+was trusted rather than how far the grant reaches — so a caller naming a different scope is making a
+different decision and must not have the one it asked for silently dropped.
 
 **A trust transition re-reads its record under the registry lock.** The record `admit` read was read
 outside the lock, so between it and the write another caller may have re-granted trust against the
@@ -1784,7 +1791,16 @@ its state instead of refusing the terminal edge. And because ACP v1 has the agen
 itself, a signed-in agent advertises exactly what an unsigned one does — no handshake can tell them
 apart, so `AgentRegistryService::record_authentication` is how a surface says which it was. Without
 it, running a health check on an agent that offers a sign-in would permanently take away an agent
-that was launchable before it.
+that was launchable before it. The launch gate refuses `Required` *and* `Failed`: recording an honest
+rejection must not be the thing that unblocks a launch.
+
+**Every bound is enforced in both directions, and the numbers on the two sides have to be the same
+number.** A value clamped on the way in and validated on the way out against the same constant will
+be refused for good if the clamp can exceed it — which `truncate_failure_text` does, because it
+appends its marker *after* clamping. `agent_registry`'s own `clamp` includes the marker in the
+budget, the observation record validates itself before the store writes it as well as after it reads
+it, and `agents.json` is size-checked on the write as well as on the read. A registry of entirely
+legal entries is otherwise writable and permanently unreadable.
 
 **Discovery enumerates and never executes.** No candidate is spawned, opened, read, or hashed;
 `DiscoveredCandidate` carries a name and a path and deliberately has no digest or capability field,
@@ -1806,11 +1822,12 @@ against the encoder that writes the file, and no read that rewrites — or creat
 state stays out of it entirely: a digest, a capability snapshot, a health record and a grant are
 `runtime.db` rows, so losing the database costs a re-trust rather than a registration.
 
-The read is bounded by `MAX_AGENTS_FILE_BYTES`, and the bound is on the read rather than on a stat,
-because the same parser reads `.harkness/agents.json` out of a checked-out repository. ADR-0006 says
-repository content decides nothing, and how much memory this process spends looking at it is one of
-the things it does not get to decide; a symlink to something enormous, or a file that grows between
-a stat and a read, must not get past it.
+The read is bounded by `MAX_AGENTS_FILE_BYTES` — on the read rather than on a stat, so a file that
+grows between the two cannot get past it — and anything that is not a *regular file* is refused from
+its metadata before it is opened, because `open(2)` on a FIFO with no writer never returns and a
+repository can ship `.harkness/agents.json` as a symlink to one. ADR-0006 says repository content
+decides nothing; how much memory this process spends looking at it, and how long it spends there,
+are both on that list.
 
 Every bound the encoder applies to a stored observation is re-applied on load. A row this build wrote
 satisfies all of them, so a row that does not was hand-edited or written by something else, and the

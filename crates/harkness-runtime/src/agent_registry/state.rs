@@ -20,9 +20,37 @@ use serde_json::Value;
 use time::{OffsetDateTime, UtcOffset};
 
 use crate::integration::{InvalidationReason, Sha256Hash, TrustState};
-use crate::tool::truncate_failure_text;
 
+use super::SchemaVersionProbe;
 use super::error::AgentRegistryError;
+
+/// What a clamped value ends with, so a reader can see it was cut.
+const CLAMP_MARKER: &str = "… (truncated)";
+
+/// Clamps `text` to at most `maximum` bytes, marker included.
+///
+/// Deliberately not [`truncate_failure_text`](crate::tool::truncate_failure_text),
+/// which clamps the *text* to the maximum and then appends its marker — so its
+/// result is up to fifteen bytes longer than the number it was given. That is
+/// harmless for a failure message nothing re-reads, and it is not harmless here:
+/// every one of these values is validated again on load against the same
+/// constant, so a value this build truncated would write successfully and then
+/// be refused for good, taking the whole row with it. The bound has to mean the
+/// same thing on both sides of the column.
+fn clamp(mut text: String, maximum: usize) -> String {
+    if text.len() <= maximum {
+        return text;
+    }
+    // `floor_char_boundary` is unstable, so walk back to one by hand; a cut
+    // inside a multi-byte character would panic on `truncate`.
+    let mut boundary = maximum.saturating_sub(CLAMP_MARKER.len());
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    text.truncate(boundary);
+    text.push_str(CLAMP_MARKER);
+    text
+}
 
 /// The wire version of every JSON value this module persists.
 ///
@@ -276,14 +304,12 @@ impl From<&AcpAgentCapabilities> for AgentCapabilitySnapshot {
             .take(MAX_AGENT_AUTH_METHODS)
         {
             auth_methods.push(AgentAuthMethod {
-                id: truncate_failure_text(
-                    method.id.as_str().to_owned(),
-                    MAX_AUTH_METHOD_TEXT_LENGTH,
-                ),
-                name: truncate_failure_text(method.name.clone(), MAX_AUTH_METHOD_TEXT_LENGTH),
-                description: method.description.clone().map(|description| {
-                    truncate_failure_text(description, MAX_AUTH_METHOD_DESCRIPTION_LENGTH)
-                }),
+                id: clamp(method.id.as_str().to_owned(), MAX_AUTH_METHOD_TEXT_LENGTH),
+                name: clamp(method.name.clone(), MAX_AUTH_METHOD_TEXT_LENGTH),
+                description: method
+                    .description
+                    .clone()
+                    .map(|description| clamp(description, MAX_AUTH_METHOD_DESCRIPTION_LENGTH)),
             });
         }
         Self {
@@ -329,12 +355,10 @@ impl InitializeRecord {
         recorded_at: OffsetDateTime,
     ) -> Self {
         Self {
-            agent_name: agent_info.map(|info| {
-                truncate_failure_text(info.name.clone(), MAX_AGENT_REPORTED_TEXT_LENGTH)
-            }),
-            agent_version: agent_info.map(|info| {
-                truncate_failure_text(info.version.clone(), MAX_AGENT_REPORTED_TEXT_LENGTH)
-            }),
+            agent_name: agent_info
+                .map(|info| clamp(info.name.clone(), MAX_AGENT_REPORTED_TEXT_LENGTH)),
+            agent_version: agent_info
+                .map(|info| clamp(info.version.clone(), MAX_AGENT_REPORTED_TEXT_LENGTH)),
             protocol_version,
             capabilities,
             recorded_at: recorded_at.to_offset(UtcOffset::UTC),
@@ -539,10 +563,7 @@ impl HealthRecord {
         Self {
             status,
             failure_kind: Some(kind.to_owned()),
-            detail: Some(truncate_failure_text(
-                detail.into(),
-                MAX_HEALTH_DETAIL_LENGTH,
-            )),
+            detail: Some(clamp(detail.into(), MAX_HEALTH_DETAIL_LENGTH)),
             teardown: None,
             elapsed,
             checked_at: checked_at.to_offset(UtcOffset::UTC),
@@ -664,6 +685,52 @@ impl AgentObservations {
         self.updated_at
     }
 
+    /// Refuses a value that could not be read back.
+    ///
+    /// Every bound here is enforced on the load path, and
+    /// [`AgentCapabilitySnapshot`]'s fields are public — so a caller building
+    /// one by hand rather than converting one from a handshake can assemble a
+    /// record that writes and can then never be read. The check belongs on the
+    /// write for exactly that reason: a bound enforced in one direction is how
+    /// a row becomes unreachable, not how it stays bounded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentRegistryError::InvalidRegistration`] naming the value that
+    /// is too long or too numerous.
+    pub fn validate(&self) -> Result<(), AgentRegistryError> {
+        if let Some(record) = self.last_initialize.as_ref() {
+            validate_capabilities(&record.capabilities)?;
+            validate_length(
+                "last_initialize_json",
+                record.agent_name.as_deref(),
+                MAX_AGENT_REPORTED_TEXT_LENGTH,
+                "the agent name is longer than one this build writes",
+            )?;
+            validate_length(
+                "last_initialize_json",
+                record.agent_version.as_deref(),
+                MAX_AGENT_REPORTED_TEXT_LENGTH,
+                "the agent version is longer than one this build writes",
+            )?;
+        }
+        if let Some(record) = self.last_health.as_ref() {
+            validate_length(
+                "last_health_json",
+                record.detail.as_deref(),
+                MAX_HEALTH_DETAIL_LENGTH,
+                "the health detail is longer than one this build writes",
+            )?;
+            validate_length(
+                "last_health_json",
+                record.failure_kind.as_deref(),
+                MAX_AGENT_REPORTED_TEXT_LENGTH,
+                "the failure kind is longer than any this build declares",
+            )?;
+        }
+        Ok(())
+    }
+
     /// Records what one successful handshake established.
     ///
     /// The authentication status and the compatibility status are *derived*
@@ -672,7 +739,7 @@ impl AgentObservations {
     /// that answered on a version this build speaks is compatible. A method
     /// already completed stays completed — an agent still advertising the way it
     /// was authenticated is not asking again.
-    pub fn record_initialize(&mut self, record: InitializeRecord) {
+    pub fn record_initialize(&mut self, record: InitializeRecord, at: OffsetDateTime) {
         self.auth_status = if record.capabilities().requires_authentication() {
             // A method already completed stays completed: an agent still
             // advertising the way it was authenticated is not asking again.
@@ -685,6 +752,7 @@ impl AgentObservations {
         };
         self.compatibility = CompatibilityStatus::Compatible;
         self.last_initialize = Some(record);
+        self.updated_at = at.to_offset(UtcOffset::UTC);
     }
 
     /// Records that a handshake failed on the protocol version itself.
@@ -692,8 +760,9 @@ impl AgentObservations {
     /// Separate from [`record_initialize`](Self::record_initialize) because
     /// there was no handshake to derive it from: the agent answered and named a
     /// version, and that is the whole of what was learned.
-    pub fn record_compatibility(&mut self, compatibility: CompatibilityStatus) {
+    pub fn record_compatibility(&mut self, compatibility: CompatibilityStatus, at: OffsetDateTime) {
         self.compatibility = compatibility;
+        self.updated_at = at.to_offset(UtcOffset::UTC);
     }
 
     /// Records the outcome of a sign-in a person completed outside Harkness.
@@ -860,11 +929,6 @@ impl AgentRuntimeState {
 
 // -- wire forms --------------------------------------------------------------
 
-#[derive(Deserialize)]
-struct SchemaVersionProbe {
-    schema_version: u32,
-}
-
 #[derive(Serialize)]
 struct InitializeRecordWireRef<'a> {
     schema_version: u32,
@@ -1001,11 +1065,14 @@ pub(crate) fn encode_initialize(record: &InitializeRecord) -> Value {
 /// outside this build's range, the strict body does not parse, or a stored
 /// value exceeds a bound the encoder applies.
 pub(crate) fn decode_initialize(value: &Value) -> Result<InitializeRecord, AgentRegistryError> {
-    let probe: SchemaVersionProbe =
-        serde_json::from_value(value.clone()).map_err(|_| malformed("last_initialize_json"))?;
+    // Borrowed rather than cloned: `&Value` is itself a deserializer, and a
+    // worst-case snapshot is tens of kilobytes that every `get` and `list` would
+    // otherwise copy twice over to read one integer.
+    let probe =
+        SchemaVersionProbe::deserialize(value).map_err(|_| malformed("last_initialize_json"))?;
     validate_observation_version(probe.schema_version)?;
-    let wire: InitializeRecordWire =
-        serde_json::from_value(value.clone()).map_err(|_| malformed("last_initialize_json"))?;
+    let wire =
+        InitializeRecordWire::deserialize(value).map_err(|_| malformed("last_initialize_json"))?;
     debug_assert_eq!(wire.schema_version, probe.schema_version);
     validate_capabilities(&wire.capabilities)?;
     validate_length(
@@ -1055,11 +1122,10 @@ pub(crate) fn encode_health(record: &HealthRecord) -> Value {
 /// teardown spelling is one this build does not define, or a stored value
 /// exceeds a bound the encoder applies.
 pub(crate) fn decode_health(value: &Value) -> Result<HealthRecord, AgentRegistryError> {
-    let probe: SchemaVersionProbe =
-        serde_json::from_value(value.clone()).map_err(|_| malformed("last_health_json"))?;
+    let probe =
+        SchemaVersionProbe::deserialize(value).map_err(|_| malformed("last_health_json"))?;
     validate_observation_version(probe.schema_version)?;
-    let wire: HealthRecordWire =
-        serde_json::from_value(value.clone()).map_err(|_| malformed("last_health_json"))?;
+    let wire = HealthRecordWire::deserialize(value).map_err(|_| malformed("last_health_json"))?;
     debug_assert_eq!(wire.schema_version, probe.schema_version);
     validate_length(
         "last_health_json",

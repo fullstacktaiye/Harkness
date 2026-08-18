@@ -147,8 +147,13 @@ Two things are deliberately **not** compared when the grant is checked:
 
 A grant can be **global** or confined to **one workspace**. A workspace-scoped
 grant does not reach outside the root it names — a launch from anywhere else is
-*refused*, and the grant is left exactly as it was. Being used in the wrong place
-is not evidence that anything changed, so it never costs you the grant.
+*refused* with `agent_grant_out_of_scope`, and the grant is left exactly as it
+was. Being used in the wrong place is not evidence that anything changed, so it
+never costs you the grant.
+
+Re-granting after drift re-affirms the *identity* and leaves the reach alone, so
+asking for a different scope is a different decision and produces a new record
+rather than quietly changing the old one.
 
 ### Re-trust after a change
 
@@ -238,7 +243,8 @@ Every failure carries a stable `kind()`. The ones you are most likely to see:
 | `executable_hash_mismatch` | The program at the path is not the one that was trusted. Both digests are in the message. | Re-trust if you expected the change; investigate if you did not. |
 | `executable_not_found` | Nothing is at the configured path. | Fix the path, or install the agent. The registration is kept. |
 | `invalid_executable` | Something is there and cannot be run. The operating system's reason is in the message. | Check that it is a program and that it is executable. |
-| `agent_authentication_required` | The agent advertised authentication and nobody has recorded completing it. | Sign in through the agent's own flow, then record it. |
+| `agent_authentication_required` | The agent advertised authentication and nobody has recorded completing it — or a recorded attempt failed. | Sign in through the agent's own flow, then record it. |
+| `agent_grant_out_of_scope` | The grant is fine and says somewhere else. | Launch it in the workspace it was granted for, or trust it here too. |
 | `agent_incompatible` | The last handshake selected a protocol version this build does not speak. | Use a build of the agent that speaks ACP v1. |
 | `initialize_timeout` | It was launched, said nothing usable, and was terminated. | Check that the command really starts an ACP agent, and that any required arguments are in `args`. |
 | `agents_file_version_too_new` | `agents.json` was written by a newer Harkness. | Upgrade Harkness. The file is untouched. |

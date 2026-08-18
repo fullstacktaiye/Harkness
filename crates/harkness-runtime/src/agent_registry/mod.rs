@@ -33,7 +33,8 @@
 //!    holds for *every* registration path rather than for the one that
 //!    remembered it.
 //! 3. **Trusted.** A grant exists, currently stands, and reaches here — a
-//!    workspace-scoped grant is invalid outside the root it names.
+//!    workspace-scoped grant does not reach outside the root it names, and being
+//!    used somewhere else refuses without costing the grant anything.
 //! 4. **Unchanged.** The executable is hashed *now* and compared with the digest
 //!    the grant was bound to. A mismatch invalidates the grant, disables the
 //!    agent, and refuses; it does not merely refuse this once.
@@ -74,6 +75,18 @@ mod suggestion;
 #[cfg(test)]
 mod tests;
 
+/// The forward-compatible prefix of every versioned value this module reads.
+///
+/// One definition rather than one per parser: `agents.json` and each of the two
+/// observation columns are probed the same way, and three identical derives
+/// would be three places for the idiom to drift. The *range* check stays with
+/// each caller, because that is the part that genuinely differs — a file and a
+/// column carry independent version numbers.
+#[derive(serde::Deserialize)]
+struct SchemaVersionProbe {
+    schema_version: u32,
+}
+
 pub use config::{
     AGENTS_FILE, AGENTS_LOCK_FILE, AGENTS_SCHEMA_VERSION, AgentRegistration, AgentRegistryFile,
     AgentSource, MAX_AGENT_ARGUMENT_LENGTH, MAX_AGENT_ARGUMENTS, MAX_AGENTS_FILE_BYTES,
@@ -86,9 +99,9 @@ pub use discovery::{
 pub use error::AgentRegistryError;
 pub use id::{AgentId, MAX_AGENT_ID_LENGTH};
 pub use service::{
-    AgentLaunch, AgentRegistryService, DEFAULT_HEALTH_CHECK_TIMEOUT, DEFAULT_SHUTDOWN_GRACE,
-    HealthCheck, HealthOutcome, LaunchContext, RegisteredAgent, RegistrationOutcome,
-    RemovalOutcome, TrustAgent, TrustOutcome,
+    AGENT_SCRATCH_DIRECTORY, AgentLaunch, AgentRegistryService, DEFAULT_HEALTH_CHECK_TIMEOUT,
+    DEFAULT_SHUTDOWN_GRACE, HealthCheck, HealthOutcome, LaunchContext, RegisteredAgent,
+    RegistrationOutcome, RemovalOutcome, TrustAgent, TrustOutcome,
 };
 pub use state::{
     AGENT_OBSERVATION_SCHEMA_VERSION, AgentAuthMethod, AgentCapabilitySnapshot, AgentObservations,

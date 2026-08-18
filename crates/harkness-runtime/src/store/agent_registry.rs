@@ -27,6 +27,17 @@ pub(super) fn put(
     id: &AgentId,
     observations: &AgentObservations,
 ) -> Result<(), StoreError> {
+    // Held to the same bounds the load path holds it to, before anything is
+    // written. Every field here is validated again on the way out, and a value
+    // that satisfies one direction and not the other is a row that writes and
+    // can never be read — which takes the agent with it.
+    observations
+        .validate()
+        .map_err(|error| StoreError::ColumnEncoding {
+            record: RECORD,
+            field: "agent_runtime_state",
+            reason: error.to_string(),
+        })?;
     let initialize = observations
         .last_initialize()
         .map(|record| encode(RECORD, "last_initialize_json", &encode_initialize(record)))
