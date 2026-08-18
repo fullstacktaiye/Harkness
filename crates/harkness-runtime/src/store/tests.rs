@@ -4494,6 +4494,15 @@ const FROZEN_V7_DATABASE: &[u8] = include_bytes!("fixtures/runtime-v7.db");
 
 /// The frozen v8 database carrying one run's workspace snapshot.
 const FROZEN_V8_DATABASE: &[u8] = include_bytes!("fixtures/runtime-v8.db");
+/// The frozen v9 database carrying one trusted agent and what was observed of it.
+const FROZEN_V9_DATABASE: &[u8] = include_bytes!("fixtures/runtime-v9.db");
+
+/// The agent registration and trust-record identities the v9 fixture was
+/// written with.
+const FIXTURE_AGENT_ID: &str = "gemini-cli";
+const FIXTURE_TRUST_RECORD_ID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+/// The digest the v9 fixture's grant is bound to.
+const FIXTURE_AGENT_DIGEST: &str = "frozen agent executable";
 
 /// The lease and retry identities the v7 fixture was written with.
 const FIXTURE_LEASE_ID: &str = "99999999-9999-4999-8999-999999999999";
@@ -4539,6 +4548,10 @@ const LATER_MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 9,
+        statements: include_str!("migrations/009_agent_registry.sql"),
+    },
+    Migration {
+        version: 10,
         statements: "ALTER TABLE runs ADD COLUMN cancelled_by TEXT;",
     },
 ];
@@ -4855,6 +4868,95 @@ fn a_frozen_v8_database_opens_and_reads_its_workspace_snapshot() {
 }
 
 #[test]
+fn a_frozen_v9_database_opens_and_reads_its_agent_grant_and_observations() {
+    use crate::agent_registry::{AgentId, AuthStatus, CompatibilityStatus, HealthStatus};
+    use crate::integration::{SubjectKind, TrustCheck, TrustState};
+
+    let data_dir = restore_frozen_database(FROZEN_V9_DATABASE);
+    let store = Store::open(data_dir.path()).unwrap();
+    assert_eq!(
+        recorded_version(&guard(&store.writer)).unwrap(),
+        SCHEMA_VERSION
+    );
+
+    let stored = store
+        .latest_trust_record(SubjectKind::AgentExecutable, FIXTURE_AGENT_ID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.id(),
+        FIXTURE_TRUST_RECORD_ID
+            .parse::<crate::integration::TrustRecordId>()
+            .unwrap()
+    );
+    assert_eq!(stored.subject_ref(), FIXTURE_AGENT_ID);
+    let record = stored.record();
+    assert_eq!(record.state(), TrustState::Trusted);
+    assert_eq!(
+        record
+            .identity_basis()
+            .executable()
+            .map(crate::integration::ExecutableIdentity::sha256),
+        Some(Sha256Hash::of(FIXTURE_AGENT_DIGEST))
+    );
+
+    // The frozen grant still answers the question it exists to answer: the same
+    // bytes are valid, and different bytes at the same path are not.
+    let unchanged = crate::integration::ObservedIdentity::new(
+        crate::integration::IdentityBasis::new(
+            "Gemini CLI",
+            crate::integration::ConfigurationSource::User,
+        )
+        .unwrap()
+        .launched_from(
+            crate::integration::ExecutableIdentity::new(
+                "/usr/bin/gemini",
+                Sha256Hash::of(FIXTURE_AGENT_DIGEST),
+            )
+            .unwrap(),
+        ),
+    );
+    assert_eq!(record.check(&unchanged), TrustCheck::Valid);
+    let replaced = crate::integration::ObservedIdentity::new(
+        crate::integration::IdentityBasis::new(
+            "Gemini CLI",
+            crate::integration::ConfigurationSource::User,
+        )
+        .unwrap()
+        .launched_from(
+            crate::integration::ExecutableIdentity::new(
+                "/usr/bin/gemini",
+                Sha256Hash::of("a different program"),
+            )
+            .unwrap(),
+        ),
+    );
+    assert_eq!(
+        record.check(&replaced),
+        TrustCheck::Invalidate(crate::integration::InvalidationReason::ExecutableHashChanged)
+    );
+
+    let observations = store
+        .agent_observations(&AgentId::new(FIXTURE_AGENT_ID).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(observations.auth_status(), AuthStatus::NotRequired);
+    assert_eq!(
+        observations.compatibility(),
+        CompatibilityStatus::Compatible
+    );
+    let initialize = observations.last_initialize().unwrap();
+    assert_eq!(initialize.protocol_version(), 1);
+    assert!(initialize.capabilities().load_session);
+    assert!(initialize.capabilities().session_resume);
+    assert!(!initialize.capabilities().session_close);
+    assert_eq!(
+        observations.last_health().unwrap().status(),
+        HealthStatus::Healthy
+    );
+}
+
+#[test]
 fn a_frozen_v2_database_opens_after_future_migrations() {
     let data_dir = restore_frozen_database(FROZEN_V2_DATABASE);
     let path = data_dir.path().join(DATABASE_FILE);
@@ -4865,7 +4967,7 @@ fn a_frozen_v2_database_opens_after_future_migrations() {
 
     apply(&mut connection, LATER_MIGRATIONS).unwrap();
 
-    assert_eq!(recorded_version(&connection).unwrap(), 9);
+    assert_eq!(recorded_version(&connection).unwrap(), 10);
     let run =
         super::repository::load_run(&connection, RunId::from_str(FIXTURE_RUN_ID).unwrap()).unwrap();
     assert_eq!(run.state(), ExecutionState::Running);
@@ -5240,6 +5342,76 @@ fn regenerate_the_frozen_v8_fixture() {
     freeze(&guard(&store.writer), "runtime-v8.db");
 }
 
+/// Writes the frozen v9 fixture: one trusted agent, and what was observed of it.
+///
+/// Run deliberately, and only when migration 9 changes:
+/// `cargo test -p harkness-runtime regenerate_the_frozen_v9_fixture -- --ignored`.
+#[test]
+#[ignore = "rewrites a committed fixture; run only when migration 9 changes"]
+fn regenerate_the_frozen_v9_fixture() {
+    use crate::agent_registry::{
+        AgentCapabilitySnapshot, AgentId, AgentObservations, AgentTeardown, HealthRecord,
+        HealthStatus, InitializeRecord,
+    };
+    use crate::integration::{
+        ConfigurationSource, ExecutableIdentity, IdentityBasis, SubjectKind, TrustRecord,
+        TrustRecordId, TrustScope,
+    };
+
+    let data_dir = TempDir::new().unwrap();
+    let store = store_with_migrations(data_dir.path(), &MIGRATIONS[..9]);
+
+    let executable =
+        ExecutableIdentity::new("/usr/bin/gemini", Sha256Hash::of(FIXTURE_AGENT_DIGEST)).unwrap();
+    let basis = IdentityBasis::new("Gemini CLI", ConfigurationSource::User)
+        .unwrap()
+        .launched_from(executable);
+    let record = TrustRecord::grant(
+        SubjectKind::AgentExecutable,
+        basis,
+        TrustScope::Global,
+        at(1),
+    )
+    .unwrap();
+    store
+        .insert_trust_record(
+            TrustRecordId::from_str(FIXTURE_TRUST_RECORD_ID).unwrap(),
+            SubjectKind::AgentExecutable,
+            FIXTURE_AGENT_ID,
+            &record,
+            at(1),
+        )
+        .unwrap();
+
+    let agent = AgentId::new(FIXTURE_AGENT_ID).unwrap();
+    let mut observations = AgentObservations::unobserved(at(1));
+    observations.record_initialize(
+        InitializeRecord::new(
+            None,
+            1,
+            AgentCapabilitySnapshot {
+                load_session: true,
+                session_resume: true,
+                ..AgentCapabilitySnapshot::default()
+            },
+            at(2),
+        ),
+        at(2),
+    );
+    observations.record_health(
+        HealthRecord::succeeded(
+            HealthStatus::Healthy,
+            std::time::Duration::from_millis(120),
+            at(2),
+        )
+        .torn_down(AgentTeardown::ClosedStdin),
+        at(2),
+    );
+    store.put_agent_observations(&agent, &observations).unwrap();
+
+    freeze(&guard(&store.writer), "runtime-v9.db");
+}
+
 /// Builds a store stopped at an older migration for fixture regeneration.
 fn store_with_migrations(data_dir: &std::path::Path, migrations: &[Migration]) -> Store {
     std::fs::create_dir_all(data_dir).unwrap();
@@ -5270,8 +5442,8 @@ fn freeze(connection: &Connection, name: &str) {
 
 #[test]
 fn every_migration_in_this_build_is_recorded_in_order() {
-    assert_eq!(MIGRATIONS.len(), 8, "add coverage for a new migration");
-    assert_eq!(SCHEMA_VERSION, 8);
+    assert_eq!(MIGRATIONS.len(), 9, "add coverage for a new migration");
+    assert_eq!(SCHEMA_VERSION, 9);
 }
 
 // -- performance -------------------------------------------------------------

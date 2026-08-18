@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "agents": [
+    {
+      "id": "gemini-cli",
+      "display_name": "Gemini CLI",
+      "command": "/usr/bin/gemini",
+      "args": [],
+      "env_allowlist": [
+        "HOME",
+        "PATH"
+      ],
+      "enabled": true,
+      "source": "user"
+    },
+    {
+      "id": "gemini-cli-dev",
+      "display_name": "Gemini CLI (development build)",
+      "command": "/home/user/src/gemini/target/debug/gemini",
+      "args": [
+        "--experimental-acp"
+      ],
+      "env_allowlist": [],
+      "enabled": false,
+      "source": "development"
+    }
+  ]
+}

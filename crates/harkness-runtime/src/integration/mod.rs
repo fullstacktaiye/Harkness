@@ -111,7 +111,9 @@ mod wire;
 
 pub use binding::IntegrationIdentity;
 pub use error::IntegrationDomainError;
-pub use id::{ExternalAgentId, ForgeAccountId, ForgeRepoRef, McpServerId, McpToolRef, RecipeId};
+pub use id::{
+    ExternalAgentId, ForgeAccountId, ForgeRepoRef, McpServerId, McpToolRef, RecipeId, TrustRecordId,
+};
 pub use record::{ObservedIdentity, TrustRecord};
 pub use state::{
     InvalidationReason, TRUST_TRANSITIONS, TrustCheck, TrustScope, TrustScopeKind, TrustState,
@@ -119,6 +121,7 @@ pub use state::{
 pub use subject::{
     ConfigurationSource, EndpointIdentity, ExecutableIdentity, IdentityBasis, MAX_CAPABILITIES,
     MAX_EXECUTABLE_PATH_LENGTH, MAX_IDENTITY_FIELD_LENGTH, Sha256Hash, SubjectKind,
+    is_rooted_anywhere,
 };
 pub use wire::{
     INTEGRATION_RECORD_SCHEMA_VERSION, MINIMUM_INTEGRATION_RECORD_SCHEMA_VERSION, TrustRecordWire,

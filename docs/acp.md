@@ -187,8 +187,12 @@ with and is observed within the workspace's 250 ms visibility target.
 
 `harkness-acp` never launches an executable. `AcpConnection::new` takes a
 connection that already exists, because deciding which program may run is a trust
-decision bound to an executable digest and that decision is #150's under
-ADR-0016. A crate that could launch a program would be a second route around it.
+decision bound to an executable digest, and that decision belongs to
+`harkness-runtime`'s agent registry under ADR-0016. A crate that could launch a
+program would be a second route around it.
+
+Registering an agent, trusting one, discovering candidates, and health-checking a
+registration are documented in [`docs/agents.md`](agents.md).
 
 ## Frozen fixtures
 

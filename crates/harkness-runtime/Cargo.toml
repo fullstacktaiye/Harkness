@@ -11,6 +11,12 @@ path = "src/lib.rs"
 
 [dependencies]
 base64.workspace = true
+# ADR-0009 points this edge one way only: the runtime is the composition point
+# and may name an adapter, while no adapter may name the runtime. The agent
+# registry needs both the run store and the ACP handshake, and trust has to
+# compose with `trust` and `policy`, which an adapter cannot see — so the
+# registry lives here and reaches down rather than the other way round.
+harkness-acp.workspace = true
 harkness-core.workspace = true
 harkness-context.workspace = true
 harkness-git.workspace = true

@@ -64,6 +64,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: 8,
         statements: include_str!("migrations/008_workspace_snapshots.sql"),
     },
+    Migration {
+        version: 9,
+        statements: include_str!("migrations/009_agent_registry.sql"),
+    },
 ];
 
 /// Newest schema version this build understands.
@@ -186,8 +190,10 @@ mod tests {
         assert_eq!(
             tables,
             [
+                "agent_runtime_state",
                 "approvals",
                 "artifacts",
+                "integration_trust_records",
                 "run_events",
                 "runs",
                 "runtime_leases",

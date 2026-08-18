@@ -194,6 +194,19 @@ pub enum EventKind {
     /// generation bump changes what every later snapshot digest means, not
     /// because anything in `runtime.db` was touched — nothing was.
     ContextCacheRecreated,
+    /// A registered external agent was spawned, negotiated with, and torn down.
+    ///
+    /// The whole health record, including the typed failure kind and the rung
+    /// teardown had to reach — "this agent had to be killed" is a bug report
+    /// rather than an implementation detail.
+    ExternalAgentHealthChecked,
+    /// A registered external agent's executable stopped matching its grant.
+    ///
+    /// Recorded where the drift was *detected* — a health check or a launch —
+    /// because which of the two noticed is what an audit needs to know. The
+    /// durable consequence is on the trust record; this is the timeline entry
+    /// saying when the run in front of the user ran into it.
+    ExternalAgentTrustInvalidated,
     /// Anything a run wants to say that no other kind covers.
     Diagnostic,
     /// A kind this build does not define, preserved exactly as stored.
@@ -229,6 +242,8 @@ impl EventKind {
         "agent_checkpoint",
         "snapshot_captured",
         "context_cache_recreated",
+        "external_agent_health_checked",
+        "external_agent_trust_invalidated",
         "diagnostic",
     ];
 
@@ -253,7 +268,9 @@ impl EventKind {
             Self::AgentCheckpoint => Self::KINDS[14],
             Self::SnapshotCaptured => Self::KINDS[15],
             Self::ContextCacheRecreated => Self::KINDS[16],
-            Self::Diagnostic => Self::KINDS[17],
+            Self::ExternalAgentHealthChecked => Self::KINDS[17],
+            Self::ExternalAgentTrustInvalidated => Self::KINDS[18],
+            Self::Diagnostic => Self::KINDS[19],
             Self::Unrecognized(spelling) => spelling,
         }
     }
@@ -283,6 +300,8 @@ impl EventKind {
             "agent_checkpoint" => Self::AgentCheckpoint,
             "snapshot_captured" => Self::SnapshotCaptured,
             "context_cache_recreated" => Self::ContextCacheRecreated,
+            "external_agent_health_checked" => Self::ExternalAgentHealthChecked,
+            "external_agent_trust_invalidated" => Self::ExternalAgentTrustInvalidated,
             "diagnostic" => Self::Diagnostic,
             other => Self::Unrecognized(other.to_owned()),
         }
@@ -847,6 +866,8 @@ mod tests {
             EventKind::AgentCheckpoint,
             EventKind::SnapshotCaptured,
             EventKind::ContextCacheRecreated,
+            EventKind::ExternalAgentHealthChecked,
+            EventKind::ExternalAgentTrustInvalidated,
             EventKind::Diagnostic,
         ];
 

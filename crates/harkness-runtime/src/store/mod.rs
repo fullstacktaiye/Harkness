@@ -98,6 +98,7 @@
 //! behind, which is reported as [`StoreError::IncompleteCheckpoint`] rather
 //! than by failing the statement.
 
+mod agent_registry;
 mod approval;
 mod artifact;
 mod column;
@@ -110,6 +111,7 @@ mod recovery;
 mod redaction;
 mod repository;
 mod snapshot;
+mod trust_record;
 mod workspace_trust;
 
 use std::fs;
@@ -123,6 +125,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use serde_json::Value;
 use time::OffsetDateTime;
 
+use crate::agent_registry::{AgentId, AgentObservations};
 use crate::approval::{
     ApprovalDecision, ApprovalGrant, ApprovalId, ApprovalRequest, ApprovalState, InputHash,
     canonical_input_hash,
@@ -131,6 +134,7 @@ use crate::domain::{
     ArtifactId, Failure, LeaseId, Run, RunDomainError, RunId, Step, StepId, Task, TaskId, ToolCall,
     ToolCallId,
 };
+use crate::integration::{SubjectKind, TrustRecord, TrustRecordId};
 use crate::tool::ToolIdentity;
 use crate::trust::{TrustState, WorkspaceTrust};
 
@@ -148,6 +152,7 @@ pub use recovery::{InterruptionReason, RunInterruption};
 pub(crate) use redaction::redact_payload;
 pub use redaction::{PassThrough, Redactor};
 pub use snapshot::StoredSnapshot;
+pub use trust_record::StoredTrustRecord;
 
 /// Name of the run database inside the Harkness data directory.
 pub const DATABASE_FILE: &str = "runtime.db";
@@ -430,6 +435,128 @@ impl Store {
         run_id: RunId,
     ) -> Result<Vec<StoredSnapshot>, StoreError> {
         self.with_reader(|connection| snapshot::for_run(connection, run_id))
+    }
+
+    // -- external-integration trust and agent state -------------------------
+
+    /// Records a new trust grant about one external subject.
+    ///
+    /// A *new* row, never an upsert. `TrustRecord::check` ignores the display
+    /// name and the executable path and accepts a compatible upgrade, so there
+    /// is no structural key to deduplicate on — and the one an upsert would
+    /// invent would let a fresh grant overwrite the revocation that preceded it.
+    /// Transitions of an existing grant go through
+    /// [`update_trust_record`](Self::update_trust_record) instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::AlreadyExists`] when the row identity is taken and
+    /// [`StoreError::PayloadTooLarge`] when the subject reference or the encoded
+    /// record exceeds [`MAX_INLINE_PAYLOAD_BYTES`].
+    pub fn insert_trust_record(
+        &self,
+        id: TrustRecordId,
+        subject_kind: SubjectKind,
+        subject_ref: &str,
+        record: &TrustRecord,
+        recorded_at: OffsetDateTime,
+    ) -> Result<(), StoreError> {
+        trust_record::insert(
+            &guard(&self.writer),
+            id,
+            subject_kind,
+            subject_ref,
+            record,
+            recorded_at,
+        )
+    }
+
+    /// Rewrites the grant one row holds, leaving its identity and subject alone.
+    ///
+    /// A revocation, an invalidation, and a re-grant are all transitions of the
+    /// decision a user already made, so all three land here. Writing a new row
+    /// for each would make "the most recent record about this subject" a
+    /// question with more than one answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NotFound`] when no row carries `id`.
+    pub fn update_trust_record(
+        &self,
+        id: TrustRecordId,
+        record: &TrustRecord,
+    ) -> Result<(), StoreError> {
+        trust_record::update(&guard(&self.writer), id, record)
+    }
+
+    /// Every grant recorded about one subject, oldest first.
+    ///
+    /// The whole history rather than the current answer, because a revocation
+    /// followed by a fresh grant is two records and an audit that showed only
+    /// the second would omit the decision the model exists to preserve.
+    pub fn trust_records(
+        &self,
+        subject_kind: SubjectKind,
+        subject_ref: &str,
+    ) -> Result<Vec<StoredTrustRecord>, StoreError> {
+        self.with_reader(|connection| {
+            trust_record::for_subject(connection, subject_kind, subject_ref)
+        })
+    }
+
+    /// The most recently recorded grant about one subject, if there is one.
+    ///
+    /// One indexed seek rather than the history with everything but its last
+    /// row thrown away — this is the query every launch and every health check
+    /// runs, and a subject with a long decision history must not make it slower.
+    pub fn latest_trust_record(
+        &self,
+        subject_kind: SubjectKind,
+        subject_ref: &str,
+    ) -> Result<Option<StoredTrustRecord>, StoreError> {
+        self.with_reader(|connection| {
+            trust_record::latest_for_subject(connection, subject_kind, subject_ref)
+        })
+    }
+
+    /// Replaces everything observed about one registered agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::PayloadTooLarge`] when an encoded observation
+    /// exceeds [`MAX_INLINE_PAYLOAD_BYTES`].
+    pub fn put_agent_observations(
+        &self,
+        id: &AgentId,
+        observations: &AgentObservations,
+    ) -> Result<(), StoreError> {
+        agent_registry::put(&guard(&self.writer), id, observations)
+    }
+
+    /// Everything observed about one registered agent, if anything was.
+    pub fn agent_observations(
+        &self,
+        id: &AgentId,
+    ) -> Result<Option<AgentObservations>, StoreError> {
+        self.with_reader(|connection| agent_registry::load(connection, id))
+    }
+
+    /// Forgets one agent's observations and every grant made about it.
+    ///
+    /// One transaction, because the two halves are one decision: state left
+    /// behind for an identifier a user later reuses would answer for a program
+    /// nobody checked, and a grant left behind would make the reused identifier
+    /// trusted on arrival.
+    pub fn forget_agent(&self, id: &AgentId) -> Result<(), StoreError> {
+        self.in_write_transaction("removing an agent registration", |connection| {
+            agent_registry::delete(connection, id)?;
+            trust_record::delete_for_subject(
+                connection,
+                SubjectKind::AgentExecutable,
+                id.as_str(),
+            )?;
+            Ok(())
+        })
     }
 
     // -- approvals ----------------------------------------------------------
