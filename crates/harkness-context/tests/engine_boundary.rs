@@ -71,6 +71,21 @@ fn an_engine_serves_workspace_identity_with_nothing_else_in_the_process() {
     assert_eq!(snapshot.index_generation(), engine.index_generation());
     assert_eq!(engine.cache_root(), workspace.cache_root(&engine));
     assert!(engine.cache_root().join(INDEX_DATABASE_FILE).is_file());
+
+    // And what that workspace offers as context, from the same standing start:
+    // no runtime, no store, no model in the process.
+    let inventory = engine
+        .inventory(&InventoryRequest::new(), &Cancellation::default())
+        .unwrap();
+    assert!(
+        inventory
+            .entries()
+            .iter()
+            .any(|entry| entry.path.display() == "tracked.txt" && entry.eligible()),
+        "{:?}",
+        inventory.entries()
+    );
+    assert!(!inventory.is_truncated());
 }
 
 /// Every retrieval issue has a compiling seam today and a typed refusal until it
@@ -83,10 +98,6 @@ fn the_unimplemented_facade_methods_refuse_by_name_from_outside_the_crate() {
     let chunk = ChunkId::derive(&RepoPath::from_path(Path::new("src/lib.rs")), "0", b"");
 
     let refusals = [
-        engine
-            .inventory(&InventoryRequest::new(), &cancellation)
-            .map(|_| ())
-            .unwrap_err(),
         engine
             .search(&SearchQuery::new("needle"), &cancellation)
             .map(|_| ())

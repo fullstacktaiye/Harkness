@@ -55,7 +55,7 @@ use crate::index::{
     self, CacheRecreation, ExpectedVersions, IndexAvailability, IndexCache, IndexReport,
     IndexStatus, RecreationReason,
 };
-use crate::inventory::FileInventory;
+use crate::inventory::{FileInventory, GLOBAL_IGNORE_FILE, InventoryBuilder, InventoryPolicy};
 use crate::probe::FilesystemProbe;
 use crate::snapshot::{Capture, CaptureRequest, WorkspaceSnapshot};
 
@@ -530,20 +530,43 @@ impl ContextEngine {
         )?)
     }
 
-    /// The classified, bounded set of files eligible for indexing ([#112]).
+    /// The classified, bounded set of files eligible for indexing.
+    ///
+    /// Captures a snapshot and walks it: an inventory names the capture it was
+    /// built for, and the two must come from one call rather than from a
+    /// caller pairing them. The walk's own bounds and layers are documented on
+    /// [`InventoryBuilder`].
+    ///
+    /// The policy comes from the engine's configuration and never from the
+    /// request, which is why [`InventoryRequest`] carries no ignore settings:
+    /// the global layer is `<data_dir>/`[`GLOBAL_IGNORE_FILE`] — the one place
+    /// that path is composed — and the repository's own layer is found inside
+    /// the worktree, where it may only tighten.
     ///
     /// # Errors
     ///
-    /// [`ContextEngineError::NotYetAvailable`] until [#112] lands.
-    ///
-    /// [#112]: https://github.com/fullstacktaiye/harkness/issues/112
+    /// [`ContextEngineError::Cancelled`] if the token is observed, and
+    /// [`ContextEngineError::Inventory`] for a root that cannot be walked or a
+    /// rule file that cannot be applied.
     pub fn inventory(
         &self,
         request: &InventoryRequest,
         cancellation: &Cancellation,
     ) -> Result<FileInventory, ContextEngineError> {
-        let _ = (request, cancellation);
-        Err(unavailable("file inventory"))
+        // `InventoryRequest` is empty today and taken by reference anyway, so
+        // that the field a later issue adds is not a breaking change here.
+        let _ = request;
+        let snapshot = self.snapshot(cancellation)?;
+        Ok(InventoryBuilder::build(
+            &snapshot,
+            &self.inventory_policy(),
+            cancellation,
+        )?)
+    }
+
+    /// The walk policy this engine's configuration implies.
+    fn inventory_policy(&self) -> InventoryPolicy {
+        InventoryPolicy::new().with_global_ignore(self.config.data_dir.join(GLOBAL_IGNORE_FILE))
     }
 
     /// Lexical and filename search over the index ([#116]).

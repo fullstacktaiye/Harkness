@@ -16,6 +16,15 @@ The code is `crates/harkness-context/src/inventory.rs` (the walk and the
 exclusion hierarchy) and `crates/harkness-context/src/classify.rs` (the class
 each recorded path gets).
 
+`ContextEngine::inventory` is how anything reaches it. The engine captures a
+snapshot and walks it in one call — an inventory names the capture it was built
+for, so pairing the two is not left to a caller — and it composes the policy from
+its own configuration: the global layer at `<data_dir>/context-ignore`, which is
+the one place that path is joined, and the repository's own layer inside the
+worktree, where it may only tighten. `InventoryRequest` carries no ignore
+settings for that reason: a request that could widen the walk would be input
+deciding what the engine may read.
+
 ## The exclusion hierarchy
 
 Four layers are consulted for every path, strictly in this order, and the first

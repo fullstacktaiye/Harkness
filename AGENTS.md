@@ -608,7 +608,11 @@ either.
 
 **The root comes from a captured snapshot, never from a caller's string.** There
 is no entry point taking a bare path, so containment is answered once where the
-workspace was read. Symlinks are recorded and never followed; a directory holding
+workspace was read, and `ContextEngine::inventory` captures and walks in one call
+so the id an inventory carries always names the capture it was built from. The
+walk policy comes from the engine's configuration and never from the request,
+which is why `InventoryRequest` holds no ignore settings: a request that could
+widen the walk would be input deciding what the engine may read. Symlinks are recorded and never followed; a directory holding
 its own `.git` is a boundary the walk stops at; the repository's own `.git` is
 skipped rather than counted, because nothing excluded it.
 

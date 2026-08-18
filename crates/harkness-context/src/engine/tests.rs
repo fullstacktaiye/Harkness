@@ -15,6 +15,7 @@ use super::{
 use crate::index::{
     INDEX_DATABASE_FILE, INDEX_SCHEMA_VERSION, IndexAvailability, RecreationReason,
 };
+use crate::inventory::GLOBAL_IGNORE_FILE;
 use crate::probe::FilesystemProbe;
 use crate::{ChunkId, FreshnessState, RepoPath};
 
@@ -122,6 +123,72 @@ fn two_linked_worktrees_of_one_repository_share_a_cache_root() {
     );
 }
 
+/// The facade walks the workspace it was configured for, under the policy that
+/// configuration implies — including the global ignore file, whose path only the
+/// engine knows how to compose.
+#[test]
+fn an_inventory_is_walked_under_the_engines_own_policy() {
+    let workspace = Workspace::new();
+    fs::write(workspace.root.join("keep.rs"), "fn main() {}\n").unwrap();
+    fs::write(workspace.root.join("notes.md"), "# notes\n").unwrap();
+    fs::write(workspace.root.join(".env"), "TOKEN=hunter2\n").unwrap();
+    fs::create_dir_all(&workspace.fixture.data_dir).unwrap();
+    fs::write(
+        workspace.fixture.data_dir.join(GLOBAL_IGNORE_FILE),
+        "notes.md\n",
+    )
+    .unwrap();
+
+    let engine = workspace.engine();
+    let inventory = engine
+        .inventory(&InventoryRequest::new(), &Cancellation::default())
+        .unwrap();
+
+    let paths = inventory
+        .entries()
+        .iter()
+        .map(|entry| entry.path.display())
+        .collect::<Vec<_>>();
+    assert!(paths.contains(&"keep.rs".to_owned()), "{paths:?}");
+    // The user's own layer applied, which only happens because the engine
+    // joined `<data_dir>/context-ignore` — nothing else in the workspace does.
+    assert!(!paths.contains(&"notes.md".to_owned()), "{paths:?}");
+    assert_eq!(inventory.ignored_count(), 1);
+    // And the denial layer still holds through the facade.
+    assert_eq!(inventory.denied_count(), 1);
+    assert!(!format!("{inventory:#?}").contains("hunter2"));
+    // The id names the capture this walk was built for, and a second capture of
+    // one unchanged workspace is a different id — which is what an id means.
+    assert_ne!(
+        inventory.snapshot(),
+        engine.snapshot(&Cancellation::default()).unwrap().id()
+    );
+}
+
+/// A cancelled walk reaches the caller as the engine's own `cancelled`, not as a
+/// second spelling of it.
+#[test]
+fn a_cancelled_inventory_answers_with_the_engines_cancelled_kind() {
+    let workspace = Workspace::new();
+    let engine = workspace.engine();
+    let cancellation = Cancellation::default();
+    cancellation.cancel();
+
+    let error = engine
+        .inventory(&InventoryRequest::new(), &cancellation)
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "cancelled");
+    assert_eq!(
+        crate::ContextEngineError::kinds()
+            .iter()
+            .filter(|kind| **kind == "cancelled")
+            .count(),
+        1,
+        "one event, one spelling"
+    );
+}
+
 /// Every facade method answers. None panics, and none fabricates a result for a
 /// feature this build does not have.
 #[test]
@@ -130,8 +197,11 @@ fn every_facade_method_either_answers_or_names_the_feature_it_is_missing() {
     let engine = workspace.engine();
     let cancellation = Cancellation::default();
 
-    // The one method that is implemented.
+    // The methods that are implemented.
     engine.snapshot(&cancellation).unwrap();
+    engine
+        .inventory(&InventoryRequest::new(), &cancellation)
+        .unwrap();
 
     let chunk = ChunkId::derive(
         &RepoPath::from_path(std::path::Path::new("src/lib.rs")),
@@ -139,12 +209,6 @@ fn every_facade_method_either_answers_or_names_the_feature_it_is_missing() {
         b"",
     );
     let refusals: Vec<(&str, crate::ContextEngineError)> = vec![
-        (
-            "inventory",
-            engine
-                .inventory(&InventoryRequest::new(), &cancellation)
-                .unwrap_err(),
-        ),
         (
             "search",
             engine
@@ -181,8 +245,8 @@ fn every_facade_method_either_answers_or_names_the_feature_it_is_missing() {
 
     assert_eq!(
         refusals.len(),
-        7,
-        "eight facade methods, one of them working"
+        6,
+        "eight facade methods, two of them working"
     );
     for (method, error) in refusals {
         assert_eq!(

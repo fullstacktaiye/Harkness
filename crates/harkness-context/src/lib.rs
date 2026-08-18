@@ -113,9 +113,9 @@ pub use classify::{
 };
 pub use digest::{Sha256Hex, empty_path_set_digest};
 pub use engine::{
-    ChunkContent, ContextEngine, ContextEngineConfig, ContextPack, InstructionSet, InventoryRequest,
-    MapRequest, PackRequest, RepositoryMap, SearchQuery, SearchResults, SettingGroup, SettingOrigin,
-    SettingOrigins, SymbolQuery, SymbolResults,
+    ChunkContent, ContextEngine, ContextEngineConfig, ContextPack, InstructionSet,
+    InventoryRequest, MapRequest, PackRequest, RepositoryMap, SearchQuery, SearchResults,
+    SettingGroup, SettingOrigin, SettingOrigins, SymbolQuery, SymbolResults,
 };
 pub use error::{ContextDomainError, ContextEngineError};
 pub use ids::{
