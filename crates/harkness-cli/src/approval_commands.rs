@@ -197,10 +197,10 @@ fn listing_result(
     command_result(
         json_output,
         || {
-            if requests.is_empty() {
+            if requests.is_empty() && next_cursor.is_none() {
                 return "no approval requests".to_owned();
             }
-            requests
+            let mut lines = requests
                 .iter()
                 .map(|request| {
                     format!(
@@ -213,8 +213,14 @@ fn listing_result(
                         single_line(request.input_summary()),
                     )
                 })
-                .collect::<Vec<_>>()
-                .join("\n")
+                .collect::<Vec<_>>();
+            // `--all` pages by *run*, so an empty page is routinely not the end
+            // of the history — saying "no approval requests" without this would
+            // report a store that holds plenty as holding none.
+            if next_cursor.is_some() {
+                lines.push("more runs available; use --json to obtain next_cursor".to_owned());
+            }
+            lines.join("\n")
         },
         || {
             Ok(json!({

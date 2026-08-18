@@ -665,7 +665,11 @@ pub(crate) fn supervise_run(
         ApprovalMode::Noninteractive => Asker::Deny,
         ApprovalMode::Interactive => Asker::Ask(AnswerReader::spawn()),
     };
-    let mut state_read_at = Instant::now() - STATE_INTERVAL;
+    // `None` is "never read", so the first pass always reads. Deliberately not
+    // `Instant::now() - STATE_INTERVAL`: `Instant` is monotonic since boot on
+    // Linux and subtracting from it panics on underflow, so a process started
+    // inside the first hundred milliseconds of uptime would abort here.
+    let mut state_read_at: Option<Instant> = None;
     loop {
         let arrived = drain_events(receiver, json_output, &mut stream);
         if cancellation.is_cancelled() && !cancel_requested {
@@ -678,10 +682,10 @@ pub(crate) fn supervise_run(
             }
             cancel_requested = true;
         }
-        if !arrived && state_read_at.elapsed() < STATE_INTERVAL {
+        if !arrived && state_read_at.is_some_and(|at| at.elapsed() < STATE_INTERVAL) {
             continue;
         }
-        state_read_at = Instant::now();
+        state_read_at = Some(Instant::now());
         let run = coordinator
             .store()
             .load_run(run_id)
@@ -737,7 +741,17 @@ fn drain_events(receiver: &EventReceiver, json_output: bool, stream: &mut EventS
             emit_delivery(&delivery, json_output, stream);
             true
         }
-        Err(ReceiveTimeoutError::Timeout | ReceiveTimeoutError::Disconnected) => return false,
+        Err(ReceiveTimeoutError::Timeout) => return false,
+        // A closed subscription answers *instantly* — there is nothing left to
+        // wait for — so this is the one path that does not pace itself. The
+        // supervision loop still has a run to wait on, and without a sleep here
+        // it would spin at full speed until that run's own record said it had
+        // finished. A subscriber is closed exactly when it fell behind, which
+        // is to say on the busiest and longest runs there are.
+        Err(ReceiveTimeoutError::Disconnected) => {
+            std::thread::sleep(POLL_INTERVAL);
+            return false;
+        }
     };
     // Whatever else is already queued, without waiting again: the queue is
     // bounded and a subscriber that fills it is disconnected, so leaving events

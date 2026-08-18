@@ -210,14 +210,20 @@ fn listing_result(
     command_result(
         json_output,
         || {
-            if runs.is_empty() {
+            if runs.is_empty() && next_cursor.is_none() {
                 return "no runs recorded".to_owned();
             }
-            runs.iter()
+            let mut lines = runs
+                .iter()
                 .enumerate()
                 .map(|(index, run)| run_line(run, titles.get(index).and_then(Option::as_deref)))
-                .collect::<Vec<_>>()
-                .join("\n")
+                .collect::<Vec<_>>();
+            // The same note `git log` prints, for the same reason: a page that
+            // ends without saying so reads as the end of the history.
+            if next_cursor.is_some() {
+                lines.push("more runs available; use --json to obtain next_cursor".to_owned());
+            }
+            lines.join("\n")
         },
         || {
             Ok(json!({
@@ -311,6 +317,9 @@ fn show(
                 )
             }));
             lines.extend(timeline.events.iter().map(event_line));
+            if timeline.next_cursor.is_some() {
+                lines.push("more events available; use --json to obtain next_cursor".to_owned());
+            }
             lines.join("\n")
         },
         || Ok(data.clone()),

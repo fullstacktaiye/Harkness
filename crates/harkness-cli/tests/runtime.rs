@@ -81,6 +81,36 @@ fn run_list_pages_newest_first_through_an_opaque_cursor_that_round_trips() {
     );
 }
 
+/// A page that ends without saying so reads as the end of the history, which
+/// for `approvals list --all` means reporting a store full of decisions as
+/// holding none. `git log` prints the same note for the same reason.
+#[test]
+fn a_human_readable_page_says_when_more_remains() {
+    let world = World::new();
+    world.trust();
+    for _ in 0..2 {
+        world.read_only_run();
+    }
+
+    let runs = world.harkness(&["run", "list", "--limit", "1"]);
+    assert_success(&runs);
+    let runs = String::from_utf8(runs.stdout).unwrap();
+    assert!(
+        runs.contains("more runs available; use --json to obtain next_cursor"),
+        "{runs}"
+    );
+
+    // An empty page with a continuation must not read as an empty store.
+    let approvals = world.harkness(&["approvals", "list", "--all", "--limit", "1"]);
+    assert_success(&approvals);
+    let approvals = String::from_utf8(approvals.stdout).unwrap();
+    assert!(
+        approvals.contains("more runs available"),
+        "an empty --all page claimed the store held nothing: {approvals}"
+    );
+    assert!(!approvals.contains("no approval requests"), "{approvals}");
+}
+
 #[test]
 fn a_run_page_limit_over_the_published_cap_is_a_usage_error() {
     let world = World::new();
@@ -950,6 +980,74 @@ fn a_piped_input_document_and_an_interactive_prompt_cannot_share_standard_input(
     assert!(
         message.as_str().unwrap().contains("--interactive"),
         "the refusal names both flags: {message}"
+    );
+}
+
+/// Ctrl-C at an open approval prompt has to reach the run, and the run has to
+/// resolve the question as cancelled *without* a decision.
+///
+/// The prompt reads standard input on its own thread precisely so this works: a
+/// blocking `read_line` on the supervision thread cannot be interrupted, since
+/// the handler only sets a flag and `signal(2)` restarts the read. Absence of an
+/// answer is also not a refusal here — nobody answered, so synthesizing a denial
+/// would make the audit claim a decision that was never made.
+#[cfg(unix)]
+#[test]
+fn ctrl_c_at_an_open_approval_prompt_cancels_without_recording_a_decision() {
+    let world = World::new();
+    world.trust();
+
+    let mut child = world
+        .command(&[
+            "--json",
+            "agent",
+            "run",
+            "--scenario",
+            "approval_denied",
+            "--project",
+            "ws",
+            "--interactive",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Held open and never written to: closing it would itself be a denial, so
+    // the only thing that can end the wait is the signal.
+    let stdin = child.stdin.take().unwrap();
+    let stderr = BufReader::new(child.stderr.take().unwrap());
+    let mut asked = false;
+    for line in stderr.lines() {
+        let line = line.unwrap();
+        let event = serde_json::from_str::<Value>(&line).expect("one JSON object per line");
+        if event["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("requested:"))
+        {
+            asked = true;
+            break;
+        }
+    }
+    assert!(asked, "the run never asked its approval question");
+    // SAFETY: the child PID is live and belongs to this test process.
+    assert_eq!(
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) },
+        0
+    );
+    let output = child.wait_with_output().unwrap();
+    drop(stdin);
+
+    assert_eq!(output.status.code(), Some(130));
+    let error = &json_output(&output)["error"];
+    assert_eq!(error["kind"], "run_cancelled");
+    assert_eq!(error["details"]["run"]["state"], "cancelled");
+    let approval = &error["details"]["approvals"][0];
+    assert_eq!(approval["state"], "cancelled");
+    assert_eq!(
+        approval["decision"],
+        Value::Null,
+        "a cancelled question records no decision, because nobody answered it"
     );
 }
 
