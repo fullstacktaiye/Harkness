@@ -36,7 +36,7 @@
 //! [#114]: https://github.com/fullstacktaiye/harkness/issues/114
 //! [#115]: https://github.com/fullstacktaiye/harkness/issues/115
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, Metadata};
 use std::io::Read;
@@ -52,6 +52,7 @@ use crate::classify::{BINARY_SNIFF_BYTES, CLASSIFY_VERSION, FileClass, FileSampl
 use crate::ids::SnapshotId;
 use crate::path::RepoPath;
 use crate::snapshot::WorkspaceSnapshot;
+use crate::text::floor_char_boundary;
 
 /// The most entries one inventory may hold before it reports truncation.
 pub const MAX_INVENTORY_FILES: usize = 200_000;
@@ -176,6 +177,29 @@ pub enum InventoryTruncation {
         /// The budget that was reached.
         limit: Duration,
     },
+}
+
+impl InventoryTruncation {
+    /// The stable spelling of this truncation.
+    ///
+    /// `file_budget_exhausted` is deliberately the spelling
+    /// `harkness_git::DiffOmission` already publishes for the same idea one
+    /// layer down. It is a truncation spelling rather than an error kind, so it
+    /// shares no namespace with [`InventoryError::KINDS`]; what it must not do
+    /// is describe one concept with two words in one product.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FileBudgetExhausted { .. } => "file_budget_exhausted",
+            Self::WalkTimeExhausted { .. } => "walk_time_exhausted",
+        }
+    }
+}
+
+impl std::fmt::Display for InventoryTruncation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// What a directory that the walk refused to descend into is.
@@ -304,6 +328,34 @@ pub enum InventoryDiagnostic {
     },
 }
 
+impl InventoryDiagnostic {
+    /// Every stable discriminant a diagnostic can carry.
+    ///
+    /// A diagnostic is not a failure, so these are deliberately not
+    /// [`InventoryError::KINDS`] and no spelling is shared with it: a surface
+    /// grouping "what the walk noticed" must not be able to confuse one of these
+    /// with a walk that failed.
+    pub const KINDS: &'static [&'static str] = &[
+        "re_inclusion_discarded",
+        "invalid_rule",
+        "case_collision",
+        "unreadable_path",
+        "vanished_path",
+    ];
+
+    /// The stable spelling of this diagnostic.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::ReInclusionDiscarded { .. } => "re_inclusion_discarded",
+            Self::IgnoreRuleInvalid { .. } => "invalid_rule",
+            Self::CaseCollision { .. } => "case_collision",
+            Self::Unreadable { .. } => "unreadable_path",
+            Self::Vanished { .. } => "vanished_path",
+        }
+    }
+}
+
 impl std::fmt::Display for InventoryDiagnostic {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -337,6 +389,9 @@ impl std::fmt::Display for InventoryDiagnostic {
                 formatter,
                 "'{path}' and '{existing}' differ only by case and are both recorded"
             ),
+            Self::Unreadable { path, reason } if path.is_empty() => {
+                write!(formatter, "the worktree root is unreadable: {reason}")
+            }
             Self::Unreadable { path, reason } => {
                 write!(formatter, "'{path}' is unreadable: {reason}")
             }
@@ -376,9 +431,19 @@ impl InventoryPolicy {
 
     /// Names the global user ignore file.
     ///
+    /// **Layer 2 is not discovered.** The repository layer defaults to
+    /// [`REPOSITORY_IGNORE_FILE`] because that path is inside the worktree the
+    /// walk was given; this crate holds no data directory, so a caller that does
+    /// not name the global file gets no layer 2 at all. The conventional
+    /// location is `<data_dir>/`[`GLOBAL_IGNORE_FILE`], and the engine facade is
+    /// what joins them — one caller composing that path rather than each of them
+    /// composing it differently.
+    ///
     /// A configured file that does not exist contributes no rules; one that
     /// exists and cannot be read fails the walk, because a rule meant to
-    /// exclude something must not be skipped quietly.
+    /// exclude something must not be skipped quietly. A symlink here is followed
+    /// — it is the user's own file and a dotfile manager linking it is ordinary
+    /// — while the repository's is refused.
     #[must_use]
     pub fn with_global_ignore(mut self, path: impl Into<PathBuf>) -> Self {
         self.global_ignore = Some(path.into());
@@ -452,7 +517,16 @@ pub struct FileInventory {
 }
 
 impl FileInventory {
-    /// The capture this inventory describes.
+    /// The capture this inventory was built for.
+    ///
+    /// Not a freshness claim. A walk reads the live filesystem and verifies
+    /// nothing, so a workspace that moved between the capture and the walk
+    /// yields an inventory carrying an id whose snapshot no longer describes the
+    /// tree. Establishing that is the caller's, through
+    /// [`WorkspaceSnapshot::verify`] before and after — the reconciliation that
+    /// makes it automatic is [#115]'s.
+    ///
+    /// [#115]: https://github.com/fullstacktaiye/harkness/issues/115
     #[must_use]
     pub const fn snapshot(&self) -> SnapshotId {
         self.snapshot
@@ -707,6 +781,57 @@ enum EntryKind {
     Other,
 }
 
+/// One rule file to read, and the terms it is read on.
+///
+/// The three configurable layers differ in four ways and in no others, so they
+/// share one reader: what a diagnostic calls them, what their patterns are
+/// anchored to, whether a negation is honored, and whether the path may be a
+/// symlink. Two implementations of "read a gitignore file" would drift, and the
+/// half that drifted last time was the half that reported nothing.
+#[derive(Clone, Copy, Debug)]
+struct RuleFile<'a> {
+    file: &'a Path,
+    root: &'a Path,
+    layer: IgnoreLayer,
+    allow_negation: bool,
+    allow_symlink: bool,
+}
+
+impl<'a> RuleFile<'a> {
+    /// The user's own file: negations honored, a symlink followed.
+    const fn global(file: &'a Path, root: &'a Path) -> Self {
+        Self {
+            file,
+            root,
+            layer: IgnoreLayer::Global,
+            allow_negation: true,
+            allow_symlink: true,
+        }
+    }
+
+    /// The repository's own file: tightening only, and never a symlink.
+    const fn repository(file: &'a Path, root: &'a Path) -> Self {
+        Self {
+            file,
+            root,
+            layer: IgnoreLayer::Repository,
+            allow_negation: false,
+            allow_symlink: false,
+        }
+    }
+
+    /// One `.gitignore`, anchored at its own directory, read on Git's terms.
+    const fn gitignore(file: &'a Path, directory: &'a Path) -> Self {
+        Self {
+            file,
+            root: directory,
+            layer: IgnoreLayer::GitIgnore,
+            allow_negation: true,
+            allow_symlink: false,
+        }
+    }
+}
+
 /// What the layered hierarchy decided about one path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Decision {
@@ -778,9 +903,10 @@ impl<'a> Walk<'a> {
             window: Vec::with_capacity(BINARY_SNIFF_BYTES),
         };
 
+        let root = root.to_path_buf();
         walk.denials = walk.compile_denials()?;
         walk.global = match policy.global_ignore() {
-            Some(file) => walk.load_ignore_file(file, IgnoreLayer::Global, true)?,
+            Some(file) => walk.load_ignore_file(&RuleFile::global(file, &root))?,
             None => None,
         };
         let repository_ignore = policy
@@ -788,7 +914,7 @@ impl<'a> Walk<'a> {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| root.join(REPOSITORY_IGNORE_FILE));
         walk.repository =
-            walk.load_ignore_file(&repository_ignore, IgnoreLayer::Repository, false)?;
+            walk.load_ignore_file(&RuleFile::repository(&repository_ignore, &root))?;
         Ok(walk)
     }
 
@@ -813,58 +939,81 @@ impl<'a> Walk<'a> {
             })
     }
 
-    /// Reads one configurable rule file.
+    /// Reads one rule file.
     ///
-    /// Missing is not an error; unreadable, oversized, or undecodable is. A
-    /// layer that may only tighten discards its negations line by line and
-    /// reports each one, so a repository learns that its re-inclusion had no
-    /// effect instead of assuming it worked.
+    /// Missing is not an error; unreadable, oversized, or undecodable is — for
+    /// the caller to interpret, since the two Harkness-owned layers fail the
+    /// walk and the `.gitignore` chain is reported and skipped. A layer that may
+    /// only tighten discards its negations line by line and reports each one, so
+    /// a repository learns that its re-inclusion had no effect instead of
+    /// assuming it worked.
     fn load_ignore_file(
         &mut self,
-        file: &Path,
-        layer: IgnoreLayer,
-        allow_negation: bool,
+        rule: &RuleFile<'_>,
     ) -> Result<Option<Gitignore>, InventoryError> {
+        let RuleFile {
+            file,
+            root,
+            layer,
+            allow_negation,
+            allow_symlink,
+        } = *rule;
         let display = clamp(&file.to_string_lossy());
-        let metadata = match fs::metadata(file) {
+        let invalid = |reason: String| InventoryError::IgnoreRuleInvalid {
+            layer,
+            file: display.clone(),
+            reason,
+        };
+
+        // `symlink_metadata`, not `metadata`: a repository writes its own rule
+        // file, and a committed symlink is how it would aim this reader at
+        // `~/.ssh/id_rsa` and read the target back out through a diagnostic
+        // quoting the "pattern" it could not compile. The user's own global file
+        // is followed, because a dotfile manager symlinking it is ordinary and
+        // the path came from the user rather than from a repository.
+        let metadata = match fs::symlink_metadata(file) {
+            Ok(metadata) if metadata.is_symlink() && !allow_symlink => {
+                return Err(invalid(
+                    "a repository rule file may not be a symlink".to_owned(),
+                ));
+            }
+            Ok(metadata) if metadata.is_symlink() => match fs::metadata(file) {
+                Ok(followed) => followed,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(invalid(clamp(&error.to_string()))),
+            },
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(InventoryError::IgnoreRuleInvalid {
-                    layer,
-                    file: display,
-                    reason: clamp(&error.to_string()),
-                });
-            }
+            Err(error) => return Err(invalid(clamp(&error.to_string()))),
         };
         if !metadata.is_file() {
-            return Err(InventoryError::IgnoreRuleInvalid {
-                layer,
-                file: display,
-                reason: "not a regular file".to_owned(),
-            });
+            return Err(invalid("not a regular file".to_owned()));
         }
-        if metadata.len() > MAX_IGNORE_FILE_BYTES {
-            return Err(InventoryError::IgnoreRuleInvalid {
-                layer,
-                file: display,
-                reason: format!("larger than the {MAX_IGNORE_FILE_BYTES} byte limit"),
-            });
-        }
-        let bytes = fs::read(file).map_err(|error| InventoryError::IgnoreRuleInvalid {
-            layer,
-            file: display.clone(),
-            reason: clamp(&error.to_string()),
-        })?;
-        let text = String::from_utf8(bytes).map_err(|error| InventoryError::IgnoreRuleInvalid {
-            layer,
-            file: display.clone(),
-            reason: clamp(&error.to_string()),
-        })?;
 
-        let mut builder = GitignoreBuilder::new(&self.root);
+        // Bounded by what is *read*, not by what a stat claims. A stat is a
+        // promise about a file that may already have grown, and procfs reports
+        // zero for content that is not, so a size check alone bounds nothing.
+        let text = match read_bounded(file, MAX_IGNORE_FILE_BYTES) {
+            Ok(Some(text)) => text,
+            Ok(None) => {
+                return Err(invalid(format!(
+                    "larger than the {MAX_IGNORE_FILE_BYTES} byte limit"
+                )));
+            }
+            Err(error) => return Err(invalid(clamp(&error.to_string()))),
+        };
+
+        let mut builder = GitignoreBuilder::new(root);
         for (index, line) in text.lines().enumerate() {
             let line_number = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+            // An editor's byte-order mark belongs to the file, not to the first
+            // pattern. Leaving it in compiles `\u{feff}notes.md`, which matches
+            // nothing — a tightening rule that silently stopped applying.
+            let line = if index == 0 {
+                line.strip_prefix('\u{feff}').unwrap_or(line)
+            } else {
+                line
+            };
             if !allow_negation && line.starts_with('!') {
                 self.diagnose(InventoryDiagnostic::ReInclusionDiscarded {
                     layer,
@@ -887,11 +1036,7 @@ impl<'a> Walk<'a> {
         builder
             .build()
             .map(Some)
-            .map_err(|error| InventoryError::IgnoreRuleInvalid {
-                layer,
-                file: display,
-                reason: clamp(&error.to_string()),
-            })
+            .map_err(|error| invalid(clamp(&error.to_string())))
     }
 
     /// Walks the tree and assembles the inventory.
@@ -944,8 +1089,7 @@ impl<'a> Walk<'a> {
                 continue 'walk;
             }
 
-            let is_dir = listed.kind == EntryKind::Directory;
-            match self.decide(&stack, &absolute, is_dir) {
+            match self.decide(&stack, &absolute, listed.kind) {
                 Decision::Denied => {
                     self.denied_count = self.denied_count.saturating_add(1);
                     continue 'walk;
@@ -957,19 +1101,19 @@ impl<'a> Walk<'a> {
                 Decision::Included | Decision::Undecided => {}
             }
 
-            let path = RepoPath::from_bytes(relative.clone());
             match listed.kind {
                 EntryKind::Symlink => {
-                    if !self.record_symlink(&absolute, path) {
+                    if !self.record_symlink(&absolute, RepoPath::from_bytes(relative)) {
                         break 'walk;
                     }
                 }
                 EntryKind::File => {
-                    if !self.record_file(&absolute, path) {
+                    if !self.record_file(&absolute, RepoPath::from_bytes(relative)) {
                         break 'walk;
                     }
                 }
                 EntryKind::Directory => {
+                    let path = RepoPath::from_bytes(relative.clone());
                     let listing = match self.read_directory(&absolute, Some(&path)) {
                         Ok(listing) => listing,
                         Err(error) => {
@@ -1008,14 +1152,28 @@ impl<'a> Walk<'a> {
     }
 
     /// Applies the four layers in order, first opinion wins.
-    fn decide(&self, stack: &[Frame], absolute: &Path, is_dir: bool) -> Decision {
+    fn decide(&self, stack: &[Frame], absolute: &Path, kind: EntryKind) -> Decision {
+        let is_dir = kind == EntryKind::Directory;
         // Layer 1 consults every parent as well as the path itself, so nothing
         // beneath a denied directory can be recorded even if pruning failed.
-        if self
+        //
+        // A symlink is matched as *both*, because a denial written for a
+        // directory — `**/.config/gcloud/` — does not fire for one and the walk
+        // will not follow the link to find out what it points at. Answering
+        // "file" there would let a link standing where a credential directory
+        // belongs be recorded under its own name, and layer 1's whole contract
+        // is that a denied path is a count and never a name. Layers 2 to 4 keep
+        // Git's answer, where a symlink is not a directory.
+        let denied = self
             .denials
             .matched_path_or_any_parents(absolute, is_dir)
             .is_ignore()
-        {
+            || (kind == EntryKind::Symlink
+                && self
+                    .denials
+                    .matched_path_or_any_parents(absolute, true)
+                    .is_ignore());
+        if denied {
             return Decision::Denied;
         }
         for layer in [self.global.as_ref(), self.repository.as_ref()]
@@ -1056,6 +1214,14 @@ impl<'a> Walk<'a> {
         let reading = fs::read_dir(absolute)?;
         let mut listed = Vec::new();
         for entry in reading {
+            // Polled here as well as in the walk loop, because one directory can
+            // hold millions of names: a listing that ran to completion before
+            // anything was checked would make "cancelled within 250 ms" a claim
+            // about tree shape. Stopping mid-listing leaves the outer loop to
+            // report the cancellation, or the time budget to report truncation.
+            if self.cancellation.is_cancelled() || self.started.elapsed() >= self.policy.max_walk {
+                break;
+            }
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -1087,6 +1253,12 @@ impl<'a> Walk<'a> {
     }
 
     /// Compiles the `.gitignore` a directory holds, if it holds one.
+    ///
+    /// Read through the same loader as the two layers above it, so a malformed
+    /// pattern names its line here too. Its failures are diagnostics rather than
+    /// errors: a `.gitignore` can only ever exclude, and by the time layer 4 is
+    /// read every layer that can *deny* has already spoken, so a rule this build
+    /// cannot apply costs coverage rather than safety.
     fn gitignore_for(&mut self, absolute: &Path, listing: &[Listed]) -> Option<Gitignore> {
         if !listing
             .iter()
@@ -1095,64 +1267,74 @@ impl<'a> Walk<'a> {
             return None;
         }
         let file = absolute.join(".gitignore");
-        // Bounded like every other rule file, because a repository chooses its
-        // size. Skipping an oversized one costs coverage rather than safety: a
-        // `.gitignore` can only exclude, and the layers that can deny have
-        // already been consulted by the time it is read.
-        match fs::metadata(&file) {
-            Ok(metadata) if metadata.len() > MAX_IGNORE_FILE_BYTES => {
+        match self.load_ignore_file(&RuleFile::gitignore(&file, absolute)) {
+            Ok(gitignore) => gitignore,
+            Err(InventoryError::IgnoreRuleInvalid {
+                layer,
+                file,
+                reason,
+            }) => {
                 self.diagnose(InventoryDiagnostic::IgnoreRuleInvalid {
-                    layer: IgnoreLayer::GitIgnore,
-                    file: clamp(&file.to_string_lossy()),
+                    layer,
+                    file,
                     line: None,
                     pattern: None,
-                    reason: format!("larger than the {MAX_IGNORE_FILE_BYTES} byte limit"),
+                    reason,
                 });
-                return None;
+                None
             }
-            _ => {}
+            Err(_) => None,
         }
-        let (gitignore, error) = Gitignore::new(&file);
-        if let Some(error) = error {
-            // A `.gitignore` can only ever exclude, so a rule this build cannot
-            // read costs coverage rather than safety: it is reported and the
-            // patterns that did compile still apply.
-            self.diagnose(InventoryDiagnostic::IgnoreRuleInvalid {
-                layer: IgnoreLayer::GitIgnore,
-                file: clamp(&file.to_string_lossy()),
-                line: None,
-                pattern: None,
-                reason: clamp(&error.to_string()),
-            });
-        }
-        Some(gitignore)
     }
 
     /// Records a symlink: never followed, never read, never eligible.
     fn record_symlink(&mut self, absolute: &Path, path: RepoPath) -> bool {
-        let (byte_size, mtime_ns, unreadable) = match fs::symlink_metadata(absolute) {
-            Ok(metadata) => (metadata.len(), modified_nanos(&metadata), false),
+        match fs::symlink_metadata(absolute) {
+            // The listing said link and this stat disagrees, so the path was
+            // replaced. Recording it as the regular file it now is keeps the
+            // entry describing what the walk actually saw last.
+            Ok(metadata) if !metadata.is_symlink() && metadata.is_file() => {
+                self.record_file(absolute, path)
+            }
+            Ok(metadata) => self.record_link(&metadata, path),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 self.diagnose(InventoryDiagnostic::Vanished { path });
-                return true;
+                true
             }
             Err(error) => {
                 self.diagnose(InventoryDiagnostic::Unreadable {
                     path: path.clone(),
                     reason: clamp(&error.to_string()),
                 });
-                (0, None, true)
+                let class = FileSample::new(&path, 0).classify();
+                self.push(InventoryEntry {
+                    path,
+                    byte_size: 0,
+                    mtime_ns: None,
+                    class,
+                    symlink: true,
+                    boundary: None,
+                    unreadable: true,
+                })
             }
-        };
+        }
+    }
+
+    /// Records one entry for a path a fresh stat says is a symlink.
+    ///
+    /// Classified from its name and its own size — never from its target, which
+    /// is what following it would mean.
+    fn record_link(&mut self, metadata: &Metadata, path: RepoPath) -> bool {
+        let byte_size = metadata.len();
         let class = FileSample::new(&path, byte_size).classify();
         self.push(InventoryEntry {
             path,
             byte_size,
-            mtime_ns,
+            mtime_ns: modified_nanos(metadata),
             class,
             symlink: true,
             boundary: None,
-            unreadable,
+            unreadable: false,
         })
     }
 
@@ -1203,15 +1385,21 @@ impl<'a> Walk<'a> {
                 });
             }
         };
+        // The listing said regular file; this stat is what decides. A path
+        // replaced by a symlink in between must be recorded as the link it now
+        // is and never opened, because `File::open` *does* follow one and eight
+        // kilobytes of `/etc/passwd` would otherwise reach a classification.
+        if metadata.is_symlink() {
+            return self.record_link(&metadata, path);
+        }
         let byte_size = metadata.len();
         let mtime_ns = modified_nanos(&metadata);
 
         // A name the classifier already refuses is never opened. That is the
         // difference between recording that a file looks credential-bearing and
         // reading one to find out.
-        let path_only = FileSample::new(&path, byte_size).classify();
-        let (class, unreadable) = if path_only == FileClass::SecretSensitive {
-            (path_only, false)
+        let (class, unreadable) = if FileSample::new(&path, byte_size).is_secret_by_name() {
+            (FileClass::SecretSensitive, false)
         } else {
             match self.sniff(absolute) {
                 Ok(()) => (
@@ -1225,7 +1413,7 @@ impl<'a> Walk<'a> {
                         path: path.clone(),
                         reason: clamp(&error.to_string()),
                     });
-                    (path_only, true)
+                    (FileSample::new(&path, byte_size).classify(), true)
                 }
             }
         };
@@ -1299,22 +1487,25 @@ impl<'a> Walk<'a> {
     fn finish(mut self) -> FileInventory {
         self.entries
             .sort_by(|left, right| left.path.cmp(&right.path));
-        let mut folded: HashMap<Vec<u8>, RepoPath> = HashMap::with_capacity(self.entries.len());
-        let mut collisions = Vec::new();
-        for entry in &self.entries {
-            let key = case_fold(entry.path.as_bytes());
-            match folded.get(&key) {
-                Some(existing) => collisions.push(InventoryDiagnostic::CaseCollision {
-                    path: entry.path.clone(),
-                    existing: existing.clone(),
-                }),
-                None => {
-                    folded.insert(key, entry.path.clone());
-                }
-            }
-        }
-        for collision in collisions {
-            self.diagnose(collision);
+        // Sorted by fold, so a collision is an adjacent pair rather than a map
+        // holding two owned copies of every path in the walk. Diagnostics are
+        // built one at a time, so the bound is applied before the memory is
+        // spent rather than after.
+        let mut folded = (0..self.entries.len())
+            .map(|index| (case_fold(self.entries[index].path.as_bytes()), index))
+            .collect::<Vec<_>>();
+        folded.sort_unstable();
+        let collisions = folded
+            .windows(2)
+            .filter(|pair| pair[0].0 == pair[1].0)
+            .map(|pair| (pair[0].1, pair[1].1))
+            .collect::<Vec<_>>();
+        drop(folded);
+        for (existing, found) in collisions {
+            self.diagnose(InventoryDiagnostic::CaseCollision {
+                path: self.entries[found].path.clone(),
+                existing: self.entries[existing].path.clone(),
+            });
         }
 
         FileInventory {
@@ -1330,6 +1521,26 @@ impl<'a> Walk<'a> {
             classify_version: CLASSIFY_VERSION,
         }
     }
+}
+
+/// Reads a file's text, refusing anything past `limit` rather than trusting a
+/// stat.
+///
+/// Returns `Ok(None)` when the content exceeds the bound. Reading one byte past
+/// it is what makes the refusal describe the bytes rather than the metadata: a
+/// file can grow between a stat and a read, and procfs reports zero for content
+/// that is not.
+fn read_bounded(file: &Path, limit: u64) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    fs::File::open(file)?
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
+        return Ok(None);
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 /// The declared submodule paths of a worktree, best effort.
@@ -1351,14 +1562,26 @@ fn declared_submodules(root: &Path) -> BTreeSet<Vec<u8>> {
     let Ok(text) = fs::read_to_string(&file) else {
         return declared;
     };
+    let mut in_submodule = false;
     for line in text.lines() {
+        let line = line.trim();
+        if let Some(section) = line.strip_prefix('[') {
+            // Section-aware, because `path` is an ordinary key: a `[core]`
+            // section carrying one would otherwise declare a phantom submodule
+            // and relabel somebody's nested repository.
+            in_submodule = section.trim_start().starts_with("submodule");
+            continue;
+        }
+        if !in_submodule {
+            continue;
+        }
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
         if key.trim() != "path" {
             continue;
         }
-        let value = value.trim().trim_end_matches('/');
+        let value = value.trim().trim_matches('"').trim_end_matches('/');
         if !value.is_empty() {
             declared.insert(value.as_bytes().to_vec());
         }
@@ -1412,22 +1635,25 @@ fn case_fold(path: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Bounds text a diagnostic quotes, on a character boundary.
+/// Bounds text a diagnostic quotes, marking that it was cut.
+///
+/// The ellipsis is the difference from `provenance`'s bound: a diagnostic is
+/// read by a person deciding whether a pattern is the one they wrote, and a
+/// silent truncation there reads as a pattern that ends where it does not.
 fn clamp(text: &str) -> String {
     if text.len() <= MAX_DIAGNOSTIC_TEXT_BYTES {
         return text.to_owned();
     }
-    let mut end = MAX_DIAGNOSTIC_TEXT_BYTES;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &text[..end])
+    format!(
+        "{}…",
+        &text[..floor_char_boundary(text, MAX_DIAGNOSTIC_TEXT_BYTES)]
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
     use harkness_core::ProjectId;
@@ -1496,6 +1722,17 @@ mod tests {
         fn inventory(&self) -> FileInventory {
             self.build(&InventoryPolicy::new())
         }
+    }
+
+    /// Creates a file symlink, or skips the platform that cannot.
+    #[cfg(unix)]
+    fn link(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn link(target: &Path, link: &Path) {
+        std::os::windows::fs::symlink_file(target, link).unwrap();
     }
 
     fn paths(inventory: &FileInventory) -> Vec<String> {
@@ -2057,6 +2294,189 @@ mod tests {
     }
 
     #[test]
+    fn a_rule_file_saved_with_a_byte_order_mark_still_tightens() {
+        let workspace = Workspace::new("bom");
+        workspace.write(REPOSITORY_IGNORE_FILE, "\u{feff}notes.md\nother.md\n");
+        workspace.write("notes.md", "one\n");
+        workspace.write("other.md", "two\n");
+        workspace.write("kept.rs", "fn main() {}\n");
+
+        let inventory = workspace.inventory();
+
+        assert_eq!(paths(&inventory), [".harkness/context-ignore", "kept.rs"]);
+        assert_eq!(inventory.ignored_count(), 2);
+    }
+
+    #[test]
+    fn a_repository_rule_file_may_not_be_a_symlink() {
+        // A committed link is how a repository would aim the reader at a file
+        // outside the worktree and read it back through a diagnostic.
+        let workspace = Workspace::new("linked-rules");
+        let elsewhere = workspace.fixture.root.path().join("private-key");
+        fs::write(&elsewhere, "!.env\nsupersecret\n").unwrap();
+        fs::create_dir_all(workspace.root.join(".harkness")).unwrap();
+        link(&elsewhere, &workspace.root.join(REPOSITORY_IGNORE_FILE));
+
+        let error = InventoryBuilder::build(
+            &workspace.snapshot(),
+            &InventoryPolicy::new(),
+            &Cancellation::default(),
+        )
+        .expect_err("a symlinked repository rule file is refused");
+
+        assert_eq!(error.kind(), "ignore_rule_invalid");
+        assert!(
+            !format!("{error}").contains("supersecret"),
+            "the target's content reached the error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_users_own_rule_file_may_be_a_symlink() {
+        let workspace = Workspace::new("linked-global");
+        let real = workspace
+            .fixture
+            .root
+            .path()
+            .join("dotfiles-context-ignore");
+        fs::write(&real, "notes.md\n").unwrap();
+        let configured = workspace.fixture.root.path().join("context-ignore");
+        link(&real, &configured);
+        workspace.write("notes.md", "one\n");
+        workspace.write("kept.rs", "fn main() {}\n");
+
+        let inventory = workspace.build(&InventoryPolicy::new().with_global_ignore(&configured));
+
+        assert_eq!(paths(&inventory), ["kept.rs"]);
+    }
+
+    #[test]
+    fn an_unreadable_gitignore_is_reported_rather_than_silently_empty() {
+        let workspace = Workspace::new("gitignore-io");
+        workspace.write(".gitignore", "{unclosed\nnotes.md\n");
+        workspace.write("notes.md", "one\n");
+        workspace.write("kept.rs", "fn main() {}\n");
+
+        let inventory = workspace.inventory();
+
+        // The chain now reports its bad pattern by line, exactly as the two
+        // layers above it do, and the rest of the file still applies.
+        let invalid = inventory
+            .diagnostics()
+            .iter()
+            .find_map(|diagnostic| match diagnostic {
+                InventoryDiagnostic::IgnoreRuleInvalid {
+                    layer,
+                    line,
+                    pattern,
+                    ..
+                } => Some((*layer, *line, pattern.clone())),
+                _ => None,
+            })
+            .expect("the malformed gitignore pattern is reported");
+        assert_eq!(
+            invalid,
+            (
+                IgnoreLayer::GitIgnore,
+                Some(1),
+                Some("{unclosed".to_owned())
+            )
+        );
+        assert!(!paths(&inventory).contains(&"notes.md".to_owned()));
+    }
+
+    #[test]
+    fn a_phantom_path_key_outside_a_submodule_section_declares_nothing() {
+        let workspace = Workspace::new("gitmodules-sections");
+        workspace.write(".gitmodules", "[core]\n\tpath = lib\n");
+        let nested = workspace.directory("lib");
+        initialize_repository(&nested);
+
+        let inventory = workspace.inventory();
+
+        let boundary = inventory
+            .entries()
+            .iter()
+            .find(|entry| entry.path.display() == "lib")
+            .expect("the nested repository is recorded")
+            .boundary;
+        assert_eq!(boundary, Some(Boundary::NestedRepository));
+    }
+
+    #[test]
+    fn a_utf32_file_is_binary_despite_opening_with_a_utf16_mark() {
+        // `FF FE 00 00` is the UTF-32LE mark and also, to two bytes of context,
+        // the UTF-16LE one. Reading the rest as UTF-16 decodes every `0x0000` as
+        // a valid NUL character, so a decoder that accepted them would hand an
+        // indexer a binary blob.
+        let workspace = Workspace::new("utf32");
+        let mut utf32 = vec![0xFF, 0xFE, 0x00, 0x00];
+        for point in "hello".chars() {
+            utf32.extend_from_slice(&u32::from(point).to_le_bytes());
+        }
+        workspace.write("data/blob.bin", utf32);
+
+        let inventory = workspace.inventory();
+
+        let entry = &inventory.entries()[0];
+        assert_eq!(entry.class, FileClass::Binary);
+        assert!(!entry.eligible());
+    }
+
+    #[test]
+    fn the_truncation_and_diagnostic_spellings_are_published_and_disjoint() {
+        assert_eq!(
+            InventoryTruncation::FileBudgetExhausted { limit: 1 }.to_string(),
+            "file_budget_exhausted"
+        );
+        assert_eq!(
+            InventoryTruncation::WalkTimeExhausted {
+                limit: Duration::ZERO
+            }
+            .to_string(),
+            "walk_time_exhausted"
+        );
+
+        let diagnostics = [
+            InventoryDiagnostic::ReInclusionDiscarded {
+                layer: IgnoreLayer::Repository,
+                file: "f".to_owned(),
+                line: 1,
+                pattern: "!x".to_owned(),
+            },
+            InventoryDiagnostic::IgnoreRuleInvalid {
+                layer: IgnoreLayer::GitIgnore,
+                file: "f".to_owned(),
+                line: None,
+                pattern: None,
+                reason: "r".to_owned(),
+            },
+            InventoryDiagnostic::CaseCollision {
+                path: RepoPath::from_bytes(b"a".to_vec()),
+                existing: RepoPath::from_bytes(b"A".to_vec()),
+            },
+            InventoryDiagnostic::Unreadable {
+                path: RepoPath::from_bytes(b"a".to_vec()),
+                reason: "r".to_owned(),
+            },
+            InventoryDiagnostic::Vanished {
+                path: RepoPath::from_bytes(b"a".to_vec()),
+            },
+        ];
+        let kinds = diagnostics
+            .iter()
+            .map(InventoryDiagnostic::kind)
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, InventoryDiagnostic::KINDS);
+        for kind in InventoryDiagnostic::KINDS {
+            assert!(
+                !InventoryError::KINDS.contains(kind),
+                "'{kind}' is both a diagnostic and a failure"
+            );
+        }
+    }
+
+    #[test]
     fn a_root_that_is_not_a_directory_is_refused_by_name() {
         let workspace = Workspace::new("root-checks");
         let snapshot = workspace.snapshot();
@@ -2153,10 +2573,15 @@ mod tests {
         const RUNS: usize = 5;
 
         let workspace = Workspace::new("benchmark");
+        // Sized past `BINARY_SNIFF_BYTES` so every file pays the full 8 KiB
+        // read and the 1 KiB marker scan. A budget measured on 29-byte files
+        // measures neither, and those two are what a real walk spends its time
+        // on.
+        let body = "fn main() { let value = 1; }\n".repeat(400);
         for index in 0..FILES {
             workspace.write(
                 &format!("src/module-{}/file-{index}.rs", index % 100),
-                "fn main() { let value = 1; }\n",
+                &body,
             );
         }
         let snapshot = workspace.snapshot();
@@ -2232,23 +2657,42 @@ mod tests {
             );
         }
 
-        /// Skips rather than fails when the process can read a mode-`000` path
-        /// anyway, which is what running as root does.
-        fn deny_access(path: &std::path::Path, is_dir: bool) -> bool {
-            use std::os::unix::fs::PermissionsExt;
+        /// Restores a path's mode however the test ends.
+        ///
+        /// A failing assertion unwinds past any restoring statement, and the
+        /// fixture's `TempDir` then cannot remove a mode-`000` directory: the
+        /// real failure would be reported behind a cleanup error, by the very
+        /// tests written to catch a regression in unreadable-path handling.
+        struct Restore {
+            path: std::path::PathBuf,
+            mode: u32,
+        }
 
-            fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
-            if is_dir {
-                fs::read_dir(path).is_err()
-            } else {
-                fs::File::open(path).is_err()
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                use std::os::unix::fs::PermissionsExt;
+
+                let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(self.mode));
             }
         }
 
-        fn restore_access(path: &std::path::Path, mode: u32) {
+        /// Denies access and restores it on drop, or returns `None` when the
+        /// process can read a mode-`000` path anyway — which is what running as
+        /// root does, and a reason to skip rather than to fail.
+        fn deny_access(path: &std::path::Path, is_dir: bool, mode: u32) -> Option<Restore> {
             use std::os::unix::fs::PermissionsExt;
 
-            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+            let restore = Restore {
+                path: path.to_path_buf(),
+                mode,
+            };
+            let denied = if is_dir {
+                fs::read_dir(path).is_err()
+            } else {
+                fs::File::open(path).is_err()
+            };
+            denied.then_some(restore)
         }
 
         #[test]
@@ -2257,13 +2701,11 @@ mod tests {
             workspace.write("readable/file.rs", "fn main() {}\n");
             let closed = workspace.directory("closed");
             fs::write(closed.join("hidden.rs"), "fn main() {}\n").unwrap();
-            if !deny_access(&closed, true) {
-                restore_access(&closed, 0o755);
+            let Some(_restore) = deny_access(&closed, true, 0o755) else {
                 return;
-            }
+            };
 
             let inventory = workspace.build(&InventoryPolicy::new());
-            restore_access(&closed, 0o755);
 
             assert!(paths(&inventory).contains(&"readable/file.rs".to_owned()));
             assert!(
@@ -2280,13 +2722,11 @@ mod tests {
         fn a_file_that_cannot_be_opened_is_recorded_and_never_eligible() {
             let workspace = Workspace::new("unreadable-file");
             let closed = workspace.write("closed.rs", "fn main() {}\n");
-            if !deny_access(&closed, false) {
-                restore_access(&closed, 0o644);
+            let Some(_restore) = deny_access(&closed, false, 0o644) else {
                 return;
-            }
+            };
 
             let inventory = workspace.build(&InventoryPolicy::new());
-            restore_access(&closed, 0o644);
 
             let entry = &inventory.entries()[0];
             assert_eq!(entry.path.display(), "closed.rs");

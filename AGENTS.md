@@ -562,7 +562,27 @@ diagnostic, not a count keyed by path, and its content is never opened — the
 whole point of denying at the walk is that no later stage has anything to
 retrieve. A denied directory counts once and is not descended into, so
 `denied_count` counts rules applied rather than files that exist. The test that
-matters scans the *whole* rendered inventory rather than its entries.
+matters scans the *whole* rendered inventory rather than its entries. A symlink
+is matched against layer 1 as both a file and a directory, because the walk will
+not follow one to find out which it is and a directory-only denial would
+otherwise let a link standing where a credential directory belongs be recorded
+under its own name.
+
+**A rule file is read on terms the repository does not choose.** The repository's
+own file may not be a symlink — a committed link is how a repository would aim
+the reader at `~/.ssh/id_rsa` and read the target back through a diagnostic
+quoting the "pattern" that would not compile — while the global file, whose path
+the user supplied, is followed. The size bound is enforced on the bytes *read*
+rather than on a stat, because a file grows between the two and procfs reports
+zero for content that is not. A leading byte-order mark is stripped, since
+leaving it in compiles a first pattern that matches nothing: a tightening rule
+that silently stopped applying is the failure this whole layer exists to prevent,
+and one reader serves all three configurable layers so the halves cannot drift.
+
+**What a walk records is decided by the last stat, not the first.** A path listed
+as a regular file and replaced by a symlink before it is opened is recorded as
+the link it now is and never read — `File::open` follows one, and eight kilobytes
+of somewhere else would otherwise reach a classification.
 
 **The walk is ours and the rule engine is `ignore`'s**, and that split is
 deliberate. `WalkBuilder` decides exclusion inside its own iterator, which would

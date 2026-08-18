@@ -227,6 +227,18 @@ impl<'a> FileSample<'a> {
         self
     }
 
+    /// Whether this file's *name* alone makes it secret-sensitive.
+    ///
+    /// The first step of [`Self::classify`], asked on its own so a caller can
+    /// answer "may I open this file" before opening it. A walk uses it to keep
+    /// the promise that a credential-looking name is never read: the alternative
+    /// is running the whole cascade and comparing the answer against one class,
+    /// which reads the file's bytes to decide whether it was allowed to.
+    #[must_use]
+    pub fn is_secret_by_name(&self) -> bool {
+        is_secret_sensitive(file_name(self.path.as_bytes()))
+    }
+
     /// The one class this file holds.
     ///
     /// Exactly one class is assigned, by the first rule that matches, in this
@@ -353,9 +365,18 @@ fn sniff(window: &[u8], complete: bool) -> ContentSniff {
         return if decodes_as_utf16(&window[2..], big_endian, complete) {
             ContentSniff::Text
         } else {
-            ContentSniff::Undecodable
+            // A mark is a claim, not proof. Bytes that open `FF FE` and then
+            // fail to be UTF-16 — a UTF-32LE file, whose mark is `FF FE 00 00`,
+            // or any binary format starting the same way — fall back to the scan
+            // every other file gets rather than to a verdict about encoding.
+            binary_or_utf8(window, complete)
         };
     }
+    binary_or_utf8(window, complete)
+}
+
+/// The verdict for bytes that made no UTF-16 claim, or made one and failed it.
+fn binary_or_utf8(window: &[u8], complete: bool) -> ContentSniff {
     let body = window.strip_prefix(UTF8_BOM).unwrap_or(window);
     if body.contains(&0) {
         return ContentSniff::Binary;
@@ -370,6 +391,12 @@ fn sniff(window: &[u8], complete: bool) -> ContentSniff {
 }
 
 /// Whether the bytes after a byte-order mark are UTF-16 code units.
+///
+/// A NUL character fails the decode rather than passing it. Nothing else here
+/// would notice one: a UTF-32LE file opens with the UTF-16 LE mark, and every
+/// `0x0000` half of its code points decodes as a perfectly valid `U+0000`, so a
+/// decoder that accepted them would call a NUL-riddled binary "text" and hand it
+/// to an indexer. Real UTF-16 prose does not contain NUL characters.
 fn decodes_as_utf16(body: &[u8], big_endian: bool, complete: bool) -> bool {
     if complete && !body.len().is_multiple_of(2) {
         return false;
@@ -385,6 +412,7 @@ fn decodes_as_utf16(body: &[u8], big_endian: bool, complete: bool) -> bool {
     loop {
         match decoder.next() {
             None => return true,
+            Some(Ok('\0')) => return false,
             Some(Ok(_)) => {}
             // A lone leading surrogate as the last unit is a pair the window
             // cut in half; anywhere else it is not UTF-16 at all.
@@ -400,13 +428,33 @@ fn decodes_as_utf16(body: &[u8], big_endian: bool, complete: bool) -> bool {
 /// `token.rs` is the name of a parser far more often than of a secret. The
 /// denial list has no such exemption, because a file named `id_rsa.go` is still
 /// refused.
+///
+/// The fragments are qualified rather than bare for the same reason. A bare
+/// `token` classifies `tokens.json`, `design-tokens.css`, and most of an i18n
+/// or design-system tree — none of which hold a credential, and all of which
+/// would become unretrievable with no layer able to re-include a *class*.
+/// `access_token` does not have that problem, and the files this rule exists for
+/// are named that way.
 fn is_secret_sensitive(name: &[u8]) -> bool {
     if is_source(name) {
         return false;
     }
     const PREFIXES: &[&str] = &["secret", "credential"];
     const FRAGMENTS: &[&str] = &[
-        "token", "password", "passwd", "apikey", "api_key", "api-key",
+        "access_token",
+        "access-token",
+        "auth_token",
+        "auth-token",
+        "api_token",
+        "api-token",
+        "refresh_token",
+        "refresh-token",
+        "bearer_token",
+        "apikey",
+        "api_key",
+        "api-key",
+        "password",
+        "passwd",
     ];
     const SUFFIXES: &[&str] = &[".dump"];
 
@@ -937,7 +985,9 @@ mod classification_tests {
 
         let mut odd_utf16 = vec![0xFF, 0xFE, b'a', 0x00, b'b'];
         assert_eq!(sniff(&odd_utf16, false), ContentSniff::Text);
-        assert_eq!(sniff(&odd_utf16, true), ContentSniff::Undecodable);
+        // A whole file cannot end mid-unit, so the UTF-16 claim fails and the
+        // bytes get the scan every other file gets — which finds the NUL.
+        assert_eq!(sniff(&odd_utf16, true), ContentSniff::Binary);
         odd_utf16.pop();
         assert_eq!(sniff(&odd_utf16, true), ContentSniff::Text);
     }

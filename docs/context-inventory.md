@@ -111,7 +111,13 @@ something an earlier layer excluded.)
 A configured ignore file that does not exist contributes no rules; one that
 exists and cannot be read, is larger than 1 MiB, or is not valid UTF-8 fails the
 walk with `ignore_rule_invalid`, because a rule meant to exclude something must
-not be skipped quietly. An oversized `.gitignore` is the one exception: it is
+not be skipped quietly. **A repository's rule file may not be a symlink** — a
+committed link is how a repository would aim the reader at `~/.ssh/id_rsa` and
+read the target back through a diagnostic quoting the "pattern" it could not
+compile — while the global file, whose path the user supplied, is followed. A
+leading byte-order mark belongs to the file rather than to its first pattern and
+is stripped, so a rule file saved by a Windows editor still tightens what it
+says it tightens. An oversized `.gitignore` is the one exception: it is
 skipped and reported rather than fatal, because layer 4 can only exclude and by
 the time it is read every layer that can deny has already spoken.
 
@@ -139,6 +145,11 @@ undecodable — **is** listed, with that class and `eligible() == false`, becaus
 
 ### Traversal rules
 
+- **A built-in denial matches a symlink as both a file and a directory.** The
+  walk will not follow a link to learn which it is, and a denial written for a
+  directory would otherwise let a link standing where `.config/gcloud` belongs be
+  recorded under its own name. Layers 2 to 4 keep Git's answer, where a symlink
+  is not a directory.
 - **Symlinks are recorded and never followed.** A link to a directory produces
   one entry and no entries for the target's contents, whether the target is
   inside the worktree or outside it. The walk never leaves the worktree root, and
@@ -171,7 +182,7 @@ Exactly one class per recorded path, by the first rule that matches:
 
 | # | Class | Decided by | Eligible |
 | --- | --- | --- | --- |
-| 1 | `secret_sensitive` | a name starting `secret`/`credential`, containing `token`, `password`, `passwd`, `apikey`, `api_key`, `api-key`, or ending `.dump` — none of which apply to a file with a language extension | no |
+| 1 | `secret_sensitive` | a name starting `secret`/`credential`, containing `access_token`, `auth_token`, `api_token`, `refresh_token`, `bearer_token` (in either spelling), `apikey`, `api_key`, `api-key`, `password`, `passwd`, or ending `.dump` — none of which apply to a file with a language extension | no |
 | 2 | `binary` | a NUL byte in the first 8 KiB | no |
 | 3 | `oversized` | larger than 1 MiB | no |
 | 4 | `unsupported_encoding` | the sniff window decodes as neither UTF-8 nor UTF-16 | no |
@@ -196,7 +207,10 @@ else's code rather than as this repository's output.
 Classification reads at most 8 KiB of any file, and nothing at all from a file
 whose *name* already makes it secret-sensitive. A UTF-16 file announced by a
 byte-order mark is text rather than binary, despite being half NUL bytes; a file
-with NUL bytes and no mark is binary. A character the sniff window cuts in half
+with NUL bytes and no mark is binary. A mark is a claim rather than proof — a
+UTF-32 file opens with the same two bytes — so bytes that announce UTF-16 and
+then fail to decode as it, or that decode to a NUL character, fall back to the
+scan every other file gets. A character the sniff window cuts in half
 is a window artifact, not an encoding failure.
 
 `secret_sensitive` is the weaker, recorded cousin of a denial: the path and its
@@ -215,7 +229,7 @@ list has no such exemption.
 | `OVERSIZED_FILE_THRESHOLD` | 1 MiB | class `oversized` |
 | `BINARY_SNIFF_BYTES` | 8 KiB | the most any file is read |
 | `MAX_INVENTORY_DIAGNOSTICS` | 1,000 | count the overflow in `dropped_diagnostics` |
-| `MAX_IGNORE_FILE_BYTES` | 1 MiB | refuse the rule file — fatal on layers 2 and 3, reported and skipped on a `.gitignore` |
+| `MAX_IGNORE_FILE_BYTES` | 1 MiB | refuse the rule file — fatal on layers 2 and 3, reported and skipped on a `.gitignore`. Measured on the bytes read, never on what a stat claims |
 
 A truncated inventory is a **partial answer** and must never be read as "the
 repository has this many files" or "nothing matched". Truncation is reported, not
@@ -231,10 +245,12 @@ visibility target whatever the size of the tree.
 ## Diagnostics
 
 Carried on the inventory rather than logged, so a surface can show them beside
-the entries they explain: a discarded re-inclusion, an invalid pattern, a case
-collision, an unreadable path, and a path that vanished between being listed and
-being read. Every quoted string is clamped, because a pattern and a path are both
-repository content and neither may decide how long a Harkness message is.
+the entries they explain, each under a stable spelling: `re_inclusion_discarded`,
+`invalid_rule`, `case_collision`, `unreadable_path`, `vanished_path`. Every
+quoted *pattern*, *reason*, and file name is clamped, because a repository writes
+those and none of them may decide how long a Harkness message is. A recorded path
+is not clamped: it is the walk's own product, bounded by what the filesystem let
+the walk reach, and a truncated one would name a file that does not exist.
 
 An unreadable directory or file is a diagnostic and never a failure: one
 permission bit must not cost a whole inventory, exactly as one unreadable file

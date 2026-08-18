@@ -105,6 +105,7 @@ mod path;
 mod probe;
 mod provenance;
 mod snapshot;
+mod text;
 mod wire;
 
 pub use classify::{
