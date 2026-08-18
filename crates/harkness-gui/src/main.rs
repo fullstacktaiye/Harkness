@@ -540,14 +540,17 @@ Kirigami.ApplicationWindow {
               && typeof runs.loadApprovalInput === "function");
 
         check("runListProperties",
-              runList.loading === false && runList.more === false && runList.status === "");
-        check("runListInvokables", typeof runList.refresh === "function");
+              runList.loading === false && runList.more === false
+              && runList.status === "" && runList.kind === "");
+        check("runListInvokables",
+              typeof runList.refresh === "function"
+              && typeof runList.loadMore === "function");
         check("runListStartsEmpty", runView.count === 0);
 
         check("timelineProperties",
               timeline.run === "" && timeline.loading === false
               && timeline.live === false && timeline.more === false
-              && timeline.status === "");
+              && timeline.status === "" && timeline.kind === "");
         check("timelineInvokables",
               typeof timeline.select === "function"
               && typeof timeline.refresh === "function"
@@ -556,7 +559,7 @@ Kirigami.ApplicationWindow {
 
         check("approvalProperties",
               approvals.count === 0 && approvals.loading === false
-              && approvals.status === "");
+              && approvals.status === "" && approvals.kind === "");
         check("approvalInvokables", typeof approvals.refresh === "function");
         check("approvalQueueStartsEmpty", approvalView.count === 0);
 

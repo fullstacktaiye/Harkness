@@ -80,6 +80,7 @@ pub mod ffi {
         #[qproperty(bool, loading)]
         #[qproperty(bool, more)]
         #[qproperty(QString, status)]
+        #[qproperty(QString, kind)]
         type RunListModel = super::RunListModelRust;
 
         #[cxx_override]
@@ -104,6 +105,17 @@ pub mod ffi {
         /// Discards every row and loads the newest page again.
         #[qinvokable]
         fn refresh(self: Pin<&mut RunListModel>);
+
+        /// Appends the next page, if `more` says there is one.
+        ///
+        /// The same work `fetchMore` does, reachable by name. QML's `ListView`
+        /// does not drive `canFetchMore`/`fetchMore` the way the widget views
+        /// do — that is `QAbstractItemView`'s behavior — so a list bound to
+        /// this model would otherwise stop at its first page with no way to ask
+        /// for another. The override stays for anything that does drive it.
+        #[qinvokable]
+        #[cxx_name = "loadMore"]
+        fn load_more(self: Pin<&mut RunListModel>);
     }
 
     impl cxx_qt::Threading for RunListModel {}
@@ -288,6 +300,7 @@ pub struct RunListModelRust {
     loading: bool,
     more: bool,
     status: QString,
+    kind: QString,
     next_request: u64,
 }
 
@@ -342,10 +355,14 @@ impl ffi::RunListModel {
         rust.cursor.is_some() && !rust.loading
     }
 
-    fn fetch_more(mut self: Pin<&mut Self>, parent: &QModelIndex) {
+    fn fetch_more(self: Pin<&mut Self>, parent: &QModelIndex) {
         if parent.is_valid() {
             return;
         }
+        self.load_more();
+    }
+
+    fn load_more(mut self: Pin<&mut Self>) {
         let Some(cursor) = self.as_ref().rust().cursor else {
             return;
         };
@@ -379,6 +396,7 @@ impl ffi::RunListModel {
         };
         self.as_mut().set_loading(true);
         self.as_mut().set_status(QString::default());
+        self.as_mut().set_kind(QString::default());
         request
     }
 }
@@ -393,6 +411,11 @@ fn fail(mut model: Pin<&mut ffi::RunListModel>, failure: &RunsFailure) {
     model
         .as_mut()
         .set_status(QString::from(failure.message.as_str()));
+    // The discriminant travels beside the message, so a surface can tell a
+    // directory that has recorded nothing from a store it could not read.
+    model
+        .as_mut()
+        .set_kind(QString::from(failure.kind.as_str()));
 }
 
 fn replace_page(
@@ -635,6 +658,38 @@ mod tests {
             !fixture.path().join("never-used").exists(),
             "a read must not be what creates the run store"
         );
+    }
+
+    #[test]
+    fn attaching_to_a_store_ends_the_runs_no_live_process_is_driving() {
+        let fixture = TempDir::new().unwrap();
+        let data_dir = fixture.path().join("data");
+        let store = Store::open(&data_dir).unwrap();
+        let task = Task::with_id(
+            TaskId::new(),
+            "Check: cargo test",
+            "/workspace",
+            None,
+            at(0),
+        );
+        store.insert_task(&task).unwrap();
+        let run = Run::with_id(RunId::new(), task.id(), at(1));
+        store.insert_run(&run).unwrap();
+        // Left `running` with no claim behind it, exactly as a process killed
+        // mid-run leaves it.
+        store
+            .transition_run(run.id(), ExecutionState::Running, at(2))
+            .unwrap();
+        drop(store);
+
+        let page = load_page_in(&data_dir, None).unwrap();
+
+        assert_eq!(
+            page.rows[0].state, "interrupted",
+            "building the coordinator a read goes through sweeps first, and a run \
+             whose owning process is provably gone is what that sweep claims"
+        );
+        assert!(page.rows[0].terminal);
     }
 
     #[test]

@@ -141,19 +141,42 @@ use harkness_runtime::store::{PassThrough, Store, StoreError};
 /// projection rather than silently missing.
 const MAX_APPROVAL_INPUT_BYTES: usize = 8 * 1024;
 
+/// The Harkness data directory could not be resolved at all.
+pub(crate) const DATA_DIRECTORY_UNAVAILABLE: &str = "data_directory_unresolved";
+/// The process's run coordinator could not be built.
+pub(crate) const COORDINATOR_UNAVAILABLE: &str = "coordinator_unavailable";
+/// The data directory holds no run store, so it holds no run or approval.
+pub(crate) const NO_RUN_STORE: &str = "no_run_store";
+/// A run identifier QML supplied is not one.
+pub(crate) const INVALID_RUN_ID: &str = "invalid_run_id";
+/// An approval identifier QML supplied is not one.
+pub(crate) const INVALID_APPROVAL_ID: &str = "invalid_approval_id";
+/// A scope spelling QML supplied is not one this build defines.
+pub(crate) const UNKNOWN_APPROVAL_SCOPE: &str = "unknown_approval_scope";
+/// A run's recorded calls cannot be rebuilt into a script that re-issues them.
+pub(crate) const RUN_NOT_REPLAYABLE: &str = "run_not_replayable";
+
 /// Kinds this bridge raises itself, in declaration order.
 ///
 /// They are front-end discriminants and deliberately not additions to
 /// `RuntimeError::KINDS` or `StoreError::KINDS`, which the CLI concatenates
 /// into its published `exit_code_by_kind` table. Nothing here reaches that
 /// table, and no spelling in it is reused.
-pub(crate) const BRIDGE_KINDS: [&str; 6] = [
-    "catalog_unavailable",
-    "coordinator_unavailable",
-    "no_run_store",
-    "invalid_run_id",
-    "invalid_approval_id",
-    "unknown_approval_scope",
+///
+/// The table is built from the named constants rather than being the source of
+/// them, and every raise site names a constant. A positional table indexed at
+/// the raise sites would remap every kind the moment one was inserted or
+/// reordered, with nothing failing to compile and the set-based collision test
+/// below still passing — which is why this exists only to be asserted over.
+#[cfg(test)]
+pub(crate) const BRIDGE_KINDS: [&str; 7] = [
+    DATA_DIRECTORY_UNAVAILABLE,
+    COORDINATOR_UNAVAILABLE,
+    NO_RUN_STORE,
+    INVALID_RUN_ID,
+    INVALID_APPROVAL_ID,
+    UNKNOWN_APPROVAL_SCOPE,
+    RUN_NOT_REPLAYABLE,
 ];
 
 /// One failure on its way to QML: a stable discriminant and a message.
@@ -213,11 +236,23 @@ pub(crate) fn coordinator_for(data_dir: &Path) -> Result<RunCoordinator, RunsFai
 
 /// The coordinator for a data directory that has already recorded something.
 ///
-/// Opening a runs panel is a read, and a read must not be what brings a run
-/// store into existence — the same rule the checks panel follows. A directory
-/// with no `runtime.db` answers `None` and is left exactly as it was; a
-/// coordinator already built for it is returned without probing, because at
-/// that point the store demonstrably exists.
+/// A read must not be what brings a run store into existence — the same rule
+/// the checks panel follows. A directory with no `runtime.db` answers `None` and
+/// is left exactly as it was; a coordinator already built for it is returned
+/// without probing, because at that point the store demonstrably exists.
+///
+/// # Attaching to an existing store is not itself a read
+///
+/// Building the *first* coordinator for a directory takes this process's lease
+/// and runs the startup sweep, which marks every run whose owning process is
+/// provably dead as `interrupted` and appends an event saying so. That is a
+/// write, and it happens on whichever call gets there first — the runs panel
+/// opening, or a check being started. It is deliberate rather than incidental:
+/// a front end attaching to run history is exactly the moment abandoned runs
+/// should stop reading as live, and ADR-0020 makes the sweep a precondition of
+/// accepting work rather than something a caller may skip. What it must never
+/// do is disturb a *live* sibling process, and it cannot: the proof is an
+/// advisory lock rather than a timestamp.
 pub(crate) fn existing_coordinator(data_dir: &Path) -> Result<Option<RunCoordinator>, RunsFailure> {
     coordinator_in(data_dir, false)
 }
@@ -261,28 +296,46 @@ fn coordinator_in(data_dir: &Path, create: bool) -> Result<Option<RunCoordinator
         .lock()
         .map_err(|_| {
             RunsFailure::new(
-                BRIDGE_KINDS[1],
+                COORDINATOR_UNAVAILABLE,
                 "the run coordinator cache is poisoned; restart Harkness",
             )
         })?;
     if let Some(existing) = coordinators.get(data_dir) {
         return Ok(Some(existing.clone()));
     }
-    if !create && Store::open_existing(data_dir)?.is_none() {
-        return Ok(None);
-    }
-    let store = Arc::new(Store::open(data_dir)?);
-    let coordinator = harkness_runtime::check::check_coordinator(store)
-        .map_err(|error| RunsFailure::new(BRIDGE_KINDS[1], error.to_string()))?;
+    // Opened once and handed on. `Store::open_existing` is not a cheap probe —
+    // it opens the connection, enables WAL, and climbs the whole migration
+    // ladder — so discarding it and calling `Store::open` would pay for all of
+    // that twice on the first read.
+    let store = if create {
+        Store::open(data_dir)?
+    } else {
+        match Store::open_existing(data_dir)? {
+            Some(store) => store,
+            None => return Ok(None),
+        }
+    };
+    let coordinator = harkness_runtime::check::check_coordinator(Arc::new(store))
+        .map_err(|error| RunsFailure::new(COORDINATOR_UNAVAILABLE, error.to_string()))?;
     coordinators.insert(data_dir.to_path_buf(), coordinator.clone());
     Ok(Some(coordinator))
 }
 
 /// The data directory every front-end read and write in this process uses.
+///
+/// Resolved from the environment and the platform directly rather than through
+/// `ProjectService::load`, which reads and parses the whole project catalog on
+/// the way to the same path. This is on the hot path of every page, every
+/// timeline, and every mutation, and run history is independent of the catalog:
+/// an unreadable `projects.json` must not be what stops a user seeing what
+/// their runs did.
 pub(crate) fn data_dir() -> Result<PathBuf, RunsFailure> {
-    harkness_core::ProjectService::load()
-        .map(|service| service.data_dir().to_path_buf())
-        .map_err(|error| RunsFailure::new(BRIDGE_KINDS[0], error.to_string()))
+    harkness_core::data_directory().ok_or_else(|| {
+        RunsFailure::new(
+            DATA_DIRECTORY_UNAVAILABLE,
+            "this platform exposes no data directory and HARKNESS_DATA_DIR is not set",
+        )
+    })
 }
 
 /// The coordinator a read goes through, or `None` when nothing was ever run.
@@ -297,10 +350,7 @@ pub(crate) fn read_coordinator() -> Result<Option<RunCoordinator>, RunsFailure> 
 /// discover it is empty.
 fn write_coordinator() -> Result<RunCoordinator, RunsFailure> {
     read_coordinator()?.ok_or_else(|| {
-        RunsFailure::new(
-            BRIDGE_KINDS[2],
-            "this data directory has recorded no runs yet",
-        )
+        RunsFailure::new(NO_RUN_STORE, "this data directory has recorded no runs yet")
     })
 }
 
@@ -314,16 +364,19 @@ pub(crate) fn optional_rfc3339(at: Option<OffsetDateTime>) -> String {
     at.map(rfc3339).unwrap_or_default()
 }
 
-fn parse_run(value: &str) -> Result<RunId, RunsFailure> {
+pub(crate) fn parse_run(value: &str) -> Result<RunId, RunsFailure> {
     value
         .parse()
-        .map_err(|_| RunsFailure::new(BRIDGE_KINDS[3], format!("{value:?} is not a run id")))
+        .map_err(|_| RunsFailure::new(INVALID_RUN_ID, format!("{value:?} is not a run id")))
 }
 
 fn parse_approval(value: &str) -> Result<ApprovalId, RunsFailure> {
-    value
-        .parse()
-        .map_err(|_| RunsFailure::new(BRIDGE_KINDS[4], format!("{value:?} is not an approval id")))
+    value.parse().map_err(|_| {
+        RunsFailure::new(
+            INVALID_APPROVAL_ID,
+            format!("{value:?} is not an approval id"),
+        )
+    })
 }
 
 /// Reads the scope a grant should carry from what QML asked for.
@@ -338,7 +391,7 @@ fn grant_scope(requested: &str, effective: ApprovalScope) -> Result<ApprovalScop
     }
     ApprovalScope::from_stored(requested).ok_or_else(|| {
         RunsFailure::new(
-            BRIDGE_KINDS[5],
+            UNKNOWN_APPROVAL_SCOPE,
             format!("{requested:?} is not an approval scope"),
         )
     })
@@ -433,7 +486,7 @@ fn retry_scenario(run: RunId, calls: &[ToolCall]) -> Result<Scenario, RunsFailur
     for call in calls {
         let identity =
             harkness_runtime::tool::ToolIdentity::parse(call.tool_id(), call.tool_version())
-                .map_err(|error| RunsFailure::new(BRIDGE_KINDS[1], error.to_string()))?;
+                .map_err(|error| RunsFailure::new(RUN_NOT_REPLAYABLE, error.to_string()))?;
         steps.push(ScenarioStep::new(
             expectation,
             AgentAction::CallTool {
@@ -457,10 +510,10 @@ fn retry_scenario(run: RunId, calls: &[ToolCall]) -> Result<Scenario, RunsFailur
         },
     ));
     let id = ScenarioId::new("retried_run")
-        .map_err(|error| RunsFailure::new(BRIDGE_KINDS[1], error.to_string()))?;
+        .map_err(|error| RunsFailure::new(RUN_NOT_REPLAYABLE, error.to_string()))?;
     Scenario::new(id, steps).map_err(|error| {
         RunsFailure::new(
-            BRIDGE_KINDS[1],
+            RUN_NOT_REPLAYABLE,
             format!("run {run} cannot be re-attempted from its recorded calls: {error}"),
         )
     })
@@ -530,15 +583,22 @@ fn settle(
     if !newest {
         return;
     }
+    // `detail` describes the operation being reported and nothing else. Left
+    // standing, a failed `loadApprovalInput` — or any later cancel, approve, or
+    // deny — would leave the *previous* approval's validated input bound while
+    // a dialog asks about a different one, which is the worst way for this
+    // field to be wrong.
+    let detail = match &outcome {
+        Ok(completion) => completion.detail.as_ref().map(approval_detail),
+        Err(_) => None,
+    };
+    backend.as_mut().set_detail(detail.unwrap_or_default());
     match outcome {
         Ok(completion) => {
             backend
                 .as_mut()
                 .set_status(QString::from(completion.message.as_str()));
             backend.as_mut().set_kind(QString::default());
-            if let Some(input) = completion.detail.as_ref() {
-                backend.as_mut().set_detail(approval_detail(input));
-            }
         }
         Err(failure) => {
             backend
@@ -746,6 +806,15 @@ mod tests {
     }
 
     #[test]
+    fn every_bridge_kind_has_one_spelling() {
+        let mut seen = std::collections::HashSet::new();
+
+        for kind in BRIDGE_KINDS {
+            assert!(seen.insert(kind), "{kind} is declared twice");
+        }
+    }
+
+    #[test]
     fn an_unparseable_identifier_is_refused_by_name() {
         assert_eq!(parse_run("not-a-uuid").unwrap_err().kind, "invalid_run_id");
         assert_eq!(
@@ -860,7 +929,7 @@ mod tests {
 
         let failure = retry_scenario(run, &calls).unwrap_err();
 
-        assert_eq!(failure.kind, "coordinator_unavailable");
+        assert_eq!(failure.kind, "run_not_replayable");
         assert!(
             failure.message.contains("cannot be re-attempted"),
             "{}",

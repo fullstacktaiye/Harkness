@@ -115,6 +115,7 @@ pub mod ffi {
         #[qproperty(bool, live)]
         #[qproperty(bool, more)]
         #[qproperty(QString, status)]
+        #[qproperty(QString, kind)]
         type RunTimelineModel = super::RunTimelineModelRust;
 
         #[cxx_override]
@@ -167,7 +168,9 @@ use harkness_runtime::coordinator::{
 use harkness_runtime::domain::RunId;
 use harkness_runtime::store::{EventListing, EventPage, EventSeq, RunEvent};
 
-use super::runs_backend::{RunsFailure, data_dir, existing_coordinator, note_qt_thread, rfc3339};
+use super::runs_backend::{
+    RunsFailure, data_dir, existing_coordinator, note_qt_thread, parse_run, rfc3339,
+};
 
 /// Events loaded per page, in either direction.
 ///
@@ -521,8 +524,14 @@ fn open_timeline_in(
     // Subscribed before the page is read, so an event recorded between the two
     // arrives on the stream instead of falling into the gap between them.
     let receiver = coordinator.subscribe(run)?;
+    // A subscription to a run that already finished is closed before it is
+    // handed over, and only says so once its whole replay has drained. Asking
+    // the record instead is what stops a run that ended hours ago showing as
+    // live for as long as its log takes to walk; a run that finishes while it
+    // is being watched still flips to false when the stream disconnects.
+    let live = !coordinator.store().load_run(run)?.state().is_terminal();
     let listing = coordinator.event_page(run, EventPage::newest(TIMELINE_PAGE_SIZE))?;
-    Ok(Some((receiver, timeline_page(listing, true))))
+    Ok(Some((receiver, timeline_page(listing, live))))
 }
 
 /// Reads one page older than `cursor`.
@@ -618,6 +627,7 @@ pub struct RunTimelineModelRust {
     live: bool,
     more: bool,
     status: QString,
+    kind: QString,
     timeline: Timeline,
     selection: Selection,
 }
@@ -677,13 +687,15 @@ impl ffi::RunTimelineModel {
         }
         self.as_mut().set_loading(true);
         self.as_mut().set_status(QString::default());
+        self.as_mut().set_kind(QString::default());
         let qt_thread = self.qt_thread();
         std::thread::spawn(move || {
-            let Ok(run) = run_id.parse::<RunId>() else {
-                let failure =
-                    RunsFailure::new("invalid_run_id", format!("{run_id:?} is not a run id"));
-                let _ = qt_thread.queue(move |model| report(model, request, &failure));
-                return;
+            let run = match parse_run(&run_id) {
+                Ok(run) => run,
+                Err(failure) => {
+                    let _ = qt_thread.queue(move |model| report(model, request, &failure));
+                    return;
+                }
             };
             let opened = match open_timeline(run) {
                 Ok(opened) => opened,
@@ -832,9 +844,14 @@ fn deliver(
     qt_thread: &cxx_qt::CxxQtThread<ffi::RunTimelineModel>,
 ) {
     loop {
-        // Selecting another run is what ends this thread; without the check it
-        // would keep draining a subscription nothing is showing any more.
-        if !selection.describes(request) {
+        // Three things end this thread. Selecting another run is the ordinary
+        // one. A destroyed model is the one that would otherwise leak: the
+        // worker holds its own clone of the selection counter, so nothing about
+        // dropping the model moves it, and a run that never reaches a terminal
+        // state never disconnects either — the thread would poll for the life
+        // of the process, one per timeline the user ever opened. The third is a
+        // queue that fails below, which says the same thing without the race.
+        if !selection.describes(request) || qt_thread.is_destroyed() {
             return;
         }
         let first = match receiver.recv_timeout(SUBSCRIPTION_POLL) {
@@ -845,23 +862,26 @@ fn deliver(
                 return;
             }
         };
-        let mut batch = Vec::new();
-        let mut lost = collect(first, &mut batch, run);
+        let mut rows = Vec::new();
+        let mut lost = collect(first, &mut rows, run, floor);
         // Everything already queued joins this batch, which is what makes a
-        // burst one insert span rather than one per event.
-        while !lost {
+        // burst one insert span rather than one per event. The selection is
+        // re-checked inside the drain because a subscription opened on a long
+        // run replays its whole log, and that replay must not outlive the run
+        // being deselected part-way through it.
+        while !lost && selection.describes(request) {
             match receiver.try_recv() {
-                Ok(delivery) => lost = collect(delivery, &mut batch, run),
+                Ok(delivery) => lost = collect(delivery, &mut rows, run, floor),
                 Err(TryReceiveError::Empty | TryReceiveError::Disconnected) => break,
             }
         }
-        let rows: Vec<TimelineRow> = batch
-            .into_iter()
-            .filter(|(seq, _)| *seq > floor)
-            .map(|(seq, event)| event_row(seq, &event))
-            .collect();
-        if !rows.is_empty() {
-            let _ = qt_thread.queue(move |model| append_batch(model, request, rows));
+        if !rows.is_empty()
+            && qt_thread
+                .queue(move |model| append_batch(model, request, rows))
+                .is_err()
+        {
+            // The model is gone; nothing will ever read this stream again.
+            return;
         }
         if lost {
             // A subscriber is closed once it lags, so there is nothing left to
@@ -873,12 +893,22 @@ fn deliver(
 }
 
 /// Adds one delivery to a batch, reporting whether the stream was lost.
-fn collect(delivery: EventDelivery, batch: &mut Vec<(u64, RunEvent)>, run: RunId) -> bool {
+///
+/// Projected and filtered here rather than after the drain, and that ordering
+/// is what keeps the batch bounded. A subscription replays the run's whole log
+/// before it reaches live events, so retaining the raw deliveries first would
+/// hold every payload of a five-thousand-event run in memory — up to 64 KiB
+/// each — only to discard all of them against `floor` a moment later. A row is
+/// a handful of short strings and an event at or below `floor` becomes nothing
+/// at all.
+fn collect(delivery: EventDelivery, rows: &mut Vec<TimelineRow>, run: RunId, floor: u64) -> bool {
     match delivery {
         // A subscription is per run, but the run is checked rather than assumed:
         // a row rendered under the wrong run is not re-checked by anything.
         EventDelivery::Event(stored) if stored.run_id == run => {
-            batch.push((stored.seq.get(), stored.event));
+            if stored.seq.get() > floor {
+                rows.push(event_row(stored.seq.get(), &stored.event));
+            }
             false
         }
         EventDelivery::Event(_) => false,
@@ -905,6 +935,11 @@ fn report(mut model: Pin<&mut ffi::RunTimelineModel>, request: u64, failure: &Ru
     model
         .as_mut()
         .set_status(QString::from(failure.message.as_str()));
+    // The discriminant travels beside the message, so a surface can tell a
+    // run that is not stored from a store it could not read.
+    model
+        .as_mut()
+        .set_kind(QString::from(failure.kind.as_str()));
 }
 
 /// Records that the run stopped publishing without disturbing its rows.
@@ -1433,7 +1468,10 @@ mod tests {
         );
         assert_eq!(page.rows.last().map(|row| row.seq), Some(total));
         assert!(!page.beginning, "there are older entries behind it");
-        assert!(page.live);
+        assert!(
+            !page.live,
+            "the seeded run already succeeded, so nothing is delivering for it"
+        );
     }
 
     #[test]

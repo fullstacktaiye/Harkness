@@ -95,6 +95,7 @@ pub mod ffi {
         #[qproperty(i32, count)]
         #[qproperty(bool, loading)]
         #[qproperty(QString, status)]
+        #[qproperty(QString, kind)]
         type ApprovalModel = super::ApprovalModelRust;
 
         #[cxx_override]
@@ -380,6 +381,7 @@ pub struct ApprovalModelRust {
     count: i32,
     loading: bool,
     status: QString,
+    kind: QString,
     next_request: u64,
 }
 
@@ -501,10 +503,17 @@ fn apply_queue(
             model
                 .as_mut()
                 .set_status(QString::from(failure.message.as_str()));
+            // The discriminant travels beside the message, so a surface can
+            // tell a directory that has recorded nothing from one it could not
+            // read.
+            model
+                .as_mut()
+                .set_kind(QString::from(failure.kind.as_str()));
             return;
         }
     };
     model.as_mut().set_status(QString::default());
+    model.as_mut().set_kind(QString::default());
     // Bound before the loop: a temporary in a `for` head lives for the whole
     // loop, and this one borrows the object the body mutates.
     let planned = plan_edits(&model.as_ref().rust().rows, &incoming);
