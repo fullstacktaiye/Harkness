@@ -1725,14 +1725,18 @@ mod tests {
     }
 
     /// Creates a file symlink, or skips the platform that cannot.
+    /// Creates a file symlink, reporting whether the platform allowed it.
+    ///
+    /// Windows needs developer mode or elevation for one, so a test that needs a
+    /// link skips there rather than failing on a privilege it never had.
     #[cfg(unix)]
-    fn link(target: &Path, link: &Path) {
-        std::os::unix::fs::symlink(target, link).unwrap();
+    fn link(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
     }
 
     #[cfg(windows)]
-    fn link(target: &Path, link: &Path) {
-        std::os::windows::fs::symlink_file(target, link).unwrap();
+    fn link(target: &Path, link: &Path) -> bool {
+        std::os::windows::fs::symlink_file(target, link).is_ok()
     }
 
     fn paths(inventory: &FileInventory) -> Vec<String> {
@@ -2062,15 +2066,22 @@ mod tests {
 
     #[test]
     fn entries_are_sorted_by_exact_path_bytes() {
+        // Names that differ by more than case: APFS and NTFS fold `A.txt` and
+        // `a.txt` onto one file, so a pair like that would test the filesystem
+        // rather than the ordering. `Z` sorts before `a` by byte and after it by
+        // alphabet, and `.` sorts before `/`, which is the whole claim.
         let workspace = Workspace::new("ordering");
-        workspace.write("b.txt", "b\n");
-        workspace.write("A.txt", "a\n");
-        workspace.write("a/z.txt", "z\n");
-        workspace.write("a.txt", "a\n");
+        workspace.write("beta.txt", "b\n");
+        workspace.write("Zeta.txt", "z\n");
+        workspace.write("alpha/z.txt", "z\n");
+        workspace.write("alpha.txt", "a\n");
 
         let inventory = workspace.inventory();
 
-        assert_eq!(paths(&inventory), ["A.txt", "a.txt", "a/z.txt", "b.txt"]);
+        assert_eq!(
+            paths(&inventory),
+            ["Zeta.txt", "alpha.txt", "alpha/z.txt", "beta.txt"]
+        );
         let mut sorted = inventory.entries().to_vec();
         sorted.sort_by(|left, right| left.path.cmp(&right.path));
         assert_eq!(sorted, inventory.entries());
@@ -2315,7 +2326,9 @@ mod tests {
         let elsewhere = workspace.fixture.root.path().join("private-key");
         fs::write(&elsewhere, "!.env\nsupersecret\n").unwrap();
         fs::create_dir_all(workspace.root.join(".harkness")).unwrap();
-        link(&elsewhere, &workspace.root.join(REPOSITORY_IGNORE_FILE));
+        if !link(&elsewhere, &workspace.root.join(REPOSITORY_IGNORE_FILE)) {
+            return;
+        }
 
         let error = InventoryBuilder::build(
             &workspace.snapshot(),
@@ -2341,7 +2354,9 @@ mod tests {
             .join("dotfiles-context-ignore");
         fs::write(&real, "notes.md\n").unwrap();
         let configured = workspace.fixture.root.path().join("context-ignore");
-        link(&real, &configured);
+        if !link(&real, &configured) {
+            return;
+        }
         workspace.write("notes.md", "one\n");
         workspace.write("kept.rs", "fn main() {}\n");
 
@@ -2640,7 +2655,12 @@ mod tests {
         fn a_non_utf8_path_round_trips_byte_exactly_and_reports_itself_lossy() {
             let workspace = Workspace::new("lossy-paths");
             let name = std::ffi::OsStr::from_bytes(b"weird-\xff\xfe.txt");
-            fs::write(workspace.root.join(name), "content\n").unwrap();
+            // Linux takes any byte but `/` and NUL; APFS refuses a name that is
+            // not valid UTF-8 outright, so there is nothing to record there and
+            // nothing to assert about it.
+            if fs::write(workspace.root.join(name), "content\n").is_err() {
+                return;
+            }
 
             let inventory = workspace.inventory();
 
