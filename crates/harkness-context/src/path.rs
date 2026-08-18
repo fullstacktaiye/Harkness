@@ -68,6 +68,32 @@ impl RepoPath {
         &self.0
     }
 
+    /// Appends one directory-entry name to a repository-relative path.
+    ///
+    /// Lives here because the platform spelling of a name in bytes does — a
+    /// walk that rebuilt it would be a second copy of the rule this type
+    /// exists to hold, and the two would drift the first time a platform
+    /// needed something different. An empty parent yields the name alone, so a
+    /// path at the worktree root carries no leading separator.
+    #[must_use]
+    pub fn join_bytes(parent: &[u8], name: &std::ffi::OsStr) -> Vec<u8> {
+        let mut joined = Vec::with_capacity(parent.len() + 1 + name.len());
+        if !parent.is_empty() {
+            joined.extend_from_slice(parent);
+            joined.push(b'/');
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            joined.extend_from_slice(name.as_bytes());
+        }
+        #[cfg(not(unix))]
+        {
+            joined.extend_from_slice(name.to_string_lossy().as_bytes());
+        }
+        joined
+    }
+
     /// Whether the display form loses information.
     #[must_use]
     pub fn is_lossy(&self) -> bool {

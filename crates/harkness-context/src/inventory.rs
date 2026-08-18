@@ -37,7 +37,7 @@
 //! [#115]: https://github.com/fullstacktaiye/harkness/issues/115
 
 use std::collections::BTreeSet;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs::{self, Metadata};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -965,12 +965,21 @@ impl<'a> Walk<'a> {
             reason,
         };
 
-        // `symlink_metadata`, not `metadata`: a repository writes its own rule
-        // file, and a committed symlink is how it would aim this reader at
-        // `~/.ssh/id_rsa` and read the target back out through a diagnostic
-        // quoting the "pattern" it could not compile. The user's own global file
-        // is followed, because a dotfile manager symlinking it is ordinary and
-        // the path came from the user rather than from a repository.
+        // A repository writes its own rule file, and a committed symlink is how
+        // it would aim this reader at `~/.ssh/id_rsa` and read the target back
+        // out through a diagnostic quoting the "pattern" it could not compile.
+        // Every component under the worktree root is checked, not just the leaf:
+        // `lstat` resolves everything before the final name, so a `.harkness`
+        // directory that is itself a link would pass a check on
+        // `.harkness/context-ignore` alone. The user's own global file is
+        // followed, because a dotfile manager linking it is ordinary and the
+        // path came from the user rather than from a repository.
+        if !allow_symlink && let Some(link) = symlinked_component(root, file) {
+            return Err(invalid(format!(
+                "'{}' is a symlink, and a repository rule file may not be reached through one",
+                clamp(&link.to_string_lossy())
+            )));
+        }
         let metadata = match fs::symlink_metadata(file) {
             Ok(metadata) if metadata.is_symlink() && !allow_symlink => {
                 return Err(invalid(
@@ -1057,6 +1066,13 @@ impl<'a> Walk<'a> {
         }];
 
         'walk: loop {
+            // Emptiness first: a walk that visited everything is finished, and
+            // asking about the clock before asking whether there is anything
+            // left would report a complete inventory as truncated whenever the
+            // last entry landed on the budget.
+            if stack.is_empty() {
+                break 'walk;
+            }
             if self.cancellation.is_cancelled() {
                 return Err(InventoryError::Cancelled);
             }
@@ -1073,7 +1089,7 @@ impl<'a> Walk<'a> {
                 };
                 frame.entries.next().map(|listed| {
                     let absolute = frame.absolute.join(&listed.name);
-                    let relative = join_relative(&frame.relative, &listed.name);
+                    let relative = RepoPath::join_bytes(&frame.relative, &listed.name);
                     (listed, absolute, relative)
                 })
             };
@@ -1114,6 +1130,16 @@ impl<'a> Walk<'a> {
                 }
                 EntryKind::Directory => {
                     let path = RepoPath::from_bytes(relative.clone());
+                    // Asked before the listing, because a nested repository can
+                    // hold hundreds of thousands of names and every one of them
+                    // would be read, allocated, and sorted only to be thrown
+                    // away by the boundary check that followed.
+                    if fs::symlink_metadata(absolute.join(".git")).is_ok() {
+                        if !self.record_boundary(&absolute, path, &relative) {
+                            break 'walk;
+                        }
+                        continue 'walk;
+                    }
                     let listing = match self.read_directory(&absolute, Some(&path)) {
                         Ok(listing) => listing,
                         Err(error) => {
@@ -1124,15 +1150,6 @@ impl<'a> Walk<'a> {
                             continue 'walk;
                         }
                     };
-                    // A directory holding its own `.git` belongs to another
-                    // repository. It is recorded as a boundary and the walk
-                    // stops there, so no cross-repository content can enter.
-                    if listing.iter().any(|entry| entry.name == ".git") {
-                        if !self.record_boundary(&absolute, path, &relative) {
-                            break 'walk;
-                        }
-                        continue 'walk;
-                    }
                     let gitignore = self.gitignore_for(&absolute, &listing);
                     stack.push(Frame {
                         absolute,
@@ -1164,15 +1181,22 @@ impl<'a> Walk<'a> {
         // belongs be recorded under its own name, and layer 1's whole contract
         // is that a denied path is a count and never a name. Layers 2 to 4 keep
         // Git's answer, where a symlink is not a directory.
-        let denied = self
-            .denials
-            .matched_path_or_any_parents(absolute, is_dir)
-            .is_ignore()
-            || (kind == EntryKind::Symlink
-                && self
-                    .denials
-                    .matched_path_or_any_parents(absolute, true)
-                    .is_ignore());
+        let denied = match kind {
+            // A directory's ancestors decide whether it may be descended into
+            // at all, so this is the one kind that pays for the parent walk.
+            EntryKind::Directory => self
+                .denials
+                .matched_path_or_any_parents(absolute, true)
+                .is_ignore(),
+            // Everything else sits inside a directory the walk already asked
+            // this question about — nothing is descended into before it is
+            // checked — so the path itself is the whole question.
+            EntryKind::Symlink => {
+                self.denials.matched(absolute, false).is_ignore()
+                    || self.denials.matched(absolute, true).is_ignore()
+            }
+            EntryKind::File | EntryKind::Other => self.denials.matched(absolute, false).is_ignore(),
+        };
         if denied {
             return Decision::Denied;
         }
@@ -1237,7 +1261,20 @@ impl<'a> Walk<'a> {
                 Ok(kind) if kind.is_file() => EntryKind::File,
                 Ok(_) => EntryKind::Other,
                 Err(error) => {
-                    self.unreadable(&entry.path(), None, &error);
+                    // Reported by name only once layer 1 has been asked about
+                    // it. This runs before `decide` does, and a credential file
+                    // deleted between `readdir` and its `lstat` would otherwise
+                    // reach a diagnostic under its own name.
+                    let path = entry.path();
+                    if self
+                        .denials
+                        .matched_path_or_any_parents(&path, false)
+                        .is_ignore()
+                    {
+                        self.denied_count = self.denied_count.saturating_add(1);
+                    } else {
+                        self.unreadable(&path, None, &error);
+                    }
                     continue;
                 }
             };
@@ -1260,43 +1297,49 @@ impl<'a> Walk<'a> {
     /// read every layer that can *deny* has already spoken, so a rule this build
     /// cannot apply costs coverage rather than safety.
     fn gitignore_for(&mut self, absolute: &Path, listing: &[Listed]) -> Option<Gitignore> {
-        if !listing
-            .iter()
-            .any(|entry| entry.name == ".gitignore" && entry.kind == EntryKind::File)
-        {
+        // A `.gitignore` that is present but not a regular file — a symlink,
+        // most plausibly a shared one in a monorepo — is refused by the loader
+        // and *reported*. Skipping it on the kind alone would drop every rule it
+        // held with nobody told, which is the silent widening this layer is
+        // written against.
+        if !listing.iter().any(|entry| entry.name == ".gitignore") {
             return None;
         }
         let file = absolute.join(".gitignore");
         match self.load_ignore_file(&RuleFile::gitignore(&file, absolute)) {
             Ok(gitignore) => gitignore,
-            Err(InventoryError::IgnoreRuleInvalid {
-                layer,
-                file,
-                reason,
-            }) => {
+            Err(error) => {
                 self.diagnose(InventoryDiagnostic::IgnoreRuleInvalid {
-                    layer,
-                    file,
+                    layer: IgnoreLayer::GitIgnore,
+                    file: clamp(&file.to_string_lossy()),
                     line: None,
                     pattern: None,
-                    reason,
+                    reason: clamp(&error.to_string()),
                 });
                 None
             }
-            Err(_) => None,
         }
     }
 
     /// Records a symlink: never followed, never read, never eligible.
     fn record_symlink(&mut self, absolute: &Path, path: RepoPath) -> bool {
         match fs::symlink_metadata(absolute) {
+            Ok(metadata) if metadata.is_symlink() => self.record_link(&metadata, path),
             // The listing said link and this stat disagrees, so the path was
             // replaced. Recording it as the regular file it now is keeps the
             // entry describing what the walk actually saw last.
-            Ok(metadata) if !metadata.is_symlink() && metadata.is_file() => {
-                self.record_file(absolute, path)
+            Ok(metadata) if metadata.is_file() => self.record_regular(absolute, path, &metadata),
+            // A directory or a device now stands where a link was listed. There
+            // is no honest entry to write — its contents were never walked, and
+            // calling it a link would contradict the stat that just answered —
+            // so it is reported and left out.
+            Ok(_) => {
+                self.diagnose(InventoryDiagnostic::Unreadable {
+                    path,
+                    reason: "changed kind while the walk was running".to_owned(),
+                });
+                true
             }
-            Ok(metadata) => self.record_link(&metadata, path),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 self.diagnose(InventoryDiagnostic::Vanished { path });
                 true
@@ -1358,7 +1401,7 @@ impl<'a> Walk<'a> {
         })
     }
 
-    /// Records a regular file, reading at most the sniff window.
+    /// Stats a path the listing typed as a regular file, then records it.
     fn record_file(&mut self, absolute: &Path, path: RepoPath) -> bool {
         let metadata = match fs::symlink_metadata(absolute) {
             Ok(metadata) => metadata,
@@ -1392,8 +1435,13 @@ impl<'a> Walk<'a> {
         if metadata.is_symlink() {
             return self.record_link(&metadata, path);
         }
+        self.record_regular(absolute, path, &metadata)
+    }
+
+    /// Records a path a fresh stat has already established is a regular file.
+    fn record_regular(&mut self, absolute: &Path, path: RepoPath, metadata: &Metadata) -> bool {
         let byte_size = metadata.len();
-        let mtime_ns = modified_nanos(&metadata);
+        let mtime_ns = modified_nanos(metadata);
 
         // A name the classifier already refuses is never opened. That is the
         // difference between recording that a file looks credential-bearing and
@@ -1401,7 +1449,7 @@ impl<'a> Walk<'a> {
         let (class, unreadable) = if FileSample::new(&path, byte_size).is_secret_by_name() {
             (FileClass::SecretSensitive, false)
         } else {
-            match self.sniff(absolute) {
+            match self.sniff(absolute, metadata) {
                 Ok(()) => (
                     FileSample::new(&path, byte_size)
                         .with_window(&self.window)
@@ -1430,17 +1478,23 @@ impl<'a> Walk<'a> {
     }
 
     /// Reads at most [`BINARY_SNIFF_BYTES`] into the reused window.
-    fn sniff(&mut self, absolute: &Path) -> std::io::Result<()> {
+    ///
+    /// `expected` is the stat that decided this path was a regular file, and the
+    /// open is checked back against it: `File::open` follows a symlink, so a
+    /// path swapped in between would otherwise deliver eight kilobytes of
+    /// somewhere else to a classification. On Unix that check is the inode and
+    /// device, which a swap cannot preserve; elsewhere it is the file type
+    /// alone, and the residual is stated rather than argued away. A swap to a
+    /// FIFO can still block the open itself, exactly as `FilesystemProbe`
+    /// documents.
+    fn sniff(&mut self, absolute: &Path, expected: &Metadata) -> std::io::Result<()> {
         self.window.clear();
         let file = fs::File::open(absolute)?;
-        // Re-checked on the open handle: the listing said regular file, and an
-        // entry swapped for a directory or a device in between must not be read
-        // as one. A swap to a FIFO can still block the open itself, which is the
-        // same residual `FilesystemProbe` documents.
-        if !file.metadata()?.is_file() {
+        let opened = file.metadata()?;
+        if !opened.is_file() || !is_same_file(&opened, expected) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "not a regular file",
+                "the path changed while it was being opened",
             ));
         }
         file.take(u64::try_from(BINARY_SNIFF_BYTES).unwrap_or(u64::MAX))
@@ -1487,20 +1541,29 @@ impl<'a> Walk<'a> {
     fn finish(mut self) -> FileInventory {
         self.entries
             .sort_by(|left, right| left.path.cmp(&right.path));
-        // Sorted by fold, so a collision is an adjacent pair rather than a map
-        // holding two owned copies of every path in the walk. Diagnostics are
-        // built one at a time, so the bound is applied before the memory is
-        // spent rather than after.
-        let mut folded = (0..self.entries.len())
-            .map(|index| (case_fold(self.entries[index].path.as_bytes()), index))
-            .collect::<Vec<_>>();
-        folded.sort_unstable();
-        let collisions = folded
+        // Ordered by fold, so a collision is an adjacent pair. The comparison
+        // folds as it goes rather than building a lowercased copy of every path:
+        // at the entry bound that would be two hundred thousand allocations to
+        // answer a question about neighbours.
+        let mut order = (0..self.entries.len()).collect::<Vec<_>>();
+        order.sort_unstable_by(|left, right| {
+            compare_case_folded(
+                self.entries[*left].path.as_bytes(),
+                self.entries[*right].path.as_bytes(),
+            )
+        });
+        let collisions = order
             .windows(2)
-            .filter(|pair| pair[0].0 == pair[1].0)
-            .map(|pair| (pair[0].1, pair[1].1))
+            .filter(|pair| {
+                compare_case_folded(
+                    self.entries[pair[0]].path.as_bytes(),
+                    self.entries[pair[1]].path.as_bytes(),
+                )
+                .is_eq()
+            })
+            .map(|pair| (pair[0], pair[1]))
             .collect::<Vec<_>>();
-        drop(folded);
+        drop(order);
         for (existing, found) in collisions {
             self.diagnose(InventoryDiagnostic::CaseCollision {
                 path: self.entries[found].path.clone(),
@@ -1521,6 +1584,46 @@ impl<'a> Walk<'a> {
             classify_version: CLASSIFY_VERSION,
         }
     }
+}
+
+/// Whether an opened file is the one a stat described.
+///
+/// Unix compares the inode and device, which a swap cannot preserve. Other
+/// platforms have no equally cheap identity here, so the type check the caller
+/// already made stands alone and the window between the two calls is a stated
+/// residual rather than a closed one.
+#[cfg(unix)]
+fn is_same_file(opened: &Metadata, expected: &Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    opened.ino() == expected.ino() && opened.dev() == expected.dev()
+}
+
+#[cfg(not(unix))]
+fn is_same_file(_opened: &Metadata, _expected: &Metadata) -> bool {
+    true
+}
+
+/// The first component of `file` beneath `root` that is a symlink, if any.
+///
+/// Lexical from `root` down, one `lstat` per component, and deliberately not a
+/// canonicalization: the question is whether a repository placed a link on the
+/// way to a file Harkness is about to read, and canonicalizing would answer a
+/// different one by resolving the link first. A path that is not under `root` is
+/// nobody's repository content, so it has no components to refuse.
+fn symlinked_component(root: &Path, file: &Path) -> Option<PathBuf> {
+    let relative = file.strip_prefix(root).ok()?;
+    let mut walked = root.to_path_buf();
+    for component in relative.components() {
+        walked.push(component);
+        match fs::symlink_metadata(&walked) {
+            Ok(metadata) if metadata.is_symlink() => return Some(walked),
+            // A component that is not there yet cannot be a link, and the read
+            // that follows reports its own absence.
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Reads a file's text, refusing anything past `limit` rather than trusting a
@@ -1553,13 +1656,18 @@ fn declared_submodules(root: &Path) -> BTreeSet<Vec<u8>> {
 
     let file = root.join(".gitmodules");
     let mut declared = BTreeSet::new();
-    let Ok(metadata) = fs::metadata(&file) else {
+    // Read on the same terms as a rule file: never through a symlink, and
+    // bounded by the bytes read rather than by a stat that procfs answers with
+    // zero. Nothing here leaks — the result only picks between two spellings of
+    // one boundary — but a repository does not get to choose what this process
+    // opens or how much of it lands in memory.
+    let Ok(metadata) = fs::symlink_metadata(&file) else {
         return declared;
     };
-    if !metadata.is_file() || metadata.len() > MAX_GITMODULES_BYTES {
+    if !metadata.is_file() {
         return declared;
     }
-    let Ok(text) = fs::read_to_string(&file) else {
+    let Ok(Some(text)) = read_bounded(&file, MAX_GITMODULES_BYTES) else {
         return declared;
     };
     let mut in_submodule = false;
@@ -1589,28 +1697,6 @@ fn declared_submodules(root: &Path) -> BTreeSet<Vec<u8>> {
     declared
 }
 
-/// Joins a directory's relative path with one entry name, in Git's spelling.
-///
-/// Byte-exact on Unix, where a file name is any byte sequence, and through the
-/// UTF-8 form elsewhere, which is lossless for every name Git can report there.
-fn join_relative(parent: &[u8], name: &OsStr) -> Vec<u8> {
-    let mut joined = Vec::with_capacity(parent.len() + 1 + name.len());
-    if !parent.is_empty() {
-        joined.extend_from_slice(parent);
-        joined.push(b'/');
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        joined.extend_from_slice(name.as_bytes());
-    }
-    #[cfg(not(unix))]
-    {
-        joined.extend_from_slice(name.to_string_lossy().replace('\\', "/").as_bytes());
-    }
-    joined
-}
-
 /// Modification time in nanoseconds since the Unix epoch.
 fn modified_nanos(metadata: &Metadata) -> Option<i64> {
     let modified = metadata.modified().ok()?;
@@ -1622,16 +1708,22 @@ fn modified_nanos(metadata: &Metadata) -> Option<i64> {
     }
 }
 
-/// Folds a path for the case-collision check.
+/// Orders two paths as a case-insensitive filesystem would see them.
 ///
-/// Simple Unicode lowercasing where the bytes are UTF-8, ASCII folding where
-/// they are not. This decides only whether to *flag* two entries; both are kept
-/// under their exact bytes either way, so a fold that is too eager costs a
-/// diagnostic and never an entry.
-fn case_fold(path: &[u8]) -> Vec<u8> {
-    match std::str::from_utf8(path) {
-        Ok(text) => text.to_lowercase().into_bytes(),
-        Err(_) => path.to_ascii_lowercase(),
+/// Simple Unicode lowercasing where both are UTF-8, ASCII folding where either
+/// is not, and neither side is materialized. This decides only whether to *flag*
+/// two entries; both are kept under their exact bytes either way, so a fold that
+/// is too eager costs a diagnostic and never an entry.
+fn compare_case_folded(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+    match (std::str::from_utf8(left), std::str::from_utf8(right)) {
+        (Ok(left), Ok(right)) => left
+            .chars()
+            .flat_map(char::to_lowercase)
+            .cmp(right.chars().flat_map(char::to_lowercase)),
+        _ => left
+            .iter()
+            .map(u8::to_ascii_lowercase)
+            .cmp(right.iter().map(u8::to_ascii_lowercase)),
     }
 }
 
@@ -2366,7 +2458,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_gitignore_is_reported_rather_than_silently_empty() {
+    fn a_malformed_gitignore_pattern_is_reported_by_line() {
         let workspace = Workspace::new("gitignore-io");
         workspace.write(".gitignore", "{unclosed\nnotes.md\n");
         workspace.write("notes.md", "one\n");
@@ -2436,6 +2528,57 @@ mod tests {
         let entry = &inventory.entries()[0];
         assert_eq!(entry.class, FileClass::Binary);
         assert!(!entry.eligible());
+    }
+
+    #[test]
+    fn a_rule_file_reached_through_a_linked_directory_is_refused() {
+        // `lstat` on `.harkness/context-ignore` resolves `.harkness` first, so a
+        // check on the leaf alone answers about a file outside the worktree
+        // while reporting that nothing was a link.
+        let workspace = Workspace::new("linked-directory");
+        let elsewhere = workspace.fixture.directory("outside");
+        fs::write(elsewhere.join("context-ignore"), "!.env\nsupersecret[\n").unwrap();
+        if !link(&elsewhere, &workspace.root.join(".harkness")) {
+            return;
+        }
+
+        let error = InventoryBuilder::build(
+            &workspace.snapshot(),
+            &InventoryPolicy::new(),
+            &Cancellation::default(),
+        )
+        .expect_err("a rule file reached through a linked directory is refused");
+
+        assert_eq!(error.kind(), "ignore_rule_invalid");
+        assert!(
+            !format!("{error}").contains("supersecret"),
+            "the target's content reached the error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_complete_walk_is_never_reported_as_truncated() {
+        // The budget is checked once more after the last frame is popped, and a
+        // walk that visited everything must not answer that check.
+        let workspace = Workspace::new("complete");
+        workspace.write("a.rs", "fn main() {}\n");
+        let snapshot = workspace.snapshot();
+
+        for _ in 0..20 {
+            let inventory = InventoryBuilder::build(
+                &snapshot,
+                &InventoryPolicy::new().with_max_walk(Duration::from_nanos(1)),
+                &Cancellation::default(),
+            )
+            .unwrap();
+            if inventory.entries().len() == 1 {
+                assert!(
+                    !inventory.is_truncated(),
+                    "a walk that recorded everything reported {:?}",
+                    inventory.truncation()
+                );
+            }
+        }
     }
 
     #[test]
@@ -2628,7 +2771,7 @@ mod tests {
         use std::fs;
         use std::os::unix::ffi::OsStrExt;
 
-        use super::{InventoryDiagnostic, InventoryPolicy, Workspace, paths};
+        use super::{IgnoreLayer, InventoryDiagnostic, InventoryPolicy, Workspace, link, paths};
         use crate::RepoPath;
 
         #[test]
@@ -2649,6 +2792,56 @@ mod tests {
             assert!(linked.symlink);
             assert!(linked.boundary.is_none());
             assert!(!linked.eligible(), "a link's content is somewhere else");
+        }
+
+        #[test]
+        fn an_unreadable_gitignore_is_reported_rather_than_silently_empty() {
+            // `Gitignore::new` drops I/O errors, so this used to leave an empty
+            // matcher and no diagnostic: every path the file excluded became
+            // indexable with nobody told.
+            let workspace = Workspace::new("gitignore-unreadable");
+            let ignored = workspace.write(".gitignore", "notes.md\n");
+            workspace.write("notes.md", "one\n");
+            let Some(_restore) = deny_access(&ignored, false, 0o644) else {
+                return;
+            };
+
+            let inventory = workspace.build(&InventoryPolicy::new());
+
+            assert!(
+                inventory.diagnostics().iter().any(|diagnostic| matches!(
+                    diagnostic,
+                    InventoryDiagnostic::IgnoreRuleInvalid { layer, .. }
+                        if *layer == IgnoreLayer::GitIgnore
+                )),
+                "an unreadable .gitignore was skipped silently: {:?}",
+                inventory.diagnostics()
+            );
+            // The rules are genuinely gone — that is what the diagnostic is for.
+            assert!(paths(&inventory).contains(&"notes.md".to_owned()));
+        }
+
+        #[test]
+        fn a_symlinked_gitignore_is_reported_rather_than_skipped() {
+            let workspace = Workspace::new("gitignore-link");
+            let shared = workspace.fixture.root.path().join("shared-gitignore");
+            fs::write(&shared, "notes.md\n").unwrap();
+            if !link(&shared, &workspace.root.join(".gitignore")) {
+                return;
+            }
+            workspace.write("notes.md", "one\n");
+
+            let inventory = workspace.build(&InventoryPolicy::new());
+
+            assert!(
+                inventory.diagnostics().iter().any(|diagnostic| matches!(
+                    diagnostic,
+                    InventoryDiagnostic::IgnoreRuleInvalid { layer, .. }
+                        if *layer == IgnoreLayer::GitIgnore
+                )),
+                "a symlinked .gitignore vanished without a word: {:?}",
+                inventory.diagnostics()
+            );
         }
 
         #[test]

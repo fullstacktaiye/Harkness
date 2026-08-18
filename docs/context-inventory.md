@@ -111,10 +111,13 @@ something an earlier layer excluded.)
 A configured ignore file that does not exist contributes no rules; one that
 exists and cannot be read, is larger than 1 MiB, or is not valid UTF-8 fails the
 walk with `ignore_rule_invalid`, because a rule meant to exclude something must
-not be skipped quietly. **A repository's rule file may not be a symlink** — a
-committed link is how a repository would aim the reader at `~/.ssh/id_rsa` and
-read the target back through a diagnostic quoting the "pattern" it could not
-compile — while the global file, whose path the user supplied, is followed. A
+not be skipped quietly. **A repository's rule file may not be reached through a
+symlink** — not the file itself and not any directory on the way to it, because
+`lstat` on `.harkness/context-ignore` resolves `.harkness` first and would answer
+about a file outside the worktree while reporting that nothing was a link. That
+is how a repository would aim the reader at `~/.ssh/id_rsa` and read the target
+back through a diagnostic quoting the "pattern" it could not compile. The global
+file, whose path the user supplied, is followed. A
 leading byte-order mark belongs to the file rather than to its first pattern and
 is stripped, so a rule file saved by a Windows editor still tightens what it
 says it tightens. An oversized `.gitignore` is the one exception: it is
@@ -145,6 +148,10 @@ undecodable — **is** listed, with that class and `eligible() == false`, becaus
 
 ### Traversal rules
 
+- **A `.gitignore` that is not a readable regular file is reported, never
+  skipped.** A symlinked or unreadable one contributes no rules, and the whole
+  point of saying so is that its exclusions are gone: silence there reads as a
+  repository that excluded nothing.
 - **A built-in denial matches a symlink as both a file and a directory.** The
   walk will not follow a link to learn which it is, and a denial written for a
   directory would otherwise let a link standing where `.config/gcloud` belongs be
@@ -171,6 +178,13 @@ undecodable — **is** listed, with that class and `eligible() == false`, becaus
 - **A path that is not a regular file, a directory, or a symlink** — a FIFO, a
   socket, a device — is skipped and never opened, because `open(2)` on one can
   block forever.
+- **What an entry is comes from the last stat, not the listing.** A path replaced
+  between the two is recorded as what it became, or reported and left out when it
+  became something with no honest entry. The open that follows is checked back
+  against that stat — on Unix by inode and device, which a swap cannot preserve —
+  so a file swapped for a symlink cannot deliver eight kilobytes of somewhere
+  else to a classification. On other platforms the check is the file type alone
+  and the remaining window is stated rather than closed.
 - **Non-UTF-8 paths** are stored byte-exactly and rendered lossily for display,
   the same way `harkness-git` handles path bytes.
 - **Two paths differing only by case** are both kept — indexing is keyed by exact

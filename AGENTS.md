@@ -569,10 +569,16 @@ otherwise let a link standing where a credential directory belongs be recorded
 under its own name.
 
 **A rule file is read on terms the repository does not choose.** The repository's
-own file may not be a symlink — a committed link is how a repository would aim
-the reader at `~/.ssh/id_rsa` and read the target back through a diagnostic
-quoting the "pattern" that would not compile — while the global file, whose path
-the user supplied, is followed. The size bound is enforced on the bytes *read*
+own file may not be *reached through* a symlink — neither the file nor any
+directory on the way to it, because `lstat` on `.harkness/context-ignore`
+resolves `.harkness` first and a check on the leaf alone answers about a file
+outside the worktree while reporting that nothing was a link. That is how a
+repository would aim the reader at `~/.ssh/id_rsa` and read the target back
+through a diagnostic quoting the "pattern" that would not compile. The global
+file, whose path the user supplied, is followed, and `.gitmodules` is read on the
+same terms as a rule file even though its answer only picks a boundary spelling.
+A `.gitignore` that is not a readable regular file is *reported*: dropping it on
+its kind alone loses every rule it held with nobody told. The size bound is enforced on the bytes *read*
 rather than on a stat, because a file grows between the two and procfs reports
 zero for content that is not. A leading byte-order mark is stripped, since
 leaving it in compiles a first pattern that matches nothing: a tightening rule
@@ -582,7 +588,16 @@ and one reader serves all three configurable layers so the halves cannot drift.
 **What a walk records is decided by the last stat, not the first.** A path listed
 as a regular file and replaced by a symlink before it is opened is recorded as
 the link it now is and never read — `File::open` follows one, and eight kilobytes
-of somewhere else would otherwise reach a classification.
+of somewhere else would otherwise reach a classification. The open is then
+checked back against that stat, on Unix by inode and device, because narrowing a
+race is not closing one; the platforms without a cheap identity keep the residual
+and say so. A path that became a directory is reported rather than recorded,
+since no entry about it would be true.
+
+**A budget answers only while there is work left.** The walk asks whether its
+stack is empty before it asks the clock, so an inventory that recorded every path
+is never handed back marked truncated — a caller told to treat it as partial
+would degrade a complete answer.
 
 **The walk is ours and the rule engine is `ignore`'s**, and that split is
 deliberate. `WalkBuilder` decides exclusion inside its own iterator, which would

@@ -450,6 +450,7 @@ fn is_secret_sensitive(name: &[u8]) -> bool {
         "refresh_token",
         "refresh-token",
         "bearer_token",
+        "bearer-token",
         "apikey",
         "api_key",
         "api-key",
