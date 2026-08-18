@@ -436,6 +436,13 @@ pub(crate) const RUNTIME_KIND_EXIT_CODES: &[(&str, u8)] = &[
     ("approval_refused", EXIT_REFUSED),
     ("approval_binding_mismatch", EXIT_REFUSED),
     ("invalid_record", EXIT_OPERATION_FAILED),
+    // A stored context record this build cannot decode, which is most often a
+    // workspace snapshot written by a newer Harkness. It shares
+    // `invalid_record`'s code rather than `schema_too_new`'s because the
+    // remedy is the same as any other unreadable row — upgrade or re-run —
+    // while the *kind* stays distinct, since only this one says the document
+    // came from the independently versioned context ladder.
+    ("invalid_context_record", EXIT_OPERATION_FAILED),
     ("column_encoding", EXIT_OPERATION_FAILED),
     ("invalid_page_limit", EXIT_REFUSED),
     ("query_failed", EXIT_OPERATION_FAILED),

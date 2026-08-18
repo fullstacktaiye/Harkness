@@ -350,12 +350,16 @@ pub trait WorkspaceProbe {
 #[derive(Debug)]
 pub struct FilesystemProbe {
     root: PathBuf,
-    staged_blobs: RefCell<IndexCache>,
+    staged_blobs: RefCell<StagedBlobCache>,
 }
 
 /// The Git index, read at most once per capture or verification.
+///
+/// Named for what it holds rather than for the index it comes from: the crate
+/// also has an [`IndexCache`](crate::index::IndexCache), which is the
+/// disposable retrieval cache on disk and has nothing to do with Git's.
 #[derive(Debug)]
-enum IndexCache {
+enum StagedBlobCache {
     /// Not read yet during the current read.
     Unloaded,
     /// The repository or its index could not be opened.
@@ -376,7 +380,7 @@ impl FilesystemProbe {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            staged_blobs: RefCell::new(IndexCache::Unloaded),
+            staged_blobs: RefCell::new(StagedBlobCache::Unloaded),
         }
     }
 
@@ -418,7 +422,7 @@ impl FilesystemProbe {
 
 impl WorkspaceProbe for FilesystemProbe {
     fn begin_read(&self) {
-        *self.staged_blobs.borrow_mut() = IndexCache::Unloaded;
+        *self.staged_blobs.borrow_mut() = StagedBlobCache::Unloaded;
     }
 
     fn expand_untracked(
@@ -567,13 +571,13 @@ impl WorkspaceProbe for FilesystemProbe {
 
     fn staged_blob_id(&self, path: &RepoPath) -> Result<Option<String>, ProbeFailure> {
         let mut cache = self.staged_blobs.borrow_mut();
-        if matches!(*cache, IndexCache::Unloaded) {
+        if matches!(*cache, StagedBlobCache::Unloaded) {
             *cache = match load_index_blobs(&self.root) {
-                Some(blobs) => IndexCache::Loaded(blobs),
-                None => IndexCache::Unavailable,
+                Some(blobs) => StagedBlobCache::Loaded(blobs),
+                None => StagedBlobCache::Unavailable,
             };
         }
-        let IndexCache::Loaded(blobs) = &*cache else {
+        let StagedBlobCache::Loaded(blobs) = &*cache else {
             return Err(ProbeFailure::skipped("the Git index could not be read"));
         };
         Ok(blobs

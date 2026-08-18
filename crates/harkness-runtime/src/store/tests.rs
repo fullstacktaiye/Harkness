@@ -11,6 +11,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use harkness_context::{
+    CONTEXT_RECORD_SCHEMA_VERSION, CaptureRequest, FilesystemProbe, SnapshotWireRef,
+    WorkspaceSnapshot,
+};
 use rusqlite::{Connection, TransactionBehavior};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -4185,6 +4189,285 @@ fn a_v2_approval_row_cannot_claim_v3_external_identity_fields() {
     assert!(!matches!(held.store().run_grants(held.run.id()), Ok(grants) if !grants.is_empty()));
 }
 
+// -- workspace snapshots -----------------------------------------------------
+
+/// A hermetic worktree and one capture of it.
+///
+/// [`WorkspaceSnapshot`] has exactly one constructor — reading a real
+/// workspace — so this builds one rather than hand-writing a wire form. Doing
+/// it by hand would also mean hand-writing the composite digest the load path
+/// re-derives, which is the very check the store depends on.
+struct CapturedWorkspace {
+    fixture: harkness_test_fixtures::Fixture,
+    root: PathBuf,
+    snapshot: WorkspaceSnapshot,
+}
+
+impl CapturedWorkspace {
+    fn new() -> Self {
+        let fixture = harkness_test_fixtures::Fixture::new();
+        let root = fixture.directory("workspace");
+        harkness_test_fixtures::initialize_repository(&root);
+        let snapshot = capture_at(&fixture, &root);
+        Self {
+            fixture,
+            root,
+            snapshot,
+        }
+    }
+
+    /// Reads the same workspace again, after a test has changed it.
+    fn recapture(&self) -> WorkspaceSnapshot {
+        capture_at(&self.fixture, &self.root)
+    }
+}
+
+fn capture_at(fixture: &harkness_test_fixtures::Fixture, root: &Path) -> WorkspaceSnapshot {
+    WorkspaceSnapshot::capture(
+        &CaptureRequest::new(harkness_core::ProjectId::new()).with_index_generation(9),
+        &harkness_git::GitService::new(root, &fixture.data_dir),
+        &FilesystemProbe::new(root),
+        &harkness_git::Cancellation::default(),
+    )
+    .unwrap()
+}
+
+fn stored_payload(store: &Store, snapshot: &WorkspaceSnapshot) -> String {
+    store
+        .writer_for_test()
+        .query_row(
+            "SELECT payload_json FROM workspace_snapshots WHERE id = ?1",
+            [snapshot.id().to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+}
+
+/// The row and the event that announces it commit together. A capture the
+/// timeline does not mention is a run whose context arrived from nowhere.
+#[test]
+fn recording_a_run_snapshot_writes_its_row_and_its_event_together() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let workspace = CapturedWorkspace::new();
+
+    let seq = fixture
+        .store
+        .record_workspace_snapshot_for_run(run.id(), &workspace.snapshot)
+        .unwrap();
+
+    assert_eq!(seq, EventSeq::FIRST);
+    let events = fixture.store.events(run.id(), None, 10).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event.kind(), &EventKind::SnapshotCaptured);
+    assert_eq!(
+        events[0].event.payload(),
+        &json!({
+            "snapshot_id": workspace.snapshot.id().to_string(),
+            "snapshot_digest": workspace.snapshot.digest().to_string(),
+        })
+    );
+
+    let stored = fixture
+        .store
+        .workspace_snapshot(workspace.snapshot.id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.run_id, Some(run.id()));
+    assert_eq!(stored.snapshot, workspace.snapshot);
+    assert_eq!(
+        fixture.store.run_workspace_snapshots(run.id()).unwrap(),
+        vec![stored]
+    );
+}
+
+/// A capture that belongs to nobody has no timeline to be announced on, and
+/// inventing a run to hold one would be worse than recording none.
+#[test]
+fn a_standalone_snapshot_is_recorded_without_a_run_or_an_event() {
+    let fixture = Fixture::new();
+    let workspace = CapturedWorkspace::new();
+
+    fixture
+        .store
+        .record_workspace_snapshot(&workspace.snapshot)
+        .unwrap();
+
+    let stored = fixture
+        .store
+        .workspace_snapshot(workspace.snapshot.id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.run_id, None);
+    assert_eq!(stored.snapshot.digest(), workspace.snapshot.digest());
+}
+
+/// The column is the frozen `harkness-context` wire form, so a value written by
+/// this build and read back by it must be the same bytes — that is what makes a
+/// future format change a migration rather than a silent rewrite.
+#[test]
+fn a_snapshot_payload_round_trips_byte_identically() {
+    let fixture = Fixture::new();
+    let workspace = CapturedWorkspace::new();
+    fixture
+        .store
+        .record_workspace_snapshot(&workspace.snapshot)
+        .unwrap();
+
+    let stored = fixture
+        .store
+        .workspace_snapshot(workspace.snapshot.id())
+        .unwrap()
+        .unwrap();
+
+    let payload = stored_payload(&fixture.store, &workspace.snapshot);
+    assert_eq!(
+        payload,
+        serde_json::to_string(&SnapshotWireRef::from(&stored.snapshot)).unwrap()
+    );
+    assert_eq!(
+        payload,
+        serde_json::to_string(&SnapshotWireRef::from(&workspace.snapshot)).unwrap()
+    );
+}
+
+#[test]
+fn a_snapshot_naming_an_unstored_run_is_refused() {
+    let fixture = Fixture::new();
+    let workspace = CapturedWorkspace::new();
+
+    let error = fixture
+        .store
+        .record_workspace_snapshot_for_run(
+            RunId::from_str(FIXTURE_RUN_ID).unwrap(),
+            &workspace.snapshot,
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "missing_parent");
+    assert!(
+        fixture
+            .store
+            .workspace_snapshot(workspace.snapshot.id())
+            .unwrap()
+            .is_none(),
+        "a refused write must leave no row behind"
+    );
+}
+
+#[test]
+fn recording_one_capture_twice_is_refused() {
+    let fixture = Fixture::new();
+    let workspace = CapturedWorkspace::new();
+    fixture
+        .store
+        .record_workspace_snapshot(&workspace.snapshot)
+        .unwrap();
+
+    let error = fixture
+        .store
+        .record_workspace_snapshot(&workspace.snapshot)
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "already_exists");
+}
+
+/// The denormalized columns are compared against the payload, never trusted. A
+/// hand-edited digest would otherwise make a search by workspace identity
+/// return a capture of a different workspace.
+#[test]
+fn a_snapshot_row_whose_digest_column_was_edited_fails_to_load() {
+    let fixture = Fixture::new();
+    let workspace = CapturedWorkspace::new();
+    fixture
+        .store
+        .record_workspace_snapshot(&workspace.snapshot)
+        .unwrap();
+
+    fixture
+        .store
+        .writer_for_test()
+        .execute(
+            "UPDATE workspace_snapshots SET snapshot_digest = ?1",
+            [format!("{:0>64}", "b")],
+        )
+        .unwrap();
+
+    let error = fixture
+        .store
+        .workspace_snapshot(workspace.snapshot.id())
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "column_encoding");
+    assert!(error.to_string().contains("snapshot_digest"), "{error}");
+}
+
+/// The payload carries its own schema version, probed before its body, so a
+/// document from a newer build reads as an upgrade request rather than as a
+/// corrupt column.
+#[test]
+fn a_snapshot_payload_from_a_newer_build_reads_as_an_upgrade_request() {
+    let fixture = Fixture::new();
+    let workspace = CapturedWorkspace::new();
+    fixture
+        .store
+        .record_workspace_snapshot(&workspace.snapshot)
+        .unwrap();
+    let mut payload: Value =
+        serde_json::from_str(&stored_payload(&fixture.store, &workspace.snapshot)).unwrap();
+    payload["schema_version"] = json!(CONTEXT_RECORD_SCHEMA_VERSION + 1);
+    fixture
+        .store
+        .writer_for_test()
+        .execute(
+            "UPDATE workspace_snapshots SET payload_json = ?1",
+            [payload.to_string()],
+        )
+        .unwrap();
+
+    let error = fixture
+        .store
+        .workspace_snapshot(workspace.snapshot.id())
+        .unwrap_err();
+
+    assert_eq!(error.kind(), "invalid_context_record");
+    assert!(error.to_string().contains("upgrade Harkness"), "{error}");
+}
+
+/// A snapshot is caller data in a column, so it is held to the same inline
+/// bound every other one keeps. Refusing is the honest answer: a snapshot that
+/// recorded only some of a workspace's paths would claim an identity the
+/// workspace never had.
+#[test]
+fn an_oversized_snapshot_is_refused_rather_than_truncated() {
+    let fixture = Fixture::new();
+    let workspace = CapturedWorkspace::new();
+    for index in 0..900 {
+        std::fs::write(workspace.root.join(format!("f{index:04}")), b"x").unwrap();
+    }
+    let large = workspace.recapture();
+    assert!(
+        serde_json::to_string(&SnapshotWireRef::from(&large))
+            .unwrap()
+            .len()
+            > MAX_INLINE_PAYLOAD_BYTES,
+        "the fixture workspace must produce an oversized payload"
+    );
+
+    let error = fixture.store.record_workspace_snapshot(&large).unwrap_err();
+
+    assert_eq!(error.kind(), "payload_too_large");
+    assert!(
+        fixture
+            .store
+            .workspace_snapshot(large.id())
+            .unwrap()
+            .is_none(),
+        "a refused write must leave no row behind"
+    );
+}
+
 // -- migration from a frozen database ---------------------------------------
 
 /// The frozen v2 database committed beside this module.
@@ -4208,6 +4491,9 @@ const FROZEN_V6_DATABASE: &[u8] = include_bytes!("fixtures/runtime-v6.db");
 
 /// The frozen v7 database carrying a dead lease and the retry that followed it.
 const FROZEN_V7_DATABASE: &[u8] = include_bytes!("fixtures/runtime-v7.db");
+
+/// The frozen v8 database carrying one run's workspace snapshot.
+const FROZEN_V8_DATABASE: &[u8] = include_bytes!("fixtures/runtime-v8.db");
 
 /// The lease and retry identities the v7 fixture was written with.
 const FIXTURE_LEASE_ID: &str = "99999999-9999-4999-8999-999999999999";
@@ -4249,6 +4535,10 @@ const LATER_MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 8,
+        statements: include_str!("migrations/008_workspace_snapshots.sql"),
+    },
+    Migration {
+        version: 9,
         statements: "ALTER TABLE runs ADD COLUMN cancelled_by TEXT;",
     },
 ];
@@ -4514,6 +4804,56 @@ fn a_frozen_v7_database_opens_and_reads_its_lease_and_retry_provenance() {
     );
 }
 
+/// The evidence half of ADR-0004's split, pinned: a snapshot recorded by an
+/// earlier build still loads, still re-derives its own identity, and is still
+/// tied to the run and the timeline entry that announced it.
+#[test]
+fn a_frozen_v8_database_opens_and_reads_its_workspace_snapshot() {
+    let data_dir = restore_frozen_database(FROZEN_V8_DATABASE);
+    let store = Store::open(data_dir.path()).unwrap();
+    assert_eq!(
+        recorded_version(&guard(&store.writer)).unwrap(),
+        SCHEMA_VERSION
+    );
+
+    let run_id = RunId::from_str(FIXTURE_RUN_ID).unwrap();
+    let recorded = store.run_workspace_snapshots(run_id).unwrap();
+    assert_eq!(recorded.len(), 1);
+    let stored = &recorded[0];
+    assert_eq!(stored.run_id, Some(run_id));
+
+    // Loading re-derives all three content digests and the composite from the
+    // entry lists, so reaching this line is the assertion: the frozen payload
+    // still supports the identity it claims.
+    let snapshot = &stored.snapshot;
+    assert_eq!(snapshot.index_generation(), 9);
+    assert!(snapshot.head().is_some());
+    assert_eq!(
+        store.workspace_snapshot(snapshot.id()).unwrap().as_ref(),
+        Some(stored)
+    );
+
+    let kinds = store
+        .events(run_id, None, 10)
+        .unwrap()
+        .into_iter()
+        .map(|stored| stored.event.kind().as_str().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, ["snapshot_captured"]);
+
+    // The other side of the split: deleting the whole context cache is what a
+    // user is told to do, and it must leave this database untouched. There is
+    // nothing to delete here because the engine never wrote to it — which is
+    // the property, stated as an assertion.
+    assert!(
+        !data_dir
+            .path()
+            .join(harkness_core::CONTEXT_DIRECTORY)
+            .exists(),
+        "the run store must hold no context cache"
+    );
+}
+
 #[test]
 fn a_frozen_v2_database_opens_after_future_migrations() {
     let data_dir = restore_frozen_database(FROZEN_V2_DATABASE);
@@ -4525,7 +4865,7 @@ fn a_frozen_v2_database_opens_after_future_migrations() {
 
     apply(&mut connection, LATER_MIGRATIONS).unwrap();
 
-    assert_eq!(recorded_version(&connection).unwrap(), 8);
+    assert_eq!(recorded_version(&connection).unwrap(), 9);
     let run =
         super::repository::load_run(&connection, RunId::from_str(FIXTURE_RUN_ID).unwrap()).unwrap();
     assert_eq!(run.state(), ExecutionState::Running);
@@ -4875,6 +5215,31 @@ fn regenerate_the_frozen_v7_fixture() {
     freeze(&guard(&store.writer), "runtime-v7.db");
 }
 
+/// Writes the frozen v8 fixture: one run and the workspace it read.
+///
+/// Run deliberately, and only when migration 8 changes:
+/// `cargo test -p harkness-runtime regenerate_the_frozen_v8_fixture -- --ignored`.
+///
+/// The capture's identity is not pinned by a constant the way a task or a lease
+/// id is, and cannot be: a snapshot's id is minted per capture and its digest
+/// covers a temporary worktree root. That is what the fixture is *for* — the
+/// load path re-derives the digest from the payload, so a frozen document that
+/// no longer supports its own identity fails the test whatever the values are.
+#[test]
+#[ignore = "rewrites a committed fixture; run only when migration 8 changes"]
+fn regenerate_the_frozen_v8_fixture() {
+    let data_dir = TempDir::new().unwrap();
+    let store = store_with_migrations(data_dir.path(), &MIGRATIONS[..8]);
+    let task = stored_task(&store);
+    let run = stored_run(&store, &task);
+    let workspace = CapturedWorkspace::new();
+    store
+        .record_workspace_snapshot_for_run(run.id(), &workspace.snapshot)
+        .unwrap();
+
+    freeze(&guard(&store.writer), "runtime-v8.db");
+}
+
 /// Builds a store stopped at an older migration for fixture regeneration.
 fn store_with_migrations(data_dir: &std::path::Path, migrations: &[Migration]) -> Store {
     std::fs::create_dir_all(data_dir).unwrap();
@@ -4905,8 +5270,8 @@ fn freeze(connection: &Connection, name: &str) {
 
 #[test]
 fn every_migration_in_this_build_is_recorded_in_order() {
-    assert_eq!(MIGRATIONS.len(), 7, "add coverage for a new migration");
-    assert_eq!(SCHEMA_VERSION, 7);
+    assert_eq!(MIGRATIONS.len(), 8, "add coverage for a new migration");
+    assert_eq!(SCHEMA_VERSION, 8);
 }
 
 // -- performance -------------------------------------------------------------

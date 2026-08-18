@@ -45,15 +45,25 @@
 //! diagnostic rather than failing the capture — because a snapshot is an honest
 //! record of what was read, and verification is what turns that into safety.
 //!
+//! # The service boundary
+//!
+//! [`ContextEngine`] is the one way anything reaches a context feature, and
+//! [`index`] is the disposable per-repository cache beneath it. The engine
+//! returns typed values and persists nothing: a snapshot becomes evidence only
+//! when `harkness-runtime` records it, which is what keeps deleting
+//! `<data_dir>/context/` lossless (ADR-0004). Only
+//! [`snapshot`](ContextEngine::snapshot) of the eight facade methods is
+//! implemented; the rest return [`ContextEngineError::NotYetAvailable`] naming
+//! what is missing, so every later retrieval issue has a compiling seam.
+//!
 //! # What is not here
 //!
 //! No file walking or ignore handling ([#112]), no chunking ([#113]), no index
-//! storage ([#114]), no search ([#116]), no symbol extraction ([#117]), no
-//! persistence and no engine facade ([#110]), and no provider or token concepts
-//! ([#111], [#122]). The identifiers those issues need are defined here so that
-//! none of them has to invent one.
+//! content tables ([#114]), no search ([#116]), no symbol extraction ([#117]),
+//! and no provider or token concepts ([#111], [#122]). The identifiers and the
+//! facade signatures those issues need are defined here so that none of them
+//! has to invent one.
 //!
-//! [#110]: https://github.com/fullstacktaiye/harkness/issues/110
 //! [#111]: https://github.com/fullstacktaiye/harkness/issues/111
 //! [#112]: https://github.com/fullstacktaiye/harkness/issues/112
 //! [#113]: https://github.com/fullstacktaiye/harkness/issues/113
@@ -66,8 +76,10 @@
 
 mod classify;
 mod digest;
+mod engine;
 mod error;
 mod ids;
+pub mod index;
 mod path;
 mod probe;
 mod provenance;
@@ -76,7 +88,12 @@ mod wire;
 
 pub use classify::FileClass;
 pub use digest::{Sha256Hex, empty_path_set_digest};
-pub use error::ContextDomainError;
+pub use engine::{
+    ChunkContent, ContextEngine, ContextEngineConfig, ContextPack, FileInventory, InstructionSet,
+    InventoryRequest, MapRequest, PackRequest, RepositoryMap, SearchQuery, SearchResults,
+    SettingGroup, SettingOrigin, SettingOrigins, SymbolQuery, SymbolResults,
+};
+pub use error::{ContextDomainError, ContextEngineError};
 pub use ids::{
     ChunkId, ContextItemId, ContextPackId, ContextQueryId, FileVersionId, SnapshotId, SymbolId,
 };

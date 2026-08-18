@@ -156,6 +156,57 @@ index-writer lock is leaf-level: it is never held while acquiring the repository
 lock or the catalog lock, so the existing repository-then-catalog ordering is
 untouched.
 
+### Cache lifecycle
+
+Opening a cache reads it before it writes to it. That order is the whole of the
+refusal guarantee: a cache written by a newer build is left byte-identical
+rather than downgraded, because nothing has touched it by the time the decision
+is made.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Probe: open_or_create
+    Probe --> Create: no file
+    Probe --> Refuse: schema_version newer
+    Probe --> Quarantine: unreadable, older schema,<br/>or another repository
+    Probe --> Busy: locked, unreadable directory
+    Probe --> Ready: schema_version equal
+    Quarantine --> Create: index.db → index.db.corrupt-&lt;stamp&gt;<br/>(keep 2, oldest deleted)
+    Create --> Ready: new index_meta,<br/>generation advanced
+    Ready --> Ready: component version skew<br/>(file kept, skew reported)
+    Ready --> Quarantine: refresh finds it faulted
+    Ready --> Create: dispose()
+    Refuse --> [*]: cache_version_conflict
+    Busy --> [*]: cache_open_failed
+```
+
+Three distinctions in that diagram carry weight:
+
+- **`Refuse` and `Quarantine` are opposite answers to a version mismatch.** A
+  *newer* `schema_version` means a sibling process understands the file and this
+  build does not, so it is left alone; an *older* one means nothing does, and the
+  cache is disposable, so it is replaced. There is no downgrade path.
+- **`Busy` is not `Quarantine`.** Contention, a permission bit, and a read-only
+  directory say nothing about what the file holds. Treating a locked cache as a
+  corrupt one would let one front end destroy the other's index by being slow.
+- **A component version never moves the file.** Parser, chunking and ranking
+  versions describe what produced the rows rather than where they sit, so a
+  mismatch keeps the cache, keeps the *stored* version, and reports the skew —
+  overwriting it would erase what incremental reconciliation needs to know.
+
+The engine survives all of it. A cache that cannot be prepared does not fail
+`ContextEngine::open`: the failure is remembered, `index_status` reports it, and
+the Git-backed half — workspace identity above all — keeps answering. Losing
+retrieval is a degradation; losing the ability to say which workspace a run read
+would stop the run.
+
+It is not remembered *forever*, either. The commonest way to reach `Busy` is
+another front end holding the cache for a few seconds at exactly the wrong
+moment, so `refresh_index` and `dispose_index` retry the open before doing
+anything else — an engine that answered "no index" for its whole life because of
+five seconds at startup would make the failure far more expensive than its
+cause.
+
 ## The provider boundary
 
 Three distinct contracts, and no type unifies them (ADR-0002):
