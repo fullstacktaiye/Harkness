@@ -125,7 +125,10 @@ use std::collections::HashMap;
 use std::pin::Pin;
 
 use cxx_qt::{CxxQtType, Threading, casting::Upcast};
-use cxx_qt_lib::{QByteArray, QHash, QHashPair_i32_QByteArray, QModelIndex, QString, QVariant};
+use cxx_qt_lib::{
+    QByteArray, QHash, QHashPair_i32_QByteArray, QMap, QMapPair_QString_QVariant, QModelIndex,
+    QString, QVariant,
+};
 
 use harkness_runtime::domain::{Run, Task, TaskId};
 use harkness_runtime::store::{RunCursor, RunPage};
@@ -185,20 +188,20 @@ fn model_roles() -> QHash<QHashPair_i32_QByteArray> {
 /// before anything crosses back to the Qt thread.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RunRow {
-    run_id: String,
-    task_id: String,
-    title: String,
-    state: String,
-    terminal: bool,
-    created: String,
-    started: String,
-    finished: String,
-    workspace: String,
-    project_id: String,
-    error_kind: String,
-    error_message: String,
-    retry_of: String,
-    workspace_modified: bool,
+    pub(crate) run_id: String,
+    pub(crate) task_id: String,
+    pub(crate) title: String,
+    pub(crate) state: String,
+    pub(crate) terminal: bool,
+    pub(crate) created: String,
+    pub(crate) started: String,
+    pub(crate) finished: String,
+    pub(crate) workspace: String,
+    pub(crate) project_id: String,
+    pub(crate) error_kind: String,
+    pub(crate) error_message: String,
+    pub(crate) retry_of: String,
+    pub(crate) workspace_modified: bool,
 }
 
 /// Projects one run, with the task it attempts when that task could be read.
@@ -237,6 +240,38 @@ pub(crate) fn run_row(run: &Run, task: Option<&Task>) -> RunRow {
             .unwrap_or_default(),
         workspace_modified: run.workspace_may_be_modified(),
     }
+}
+
+/// One row as a map keyed by the model's own role names.
+///
+/// The run-detail page's header says the same words about a run as the list row
+/// that opened it, so it reads the same projection rather than a second one
+/// beside it. Every key here is a role name from [`model_roles`]; the test below
+/// asserts that, because two spellings of "the state a run is in" is exactly the
+/// bug this exists to prevent.
+pub(crate) fn row_map(row: &RunRow) -> QMap<QMapPair_QString_QVariant> {
+    let mut map = QMap::<QMapPair_QString_QVariant>::default();
+    let mut text = |key: &str, value: &str| {
+        map.insert(QString::from(key), QVariant::from(&QString::from(value)));
+    };
+    text("runId", &row.run_id);
+    text("taskId", &row.task_id);
+    text("title", &row.title);
+    text("state", &row.state);
+    text("created", &row.created);
+    text("started", &row.started);
+    text("finished", &row.finished);
+    text("workspace", &row.workspace);
+    text("projectId", &row.project_id);
+    text("errorKind", &row.error_kind);
+    text("errorMessage", &row.error_message);
+    text("retryOf", &row.retry_of);
+    map.insert(QString::from("terminal"), QVariant::from(&row.terminal));
+    map.insert(
+        QString::from("workspaceModified"),
+        QVariant::from(&row.workspace_modified),
+    );
+    map
 }
 
 /// One page of rows and the continuation that follows it.
@@ -496,7 +531,7 @@ mod tests {
         CREATED_ROLE, DISPLAY_ROLE, ERROR_KIND_ROLE, ERROR_MESSAGE_ROLE, FINISHED_ROLE,
         MODIFIED_ROLE, PROJECT_ROLE, RETRY_OF_ROLE, RUN_ID_ROLE, RUN_PAGE_SIZE, STARTED_ROLE,
         STATE_ROLE, TASK_ID_ROLE, TERMINAL_ROLE, TITLE_ROLE, WORKSPACE_ROLE, load_page_in,
-        model_roles, page_rows, run_row,
+        model_roles, page_rows, row_map, run_row,
     };
 
     fn at(seconds: i64) -> OffsetDateTime {
@@ -536,6 +571,26 @@ mod tests {
         ] {
             assert_eq!(roles.get(&role), Some(QByteArray::from(name)));
         }
+    }
+
+    #[test]
+    fn the_detail_projection_uses_exactly_the_role_names_a_delegate_binds_to() {
+        let task = task();
+        let run = Run::with_id(RunId::new(), task.id(), at(1));
+
+        let map = row_map(&run_row(&run, Some(&task)));
+
+        let mut expected: Vec<String> = model_roles()
+            .iter()
+            .map(|(_, name)| name.to_string())
+            // `display` is Qt's own role for accessibility tooling and names no
+            // field of its own; every other role is a field the header shows.
+            .filter(|name| name != "display")
+            .collect();
+        expected.sort();
+        let mut published: Vec<String> = map.iter().map(|(key, _)| key.to_string()).collect();
+        published.sort();
+        assert_eq!(published, expected);
     }
 
     #[test]

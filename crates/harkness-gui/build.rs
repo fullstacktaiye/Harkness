@@ -27,6 +27,10 @@ fn main() {
             "qml/DiscardPrompt.qml",
             "qml/HistoryPanel.qml",
             "qml/ReviewSurface.qml",
+            "qml/RunState.qml",
+            "qml/RunListPane.qml",
+            "qml/RunsPanel.qml",
+            "qml/RunDetailPage.qml",
         ]),
     )
     .qt_module("Network")

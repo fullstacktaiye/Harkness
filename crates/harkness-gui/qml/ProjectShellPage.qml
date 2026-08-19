@@ -114,6 +114,12 @@ Kirigami.Page {
         onActivated: shell.activateView(checksPanel.viewId)
     }
 
+    Shortcut {
+        enabled: runsPanel.viewAvailable
+        sequences: [runsPanel.viewShortcut]
+        onActivated: shell.activateView(runsPanel.viewId)
+    }
+
     // The header toolbar answers the same job and Git-state questions the
     // source-control view does; both derive them from this projection so a
     // running operation disables the toolbar and the panel together.
@@ -365,6 +371,16 @@ Kirigami.Page {
 
                         backend: shell.backend
                         project: shell.project
+                        onHideRequested: shell.sidePanelExpanded = false
+                    }
+
+                    // Last in the bar because it is the one view that is not
+                    // about the checkout in front of the reader: it is the
+                    // history of what Harkness has run, and it stays available
+                    // when the project's directory does not.
+                    RunsPanel {
+                        id: runsPanel
+
                         onHideRequested: shell.sidePanelExpanded = false
                     }
                 }

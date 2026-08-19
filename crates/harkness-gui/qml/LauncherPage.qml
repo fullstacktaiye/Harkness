@@ -445,6 +445,65 @@ Kirigami.Page {
                     }
                 }
 
+                // Recorded runs, reachable before any project is opened.
+                //
+                // This is where a run abandoned by a killed process has to be
+                // findable: the shell's Runs view needs a project on screen, and
+                // the reason to look for an interrupted run is usually that the
+                // window came back up without one. The list is bounded in height
+                // rather than in rows — it pages the same way the shell's does,
+                // inside its own scroll.
+                ColumnLayout {
+                    Layout.alignment: Qt.AlignHCenter
+                    Layout.fillWidth: true
+                    Layout.maximumWidth: Kirigami.Units.gridUnit * 34
+                    spacing: Kirigami.Units.smallSpacing
+                    visible: recentRuns.count > 0
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: Kirigami.Units.smallSpacing
+
+                        Controls.Label {
+                            Layout.fillWidth: true
+                            color: Kirigami.Theme.disabledTextColor
+                            font.bold: true
+                            font.letterSpacing: 0.6
+                            font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                            text: qsTr("RECENT RUNS")
+                            textFormat: Text.PlainText
+                        }
+
+                        Controls.ToolButton {
+                            Controls.ToolTip.text: qsTr("Re-read recorded runs")
+                            Controls.ToolTip.visible: hovered
+                            display: Controls.AbstractButton.IconOnly
+                            enabled: !recentRuns.loading
+                            icon.name: "view-refresh-symbolic"
+                            text: qsTr("Refresh")
+                            onClicked: recentRuns.refresh()
+                        }
+                    }
+
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: Kirigami.Units.gridUnit * 14
+                        border.color: launcher.tinted(Kirigami.Theme.textColor, 0.15)
+                        border.width: 1
+                        color: launcher.tinted(Kirigami.Theme.textColor, 0.025)
+                        radius: Kirigami.Units.smallSpacing
+
+                        RunListPane {
+                            id: recentRuns
+
+                            anchors.fill: parent
+                            anchors.margins: 1
+                            compact: true
+                            onRunActivated: runId => applicationWindow().showRun(runId)
+                        }
+                    }
+                }
+
                 Item {
                     Layout.fillWidth: true
                     Layout.minimumHeight: Kirigami.Units.largeSpacing * 2
