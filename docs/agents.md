@@ -151,6 +151,12 @@ grant does not reach outside the root it names — a launch from anywhere else i
 was. Being used in the wrong place is not evidence that anything changed, so it
 never costs you the grant.
 
+A root is resolved before it is stored and before it is checked, so the
+spellings that reach one checkout — a symlinked working copy, a relative path, a
+path through `..` — are one workspace rather than several. A grant made in one
+of them reaches a launch named in any of the others, and only a genuinely
+different directory is out of scope.
+
 Re-granting after drift re-affirms the *identity* and leaves the reach alone, so
 asking for a different scope is a different decision and produces a new record
 rather than quietly changing the old one.
