@@ -1814,9 +1814,15 @@ fn a_re_grant_that_changes_the_scope_is_a_new_record() {
         2,
         "a narrower grant is a decision of its own, not a re-affirmation"
     );
+    // Compared canonically, because that is how the scope is stored. On macOS
+    // the fixture's own root is reached through a `/var` -> `/private/var`
+    // symlink, so asserting the raw path here would be asserting that a trust
+    // decision is stored against a lexical path — the thing `in_workspace`
+    // resolves it to prevent.
+    let canonical = std::fs::canonicalize(&project).unwrap();
     assert_eq!(
         history[1].record().scope().root(),
-        Some(project.as_path()),
+        Some(canonical.as_path()),
         "and it is the scope the caller asked for"
     );
     assert!(
