@@ -364,6 +364,27 @@ and every new bridge file — must be added to `build.rs`'s lists.
   loses nothing: a run this process is not driving cannot publish to it anyway. The consequence is
   stated rather than hidden — a run abandoned by a dead process keeps reading as `running` until
   something in this process actually drives work.
+- **`RunsBackend` answers three questions and never crosses them.** `detail`, `run` and `excerpt`
+  are filled by `loadApprovalInput`, `loadRun` and `loadArtifactExcerpt` respectively, and each is
+  written only by the loader that answers it — cancelling the run a page is showing must not blank
+  the page it was pressed from. A *decision* additionally clears `detail`, because approving or
+  denying changes which approval is in question.
+- **`RunTimelineModel` folds consecutive `tool_progress` events of one call into one row.** It is
+  presentation, not redaction: nothing leaves the log, the row carries the count, and `harkness run
+  show` still prints every tick. The folded row remembers its oldest absorbed sequence as well as
+  its newest, because backwards paging continues from a position in the log and resuming from the
+  newest would re-read the ticks the row already stands for.
+- **The run surfaces are four QML files over those bridges and no domain logic.** `RunState.qml`
+  is the shared vocabulary — state and event-kind words, the palette, byte and time units, and the
+  `escapedRichText` every `InlineMessage` on these pages goes through — instantiated rather than
+  imported, because `build.rs`'s flat file list cannot mark a singleton. `RunListPane.qml` is the
+  virtualized list both entry points show; `RunsPanel.qml` wraps it as a side-panel view;
+  `RunDetailPage.qml` is the pushed page. Every route to a run goes through `Main.qml`'s `showRun`,
+  which is also why `Main.qml` finds the shell by walking the stack rather than reading
+  `currentItem` — a detail page sits *above* the shell, and a catalog refresh arriving then would
+  otherwise push a second shell over it. `RunListPane` deliberately does not filter by project:
+  `RunListModel` pages by key through the whole store, so hiding rows would hide runs rather than
+  exclude them and leave "load older" looking broken.
 - **`reconcile.rs` is the one keyed-list walk.** `ChangesModel` and `ApprovalModel` both reconcile
   a whole projection into the smallest set of row edits; the walk is generic over a `Keyed` row and
   lives in one place. `cxx/listmodelbase.h` is the same idea for the C++ side: one set of
@@ -378,6 +399,12 @@ and every new bridge file — must be added to `build.rs`'s lists.
   `next_review_request`) and on the still-open project, so a stale reply is dropped rather than
   applied. Follow that pattern for new async work.
 - `tests/qml_smoke.rs` includes `src/main.rs` directly and loads `Main.qml` to catch QML errors.
+  `tests/run_surfaces.rs` is a second such binary and needs its own process for a reason: every read
+  the run pages perform is asynchronous by construction, so its checks only mean anything under a
+  real `exec()`. It seeds a store with one run per state, drives the pages through them, and reports
+  by `objectName` the way the other QML checks do. Setting `HARKNESS_RUN_SCREENSHOT_DIR` makes the
+  same pass write `docs/screenshots/run*.png` along the way — that is how those images are
+  regenerated, and it changes no assertion.
 - **QML hot reload** (`cxx/qmlhotreload.h`, `src/hotreload.rs`) makes a working-copy build read
   `qml/` from disk rather than from the compiled resource, and rebuild the window on save. It is an
   URL interceptor rather than an extra import path because the module's `qmldir` maps every type to

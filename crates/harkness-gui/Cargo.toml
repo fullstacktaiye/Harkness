@@ -16,6 +16,11 @@ path = "tests/qml_smoke.rs"
 harness = false
 
 [[test]]
+name = "run_surfaces"
+path = "tests/run_surfaces.rs"
+harness = false
+
+[[test]]
 name = "default_branch_push_repro"
 path = "tests/default_branch_push_repro.rs"
 harness = false
