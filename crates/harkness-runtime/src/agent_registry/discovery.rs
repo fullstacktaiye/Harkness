@@ -34,13 +34,6 @@ pub const MAX_DISCOVERY_CANDIDATES: usize = 64;
 pub const MAX_DISCOVERY_DIRECTORIES: usize = 64;
 /// How long one probe may run before it reports what it has.
 pub const DEFAULT_DISCOVERY_BUDGET: Duration = Duration::from_secs(5);
-/// How often a probe checks its cancellation token and its deadline.
-///
-/// Every directory and every candidate is one `metadata` call, so the check is
-/// per entry rather than on a timer — an order of magnitude inside the
-/// workspace's 250 ms visibility target on any filesystem that answers at all.
-const POLL_EVERY_ENTRIES: usize = 8;
-
 /// One executable found on the search path, and nothing else about it.
 ///
 /// There is deliberately no digest, no version, and no capability set. Every one
@@ -227,8 +220,6 @@ impl Discovery {
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>();
-        let mut checked = 0usize;
-
         for directory in directories {
             if remaining.is_empty() {
                 break;
@@ -254,16 +245,21 @@ impl Discovery {
 
             let mut found_here = Vec::new();
             for name in &remaining {
-                checked += 1;
-                if checked.is_multiple_of(POLL_EVERY_ENTRIES) {
-                    if cancel.is_cancelled() {
-                        report.truncation = Some(DiscoveryTruncation::Cancelled);
-                        return report;
-                    }
-                    if started.elapsed() >= self.budget {
-                        report.truncation = Some(DiscoveryTruncation::Deadline);
-                        return report;
-                    }
+                // Polled on every entry, and deliberately not batched. Every
+                // entry costs one `metadata` call, so an atomic load and a
+                // clock read beside it are free; batching them bought nothing
+                // and cost the guarantee, because a probe with fewer entries
+                // than the batch size never reached the check at all. That is
+                // the one answer `DiscoveryTruncation` exists to prevent: a
+                // cancelled or overrunning probe reporting no truncation reads
+                // as "there is nothing else installed".
+                if cancel.is_cancelled() {
+                    report.truncation = Some(DiscoveryTruncation::Cancelled);
+                    return report;
+                }
+                if started.elapsed() >= self.budget {
+                    report.truncation = Some(DiscoveryTruncation::Deadline);
+                    return report;
                 }
                 let path = directory.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
                 if is_runnable_file(&path) {

@@ -1069,12 +1069,20 @@ fn an_already_cancelled_probe_reports_the_cancellation() {
     let cancel = Cancellation::default();
     cancel.cancel();
 
+    // Two names and one directory: two entries in total. The probe has to
+    // report the cancellation on a probe this small, which is the size a
+    // realistic one is — batching the poll meant a probe with fewer entries
+    // than the batch never reached it and reported itself complete.
     let report = Discovery::default()
-        .looking_for(["a", "b", "c", "d", "e", "f", "g", "h", "i"])
+        .looking_for(["a", "b"])
         .on_path(fixture.root.path().to_path_buf())
         .run(&cancel);
 
     assert_eq!(report.truncation(), Some(DiscoveryTruncation::Cancelled));
+    assert!(
+        !report.is_complete(),
+        "a cancelled probe never supports `there is nothing else installed`"
+    );
 }
 
 /// A candidate name is joined onto a search-path directory, so anything but one
@@ -1806,9 +1814,15 @@ fn a_re_grant_that_changes_the_scope_is_a_new_record() {
         2,
         "a narrower grant is a decision of its own, not a re-affirmation"
     );
+    // Compared canonically, because that is how the scope is stored. On macOS
+    // the fixture's own root is reached through a `/var` -> `/private/var`
+    // symlink, so asserting the raw path here would be asserting that a trust
+    // decision is stored against a lexical path — the thing `in_workspace`
+    // resolves it to prevent.
+    let canonical = std::fs::canonicalize(&project).unwrap();
     assert_eq!(
         history[1].record().scope().root(),
-        Some(project.as_path()),
+        Some(canonical.as_path()),
         "and it is the scope the caller asked for"
     );
     assert!(
@@ -2288,4 +2302,226 @@ fn drift_found_during_a_launch_is_recorded_on_the_run_that_found_it() {
     let payload = drift.event.payload();
     assert_eq!(payload["reason"], "executable_hash_changed");
     assert_eq!(payload["detected_at"], "launch");
+}
+
+// -- review regressions ---------------------------------------------------
+//
+// One test per finding from the review of this module, each named for the
+// property rather than the fix, so a later change that reintroduces the fault
+// fails on what was actually promised.
+
+/// A launch holds resolved environment *values*, so its `Debug` names the keys
+/// and nothing else.
+///
+/// `SpawnSpec` states the rule one layer down — "a spec is the one place a
+/// credential can legitimately be" — and this is the value a `SpawnSpec` is
+/// built from, so the refusal has to be restated rather than inherited.
+#[test]
+fn a_launch_names_its_environment_keys_and_never_prints_their_values() {
+    let harness = Harness::new();
+    let command = trustable_file(&harness.fixture, "debug-agent");
+    let command_text = command.display().to_string();
+
+    // Discovered rather than set, for the reason
+    // `the_agent_sees_only_the_variables_the_registration_admits` gives: `setenv`
+    // is not thread-safe against the other tests in this binary. The longest
+    // value is picked because it is the most distinctive, and one that occurs in
+    // the command path is skipped so the assertion cannot pass by accident.
+    let (name, value) = std::env::vars()
+        .filter(|(name, value)| {
+            value.len() >= 8
+                && !command_text.contains(value.as_str())
+                && !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+                && !name.as_bytes()[0].is_ascii_digit()
+        })
+        .max_by_key(|(_, value)| value.len())
+        .expect("the test process carries a usable environment variable");
+
+    let id = harness.ready("debug", &command, &[name.as_str()]);
+    let launch = harness
+        .service
+        .prepare_launch(&id, &LaunchContext::default())
+        .unwrap();
+
+    assert!(
+        launch
+            .environment()
+            .any(|(key, held)| key == name && held == value),
+        "the launch really is carrying the value, so the assertion below means something"
+    );
+    let rendered = format!("{launch:?}");
+    assert!(
+        rendered.contains(&name),
+        "the key stays legible, because that is what makes the rendering useful: {rendered}"
+    );
+    assert!(
+        !rendered.contains(&value),
+        "a launch printed the value of {name}, which is where a credential legitimately is"
+    );
+}
+
+/// A health check runs with no registry lock held, so the agent it is about can
+/// be removed while it runs — and `remove` deletes exactly the row the check is
+/// about to write. The write is refused rather than allowed to resurrect state
+/// for an identifier that is no longer registered.
+#[cfg(unix)]
+#[test]
+fn an_agent_removed_while_its_health_check_ran_is_not_given_its_state_back() {
+    let harness = Harness::new();
+    let shim = stubborn_shim(&harness.fixture, "vanishing-agent");
+    let id = harness.ready("vanishing", &shim, &["PATH"]);
+
+    // A second service over the same data directory, which is the situation
+    // exactly: two callers, one registry, no lock held across the probe.
+    let checking =
+        AgentRegistryService::new(harness.fixture.data_dir.clone(), Arc::clone(&harness.store));
+    let options = HealthCheck::new(id.clone())
+        .within(Duration::from_millis(1500))
+        .tearing_down_within(Duration::from_millis(200));
+    let probe =
+        std::thread::spawn(move || checking.health_check(&options, &Cancellation::default()));
+
+    // Well after the check has spawned its agent and well before its deadline.
+    std::thread::sleep(Duration::from_millis(200));
+    harness.service.remove(&id).unwrap();
+
+    let error = probe.join().unwrap().unwrap_err();
+    assert_eq!(
+        error.kind(),
+        "unknown_agent",
+        "a check whose agent went away reports that, not a health result about it"
+    );
+    assert!(
+        harness.store.agent_observations(&id).unwrap().is_none(),
+        "the removal's cleanup stayed cleaned up"
+    );
+}
+
+/// A grant is stored against a workspace root and a launch is checked against
+/// one, so the spellings a user can reach have to resolve the same way. A
+/// symlinked checkout is the ordinary way to end up with two of them.
+#[cfg(unix)]
+#[test]
+fn a_grant_made_through_a_symlinked_workspace_covers_a_launch_naming_the_real_one() {
+    let harness = Harness::new();
+    let command = trustable_file(&harness.fixture, "scoped-agent");
+    let real = harness.fixture.directory("workspace");
+    let link = harness.fixture.root.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let id = AgentId::new("scoped").unwrap();
+    harness
+        .service
+        .register(
+            AgentRegistration::new(id.clone(), "Shim Agent", command, AgentSource::User).unwrap(),
+        )
+        .unwrap();
+    harness
+        .service
+        .trust(
+            TrustAgent::new(id.clone(), at(0))
+                .in_workspace(link.clone())
+                .and_enable(),
+        )
+        .unwrap();
+
+    harness
+        .service
+        .prepare_launch(&id, &LaunchContext::default().in_workspace(real.clone()))
+        .expect("one workspace named the other way is still that workspace");
+    harness
+        .service
+        .prepare_launch(&id, &LaunchContext::default().in_workspace(link.clone()))
+        .expect("the spelling the grant was made in still reaches it");
+
+    // The other half of the property: canonicalizing must not make a grant
+    // reach somewhere it was never given for.
+    let elsewhere = harness.fixture.directory("elsewhere");
+    let error = harness
+        .service
+        .prepare_launch(&id, &LaunchContext::default().in_workspace(elsewhere))
+        .unwrap_err();
+    assert_eq!(error.kind(), "agent_grant_out_of_scope");
+}
+
+/// The digest is streamed before the registry lock is taken, so the
+/// registration that was hashed is not necessarily the one the grant is filed
+/// against. A grant binds the executable the registration names *now*.
+#[cfg(unix)]
+#[test]
+fn a_grant_binds_the_executable_the_registration_names_now() {
+    let harness = Harness::new();
+    let first = harness.fixture.shim("first-agent", "#!/bin/sh\nexit 0\n");
+    let second = harness.fixture.shim("second-agent", "#!/bin/sh\nexit 1\n");
+
+    let id = AgentId::new("moved").unwrap();
+    harness
+        .service
+        .register(
+            AgentRegistration::new(id.clone(), "Shim Agent", first, AgentSource::User).unwrap(),
+        )
+        .unwrap();
+    harness
+        .service
+        .trust(TrustAgent::new(id.clone(), at(0)).and_enable())
+        .unwrap();
+
+    // An update lands the registration disabled, so trusting again is both the
+    // re-enable and the re-grant — and the re-grant is the thing under test.
+    harness
+        .service
+        .update(
+            AgentRegistration::new(id.clone(), "Shim Agent", second.clone(), AgentSource::User)
+                .unwrap(),
+        )
+        .unwrap();
+    harness
+        .service
+        .trust(TrustAgent::new(id.clone(), at(1)).and_enable())
+        .unwrap();
+
+    let launch = harness
+        .service
+        .prepare_launch(&id, &LaunchContext::default())
+        .unwrap();
+    let expected = Sha256Hash::of_reader(&mut std::fs::File::open(&second).unwrap()).unwrap();
+    assert_eq!(
+        launch.executable_sha256(),
+        expected,
+        "the grant bound the binary that is registered, not the one that was"
+    );
+}
+
+/// The timeline entry is a side effect of a check, never its answer.
+///
+/// The health record is durable before the entry is attempted, so a store that
+/// refuses the entry leaves the history short an item — it does not mean the
+/// agent failed for the reason SQLite gives.
+#[cfg(unix)]
+#[test]
+fn a_health_failure_outranks_a_timeline_entry_that_cannot_be_written() {
+    let harness = Harness::new();
+    let shim = stubborn_shim(&harness.fixture, "unfileable-agent");
+    let id = harness.ready("unfileable", &shim, &["PATH"]);
+
+    // A run this store has never heard of, so the event's foreign key refuses
+    // the append — the cheapest honest way to make the write fail.
+    let orphan = crate::domain::RunId::new();
+    let options = HealthCheck::new(id.clone())
+        .with_context(LaunchContext::default().during_run(orphan))
+        .within(Duration::from_millis(300))
+        .tearing_down_within(Duration::from_millis(200));
+
+    let error = check(&harness.service, &options).unwrap_err();
+    assert_eq!(
+        error.kind(),
+        "initialize_timeout",
+        "the check's own answer survived the entry it could not file"
+    );
+    let agent = harness.service.get(&id).unwrap();
+    let record = agent.state().last_health().expect("the record was written");
+    assert_eq!(record.failure_kind(), Some("initialize_timeout"));
 }

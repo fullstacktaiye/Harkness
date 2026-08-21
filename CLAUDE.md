@@ -299,7 +299,10 @@ mechanism either. It is taken for the length of one registry mutation, its order
 fixed — **`agents.lock` → run store**, never the reverse — and it is never held while any of the
 four above is acquired. A mutation reads `agents.json` directly under its own exclusive lock rather
 than through the shared-lock read path, because an advisory lock does not care that the same process
-is on both ends of the wait.
+is on both ends of the wait. It also blocks, so its critical section is one small read plus one
+write: an executable digest is streamed before the lock is taken and a health check's handshake runs
+outside it entirely, and a check re-reads its registration under the lock before writing, because
+the agent may have been removed while the probe ran.
 
 **Ordering: scheduler workspace slot, then repository lock, then catalog lock.** The store takes
 none of them, and no caller may hold a store transaction while acquiring any. The scheduler cannot

@@ -8,6 +8,7 @@
 //! an invalidation is recorded before the registration is switched off, so the
 //! worst outcome of a half-finished mutation is an agent that refuses to launch.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -182,9 +183,19 @@ impl TrustAgent {
     }
 
     /// Confines the grant to one workspace root.
+    ///
+    /// The root is canonicalized. [`TrustScope::Workspace`] is documented as
+    /// holding a canonical one, and `TrustRecord::check` compares it against an
+    /// observed root for exact equality — so a grant filed against `/w/proj`
+    /// and a launch naming a symlink that resolves there would be two
+    /// workspaces to the check and one to the user, and the launch would be
+    /// refused in the very place the grant was made for. It is the rule
+    /// [`WorkspaceTrust::decide`](crate::trust::WorkspaceTrust::decide) states
+    /// for a project, applied to an agent: a trust decision is never stored
+    /// against a lexical path.
     #[must_use]
     pub fn in_workspace(mut self, root: impl Into<PathBuf>) -> Self {
-        self.scope = TrustScope::workspace(root);
+        self.scope = TrustScope::workspace(canonical_workspace(root.into()));
         self
     }
 
@@ -214,9 +225,14 @@ impl LaunchContext {
     /// caller that supplies nothing gets that refusal rather than a silent pass.
     /// The refusal costs the grant nothing: being used in the wrong place is not
     /// evidence that anything about the agent changed.
+    ///
+    /// The root is canonicalized, for the same reason and by the same helper as
+    /// [`TrustAgent::in_workspace`]. Both sides of the scope check have to
+    /// resolve a path the same way or the check compares two spellings of one
+    /// workspace and calls them different places.
     #[must_use]
     pub fn in_workspace(mut self, root: impl Into<PathBuf>) -> Self {
-        self.workspace = Some(root.into());
+        self.workspace = Some(canonical_workspace(root.into()));
         self
     }
 
@@ -325,13 +341,37 @@ impl HealthOutcome {
 /// executable still hashes to what the grant was made about. It carries the
 /// digest it verified so a caller records exactly what it launched rather than
 /// re-deriving it and possibly disagreeing.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct AgentLaunch {
     id: AgentId,
     command: PathBuf,
     args: Vec<String>,
     env: Vec<(String, String)>,
     executable_sha256: Sha256Hash,
+}
+
+impl fmt::Debug for AgentLaunch {
+    /// Names the environment's keys and not its values, exactly as
+    /// [`SpawnSpec`]'s own `Debug` does.
+    ///
+    /// This is the value a [`SpawnSpec`] is built *from*: `env` here holds the
+    /// resolved values an allowlist admitted, which is where a credential
+    /// legitimately is. A derived `Debug` would print it wherever a caller
+    /// logged a launch, one layer above the type that already refuses to — so
+    /// the refusal has to be restated here rather than inherited.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentLaunch")
+            .field("id", &self.id)
+            .field("command", &self.command)
+            .field("args", &self.args)
+            .field(
+                "env",
+                &self.env.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            )
+            .field("executable_sha256", &self.executable_sha256)
+            .finish()
+    }
 }
 
 impl AgentLaunch {
@@ -652,15 +692,34 @@ impl AgentRegistryService {
     /// [`AgentRegistryError::Integration`] when the identity cannot be built,
     /// and [`AgentRegistryError::Store`].
     pub fn trust(&self, options: TrustAgent) -> Result<TrustOutcome, AgentRegistryError> {
-        // The registry lock is taken first and held across both stores, which is
+        // Hashed *before* the registry lock is taken. `lock_exclusive` blocks,
+        // and its own doc justifies blocking by the critical section being one
+        // small read plus one write; streaming a SHA-256 of an agent binary —
+        // a file this module elsewhere calls routinely tens of megabytes —
+        // underneath it would stall every concurrent registration, enable,
+        // removal and health check for the length of a read of somebody else's
+        // file. `admit` hashes outside the lock for exactly this reason.
+        let unlocked = self.registration(&options.id)?;
+        let mut digest = self.verify_executable(&unlocked)?;
+
+        // The registry lock is then taken and held across both stores, which is
         // the order every mutation here uses: `agents.json` lock, then the run
-        // store. Reading the registration through `registrations` instead would
-        // ask for a *shared* lock while this exclusive one is held, and an
-        // advisory lock does not care that the same process is on both ends of
-        // that wait.
+        // store. Reading the registration through `registrations` while it is
+        // held would ask for a *shared* lock underneath this exclusive one, and
+        // an advisory lock does not care that the same process is on both ends
+        // of that wait — which is why the read above happens first rather than
+        // here.
         let _lock = lock_exclusive(&self.data_dir)?;
         let registration = self.registration_locked(&options.id)?;
-        let digest = self.verify_executable(&registration)?;
+        // What was hashed is not necessarily what this grant will be filed
+        // against: `update` may have moved the command, its arguments or its
+        // environment while the hash was streaming. A grant describes the
+        // registration that is there *now*, so one that moved is re-hashed
+        // under the lock — paying the cost in the race it exists for rather
+        // than on every call.
+        if registration != unlocked {
+            digest = self.verify_executable(&registration)?;
+        }
         let basis = identity_basis(&registration, digest)?;
 
         let latest = self
@@ -1103,6 +1162,16 @@ impl AgentRegistryService {
         // and then written back stale — which would put an agent somebody just
         // signed in to back into `Required` and out of reach.
         let _lock = lock_exclusive(&self.data_dir)?;
+        // Re-read under the lock before anything is written, the way
+        // `record_authentication` does. The check itself ran with no lock held,
+        // so the agent it was about may have been removed while it ran — and
+        // `remove` deletes exactly this row on its way out. Writing the
+        // observation anyway would resurrect state for an identifier that is no
+        // longer registered, which is what the row's schema note forbids: state
+        // left behind for an identifier a user later reuses would answer for a
+        // program nobody checked. An agent that went away mid-check is reported
+        // as unknown rather than as a health result, because it is.
+        let _registration = self.registration_locked(&options.id)?;
         let at = OffsetDateTime::now_utc();
         let mut observations = self
             .store
@@ -1170,28 +1239,45 @@ impl AgentRegistryService {
         self.store
             .put_agent_observations(&options.id, &observations)?;
 
-        if let Some(run) = options.context.run {
-            let payload = json!({
-                "agent_id": options.id.as_str(),
-                "status": status.as_str(),
-                "failure_kind": record.failure_kind(),
-                "elapsed_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
-                "protocol_version": initialize.as_ref().map(InitializeRecord::protocol_version),
-                "teardown": record.teardown().map(AgentTeardown::as_str),
-            });
-            self.store.append_event(
-                run,
-                RunEvent::new(EventKind::ExternalAgentHealthChecked, at).with_payload(payload),
-            )?;
-        }
+        // The timeline entry is a side effect of the check and is never allowed
+        // to become its answer. The record above is already durable, so a store
+        // failure here means the history is missing an entry — not that the
+        // agent is fine, and not that it failed for the reason SQLite gives.
+        // Reporting it in place of an `InitializeTimeout` or an
+        // `UnsupportedProtocolVersion` would tell a user the wrong thing about
+        // their agent, so it is only reported when the check itself has nothing
+        // to say.
+        let filed = match options.context.run {
+            Some(run) => {
+                let payload = json!({
+                    "agent_id": options.id.as_str(),
+                    "status": status.as_str(),
+                    "failure_kind": record.failure_kind(),
+                    "elapsed_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                    "protocol_version": initialize.as_ref().map(InitializeRecord::protocol_version),
+                    "teardown": record.teardown().map(AgentTeardown::as_str),
+                });
+                self.store
+                    .append_event(
+                        run,
+                        RunEvent::new(EventKind::ExternalAgentHealthChecked, at)
+                            .with_payload(payload),
+                    )
+                    .map(|_| ())
+            }
+            None => Ok(()),
+        };
 
         match probe.failure {
             Some(failure) => Err(failure),
-            None => Ok(HealthOutcome {
-                id: options.id.clone(),
-                record,
-                initialize,
-            }),
+            None => {
+                filed?;
+                Ok(HealthOutcome {
+                    id: options.id.clone(),
+                    record,
+                    initialize,
+                })
+            }
         }
     }
 
@@ -1522,6 +1608,23 @@ struct ProbeOutcome {
 /// anything about the program on the other end.
 fn client_identity() -> ClientIdentity {
     ClientIdentity::new("harkness", env!("CARGO_PKG_VERSION")).title("Harkness")
+}
+
+/// One workspace root, resolved the way both sides of a scope check resolve it.
+///
+/// `std::fs::canonicalize` for the same reason
+/// [`ContextRegistry`](crate::context::ContextRegistry) uses it on a worktree
+/// root: `/w/foo`, a relative path, and a path through a symlink all name one
+/// checkout, and comparing them as written would treat them as three. A grant
+/// is stored through here and a launch is checked through here, so the two
+/// cannot disagree about which spelling a workspace has.
+///
+/// A root that cannot be resolved — one that does not exist yet, most often —
+/// is returned unchanged rather than refused. That keeps both callers
+/// infallible and leaves such a root compared exactly as it is compared today;
+/// inventing a match for it would be worse than paying for the lexical answer.
+fn canonical_workspace(root: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&root).unwrap_or(root)
 }
 
 /// The identity a grant about this registration is bound to.

@@ -1854,6 +1854,18 @@ one in the workspace, so a mutation reads the file directly under its own exclus
 through the shared-lock read path — asking for a shared lock while holding the exclusive one is a
 process waiting for itself.
 
+Because that lock blocks, its critical section stays one small read plus one write: **nothing that
+reads a file of unknown size, spawns a process, or waits on a peer runs while it is held.** Trusting
+an agent streams the executable's digest *before* taking it and re-hashes under it only when the
+registration moved in between, and a health check runs its whole handshake with no lock at all —
+otherwise one agent binary, or one agent that felt like taking its full deadline, would stall every
+other registration, enable, removal and check in the process.
+
+That is also why a check re-reads its registration under the lock before recording anything. The
+probe ran unlocked, so the agent it was about may have been removed while it ran, and `remove`
+deletes exactly the row the check is about to write; a check whose agent went away reports
+`unknown_agent` rather than leaving state behind for an identifier somebody may reuse.
+
 `AgentRegistryError` publishes a union namespace the way `InvocationError` and `AcpError` do: its own
 table followed by the store's, the integration domain's, and ACP's, each carrying its own
 discriminant. Exactly two failures are re-classified rather than passed through, and both answer a
