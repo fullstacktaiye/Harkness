@@ -145,10 +145,14 @@ fn per_call_overhead_stays_inside_the_budget_with_the_subscriber_installed() {
     }
 
     let mean = total / MEASURED_CALLS;
-    println!("with tracing at info: mean {mean:?}, worst {worst:?} over {MEASURED_CALLS} calls");
-    assert!(
-        worst < BUDGET,
-        "per-call overhead with the subscriber installed peaked at {worst:?}, over the {BUDGET:?} budget"
+    println!("with tracing at info: mean {mean:?} over {MEASURED_CALLS} calls");
+    // The worst call rather than the mean: an instrumentation cost that is
+    // usually free and occasionally not is exactly the regression this exists
+    // to catch.
+    harkness_test_fixtures::latency::record(
+        "observe::per_call_overhead_with_the_subscriber_installed",
+        worst,
+        BUDGET,
     );
 
     // And the lines really were written, so the measurement was not of a

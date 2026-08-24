@@ -2358,7 +2358,10 @@ mod tests {
             std::hint::black_box(engine.evaluate(std::hint::black_box(&request)));
         }
         let average = started.elapsed() / iterations;
-        eprintln!("policy evaluation averaged {average:?} over {iterations} iterations");
-        assert!(average < std::time::Duration::from_millis(5));
+        harkness_test_fixtures::latency::record(
+            "policy::evaluate_one_request",
+            average,
+            std::time::Duration::from_millis(5),
+        );
     }
 }

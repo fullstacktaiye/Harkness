@@ -2755,14 +2755,11 @@ mod tests {
         }
         timings.sort_unstable();
         let worst = *timings.last().unwrap();
-        println!(
-            "inventory of {FILES} files: {timings:?} on {} / {}",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        );
-        assert!(
-            worst < Duration::from_millis(1_500),
-            "slowest run {worst:?}"
+        println!("inventory of {FILES} files: {timings:?}");
+        harkness_test_fixtures::latency::record(
+            "context::inventory_walk_of_a_medium_repository",
+            worst,
+            Duration::from_millis(1_500),
         );
     }
 

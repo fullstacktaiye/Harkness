@@ -1905,10 +1905,10 @@ fn executor_overhead_per_call_meets_the_latency_target() {
     let elapsed = began.elapsed();
 
     assert!(completed.outcome().succeeded());
-    println!("one call of a trivial tool took {elapsed:?}");
-    assert!(
-        elapsed < Duration::from_millis(10),
-        "per-call executor overhead was {elapsed:?}"
+    harkness_test_fixtures::latency::record(
+        "tool::executor_per_call_overhead",
+        elapsed,
+        Duration::from_millis(10),
     );
 }
 
@@ -1947,9 +1947,9 @@ fn cancellation_latency_meets_the_target() {
             .lock()
             .unwrap()
             .expect("cancellation was requested");
-    println!("a cooperative tool stopped {elapsed:?} after the request");
-    assert!(
-        elapsed < Duration::from_millis(250),
-        "cancellation took {elapsed:?} to take effect"
+    harkness_test_fixtures::latency::record(
+        "tool::cancellation_becomes_visible",
+        elapsed,
+        Duration::from_millis(250),
     );
 }

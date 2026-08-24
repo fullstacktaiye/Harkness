@@ -5619,10 +5619,10 @@ fn persisting_a_state_change_batch_meets_the_latency_target() {
         .unwrap();
     let elapsed = started.elapsed();
 
-    println!("persisting an ordinary state-change batch took {elapsed:?}");
-    assert!(
-        elapsed < std::time::Duration::from_millis(10),
-        "persisting a state-change batch took {elapsed:?}"
+    harkness_test_fixtures::latency::record(
+        "store::persist_state_change_batch",
+        elapsed,
+        std::time::Duration::from_millis(10),
     );
 }
 
@@ -5674,10 +5674,10 @@ fn persisting_a_state_change_batch_with_its_events_meets_the_latency_target() {
         .unwrap();
     let elapsed = started.elapsed();
 
-    println!("persisting a state-change batch with its events took {elapsed:?}");
-    assert!(
-        elapsed < std::time::Duration::from_millis(10),
-        "persisting a state-change batch with its events took {elapsed:?}"
+    harkness_test_fixtures::latency::record(
+        "store::persist_state_change_batch_with_events",
+        elapsed,
+        std::time::Duration::from_millis(10),
     );
 }
 
@@ -5710,10 +5710,10 @@ fn loading_a_thousand_event_run_meets_the_latency_target() {
     let elapsed = started.elapsed();
 
     assert_eq!(events.len(), EVENTS);
-    println!("loading a {EVENTS}-event run took {elapsed:?}");
-    assert!(
-        elapsed < std::time::Duration::from_millis(500),
-        "loading a {EVENTS}-event run took {elapsed:?}"
+    harkness_test_fixtures::latency::record(
+        "store::load_thousand_event_run",
+        elapsed,
+        std::time::Duration::from_millis(500),
     );
 }
 
@@ -5731,9 +5731,9 @@ fn listing_one_hundred_runs_meets_the_latency_target() {
     let elapsed = started.elapsed();
 
     assert_eq!(page.runs.len(), 100);
-    println!("listing 100 of 1000 runs took {elapsed:?}");
-    assert!(
-        elapsed < std::time::Duration::from_millis(100),
-        "listing 100 runs took {elapsed:?}"
+    harkness_test_fixtures::latency::record(
+        "store::list_one_hundred_of_a_thousand_runs",
+        elapsed,
+        std::time::Duration::from_millis(100),
     );
 }

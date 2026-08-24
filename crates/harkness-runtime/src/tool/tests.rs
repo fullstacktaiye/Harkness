@@ -1556,14 +1556,17 @@ fn registry_lookup_meets_the_latency_target() {
     }
     let latest = started.elapsed() / u32::try_from(LOOKUPS).unwrap();
 
-    println!("exact lookup: {exact:?} per call over {TOOLS} tools");
-    println!("latest lookup: {latest:?} per call over {TOOLS} tools");
-    assert!(
-        exact < std::time::Duration::from_millis(1),
-        "exact lookup took {exact:?}"
+    // Two measurements rather than one: resolving a pinned version and
+    // resolving the latest take different paths through the registry, and the
+    // budget applies to each.
+    harkness_test_fixtures::latency::record(
+        "tool::registry_resolve_exact_version",
+        exact,
+        std::time::Duration::from_millis(1),
     );
-    assert!(
-        latest < std::time::Duration::from_millis(1),
-        "latest lookup took {latest:?}"
+    harkness_test_fixtures::latency::record(
+        "tool::registry_resolve_latest_version",
+        latest,
+        std::time::Duration::from_millis(1),
     );
 }
