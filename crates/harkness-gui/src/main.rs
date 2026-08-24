@@ -526,6 +526,14 @@ Kirigami.ApplicationWindow {
     property var openedPage: null
     property string excerptableArtifact: ""
     property bool overlapIssued: false
+    property bool narrowed: false
+    property bool cancelPressed: false
+    property int cancelPolls: 0
+
+    readonly property int wideWidth: 1180
+    /// Narrower than the two halves of the detail page's body can both be, so
+    /// the split has to turn rather than clip one of them.
+    readonly property int narrowWidth: Kirigami.Units.gridUnit * 30
 
     /// Where to write the pages as images, or empty to write none.
     ///
@@ -649,6 +657,63 @@ Kirigami.ApplicationWindow {
         id: overlap
     }
 
+    // The Runs view inside the host the shell puts it in. `runsPanel` above is
+    // the view on its own; this is its side-panel *contract* - the activity bar
+    // reads these members off it, and a view the host cannot resolve is one the
+    // bar cannot switch to.
+    SidePanel {
+        id: hostedPanel
+
+        anchors.right: parent.right
+        anchors.top: parent.top
+        currentViewId: "runs"
+        height: window.height
+        visible: false
+        width: Kirigami.Units.gridUnit * 30
+
+        RunsPanel {
+            id: hostedRuns
+        }
+    }
+
+    // Stand-ins for the two pages the navigation check needs in a stack. The
+    // shell needs a project catalog behind it and the detail page cannot be
+    // pushed here at all - see the check itself - so each is reduced to the
+    // property Main.qml actually looks for.
+    Component {
+        id: shellStandIn
+
+        Kirigami.Page {
+            property bool isShell: true
+        }
+    }
+
+    Component {
+        id: detailStandIn
+
+        Kirigami.Page {
+            property bool isRunDetail: true
+            property string runId: ""
+        }
+    }
+
+    // Main.qml itself. The window's own `showRun` above is a stand-in for this
+    // page's benefit; re-implementing the *stack* behaviour is how the
+    // regression Main.qml's version fixes went untested in the first place.
+    Component {
+        id: mainWindow
+
+        // Shown, because an invisible Window has no scene graph and every item
+        // pushed into its stack is reported as a graphical object outside the
+        // scene - a warning, which this binary makes fatal. Offscreen, so
+        // "shown" costs a surface nobody looks at.
+        Main {
+            height: 720
+            visible: true
+            width: 960
+        }
+    }
+
     // The shell's Runs view, which reaches a page only through `openRun`.
     RunsPanel {
         id: runsPanel
@@ -698,6 +763,18 @@ Kirigami.ApplicationWindow {
                 return;
             check("theLauncherPaneListsEverySeededRun", launcherPane.count === 6);
             check("theLauncherPaneReportsNoFailure", launcherPane.loadErrorKind.length === 0);
+            // The side-panel contract, which the activity bar reads off the
+            // view rather than being told: a view the host cannot resolve is
+            // one no shortcut and no bar entry can reach.
+            check("theRunsViewIsResolvableByTheHostThatShowsIt",
+                  hostedPanel.view("runs") === hostedRuns);
+            check("theRunsViewIsTheOneTheHostHasOnScreen",
+                  hostedPanel.currentPanel === hostedRuns && hostedPanel.currentPanelReady);
+            check("theRunsViewAppliesToEveryProjectSoTheHostAlwaysHasOne",
+                  hostedPanel.hasAvailableView
+                  && hostedPanel.firstAvailableViewId() === "runs");
+            check("theRunsViewAdvertisesTheShortcutTheShellBinds",
+                  String(hostedRuns.viewShortcut) === "Ctrl+Shift+R");
             if (!captured("runs-list", runsPanel))
                 return;
             next(1, failedRun);
@@ -859,6 +936,24 @@ Kirigami.ApplicationWindow {
             const delegates = detail.timelineView.contentItem.children.length;
             check("aLongTimelineMaterializesOnlyItsVisibleRegion",
                   delegates > 0 && delegates * 2 < detail.timelineView.count);
+
+            // The body's two halves ask for twenty-two and eighteen grid units.
+            // Below their sum there is no side-by-side arrangement that is not
+            // clipping one of them, so the split turns instead.
+            if (!narrowed) {
+                check("aWidePageSplitsItsBodySideBySide", detail.sideBySide);
+                narrowed = true;
+                window.width = narrowWidth;
+                return;
+            }
+            check("aNarrowPageStacksItsHalvesRatherThanClippingOne", !detail.sideBySide);
+            check("aStackedTimelineSpansTheWholeWidth",
+                  detail.timelineView.width > detail.width * 0.8);
+            check("aStackedTimelineLeavesTheRecordsBelowItSomeRoom",
+                  detail.timelineView.height > 0
+                  && detail.timelineView.height < detail.height);
+            window.width = wideWidth;
+
             next(6, progressedRun);
             return;
         }
@@ -921,13 +1016,110 @@ Kirigami.ApplicationWindow {
             // the one the reader would be watching.
             check("theSharedStatusDescribesTheNewestOperation",
                   String(overlap.status).indexOf(failedRun) !== -1);
-            // Every grab is asynchronous, so the loop ends when the last of
-            // them has written its file rather than when the last check ran.
-            next(9);
+            next(9, waitingRun);
             return;
         }
 
         if (phase === 9) {
+            if (!detailReady)
+                return;
+            // Cancelling attaches this process's coordinator, which sweeps
+            // first: every seeded run names no lease, so the sweep can prove
+            // the claim is gone and marks the unfinished ones interrupted. The
+            // cancellation itself is then refused - this coordinator did not
+            // start the run - and both facts are the point. The page has to end
+            // up showing what the store now says rather than what it read
+            // before the button was pressed, whichever way the request went.
+            //
+            // Left until last because the sweep changes the runs the earlier
+            // phases assert against.
+            if (!cancelPressed) {
+                check("theParkedRunReadsAsParkedBeforeAnythingIsPressed",
+                      detail.runStateValue === "waiting_for_approval");
+                cancelPressed = true;
+                detail.cancel();
+                return;
+            }
+            // Bounded, and bounded around *both* waits: a page that never
+            // clears `mutating` is exactly the failure this checks for, and
+            // waiting on it unbounded would report the fixture's deadline
+            // instead of the check that did not hold.
+            cancelPolls += 1;
+            if (cancelPolls < 100
+                    && (detail.mutating
+                        || detail.runStateValue === "waiting_for_approval"))
+                return;
+            check("aMutationMakesThePageReadTheRunAgain",
+                  !detail.mutating && detail.runStateValue === "interrupted");
+            next(10);
+            return;
+        }
+
+        if (phase === 10) {
+            // Main.qml's own stack behaviour, which nothing else here reaches:
+            // this window's `showRun` is a stand-in for the detail page's
+            // benefit, and re-implementing the stack rules rather than
+            // exercising them is how the regression below went untested.
+            //
+            // The pages are built here and pushed as objects. Kirigami's own
+            // push creates a page into `pagesLogic`, a QtObject, and reparents
+            // it a line later - which Qt reports as a graphical object outside
+            // the scene on every push in every Kirigami application, and this
+            // binary makes warnings fatal. That is also why `showRun` is driven
+            // with a detail page already in the stack rather than being asked
+            // to push a real one: what is under test is which page the window
+            // finds, not Kirigami's incubation.
+            const main = mainWindow.createObject(null);
+            check("theWindowLoads", main !== null);
+            if (main === null) {
+                next(11);
+                return;
+            }
+            const shellPage = shellStandIn.createObject(main.pageStack);
+            const detailPageStandIn = detailStandIn.createObject(main.pageStack,
+                                                                 { "runId": failedRun });
+            check("theNavigationStandInsAreBuilt",
+                  shellPage !== null && detailPageStandIn !== null);
+            if (shellPage === null || detailPageStandIn === null) {
+                main.destroy();
+                next(11);
+                return;
+            }
+
+            main.pageStack.push(shellPage);
+            check("theShellIsFoundWhenItIsAlsoTheCurrentPage",
+                  main.shellPage() === shellPage);
+
+            main.pageStack.push(detailPageStandIn);
+            check("aRunDetailSitsAboveTheShellRatherThanReplacingIt",
+                  main.pageStack.depth === 3
+                  && main.pageStack.currentItem === detailPageStandIn);
+            // The regression this branch fixes. `currentItem` is now the detail
+            // page, so a catalog refresh reading it would find no shell and
+            // push a second one over what the reader is looking at; walking the
+            // stack still finds the one that is there.
+            check("theShellIsStillFoundUnderAnOpenRunDetail",
+                  main.shellPage() === shellPage);
+
+            // The two requests `showRun` answers by doing nothing, both read
+            // off the page that is current.
+            main.showRun("");
+            check("namingNoRunAtAllChangesNothing",
+                  main.pageStack.depth === 3
+                  && main.pageStack.currentItem === detailPageStandIn);
+            main.showRun(failedRun);
+            check("namingTheRunAlreadyOpenChangesNothing",
+                  main.pageStack.depth === 3
+                  && main.pageStack.currentItem === detailPageStandIn);
+
+            main.destroy();
+            next(11);
+            return;
+        }
+
+        if (phase === 11) {
+            // Every grab is asynchronous, so the loop ends when the last of
+            // them has written its file rather than when the last check ran.
             if (pendingGrabs > 0)
                 return;
             finish();

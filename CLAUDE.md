@@ -375,7 +375,15 @@ and every new bridge file — must be added to `build.rs`'s lists.
   presentation, not redaction: nothing leaves the log, the row carries the count, and `harkness run
   show` still prints every tick. The folded row remembers its oldest absorbed sequence as well as
   its newest, because backwards paging continues from a position in the log and resuming from the
-  newest would re-read the ticks the row already stands for.
+  newest would re-read the ticks the row already stands for. Two roles exist so a surface never has
+  to parse a row back out: `progressCount`, and `outcome` — the `state` or `verdict` the payload
+  named. `summarize` sorts the payload's keys and then clamps the line, so on an event with many
+  fields the one that decides a row's colour is exactly what falls off the end.
+- **A surface that re-reads on timeline movement listens to `appended`, not `rowsInserted` or
+  `dataChanged`.** Both of those also fire for a backwards page — history that has not changed
+  since it was written — and `dataChanged` fires again when a lazily loaded payload arrives on a
+  row that was already there. `appended` is emitted only when `plan_append` produced an edit, which
+  covers the folded progress row absorbing ticks in place as well as rows arriving.
 - **The run surfaces are four QML files over those bridges and no domain logic.** `RunState.qml`
   is the shared vocabulary — state and event-kind words, the palette, byte and time units, and the
   `escapedRichText` every `InlineMessage` on these pages goes through — instantiated rather than
@@ -406,7 +414,13 @@ and every new bridge file — must be added to `build.rs`'s lists.
   real `exec()`. It seeds a store with one run per state, drives the pages through them, and reports
   by `objectName` the way the other QML checks do. Setting `HARKNESS_RUN_SCREENSHOT_DIR` makes the
   same pass write `docs/screenshots/run*.png` along the way — that is how those images are
-  regenerated, and it changes no assertion.
+  regenerated, and it changes no assertion. Two of its phases are ordered rather than incidental:
+  the cancellation check runs **last** because reaching a coordinator sweeps, and the sweep marks
+  every seeded run that names no lease `interrupted` — which is what makes it an observable, and
+  what would break the earlier phases if it ran before them. Its pages are also built with an
+  explicit parent and pushed as objects: Kirigami's own `push` creates a page into `pagesLogic`, a
+  `QtObject`, and reparents it a line later, which Qt reports as a graphical object outside the
+  scene — harmless in the application, fatal under this binary's `QT_FATAL_WARNINGS`.
 - **QML hot reload** (`cxx/qmlhotreload.h`, `src/hotreload.rs`) makes a working-copy build read
   `qml/` from disk rather than from the compiled resource, and rebuild the window on save. It is an
   URL interceptor rather than an extra import path because the module's `qmldir` maps every type to

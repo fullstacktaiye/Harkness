@@ -255,12 +255,16 @@ Item {
 
     /// The accent one timeline row is marked with.
     ///
-    /// Read from the event's *payload summary* as well as its kind, because a
-    /// state change is the same kind whether it says `succeeded` or `failed`,
-    /// and the colour is the fastest thing to read when scanning a timeline.
-    function eventColor(kind, summary) {
+    /// Read from the event's kind and from the outcome its payload named,
+    /// because a state change is the same kind whether it says `succeeded` or
+    /// `failed`, and the colour is the fastest thing to read when scanning a
+    /// timeline. The outcome is a field on the row rather than something
+    /// recovered from the summary text: `summarize` sorts the payload's keys
+    /// and then clamps the line, so on an event with many fields the one that
+    /// decides the colour is exactly what falls off the end.
+    function eventColor(kind, outcome) {
         const value = String(kind);
-        const text = String(summary);
+        const result = String(outcome);
         if (value === "run_interrupted" || value === "external_agent_trust_invalidated"
                 || value === "approval_identity_drift")
             return neutralColor;
@@ -268,21 +272,20 @@ Item {
             return neutralColor;
         if (value === "run_state_changed" || value === "step_finished"
                 || value === "tool_call_state_changed") {
-            if (text.indexOf("state=succeeded") !== -1)
+            if (result === "succeeded")
                 return positiveColor;
-            if (text.indexOf("state=failed") !== -1 || text.indexOf("state=denied") !== -1)
+            if (result === "failed" || result === "denied")
                 return negativeColor;
-            if (text.indexOf("state=cancelled") !== -1
-                    || text.indexOf("state=interrupted") !== -1
-                    || text.indexOf("state=waiting_for_approval") !== -1)
+            if (result === "cancelled" || result === "interrupted"
+                    || result === "waiting_for_approval")
                 return neutralColor;
-            if (text.indexOf("state=running") !== -1)
+            if (result === "running")
                 return accentColor;
         }
         if (value === "approval_decided")
-            return text.indexOf("verdict=granted") !== -1 ? positiveColor : negativeColor;
+            return result === "granted" ? positiveColor : negativeColor;
         if (value === "policy_decision")
-            return text.indexOf("verdict=deny") !== -1 ? negativeColor : dimColor;
+            return result === "deny" ? negativeColor : dimColor;
         return dimColor;
     }
 

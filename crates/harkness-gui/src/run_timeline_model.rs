@@ -163,6 +163,19 @@ pub mod ffi {
         #[qinvokable]
         #[cxx_name = "loadDetail"]
         fn load_detail(self: Pin<&mut RunTimelineModel>, seq: i64);
+
+        /// Emitted when the run's log grew at the tip: rows arrived, or the
+        /// folded progress row already there absorbed ticks it had not seen.
+        ///
+        /// A surface that re-reads something *else* about the run when its
+        /// timeline moves wants this rather than `rowsInserted` or
+        /// `dataChanged`. Both of those also fire for a backwards page, which
+        /// is history that has not changed since it was written, and
+        /// `dataChanged` fires again for a payload arriving on a row that was
+        /// already there — so a page listening to them re-reads the whole run
+        /// every time a reader opens a row or asks for older events.
+        #[qsignal]
+        fn appended(self: Pin<&mut RunTimelineModel>);
     }
 
     impl cxx_qt::Threading for RunTimelineModel {}
@@ -226,6 +239,17 @@ const SUMMARY_ROLE: i32 = 264;
 const HAS_DETAIL_ROLE: i32 = 265;
 const DETAIL_ROLE: i32 = 266;
 const PROGRESS_COUNT_ROLE: i32 = 267;
+const OUTCOME_ROLE: i32 = 268;
+
+/// Payload fields an event's outcome is read from, in the order they are tried.
+///
+/// A state change is the same *kind* whether it says `succeeded` or `failed`,
+/// and which of the two it was is the fastest thing to read when scanning a
+/// timeline. The value is carried on the row rather than recovered from the
+/// summary: `summarize` sorts the payload's keys and then clamps the line, so
+/// on an event with many fields the one that decides the colour is exactly what
+/// falls off the end.
+const OUTCOME_FIELDS: [&str; 2] = ["state", "verdict"];
 
 /// The stored spelling of the one kind this model folds.
 ///
@@ -248,6 +272,7 @@ fn model_roles() -> QHash<QHashPair_i32_QByteArray> {
     roles.insert(HAS_DETAIL_ROLE, QByteArray::from("hasDetail"));
     roles.insert(DETAIL_ROLE, QByteArray::from("detail"));
     roles.insert(PROGRESS_COUNT_ROLE, QByteArray::from("progressCount"));
+    roles.insert(OUTCOME_ROLE, QByteArray::from("outcome"));
     roles
 }
 
@@ -279,6 +304,28 @@ pub(crate) struct TimelineRow {
     /// One for a single tick, so a reader can tell "a progress event" from "a
     /// row that is not about progress" without matching on the kind text.
     progress_count: u32,
+    /// The state or verdict the payload named, empty when it named neither.
+    ///
+    /// A stored spelling, passed through rather than interpreted: what a colour
+    /// or a word is made of it belongs to the surface, and a spelling this
+    /// build does not define is a newer build's rather than a bug.
+    outcome: String,
+}
+
+/// Reads the state or verdict an event's payload named.
+///
+/// String values only. A payload whose `state` is an object or a number is not
+/// saying what a state change says, and reading `{2 fields}` as an outcome
+/// would be worse than reading nothing.
+fn outcome(payload: &Value) -> String {
+    let Value::Object(fields) = payload else {
+        return String::new();
+    };
+    OUTCOME_FIELDS
+        .iter()
+        .find_map(|field| fields.get(*field).and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// Keeps a rendering inside its byte budget on a character boundary.
@@ -355,6 +402,7 @@ pub(crate) fn event_row(seq: u64, event: &RunEvent) -> TimelineRow {
             .map(|id| id.to_string())
             .unwrap_or_default(),
         summary: summarize(event.payload()),
+        outcome: outcome(event.payload()),
         has_detail: !event.payload().is_null(),
         detail: String::new(),
     }
@@ -802,6 +850,7 @@ impl ffi::RunTimelineModel {
             PROGRESS_COUNT_ROLE => {
                 QVariant::from(&i32::try_from(entry.progress_count).unwrap_or(i32::MAX))
             }
+            OUTCOME_ROLE => text(&entry.outcome),
             _ => QVariant::default(),
         }
     }
@@ -1163,11 +1212,21 @@ fn append_batch(mut model: Pin<&mut ffi::RunTimelineModel>, request: u64, rows: 
         return;
     }
     let edits = model.as_ref().rust().timeline.plan_append(rows);
+    // A batch that was entirely repeats plans nothing and is not growth. The
+    // subscription replays from where it was opened, so that is ordinary rather
+    // than exceptional, and announcing it would wake every listener for a
+    // delivery that changed no row.
+    let grew = !edits.is_empty();
     for edit in edits {
         model.as_mut().edit(&edit);
     }
     let more = model.as_ref().rust().timeline.more();
     model.as_mut().set_more(more);
+    // Announced last, so a handler that reads the model sees every row and
+    // both flags as they now stand.
+    if grew {
+        model.as_mut().appended();
+    }
 }
 
 fn attach_detail(
@@ -1188,7 +1247,7 @@ fn attach_detail(
 #[cfg(test)]
 mod tests {
     use cxx_qt_lib::QByteArray;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use time::OffsetDateTime;
 
     use harkness_runtime::domain::{
@@ -1199,9 +1258,10 @@ mod tests {
 
     use super::{
         ARTIFACT_ROLE, AT_ROLE, DETAIL_ROLE, DISPLAY_ROLE, HAS_DETAIL_ROLE, KIND_ROLE,
-        MAX_TIMELINE_ROWS, MAX_TIMELINE_SUMMARY_BYTES, ModelEdit, PROGRESS_COUNT_ROLE,
-        RECOGNIZED_ROLE, SEQ_ROLE, STEP_ROLE, SUMMARY_ROLE, Selection, TIMELINE_PAGE_SIZE,
-        TOOL_CALL_ROLE, Timeline, TimelineRow, event_row, model_roles, summarize,
+        MAX_TIMELINE_ROWS, MAX_TIMELINE_SUMMARY_BYTES, ModelEdit, OUTCOME_ROLE,
+        PROGRESS_COUNT_ROLE, RECOGNIZED_ROLE, SEQ_ROLE, STEP_ROLE, SUMMARY_ROLE, Selection,
+        TIMELINE_PAGE_SIZE, TOOL_CALL_ROLE, Timeline, TimelineRow, event_row, model_roles,
+        summarize,
     };
     use super::{load_event_detail_in, load_older_page_in, open_timeline_in};
 
@@ -1261,6 +1321,7 @@ mod tests {
             (HAS_DETAIL_ROLE, "hasDetail"),
             (DETAIL_ROLE, "detail"),
             (PROGRESS_COUNT_ROLE, "progressCount"),
+            (OUTCOME_ROLE, "outcome"),
         ] {
             assert_eq!(roles.get(&role), Some(QByteArray::from(name)));
         }
@@ -1394,6 +1455,73 @@ mod tests {
         let timeline = populated(1..=10);
 
         assert!(timeline.plan_append(rows(1..=10)).is_empty());
+    }
+
+    #[test]
+    fn a_row_carries_the_state_its_payload_named() {
+        let row = event_row(
+            1,
+            &RunEvent::new(EventKind::RunStateChanged, at(1))
+                .with_payload(json!({"state": "succeeded"})),
+        );
+
+        assert_eq!(row.outcome, "succeeded");
+    }
+
+    #[test]
+    fn a_decision_carries_its_verdict_where_a_state_change_carries_its_state() {
+        let row = event_row(
+            1,
+            &RunEvent::new(EventKind::ApprovalDecided, at(1))
+                .with_payload(json!({"verdict": "granted", "decided_via": "gui"})),
+        );
+
+        assert_eq!(row.outcome, "granted");
+    }
+
+    #[test]
+    fn an_outcome_survives_a_payload_whose_summary_is_clamped() {
+        // Keys sort before "state", and enough of them to push it past the
+        // summary's byte bound. Reading the colour off the summary is exactly
+        // what this row would defeat.
+        let mut payload = serde_json::Map::new();
+        for index in 0..80 {
+            payload.insert(format!("a{index:03}"), json!("padding-padding-padding"));
+        }
+        payload.insert("state".to_owned(), json!("failed"));
+
+        let row = event_row(
+            1,
+            &RunEvent::new(EventKind::RunStateChanged, at(1)).with_payload(Value::Object(payload)),
+        );
+
+        assert!(
+            !row.summary.contains("state=failed"),
+            "the summary was expected to be clamped short of it"
+        );
+        assert_eq!(row.outcome, "failed", "the row still knows what happened");
+    }
+
+    #[test]
+    fn a_payload_naming_neither_a_state_nor_a_verdict_carries_no_outcome() {
+        let row = event_row(
+            1,
+            &RunEvent::new(EventKind::ToolProgress, at(1))
+                .with_payload(json!({"line": "compiling"})),
+        );
+
+        assert!(row.outcome.is_empty());
+    }
+
+    #[test]
+    fn a_state_that_is_not_a_word_is_read_as_no_outcome_rather_than_as_its_shape() {
+        let row = event_row(
+            1,
+            &RunEvent::new(EventKind::RunStateChanged, at(1))
+                .with_payload(json!({"state": {"was": "running"}})),
+        );
+
+        assert!(row.outcome.is_empty(), "{}", row.outcome);
     }
 
     #[test]

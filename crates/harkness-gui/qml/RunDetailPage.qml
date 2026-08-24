@@ -237,6 +237,15 @@ Kirigami.Page {
         }
     }
 
+    /// Whether both halves of the body fit side by side.
+    ///
+    /// The timeline and the record lists ask for 22 and 18 grid units, so below
+    /// their sum plus a handle there is no horizontal arrangement that is not
+    /// clipping one of them. Stacking is the answer rather than hiding: both
+    /// halves stay reachable and the reader keeps the divider, which is the one
+    /// control that decides how the space is shared.
+    readonly property bool sideBySide: width >= Kirigami.Units.gridUnit * 44
+
     /// One section tab, marked along its bottom edge the way the checks view
     /// marks its evidence tabs — and for the reason a `TabBar` is not used
     /// there: a bar divides its width between its buttons and drifts them apart.
@@ -353,6 +362,10 @@ Kirigami.Page {
     readonly property alias approvalBannerVisible: approvalBanner.visible
     /// The validated input the banner is showing, empty until it is asked for.
     readonly property alias approvalInput: approvalReview.input
+    /// The discriminant of the last failure the bridge reported, empty on
+    /// success. Exposed for the same reason the two views below are: whether a
+    /// refused mutation reaches the reader is a property of this page.
+    readonly property string failureKind: String(runs.kind || "")
     /// The timeline's view, exposed for the same reason: whether a
     /// thousand-event run creates delegates only for its visible region is a
     /// property of this view and of nothing the model can be asked.
@@ -460,19 +473,20 @@ Kirigami.Page {
     }
 
     Connections {
-        function onDataChanged() {
-            // A folded progress row updates in place rather than inserting, so
-            // without this the header would stop refreshing for exactly the run
-            // that is still working.
+        /// The log grew at the tip, so the run's own state may have moved with
+        /// it. `appended` rather than `rowsInserted` or `dataChanged`: both of
+        /// those also fire for a backwards page, which is history that has not
+        /// changed since it was written, and `dataChanged` fires again when a
+        /// payload arrives on a row a reader opened — so listening to them made
+        /// opening a row, or asking for older events, cost a full re-read of
+        /// the run. It still covers the folded progress row, which absorbs
+        /// ticks in place rather than inserting.
+        function onAppended() {
             headerReload.restart();
         }
 
         function onLiveChanged() {
             page.reload();
-        }
-
-        function onRowsInserted() {
-            headerReload.restart();
         }
 
         target: timeline
@@ -615,12 +629,6 @@ Kirigami.Page {
                             : ""
                     }
 
-                    MetaField {
-                        monospace: true
-                        name: qsTr("Run")
-                        value: page.runId
-                    }
-
                     Item {
                         Layout.fillWidth: true
                     }
@@ -646,6 +654,32 @@ Kirigami.Page {
                         font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                         // A filesystem path out of a task record.
                         text: page.ready ? String(page.run.workspace || "") : ""
+                        textFormat: Text.PlainText
+                    }
+
+                    // The run identifier sits on this row rather than with the
+                    // times above it: it is the widest thing in the header and
+                    // the only one of them that can be elided without losing
+                    // what it says, because the row above holds no label that
+                    // shrinks and would simply overflow a narrow window.
+                    Controls.Label {
+                        color: runState.dimColor
+                        font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                        text: qsTr("Run")
+                        textFormat: Text.PlainText
+                    }
+
+                    Controls.Label {
+                        // No `fillWidth`, so it takes its natural width while
+                        // there is room and gives way only when the row is over
+                        // budget - at which point eliding an identifier beats
+                        // pushing the workspace path off the window.
+                        Layout.maximumWidth: implicitWidth
+                        color: runState.bodyColor
+                        elide: Text.ElideMiddle
+                        font.family: "monospace"
+                        font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                        text: page.runId
                         textFormat: Text.PlainText
                     }
 
@@ -887,15 +921,21 @@ Kirigami.Page {
         Controls.SplitView {
             Layout.fillHeight: true
             Layout.fillWidth: true
-            orientation: Qt.Horizontal
+            orientation: page.sideBySide ? Qt.Horizontal : Qt.Vertical
 
+            // One hairline whichever way the split runs; a vertical SplitView
+            // sizes its handle by height and a horizontal one by width, and an
+            // unstated implicit size collapses the handle to nothing.
             handle: Rectangle {
                 color: runState.frameColor
+                implicitHeight: 1
                 implicitWidth: 1
             }
 
             ColumnLayout {
+                Controls.SplitView.fillHeight: true
                 Controls.SplitView.fillWidth: true
+                Controls.SplitView.minimumHeight: Kirigami.Units.gridUnit * 10
                 Controls.SplitView.minimumWidth: Kirigami.Units.gridUnit * 22
                 spacing: 0
 
@@ -1004,6 +1044,7 @@ Kirigami.Page {
                         required property bool hasDetail
                         required property int index
                         required property string kind
+                        required property string outcome
                         required property int progressCount
                         required property bool recognized
                         required property int seq
@@ -1012,7 +1053,7 @@ Kirigami.Page {
 
                         property bool expanded: false
 
-                        readonly property color accent: runState.eventColor(kind, summary)
+                        readonly property color accent: runState.eventColor(kind, outcome)
 
                         /// Opens or closes this row, reading its payload the
                         /// first time somebody asks to see one. A payload is
@@ -1198,7 +1239,12 @@ Kirigami.Page {
             // --- Calls, artifacts, approvals ------------------------------
 
             ColumnLayout {
+                // Both axes are stated because the split turns: a vertical
+                // SplitView reads the height constraints and ignores the width
+                // ones, and an item with neither takes whatever is left.
+                Controls.SplitView.minimumHeight: Kirigami.Units.gridUnit * 8
                 Controls.SplitView.minimumWidth: Kirigami.Units.gridUnit * 18
+                Controls.SplitView.preferredHeight: Kirigami.Units.gridUnit * 16
                 Controls.SplitView.preferredWidth: Kirigami.Units.gridUnit * 26
                 spacing: 0
 
