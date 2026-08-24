@@ -1552,6 +1552,40 @@ mod tests {
     }
 
     #[test]
+    fn a_backwards_page_folds_within_itself_and_never_into_the_row_above() {
+        let call = ToolCallId::new();
+        let mut timeline = Timeline::default();
+        timeline.reset((5..=8).map(|seq| tick(seq, call)).collect(), false);
+
+        // Four older ticks of the same call. They are one row between
+        // themselves, and deliberately stay a second row rather than merging
+        // into the one already on screen: rewriting a row the reader is looking
+        // at, and moving everything under it, is worse than a seam at a page
+        // boundary that only costs them one row.
+        let edits = timeline.plan_prepend((1..=4).map(|seq| tick(seq, call)).collect());
+
+        assert!(
+            matches!(
+                edits.as_slice(),
+                [ModelEdit::Insert { first: 0, rows }]
+                    if rows.len() == 1
+                        && rows[0].progress_count == 4
+                        && rows[0].first_seq == 1
+                        && rows[0].seq == 4
+            ),
+            "{edits:?}"
+        );
+        for edit in &edits {
+            timeline.apply(edit);
+        }
+        assert_eq!(timeline.rows.len(), 2);
+        assert_eq!(
+            timeline.rows[1].progress_count, 4,
+            "the page above is intact"
+        );
+    }
+
+    #[test]
     fn a_batch_drained_out_of_order_still_inserts_in_sequence_order() {
         let timeline = populated(1..=2);
         let mut batch = rows(3..=6);

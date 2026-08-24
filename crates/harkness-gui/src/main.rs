@@ -758,6 +758,34 @@ Kirigami.ApplicationWindow {
             check("openingATimelineRowLoadsThatRowsPayload",
                   row !== null && row.detail.indexOf("state") !== -1);
 
+            // The artifacts section, which no other phase reaches: its rows
+            // are the one place this page renders bytes a tool wrote, so the
+            // delegates have to be built at least once under QT_FATAL_WARNINGS
+            // and the read behind them driven end to end.
+            if (detailPage.section !== 1) {
+                detailPage.section = 1;
+                return;
+            }
+            check("theArtifactsSectionBuildsARowPerArtifact",
+                  detailPage.artifactView.count === 3);
+            if (detailPage.openArtifact.length === 0) {
+                detailPage.showArtifact(window.excerptableArtifact);
+                return;
+            }
+            if (detailPage.openArtifactText.length === 0)
+                return;
+            check("showingAnArtifactRendersTheBytesTheRunStored",
+                  detailPage.openArtifactText.indexOf("running 1 test") !== -1);
+            check("aRenderingInsideTheBudgetIsNotReportedAsCut",
+                  !detailPage.openArtifactCut);
+            // One identifier, so a second artifact cannot also be open; naming
+            // the open one again is how the row's single control hides it.
+            detailPage.showArtifact(window.excerptableArtifact);
+            check("namingTheOpenArtifactAgainClosesIt",
+                  detailPage.openArtifact.length === 0);
+            // Back to the section the screenshot is of.
+            detailPage.section = 0;
+
             if (!captured("run-failed", detailPage))
                 return;
             next(2, waitingRun);

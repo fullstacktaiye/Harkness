@@ -372,6 +372,12 @@ Kirigami.Page {
                         backend: shell.backend
                         project: shell.project
                         onHideRequested: shell.sidePanelExpanded = false
+                        // The Runs view pages through the store rather than
+                        // subscribing to it, so a run started next door stays
+                        // invisible there until something asks again. Starting
+                        // and finishing one are the two moments this window
+                        // knows about, and both change what that list says.
+                        onRunActivity: runsPanel.refresh()
                     }
 
                     // Last in the bar because it is the one view that is not

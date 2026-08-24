@@ -2319,6 +2319,37 @@ mod tests {
     }
 
     #[test]
+    fn an_artifact_whose_bytes_changed_is_not_offered_inline_either() {
+        let (_fixture, data_dir, store, task) = seeded();
+        let run = recorded_run(&store, &task, ExecutionState::Succeeded, 1);
+        let mut sink = store
+            .create_artifact(run, "notes.txt", "text/plain", at(4))
+            .unwrap();
+        sink.write_all(b"original").unwrap();
+        let artifact = sink.finish().unwrap();
+        // The row records what was true at finalization and is never updated,
+        // so the size the reader would be shown is not the size on disk. What
+        // `excerptable` promises is that the bytes are still the recorded ones.
+        std::fs::write(
+            data_dir
+                .join("artifacts")
+                .join(run.to_string())
+                .join(artifact.id().to_string()),
+            b"rewritten from outside",
+        )
+        .unwrap();
+        drop(store);
+
+        let detail = detail(&data_dir, run);
+
+        assert_eq!(detail.artifacts[0].availability, "size_mismatch");
+        assert!(
+            !detail.artifacts[0].excerptable,
+            "these are not the bytes the row describes"
+        );
+    }
+
+    #[test]
     fn an_unparseable_artifact_identifier_is_refused_before_any_store_opens() {
         assert_eq!(
             parse_artifact("not-a-uuid").unwrap_err().kind,

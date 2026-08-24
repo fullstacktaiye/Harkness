@@ -44,6 +44,48 @@ Kirigami.Page {
     /// reload, because a reader comparing two runs compares the same evidence.
     property int section: 0
 
+    /// The one artifact whose bytes are on screen, or empty.
+    ///
+    /// Held here rather than per row because `excerpt` is one property
+    /// answering for every artifact: two rows open at once would leave the
+    /// older one reading "Hide" over nothing, with nothing on either row saying
+    /// which of them the property is about. Opening one closes the other, which
+    /// a single identifier makes unrepresentable rather than merely enforced.
+    property string openArtifact: ""
+
+    /// The bytes on screen, empty until the read for `openArtifact` answers.
+    ///
+    /// Gated on the identifier here rather than in the delegate, because the
+    /// bridge answers for whichever artifact was asked for last and a row must
+    /// never render another row's content under its own name.
+    readonly property string openArtifactText: {
+        if (page.openArtifact.length === 0
+                || runs.excerpt === undefined || runs.excerpt === null)
+            return "";
+        return String(runs.excerpt.artifactId || "") === page.openArtifact
+            ? String(runs.excerpt.text) : "";
+    }
+
+    /// Whether the bridge cut the rendering now on screen.
+    readonly property bool openArtifactCut: page.openArtifactText.length > 0
+        && runs.excerpt !== undefined && runs.excerpt !== null
+        && runs.excerpt.truncated === true
+
+    /// Puts one artifact's bytes on screen, closing whatever was open.
+    ///
+    /// Naming the artifact already open closes it, so the row's one control
+    /// both opens and hides. The rule lives here rather than in the delegate
+    /// because a pooled delegate is not where state about the page belongs.
+    function showArtifact(artifactId) {
+        const id = String(artifactId || "");
+        if (id.length === 0 || page.openArtifact === id) {
+            page.openArtifact = "";
+            return;
+        }
+        page.openArtifact = id;
+        runs.loadArtifactExcerpt(id);
+    }
+
     title: page.headerTitle
     padding: 0
 
@@ -262,6 +304,8 @@ Kirigami.Page {
     readonly property var artifacts: ready && run.artifacts !== undefined ? run.artifacts : []
     readonly property var approvals: ready && run.approvals !== undefined ? run.approvals : []
     readonly property var truncated: ready && run.truncated !== undefined ? run.truncated : []
+    /// Later attempts at the same task, oldest first, as the bridge lists them.
+    readonly property var retries: ready && run.retries !== undefined ? run.retries : []
 
     /// The unanswered request a parked run is waiting on, or null.
     ///
@@ -313,6 +357,9 @@ Kirigami.Page {
     /// thousand-event run creates delegates only for its visible region is a
     /// property of this view and of nothing the model can be asked.
     readonly property alias timelineView: events
+    /// The artifacts list, exposed for the same reason: whether its rows exist
+    /// and render is a property of the view rather than of the projection.
+    readonly property alias artifactView: artifactList
 
     readonly property bool cancellable: ready && runState.pending(runStateValue)
     readonly property bool retryable: ready && run.retryable === true
@@ -358,6 +405,11 @@ Kirigami.Page {
 
     /// Reads the run this page is pointed at, from both of its sources.
     function select() {
+        // A new run is a new set of artifacts, so the identifier held here
+        // names none of them. Cleared on a re-target and not on a reload: a
+        // reload is the header catching up, and collapsing what the reader has
+        // open every time a live run appends an event would be unusable.
+        page.openArtifact = "";
         reload();
         timeline.select(page.runId);
     }
@@ -603,6 +655,19 @@ Kirigami.Page {
                         text: qsTr("Re-attempt of an earlier run")
                         visible: page.ready && String(page.run.retryOf || "").length > 0
                         onClicked: applicationWindow().showRun(String(page.run.retryOf))
+                    }
+
+                    // The other direction. "Was this already re-attempted, and
+                    // how did that go" is the question a reader arrives at a
+                    // failed run with, and the answer is a run of its own; the
+                    // newest is the one that has the most to say.
+                    Controls.ToolButton {
+                        Controls.ToolTip.text: qsTr("Open the newest re-attempt of this run")
+                        Controls.ToolTip.visible: hovered
+                        text: qsTr("Re-attempted since")
+                        visible: page.retries.length > 0
+                        onClicked: applicationWindow().showRun(
+                            String(page.retries[page.retries.length - 1]))
                     }
                 }
             }
@@ -1303,27 +1368,19 @@ Kirigami.Page {
 
                             required property var modelData
 
-                            property bool expanded: false
-
+                            readonly property bool expanded:
+                                page.openArtifact === String(modelData.artifactId)
                             readonly property bool available:
                                 String(modelData.availability) === "available"
-                            /// The loaded excerpt, but only while it is this
-                            /// row's: one property answers for every artifact.
-                            readonly property string excerpt: {
-                                if (!expanded || runs.excerpt === undefined
-                                        || runs.excerpt === null)
-                                    return "";
-                                return String(runs.excerpt.artifactId || "")
-                                    === String(modelData.artifactId)
-                                    ? String(runs.excerpt.text) : "";
-                            }
+                            /// The loaded excerpt, which is this row's only
+                            /// while this row is the one that is open.
+                            readonly property string excerpt: expanded
+                                ? page.openArtifactText
+                                : ""
 
                             implicitHeight: artifactBody.implicitHeight
                                 + Kirigami.Units.smallSpacing * 2
                             width: ListView.view.width
-
-                            ListView.onPooled: expanded = false
-                            ListView.onReused: expanded = false
 
                             ColumnLayout {
                                 id: artifactBody
@@ -1413,21 +1470,15 @@ Kirigami.Page {
                                         // textual is ever rendered inline, and
                                         // nothing here is ever executed.
                                         visible: artifactRow.modelData.excerptable === true
-                                        onClicked: {
-                                            artifactRow.expanded = !artifactRow.expanded;
-                                            if (artifactRow.expanded)
-                                                runs.loadArtifactExcerpt(
-                                                    String(artifactRow.modelData.artifactId));
-                                        }
+                                        onClicked: page.showArtifact(
+                                            String(artifactRow.modelData.artifactId))
                                     }
                                 }
 
                                 BoundedText {
                                     Layout.fillWidth: true
                                     content: artifactRow.excerpt
-                                    cut: artifactRow.excerpt.length > 0
-                                        && runs.excerpt !== undefined && runs.excerpt !== null
-                                        && runs.excerpt.truncated === true
+                                    cut: artifactRow.expanded && page.openArtifactCut
                                 }
                             }
                         }
