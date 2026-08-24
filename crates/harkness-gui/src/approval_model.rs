@@ -120,7 +120,10 @@ pub mod ffi {
 use std::pin::Pin;
 
 use cxx_qt::{CxxQtType, Threading, casting::Upcast};
-use cxx_qt_lib::{QByteArray, QHash, QHashPair_i32_QByteArray, QModelIndex, QString, QVariant};
+use cxx_qt_lib::{
+    QByteArray, QHash, QHashPair_i32_QByteArray, QMap, QMapPair_QString_QVariant, QModelIndex,
+    QString, QVariant,
+};
 
 use harkness_runtime::approval::ApprovalRequest;
 
@@ -236,6 +239,36 @@ pub(crate) fn approval_row(request: &ApprovalRequest) -> ApprovalRow {
             .map(|id| id.to_string())
             .unwrap_or_default(),
     }
+}
+
+/// One row as a map keyed by the model's own role names.
+///
+/// A run's detail page names the approval it is parked on with the same words
+/// the queue uses, so it reads this projection rather than a second one beside
+/// it. Every key is a role name from [`model_roles`], which the test below
+/// asserts.
+pub(crate) fn row_map(row: &ApprovalRow) -> QMap<QMapPair_QString_QVariant> {
+    let mut map = QMap::<QMapPair_QString_QVariant>::default();
+    let mut text = |key: &str, value: &str| {
+        map.insert(QString::from(key), QVariant::from(&QString::from(value)));
+    };
+    text("approvalId", &row.approval_id);
+    text("runId", &row.run_id);
+    text("toolCallId", &row.tool_call_id);
+    text("tool", &row.tool);
+    text("toolId", &row.tool_id);
+    text("toolVersion", &row.tool_version);
+    text("risk", &row.risk);
+    text("scope", &row.scope);
+    text("requestedScope", &row.requested_scope);
+    text("capabilities", &row.capabilities);
+    text("summary", &row.summary);
+    text("requested", &row.requested);
+    text("expires", &row.expires);
+    text("workspace", &row.workspace);
+    text("projectId", &row.project_id);
+    map.insert(QString::from("downgraded"), QVariant::from(&row.downgraded));
+    map
 }
 
 /// Reads the pending queue off the Qt thread.
@@ -445,7 +478,7 @@ mod tests {
         APPROVAL_ID_ROLE, CAPABILITIES_ROLE, DISPLAY_ROLE, DOWNGRADED_ROLE, EXPIRES_ROLE,
         PROJECT_ROLE, REQUESTED_ROLE, REQUESTED_SCOPE_ROLE, RISK_ROLE, RUN_ID_ROLE, SCOPE_ROLE,
         SUMMARY_ROLE, TOOL_CALL_ID_ROLE, TOOL_ID_ROLE, TOOL_ROLE, TOOL_VERSION_ROLE,
-        WORKSPACE_ROLE, approval_row, load_pending_in, model_roles,
+        WORKSPACE_ROLE, approval_row, load_pending_in, model_roles, row_map,
     };
 
     fn at(seconds: i64) -> OffsetDateTime {
@@ -498,6 +531,23 @@ mod tests {
         ] {
             assert_eq!(roles.get(&role), Some(QByteArray::from(name)));
         }
+    }
+
+    #[test]
+    fn the_banner_projection_uses_exactly_the_role_names_a_delegate_binds_to() {
+        let map = row_map(&approval_row(&request("process.exec")));
+
+        let mut expected: Vec<String> = model_roles()
+            .iter()
+            .map(|(_, name)| name.to_string())
+            // `display` is Qt's own role for accessibility tooling and names no
+            // field of its own; every other role is a field a banner shows.
+            .filter(|name| name != "display")
+            .collect();
+        expected.sort();
+        let mut published: Vec<String> = map.iter().map(|(key, _)| key.to_string()).collect();
+        published.sort();
+        assert_eq!(published, expected);
     }
 
     #[test]

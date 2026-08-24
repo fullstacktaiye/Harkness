@@ -272,21 +272,60 @@ Kirigami.ApplicationWindow {
         }
     }
 
+    /// The project shell wherever it is in the stack, or null.
+    ///
+    /// Found by walking rather than read off `currentItem`: a run's detail page
+    /// is pushed *above* the shell, and a refresh arriving while it is on screen
+    /// would otherwise stack a second shell on top of the page the reader is on.
+    function shellPage() {
+        for (let index = 0; index < pageStack.depth; ++index) {
+            const candidate = pageStack.get(index);
+            if (candidate && candidate.isShell === true)
+                return candidate;
+        }
+        return null;
+    }
+
+    /// Opens one run's detail page, from wherever the run was named.
+    ///
+    /// Both entry points — the shell's Runs view and the launcher's recent runs
+    /// — come through here, so one run has one detail surface however it was
+    /// reached. Opening a second run replaces the page rather than stacking
+    /// another, so Back stays one step from where the reader started.
+    function showRun(runId) {
+        const id = String(runId || "");
+        if (id.length === 0)
+            return;
+        if (pageStack.currentItem && pageStack.currentItem.isRunDetail === true) {
+            if (pageStack.currentItem.runId === id)
+                return;
+            pageStack.pop();
+        }
+        pageStack.push(Qt.resolvedUrl("RunDetailPage.qml"), {
+            "backend": appBackend,
+            "runId": id
+        });
+    }
+
     onOpenedProjectChanged: {
         const id = openedProject && openedProject.id !== undefined ? String(openedProject.id) : "";
         if (id.length > 0) {
             // A refresh re-sets `opened` for the project already on screen;
             // update that page instead of stacking a duplicate.
-            if (pageStack.depth > 1 && pageStack.currentItem.isShell === true) {
-                pageStack.currentItem.project = openedProject;
+            const shell = root.shellPage();
+            if (shell !== null) {
+                shell.project = openedProject;
             } else {
                 pageStack.push(Qt.resolvedUrl("ProjectShellPage.qml"), {
                     "backend": appBackend,
                     "project": openedProject
                 });
             }
-        } else if (pageStack.depth > 1) {
-            pageStack.pop();
+        } else {
+            // Closing the project unwinds everything above the launcher, which
+            // is more than one page whenever a run's detail is open.
+            while (pageStack.depth > 1)
+                pageStack.pop();
         }
     }
 

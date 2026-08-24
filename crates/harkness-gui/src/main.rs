@@ -55,6 +55,1079 @@ pub(crate) mod tests {
     use git2::{Repository, Signature};
     use tempfile::TempDir;
 
+    /// The runs one seeded store holds, by what each of them is there to prove.
+    #[allow(dead_code)]
+    pub(crate) struct SeededRuns {
+        failed: String,
+        waiting: String,
+        interrupted: String,
+        running: String,
+        paged: String,
+        progressed: String,
+    }
+
+    /// Events a run needs before its timeline can be said to page.
+    ///
+    /// Six pages of the model's own `TIMELINE_PAGE_SIZE`, so the newest page is
+    /// full, backwards paging has somewhere to go, and the count is far enough
+    /// above a screenful that a delegate count near it would mean the view had
+    /// materialized the whole log.
+    #[allow(dead_code)]
+    const PAGED_RUN_EVENTS: usize = 1200;
+
+    /// Progress ticks one call reports in a row.
+    #[allow(dead_code)]
+    const FOLDED_PROGRESS_TICKS: usize = 100;
+
+    /// Records the runs the run-surface fixtures render.
+    ///
+    /// Written through the real store rather than through hand-built JSON: the
+    /// point of these tests is that the pages render what the runtime persists,
+    /// and a fixture that skipped the domain's validation could describe a run
+    /// that cannot exist.
+    #[allow(dead_code)]
+    fn seed_run_fixtures(data_dir: &Path) -> SeededRuns {
+        use harkness_runtime::approval::{
+            ApprovalRequest, PendingApproval, WorkspaceBinding, canonical_input_hash,
+        };
+        use harkness_runtime::domain::{
+            ExecutionState, Failure, Run, RunId, Step, Task, TaskId, ToolCall, ToolCallState,
+        };
+        use harkness_runtime::store::{EventKind, RunEvent, Store};
+        use harkness_runtime::tool::{Capability, RiskLevel, ToolIdentity};
+        use serde_json::json;
+        use std::io::Write as _;
+        use time::OffsetDateTime;
+
+        let at =
+            |seconds: i64| OffsetDateTime::from_unix_timestamp(1_755_000_000 + seconds).unwrap();
+        let store = Store::open(data_dir).unwrap();
+        let task = Task::with_id(
+            TaskId::new(),
+            "Check: cargo test --workspace",
+            data_dir.join("workspace"),
+            None,
+            at(0),
+        );
+        store.insert_task(&task).unwrap();
+
+        // --- A finished run that failed, with everything a page can show ----
+        let failed = Run::with_id(RunId::new(), task.id(), at(1));
+        store.insert_run(&failed).unwrap();
+        store
+            .transition_run(failed.id(), ExecutionState::Running, at(2))
+            .unwrap();
+        let step = Step::new(failed.id(), 0, "run the check", at(3));
+        store.insert_step(&step).unwrap();
+        let read = ToolCall::new(
+            &step,
+            "fs.read_file",
+            "1.0.0",
+            json!({"path": "Cargo.toml"}),
+            at(4),
+        );
+        store.insert_tool_call(&read).unwrap();
+        store
+            .transition_tool_call(read.id(), ToolCallState::Running, at(5))
+            .unwrap();
+        store
+            .succeed_tool_call(read.id(), json!({"bytes": 42}), at(6))
+            .unwrap();
+        let exec = ToolCall::new(
+            &step,
+            "process.exec",
+            "1.0.0",
+            json!({"argv": ["cargo", "test"]}),
+            at(7),
+        );
+        store.insert_tool_call(&exec).unwrap();
+        store
+            .transition_tool_call(exec.id(), ToolCallState::Running, at(8))
+            .unwrap();
+        store
+            .fail_tool_call(
+                exec.id(),
+                Failure::new("tool_failed", MARKUP_MESSAGE),
+                at(9),
+            )
+            .unwrap();
+        // Three artifacts: one small and textual, one nobody may render inline,
+        // and one whose bytes are removed after the row is written.
+        let mut log = store
+            .create_artifact(failed.id(), "stdout.log", "text/plain", at(10))
+            .unwrap()
+            .for_step(step.id())
+            .for_tool_call(exec.id());
+        log.write_all(b"running 1 test\ntest failed\n").unwrap();
+        let log = log.finish().unwrap();
+        let mut binary = store
+            .create_artifact(failed.id(), "core", "application/octet-stream", at(11))
+            .unwrap();
+        binary.write_all(&[0, 159, 146, 150]).unwrap();
+        binary.finish().unwrap();
+        let mut gone = store
+            .create_artifact(failed.id(), "removed.log", "text/plain", at(12))
+            .unwrap();
+        gone.write_all(b"deleted out from under the row\n").unwrap();
+        let gone = gone.finish().unwrap();
+        fs::remove_file(
+            data_dir
+                .join("artifacts")
+                .join(failed.id().to_string())
+                .join(gone.id().to_string()),
+        )
+        .unwrap();
+        store
+            .append_events(
+                failed.id(),
+                [
+                    RunEvent::new(EventKind::RunStateChanged, at(2))
+                        .with_payload(json!({"state": "running"})),
+                    RunEvent::new(EventKind::AgentAction, at(3))
+                        .with_payload(json!({"action": "call_tool", "tool": "fs.read_file"})),
+                    RunEvent::new(EventKind::StepStarted, at(3)).for_step(step.id()),
+                    RunEvent::new(EventKind::PolicyDecision, at(4))
+                        .for_step(step.id())
+                        .for_tool_call(read.id())
+                        .with_payload(json!({"verdict": "allow", "source": "built_in"})),
+                    RunEvent::new(EventKind::ToolCallStateChanged, at(6))
+                        .for_step(step.id())
+                        .for_tool_call(read.id())
+                        .with_payload(json!({"state": "succeeded"})),
+                    RunEvent::new(EventKind::ToolProgress, at(8))
+                        .for_step(step.id())
+                        .for_tool_call(exec.id())
+                        .with_payload(json!({"line": "compiling harkness-gui"})),
+                    RunEvent::new(EventKind::ArtifactCreated, at(10))
+                        .for_step(step.id())
+                        .for_tool_call(exec.id())
+                        .for_artifact(log.id())
+                        .with_payload(json!({"name": "stdout.log", "bytes": 26})),
+                    // The event the untrusted-text criterion is about: markup,
+                    // an ampersand, and a control character, kept verbatim.
+                    RunEvent::new(EventKind::Diagnostic, at(11))
+                        .with_payload(json!({"message": MARKUP_MESSAGE})),
+                    RunEvent::new(EventKind::SnapshotCaptured, at(12))
+                        .with_payload(json!({"digest": "0f0f"})),
+                    // A kind this build does not define, which must render as an
+                    // entry rather than being dropped.
+                    RunEvent::new(EventKind::parse("from_a_later_build"), at(12))
+                        .with_payload(json!({"whatever": true})),
+                    RunEvent::new(EventKind::StepFinished, at(13))
+                        .for_step(step.id())
+                        .with_payload(json!({"state": "failed"})),
+                    RunEvent::new(EventKind::RunStateChanged, at(13))
+                        .with_payload(json!({"state": "failed"})),
+                ],
+            )
+            .unwrap();
+        store
+            .fail_step(
+                step.id(),
+                Failure::new("tool_failed", MARKUP_MESSAGE),
+                at(13),
+            )
+            .unwrap();
+        store
+            .fail_run(
+                failed.id(),
+                Failure::new("tool_failed", MARKUP_MESSAGE),
+                at(13),
+            )
+            .unwrap();
+
+        // --- A run parked on an unanswered approval -------------------------
+        let waiting = Run::with_id(RunId::new(), task.id(), at(20));
+        store.insert_run(&waiting).unwrap();
+        store
+            .transition_run(waiting.id(), ExecutionState::Running, at(21))
+            .unwrap();
+        let waiting_step = Step::new(waiting.id(), 0, "run the check", at(22));
+        store.insert_step(&waiting_step).unwrap();
+        let waiting_call = ToolCall::new(
+            &waiting_step,
+            "process.exec",
+            "1.0.0",
+            json!({"argv": ["cargo", "test"]}),
+            at(23),
+        );
+        store.insert_tool_call(&waiting_call).unwrap();
+        store
+            .transition_tool_call(waiting_call.id(), ToolCallState::AwaitingApproval, at(24))
+            .unwrap();
+        store
+            .open_approval(
+                ApprovalRequest::open(
+                    PendingApproval::new(
+                        waiting.id(),
+                        waiting_call.id(),
+                        ToolIdentity::parse("process.exec", "1.0.0").unwrap(),
+                        canonical_input_hash(&json!({"argv": ["cargo", "test"]})).unwrap(),
+                        WorkspaceBinding::new(None, data_dir.join("workspace")),
+                        RiskLevel::Execute,
+                        at(24),
+                    )
+                    .summarized_as("cargo test --workspace")
+                    .with_capabilities([Capability::new("process.spawn").unwrap()]),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        store
+            .transition_run(waiting.id(), ExecutionState::WaitingForApproval, at(25))
+            .unwrap();
+
+        // --- A run whose owning process stopped mid-call --------------------
+        let interrupted = Run::with_id(RunId::new(), task.id(), at(30));
+        store.insert_run(&interrupted).unwrap();
+        store
+            .transition_run(interrupted.id(), ExecutionState::Running, at(31))
+            .unwrap();
+        let interrupted_step = Step::new(interrupted.id(), 0, "run the check", at(32));
+        store.insert_step(&interrupted_step).unwrap();
+        let interrupted_call = ToolCall::new(
+            &interrupted_step,
+            "process.exec",
+            "1.0.0",
+            json!({"argv": ["cargo", "test"]}),
+            at(33),
+        );
+        store.insert_tool_call(&interrupted_call).unwrap();
+        store
+            .transition_tool_call(interrupted_call.id(), ToolCallState::Running, at(34))
+            .unwrap();
+        store
+            .transition_tool_call(interrupted_call.id(), ToolCallState::Interrupted, at(35))
+            .unwrap();
+        store
+            .append_event(
+                interrupted.id(),
+                RunEvent::new(EventKind::RunInterrupted, at(35))
+                    .with_payload(json!({"reason": "lease_released"})),
+            )
+            .unwrap();
+        store
+            .transition_run(interrupted.id(), ExecutionState::Interrupted, at(35))
+            .unwrap();
+
+        // --- A run still executing, which nothing may re-attempt ------------
+        let running = Run::with_id(RunId::new(), task.id(), at(40));
+        store.insert_run(&running).unwrap();
+        store
+            .transition_run(running.id(), ExecutionState::Running, at(41))
+            .unwrap();
+        let running_step = Step::new(running.id(), 0, "run the check", at(42));
+        store.insert_step(&running_step).unwrap();
+        let running_call = ToolCall::new(
+            &running_step,
+            "process.exec",
+            "1.0.0",
+            json!({"argv": ["cargo", "test", "--workspace"]}),
+            at(43),
+        );
+        store.insert_tool_call(&running_call).unwrap();
+        store
+            .transition_tool_call(running_call.id(), ToolCallState::Running, at(44))
+            .unwrap();
+        store
+            .append_events(
+                running.id(),
+                [
+                    RunEvent::new(EventKind::RunStateChanged, at(41))
+                        .with_payload(json!({"state": "running"})),
+                    RunEvent::new(EventKind::StepStarted, at(42)).for_step(running_step.id()),
+                    RunEvent::new(EventKind::ToolCallStateChanged, at(44))
+                        .for_step(running_step.id())
+                        .for_tool_call(running_call.id())
+                        .with_payload(json!({"state": "running"})),
+                ],
+            )
+            .unwrap();
+        store
+            .append_events(
+                running.id(),
+                (0..8).map(|index| {
+                    RunEvent::new(EventKind::ToolProgress, at(45))
+                        .for_step(running_step.id())
+                        .for_tool_call(running_call.id())
+                        .with_payload(json!({"line": format!("Compiling harkness-crate-{index}")}))
+                }),
+            )
+            .unwrap();
+
+        // --- A run long enough that its timeline has to page ----------------
+        let paged = Run::with_id(RunId::new(), task.id(), at(50));
+        store.insert_run(&paged).unwrap();
+        store
+            .transition_run(paged.id(), ExecutionState::Running, at(51))
+            .unwrap();
+        store
+            .append_events(
+                paged.id(),
+                (0..PAGED_RUN_EVENTS).map(|index| {
+                    RunEvent::new(EventKind::Diagnostic, at(52))
+                        .with_payload(json!({"index": index}))
+                }),
+            )
+            .unwrap();
+        store
+            .transition_run(paged.id(), ExecutionState::Succeeded, at(53))
+            .unwrap();
+
+        // --- A run whose one call reported a hundred progress lines ---------
+        let progressed = Run::with_id(RunId::new(), task.id(), at(60));
+        store.insert_run(&progressed).unwrap();
+        store
+            .transition_run(progressed.id(), ExecutionState::Running, at(61))
+            .unwrap();
+        let progress_step = Step::new(progressed.id(), 0, "run the check", at(62));
+        store.insert_step(&progress_step).unwrap();
+        let progress_call = ToolCall::new(
+            &progress_step,
+            "process.exec",
+            "1.0.0",
+            json!({"argv": ["cargo", "build"]}),
+            at(63),
+        );
+        store.insert_tool_call(&progress_call).unwrap();
+        store
+            .append_event(
+                progressed.id(),
+                RunEvent::new(EventKind::StepStarted, at(62)).for_step(progress_step.id()),
+            )
+            .unwrap();
+        store
+            .append_events(
+                progressed.id(),
+                (0..FOLDED_PROGRESS_TICKS).map(|index| {
+                    RunEvent::new(EventKind::ToolProgress, at(63))
+                        .for_step(progress_step.id())
+                        .for_tool_call(progress_call.id())
+                        .with_payload(json!({"line": format!("compiling crate {index}")}))
+                }),
+            )
+            .unwrap();
+        store
+            .transition_run(progressed.id(), ExecutionState::Succeeded, at(64))
+            .unwrap();
+
+        drop(store);
+        SeededRuns {
+            failed: failed.id().to_string(),
+            waiting: waiting.id().to_string(),
+            interrupted: interrupted.id().to_string(),
+            running: running.id().to_string(),
+            paged: paged.id().to_string(),
+            progressed: progressed.id().to_string(),
+        }
+    }
+
+    /// A failure message carrying the three things a renderer must not act on:
+    /// markup, an entity-shaped ampersand, and a control character.
+    #[allow(dead_code)]
+    const MARKUP_MESSAGE: &str = "<b>alert</b> & \u{7}the tool exited 1";
+
+    /// Drives the run surfaces against a seeded store under a real event loop.
+    ///
+    /// Its own test binary rather than another block of `main_qml_loads`,
+    /// because every read these pages perform is asynchronous by construction —
+    /// a store open is a blocking call and belongs on a worker — so nothing here
+    /// can be checked without `exec()` running. `default_branch_push_repro` is
+    /// the same shape for the same reason.
+    ///
+    /// The fixture reports through `objectName`, the convention the other QML
+    /// checks in this file use: a failure names every check that did not hold
+    /// rather than stopping at the first.
+    #[allow(dead_code)]
+    pub(crate) fn run_surfaces() {
+        let fixture = TempDir::new().unwrap();
+        let data_dir = fixture.path().join("data");
+
+        // SAFETY: set before any Qt object is constructed, and this binary runs
+        // single-threaded with respect to Qt and environment usage.
+        unsafe {
+            std::env::set_var("QT_QPA_PLATFORM", "offscreen");
+            std::env::set_var("QT_FORCE_STDERR_LOGGING", "1");
+            std::env::set_var("QT_FATAL_WARNINGS", "1");
+            std::env::set_var("HARKNESS_DATA_DIR", &data_dir);
+        }
+        let seeded = seed_run_fixtures(&data_dir);
+
+        cxx_qt::init_qml_module!("io.github.fullstacktaiye.harkness");
+        let mut app = QGuiApplication::new();
+        let mut engine = QQmlApplicationEngine::new();
+
+        static LOADED: AtomicBool = AtomicBool::new(false);
+        static ROOT: AtomicPtr<QObject> = AtomicPtr::new(ptr::null_mut());
+        if let Some(mut engine) = engine.as_mut() {
+            let _connection = engine.as_mut().on_object_created(|_engine, object, _url| {
+                LOADED.store(!object.is_null(), Ordering::SeqCst);
+                ROOT.store(object, Ordering::SeqCst);
+            });
+            let qml = String::from_utf8(RUN_SURFACES_QML.to_vec())
+                .unwrap()
+                // Set by `docs/screenshots`' regeneration and by nothing else;
+                // the checks below run either way, so a screenshot pass is the
+                // same evidence with images taken along the way.
+                .replace(
+                    "__SCREENSHOT_DIR__",
+                    &std::env::var("HARKNESS_RUN_SCREENSHOT_DIR")
+                        .unwrap_or_default()
+                        .replace('\\', "\\\\")
+                        .replace('"', "\\\""),
+                )
+                .replace("__FAILED_RUN__", &seeded.failed)
+                .replace("__WAITING_RUN__", &seeded.waiting)
+                .replace("__INTERRUPTED_RUN__", &seeded.interrupted)
+                .replace("__RUNNING_RUN__", &seeded.running)
+                .replace("__PAGED_RUN__", &seeded.paged)
+                .replace("__PROGRESSED_RUN__", &seeded.progressed);
+            engine.as_mut().load_data(
+                &QByteArray::from(qml.as_bytes()),
+                &QUrl::from("qrc:/RunSurfaces.qml"),
+            );
+        }
+        assert!(
+            LOADED.load(Ordering::SeqCst),
+            "the run-surface fixture failed to load; see QML warnings above"
+        );
+        if let Some(app) = app.as_mut() {
+            app.exec();
+        }
+        let name = unsafe { ROOT.load(Ordering::SeqCst).as_ref() }
+            .map(|object| object.object_name().to_string())
+            .unwrap_or_default();
+        assert_eq!(name, "RunSurfacesPassed", "run-surface checks failed");
+    }
+
+    /// The run-surface fixture, with one run identifier substituted per marker.
+    #[allow(dead_code)]
+    const RUN_SURFACES_QML: &[u8] = br#"
+import QtQuick
+import org.kde.kirigami as Kirigami
+import io.github.fullstacktaiye.harkness
+
+Kirigami.ApplicationWindow {
+    id: window
+
+    objectName: "RunSurfacesPending"
+    visible: true
+    width: 1180
+    height: 820
+
+    pageStack.columnView.columnResizeMode: Kirigami.ColumnView.SingleColumn
+    pageStack.globalToolBar.style: Kirigami.ApplicationHeaderStyle.None
+
+    property var failures: []
+    property int phase: 0
+    property int settled: 0
+    property int pendingGrabs: 0
+    property bool grabbing: false
+    property var openedPage: null
+    property string excerptableArtifact: ""
+    property bool overlapIssued: false
+    property bool narrowed: false
+    property bool cancelPressed: false
+    property int cancelPolls: 0
+
+    readonly property int wideWidth: 1180
+    /// Narrower than the two halves of the detail page's body can both be, so
+    /// the split has to turn rather than clip one of them.
+    readonly property int narrowWidth: Kirigami.Units.gridUnit * 30
+
+    /// Where to write the pages as images, or empty to write none.
+    ///
+    /// A screenshot pass runs the same checks; it only waits a few frames
+    /// longer at each page so what it grabs is laid out rather than half bound.
+    readonly property string screenshotDir: "__SCREENSHOT_DIR__"
+    readonly property bool capturing: screenshotDir.length > 0
+
+    /// Whether this page has been written out, and true at once when nothing is
+    /// being captured.
+    ///
+    /// Called last in a phase, after its checks: `grabToImage` renders on a
+    /// later frame, so a phase that moved on as soon as it asked for an image
+    /// would save the page it moved *to*.
+    function captured(name, item) {
+        if (!capturing)
+            return true;
+        if (!grabbing) {
+            grabbing = true;
+            pendingGrabs += 1;
+            item.grabToImage(function (result) {
+                if (!result.saveToFile(screenshotDir + "/" + name + ".png"))
+                    check("wroteTheScreenshot_" + name, false);
+                pendingGrabs -= 1;
+            });
+            return false;
+        }
+        if (pendingGrabs > 0)
+            return false;
+        grabbing = false;
+        return true;
+    }
+
+    /// Whether the page in front of the fixture has had time to lay out.
+    ///
+    /// Only a capturing pass waits: an ordinary run has nothing to look at and
+    /// pays seven times this delay for nothing.
+    function composed() {
+        if (!capturing)
+            return true;
+        if (settled < 6) {
+            settled += 1;
+            return false;
+        }
+        return true;
+    }
+
+    readonly property string failedRun: "__FAILED_RUN__"
+    readonly property string waitingRun: "__WAITING_RUN__"
+    readonly property string interruptedRun: "__INTERRUPTED_RUN__"
+    readonly property string runningRun: "__RUNNING_RUN__"
+    readonly property string pagedRun: "__PAGED_RUN__"
+    readonly property string progressedRun: "__PROGRESSED_RUN__"
+
+    readonly property var detail: detailPage
+    readonly property bool detailReady: detail.runId === window.currentRun && detail.ready
+        && detail.timelineView.count > 0
+
+    function check(name, passed) {
+        // A phase is re-entered while it waits for its image to be written, so
+        // a failing check is recorded once rather than once per poll.
+        if (!passed && failures.indexOf(name) === -1)
+            failures.push(name);
+    }
+
+    function finish() {
+        poll.stop();
+        deadline.stop();
+        window.objectName = failures.length === 0
+            ? "RunSurfacesPassed"
+            : "RunSurfacesFailed[" + failures.join(",") + "]";
+        Qt.quit();
+    }
+
+    /// The run the detail page is pointed at.
+    ///
+    /// Every route to a run - the shell's Runs view, the launcher's list, and
+    /// a re-attempt link - goes through `showRun`, so one detail page shows
+    /// whichever run was named last. Main.qml pushes a page per run instead;
+    /// what both share, and what the criterion is about, is that naming a run
+    /// from either entry point lands on one RunDetailPage for that run rather
+    /// than on two.
+    property string currentRun: ""
+
+    function showRun(runId) {
+        const id = String(runId || "");
+        if (id.length === 0)
+            return;
+        window.currentRun = id;
+    }
+
+    pageStack.initialPage: Kirigami.Page {
+        padding: 0
+
+        RunState {
+            id: vocabulary
+        }
+
+        // The launcher's recent-runs body, wired the way the launcher wires it.
+        RunListPane {
+            id: launcherPane
+
+            anchors.fill: parent
+            compact: true
+            visible: window.currentRun.length === 0
+            onRunActivated: runId => window.showRun(runId)
+        }
+
+        RunDetailPage {
+            id: detailPage
+
+            anchors.fill: parent
+            runId: window.currentRun
+            visible: window.currentRun.length > 0
+        }
+    }
+
+    // A bridge of its own, so the overlapping-load check drives it without
+    // disturbing the page the earlier phases asserted against.
+    RunsBackend {
+        id: overlap
+    }
+
+    // The Runs view inside the host the shell puts it in. `runsPanel` above is
+    // the view on its own; this is its side-panel *contract* - the activity bar
+    // reads these members off it, and a view the host cannot resolve is one the
+    // bar cannot switch to.
+    SidePanel {
+        id: hostedPanel
+
+        anchors.right: parent.right
+        anchors.top: parent.top
+        currentViewId: "runs"
+        height: window.height
+        visible: false
+        width: Kirigami.Units.gridUnit * 30
+
+        RunsPanel {
+            id: hostedRuns
+        }
+    }
+
+    // Stand-ins for the two pages the navigation check needs in a stack. The
+    // shell needs a project catalog behind it and the detail page cannot be
+    // pushed here at all - see the check itself - so each is reduced to the
+    // property Main.qml actually looks for.
+    Component {
+        id: shellStandIn
+
+        Kirigami.Page {
+            property bool isShell: true
+        }
+    }
+
+    Component {
+        id: detailStandIn
+
+        Kirigami.Page {
+            property bool isRunDetail: true
+            property string runId: ""
+        }
+    }
+
+    // Main.qml itself. The window's own `showRun` above is a stand-in for this
+    // page's benefit; re-implementing the *stack* behaviour is how the
+    // regression Main.qml's version fixes went untested in the first place.
+    Component {
+        id: mainWindow
+
+        // Shown, because an invisible Window has no scene graph and every item
+        // pushed into its stack is reported as a graphical object outside the
+        // scene - a warning, which this binary makes fatal. Offscreen, so
+        // "shown" costs a surface nobody looks at.
+        Main {
+            height: 720
+            visible: true
+            width: 960
+        }
+    }
+
+    // The shell's Runs view, which reaches a page only through `openRun`.
+    RunsPanel {
+        id: runsPanel
+
+        anchors.left: parent.left
+        anchors.top: parent.top
+        height: window.height
+        // On screen only while it is the subject: the rest of the fixture is
+        // about the detail page, which this would otherwise cover.
+        visible: window.phase === 0
+        width: Kirigami.Units.gridUnit * 30
+    }
+
+    Timer {
+        id: poll
+
+        interval: 50
+        repeat: true
+        running: true
+        onTriggered: window.advance()
+    }
+
+    Timer {
+        id: deadline
+
+        interval: 60000
+        repeat: false
+        running: true
+        onTriggered: {
+            window.check("timedOutInPhase" + window.phase, false);
+            window.finish();
+        }
+    }
+
+    /// Moves to the next page, resetting the settling counter with it.
+    function next(step, runId) {
+        settled = 0;
+        grabbing = false;
+        phase = step;
+        if (runId !== undefined)
+            showRun(runId);
+    }
+
+    function advance() {
+        if (phase === 0) {
+            if (launcherPane.loading || launcherPane.count === 0 || !composed())
+                return;
+            check("theLauncherPaneListsEverySeededRun", launcherPane.count === 6);
+            check("theLauncherPaneReportsNoFailure", launcherPane.loadErrorKind.length === 0);
+            // The side-panel contract, which the activity bar reads off the
+            // view rather than being told: a view the host cannot resolve is
+            // one no shortcut and no bar entry can reach.
+            check("theRunsViewIsResolvableByTheHostThatShowsIt",
+                  hostedPanel.view("runs") === hostedRuns);
+            check("theRunsViewIsTheOneTheHostHasOnScreen",
+                  hostedPanel.currentPanel === hostedRuns && hostedPanel.currentPanelReady);
+            check("theRunsViewAppliesToEveryProjectSoTheHostAlwaysHasOne",
+                  hostedPanel.hasAvailableView
+                  && hostedPanel.firstAvailableViewId() === "runs");
+            check("theRunsViewAdvertisesTheShortcutTheShellBinds",
+                  String(hostedRuns.viewShortcut) === "Ctrl+Shift+R");
+            if (!captured("runs-list", runsPanel))
+                return;
+            next(1, failedRun);
+            return;
+        }
+
+        if (phase === 1) {
+            if (!detailReady || !composed())
+                return;
+            check("aFailedRunNamesItsDiscriminant",
+                  String(detail.run.errorKind) === "tool_failed");
+            check("aFailedRunCarriesTheToolsOwnMessage",
+                  String(detail.run.errorMessage).indexOf("<b>alert</b>") !== -1);
+            check("aFailedRunShowsNoApprovalBanner", !detail.approvalBannerVisible);
+            check("aFinishedRunNamesNothingInFlight", detail.inFlightCall === null);
+            check("aRunListsEveryCallItRecorded", detail.calls.length === 2);
+            check("aRunListsEveryArtifactItRecorded", detail.artifacts.length === 3);
+            check("aRunListsNoApprovalItNeverAsked", detail.approvals.length === 0);
+            check("aFailedRunOffersARetry", detail.retryable);
+            check("aFinishedRunOffersNoCancellation", !detail.cancellable);
+            check("theTimelineHoldsEveryRecordedEvent", detail.timelineView.count === 12);
+            check("nothingWasCutFromThisRunsProjection", detail.truncated.length === 0);
+
+            let available = 0;
+            let missing = 0;
+            let excerptable = 0;
+            for (let index = 0; index < detail.artifacts.length; ++index) {
+                const artifact = detail.artifacts[index];
+                if (String(artifact.availability) === "available")
+                    ++available;
+                if (String(artifact.availability) === "missing")
+                    ++missing;
+                if (artifact.excerptable === true) {
+                    ++excerptable;
+                    window.excerptableArtifact = String(artifact.artifactId);
+                }
+                check("everyArtifactRowNamesItsMediaType",
+                      String(artifact.mediaType).length > 0);
+                check("everyArtifactRowNamesWhereItsBytesAre",
+                      String(artifact.path).indexOf("artifacts") !== -1);
+            }
+            check("aDeletedArtifactRendersAsUnavailable", missing === 1);
+            check("thePresentArtifactsStillRead", available === 2);
+            check("onlySmallTextIsOfferedInline", excerptable === 1);
+
+            // Opening a row is the only way a payload is ever read, so the
+            // check is what the reader does: expand the row, ask for its
+            // payload, and wait for it to arrive on that row alone.
+            const row = detailPage.timelineView.itemAtIndex(0);
+            check("theTimelineCreatesDelegatesForTheRowsOnScreen", row !== null);
+            if (row !== null && !row.expanded) {
+                row.expanded = true;
+                detailPage.timelineView.model.loadDetail(row.seq);
+                return;
+            }
+            if (row !== null && row.detail.length === 0)
+                return;
+            check("openingATimelineRowLoadsThatRowsPayload",
+                  row !== null && row.detail.indexOf("state") !== -1);
+
+            // The artifacts section, which no other phase reaches: its rows
+            // are the one place this page renders bytes a tool wrote, so the
+            // delegates have to be built at least once under QT_FATAL_WARNINGS
+            // and the read behind them driven end to end.
+            if (detailPage.section !== 1) {
+                detailPage.section = 1;
+                return;
+            }
+            check("theArtifactsSectionBuildsARowPerArtifact",
+                  detailPage.artifactView.count === 3);
+            if (detailPage.openArtifact.length === 0) {
+                detailPage.showArtifact(window.excerptableArtifact);
+                return;
+            }
+            if (detailPage.openArtifactText.length === 0)
+                return;
+            check("showingAnArtifactRendersTheBytesTheRunStored",
+                  detailPage.openArtifactText.indexOf("running 1 test") !== -1);
+            check("aRenderingInsideTheBudgetIsNotReportedAsCut",
+                  !detailPage.openArtifactCut);
+            // One identifier, so a second artifact cannot also be open; naming
+            // the open one again is how the row's single control hides it.
+            detailPage.showArtifact(window.excerptableArtifact);
+            check("namingTheOpenArtifactAgainClosesIt",
+                  detailPage.openArtifact.length === 0);
+            // Back to the section the screenshot is of.
+            detailPage.section = 0;
+
+            if (!captured("run-failed", detailPage))
+                return;
+            next(2, waitingRun);
+            return;
+        }
+
+        if (phase === 2) {
+            if (!detailReady || !composed())
+                return;
+            check("aParkedRunShowsTheApprovalBanner", detail.approvalBannerVisible);
+            check("aParkedRunNamesTheQuestionItIsWaitingOn",
+                  detail.pendingApproval !== null
+                  && String(detail.pendingApproval.tool).indexOf("process.exec") !== -1);
+            check("aParkedRunOffersCancellation", detail.cancellable);
+            check("aParkedRunOffersNoRetry", !detail.retryable);
+            check("aParkedRunSaysWhyItCannotBeRetried",
+                  detail.retryBlocked === "run_still_active");
+
+            // Reviewing the request is the banner's whole action: it must show
+            // the validated input the parked call is holding, and nothing on
+            // this page may answer the question.
+            if (!detailPage.approvalExpanded) {
+                detailPage.reviewApproval();
+                return;
+            }
+            if (detailPage.approvalInput.length === 0)
+                return;
+            check("reviewingARequestShowsTheInputTheCallIsHolding",
+                  detailPage.approvalInput.indexOf("cargo") !== -1);
+
+            if (!captured("run-approval", detailPage))
+                return;
+            next(3, interruptedRun);
+            return;
+        }
+
+        if (phase === 3) {
+            if (!detailReady || !composed())
+                return;
+            check("anInterruptedRunNamesTheCallThatWasInFlight",
+                  detail.inFlightCall !== null
+                  && String(detail.inFlightCall.toolId) === "process.exec");
+            check("anInterruptedRunOffersARetry", detail.retryable);
+            check("anInterruptedRunShowsNoApprovalBanner", !detail.approvalBannerVisible);
+            if (!captured("run-interrupted", detailPage))
+                return;
+            next(4, runningRun);
+            return;
+        }
+
+        if (phase === 4) {
+            if (!detailReady || !composed())
+                return;
+            check("aRunningRunOffersNoRetry", !detail.retryable);
+            check("aRunningRunSaysWhyItCannotBeRetried",
+                  detail.retryBlocked === "run_still_active");
+            check("aRunningRunShowsNoApprovalBanner", !detail.approvalBannerVisible);
+            check("aRunningRunOffersCancellation", detail.cancellable);
+            if (!captured("run-progress", detailPage))
+                return;
+            next(5, pagedRun);
+            return;
+        }
+
+        if (phase === 5) {
+            if (!detailReady || !composed())
+                return;
+            // One store page of the twelve hundred events recorded, and the
+            // header button is the only thing that reads another.
+            check("aLongTimelineOpensOnOneStorePage", detail.timelineView.count === 200);
+            const delegates = detail.timelineView.contentItem.children.length;
+            check("aLongTimelineMaterializesOnlyItsVisibleRegion",
+                  delegates > 0 && delegates * 2 < detail.timelineView.count);
+
+            // The body's two halves ask for twenty-two and eighteen grid units.
+            // Below their sum there is no side-by-side arrangement that is not
+            // clipping one of them, so the split turns instead.
+            if (!narrowed) {
+                check("aWidePageSplitsItsBodySideBySide", detail.sideBySide);
+                narrowed = true;
+                window.width = narrowWidth;
+                return;
+            }
+            check("aNarrowPageStacksItsHalvesRatherThanClippingOne", !detail.sideBySide);
+            check("aStackedTimelineSpansTheWholeWidth",
+                  detail.timelineView.width > detail.width * 0.8);
+            check("aStackedTimelineLeavesTheRecordsBelowItSomeRoom",
+                  detail.timelineView.height > 0
+                  && detail.timelineView.height < detail.height);
+            window.width = wideWidth;
+
+            next(6, progressedRun);
+            return;
+        }
+
+        if (phase === 6) {
+            if (!detailReady || !composed())
+                return;
+            // One step-started row and one folded progress row: a hundred ticks
+            // of one call cost the reader a single row.
+            check("aHundredProgressTicksAreOneTimelineRow",
+                  detail.timelineView.count === 2);
+            check("markupInAToolsTextIsNeutralizedBeforeItReachesRichText",
+                  vocabulary.escapedRichText("<b>x</b> & y")
+                      === "<span>&lt;b&gt;x&lt;/b&gt; &amp; y</span>");
+            check("aStateThisBuildDoesNotDefineKeepsItsSpelling",
+                  vocabulary.stateLabel("from_a_later_build") === "from_a_later_build");
+            check("anEventKindThisBuildDoesNotDefineKeepsItsSpelling",
+                  vocabulary.eventLabel("from_a_later_build") === "from_a_later_build");
+            // The shell's Runs view reaches a detail page only through this.
+            runsPanel.openRun(failedRun);
+            next(7);
+            return;
+        }
+
+        if (phase === 7) {
+            if (!detailReady || detail.runId !== failedRun)
+                return;
+            openedPage = detail;
+            check("theRunsViewOpensTheRunItNamed", detail.runId === failedRun);
+            // The launcher's list names the same run; both entry points reach
+            // one detail page for one run rather than two.
+            launcherPane.runActivated(failedRun);
+            check("bothEntryPointsOpenOneDetailPageForOneRun",
+                  detail === openedPage && detail.runId === failedRun);
+            next(8);
+            return;
+        }
+
+        if (phase === 8) {
+            // Two questions of different kinds, issued back to back on the Qt
+            // thread so the run detail is unambiguously the newer of them. A
+            // bridge counting staleness once for all three answer properties
+            // drops the excerpt's reply here, leaving the row that asked for it
+            // expanded, empty, and reporting no failure.
+            if (!overlapIssued) {
+                overlapIssued = true;
+                overlap.loadArtifactExcerpt(window.excerptableArtifact);
+                overlap.loadRun(failedRun);
+                return;
+            }
+            if (overlap.busy)
+                return;
+            check("anOverlappedLoadStillAnswersItsOwnQuestion",
+                  overlap.excerpt !== undefined && overlap.excerpt !== null
+                  && String(overlap.excerpt.artifactId) === window.excerptableArtifact);
+            check("theNewerOfTwoOverlappingLoadsAnswersAsWell",
+                  overlap.run !== undefined && overlap.run !== null
+                  && String(overlap.run.runId) === failedRun);
+            // The shared status describes the operation issued last, which is
+            // the one the reader would be watching.
+            check("theSharedStatusDescribesTheNewestOperation",
+                  String(overlap.status).indexOf(failedRun) !== -1);
+            next(9, waitingRun);
+            return;
+        }
+
+        if (phase === 9) {
+            if (!detailReady)
+                return;
+            // Cancelling attaches this process's coordinator, which sweeps
+            // first: every seeded run names no lease, so the sweep can prove
+            // the claim is gone and marks the unfinished ones interrupted. The
+            // cancellation itself is then refused - this coordinator did not
+            // start the run - and both facts are the point. The page has to end
+            // up showing what the store now says rather than what it read
+            // before the button was pressed, whichever way the request went.
+            //
+            // Left until last because the sweep changes the runs the earlier
+            // phases assert against.
+            if (!cancelPressed) {
+                check("theParkedRunReadsAsParkedBeforeAnythingIsPressed",
+                      detail.runStateValue === "waiting_for_approval");
+                cancelPressed = true;
+                detail.cancel();
+                return;
+            }
+            // Bounded, and bounded around *both* waits: a page that never
+            // clears `mutating` is exactly the failure this checks for, and
+            // waiting on it unbounded would report the fixture's deadline
+            // instead of the check that did not hold.
+            cancelPolls += 1;
+            if (cancelPolls < 100
+                    && (detail.mutating
+                        || detail.runStateValue === "waiting_for_approval"))
+                return;
+            check("aMutationMakesThePageReadTheRunAgain",
+                  !detail.mutating && detail.runStateValue === "interrupted");
+            next(10);
+            return;
+        }
+
+        if (phase === 10) {
+            // Main.qml's own stack behaviour, which nothing else here reaches:
+            // this window's `showRun` is a stand-in for the detail page's
+            // benefit, and re-implementing the stack rules rather than
+            // exercising them is how the regression below went untested.
+            //
+            // The pages are built here and pushed as objects. Kirigami's own
+            // push creates a page into `pagesLogic`, a QtObject, and reparents
+            // it a line later - which Qt reports as a graphical object outside
+            // the scene on every push in every Kirigami application, and this
+            // binary makes warnings fatal. That is also why `showRun` is driven
+            // with a detail page already in the stack rather than being asked
+            // to push a real one: what is under test is which page the window
+            // finds, not Kirigami's incubation.
+            const main = mainWindow.createObject(null);
+            check("theWindowLoads", main !== null);
+            if (main === null) {
+                next(11);
+                return;
+            }
+            const shellPage = shellStandIn.createObject(main.pageStack);
+            const detailPageStandIn = detailStandIn.createObject(main.pageStack,
+                                                                 { "runId": failedRun });
+            check("theNavigationStandInsAreBuilt",
+                  shellPage !== null && detailPageStandIn !== null);
+            if (shellPage === null || detailPageStandIn === null) {
+                main.destroy();
+                next(11);
+                return;
+            }
+
+            main.pageStack.push(shellPage);
+            check("theShellIsFoundWhenItIsAlsoTheCurrentPage",
+                  main.shellPage() === shellPage);
+
+            main.pageStack.push(detailPageStandIn);
+            check("aRunDetailSitsAboveTheShellRatherThanReplacingIt",
+                  main.pageStack.depth === 3
+                  && main.pageStack.currentItem === detailPageStandIn);
+            // The regression this branch fixes. `currentItem` is now the detail
+            // page, so a catalog refresh reading it would find no shell and
+            // push a second one over what the reader is looking at; walking the
+            // stack still finds the one that is there.
+            check("theShellIsStillFoundUnderAnOpenRunDetail",
+                  main.shellPage() === shellPage);
+
+            // The two requests `showRun` answers by doing nothing, both read
+            // off the page that is current.
+            main.showRun("");
+            check("namingNoRunAtAllChangesNothing",
+                  main.pageStack.depth === 3
+                  && main.pageStack.currentItem === detailPageStandIn);
+            main.showRun(failedRun);
+            check("namingTheRunAlreadyOpenChangesNothing",
+                  main.pageStack.depth === 3
+                  && main.pageStack.currentItem === detailPageStandIn);
+
+            main.destroy();
+            next(11);
+            return;
+        }
+
+        if (phase === 11) {
+            // Every grab is asynchronous, so the loop ends when the last of
+            // them has written its file rather than when the last check ran.
+            if (pendingGrabs > 0)
+                return;
+            finish();
+        }
+    }
+}
+"#;
+
     /// Loads Main.qml the same way `main` does and asserts the engine
     /// produced a root object, catching broken imports and malformed QML
     /// without a display.

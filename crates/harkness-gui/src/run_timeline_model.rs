@@ -39,6 +39,21 @@
 //! a detached-then-reattached timeline should show is a presentation decision
 //! that belongs with the QML rather than with the bridge.
 //!
+//! # Progress ticks fold
+//!
+//! Consecutive `tool_progress` events of one tool call occupy one row carrying
+//! the newest line and how many ticks it stands for, and a tick arriving at the
+//! tip rewrites that row instead of adding one. A tool that reports a line per
+//! file would otherwise turn a run's timeline into a copy of its own output,
+//! with the state changes either side of it pushed off the screen.
+//!
+//! It is a fold and not a filter: nothing is dropped from the log, the count is
+//! on the row, and `harkness run show` still prints every tick. Only
+//! *consecutive* ticks fold, so anything the run recorded between two of them
+//! keeps them apart. The row remembers the oldest tick it absorbed as well as
+//! the newest, because backwards paging continues from a position in the log and
+//! resuming from the newest would re-read the ticks the row already stands for.
+//!
 //! # The Qt-thread mutation invariant
 //!
 //! Every `RunTimelineModelRust` field is read and written on the Qt thread. The
@@ -148,6 +163,19 @@ pub mod ffi {
         #[qinvokable]
         #[cxx_name = "loadDetail"]
         fn load_detail(self: Pin<&mut RunTimelineModel>, seq: i64);
+
+        /// Emitted when the run's log grew at the tip: rows arrived, or the
+        /// folded progress row already there absorbed ticks it had not seen.
+        ///
+        /// A surface that re-reads something *else* about the run when its
+        /// timeline moves wants this rather than `rowsInserted` or
+        /// `dataChanged`. Both of those also fire for a backwards page, which
+        /// is history that has not changed since it was written, and
+        /// `dataChanged` fires again for a payload arriving on a row that was
+        /// already there — so a page listening to them re-reads the whole run
+        /// every time a reader opens a row or asks for older events.
+        #[qsignal]
+        fn appended(self: Pin<&mut RunTimelineModel>);
     }
 
     impl cxx_qt::Threading for RunTimelineModel {}
@@ -210,6 +238,25 @@ const ARTIFACT_ROLE: i32 = 263;
 const SUMMARY_ROLE: i32 = 264;
 const HAS_DETAIL_ROLE: i32 = 265;
 const DETAIL_ROLE: i32 = 266;
+const PROGRESS_COUNT_ROLE: i32 = 267;
+const OUTCOME_ROLE: i32 = 268;
+
+/// Payload fields an event's outcome is read from, in the order they are tried.
+///
+/// A state change is the same *kind* whether it says `succeeded` or `failed`,
+/// and which of the two it was is the fastest thing to read when scanning a
+/// timeline. The value is carried on the row rather than recovered from the
+/// summary: `summarize` sorts the payload's keys and then clamps the line, so
+/// on an event with many fields the one that decides the colour is exactly what
+/// falls off the end.
+const OUTCOME_FIELDS: [&str; 2] = ["state", "verdict"];
+
+/// The stored spelling of the one kind this model folds.
+///
+/// Named rather than written at each site because the folding rule below is the
+/// only place in the front end that branches on a kind at all, and a typo in one
+/// of three string literals would silently stop it folding.
+const TOOL_PROGRESS_KIND: &str = "tool_progress";
 
 fn model_roles() -> QHash<QHashPair_i32_QByteArray> {
     let mut roles = QHash::<QHashPair_i32_QByteArray>::default();
@@ -224,6 +271,8 @@ fn model_roles() -> QHash<QHashPair_i32_QByteArray> {
     roles.insert(SUMMARY_ROLE, QByteArray::from("summary"));
     roles.insert(HAS_DETAIL_ROLE, QByteArray::from("hasDetail"));
     roles.insert(DETAIL_ROLE, QByteArray::from("detail"));
+    roles.insert(PROGRESS_COUNT_ROLE, QByteArray::from("progressCount"));
+    roles.insert(OUTCOME_ROLE, QByteArray::from("outcome"));
     roles
 }
 
@@ -231,6 +280,14 @@ fn model_roles() -> QHash<QHashPair_i32_QByteArray> {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct TimelineRow {
     seq: u64,
+    /// Sequence of the oldest event this row stands for.
+    ///
+    /// Equal to `seq` for every row but a folded run of progress ticks, where
+    /// it is the first tick's. Backwards paging continues from *this* number
+    /// rather than from `seq`, because a cursor of the newest folded tick would
+    /// re-read the ticks the row already absorbed and show them again as rows
+    /// of their own.
+    first_seq: u64,
     kind: String,
     recognized: bool,
     at: String,
@@ -242,6 +299,33 @@ pub(crate) struct TimelineRow {
     has_detail: bool,
     /// The payload rendering, empty until `loadDetail` attached it.
     detail: String,
+    /// How many progress ticks this row stands for; zero for anything else.
+    ///
+    /// One for a single tick, so a reader can tell "a progress event" from "a
+    /// row that is not about progress" without matching on the kind text.
+    progress_count: u32,
+    /// The state or verdict the payload named, empty when it named neither.
+    ///
+    /// A stored spelling, passed through rather than interpreted: what a colour
+    /// or a word is made of it belongs to the surface, and a spelling this
+    /// build does not define is a newer build's rather than a bug.
+    outcome: String,
+}
+
+/// Reads the state or verdict an event's payload named.
+///
+/// String values only. A payload whose `state` is an object or a number is not
+/// saying what a state change says, and reading `{2 fields}` as an outcome
+/// would be worse than reading nothing.
+fn outcome(payload: &Value) -> String {
+    let Value::Object(fields) = payload else {
+        return String::new();
+    };
+    OUTCOME_FIELDS
+        .iter()
+        .find_map(|field| fields.get(*field).and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// Keeps a rendering inside its byte budget on a character boundary.
@@ -303,6 +387,8 @@ pub(crate) fn summarize(payload: &Value) -> String {
 pub(crate) fn event_row(seq: u64, event: &RunEvent) -> TimelineRow {
     TimelineRow {
         seq,
+        first_seq: seq,
+        progress_count: u32::from(event.kind().as_str() == TOOL_PROGRESS_KIND),
         kind: event.kind().as_str().to_owned(),
         recognized: event.kind().is_recognized(),
         at: rfc3339(event.at()),
@@ -316,9 +402,65 @@ pub(crate) fn event_row(seq: u64, event: &RunEvent) -> TimelineRow {
             .map(|id| id.to_string())
             .unwrap_or_default(),
         summary: summarize(event.payload()),
+        outcome: outcome(event.payload()),
         has_detail: !event.payload().is_null(),
         detail: String::new(),
     }
+}
+
+/// Whether `row` is a progress tick that may fold into a neighbour.
+///
+/// A tick that names no tool call is not foldable: a row with nothing to fold
+/// *into* would otherwise absorb the next unrelated tick and report a count
+/// spanning two different pieces of work.
+fn foldable(row: &TimelineRow) -> bool {
+    row.progress_count > 0 && !row.tool_call_id.is_empty()
+}
+
+/// Whether `row` continues the run of ticks `previous` already stands for.
+fn folds_into(previous: &TimelineRow, row: &TimelineRow) -> bool {
+    foldable(previous) && foldable(row) && previous.tool_call_id == row.tool_call_id
+}
+
+/// Merges a later tick into the run of ticks an earlier row stands for.
+///
+/// The newest tick's text wins, because the line a reader wants from a running
+/// tool is the one it printed last; the span the row covers keeps the oldest
+/// tick's sequence so paging backwards resumes before it rather than inside it.
+fn absorb(earlier: &TimelineRow, later: &TimelineRow) -> TimelineRow {
+    let mut merged = later.clone();
+    merged.first_seq = earlier.first_seq;
+    merged.progress_count = earlier.progress_count.saturating_add(later.progress_count);
+    merged
+}
+
+/// Collapses each run of consecutive progress ticks of one call into one row.
+///
+/// A tool that reports a line per file turns a timeline into its own output, so
+/// consecutive ticks of one call become a single row carrying the newest line
+/// and how many there were. Only *consecutive* ticks fold: anything else the run
+/// recorded between two of them — a state change, an artifact, an approval — is
+/// a thing that happened, and folding across it would put two ticks in one row
+/// while claiming nothing happened in between.
+///
+/// This is presentation and not redaction. The events are in the append-only
+/// log exactly as they were written, `harkness run show` prints every one of
+/// them, and the folded row names the count so the reader knows what it stands
+/// for.
+fn fold(rows: Vec<TimelineRow>) -> Vec<TimelineRow> {
+    let mut folded: Vec<TimelineRow> = Vec::with_capacity(rows.len());
+    for row in rows {
+        match folded.last() {
+            Some(previous) if folds_into(previous, &row) => {
+                let merged = absorb(previous, &row);
+                *folded
+                    .last_mut()
+                    .expect("the branch above matched on the same last row") = merged;
+            }
+            _ => folded.push(row),
+        }
+    }
+    folded
 }
 
 /// One step of a model mutation, in the row coordinates that hold when it is
@@ -369,7 +511,7 @@ impl Timeline {
     /// Replaces every row with a freshly loaded page.
     fn reset(&mut self, rows: Vec<TimelineRow>, beginning: bool) {
         self.last_seq = rows.iter().map(|row| row.seq).max().unwrap_or_default();
-        self.rows = rows;
+        self.rows = fold(rows);
         self.beginning = beginning;
     }
 
@@ -379,16 +521,36 @@ impl Timeline {
     /// because the two are applied in order.
     pub(crate) fn plan_append(&self, batch: Vec<TimelineRow>) -> Vec<ModelEdit> {
         let applied = self.last_seq;
-        let fresh = ordered(batch, |row| row.seq > applied);
+        let mut fresh = fold(ordered(batch, |row| row.seq > applied));
         if fresh.is_empty() {
             return Vec::new();
         }
-        let mut edits = Vec::with_capacity(2);
+        let mut edits = Vec::with_capacity(3);
+        // A tick continuing the run of ticks already at the tip rewrites that
+        // row instead of adding one, which is what makes a tool reporting a
+        // hundred lines cost the reader no new rows and no scroll position.
+        if self
+            .rows
+            .last()
+            .is_some_and(|last| folds_into(last, &fresh[0]))
+        {
+            let head = fresh.remove(0);
+            let last = self
+                .rows
+                .last()
+                .expect("the condition above read the same last row");
+            edits.push(ModelEdit::Update {
+                first: self.rows.len() - 1,
+                rows: vec![absorb(last, &head)],
+            });
+        }
         let length = self.rows.len() + fresh.len();
-        edits.push(ModelEdit::Insert {
-            first: self.rows.len(),
-            rows: fresh,
-        });
+        if !fresh.is_empty() {
+            edits.push(ModelEdit::Insert {
+                first: self.rows.len(),
+                rows: fresh,
+            });
+        }
         if length > MAX_TIMELINE_ROWS {
             edits.push(ModelEdit::Remove {
                 first: 0,
@@ -399,9 +561,14 @@ impl Timeline {
     }
 
     /// Plans a backwards page, dropping anything the model already holds.
+    ///
+    /// Ticks fold within the arriving page but never into the row above it: the
+    /// row a backwards page would merge into is one the reader is already
+    /// looking at, and rewriting it while they read is a worse outcome than one
+    /// extra row at a page boundary.
     pub(crate) fn plan_prepend(&self, batch: Vec<TimelineRow>) -> Vec<ModelEdit> {
-        let boundary = self.rows.first().map_or(u64::MAX, |row| row.seq);
-        let older = ordered(batch, |row| row.seq < boundary);
+        let boundary = self.rows.first().map_or(u64::MAX, |row| row.first_seq);
+        let older = fold(ordered(batch, |row| row.seq < boundary));
         if older.is_empty() {
             return Vec::new();
         }
@@ -444,6 +611,14 @@ impl Timeline {
                 self.beginning = false;
             }
             ModelEdit::Update { first, rows } => {
+                // An update is not always a rewrite of what a row already
+                // stood for: a folded progress row absorbs ticks the model has
+                // not seen before, and forgetting to raise the watermark for
+                // them would let the next delivery of the same ticks fold a
+                // second time and double the count.
+                self.last_seq = self
+                    .last_seq
+                    .max(rows.iter().map(|row| row.seq).max().unwrap_or_default());
                 self.rows
                     .splice(*first..*first + rows.len(), rows.iter().cloned());
             }
@@ -470,7 +645,7 @@ impl Timeline {
 
     /// The exclusive boundary a backwards page continues from.
     fn older_cursor(&self) -> Option<EventSeq> {
-        self.rows.first().map(|row| EventSeq::new(row.seq))
+        self.rows.first().map(|row| EventSeq::new(row.first_seq))
     }
 }
 
@@ -672,6 +847,10 @@ impl ffi::RunTimelineModel {
             ARTIFACT_ROLE => text(&entry.artifact_id),
             HAS_DETAIL_ROLE => QVariant::from(&entry.has_detail),
             DETAIL_ROLE => text(&entry.detail),
+            PROGRESS_COUNT_ROLE => {
+                QVariant::from(&i32::try_from(entry.progress_count).unwrap_or(i32::MAX))
+            }
+            OUTCOME_ROLE => text(&entry.outcome),
             _ => QVariant::default(),
         }
     }
@@ -1033,11 +1212,21 @@ fn append_batch(mut model: Pin<&mut ffi::RunTimelineModel>, request: u64, rows: 
         return;
     }
     let edits = model.as_ref().rust().timeline.plan_append(rows);
+    // A batch that was entirely repeats plans nothing and is not growth. The
+    // subscription replays from where it was opened, so that is ordinary rather
+    // than exceptional, and announcing it would wake every listener for a
+    // delivery that changed no row.
+    let grew = !edits.is_empty();
     for edit in edits {
         model.as_mut().edit(&edit);
     }
     let more = model.as_ref().rust().timeline.more();
     model.as_mut().set_more(more);
+    // Announced last, so a handler that reads the model sees every row and
+    // both flags as they now stand.
+    if grew {
+        model.as_mut().appended();
+    }
 }
 
 fn attach_detail(
@@ -1058,20 +1247,21 @@ fn attach_detail(
 #[cfg(test)]
 mod tests {
     use cxx_qt_lib::QByteArray;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use time::OffsetDateTime;
 
     use harkness_runtime::domain::{
         ArtifactId, ExecutionState, Run, RunId, StepId, Task, TaskId, ToolCallId,
     };
-    use harkness_runtime::store::{EventKind, RunEvent, Store};
+    use harkness_runtime::store::{EventKind, EventSeq, RunEvent, Store};
     use tempfile::TempDir;
 
     use super::{
         ARTIFACT_ROLE, AT_ROLE, DETAIL_ROLE, DISPLAY_ROLE, HAS_DETAIL_ROLE, KIND_ROLE,
-        MAX_TIMELINE_ROWS, MAX_TIMELINE_SUMMARY_BYTES, ModelEdit, RECOGNIZED_ROLE, SEQ_ROLE,
-        STEP_ROLE, SUMMARY_ROLE, Selection, TIMELINE_PAGE_SIZE, TOOL_CALL_ROLE, Timeline,
-        TimelineRow, event_row, model_roles, summarize,
+        MAX_TIMELINE_ROWS, MAX_TIMELINE_SUMMARY_BYTES, ModelEdit, OUTCOME_ROLE,
+        PROGRESS_COUNT_ROLE, RECOGNIZED_ROLE, SEQ_ROLE, STEP_ROLE, SUMMARY_ROLE, Selection,
+        TIMELINE_PAGE_SIZE, TOOL_CALL_ROLE, Timeline, TimelineRow, event_row, model_roles,
+        summarize,
     };
     use super::{load_event_detail_in, load_older_page_in, open_timeline_in};
 
@@ -1085,6 +1275,27 @@ mod tests {
 
     fn rows(range: std::ops::RangeInclusive<u64>) -> Vec<TimelineRow> {
         range.map(row).collect()
+    }
+
+    /// One progress tick attributed to `call`, which is what makes it foldable.
+    fn tick(seq: u64, call: ToolCallId) -> TimelineRow {
+        event_row(
+            seq,
+            &RunEvent::new(EventKind::ToolProgress, at(seq as i64))
+                .for_step(StepId::new())
+                .for_tool_call(call),
+        )
+    }
+
+    /// Anything that is not a progress tick, on the same call.
+    fn other(seq: u64, call: ToolCallId) -> TimelineRow {
+        event_row(
+            seq,
+            &RunEvent::new(EventKind::ToolCallStateChanged, at(seq as i64))
+                .for_step(StepId::new())
+                .for_tool_call(call)
+                .with_payload(json!({"state": "running"})),
+        )
     }
 
     fn populated(range: std::ops::RangeInclusive<u64>) -> Timeline {
@@ -1109,6 +1320,8 @@ mod tests {
             (SUMMARY_ROLE, "summary"),
             (HAS_DETAIL_ROLE, "hasDetail"),
             (DETAIL_ROLE, "detail"),
+            (PROGRESS_COUNT_ROLE, "progressCount"),
+            (OUTCOME_ROLE, "outcome"),
         ] {
             assert_eq!(roles.get(&role), Some(QByteArray::from(name)));
         }
@@ -1242,6 +1455,262 @@ mod tests {
         let timeline = populated(1..=10);
 
         assert!(timeline.plan_append(rows(1..=10)).is_empty());
+    }
+
+    #[test]
+    fn a_row_carries_the_state_its_payload_named() {
+        let row = event_row(
+            1,
+            &RunEvent::new(EventKind::RunStateChanged, at(1))
+                .with_payload(json!({"state": "succeeded"})),
+        );
+
+        assert_eq!(row.outcome, "succeeded");
+    }
+
+    #[test]
+    fn a_decision_carries_its_verdict_where_a_state_change_carries_its_state() {
+        let row = event_row(
+            1,
+            &RunEvent::new(EventKind::ApprovalDecided, at(1))
+                .with_payload(json!({"verdict": "granted", "decided_via": "gui"})),
+        );
+
+        assert_eq!(row.outcome, "granted");
+    }
+
+    #[test]
+    fn an_outcome_survives_a_payload_whose_summary_is_clamped() {
+        // Keys sort before "state", and enough of them to push it past the
+        // summary's byte bound. Reading the colour off the summary is exactly
+        // what this row would defeat.
+        let mut payload = serde_json::Map::new();
+        for index in 0..80 {
+            payload.insert(format!("a{index:03}"), json!("padding-padding-padding"));
+        }
+        payload.insert("state".to_owned(), json!("failed"));
+
+        let row = event_row(
+            1,
+            &RunEvent::new(EventKind::RunStateChanged, at(1)).with_payload(Value::Object(payload)),
+        );
+
+        assert!(
+            !row.summary.contains("state=failed"),
+            "the summary was expected to be clamped short of it"
+        );
+        assert_eq!(row.outcome, "failed", "the row still knows what happened");
+    }
+
+    #[test]
+    fn a_payload_naming_neither_a_state_nor_a_verdict_carries_no_outcome() {
+        let row = event_row(
+            1,
+            &RunEvent::new(EventKind::ToolProgress, at(1))
+                .with_payload(json!({"line": "compiling"})),
+        );
+
+        assert!(row.outcome.is_empty());
+    }
+
+    #[test]
+    fn a_state_that_is_not_a_word_is_read_as_no_outcome_rather_than_as_its_shape() {
+        let row = event_row(
+            1,
+            &RunEvent::new(EventKind::RunStateChanged, at(1))
+                .with_payload(json!({"state": {"was": "running"}})),
+        );
+
+        assert!(row.outcome.is_empty(), "{}", row.outcome);
+    }
+
+    #[test]
+    fn consecutive_progress_ticks_of_one_call_occupy_one_row() {
+        let call = ToolCallId::new();
+        let mut timeline = Timeline::default();
+
+        timeline.reset((1..=5).map(|seq| tick(seq, call)).collect(), true);
+
+        assert_eq!(timeline.rows.len(), 1, "five ticks of one call are one row");
+        assert_eq!(timeline.rows[0].progress_count, 5);
+        assert_eq!(
+            timeline.rows[0].seq, 5,
+            "the newest tick's line is the one shown"
+        );
+        assert_eq!(
+            timeline.rows[0].first_seq, 1,
+            "the row still names where it began"
+        );
+    }
+
+    #[test]
+    fn progress_ticks_of_different_calls_stay_apart() {
+        let first = ToolCallId::new();
+        let second = ToolCallId::new();
+        let mut timeline = Timeline::default();
+
+        timeline.reset(vec![tick(1, first), tick(2, second), tick(3, first)], true);
+
+        assert_eq!(
+            timeline.rows.len(),
+            3,
+            "no two of these ticks are one call's"
+        );
+    }
+
+    #[test]
+    fn a_tick_after_another_event_starts_a_new_row() {
+        let call = ToolCallId::new();
+        let mut timeline = Timeline::default();
+
+        timeline.reset(
+            vec![tick(1, call), tick(2, call), other(3, call), tick(4, call)],
+            true,
+        );
+
+        assert_eq!(
+            timeline.rows.len(),
+            3,
+            "the state change keeps the ticks apart"
+        );
+        assert_eq!(timeline.rows[0].progress_count, 2);
+        assert_eq!(timeline.rows[2].progress_count, 1);
+    }
+
+    #[test]
+    fn a_tick_that_names_no_tool_call_is_never_folded() {
+        let mut timeline = Timeline::default();
+
+        // `row` builds a progress event with no association at all, which is
+        // what a run-level progress line looks like. Folding those together
+        // would report one count across two unrelated pieces of work.
+        timeline.reset(rows(1..=4), true);
+
+        assert_eq!(timeline.rows.len(), 4);
+    }
+
+    #[test]
+    fn a_hundred_progress_ticks_add_one_row_and_then_none() {
+        let call = ToolCallId::new();
+        let mut timeline = Timeline::default();
+        timeline.reset(vec![other(1, call)], true);
+        let before = timeline.rows.len();
+
+        for seq in 2..=101 {
+            for edit in timeline.plan_append(vec![tick(seq, call)]) {
+                timeline.apply(&edit);
+            }
+        }
+
+        assert_eq!(
+            timeline.rows.len(),
+            before + 1,
+            "the first tick added its row and the other ninety-nine rewrote it"
+        );
+        assert_eq!(timeline.rows.last().unwrap().progress_count, 100);
+        assert_eq!(timeline.rows.last().unwrap().seq, 101);
+    }
+
+    #[test]
+    fn a_progress_tick_at_the_tip_updates_the_row_rather_than_adding_one() {
+        let call = ToolCallId::new();
+        let mut timeline = Timeline::default();
+        timeline.reset(vec![other(1, call), tick(2, call)], true);
+
+        let edits = timeline.plan_append(vec![tick(3, call)]);
+
+        assert!(
+            matches!(edits.as_slice(), [ModelEdit::Update { first: 1, rows }] if rows[0].progress_count == 2),
+            "{edits:?}"
+        );
+    }
+
+    #[test]
+    fn a_batch_that_both_extends_a_tick_and_moves_on_updates_before_it_inserts() {
+        let call = ToolCallId::new();
+        let mut timeline = Timeline::default();
+        timeline.reset(vec![tick(1, call)], true);
+
+        let edits = timeline.plan_append(vec![tick(2, call), other(3, call)]);
+
+        assert!(
+            matches!(
+                edits.as_slice(),
+                [
+                    ModelEdit::Update { first: 0, .. },
+                    ModelEdit::Insert { first: 1, rows }
+                ] if rows.len() == 1
+            ),
+            "{edits:?}"
+        );
+    }
+
+    #[test]
+    fn a_tick_folded_into_a_row_is_not_counted_a_second_time() {
+        let call = ToolCallId::new();
+        let mut timeline = Timeline::default();
+        timeline.reset(vec![tick(1, call)], true);
+        for edit in timeline.plan_append(vec![tick(2, call)]) {
+            timeline.apply(&edit);
+        }
+
+        // The subscription replays from where it was opened, so the same tick
+        // arriving twice is ordinary rather than exceptional.
+        let repeat = timeline.plan_append(vec![tick(2, call)]);
+
+        assert!(repeat.is_empty(), "{repeat:?}");
+        assert_eq!(timeline.rows[0].progress_count, 2);
+    }
+
+    #[test]
+    fn paging_backwards_resumes_before_the_oldest_tick_a_folded_row_absorbed() {
+        let call = ToolCallId::new();
+        let mut timeline = Timeline::default();
+        timeline.reset((5..=8).map(|seq| tick(seq, call)).collect(), false);
+
+        // The store is asked for events older than this, and answers with the
+        // page ending at it. A cursor of the newest folded tick would hand back
+        // the ticks the row already stands for and show them all over again.
+        assert_eq!(timeline.older_cursor().map(EventSeq::get), Some(5));
+        let edits = timeline.plan_prepend(vec![other(4, call), tick(5, call)]);
+        assert!(
+            matches!(edits.as_slice(), [ModelEdit::Insert { first: 0, rows }] if rows.len() == 1),
+            "the repeated tick is dropped and only the older event lands: {edits:?}"
+        );
+    }
+
+    #[test]
+    fn a_backwards_page_folds_within_itself_and_never_into_the_row_above() {
+        let call = ToolCallId::new();
+        let mut timeline = Timeline::default();
+        timeline.reset((5..=8).map(|seq| tick(seq, call)).collect(), false);
+
+        // Four older ticks of the same call. They are one row between
+        // themselves, and deliberately stay a second row rather than merging
+        // into the one already on screen: rewriting a row the reader is looking
+        // at, and moving everything under it, is worse than a seam at a page
+        // boundary that only costs them one row.
+        let edits = timeline.plan_prepend((1..=4).map(|seq| tick(seq, call)).collect());
+
+        assert!(
+            matches!(
+                edits.as_slice(),
+                [ModelEdit::Insert { first: 0, rows }]
+                    if rows.len() == 1
+                        && rows[0].progress_count == 4
+                        && rows[0].first_seq == 1
+                        && rows[0].seq == 4
+            ),
+            "{edits:?}"
+        );
+        for edit in &edits {
+            timeline.apply(edit);
+        }
+        assert_eq!(timeline.rows.len(), 2);
+        assert_eq!(
+            timeline.rows[1].progress_count, 4,
+            "the page above is intact"
+        );
     }
 
     #[test]

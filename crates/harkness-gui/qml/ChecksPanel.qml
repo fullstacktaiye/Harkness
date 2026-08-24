@@ -83,6 +83,14 @@ Item {
 
     signal hideRequested()
 
+    /// Emitted when a check run starts here and again when it ends.
+    ///
+    /// The run store gained a row, or one of its rows reached a new state, and
+    /// the surfaces that list runs page through that store rather than
+    /// subscribing to it. Both edges are reported because both change what a
+    /// list shows: the first adds a run, the second gives it an outcome.
+    signal runActivity()
+
     // Side-panel view contract; see SidePanel.qml.
     readonly property string viewId: "checks"
     readonly property string viewTitle: qsTr("Checks")
@@ -543,6 +551,7 @@ Item {
         } else {
             runRequestedCheckId = "";
         }
+        panel.runActivity();
     }
 
     // Elapsed time counts from when this window saw the job appear, which is

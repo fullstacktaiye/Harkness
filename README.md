@@ -436,6 +436,36 @@ line it changed on, and a reveal control (Alt+W) draws every space and tab
 without moving a column; copying a line yields the bytes, never the glyphs. Managed worktree rows expose move,
 lock, and unlock while showing the stored lock reason inline.
 
+A Runs view in the activity bar (Ctrl+Shift+R) lists every run Harkness has
+recorded, newest first, and the launcher shows the same list before any project
+is opened — which is where a run abandoned by a killed process has to be
+findable. Opening one shows its whole history: the chronological event timeline,
+each step and tool call with its own state, the policy decision every call was
+admitted under, the approvals it asked for and how they were answered, and its
+artifacts with media type, size, and whether the bytes are still on disk. A run
+still executing streams into the page live, and a tool reporting a line per file
+occupies one timeline row that counts its updates rather than one row per line.
+A failed run shows the structured error kind beside the message; a run waiting
+for a decision shows a banner naming the request, its risk, and the exact input
+it is holding; an interrupted run names the tool call that was in flight when
+the process stopped. Cancel appears while a run can still be stopped, and Retry
+appears only when the runtime's own durable state says a fresh attempt is
+allowed — with the reason spelled out when it is not. Everything a tool, an
+agent, or the repository wrote is rendered as inert plain text, and an artifact
+is only ever shown, never opened or executed.
+
+### Runs UI
+
+![The Runs view listing every recorded run and its state](docs/screenshots/runs-list.png)
+
+![A failed run's timeline, calls, artifacts, and structured error](docs/screenshots/run-failed.png)
+
+![A run executing, with a tool's progress folded into one timeline row](docs/screenshots/run-progress.png)
+
+![A run waiting for a decision, with the request named in a banner](docs/screenshots/run-approval.png)
+
+![An interrupted run naming the tool call that was in flight](docs/screenshots/run-interrupted.png)
+
 ### Git review UI
 
 ![Selected changed lines in the lazily loaded unified review diff](docs/screenshots/review-surface.png)

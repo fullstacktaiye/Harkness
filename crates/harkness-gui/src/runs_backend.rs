@@ -13,8 +13,18 @@
 //! reachable from `RunsBackend`'s Rust — so a `refresh_runs` invokable here
 //! could not fill a model over there. Each model therefore drives its own
 //! paging, and this object carries the operations that change something:
-//! `cancelRun`, `retryRun`, `approve`, `deny`, and the on-demand
-//! `loadApprovalInput`.
+//! `cancelRun`, `retryRun`, `approve`, `deny`, and the on-demand reads that
+//! answer one question each: `loadApprovalInput`, `loadRun`, and
+//! `loadArtifactExcerpt`.
+//!
+//! Those three are reads and could have been models. They are not, because each
+//! answers a question a surface asks once about one identifier — the input this
+//! approval is holding, the shape of this run, the text of this artifact — and a
+//! `QAbstractListModel` per single-value answer would be three more paging,
+//! staleness and reset mechanisms for rows that never number more than one. They
+//! follow `loadApprovalInput`'s shape exactly: a worker reads, a property
+//! carries the answer, and the operation that filled it is the only one that
+//! writes it.
 //!
 //! # Reading and attaching are different things
 //!
@@ -39,10 +49,19 @@
 //!
 //! `next_request` is the same mechanism `HarknessBackend::next_review_request`
 //! is: every operation takes the next number, and a reply whose number is no
-//! longer the newest still clears its share of `busy` but never writes
-//! `status`, `kind`, or `detail`. Two operations overlapping otherwise let the
-//! slower one's message overwrite the faster one's, so the panel would report
-//! the outcome of the thing the user did *first*.
+//! longer the newest still clears its share of `busy` but never writes `status`
+//! or `kind`. Two operations overlapping otherwise let the slower one's message
+//! overwrite the faster one's, so the panel would report the outcome of the
+//! thing the user did *first*.
+//!
+//! The *answer* properties are counted separately, one watermark each. `status`
+//! is genuinely shared and a newer operation of any kind supersedes it; `run`,
+//! `detail` and `excerpt` are three different questions, and a header re-read
+//! landing while an artifact excerpt is still being read supersedes nothing
+//! about that excerpt. Measuring all four against one counter would drop the
+//! reply, leaving the row that asked expanded, empty, and reporting no failure.
+//! [`settlement`] is the rule, and it is a pure function so it can be tested
+//! without a Qt thread.
 //!
 //! # The error namespace
 //!
@@ -72,15 +91,23 @@ pub mod ffi {
         /// kept to a single word.
         ///
         /// `busy` is true while any operation is outstanding, `status` carries
-        /// the newest operation's user-facing message, `kind` its stable
-        /// discriminant (empty on success), and `detail` the last approval
-        /// input `loadApprovalInput` fetched.
+        /// the newest operation's user-facing message, and `kind` its stable
+        /// discriminant (empty on success).
+        ///
+        /// The other three properties are answers rather than status: `detail`
+        /// is the last approval input `loadApprovalInput` fetched, `run` the
+        /// last run `loadRun` projected, and `excerpt` the last artifact
+        /// rendering `loadArtifactExcerpt` produced. Each is written only by
+        /// the loader that answers it, so cancelling the run a page is showing
+        /// does not blank the page.
         #[qobject]
         #[qml_element]
         #[qproperty(bool, busy)]
         #[qproperty(QString, status)]
         #[qproperty(QString, kind)]
         #[qproperty(QVariant, detail)]
+        #[qproperty(QVariant, run)]
+        #[qproperty(QVariant, excerpt)]
         type RunsBackend = super::RunsBackendRust;
 
         /// Stops a run: its queued calls, its executing tool, and any approval
@@ -120,29 +147,58 @@ pub mod ffi {
         #[qinvokable]
         #[cxx_name = "loadApprovalInput"]
         fn load_approval_input(self: Pin<&mut RunsBackend>, approval_id: &QString);
+
+        /// Projects one run into the `run` property: header fields, whether a
+        /// retry is available and why not, and its steps, calls, approvals and
+        /// artifact metadata.
+        ///
+        /// A read, so it goes through the store rather than attaching a
+        /// coordinator. Nothing here is decided by this bridge — retry
+        /// eligibility is read back off the same durable state
+        /// `RunCoordinator::retry_run` refuses on, so the button a page offers
+        /// and the answer the runtime gives cannot disagree except by racing.
+        #[qinvokable]
+        #[cxx_name = "loadRun"]
+        fn load_run(self: Pin<&mut RunsBackend>, run_id: &QString);
+
+        /// Renders one small text artifact into the `excerpt` property.
+        ///
+        /// Bounded on the bytes actually read, not on the recorded size, and
+        /// refused by name for anything that is not text this build can render.
+        /// Artifact content is tool output: it is never executed, never opened
+        /// through the desktop, and reaches QML as plain text.
+        #[qinvokable]
+        #[cxx_name = "loadArtifactExcerpt"]
+        fn load_artifact_excerpt(self: Pin<&mut RunsBackend>, artifact_id: &QString);
     }
 
     impl cxx_qt::Threading for RunsBackend {}
 }
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cxx_qt::{CxxQtType, Threading};
-use cxx_qt_lib::{QMap, QMapPair_QString_QVariant, QString, QVariant};
+use cxx_qt_lib::{QList, QMap, QMapPair_QString_QVariant, QString, QVariant};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use harkness_runtime::agent::{
     AgentAction, MockAgent, ObservationPattern, Scenario, ScenarioId, ScenarioStep, WorkspaceRef,
 };
-use harkness_runtime::approval::{ApprovalDecision, ApprovalId, ApprovalScope, DecidedVia};
+use harkness_runtime::approval::{
+    ApprovalDecision, ApprovalId, ApprovalRequest, ApprovalScope, ApprovalState, DecidedVia,
+};
 use harkness_runtime::coordinator::{RunCoordinator, RuntimeError};
-use harkness_runtime::domain::{RunId, ToolCall, ToolCallState};
-use harkness_runtime::store::{PassThrough, Store, StoreError};
+use harkness_runtime::domain::{ArtifactId, ExecutionState, Run, RunId, ToolCall, ToolCallState};
+use harkness_runtime::store::{Artifact, Availability, PassThrough, Store, StoreError};
 use harkness_runtime::tool::WorkspaceMetadata;
+
+use super::approval_model::ApprovalRow;
+use super::run_list_model::{RunRow, run_row};
 
 /// Largest approval input this bridge hands to QML.
 ///
@@ -151,6 +207,22 @@ use harkness_runtime::tool::WorkspaceMetadata;
 /// asked to lay out sixty kilobytes of JSON. What is dropped is named in the
 /// projection rather than silently missing.
 const MAX_APPROVAL_INPUT_BYTES: usize = 8 * 1024;
+
+/// Rows of each kind a run's detail projection carries.
+///
+/// A run is bounded by nothing in particular — an agent may make thousands of
+/// calls and store an artifact per call — and the header of a page is not a
+/// place to page through them. What is dropped is named in `truncated` rather
+/// than silently missing, and the timeline beside the header is the surface that
+/// does page.
+const MAX_RUN_DETAIL_ROWS: usize = 200;
+
+/// Largest artifact rendering this bridge hands to QML.
+///
+/// Enforced on the bytes *read* rather than on the recorded size, because the
+/// file is on disk where anything may have rewritten it since; the recorded size
+/// only decides whether it is worth opening at all.
+const MAX_ARTIFACT_EXCERPT_BYTES: usize = 8 * 1024;
 
 /// The Harkness data directory could not be resolved at all.
 pub(crate) const DATA_DIRECTORY_UNAVAILABLE: &str = "data_directory_unresolved";
@@ -166,6 +238,10 @@ pub(crate) const INVALID_APPROVAL_ID: &str = "invalid_approval_id";
 pub(crate) const UNKNOWN_APPROVAL_SCOPE: &str = "unknown_approval_scope";
 /// A run's recorded calls cannot be rebuilt into a script that re-issues them.
 pub(crate) const RUN_NOT_REPLAYABLE: &str = "run_not_replayable";
+/// An artifact identifier QML supplied is not one.
+pub(crate) const INVALID_ARTIFACT_ID: &str = "invalid_artifact_id";
+/// An artifact is not text this build is willing to render inline.
+pub(crate) const ARTIFACT_NOT_TEXT: &str = "artifact_not_text";
 
 /// Kinds this bridge raises itself, in declaration order.
 ///
@@ -180,7 +256,7 @@ pub(crate) const RUN_NOT_REPLAYABLE: &str = "run_not_replayable";
 /// reordered, with nothing failing to compile and the set-based collision test
 /// below still passing — which is why this exists only to be asserted over.
 #[cfg(test)]
-pub(crate) const BRIDGE_KINDS: [&str; 7] = [
+pub(crate) const BRIDGE_KINDS: [&str; 9] = [
     DATA_DIRECTORY_UNAVAILABLE,
     COORDINATOR_UNAVAILABLE,
     NO_RUN_STORE,
@@ -188,6 +264,8 @@ pub(crate) const BRIDGE_KINDS: [&str; 7] = [
     INVALID_APPROVAL_ID,
     UNKNOWN_APPROVAL_SCOPE,
     RUN_NOT_REPLAYABLE,
+    INVALID_ARTIFACT_ID,
+    ARTIFACT_NOT_TEXT,
 ];
 
 /// One failure on its way to QML: a stable discriminant and a message.
@@ -437,6 +515,15 @@ fn parse_approval(value: &str) -> Result<ApprovalId, RunsFailure> {
     })
 }
 
+fn parse_artifact(value: &str) -> Result<ArtifactId, RunsFailure> {
+    value.parse().map_err(|_| {
+        RunsFailure::new(
+            INVALID_ARTIFACT_ID,
+            format!("{value:?} is not an artifact id"),
+        )
+    })
+}
+
 /// Reads the scope a grant should carry from what QML asked for.
 ///
 /// An empty request means "whatever the stored record already allows", which is
@@ -455,6 +542,105 @@ fn grant_scope(requested: &str, effective: ApprovalScope) -> Result<ApprovalScop
     })
 }
 
+/// Which of the bridge's three answer properties an operation may write.
+///
+/// `detail`, `run` and `excerpt` answer three different questions about three
+/// different identifiers, and an operation must never blank the answer to a
+/// question it was not asked: cancelling the run a detail page is showing would
+/// otherwise empty the page it was pressed from.
+///
+/// A decision is the one case that writes an answer it did not produce. It
+/// clears `detail`, because approving or denying changes *which* approval is in
+/// question and leaving the previous one's validated input bound is the worst
+/// way for that property to be wrong. It does not clear `run` or `excerpt`,
+/// which are about the run the decision was made on.
+///
+/// This is also why staleness is counted *per answer* and not once for the
+/// bridge. Three independent questions share one counter only if every newer
+/// operation genuinely supersedes every older one, and here they do not: a
+/// header re-read arriving while an artifact excerpt is still being read says
+/// nothing about the excerpt, and dropping its reply would leave the row
+/// expanded, empty, and reporting no failure. Each slot therefore carries its
+/// own watermark — see [`settlement`] — while `status` and `kind`, which really
+/// are one shared pair, stay keyed on the newest operation of any kind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Answer {
+    /// A mutation: writes no answer of its own and clears `detail`.
+    Decision,
+    /// `loadApprovalInput`, which writes `detail`.
+    ApprovalInput,
+    /// `loadRun`, which writes `run`.
+    RunDetail,
+    /// `loadArtifactExcerpt`, which writes `excerpt`.
+    ArtifactExcerpt,
+}
+
+/// How many answer properties an operation's staleness is tracked against.
+///
+/// Three, not four: `Decision` and `ApprovalInput` both write `detail`, so they
+/// supersede one another and share a slot.
+const ANSWER_SLOTS: usize = 3;
+
+impl Answer {
+    /// Which answer property this operation writes, as an index into
+    /// [`RunsBackendRust::newest`].
+    fn slot(self) -> usize {
+        match self {
+            Self::Decision | Self::ApprovalInput => 0,
+            Self::RunDetail => 1,
+            Self::ArtifactExcerpt => 2,
+        }
+    }
+}
+
+/// What one settling reply is still entitled to write.
+///
+/// Two questions rather than one, because this bridge answers three independent
+/// questions about three different identifiers and reports *one* status. A
+/// reply that is no longer the newest operation of any kind must not describe
+/// itself in `status` — the panel would report the outcome of the thing the
+/// user did first — but it is still the only answer its own question is ever
+/// going to get, and dropping it leaves an empty panel with nothing said about
+/// why.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Settlement {
+    /// Whether this reply is still the newest question of its own kind, and so
+    /// may write the one answer property it owns.
+    pub(crate) answer: bool,
+    /// Whether it is the newest operation of any kind, and so may write the
+    /// single `status`/`kind` pair the three of them share.
+    pub(crate) status: bool,
+}
+
+/// Decides what a reply may write, from the two watermarks it is measured
+/// against.
+///
+/// Split out and pure so the rule is testable: `settle` needs a pinned
+/// `QObject` and a running Qt thread, and the rule is the part that is easy to
+/// get wrong. `status` implies `answer` — the newest operation overall is by
+/// construction the newest of its own kind — so the two are never both false
+/// for a reply that still matters.
+pub(crate) fn settlement(request: u64, newest_for_answer: u64, newest_overall: u64) -> Settlement {
+    Settlement {
+        answer: request == newest_for_answer,
+        status: request == newest_overall,
+    }
+}
+
+/// The answer one finished operation produced, if it produced one.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) enum Answered {
+    /// A mutation, or a load that failed.
+    #[default]
+    Nothing,
+    ApprovalInput(ApprovalInput),
+    /// Boxed: a run detail carries four bounded row lists and is much larger
+    /// than every other variant, which would otherwise be the size of all of
+    /// them.
+    RunDetail(Box<RunDetail>),
+    ArtifactExcerpt(ArtifactExcerpt),
+}
+
 /// What a finished operation has to say for itself, in `Send` data only.
 ///
 /// `QString` and `QVariant` are not `Send`, so a worker returns plain Rust and
@@ -462,14 +648,21 @@ fn grant_scope(requested: &str, effective: ApprovalScope) -> Result<ApprovalScop
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Completion {
     message: String,
-    detail: Option<ApprovalInput>,
+    answered: Answered,
 }
 
 impl Completion {
     fn message(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            detail: None,
+            answered: Answered::Nothing,
+        }
+    }
+
+    fn answering(message: impl Into<String>, answered: Answered) -> Self {
+        Self {
+            message: message.into(),
+            answered,
         }
     }
 }
@@ -515,16 +708,443 @@ fn approval_input(approval: ApprovalId) -> Result<Completion, RunsFailure> {
     let rendered =
         serde_json::to_string_pretty(call.input()).unwrap_or_else(|_| call.input().to_string());
     let (input, truncated) = clamp(rendered, MAX_APPROVAL_INPUT_BYTES);
-    Ok(Completion {
-        message: format!("Loaded the input {} is holding", request.tool()),
-        detail: Some(ApprovalInput {
+    Ok(Completion::answering(
+        format!("Loaded the input {} is holding", request.tool()),
+        Answered::ApprovalInput(ApprovalInput {
             approval_id: approval.to_string(),
             run_id: request.run_id().to_string(),
             tool: request.tool().to_string(),
             input,
             truncated,
         }),
-    })
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// One run's detail
+// ---------------------------------------------------------------------------
+
+/// One step of a run as its detail page draws it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct StepRow {
+    step_id: String,
+    ordinal: u32,
+    title: String,
+    state: String,
+    terminal: bool,
+    created: String,
+    started: String,
+    finished: String,
+    error_kind: String,
+    error_message: String,
+}
+
+/// One recorded tool call as its detail page draws it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CallRow {
+    tool_call_id: String,
+    step_id: String,
+    tool_id: String,
+    tool_version: String,
+    state: String,
+    terminal: bool,
+    created: String,
+    started: String,
+    finished: String,
+    error_kind: String,
+    error_message: String,
+    verdict: String,
+    reason: String,
+    source: String,
+}
+
+/// One approval of a run, with the answer it did or did not receive.
+///
+/// The queue model's row plus the fields only a *history* needs. The queue lists
+/// unanswered requests, so it has no reason to carry a state or a verdict; a run
+/// that ended because somebody said no has every reason to.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RunApprovalRow {
+    row: ApprovalRow,
+    state: String,
+    pending: bool,
+    verdict: String,
+    decided_via: String,
+    decided_at: String,
+    reason: String,
+}
+
+/// One artifact's metadata as its detail page draws it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ArtifactRow {
+    artifact_id: String,
+    step_id: String,
+    tool_call_id: String,
+    name: String,
+    media_type: String,
+    byte_size: u64,
+    availability: String,
+    created: String,
+    /// Where the bytes are, rebuilt from the two identifiers as the store does.
+    path: String,
+    /// Whether [`artifact_excerpt`] would render this one inline.
+    excerptable: bool,
+}
+
+/// One run, everything under it, and what may still be done to it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RunDetail {
+    /// The header's fields, spelled exactly as the run list model's roles.
+    run: RunRow,
+    retryable: bool,
+    /// Why a retry is unavailable, empty when it is available.
+    ///
+    /// The runtime's own discriminants, because this is a read of the state
+    /// `RunCoordinator::retry_run` refuses on rather than a second opinion.
+    retry_blocked: &'static str,
+    /// Later attempts at the same task, oldest first — the order
+    /// `Store::retries_of` lists them in, which is the order they were made.
+    retries: Vec<String>,
+    steps: Vec<StepRow>,
+    calls: Vec<CallRow>,
+    approvals: Vec<RunApprovalRow>,
+    artifacts: Vec<ArtifactRow>,
+    /// Which collections [`MAX_RUN_DETAIL_ROWS`] cut short, by name.
+    truncated: Vec<&'static str>,
+}
+
+/// One artifact rendered as bounded text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArtifactExcerpt {
+    artifact_id: String,
+    name: String,
+    media_type: String,
+    text: String,
+    /// Whether [`MAX_ARTIFACT_EXCERPT_BYTES`] cut the rendering short.
+    truncated: bool,
+}
+
+/// Whether this build is willing to render an artifact's bytes as text.
+///
+/// A deliberate allowlist rather than a sniff of the content. `media_type` is
+/// what the producing tool declared, and the question being answered is "may
+/// this be shown in a label", which nothing about the bytes themselves decides.
+fn is_renderable_text(media_type: &str) -> bool {
+    let media_type = media_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    media_type.starts_with("text/")
+        || media_type.ends_with("+json")
+        || matches!(
+            media_type.as_str(),
+            "application/json" | "application/x-ndjson" | "application/xml"
+        )
+}
+
+/// Projects one step into a row.
+fn step_row(step: &harkness_runtime::domain::Step) -> StepRow {
+    StepRow {
+        step_id: step.id().to_string(),
+        ordinal: step.ordinal(),
+        title: step.title().to_owned(),
+        state: step.state().as_str().to_owned(),
+        terminal: step.state().is_terminal(),
+        created: rfc3339(step.created_at()),
+        started: optional_rfc3339(step.started_at()),
+        finished: optional_rfc3339(step.finished_at()),
+        error_kind: step
+            .failure()
+            .map(|failure| failure.kind().to_owned())
+            .unwrap_or_default(),
+        error_message: step
+            .failure()
+            .map(|failure| failure.message().to_owned())
+            .unwrap_or_default(),
+    }
+}
+
+/// Projects one recorded call into a row.
+///
+/// The call's input and output are deliberately absent. A call's input is what
+/// `loadApprovalInput` fetches for the one call a question is being asked about,
+/// and its output may be the whole of a tool's result; carrying either for every
+/// call of a run would put megabytes behind a header.
+fn call_row(call: &ToolCall) -> CallRow {
+    CallRow {
+        tool_call_id: call.id().to_string(),
+        step_id: call.step_id().to_string(),
+        tool_id: call.tool_id().to_owned(),
+        tool_version: call.tool_version().to_owned(),
+        state: call.state().as_str().to_owned(),
+        terminal: call.state().is_terminal(),
+        created: rfc3339(call.created_at()),
+        started: optional_rfc3339(call.started_at()),
+        finished: optional_rfc3339(call.finished_at()),
+        error_kind: call
+            .failure()
+            .map(|failure| failure.kind().to_owned())
+            .unwrap_or_default(),
+        error_message: call
+            .failure()
+            .map(|failure| failure.message().to_owned())
+            .unwrap_or_default(),
+        verdict: call
+            .policy_decision()
+            .map(|decision| decision.verdict().as_str().to_owned())
+            .unwrap_or_default(),
+        reason: call
+            .policy_decision()
+            .map(|decision| decision.reason().to_owned())
+            .unwrap_or_default(),
+        source: call
+            .policy_decision()
+            .map(|decision| decision.source().as_str().to_owned())
+            .unwrap_or_default(),
+    }
+}
+
+/// Projects one durable approval into a row, answer and all.
+fn run_approval_row(request: &ApprovalRequest) -> RunApprovalRow {
+    let decision = request.decision();
+    RunApprovalRow {
+        row: super::approval_model::approval_row(request),
+        state: request.state().as_str().to_owned(),
+        pending: request.state() == ApprovalState::Pending,
+        verdict: decision
+            .map(|decision| decision.verdict().as_str().to_owned())
+            .unwrap_or_default(),
+        decided_via: decision
+            .map(|decision| decision.decided_via().as_str().to_owned())
+            .unwrap_or_default(),
+        decided_at: decision
+            .map(|decision| rfc3339(decision.decided_at()))
+            .unwrap_or_default(),
+        reason: decision
+            .and_then(|decision| decision.reason())
+            .unwrap_or_default()
+            .to_owned(),
+    }
+}
+
+/// Projects one artifact's metadata into a row.
+fn artifact_row(data_dir: &Path, artifact: &Artifact) -> ArtifactRow {
+    ArtifactRow {
+        artifact_id: artifact.id().to_string(),
+        step_id: artifact
+            .step_id()
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
+        tool_call_id: artifact
+            .tool_call_id()
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
+        name: artifact.name().to_owned(),
+        media_type: artifact.media_type().to_owned(),
+        byte_size: artifact.byte_size(),
+        availability: artifact.availability().as_str().to_owned(),
+        created: rfc3339(artifact.created_at()),
+        // Rebuilt from the two identifiers, exactly as the store rebuilds it
+        // rather than trusting the path it stored. Shown and copied; never
+        // opened, and never handed to a desktop launcher.
+        path: data_dir
+            .join("artifacts")
+            .join(artifact.run_id().to_string())
+            .join(artifact.id().to_string())
+            .display()
+            .to_string(),
+        excerptable: artifact.availability() == Availability::Available
+            && is_renderable_text(artifact.media_type())
+            && artifact.byte_size() <= MAX_ARTIFACT_EXCERPT_BYTES as u64,
+    }
+}
+
+/// Keeps a projected collection inside its bound, naming it when it cut one.
+fn bounded<T>(mut rows: Vec<T>, name: &'static str, truncated: &mut Vec<&'static str>) -> Vec<T> {
+    if rows.len() > MAX_RUN_DETAIL_ROWS {
+        rows.truncate(MAX_RUN_DETAIL_ROWS);
+        truncated.push(name);
+    }
+    rows
+}
+
+/// Reads one run and everything recorded under it.
+fn run_detail(run: RunId) -> Result<Completion, RunsFailure> {
+    run_detail_in(&data_dir()?, run)
+}
+
+/// Reads one run's detail from a named data directory.
+///
+/// Split from [`run_detail`] so a test can seed a temporary store and read it
+/// back without touching `HARKNESS_DATA_DIR`, which is process-wide.
+///
+/// A read, so it goes through the store rather than attaching a coordinator:
+/// opening a page to look at what a run did must not take this process's lease
+/// and mark somebody else's runs interrupted.
+fn run_detail_in(data_dir: &Path, run: RunId) -> Result<Completion, RunsFailure> {
+    let Some(store) = read_store(data_dir)? else {
+        return Err(RunsFailure::new(
+            NO_RUN_STORE,
+            "this data directory has recorded no runs yet",
+        ));
+    };
+    let record = store.load_run(run)?;
+    // A run whose task row is unreadable is exactly the run somebody needs to
+    // see, so the header loses its title and workspace rather than the page
+    // failing to open — the same rule the list model's rows follow.
+    let task = store.load_task(record.task_id()).ok();
+    let mut truncated = Vec::new();
+    // Retry eligibility is read off the same durable state `retry_run` refuses
+    // on, in the same order, so the button and the runtime cannot disagree
+    // about *why*. It is still a read of a moment: a run that finishes between
+    // this and the press is refused by the coordinator, which is the authority.
+    let retries: Vec<Run> = store
+        .retries_of(run)?
+        .into_iter()
+        .filter_map(|attempt| store.load_run(attempt).ok())
+        .collect();
+    let retry_blocked = if !record.state().is_terminal() {
+        "run_still_active"
+    } else if record.state() == ExecutionState::Succeeded {
+        "run_not_retryable"
+    } else if retries.iter().any(|attempt| !attempt.state().is_terminal()) {
+        "run_still_active"
+    } else {
+        ""
+    };
+    let detail = RunDetail {
+        run: run_row(&record, task.as_ref()),
+        retryable: retry_blocked.is_empty(),
+        retry_blocked,
+        retries: retries
+            .iter()
+            .map(|attempt| attempt.id().to_string())
+            .collect(),
+        steps: bounded(
+            store.load_run_steps(run)?.iter().map(step_row).collect(),
+            "steps",
+            &mut truncated,
+        ),
+        calls: bounded(
+            store
+                .load_run_tool_calls(run)?
+                .iter()
+                .map(call_row)
+                .collect(),
+            "calls",
+            &mut truncated,
+        ),
+        // Every approval the run recorded, not only the unanswered ones: a
+        // denial is the reason a run ended, and a page that showed only what is
+        // still pending would render a denied run with nothing to explain it.
+        approvals: bounded(
+            store
+                .run_approvals(run)?
+                .iter()
+                .map(run_approval_row)
+                .collect(),
+            "approvals",
+            &mut truncated,
+        ),
+        // Metadata only. `run_artifacts` probes each file's presence and size
+        // and opens none of them, so a run with a gigabyte of output costs this
+        // read one query.
+        artifacts: bounded(
+            store
+                .run_artifacts(run)?
+                .iter()
+                .map(|artifact| artifact_row(store.data_dir(), artifact))
+                .collect(),
+            "artifacts",
+            &mut truncated,
+        ),
+        truncated,
+    };
+    Ok(Completion::answering(
+        format!("Loaded run {run}"),
+        Answered::RunDetail(Box::new(detail)),
+    ))
+}
+
+/// Renders one small text artifact.
+fn artifact_excerpt(artifact: ArtifactId) -> Result<Completion, RunsFailure> {
+    artifact_excerpt_in(&data_dir()?, artifact)
+}
+
+/// Renders one artifact from a named data directory.
+///
+/// Refused by name rather than rendered as replacement characters when the
+/// content is not text this build declares renderable: an excerpt is shown in a
+/// label, and lossy bytes in a label are a worse answer than "this is not
+/// something to read here".
+fn artifact_excerpt_in(data_dir: &Path, artifact: ArtifactId) -> Result<Completion, RunsFailure> {
+    let Some(store) = read_store(data_dir)? else {
+        return Err(RunsFailure::new(
+            NO_RUN_STORE,
+            "this data directory has recorded no runs yet",
+        ));
+    };
+    let record = store.artifact(artifact)?;
+    if !is_renderable_text(record.media_type()) {
+        return Err(RunsFailure::new(
+            ARTIFACT_NOT_TEXT,
+            format!(
+                "{} is {}, which Harkness does not render inline",
+                record.name(),
+                record.media_type()
+            ),
+        ));
+    }
+    // Bounded on what is read rather than on the recorded size. The recorded
+    // size is what the file was at finalization, and the file is on disk where
+    // anything may have grown it since; reading one byte past the budget is
+    // what tells the reader it was cut.
+    let mut bytes = Vec::new();
+    let mut reader = store
+        .open_artifact(artifact)?
+        .take(MAX_ARTIFACT_EXCERPT_BYTES as u64 + 1);
+    reader.read_to_end(&mut bytes).map_err(|error| {
+        RunsFailure::new(
+            ARTIFACT_NOT_TEXT,
+            format!("{} could not be read: {error}", record.name()),
+        )
+    })?;
+    let truncated = bytes.len() > MAX_ARTIFACT_EXCERPT_BYTES;
+    bytes.truncate(MAX_ARTIFACT_EXCERPT_BYTES);
+    // A truncation lands wherever the budget ran out, which is commonly inside
+    // a character, so the tail is dropped rather than replaced: one lost glyph
+    // beats a replacement character that reads as corruption in the file.
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) if truncated => {
+            let valid = error.utf8_error().valid_up_to();
+            let mut bytes = error.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).expect("truncated at a boundary the error reported")
+        }
+        Err(_) => {
+            return Err(RunsFailure::new(
+                ARTIFACT_NOT_TEXT,
+                format!(
+                    "{} declares {} but is not valid UTF-8",
+                    record.name(),
+                    record.media_type()
+                ),
+            ));
+        }
+    };
+    Ok(Completion::answering(
+        format!("Loaded {}", record.name()),
+        Answered::ArtifactExcerpt(ArtifactExcerpt {
+            artifact_id: artifact.to_string(),
+            name: record.name().to_owned(),
+            media_type: record.media_type().to_owned(),
+            text,
+            truncated,
+        }),
+    ))
 }
 
 /// Rebuilds a script that re-issues what the original run recorded.
@@ -625,8 +1245,14 @@ pub struct RunsBackendRust {
     status: QString,
     kind: QString,
     detail: QVariant,
+    run: QVariant,
+    excerpt: QVariant,
     /// Monotonic operation number; only the newest reply writes a message.
     next_request: u64,
+    /// The newest operation number issued against each answer property, indexed
+    /// by [`Answer::slot`]. A reply writes its answer only while it is still
+    /// the one this names.
+    newest: [u64; ANSWER_SLOTS],
     /// Operations still outstanding, which is what `busy` reports.
     pending: u32,
 }
@@ -638,7 +1264,10 @@ impl Default for RunsBackendRust {
             status: QString::from("Ready"),
             kind: QString::default(),
             detail: QVariant::default(),
+            run: QVariant::default(),
+            excerpt: QVariant::default(),
             next_request: 0,
+            newest: [0; ANSWER_SLOTS],
             pending: 0,
         }
     }
@@ -666,34 +1295,194 @@ fn approval_detail(input: &ApprovalInput) -> QVariant {
     QVariant::from(&map)
 }
 
+/// One run's projection as QML binds to it.
+fn run_variant(detail: &RunDetail) -> QVariant {
+    let mut map = super::run_list_model::row_map(&detail.run);
+    map.insert(
+        QString::from("retryable"),
+        QVariant::from(&detail.retryable),
+    );
+    map.insert(
+        QString::from("retryBlocked"),
+        QVariant::from(&QString::from(detail.retry_blocked)),
+    );
+    map.insert(QString::from("retries"), strings(&detail.retries));
+    map.insert(
+        QString::from("steps"),
+        list(&detail.steps, |row| {
+            let mut map = QMap::<QMapPair_QString_QVariant>::default();
+            text(&mut map, "stepId", &row.step_id);
+            text(&mut map, "title", &row.title);
+            text(&mut map, "state", &row.state);
+            text(&mut map, "created", &row.created);
+            text(&mut map, "started", &row.started);
+            text(&mut map, "finished", &row.finished);
+            text(&mut map, "errorKind", &row.error_kind);
+            text(&mut map, "errorMessage", &row.error_message);
+            map.insert(QString::from("terminal"), QVariant::from(&row.terminal));
+            map.insert(
+                QString::from("ordinal"),
+                QVariant::from(&i32::try_from(row.ordinal).unwrap_or(i32::MAX)),
+            );
+            map
+        }),
+    );
+    map.insert(
+        QString::from("calls"),
+        list(&detail.calls, |row| {
+            let mut map = QMap::<QMapPair_QString_QVariant>::default();
+            text(&mut map, "toolCallId", &row.tool_call_id);
+            text(&mut map, "stepId", &row.step_id);
+            text(&mut map, "toolId", &row.tool_id);
+            text(&mut map, "toolVersion", &row.tool_version);
+            text(&mut map, "state", &row.state);
+            text(&mut map, "created", &row.created);
+            text(&mut map, "started", &row.started);
+            text(&mut map, "finished", &row.finished);
+            text(&mut map, "errorKind", &row.error_kind);
+            text(&mut map, "errorMessage", &row.error_message);
+            text(&mut map, "verdict", &row.verdict);
+            text(&mut map, "reason", &row.reason);
+            text(&mut map, "source", &row.source);
+            map.insert(QString::from("terminal"), QVariant::from(&row.terminal));
+            map
+        }),
+    );
+    map.insert(
+        QString::from("approvals"),
+        list(&detail.approvals, |row| {
+            let mut map = super::approval_model::row_map(&row.row);
+            text(&mut map, "state", &row.state);
+            text(&mut map, "verdict", &row.verdict);
+            text(&mut map, "decidedVia", &row.decided_via);
+            text(&mut map, "decidedAt", &row.decided_at);
+            text(&mut map, "reason", &row.reason);
+            map.insert(QString::from("pending"), QVariant::from(&row.pending));
+            map
+        }),
+    );
+    map.insert(
+        QString::from("artifacts"),
+        list(&detail.artifacts, |row| {
+            let mut map = QMap::<QMapPair_QString_QVariant>::default();
+            text(&mut map, "artifactId", &row.artifact_id);
+            text(&mut map, "stepId", &row.step_id);
+            text(&mut map, "toolCallId", &row.tool_call_id);
+            text(&mut map, "name", &row.name);
+            text(&mut map, "mediaType", &row.media_type);
+            text(&mut map, "availability", &row.availability);
+            text(&mut map, "created", &row.created);
+            text(&mut map, "path", &row.path);
+            map.insert(
+                QString::from("byteSize"),
+                QVariant::from(&i64::try_from(row.byte_size).unwrap_or(i64::MAX)),
+            );
+            map.insert(
+                QString::from("excerptable"),
+                QVariant::from(&row.excerptable),
+            );
+            map
+        }),
+    );
+    map.insert(QString::from("truncated"), strings(&detail.truncated));
+    QVariant::from(&map)
+}
+
+/// One artifact rendering as QML binds to it.
+fn excerpt_variant(excerpt: &ArtifactExcerpt) -> QVariant {
+    let mut map = QMap::<QMapPair_QString_QVariant>::default();
+    text(&mut map, "artifactId", &excerpt.artifact_id);
+    text(&mut map, "name", &excerpt.name);
+    text(&mut map, "mediaType", &excerpt.media_type);
+    text(&mut map, "text", &excerpt.text);
+    map.insert(
+        QString::from("truncated"),
+        QVariant::from(&excerpt.truncated),
+    );
+    QVariant::from(&map)
+}
+
+/// Inserts one string field, which is most of what these projections are.
+fn text(map: &mut QMap<QMapPair_QString_QVariant>, key: &str, value: &str) {
+    map.insert(QString::from(key), QVariant::from(&QString::from(value)));
+}
+
+/// Projects a slice into the `QVariantList` a QML repeater binds to.
+fn list<T>(rows: &[T], project: impl Fn(&T) -> QMap<QMapPair_QString_QVariant>) -> QVariant {
+    let mut items = QList::<QVariant>::default();
+    for row in rows {
+        items.append(QVariant::from(&project(row)));
+    }
+    QVariant::from(&items)
+}
+
+/// Projects a slice of names into a `QVariantList` of plain strings.
+fn strings(values: &[impl AsRef<str>]) -> QVariant {
+    let mut items = QList::<QVariant>::default();
+    for value in values {
+        items.append(QVariant::from(&QString::from(value.as_ref())));
+    }
+    QVariant::from(&items)
+}
+
 /// Applies one finished operation on the Qt thread.
 fn settle(
     mut backend: Pin<&mut ffi::RunsBackend>,
     request: u64,
+    answer: Answer,
     outcome: Result<Completion, RunsFailure>,
 ) {
-    let newest = {
+    let settled = {
         let rust = backend.as_mut().rust_mut().get_mut();
         rust.pending = rust.pending.saturating_sub(1);
-        rust.next_request == request
+        settlement(request, rust.newest[answer.slot()], rust.next_request)
     };
     let busy = backend.as_ref().rust().pending > 0;
     backend.as_mut().set_busy(busy);
-    // A superseded reply still gave up its share of `busy`; what it must not do
-    // is describe the operation the user is currently watching.
-    if !newest {
+    // A reply superseded on its own question has nothing left to say: another
+    // load of the same kind is already on its way to the same property, and
+    // writing this one would show the older subject and then replace it.
+    if !settled.answer {
         return;
     }
-    // `detail` describes the operation being reported and nothing else. Left
-    // standing, a failed `loadApprovalInput` — or any later cancel, approve, or
-    // deny — would leave the *previous* approval's validated input bound while
-    // a dialog asks about a different one, which is the worst way for this
-    // field to be wrong.
-    let detail = match &outcome {
-        Ok(completion) => completion.detail.as_ref().map(approval_detail),
-        Err(_) => None,
+    // Exactly one answer property is written, and only by the operation that
+    // answers it. A failed load blanks the property it was loading rather than
+    // leaving the previous subject's answer standing under a new question —
+    // see `Answer` for why a decision blanks `detail` as well.
+    let answered = match &outcome {
+        Ok(completion) => &completion.answered,
+        Err(_) => &Answered::Nothing,
     };
-    backend.as_mut().set_detail(detail.unwrap_or_default());
+    match answer {
+        Answer::Decision | Answer::ApprovalInput => {
+            let detail = match answered {
+                Answered::ApprovalInput(input) => approval_detail(input),
+                _ => QVariant::default(),
+            };
+            backend.as_mut().set_detail(detail);
+        }
+        Answer::RunDetail => {
+            let run = match answered {
+                Answered::RunDetail(detail) => run_variant(detail),
+                _ => QVariant::default(),
+            };
+            backend.as_mut().set_run(run);
+        }
+        Answer::ArtifactExcerpt => {
+            let excerpt = match answered {
+                Answered::ArtifactExcerpt(excerpt) => excerpt_variant(excerpt),
+                _ => QVariant::default(),
+            };
+            backend.as_mut().set_excerpt(excerpt);
+        }
+    }
+    // `status` and `kind` are one pair shared by every operation, so only the
+    // newest of any kind may write them: two operations overlapping otherwise
+    // let the slower one's message overwrite the faster one's, and the panel
+    // would report the outcome of the thing the user did *first*.
+    if !settled.status {
+        return;
+    }
     match outcome {
         Ok(completion) => {
             backend
@@ -713,9 +1502,18 @@ fn settle(
 }
 
 impl ffi::RunsBackend {
-    /// Runs `work` off the Qt thread and applies its outcome back on it.
+    /// Runs a mutation off the Qt thread and applies its outcome back on it.
     fn dispatch(
+        self: Pin<&mut Self>,
+        work: impl FnOnce() -> Result<Completion, RunsFailure> + Send + 'static,
+    ) {
+        self.dispatch_answering(Answer::Decision, work);
+    }
+
+    /// Runs `work` off the Qt thread, writing the answer property it names.
+    fn dispatch_answering(
         mut self: Pin<&mut Self>,
+        answer: Answer,
         work: impl FnOnce() -> Result<Completion, RunsFailure> + Send + 'static,
     ) {
         note_qt_thread();
@@ -723,13 +1521,18 @@ impl ffi::RunsBackend {
             let rust = self.as_mut().rust_mut().get_mut();
             rust.next_request += 1;
             rust.pending += 1;
+            // Claims the answer property this operation owns as well as the
+            // shared status. Both watermarks are taken here, on the Qt thread,
+            // so the reply that eventually lands can be measured against the
+            // state that held when it was issued.
+            rust.newest[answer.slot()] = rust.next_request;
             rust.next_request
         };
         self.as_mut().set_busy(true);
         let qt_thread = self.qt_thread();
         std::thread::spawn(move || {
             let outcome = work();
-            let _ = qt_thread.queue(move |backend| settle(backend, request, outcome));
+            let _ = qt_thread.queue(move |backend| settle(backend, request, answer, outcome));
         });
     }
 
@@ -823,24 +1626,45 @@ impl ffi::RunsBackend {
 
     fn load_approval_input(self: Pin<&mut Self>, approval_id: &QString) {
         let approval_id = approval_id.to_string();
-        self.dispatch(move || approval_input(parse_approval(&approval_id)?));
+        self.dispatch_answering(Answer::ApprovalInput, move || {
+            approval_input(parse_approval(&approval_id)?)
+        });
+    }
+
+    fn load_run(self: Pin<&mut Self>, run_id: &QString) {
+        let run_id = run_id.to_string();
+        self.dispatch_answering(Answer::RunDetail, move || run_detail(parse_run(&run_id)?));
+    }
+
+    fn load_artifact_excerpt(self: Pin<&mut Self>, artifact_id: &QString) {
+        let artifact_id = artifact_id.to_string();
+        self.dispatch_answering(Answer::ArtifactExcerpt, move || {
+            artifact_excerpt(parse_artifact(&artifact_id)?)
+        });
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use serde_json::json;
+    use tempfile::TempDir;
     use time::OffsetDateTime;
 
     use harkness_runtime::agent::{AgentAction, ObservationPattern};
     use harkness_runtime::approval::ApprovalScope;
     use harkness_runtime::coordinator::RuntimeError;
-    use harkness_runtime::domain::{RunId, Step, ToolCall, ToolCallState};
-    use harkness_runtime::store::StoreError;
+    use harkness_runtime::domain::{
+        ExecutionState, Failure, Run, RunId, Step, Task, TaskId, ToolCall, ToolCallState,
+    };
+    use harkness_runtime::store::{Store, StoreError};
 
     use super::{
-        BRIDGE_KINDS, MAX_APPROVAL_INPUT_BYTES, RunsFailure, clamp, grant_scope, optional_rfc3339,
-        parse_approval, parse_run, retry_scenario, rfc3339,
+        Answer, Answered, BRIDGE_KINDS, MAX_APPROVAL_INPUT_BYTES, MAX_ARTIFACT_EXCERPT_BYTES,
+        MAX_RUN_DETAIL_ROWS, RunDetail, RunsFailure, artifact_excerpt_in, bounded, clamp,
+        grant_scope, is_renderable_text, optional_rfc3339, parse_approval, parse_artifact,
+        parse_run, retry_scenario, rfc3339, run_detail_in, settlement,
     };
 
     fn at(seconds: i64) -> OffsetDateTime {
@@ -915,6 +1739,87 @@ mod tests {
 
         for kind in BRIDGE_KINDS {
             assert!(seen.insert(kind), "{kind} is declared twice");
+        }
+    }
+
+    // -- what a settling reply may write -----------------------------------
+
+    #[test]
+    fn a_decision_and_an_approval_input_share_the_property_they_both_write() {
+        assert_eq!(Answer::Decision.slot(), Answer::ApprovalInput.slot());
+    }
+
+    #[test]
+    fn the_three_answer_properties_are_counted_apart() {
+        let slots = [
+            Answer::ApprovalInput.slot(),
+            Answer::RunDetail.slot(),
+            Answer::ArtifactExcerpt.slot(),
+        ];
+
+        let distinct: std::collections::HashSet<usize> = slots.into_iter().collect();
+
+        assert_eq!(
+            distinct.len(),
+            3,
+            "{slots:?} does not name three properties"
+        );
+        assert!(
+            slots.iter().all(|slot| *slot < super::ANSWER_SLOTS),
+            "{slots:?} indexes past the watermarks"
+        );
+    }
+
+    #[test]
+    fn the_newest_operation_of_all_writes_both_its_answer_and_the_status() {
+        let settled = settlement(7, 7, 7);
+
+        assert!(settled.answer);
+        assert!(settled.status);
+    }
+
+    #[test]
+    fn a_load_still_answers_its_own_question_when_another_kind_overtook_it() {
+        // The header re-read a live run schedules is issued after the excerpt
+        // the reader asked for and settles first. It says nothing about the
+        // excerpt, so the excerpt still lands on the row that asked for it.
+        let settled = settlement(7, 7, 9);
+
+        assert!(
+            settled.answer,
+            "the excerpt is still the newest of its kind"
+        );
+        assert!(
+            !settled.status,
+            "but the message belongs to the operation the reader did last"
+        );
+    }
+
+    #[test]
+    fn a_load_superseded_by_another_of_its_own_kind_writes_nothing() {
+        let settled = settlement(7, 9, 9);
+
+        assert!(!settled.answer);
+        assert!(!settled.status);
+    }
+
+    #[test]
+    fn the_status_is_never_written_by_a_reply_that_may_not_write_its_answer() {
+        // A slot's watermark is a value `next_request` held at some point, so
+        // it can never run ahead of it; the combinations where it does are not
+        // states `dispatch_answering` can produce.
+        for request in 0..4u64 {
+            for newest_overall in request..4u64 {
+                for newest_for_answer in request..=newest_overall {
+                    let settled = settlement(request, newest_for_answer, newest_overall);
+
+                    assert!(
+                        !settled.status || settled.answer,
+                        "{request}/{newest_for_answer}/{newest_overall} would describe an \
+                         operation whose answer was already superseded"
+                    );
+                }
+            }
         }
     }
 
@@ -1048,5 +1953,407 @@ mod tests {
         assert_eq!(rfc3339(at), "2025-08-12T12:00:00Z");
         assert_eq!(optional_rfc3339(Some(at)), "2025-08-12T12:00:00Z");
         assert_eq!(optional_rfc3339(None), "");
+    }
+
+    // -- one run's detail ---------------------------------------------------
+
+    /// A store with one task, in its own temporary data directory.
+    fn seeded() -> (TempDir, std::path::PathBuf, Store, Task) {
+        let fixture = TempDir::new().unwrap();
+        let data_dir = fixture.path().join("data");
+        let store = Store::open(&data_dir).unwrap();
+        let task = Task::with_id(
+            TaskId::new(),
+            "Check: cargo test",
+            "/workspace/harkness",
+            None,
+            at(0),
+        );
+        store.insert_task(&task).unwrap();
+        (fixture, data_dir, store, task)
+    }
+
+    /// Records one run of `task` and leaves it in `state`.
+    fn recorded_run(store: &Store, task: &Task, state: ExecutionState, seconds: i64) -> RunId {
+        let run = Run::with_id(RunId::new(), task.id(), at(seconds));
+        store.insert_run(&run).unwrap();
+        if state == ExecutionState::Queued {
+            return run.id();
+        }
+        store
+            .transition_run(run.id(), ExecutionState::Running, at(seconds + 1))
+            .unwrap();
+        match state {
+            ExecutionState::Running => {}
+            ExecutionState::Failed => {
+                store
+                    .fail_run(
+                        run.id(),
+                        Failure::new("tool_failed", "the tool exited 1"),
+                        at(seconds + 2),
+                    )
+                    .unwrap();
+            }
+            other => {
+                store
+                    .transition_run(run.id(), other, at(seconds + 2))
+                    .unwrap();
+            }
+        }
+        run.id()
+    }
+
+    fn detail(data_dir: &std::path::Path, run: RunId) -> RunDetail {
+        match run_detail_in(data_dir, run).unwrap().answered {
+            Answered::RunDetail(detail) => *detail,
+            other => panic!("a run detail load answers with a run detail, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_run_that_was_never_recorded_is_refused_rather_than_read_as_empty() {
+        let (_fixture, data_dir, store, _task) = seeded();
+        drop(store);
+
+        let failure = run_detail_in(&data_dir, RunId::new()).unwrap_err();
+
+        assert_eq!(failure.kind, "not_found");
+    }
+
+    #[test]
+    fn a_recorded_run_is_projected_with_its_steps_calls_and_artifacts() {
+        let (_fixture, data_dir, store, task) = seeded();
+        let run = recorded_run(&store, &task, ExecutionState::Failed, 1);
+        let step = Step::new(run, 0, "run the check", at(2));
+        store.insert_step(&step).unwrap();
+        let call = ToolCall::new(
+            &step,
+            "process.exec",
+            "1.0.0",
+            json!({"argv": ["ls"]}),
+            at(3),
+        );
+        store.insert_tool_call(&call).unwrap();
+        let mut sink = store
+            .create_artifact(run, "stdout.log", "text/plain", at(4))
+            .unwrap()
+            .for_step(step.id())
+            .for_tool_call(call.id());
+        sink.write_all(b"hello\n").unwrap();
+        sink.finish().unwrap();
+        drop(store);
+
+        let detail = detail(&data_dir, run);
+
+        assert_eq!(detail.run.state, "failed");
+        assert_eq!(detail.run.error_kind, "tool_failed");
+        assert_eq!(detail.steps.len(), 1);
+        assert_eq!(detail.calls.len(), 1);
+        assert_eq!(detail.calls[0].tool_id, "process.exec");
+        assert_eq!(detail.artifacts.len(), 1);
+        assert_eq!(detail.artifacts[0].media_type, "text/plain");
+        assert_eq!(detail.artifacts[0].byte_size, 6);
+        assert_eq!(detail.artifacts[0].availability, "available");
+        assert!(detail.artifacts[0].excerptable);
+        assert!(
+            detail.artifacts[0].path.ends_with(&format!(
+                "artifacts/{run}/{}",
+                detail.artifacts[0].artifact_id
+            )),
+            "{}",
+            detail.artifacts[0].path
+        );
+        assert!(detail.truncated.is_empty());
+    }
+
+    #[test]
+    fn an_interrupted_run_still_names_the_call_that_was_in_flight() {
+        let (_fixture, data_dir, store, task) = seeded();
+        let run = recorded_run(&store, &task, ExecutionState::Running, 1);
+        let step = Step::new(run, 0, "run the check", at(2));
+        store.insert_step(&step).unwrap();
+        let call = ToolCall::new(
+            &step,
+            "process.exec",
+            "1.0.0",
+            json!({"argv": ["ls"]}),
+            at(3),
+        );
+        store.insert_tool_call(&call).unwrap();
+        store
+            .transition_tool_call(call.id(), ToolCallState::Running, at(5))
+            .unwrap();
+        store
+            .transition_tool_call(call.id(), ToolCallState::Interrupted, at(6))
+            .unwrap();
+        store
+            .transition_run(run, ExecutionState::Interrupted, at(7))
+            .unwrap();
+        drop(store);
+
+        let detail = detail(&data_dir, run);
+
+        assert_eq!(detail.run.state, "interrupted");
+        assert_eq!(detail.calls[0].state, "interrupted");
+        assert_eq!(detail.calls[0].started, "2025-08-12T12:00:05Z");
+        assert!(detail.retryable, "an interrupted run is re-attemptable");
+    }
+
+    #[test]
+    fn a_run_that_has_not_finished_offers_no_retry_and_says_why() {
+        let (_fixture, data_dir, store, task) = seeded();
+        let run = recorded_run(&store, &task, ExecutionState::Running, 1);
+        drop(store);
+
+        let detail = detail(&data_dir, run);
+
+        assert!(!detail.retryable);
+        assert_eq!(detail.retry_blocked, "run_still_active");
+    }
+
+    #[test]
+    fn a_run_that_succeeded_offers_no_retry_and_says_why() {
+        let (_fixture, data_dir, store, task) = seeded();
+        let run = recorded_run(&store, &task, ExecutionState::Succeeded, 1);
+        drop(store);
+
+        let detail = detail(&data_dir, run);
+
+        assert!(!detail.retryable);
+        assert_eq!(detail.retry_blocked, "run_not_retryable");
+    }
+
+    #[test]
+    fn a_failed_run_whose_re_attempt_is_still_running_offers_no_second_one() {
+        let (_fixture, data_dir, store, task) = seeded();
+        let original = recorded_run(&store, &task, ExecutionState::Failed, 1);
+        let retry = Run::retrying_with_id(RunId::new(), task.id(), original, false, at(10));
+        store.insert_run(&retry).unwrap();
+        store
+            .transition_run(retry.id(), ExecutionState::Running, at(11))
+            .unwrap();
+        drop(store);
+
+        let detail = detail(&data_dir, original);
+
+        assert!(
+            !detail.retryable,
+            "two live attempts would share a worktree"
+        );
+        assert_eq!(detail.retry_blocked, "run_still_active");
+        assert_eq!(detail.retries, vec![retry.id().to_string()]);
+    }
+
+    #[test]
+    fn a_failed_run_whose_re_attempts_have_all_ended_is_retryable_again() {
+        let (_fixture, data_dir, store, task) = seeded();
+        let original = recorded_run(&store, &task, ExecutionState::Failed, 1);
+        let retry = Run::retrying_with_id(RunId::new(), task.id(), original, true, at(10));
+        store.insert_run(&retry).unwrap();
+        store
+            .transition_run(retry.id(), ExecutionState::Running, at(11))
+            .unwrap();
+        store
+            .transition_run(retry.id(), ExecutionState::Cancelled, at(12))
+            .unwrap();
+        drop(store);
+
+        let detail = detail(&data_dir, original);
+
+        assert!(detail.retryable);
+        assert_eq!(detail.retry_blocked, "");
+    }
+
+    #[test]
+    fn an_oversized_collection_is_cut_and_names_itself() {
+        let mut truncated = Vec::new();
+
+        let rows = bounded(
+            (0..MAX_RUN_DETAIL_ROWS + 1).collect::<Vec<_>>(),
+            "calls",
+            &mut truncated,
+        );
+
+        assert_eq!(rows.len(), MAX_RUN_DETAIL_ROWS);
+        assert_eq!(truncated, vec!["calls"]);
+    }
+
+    #[test]
+    fn a_collection_inside_the_bound_says_nothing_about_truncation() {
+        let mut truncated = Vec::new();
+
+        let rows = bounded(vec![1, 2, 3], "steps", &mut truncated);
+
+        assert_eq!(rows.len(), 3);
+        assert!(truncated.is_empty());
+    }
+
+    // -- one artifact's excerpt ---------------------------------------------
+
+    /// Records one artifact of `content` under a fresh run.
+    fn with_artifact(
+        store: &Store,
+        task: &Task,
+        name: &str,
+        media_type: &str,
+        content: &[u8],
+    ) -> harkness_runtime::domain::ArtifactId {
+        let run = recorded_run(store, task, ExecutionState::Succeeded, 1);
+        let mut sink = store.create_artifact(run, name, media_type, at(4)).unwrap();
+        sink.write_all(content).unwrap();
+        sink.finish().unwrap().id()
+    }
+
+    #[test]
+    fn text_media_types_are_an_allowlist_rather_than_a_guess() {
+        assert!(is_renderable_text("text/plain"));
+        assert!(is_renderable_text("text/plain; charset=utf-8"));
+        assert!(is_renderable_text("APPLICATION/JSON"));
+        assert!(is_renderable_text("application/vnd.harkness.diff+json"));
+        assert!(!is_renderable_text("application/octet-stream"));
+        assert!(!is_renderable_text("image/png"));
+        assert!(!is_renderable_text(""));
+    }
+
+    #[test]
+    fn a_text_artifact_inside_the_budget_is_delivered_whole() {
+        let (_fixture, data_dir, store, task) = seeded();
+        let artifact = with_artifact(
+            &store,
+            &task,
+            "stdout.log",
+            "text/plain",
+            b"two lines\nhere\n",
+        );
+        drop(store);
+
+        let excerpt = match artifact_excerpt_in(&data_dir, artifact).unwrap().answered {
+            Answered::ArtifactExcerpt(excerpt) => excerpt,
+            other => panic!("an excerpt load answers with an excerpt, not {other:?}"),
+        };
+
+        assert_eq!(excerpt.text, "two lines\nhere\n");
+        assert!(!excerpt.truncated);
+        assert_eq!(excerpt.name, "stdout.log");
+    }
+
+    #[test]
+    fn an_oversized_text_artifact_is_cut_on_a_character_boundary_and_says_so() {
+        let (_fixture, data_dir, store, task) = seeded();
+        // Three bytes per character, so the budget cannot land on a boundary.
+        let content = "€".repeat(MAX_ARTIFACT_EXCERPT_BYTES);
+        let artifact = with_artifact(&store, &task, "wide.log", "text/plain", content.as_bytes());
+        drop(store);
+
+        let excerpt = match artifact_excerpt_in(&data_dir, artifact).unwrap().answered {
+            Answered::ArtifactExcerpt(excerpt) => excerpt,
+            other => panic!("an excerpt load answers with an excerpt, not {other:?}"),
+        };
+
+        assert!(excerpt.truncated);
+        assert!(excerpt.text.len() <= MAX_ARTIFACT_EXCERPT_BYTES);
+        assert!(
+            excerpt.text.chars().all(|character| character == '€'),
+            "a cut inside a character drops the tail rather than replacing it"
+        );
+    }
+
+    #[test]
+    fn an_artifact_that_is_not_text_is_refused_by_name_rather_than_rendered() {
+        let (_fixture, data_dir, store, task) = seeded();
+        let artifact = with_artifact(&store, &task, "core", "application/octet-stream", &[0, 159]);
+        drop(store);
+
+        let failure = artifact_excerpt_in(&data_dir, artifact).unwrap_err();
+
+        assert_eq!(failure.kind, "artifact_not_text");
+        assert!(
+            failure.message.contains("does not render inline"),
+            "{}",
+            failure.message
+        );
+    }
+
+    #[test]
+    fn an_artifact_declaring_text_that_is_not_utf_8_is_refused_rather_than_mangled() {
+        let (_fixture, data_dir, store, task) = seeded();
+        let artifact = with_artifact(&store, &task, "latin.log", "text/plain", &[0xff, 0xfe]);
+        drop(store);
+
+        let failure = artifact_excerpt_in(&data_dir, artifact).unwrap_err();
+
+        assert_eq!(failure.kind, "artifact_not_text");
+        assert!(
+            failure.message.contains("not valid UTF-8"),
+            "{}",
+            failure.message
+        );
+    }
+
+    #[test]
+    fn a_deleted_artifact_file_reads_as_unavailable_and_the_rest_of_the_page_still_loads() {
+        let (_fixture, data_dir, store, task) = seeded();
+        let run = recorded_run(&store, &task, ExecutionState::Succeeded, 1);
+        let mut sink = store
+            .create_artifact(run, "stdout.log", "text/plain", at(4))
+            .unwrap();
+        sink.write_all(b"gone soon\n").unwrap();
+        let artifact = sink.finish().unwrap();
+        std::fs::remove_file(
+            data_dir
+                .join("artifacts")
+                .join(run.to_string())
+                .join(artifact.id().to_string()),
+        )
+        .unwrap();
+        drop(store);
+
+        let detail = detail(&data_dir, run);
+
+        assert_eq!(detail.artifacts.len(), 1, "the row survives its content");
+        assert_eq!(detail.artifacts[0].availability, "missing");
+        assert!(
+            !detail.artifacts[0].excerptable,
+            "there is nothing left to excerpt"
+        );
+    }
+
+    #[test]
+    fn an_artifact_whose_bytes_changed_is_not_offered_inline_either() {
+        let (_fixture, data_dir, store, task) = seeded();
+        let run = recorded_run(&store, &task, ExecutionState::Succeeded, 1);
+        let mut sink = store
+            .create_artifact(run, "notes.txt", "text/plain", at(4))
+            .unwrap();
+        sink.write_all(b"original").unwrap();
+        let artifact = sink.finish().unwrap();
+        // The row records what was true at finalization and is never updated,
+        // so the size the reader would be shown is not the size on disk. What
+        // `excerptable` promises is that the bytes are still the recorded ones.
+        std::fs::write(
+            data_dir
+                .join("artifacts")
+                .join(run.to_string())
+                .join(artifact.id().to_string()),
+            b"rewritten from outside",
+        )
+        .unwrap();
+        drop(store);
+
+        let detail = detail(&data_dir, run);
+
+        assert_eq!(detail.artifacts[0].availability, "size_mismatch");
+        assert!(
+            !detail.artifacts[0].excerptable,
+            "these are not the bytes the row describes"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_artifact_identifier_is_refused_before_any_store_opens() {
+        assert_eq!(
+            parse_artifact("not-a-uuid").unwrap_err().kind,
+            "invalid_artifact_id"
+        );
     }
 }
