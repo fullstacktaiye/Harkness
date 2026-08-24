@@ -446,13 +446,40 @@ artifacts with media type, size, and whether the bytes are still on disk. A run
 still executing streams into the page live, and a tool reporting a line per file
 occupies one timeline row that counts its updates rather than one row per line.
 A failed run shows the structured error kind beside the message; a run waiting
-for a decision shows a banner naming the request, its risk, and the exact input
-it is holding; an interrupted run names the tool call that was in flight when
-the process stopped. Cancel appears while a run can still be stopped, and Retry
-appears only when the runtime's own durable state says a fresh attempt is
-allowed — with the reason spelled out when it is not. Everything a tool, an
-agent, or the repository wrote is rendered as inert plain text, and an artifact
-is only ever shown, never opened or executed.
+for a decision shows a banner naming the request and its risk; an interrupted
+run names the tool call that was in flight when the process stopped. Cancel
+appears while a run can still be stopped and changes what it says the moment it
+is pressed, on the run's own header and on the tool call that is holding the run
+up, which also shows the newest line that tool reported. Retry appears only when
+the runtime's own durable state says a fresh attempt is allowed — with the
+reason spelled out when it is not. Everything a tool, an agent, or the
+repository wrote is rendered as inert plain text, and an artifact is only ever
+shown, never opened or executed.
+
+Every request waiting for a person is listed at the top of the Runs view and
+counted on its activity-bar icon, and the project shell says so in its own
+header. Reviewing one opens a page — deliberately not a dialog. A dialog has an
+implicit accept: escape, the close button and a click outside all resolve one,
+and the affirmative button is conventionally the default. None of that may be
+true of an approval, so the review surface has Back and nothing else, no
+default-focused button, and no code path from navigation, destruction or window
+close that grants anything. Leaving leaves the request open.
+
+The page names the tool, its version, the risk it was classified at, the
+workspace the answer is bound to, and the readable summary the tool published —
+without reading anything else. The exact input the approval hash binds is a
+separate, explicit expansion, rendered as inert monospace text. Approving offers
+only the breadths the runtime would actually accept, which it reads off the
+record rather than deriving a second time: a workspace write asked for run-wide
+gives a choice starting at the single call in front of you, while a remote write
+or a destructive request was reduced to one call when it was created and renders
+no choice at all. A deadline that has passed withdraws Approve while the stored
+request still reads as pending, because a lapsed request is closed by a sweeper
+and not by the clock. A decision the runtime refuses — because the request moved
+underneath the page, or because this process is not the one driving that run —
+is displayed with the discriminant the runtime published, never reported as a
+success. Denials record the reason typed with them, and the timeline shows the
+decision with its scope, the surface it was given through, and when.
 
 ### Runs UI
 
@@ -463,6 +490,12 @@ is only ever shown, never opened or executed.
 ![A run executing, with a tool's progress folded into one timeline row](docs/screenshots/run-progress.png)
 
 ![A run waiting for a decision, with the request named in a banner](docs/screenshots/run-approval.png)
+
+![Reviewing a request: what it would do, the exact input it binds, and the breadths it may be approved at](docs/screenshots/approval-review.png)
+
+![A request whose deadline passed, rendered as too late to answer with no approval offered](docs/screenshots/approval-expired.png)
+
+![A refused request showing the reason that was typed, who gave it, and when](docs/screenshots/approval-denied.png)
 
 ![An interrupted run naming the tool call that was in flight](docs/screenshots/run-interrupted.png)
 

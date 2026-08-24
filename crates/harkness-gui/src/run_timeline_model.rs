@@ -256,7 +256,7 @@ const OUTCOME_FIELDS: [&str; 2] = ["state", "verdict"];
 /// Named rather than written at each site because the folding rule below is the
 /// only place in the front end that branches on a kind at all, and a typo in one
 /// of three string literals would silently stop it folding.
-const TOOL_PROGRESS_KIND: &str = "tool_progress";
+pub(crate) const TOOL_PROGRESS_KIND: &str = "tool_progress";
 
 fn model_roles() -> QHash<QHashPair_i32_QByteArray> {
     let mut roles = QHash::<QHashPair_i32_QByteArray>::default();

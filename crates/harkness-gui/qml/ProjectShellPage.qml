@@ -61,6 +61,16 @@ Kirigami.Page {
         shell.sidePanelExpanded = true;
     }
 
+    /// Puts the Runs view on screen, without the toggle `activateView` applies.
+    ///
+    /// Pressing "Review requests" while already on that view must not collapse
+    /// the panel the requests are listed in, which is exactly what the
+    /// activity bar's own second press means.
+    function showApprovalQueue() {
+        shell.currentViewId = runsPanel.viewId;
+        shell.sidePanelExpanded = true;
+    }
+
     function toggleSidePanel() {
         if (!sidePanel.hasAvailableView)
             return;
@@ -316,6 +326,28 @@ Kirigami.Page {
                 Layout.fillWidth: true
                 color: shell.frameColor
                 implicitHeight: 1
+            }
+
+            // A run stopped waiting for a person is the one piece of run state
+            // that is about the reader rather than about the run, so it is
+            // stated in the shell's own chrome instead of only inside the view
+            // that owns the queue. It names a count and never a request: which
+            // question to answer first is a decision, and the Runs view is
+            // where the questions are.
+            //
+            // The count is read off the Runs view rather than by a second
+            // `ApprovalModel` here. Two models would be two polls of the same
+            // bounded query, and — worse — two answers that could disagree
+            // while one of them was still in flight.
+            ApprovalBanner {
+                Layout.fillWidth: true
+                Layout.leftMargin: Kirigami.Units.smallSpacing
+                Layout.rightMargin: Kirigami.Units.smallSpacing
+                Layout.topMargin: Kirigami.Units.smallSpacing
+                count: runsPanel.pendingApprovals
+                now: runsPanel.now
+                objectName: "shellApprovalBanner"
+                onReviewRequested: shell.showApprovalQueue()
             }
 
             RowLayout {

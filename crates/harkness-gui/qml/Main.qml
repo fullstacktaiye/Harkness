@@ -307,6 +307,38 @@ Kirigami.ApplicationWindow {
         });
     }
 
+    /// Opens one approval request's review surface.
+    ///
+    /// A page rather than a dialog, and pushed *above* whatever named it, so
+    /// Back returns to the run or the queue the reader came from and leaves the
+    /// request exactly as it was. Nothing about this navigation — arriving,
+    /// leaving, or the window closing over it — answers a question: only the
+    /// two buttons on the page do.
+    ///
+    /// Opening a second request replaces the page rather than stacking another,
+    /// the way `showRun` does, so a reader working through a queue does not
+    /// build a stack they have to unwind one press at a time.
+    ///
+    /// `seed` is the row whoever called this already had, so the page draws its
+    /// header before its own read lands; it may be omitted.
+    function showApproval(approvalId, runId, seed) {
+        const approval = String(approvalId || "");
+        const run = String(runId || "");
+        if (approval.length === 0 || run.length === 0)
+            return;
+        if (pageStack.currentItem && pageStack.currentItem.isApprovalReview === true) {
+            if (pageStack.currentItem.approvalId === approval)
+                return;
+            pageStack.pop();
+        }
+        pageStack.push(Qt.resolvedUrl("ApprovalPage.qml"), {
+            "approvalId": approval,
+            "backend": appBackend,
+            "runId": run,
+            "seed": seed !== undefined ? seed : null
+        });
+    }
+
     onOpenedProjectChanged: {
         const id = openedProject && openedProject.id !== undefined ? String(openedProject.id) : "";
         if (id.length > 0) {

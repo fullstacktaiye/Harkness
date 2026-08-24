@@ -162,6 +162,20 @@ Item {
         return value;
     }
 
+    /// The accent a risk level is marked with, escalating with consequence.
+    ///
+    /// Reading only is the neutral end and destructive the negative one; the
+    /// middle is the neutral warning colour rather than three shades nobody can
+    /// tell apart, because what a reader has to notice is the *last* two.
+    function riskColor(risk) {
+        const value = String(risk);
+        if (value === "observe")
+            return dimColor;
+        if (value === "remote_write" || value === "destructive")
+            return negativeColor;
+        return neutralColor;
+    }
+
     /// How far an approval reaches, in words.
     ///
     /// The spellings are `ApprovalScope::as_str`'s.
@@ -174,6 +188,52 @@ Item {
         if (value === "capability_for_run")
             return qsTr("This capability, for this run");
         return value;
+    }
+
+    /// What answering at one breadth would actually authorize.
+    ///
+    /// The words the matcher's rule reads as: `ExactCall` binds the recorded
+    /// call, the tool identity and the canonical input; `ToolForRun` binds the
+    /// tool and its version and ignores the input; `CapabilityForRun` compares
+    /// capabilities alone. A scope name on its own does not say which of those
+    /// a button is about to hand over.
+    function scopeExplanation(scope) {
+        const value = String(scope);
+        if (value === "exact_call")
+            return qsTr("Authorizes this one call, with exactly this input. An identical call later in the run asks again.");
+        if (value === "tool_for_run")
+            return qsTr("Authorizes this tool at this version for the rest of this run, whatever it is asked to do next.");
+        if (value === "capability_for_run")
+            return qsTr("Authorizes any tool for the rest of this run whose declared capabilities this request covers.");
+        return "";
+    }
+
+    /// Which surface a recorded decision was given through.
+    ///
+    /// The spellings are `DecidedVia::as_str`'s.
+    function decidedViaLabel(via) {
+        const value = String(via);
+        if (value === "gui")
+            return qsTr("from this window");
+        if (value === "cli")
+            return qsTr("from the command line");
+        return value;
+    }
+
+    /// Whether a stored deadline has passed.
+    ///
+    /// `now` is passed in rather than read here, the way `since` takes it, so a
+    /// surface comparing several requests compares them against one reading of
+    /// the clock. A request with no deadline never lapses: `expires_at` is
+    /// optional and its absence means the question waits for a person.
+    ///
+    /// A lapsed request stays `pending` until something expires it — the
+    /// runtime owes a deadline a sweeper — so this is the difference between
+    /// what the row says and what the clock says, and it is why a surface must
+    /// not offer to grant one.
+    function hasLapsed(expires, now) {
+        const deadline = instant(expires);
+        return deadline !== null && Number(now) >= deadline.getTime();
     }
 
     // --- The event log -----------------------------------------------------

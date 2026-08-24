@@ -99,144 +99,6 @@ Kirigami.Page {
         color: Kirigami.Theme.backgroundColor
     }
 
-    // --- Shared row parts, declared before anything uses them --------------
-
-    /// A short state word on its own ground, as the checks view draws one.
-    component StatePill: Rectangle {
-        id: pill
-
-        required property color pillColor
-        property alias text: pillLabel.text
-
-        border.color: Qt.alpha(pill.pillColor, 0.85)
-        border.width: 1
-        color: Qt.alpha(pill.pillColor, 0.16)
-        implicitHeight: pillLabel.implicitHeight + Kirigami.Units.smallSpacing
-        implicitWidth: pillLabel.implicitWidth + Kirigami.Units.largeSpacing
-        radius: implicitHeight / 2
-        visible: pillLabel.text.length > 0
-
-        Controls.Label {
-            id: pillLabel
-
-            anchors.centerIn: parent
-            color: pill.pillColor
-            font.pixelSize: Kirigami.Theme.smallFont.pixelSize
-            textFormat: Text.PlainText
-        }
-    }
-
-    /// One `name value` pair of the header.
-    component MetaField: Row {
-        id: field
-
-        property string name: ""
-        property string value: ""
-        property bool monospace: false
-
-        spacing: Kirigami.Units.smallSpacing
-        visible: field.value.length > 0
-
-        Controls.Label {
-            color: runState.dimColor
-            font.pixelSize: Kirigami.Theme.smallFont.pixelSize
-            text: field.name
-            textFormat: Text.PlainText
-        }
-
-        Controls.Label {
-            color: runState.bodyColor
-            font.family: field.monospace ? "monospace" : Kirigami.Theme.defaultFont.family
-            font.pixelSize: Kirigami.Theme.smallFont.pixelSize
-            text: field.value
-            textFormat: Text.PlainText
-        }
-    }
-
-    /// A height-capped monospace rendering of something a tool produced.
-    ///
-    /// Capped by line count rather than put in a scroll area on purpose: a
-    /// `Flickable` inside a `ListView` delegate steals the wheel from the list
-    /// it sits in, and the bridge has already bounded what arrives here — an
-    /// event payload at 8 KiB, an artifact excerpt at 8 KiB, an approval input
-    /// at 8 KiB. A rendering that is still cut says which of the two cut it, and
-    /// Copy puts the whole of what was loaded on the clipboard.
-    component BoundedText: ColumnLayout {
-        id: bounded
-
-        /// The text to render; empty renders nothing at all.
-        property string content: ""
-        /// Whether the bridge cut the content before it arrived.
-        property bool cut: false
-
-        spacing: Kirigami.Units.smallSpacing
-        visible: bounded.content.length > 0
-
-        // The ground is the label's own `background` rather than a `Rectangle`
-        // around it. A rectangle sized from a wrapping label is an item whose
-        // implicit height depends on the width the layout above it is still
-        // deciding, which Qt Quick Layouts detects as a recursive rearrange and
-        // abandons; a layout handles a `Text` directly.
-        Controls.Label {
-            id: boundedLabel
-
-            Layout.fillWidth: true
-            bottomPadding: Kirigami.Units.smallSpacing
-            color: runState.bodyColor
-            elide: Text.ElideRight
-            font.family: "monospace"
-            font.pixelSize: Kirigami.Theme.smallFont.pixelSize
-            leftPadding: Kirigami.Units.smallSpacing
-            // Twenty-four lines is a paragraph of evidence rather than a pane of
-            // it; what is cut here is still on the clipboard and in
-            // `harkness run show`.
-            maximumLineCount: 24
-            rightPadding: Kirigami.Units.smallSpacing
-            // Tool output, an event payload, or a validated tool input.
-            text: bounded.content
-            textFormat: Text.PlainText
-            topPadding: Kirigami.Units.smallSpacing
-            wrapMode: Text.WrapAnywhere
-
-            background: Rectangle {
-                border.color: runState.frameColor
-                border.width: 1
-                color: Kirigami.Theme.alternateBackgroundColor
-                radius: Kirigami.Units.smallSpacing
-            }
-        }
-
-        RowLayout {
-            Layout.fillWidth: true
-            spacing: Kirigami.Units.smallSpacing
-
-            Controls.Label {
-                Layout.fillWidth: true
-                color: runState.neutralColor
-                font.pixelSize: Kirigami.Theme.smallFont.pixelSize
-                text: bounded.cut
-                    ? qsTr("Harkness cut this short; the command line prints the whole of it.")
-                    : qsTr("Cut short to fit; Copy takes all of what was loaded.")
-                textFormat: Text.PlainText
-                visible: bounded.cut || boundedLabel.truncated
-                wrapMode: Text.WordWrap
-            }
-
-            Controls.ToolButton {
-                Controls.ToolTip.text: qsTr("Copy what was loaded")
-                Controls.ToolTip.visible: hovered
-                display: Controls.AbstractButton.IconOnly
-                enabled: page.backend !== null
-                icon.name: "edit-copy-symbolic"
-                text: qsTr("Copy")
-                onClicked: {
-                    if (page.backend !== null)
-                        page.backend.copyToClipboard(bounded.content);
-                }
-            }
-        }
-    }
-
     /// Whether both halves of the body fit side by side.
     ///
     /// The timeline and the record lists ask for 22 and 18 grid units, so below
@@ -341,17 +203,27 @@ Kirigami.Page {
         return null;
     }
 
-    /// Whether the banner is showing the request rather than only naming it.
+    /// The reader's clock, one reading shared by every row that ages.
     ///
-    /// Page state rather than banner state, so the one control that changes it
-    /// and the offscreen tests that drive it reach the same property.
-    property bool approvalExpanded: false
-    /// Shows or hides the request the run is parked on, loading its input the
-    /// first time somebody asks to see it.
+    /// Ticked only while this run can still change: a finished run's timestamps
+    /// are as far in the past as they will ever be, and a page of history has
+    /// nothing to re-render every second.
+    property real now: 0
+
+    /// Opens the request this run is parked on.
+    ///
+    /// The banner names a question; answering one is `ApprovalPage`'s, which
+    /// this page pushes rather than reproduces. Two surfaces rendering the same
+    /// canonical input would be two places for the rule that keeps it inert to
+    /// stop being true, and only one of them would carry the decision.
     function reviewApproval() {
-        page.approvalExpanded = !page.approvalExpanded;
-        if (page.approvalExpanded && page.pendingApproval !== null)
-            runs.loadApprovalInput(String(page.pendingApproval.approvalId));
+        if (page.pendingApproval === null)
+            return;
+        // Seeded with the row this page already read, so the surface draws its
+        // header on the frame it opens rather than after a store read it is
+        // going to perform anyway.
+        applicationWindow().showApproval(String(page.pendingApproval.approvalId), page.runId,
+                                         page.pendingApproval);
     }
 
     /// Whether the waiting-for-approval banner is on screen.
@@ -360,8 +232,6 @@ Kirigami.Page {
     /// this banner — is about the banner rather than about the two properties
     /// its condition is built from, and the offscreen tests assert it directly.
     readonly property alias approvalBannerVisible: approvalBanner.visible
-    /// The validated input the banner is showing, empty until it is asked for.
-    readonly property alias approvalInput: approvalReview.input
     /// The discriminant of the last failure the bridge reported, empty on
     /// success. Exposed for the same reason the two views below are: whether a
     /// refused mutation reaches the reader is a property of this page.
@@ -404,9 +274,30 @@ Kirigami.Page {
     /// has already been asked for and would now refuse.
     property bool mutating: false
 
+    /// Whether a cancellation this page issued has not been answered yet.
+    ///
+    /// Separate from `mutating`, which every mutation shares: a run being
+    /// stopped is the one thing a reader watches for, and "Cancelling..." must
+    /// not appear because a retry is in flight. Cleared by the same settlement
+    /// that clears `mutating`, so it lasts exactly as long as the request.
+    property bool cancelling: false
+
+    /// What the run-level cancel control currently reads.
+    ///
+    /// Exposed for the offscreen fixture, which times a press against this
+    /// rather than against a store read: the criterion is about the control the
+    /// reader is looking at, and the run reaching `cancelled` afterwards is the
+    /// coordinator's own guarantee rather than this page's.
+    readonly property alias cancelLabel: cancelButton.text
+
     /// Stops the run, and re-reads it once the request has been answered.
+    ///
+    /// The token is flipped inside `cancelRun` before its worker is spawned, so
+    /// the visible state below changes on this turn of the event loop rather
+    /// than when the store has been written.
     function cancel() {
         page.mutating = true;
+        page.cancelling = true;
         runs.cancelRun(page.runId);
     }
 
@@ -448,6 +339,17 @@ Kirigami.Page {
     /// for. A tool reporting a hundred progress lines must cost one store read,
     /// not a hundred; the delay is long enough to absorb a burst and short
     /// enough that a state change lands while the reader is still looking.
+    /// One reading of the clock per second, shared by the banner below and by
+    /// nothing else on this page. Stopped for a finished run, whose timestamps
+    /// are as far in the past as they are ever going to be.
+    Timer {
+        interval: 1000
+        repeat: true
+        running: page.ready && runState.pending(page.runStateValue)
+        triggeredOnStart: true
+        onTriggered: page.now = Date.now()
+    }
+
     Timer {
         id: headerReload
 
@@ -465,6 +367,7 @@ Kirigami.Page {
             if (runs.busy || !page.mutating)
                 return;
             page.mutating = false;
+            page.cancelling = false;
             page.reload();
             timeline.refresh();
         }
@@ -579,12 +482,22 @@ Kirigami.Page {
                         }
                     }
 
+                    // The 250 ms affordance. `cancelRun` flips this process's
+                    // token on the Qt thread before the worker that persists
+                    // anything is spawned, so `cancelling` is true on the same
+                    // turn as the press and this control has already changed by
+                    // the time the frame it was pressed on is drawn. What takes
+                    // longer is the *run* stopping, which is the tool's
+                    // cooperation and not this window's to promise.
                     Controls.Button {
+                        id: cancelButton
+
                         Controls.ToolTip.text: qsTr("Stop this run's queued calls, its executing tool, and any approval it is parked on")
                         Controls.ToolTip.visible: hovered
-                        enabled: !runs.busy
+                        enabled: !runs.busy && !page.cancelling
                         icon.name: "process-stop-symbolic"
-                        text: qsTr("Cancel")
+                        objectName: "runCancel"
+                        text: page.cancelling ? qsTr("Cancelling…") : qsTr("Cancel")
                         visible: page.cancellable
                         onClicked: page.cancel()
                     }
@@ -767,153 +680,19 @@ Kirigami.Page {
             wrapMode: Text.WordWrap
         }
 
-        // The waiting-for-approval banner, which no other state renders. It is
-        // deliberately not an approve/deny control: the decision flow is the
-        // approval surface's, and this page links to it rather than duplicating
-        // it. What it does today is the review half — name the request, its risk
-        // and its scope, and, on demand, the validated input the call holds.
-        Rectangle {
+        // The waiting-for-approval banner, which no other state renders. It
+        // names the question and offers the way into it; the decision itself
+        // belongs to `ApprovalPage`, which this page pushes rather than
+        // reproduces — see `reviewApproval`.
+        ApprovalBanner {
             id: approvalBanner
 
             Layout.fillWidth: true
             Layout.margins: Kirigami.Units.smallSpacing
-            border.color: Qt.alpha(runState.neutralColor, 0.7)
-            border.width: 1
-            color: Qt.alpha(runState.neutralColor, 0.12)
-            implicitHeight: approvalBody.implicitHeight + Kirigami.Units.largeSpacing
-            radius: Kirigami.Units.smallSpacing
+            now: page.now
+            request: page.pendingApproval
             visible: page.runStateValue === "waiting_for_approval" && page.pendingApproval !== null
-
-            onVisibleChanged: {
-                if (!visible)
-                    page.approvalExpanded = false;
-            }
-
-            ColumnLayout {
-                id: approvalBody
-
-                anchors.left: parent.left
-                anchors.leftMargin: Kirigami.Units.largeSpacing
-                anchors.right: parent.right
-                anchors.rightMargin: Kirigami.Units.largeSpacing
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: Kirigami.Units.smallSpacing
-
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: Kirigami.Units.smallSpacing
-
-                    Kirigami.Icon {
-                        Layout.preferredHeight: Kirigami.Units.iconSizes.small
-                        Layout.preferredWidth: Kirigami.Units.iconSizes.small
-                        source: "dialog-question-symbolic"
-                    }
-
-                    Controls.Label {
-                        Layout.fillWidth: true
-                        color: runState.bodyColor
-                        elide: Text.ElideRight
-                        text: page.pendingApproval !== null
-                            ? qsTr("%1 is waiting for a decision")
-                                .arg(String(page.pendingApproval.tool))
-                            : ""
-                        textFormat: Text.PlainText
-                    }
-
-                    StatePill {
-                        pillColor: runState.neutralColor
-                        text: page.pendingApproval !== null
-                            ? runState.riskLabel(String(page.pendingApproval.risk))
-                            : ""
-                    }
-
-                    Controls.Button {
-                        text: page.approvalExpanded
-                            ? qsTr("Hide request")
-                            : qsTr("Review request")
-                        onClicked: page.reviewApproval()
-                    }
-                }
-
-                Controls.Label {
-                    Layout.fillWidth: true
-                    color: runState.bodyColor
-                    // The request's own summary, written by the tool layer.
-                    text: page.pendingApproval !== null ? String(page.pendingApproval.summary) : ""
-                    textFormat: Text.PlainText
-                    visible: text.length > 0
-                    wrapMode: Text.WordWrap
-                }
-
-                ColumnLayout {
-                    id: approvalReview
-
-                    /// The loaded input, but only while it is *this* request's:
-                    /// the bridge is shared, and an input left standing under
-                    /// another question is the worst way for it to be wrong.
-                    readonly property string input: {
-                        if (!page.approvalExpanded || page.pendingApproval === null)
-                            return "";
-                        if (runs.detail === undefined || runs.detail === null)
-                            return "";
-                        return String(runs.detail.approvalId || "")
-                            === String(page.pendingApproval.approvalId)
-                            ? String(runs.detail.input) : "";
-                    }
-
-                    Layout.fillWidth: true
-                    spacing: Kirigami.Units.smallSpacing
-                    visible: page.approvalExpanded
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        spacing: Kirigami.Units.largeSpacing
-
-                        MetaField {
-                            name: qsTr("Answering it would cover")
-                            value: page.pendingApproval !== null
-                                ? runState.scopeLabel(String(page.pendingApproval.scope)) : ""
-                        }
-
-                        MetaField {
-                            name: qsTr("Asked for")
-                            value: page.pendingApproval !== null
-                                ? runState.scopeLabel(
-                                    String(page.pendingApproval.requestedScope))
-                                : ""
-                        }
-
-                        MetaField {
-                            name: qsTr("Capabilities")
-                            value: page.pendingApproval !== null
-                                ? String(page.pendingApproval.capabilities) : ""
-                        }
-
-                        Item {
-                            Layout.fillWidth: true
-                        }
-                    }
-
-                    BoundedText {
-                        Layout.fillWidth: true
-                        // The recorded call's own input, already redacted at the
-                        // persistence boundary and clamped by the bridge.
-                        content: approvalReview.input
-                        cut: approvalReview.input.length > 0
-                            && runs.detail !== undefined && runs.detail !== null
-                            && runs.detail.truncated === true
-                    }
-
-                    Controls.Label {
-                        Layout.fillWidth: true
-                        color: runState.dimColor
-                        font.pixelSize: Kirigami.Theme.smallFont.pixelSize
-                        text: qsTr("Answering is done from the approval surface or from `harkness approval decide`; this page shows what was asked.")
-                        textFormat: Text.PlainText
-                        wrapMode: Text.WordWrap
-                    }
-                }
-            }
+            onReviewRequested: page.reviewApproval()
         }
 
         // --- Timeline beside the run's own records -------------------------
@@ -1205,6 +984,7 @@ Kirigami.Page {
 
                                             BoundedText {
                                                 Layout.fillWidth: true
+                                                clipboard: page.backend
                                                 content: eventRow.detail
                                             }
 
@@ -1382,6 +1162,58 @@ Kirigami.Page {
                                     Item {
                                         Layout.fillWidth: true
                                     }
+
+                                    // Cancellation reaches a *run*, so this is
+                                    // the run's control shown where the work
+                                    // actually is rather than a second verb.
+                                    // Offered only on the call that is holding
+                                    // the run up: a page of finished calls with
+                                    // a Cancel on every row would suggest they
+                                    // can be stopped one at a time, and they
+                                    // cannot.
+                                    Controls.ToolButton {
+                                        Controls.ToolTip.text: qsTr("Stop the run this call belongs to")
+                                        Controls.ToolTip.visible: hovered
+                                        enabled: !runs.busy && !page.cancelling
+                                        icon.name: "process-stop-symbolic"
+                                        objectName: "callCancel"
+                                        text: page.cancelling
+                                            ? qsTr("Cancelling…")
+                                            : qsTr("Cancel run")
+                                        visible: page.cancellable
+                                            && !callRow.modelData.terminal
+                                        onClicked: page.cancel()
+                                    }
+                                }
+
+                                // The newest line this call reported, in place
+                                // rather than as a row per tick. The bridge
+                                // carries one only for a call that has not
+                                // finished, so a terminal row cannot be left
+                                // showing a line that reads as current.
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: Kirigami.Units.smallSpacing
+                                    visible: String(callRow.modelData.progress || "").length > 0
+
+                                    Controls.BusyIndicator {
+                                        Layout.preferredHeight: Kirigami.Units.iconSizes.small
+                                        Layout.preferredWidth: Kirigami.Units.iconSizes.small
+                                        running: String(callRow.modelData.state) === "running"
+                                        visible: running
+                                    }
+
+                                    Controls.Label {
+                                        Layout.fillWidth: true
+                                        color: runState.dimColor
+                                        elide: Text.ElideRight
+                                        font.family: "monospace"
+                                        font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                                        objectName: "callProgress"
+                                        // A progress line a tool wrote.
+                                        text: String(callRow.modelData.progress || "")
+                                        textFormat: Text.PlainText
+                                    }
                                 }
 
                                 Kirigami.InlineMessage {
@@ -1523,6 +1355,7 @@ Kirigami.Page {
 
                                 BoundedText {
                                     Layout.fillWidth: true
+                                    clipboard: page.backend
                                     content: artifactRow.excerpt
                                     cut: artifactRow.expanded && page.openArtifactCut
                                 }

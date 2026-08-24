@@ -63,6 +63,15 @@
 //! [`settlement`] is the rule, and it is a pure function so it can be tested
 //! without a Qt thread.
 //!
+//! # `busy` falls last
+//!
+//! Qt emits `busyChanged` from inside the setter, so a surface reacting to an
+//! operation finishing runs *during* [`settle`]. Everything it might read is
+//! therefore written first: the shared `status`/`kind` pair, then the answer
+//! property, then `busy`. A page that hears the decision it issued settle and
+//! reads `kind` to find out how it went would otherwise read the previous
+//! operation's answer — and would report a refusal as a success.
+//!
 //! # The error namespace
 //!
 //! A failure crossing to QML carries a machine-readable `kind` beside its
@@ -194,11 +203,12 @@ use harkness_runtime::approval::{
 };
 use harkness_runtime::coordinator::{RunCoordinator, RuntimeError};
 use harkness_runtime::domain::{ArtifactId, ExecutionState, Run, RunId, ToolCall, ToolCallState};
-use harkness_runtime::store::{Artifact, Availability, PassThrough, Store, StoreError};
+use harkness_runtime::store::{Artifact, Availability, EventPage, PassThrough, Store, StoreError};
 use harkness_runtime::tool::WorkspaceMetadata;
 
 use super::approval_model::ApprovalRow;
 use super::run_list_model::{RunRow, run_row};
+use super::run_timeline_model::{TOOL_PROGRESS_KIND, summarize};
 
 /// Largest approval input this bridge hands to QML.
 ///
@@ -207,6 +217,17 @@ use super::run_list_model::{RunRow, run_row};
 /// asked to lay out sixty kilobytes of JSON. What is dropped is named in the
 /// projection rather than silently missing.
 const MAX_APPROVAL_INPUT_BYTES: usize = 8 * 1024;
+
+/// Events scanned backwards from the tip when looking for a running call's
+/// newest progress line.
+///
+/// A run is bounded by nothing in particular, so "the last thing this call
+/// said" is read from one bounded page at the tip of the log rather than from
+/// the whole of it. A call that is genuinely executing reported its progress
+/// recently by construction, and a call whose newest tick fell off this page
+/// simply shows none — the timeline beside the row still holds every one of
+/// them.
+const MAX_PROGRESS_SCAN_EVENTS: usize = 200;
 
 /// Rows of each kind a run's detail projection carries.
 ///
@@ -756,6 +777,14 @@ pub(crate) struct CallRow {
     verdict: String,
     reason: String,
     source: String,
+    /// Newest progress line this call reported, for a call that has not
+    /// finished; empty for every other call.
+    ///
+    /// Only a call still in flight has a "latest" worth a row of its own. A
+    /// finished call's progress is history, and history is the timeline's
+    /// subject rather than a line that would sit under a terminal state pill
+    /// claiming to be current.
+    progress: String,
 }
 
 /// One approval of a run, with the answer it did or did not receive.
@@ -872,7 +901,7 @@ fn step_row(step: &harkness_runtime::domain::Step) -> StepRow {
 /// `loadApprovalInput` fetches for the one call a question is being asked about,
 /// and its output may be the whole of a tool's result; carrying either for every
 /// call of a run would put megabytes behind a header.
-fn call_row(call: &ToolCall) -> CallRow {
+fn call_row(call: &ToolCall, progress: &HashMap<String, String>) -> CallRow {
     CallRow {
         tool_call_id: call.id().to_string(),
         step_id: call.step_id().to_string(),
@@ -903,7 +932,52 @@ fn call_row(call: &ToolCall) -> CallRow {
             .policy_decision()
             .map(|decision| decision.source().as_str().to_owned())
             .unwrap_or_default(),
+        progress: progress
+            .get(&call.id().to_string())
+            .cloned()
+            .unwrap_or_default(),
     }
+}
+
+/// The newest progress line each unfinished call of `run` reported.
+///
+/// Empty — and, more to the point, free — when every call has finished, which
+/// is what a page of run history is looking at. Only then is one bounded page
+/// of the log read, newest first, so the first tick naming a call is that
+/// call's latest.
+fn latest_progress(
+    store: &Store,
+    run: RunId,
+    calls: &[ToolCall],
+) -> Result<HashMap<String, String>, RunsFailure> {
+    let mut wanted: HashMap<String, ()> = calls
+        .iter()
+        .filter(|call| !call.state().is_terminal())
+        .map(|call| (call.id().to_string(), ()))
+        .collect();
+    let mut newest = HashMap::new();
+    if wanted.is_empty() {
+        return Ok(newest);
+    }
+    let listing = store.event_page(run, EventPage::newest(MAX_PROGRESS_SCAN_EVENTS))?;
+    for stored in &listing.events {
+        if stored.event.kind().as_str() != TOOL_PROGRESS_KIND {
+            continue;
+        }
+        let Some(call) = stored.event.tool_call_id() else {
+            continue;
+        };
+        let call = call.to_string();
+        // The page is newest first, so the first tick naming a call is the one
+        // the row shows; the rest of that call's ticks are the timeline's.
+        if wanted.remove(&call).is_some() {
+            newest.insert(call, summarize(stored.event.payload()));
+            if wanted.is_empty() {
+                break;
+            }
+        }
+    }
+    Ok(newest)
 }
 
 /// Projects one durable approval into a row, answer and all.
@@ -991,6 +1065,10 @@ fn run_detail_in(data_dir: &Path, run: RunId) -> Result<Completion, RunsFailure>
         ));
     };
     let record = store.load_run(run)?;
+    let recorded_calls = store.load_run_tool_calls(run)?;
+    // Read before the projection is built, and only when something is still in
+    // flight: a page of finished history pays nothing for it.
+    let progress = latest_progress(&store, run, &recorded_calls)?;
     // A run whose task row is unreadable is exactly the run somebody needs to
     // see, so the header loses its title and workspace rather than the page
     // failing to open — the same rule the list model's rows follow.
@@ -1028,10 +1106,9 @@ fn run_detail_in(data_dir: &Path, run: RunId) -> Result<Completion, RunsFailure>
             &mut truncated,
         ),
         calls: bounded(
-            store
-                .load_run_tool_calls(run)?
+            recorded_calls
                 .iter()
-                .map(call_row)
+                .map(|call| call_row(call, &progress))
                 .collect(),
             "calls",
             &mut truncated,
@@ -1344,6 +1421,7 @@ fn run_variant(detail: &RunDetail) -> QVariant {
             text(&mut map, "verdict", &row.verdict);
             text(&mut map, "reason", &row.reason);
             text(&mut map, "source", &row.source);
+            text(&mut map, "progress", &row.progress);
             map.insert(QString::from("terminal"), QVariant::from(&row.terminal));
             map
         }),
@@ -1417,7 +1495,7 @@ fn list<T>(rows: &[T], project: impl Fn(&T) -> QMap<QMapPair_QString_QVariant>) 
 }
 
 /// Projects a slice of names into a `QVariantList` of plain strings.
-fn strings(values: &[impl AsRef<str>]) -> QVariant {
+pub(crate) fn strings(values: &[impl AsRef<str>]) -> QVariant {
     let mut items = QList::<QVariant>::default();
     for value in values {
         items.append(QVariant::from(&QString::from(value.as_ref())));
@@ -1437,68 +1515,73 @@ fn settle(
         rust.pending = rust.pending.saturating_sub(1);
         settlement(request, rust.newest[answer.slot()], rust.next_request)
     };
-    let busy = backend.as_ref().rust().pending > 0;
-    backend.as_mut().set_busy(busy);
-    // A reply superseded on its own question has nothing left to say: another
-    // load of the same kind is already on its way to the same property, and
-    // writing this one would show the older subject and then replace it.
-    if !settled.answer {
-        return;
+    // `status` and `kind` are one pair shared by every operation, so only the
+    // newest of any kind may write them: two operations overlapping otherwise
+    // let the slower one's message overwrite the faster one's, and the panel
+    // would report the outcome of the thing the user did *first*.
+    if settled.status {
+        match &outcome {
+            Ok(completion) => {
+                backend
+                    .as_mut()
+                    .set_status(QString::from(completion.message.as_str()));
+                backend.as_mut().set_kind(QString::default());
+            }
+            Err(failure) => {
+                backend
+                    .as_mut()
+                    .set_status(QString::from(failure.message.as_str()));
+                backend
+                    .as_mut()
+                    .set_kind(QString::from(failure.kind.as_str()));
+            }
+        }
     }
     // Exactly one answer property is written, and only by the operation that
     // answers it. A failed load blanks the property it was loading rather than
     // leaving the previous subject's answer standing under a new question —
     // see `Answer` for why a decision blanks `detail` as well.
-    let answered = match &outcome {
-        Ok(completion) => &completion.answered,
-        Err(_) => &Answered::Nothing,
-    };
-    match answer {
-        Answer::Decision | Answer::ApprovalInput => {
-            let detail = match answered {
-                Answered::ApprovalInput(input) => approval_detail(input),
-                _ => QVariant::default(),
-            };
-            backend.as_mut().set_detail(detail);
-        }
-        Answer::RunDetail => {
-            let run = match answered {
-                Answered::RunDetail(detail) => run_variant(detail),
-                _ => QVariant::default(),
-            };
-            backend.as_mut().set_run(run);
-        }
-        Answer::ArtifactExcerpt => {
-            let excerpt = match answered {
-                Answered::ArtifactExcerpt(excerpt) => excerpt_variant(excerpt),
-                _ => QVariant::default(),
-            };
-            backend.as_mut().set_excerpt(excerpt);
-        }
-    }
-    // `status` and `kind` are one pair shared by every operation, so only the
-    // newest of any kind may write them: two operations overlapping otherwise
-    // let the slower one's message overwrite the faster one's, and the panel
-    // would report the outcome of the thing the user did *first*.
-    if !settled.status {
-        return;
-    }
-    match outcome {
-        Ok(completion) => {
-            backend
-                .as_mut()
-                .set_status(QString::from(completion.message.as_str()));
-            backend.as_mut().set_kind(QString::default());
-        }
-        Err(failure) => {
-            backend
-                .as_mut()
-                .set_status(QString::from(failure.message.as_str()));
-            backend
-                .as_mut()
-                .set_kind(QString::from(failure.kind.as_str()));
+    //
+    // A reply superseded on its own question has nothing left to say: another
+    // load of the same kind is already on its way to the same property, and
+    // writing this one would show the older subject and then replace it.
+    if settled.answer {
+        let answered = match &outcome {
+            Ok(completion) => &completion.answered,
+            Err(_) => &Answered::Nothing,
+        };
+        match answer {
+            Answer::Decision | Answer::ApprovalInput => {
+                let detail = match answered {
+                    Answered::ApprovalInput(input) => approval_detail(input),
+                    _ => QVariant::default(),
+                };
+                backend.as_mut().set_detail(detail);
+            }
+            Answer::RunDetail => {
+                let run = match answered {
+                    Answered::RunDetail(detail) => run_variant(detail),
+                    _ => QVariant::default(),
+                };
+                backend.as_mut().set_run(run);
+            }
+            Answer::ArtifactExcerpt => {
+                let excerpt = match answered {
+                    Answered::ArtifactExcerpt(excerpt) => excerpt_variant(excerpt),
+                    _ => QVariant::default(),
+                };
+                backend.as_mut().set_excerpt(excerpt);
+            }
         }
     }
+    // Last, and deliberately so. Qt emits `busyChanged` from inside the setter,
+    // so a surface that reacts to an operation finishing runs *during* this
+    // call — and everything it would read has to be in place before it does. A
+    // page that hears the decision it issued settle and then reads `kind` to
+    // find out how it went would otherwise read the previous operation's
+    // answer, and would report a refusal as a success.
+    let busy = backend.as_ref().rust().pending > 0;
+    backend.as_mut().set_busy(busy);
 }
 
 impl ffi::RunsBackend {
@@ -1658,13 +1741,13 @@ mod tests {
     use harkness_runtime::domain::{
         ExecutionState, Failure, Run, RunId, Step, Task, TaskId, ToolCall, ToolCallState,
     };
-    use harkness_runtime::store::{Store, StoreError};
+    use harkness_runtime::store::{EventKind, Store, StoreError};
 
     use super::{
         Answer, Answered, BRIDGE_KINDS, MAX_APPROVAL_INPUT_BYTES, MAX_ARTIFACT_EXCERPT_BYTES,
-        MAX_RUN_DETAIL_ROWS, RunDetail, RunsFailure, artifact_excerpt_in, bounded, clamp,
-        grant_scope, is_renderable_text, optional_rfc3339, parse_approval, parse_artifact,
-        parse_run, retry_scenario, rfc3339, run_detail_in, settlement,
+        MAX_PROGRESS_SCAN_EVENTS, MAX_RUN_DETAIL_ROWS, RunDetail, RunsFailure, artifact_excerpt_in,
+        bounded, clamp, grant_scope, is_renderable_text, optional_rfc3339, parse_approval,
+        parse_artifact, parse_run, retry_scenario, rfc3339, run_detail_in, settlement,
     };
 
     fn at(seconds: i64) -> OffsetDateTime {
@@ -2008,6 +2091,109 @@ mod tests {
             Answered::RunDetail(detail) => *detail,
             other => panic!("a run detail load answers with a run detail, not {other:?}"),
         }
+    }
+
+    /// One step with one call in `state`, on `run`.
+    fn stepped_call(store: &Store, run: RunId, state: ToolCallState) -> (Step, ToolCall) {
+        let step = Step::new(run, 0, "run the check", at(1));
+        store.insert_step(&step).unwrap();
+        let mut call = ToolCall::new(
+            &step,
+            "process.exec",
+            "1.0.0",
+            json!({"argv": ["cargo", "test"]}),
+            at(2),
+        );
+        store.insert_tool_call(&call).unwrap();
+        if state != ToolCallState::Pending {
+            store
+                .transition_tool_call(call.id(), ToolCallState::Running, at(3))
+                .unwrap();
+            call.dispatch("1.0.0", at(3)).unwrap();
+        }
+        if state == ToolCallState::Succeeded {
+            store
+                .succeed_tool_call(call.id(), json!({"passed": true}), at(4))
+                .unwrap();
+            call.succeed(json!({"passed": true}), at(4)).unwrap();
+        }
+        (step, call)
+    }
+
+    fn progress_events(store: &Store, run: RunId, step: &Step, call: &ToolCall, lines: &[&str]) {
+        store
+            .append_events(
+                run,
+                lines.iter().map(|line| {
+                    harkness_runtime::store::RunEvent::new(EventKind::ToolProgress, at(5))
+                        .for_step(step.id())
+                        .for_tool_call(call.id())
+                        .with_payload(json!({"line": line}))
+                }),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_call_still_in_flight_carries_the_newest_line_it_reported() {
+        let (_fixture, data_dir, store, task) = seeded();
+        let run = recorded_run(&store, &task, ExecutionState::Running, 10);
+        let (step, call) = stepped_call(&store, run, ToolCallState::Running);
+        progress_events(
+            &store,
+            run,
+            &step,
+            &call,
+            &["compiling harkness-git", "compiling harkness-gui"],
+        );
+        drop(store);
+
+        let detail = detail(&data_dir, run);
+
+        assert_eq!(detail.calls.len(), 1);
+        assert_eq!(detail.calls[0].progress, "line=compiling harkness-gui");
+    }
+
+    #[test]
+    fn a_finished_call_carries_no_progress_line_of_its_own() {
+        let (_fixture, data_dir, store, task) = seeded();
+        let run = recorded_run(&store, &task, ExecutionState::Running, 10);
+        let (step, call) = stepped_call(&store, run, ToolCallState::Succeeded);
+        progress_events(&store, run, &step, &call, &["compiling harkness-git"]);
+        drop(store);
+
+        let detail = detail(&data_dir, run);
+
+        assert_eq!(detail.calls.len(), 1);
+        assert_eq!(
+            detail.calls[0].progress, "",
+            "a finished call's progress is history, which the timeline is the surface for"
+        );
+    }
+
+    #[test]
+    fn a_call_whose_ticks_fell_off_the_scanned_page_shows_none_rather_than_an_old_one() {
+        let (_fixture, data_dir, store, task) = seeded();
+        let run = recorded_run(&store, &task, ExecutionState::Running, 10);
+        let (step, call) = stepped_call(&store, run, ToolCallState::Running);
+        progress_events(&store, run, &step, &call, &["the only tick there is"]);
+        store
+            .append_events(
+                run,
+                (0..MAX_PROGRESS_SCAN_EVENTS).map(|index| {
+                    harkness_runtime::store::RunEvent::new(EventKind::Diagnostic, at(6))
+                        .with_payload(json!({"index": index}))
+                }),
+            )
+            .unwrap();
+        drop(store);
+
+        let detail = detail(&data_dir, run);
+
+        assert_eq!(
+            detail.calls[0].progress, "",
+            "the bound is on what is read, and the timeline still holds every tick"
+        );
     }
 
     #[test]

@@ -64,6 +64,22 @@ pub(crate) mod tests {
         running: String,
         paged: String,
         progressed: String,
+        /// A run parked on a request that asked for a run-wide breadth, so the
+        /// decision surface has two scopes to choose between.
+        widened: String,
+        /// The approval identifier of that request, which the approval page is
+        /// opened by rather than found through.
+        widened_approval: String,
+        /// A run parked on a remote write, which the risk ceiling reduced to a
+        /// single call however wide it asked.
+        remote: String,
+        remote_approval: String,
+        /// A run parked on a request whose deadline for an answer has passed.
+        lapsed: String,
+        lapsed_approval: String,
+        /// A run somebody refused, with the reason they typed.
+        refused: String,
+        refused_approval: String,
     }
 
     /// Events a run needs before its timeline can be said to page.
@@ -88,7 +104,8 @@ pub(crate) mod tests {
     #[allow(dead_code)]
     fn seed_run_fixtures(data_dir: &Path) -> SeededRuns {
         use harkness_runtime::approval::{
-            ApprovalRequest, PendingApproval, WorkspaceBinding, canonical_input_hash,
+            ApprovalDecision, ApprovalRequest, ApprovalScope, DecidedVia, PendingApproval,
+            WorkspaceBinding, canonical_input_hash,
         };
         use harkness_runtime::domain::{
             ExecutionState, Failure, Run, RunId, Step, Task, TaskId, ToolCall, ToolCallState,
@@ -411,6 +428,164 @@ pub(crate) mod tests {
             .transition_run(progressed.id(), ExecutionState::Succeeded, at(64))
             .unwrap();
 
+        // --- Four more parked runs, one per shape a decision can take ------
+        //
+        // Each is the same construction as `waiting` above and differs in
+        // exactly the field the surface has to react to: the breadth asked
+        // for, the risk ceiling that overrides it, a deadline that has passed,
+        // and an answer that was actually given.
+        let parked = |seconds: i64,
+                      tool: &str,
+                      risk: RiskLevel,
+                      scope: ApprovalScope,
+                      input: serde_json::Value,
+                      summary: &str,
+                      capability: &str,
+                      expires: Option<i64>| {
+            let run = Run::with_id(RunId::new(), task.id(), at(seconds));
+            store.insert_run(&run).unwrap();
+            store
+                .transition_run(run.id(), ExecutionState::Running, at(seconds + 1))
+                .unwrap();
+            let step = Step::new(run.id(), 0, "do the work", at(seconds + 2));
+            store.insert_step(&step).unwrap();
+            let call = ToolCall::new(&step, tool, "1.0.0", input.clone(), at(seconds + 3));
+            store.insert_tool_call(&call).unwrap();
+            store
+                .transition_tool_call(call.id(), ToolCallState::AwaitingApproval, at(seconds + 4))
+                .unwrap();
+            let mut request = PendingApproval::new(
+                run.id(),
+                call.id(),
+                ToolIdentity::parse(tool, "1.0.0").unwrap(),
+                canonical_input_hash(&input).unwrap(),
+                WorkspaceBinding::new(None, data_dir.join("workspace")),
+                risk,
+                at(seconds + 4),
+            )
+            .requesting(scope)
+            .summarized_as(summary)
+            .with_capabilities([Capability::new(capability).unwrap()]);
+            if let Some(deadline) = expires {
+                request = request.expiring_at(at(deadline));
+            }
+            let opened = ApprovalRequest::open(request).unwrap();
+            store.open_approval(opened.clone()).unwrap();
+            store
+                .transition_run(
+                    run.id(),
+                    ExecutionState::WaitingForApproval,
+                    at(seconds + 5),
+                )
+                .unwrap();
+            (run.id().to_string(), opened.id().to_string())
+        };
+
+        // A workspace write that asked to cover its capability for the whole
+        // run. Nothing narrows it, so the surface has a real choice to offer —
+        // and the input carries the markup the untrusted-text criterion is
+        // about, so the raw rendering has something to fail to interpret.
+        let (widened, widened_approval) = parked(
+            70,
+            "fs.apply_patch",
+            RiskLevel::WorkspaceWrite,
+            ApprovalScope::CapabilityForRun,
+            json!({"path": "src/lib.rs", "patch": MARKUP_MESSAGE}),
+            "Apply a patch to src/lib.rs (+12 -3)",
+            "fs.write",
+            None,
+        );
+
+        // A remote write that asked for the same breadth. The ceiling reduces
+        // it to one call when the request is created, so the record keeps both
+        // spellings and the surface renders no choice at all.
+        let (remote, remote_approval) = parked(
+            80,
+            "git.push",
+            RiskLevel::RemoteWrite,
+            ApprovalScope::CapabilityForRun,
+            json!({"remote": "origin", "branch": "main", "force": true}),
+            "Force-push main to origin",
+            "network",
+            None,
+        );
+
+        // A deadline that has already passed. The row is still `pending` —
+        // only a sweeper closes one — so this is the case where the clock and
+        // the record disagree and the surface has to follow the clock.
+        let (lapsed, lapsed_approval) = parked(
+            90,
+            "process.exec",
+            RiskLevel::Execute,
+            ApprovalScope::ExactCall,
+            json!({"argv": ["cargo", "publish"]}),
+            "cargo publish",
+            "process.spawn",
+            Some(95),
+        );
+
+        // --- A run somebody refused, with the reason they gave --------------
+        //
+        // Written through `Store::decide_approval`, which is the same call the
+        // bridge makes, so the record and its `approval_decided` event are the
+        // ones a real refusal produces rather than a hand-built row.
+        let refused = Run::with_id(RunId::new(), task.id(), at(100));
+        store.insert_run(&refused).unwrap();
+        store
+            .transition_run(refused.id(), ExecutionState::Running, at(101))
+            .unwrap();
+        let refused_step = Step::new(refused.id(), 0, "publish the crate", at(102));
+        store.insert_step(&refused_step).unwrap();
+        let refused_input = json!({"argv": ["cargo", "publish"]});
+        let refused_call = ToolCall::new(
+            &refused_step,
+            "process.exec",
+            "1.0.0",
+            refused_input.clone(),
+            at(103),
+        );
+        store.insert_tool_call(&refused_call).unwrap();
+        store
+            .transition_tool_call(refused_call.id(), ToolCallState::AwaitingApproval, at(104))
+            .unwrap();
+        let refused_request = ApprovalRequest::open(
+            PendingApproval::new(
+                refused.id(),
+                refused_call.id(),
+                ToolIdentity::parse("process.exec", "1.0.0").unwrap(),
+                canonical_input_hash(&refused_input).unwrap(),
+                WorkspaceBinding::new(None, data_dir.join("workspace")),
+                RiskLevel::Execute,
+                at(104),
+            )
+            .summarized_as("cargo publish")
+            .with_capabilities([Capability::new("process.spawn").unwrap()]),
+        )
+        .unwrap();
+        store.open_approval(refused_request.clone()).unwrap();
+        store
+            .decide_approval(
+                refused_request.id(),
+                ApprovalDecision::deny(refused_request.id(), DecidedVia::Gui, at(105))
+                    .because(DENIAL_REASON),
+            )
+            .unwrap();
+        store
+            .reject_tool_call_approval(
+                refused_call.id(),
+                "gui",
+                Failure::new("approval_denied", "a person refused this call"),
+                at(106),
+            )
+            .unwrap();
+        store
+            .fail_run(
+                refused.id(),
+                Failure::new("approval_denied", "a person refused this call"),
+                at(106),
+            )
+            .unwrap();
+
         drop(store);
         SeededRuns {
             failed: failed.id().to_string(),
@@ -419,8 +594,21 @@ pub(crate) mod tests {
             running: running.id().to_string(),
             paged: paged.id().to_string(),
             progressed: progressed.id().to_string(),
+            widened,
+            widened_approval,
+            remote,
+            remote_approval,
+            lapsed,
+            lapsed_approval,
+            refused: refused.id().to_string(),
+            refused_approval: refused_request.id().to_string(),
         }
     }
+
+    /// The reason the seeded refusal records, which the surface has to show
+    /// back verbatim.
+    #[allow(dead_code)]
+    const DENIAL_REASON: &str = "not on a release branch";
 
     /// A failure message carrying the three things a renderer must not act on:
     /// markup, an entity-shaped ampersand, and a control character.
@@ -481,7 +669,16 @@ pub(crate) mod tests {
                 .replace("__INTERRUPTED_RUN__", &seeded.interrupted)
                 .replace("__RUNNING_RUN__", &seeded.running)
                 .replace("__PAGED_RUN__", &seeded.paged)
-                .replace("__PROGRESSED_RUN__", &seeded.progressed);
+                .replace("__PROGRESSED_RUN__", &seeded.progressed)
+                .replace("__WIDENED_RUN__", &seeded.widened)
+                .replace("__WIDENED_APPROVAL__", &seeded.widened_approval)
+                .replace("__REMOTE_RUN__", &seeded.remote)
+                .replace("__REMOTE_APPROVAL__", &seeded.remote_approval)
+                .replace("__LAPSED_RUN__", &seeded.lapsed)
+                .replace("__LAPSED_APPROVAL__", &seeded.lapsed_approval)
+                .replace("__REFUSED_RUN__", &seeded.refused)
+                .replace("__REFUSED_APPROVAL__", &seeded.refused_approval)
+                .replace("__DENIAL_REASON__", DENIAL_REASON);
             engine.as_mut().load_data(
                 &QByteArray::from(qml.as_bytes()),
                 &QUrl::from("qrc:/RunSurfaces.qml"),
@@ -529,6 +726,14 @@ Kirigami.ApplicationWindow {
     property bool narrowed: false
     property bool cancelPressed: false
     property int cancelPolls: 0
+    /// The review surface currently built, or null. Held rather than declared,
+    /// so a phase can destroy one and prove that destroying it decides nothing.
+    property var approvalPage: null
+    property bool scopeWidened: false
+    /// Milliseconds between pressing Cancel and the control saying so.
+    property real cancelResponse: -1
+    property bool approvalPressed: false
+    property bool denyIssued: false
 
     readonly property int wideWidth: 1180
     /// Narrower than the two halves of the detail page's body can both be, so
@@ -587,6 +792,19 @@ Kirigami.ApplicationWindow {
     readonly property string runningRun: "__RUNNING_RUN__"
     readonly property string pagedRun: "__PAGED_RUN__"
     readonly property string progressedRun: "__PROGRESSED_RUN__"
+    readonly property string widenedRun: "__WIDENED_RUN__"
+    readonly property string widenedApproval: "__WIDENED_APPROVAL__"
+    readonly property string remoteRun: "__REMOTE_RUN__"
+    readonly property string remoteApproval: "__REMOTE_APPROVAL__"
+    readonly property string lapsedRun: "__LAPSED_RUN__"
+    readonly property string lapsedApproval: "__LAPSED_APPROVAL__"
+    readonly property string refusedRun: "__REFUSED_RUN__"
+    readonly property string refusedApproval: "__REFUSED_APPROVAL__"
+    readonly property string denialReason: "__DENIAL_REASON__"
+
+    /// Whether the review surface is built and has read its own run.
+    readonly property bool approvalReady: window.approvalPage !== null
+        && window.approvalPage.ready && window.approvalPage.runReady
 
     readonly property var detail: detailPage
     readonly property bool detailReady: detail.runId === window.currentRun && detail.ready
@@ -625,6 +843,29 @@ Kirigami.ApplicationWindow {
         window.currentRun = id;
     }
 
+    /// Main.qml's `showApproval` for this fixture's benefit.
+    ///
+    /// Built rather than declared, because what the closing-never-grants
+    /// criterion is about is the page going away: an `ApprovalPage` that was
+    /// only hidden would still be holding its bridge, and hiding is not what a
+    /// reader does when they navigate back.
+    function showApproval(approvalId, runId, seed) {
+        closeApproval();
+        window.approvalPage = approvalPageComponent.createObject(approvalHost, {
+            "approvalId": String(approvalId),
+            "runId": String(runId),
+            "seed": seed !== undefined ? seed : null
+        });
+    }
+
+    /// Leaves the review surface, which is all that leaving it does.
+    function closeApproval() {
+        if (window.approvalPage !== null) {
+            window.approvalPage.destroy();
+            window.approvalPage = null;
+        }
+    }
+
     pageStack.initialPage: Kirigami.Page {
         padding: 0
 
@@ -649,6 +890,36 @@ Kirigami.ApplicationWindow {
             runId: window.currentRun
             visible: window.currentRun.length > 0
         }
+
+        // Where `showApproval` builds its page. A real window pushes one onto
+        // the stack; this fixture parents it into a visible item instead, for
+        // the reason phase 15 gives about Kirigami's own push.
+        Item {
+            id: approvalHost
+
+            anchors.fill: parent
+            visible: window.approvalPage !== null
+            // Above the detail page rather than instead of it. `visible` is
+            // inherited by children, so hiding the page underneath would drive
+            // every binding on it false - including the ones a phase that has
+            // already run asserted against.
+            z: 1
+        }
+    }
+
+    Component {
+        id: approvalPageComponent
+
+        ApprovalPage {
+            anchors.fill: approvalHost
+        }
+    }
+
+    // A fourth bridge, used only to re-read the store after a surface has been
+    // destroyed. It has to be one this fixture still holds: the page's own
+    // bridge went away with it, which is the whole point of the check.
+    RunsBackend {
+        id: verify
     }
 
     // A bridge of its own, so the overlapping-load check drives it without
@@ -759,9 +1030,30 @@ Kirigami.ApplicationWindow {
 
     function advance() {
         if (phase === 0) {
-            if (launcherPane.loading || launcherPane.count === 0 || !composed())
+            if (launcherPane.loading || launcherPane.count === 0
+                    || runsPanel.pendingApprovals === 0 || !composed())
                 return;
-            check("theLauncherPaneListsEverySeededRun", launcherPane.count === 6);
+            check("theLauncherPaneListsEverySeededRun", launcherPane.count === 10);
+            // The queue is the one thing in this view that is about the reader
+            // rather than about a run, so it is the badge the activity bar
+            // carries and the section above the history.
+            check("theRunsViewBadgesTheQuestionsWaitingForAPerson",
+                  runsPanel.viewBadge === 4 && runsPanel.pendingApprovals === 4);
+            check("theRunsViewBuildsARowPerWaitingRequest", runsPanel.pendingRows === 4);
+            const queued = runsPanel.pendingRow(0);
+            check("aQueueRowNamesTheToolItIsAbout",
+                  queued !== null && String(queued.request.tool).length > 0);
+            check("aQueueRowCarriesTheBreadthsTheRuntimeWouldAccept",
+                  queued !== null && queued.request.grantableScopes !== undefined
+                  && queued.request.grantableScopes.length >= 1);
+            if (queued !== null && window.approvalPage === null) {
+                queued.reviewRequested();
+                return;
+            }
+            check("reviewingFromTheQueueOpensThatRequest",
+                  window.approvalPage !== null
+                  && window.approvalPage.approvalId === String(queued.request.approvalId));
+            window.closeApproval();
             check("theLauncherPaneReportsNoFailure", launcherPane.loadErrorKind.length === 0);
             // The side-panel contract, which the activity bar reads off the
             // view rather than being told: a view the host cannot resolve is
@@ -881,20 +1173,19 @@ Kirigami.ApplicationWindow {
             check("aParkedRunSaysWhyItCannotBeRetried",
                   detail.retryBlocked === "run_still_active");
 
-            // Reviewing the request is the banner's whole action: it must show
-            // the validated input the parked call is holding, and nothing on
-            // this page may answer the question.
-            if (!detailPage.approvalExpanded) {
-                detailPage.reviewApproval();
-                return;
-            }
-            if (detailPage.approvalInput.length === 0)
-                return;
-            check("reviewingARequestShowsTheInputTheCallIsHolding",
-                  detailPage.approvalInput.indexOf("cargo") !== -1);
-
+            // The banner names a question and offers exactly one action. The
+            // decision itself is the review surface's, and the check is that
+            // this page routes to the request its own run is parked on.
             if (!captured("run-approval", detailPage))
                 return;
+            if (window.approvalPage === null) {
+                detail.reviewApproval();
+                return;
+            }
+            check("reviewingFromARunOpensTheRequestThatRunIsParkedOn",
+                  window.approvalPage.approvalId
+                      === String(detail.pendingApproval.approvalId));
+            window.closeApproval();
             next(3, interruptedRun);
             return;
         }
@@ -921,6 +1212,18 @@ Kirigami.ApplicationWindow {
                   detail.retryBlocked === "run_still_active");
             check("aRunningRunShowsNoApprovalBanner", !detail.approvalBannerVisible);
             check("aRunningRunOffersCancellation", detail.cancellable);
+            // The row the reader is watching says what the tool last reported.
+            // Only the call still in flight carries one, so a page of finished
+            // calls cannot show a line that reads as current.
+            let executing = null;
+            for (let index = 0; index < detail.calls.length; ++index) {
+                if (String(detail.calls[index].state) === "running")
+                    executing = detail.calls[index];
+            }
+            check("aRunningCallIsOnThePage", executing !== null);
+            check("aRunningCallShowsTheNewestLineItReported",
+                  executing !== null
+                  && String(executing.progress).indexOf("Compiling harkness-crate-7") !== -1);
             if (!captured("run-progress", detailPage))
                 return;
             next(5, pagedRun);
@@ -1016,11 +1319,243 @@ Kirigami.ApplicationWindow {
             // the one the reader would be watching.
             check("theSharedStatusDescribesTheNewestOperation",
                   String(overlap.status).indexOf(failedRun) !== -1);
-            next(9, waitingRun);
+            next(9);
             return;
         }
 
+        // --- The review surface ---------------------------------------
+        //
+        // Every phase from here to 15 answers nothing, and that is deliberate:
+        // a decision needs a run this process's coordinator is driving, and
+        // reaching a coordinator at all sweeps, which is why phase 16 is last
+        // and why these run before it. What they hold to account is everything
+        // the surface decides on its own: which breadths it offers, when it
+        // withdraws them, what it renders, and that leaving decides nothing.
+
         if (phase === 9) {
+            if (window.approvalPage === null) {
+                window.showApproval(widenedApproval, widenedRun);
+                return;
+            }
+            if (!approvalReady || !composed())
+                return;
+            const approval = window.approvalPage;
+            check("aRequestNamesTheToolTheAnswerWouldAuthorize",
+                  String(approval.request.tool).indexOf("fs.apply_patch") !== -1);
+            check("aRequestNamesItsVersion",
+                  String(approval.request.toolVersion) === "1.0.0");
+            check("aRequestNamesTheRiskItWasClassifiedAt",
+                  String(approval.request.risk) === "workspace_write");
+            check("aRequestNamesTheWorkspaceItIsBoundTo",
+                  String(approval.request.workspace).length > 0);
+            check("aRequestNamesWhatItWouldDoWithoutLoadingAnything",
+                  String(approval.request.summary).indexOf("src/lib.rs") !== -1);
+            check("aPendingRequestCanBeAnswered",
+                  approval.decidable && approval.approveEnabled && approval.denyEnabled);
+
+            // The breadths on offer are the record's own, so the surface
+            // cannot express one `ApprovalRequest::decide` would refuse.
+            check("aWorkspaceWriteOffersTheBreadthsTheRuntimeWouldAccept",
+                  approval.grantableScopes.length === 2
+                  && String(approval.grantableScopes[0]) === "exact_call"
+                  && String(approval.grantableScopes[1]) === "capability_for_run");
+            check("aChoiceIsRenderedBecauseThereIsOneToMake", approval.scopeChoiceAllowed);
+            check("theSurfaceStartsOnTheNarrowestBreadth",
+                  approval.chosenScope === "exact_call");
+
+            // A page opens on the row's summary. The canonical input the hash
+            // binds is a read, and a request nobody expanded pays for none.
+            if (!approval.rawExpanded) {
+                check("aRequestOpensWithoutReadingTheInputItBinds",
+                      approval.input.length === 0);
+                approval.toggleRawInput();
+                return;
+            }
+            if (approval.input.length === 0)
+                return;
+            check("theRawInputIsTheInputTheRecordedCallIsHolding",
+                  approval.input.indexOf("src/lib.rs") !== -1);
+            check("markupInAToolInputRendersAsTheCharactersTheToolWrote",
+                  approval.input.indexOf("<b>alert</b>") !== -1
+                  && approval.input.indexOf("&") !== -1);
+            if (!captured("approval-review", approval))
+                return;
+            next(10);
+            return;
+        }
+
+        if (phase === 10) {
+            // Widen the choice, then leave without answering. Neither the
+            // widening nor the leaving may reach the store.
+            const approval = window.approvalPage;
+            if (!scopeWidened) {
+                approval.scopeIndex = 1;
+                scopeWidened = true;
+                return;
+            }
+            check("choosingTheWiderBreadthIsWhatWouldBeSent",
+                  approval.chosenScope === "capability_for_run");
+            window.closeApproval();
+            check("leavingTheReviewSurfaceDestroysIt", window.approvalPage === null);
+            verify.loadRun(widenedRun);
+            next(11);
+            return;
+        }
+
+        if (phase === 11) {
+            if (verify.busy || verify.run === undefined || verify.run === null
+                    || String(verify.run.runId) !== widenedRun)
+                return;
+            let request = null;
+            for (let index = 0; index < verify.run.approvals.length; ++index) {
+                if (String(verify.run.approvals[index].approvalId) === widenedApproval)
+                    request = verify.run.approvals[index];
+            }
+            check("theRequestIsStillThereAfterTheSurfaceWasDestroyed", request !== null);
+            check("closingTheApprovalPageLeavesTheRequestPending",
+                  request !== null && request.pending === true
+                  && String(request.state) === "pending");
+            check("closingTheApprovalPageLeavesTheEffectiveBreadthAlone",
+                  request !== null && String(request.scope) === "capability_for_run");
+            check("closingTheApprovalPageLeavesTheRunWaiting",
+                  String(verify.run.state) === "waiting_for_approval");
+            next(12);
+            return;
+        }
+
+        if (phase === 12) {
+            if (window.approvalPage === null) {
+                window.showApproval(remoteApproval, remoteRun);
+                return;
+            }
+            if (!approvalReady)
+                return;
+            const approval = window.approvalPage;
+            check("aRemoteWriteOffersNoWidenedScopes",
+                  approval.grantableScopes.length === 1
+                  && String(approval.grantableScopes[0]) === "exact_call");
+            check("aRemoteWriteRendersNoScopeControlAtAll", !approval.scopeChoiceAllowed);
+            check("aRemoteWriteIsAnsweredForOneCall",
+                  approval.chosenScope === "exact_call");
+            check("aDowngradedRequestKeepsBothSpellings",
+                  String(approval.request.requestedScope) === "capability_for_run"
+                  && String(approval.request.scope) === "exact_call"
+                  && approval.request.downgraded === true);
+            check("aRemoteWriteIsStillAnswerable", approval.decidable);
+            window.closeApproval();
+            next(13);
+            return;
+        }
+
+        if (phase === 13) {
+            if (window.approvalPage === null) {
+                window.showApproval(lapsedApproval, lapsedRun);
+                return;
+            }
+            if (!approvalReady || !composed())
+                return;
+            const approval = window.approvalPage;
+            // A deadline that passed closes nothing on its own: the row is
+            // still pending until a sweeper expires it. The surface follows
+            // the clock rather than the row, because the runtime refuses a
+            // late grant either way.
+            check("aLapsedRequestIsStillStoredAsPending",
+                  String(approval.requestState) === "pending");
+            check("aLapsedRequestReadsAsTooLateToAnswer", approval.lapsed);
+            check("aLapsedRequestCannotBeAnswered", !approval.decidable);
+            check("aLapsedRequestOffersNoApproval", !approval.approveEnabled);
+            check("aLapsedRequestOffersNoDenialEither", !approval.denyEnabled);
+            if (!captured("approval-expired", approval))
+                return;
+            window.closeApproval();
+            next(14);
+            return;
+        }
+
+        if (phase === 14) {
+            if (window.approvalPage === null) {
+                window.showApproval(refusedApproval, refusedRun);
+                return;
+            }
+            if (!approvalReady || !composed())
+                return;
+            const approval = window.approvalPage;
+            check("aRefusedRequestReadsAsDenied",
+                  String(approval.requestState) === "denied");
+            check("aRefusalShowsTheReasonThatWasTyped",
+                  String(approval.request.reason) === denialReason);
+            check("aRefusalNamesTheSurfaceItWasGivenThrough",
+                  String(approval.request.decidedVia) === "gui");
+            check("aRefusalNamesWhenItWasGiven",
+                  String(approval.request.decidedAt).length > 0);
+            check("anAnsweredRequestOffersNoSecondAnswer", !approval.decidable);
+            check("anAnsweredRequestOffersNoApproval", !approval.approveEnabled);
+            if (!captured("approval-denied", approval))
+                return;
+            window.closeApproval();
+            next(15, refusedRun);
+            return;
+        }
+
+        if (phase === 15) {
+            if (!detailReady)
+                return;
+            // The audit trail is the same thing the reader just saw. The
+            // timeline's own row for the decision carries the verdict as its
+            // outcome, and its payload carries the scope, the surface and the
+            // reason.
+            let decided = null;
+            for (let index = 0; index < detail.timelineView.count; ++index) {
+                const row = detail.timelineView.itemAtIndex(index);
+                if (row !== null && String(row.kind) === "approval_decided")
+                    decided = row;
+            }
+            check("theTimelineRecordsTheDecisionThatWasGiven", decided !== null);
+            check("theDecisionRowIsMarkedWithItsVerdict",
+                  decided !== null && String(decided.outcome) === "denied");
+            if (decided !== null && !decided.expanded) {
+                decided.expanded = true;
+                detail.timelineView.model.loadDetail(decided.seq);
+                return;
+            }
+            if (decided !== null && decided.detail.length === 0)
+                return;
+            check("theDecisionsPayloadCarriesTheReasonAndTheSurface",
+                  decided !== null
+                  && decided.detail.indexOf(denialReason) !== -1
+                  && decided.detail.indexOf("gui") !== -1);
+            check("aRefusedRunStillListsTheApprovalItRecorded",
+                  detail.approvals.length === 1
+                  && String(detail.approvals[0].state) === "denied");
+            check("aRefusedRunShowsNoApprovalBanner", !detail.approvalBannerVisible);
+            next(16, waitingRun);
+            return;
+        }
+
+        if (phase === 16) {
+            // Arms the race the next two phases are about. This page reads a
+            // request that is genuinely pending, and then the store moves
+            // underneath it: phase 17 reaches a coordinator, whose startup
+            // sweep supersedes every request no live process can answer. A
+            // surface holding the reading it took *before* that is exactly the
+            // stale page the runtime has to refuse, and this is the only way to
+            // build one on purpose.
+            if (window.approvalPage === null) {
+                window.showApproval(widenedApproval, widenedRun);
+                return;
+            }
+            if (!approvalReady)
+                return;
+            check("theRacedRequestReadsAsAnswerableBeforeAnythingMoves",
+                  window.approvalPage.decidable
+                  && window.approvalPage.approveEnabled);
+            check("theRacedRequestHasNothingToReportYet",
+                  window.approvalPage.failureKind.length === 0);
+            next(17, waitingRun);
+            return;
+        }
+
+        if (phase === 17) {
             if (!detailReady)
                 return;
             // Cancelling attaches this process's coordinator, which sweeps
@@ -1036,8 +1571,24 @@ Kirigami.ApplicationWindow {
             if (!cancelPressed) {
                 check("theParkedRunReadsAsParkedBeforeAnythingIsPressed",
                       detail.runStateValue === "waiting_for_approval");
+                check("theCancelControlReadsAsCancelBeforeItIsPressed",
+                      detail.cancelLabel === "Cancel" && !detail.cancelling);
                 cancelPressed = true;
+                // Timed around the call itself. `cancelRun` flips this
+                // process's token on the Qt thread and only then spawns the
+                // worker that persists anything, so the control the reader is
+                // looking at has to have changed by the time the call returns
+                // - before any store write, and long before the run itself
+                // reaches a terminal state.
+                const pressed = Date.now();
                 detail.cancel();
+                cancelResponse = Date.now() - pressed;
+                check("pressingCancelChangesTheControlWithinAQuarterSecond",
+                      cancelResponse >= 0 && cancelResponse < 250);
+                check("theCancelControlSaysItIsCancelling",
+                      detail.cancelling && detail.cancelLabel !== "Cancel");
+                check("theCancelControlCannotBePressedTwice", !detail.cancelling
+                      || detail.cancelLabel !== "Cancel");
                 return;
             }
             // Bounded, and bounded around *both* waits: a page that never
@@ -1051,11 +1602,59 @@ Kirigami.ApplicationWindow {
                 return;
             check("aMutationMakesThePageReadTheRunAgain",
                   !detail.mutating && detail.runStateValue === "interrupted");
-            next(10);
+            check("theCancelControlStopsSayingItIsCancellingOnceTheRequestSettles",
+                  !detail.cancelling);
+            next(18);
             return;
         }
 
-        if (phase === 10) {
+        if (phase === 18) {
+            // The stale page from phase 16, pressed after the sweep. The
+            // request it is holding no longer exists in the shape it read, and
+            // this window holds no authority to say otherwise: the runtime
+            // refuses, the refusal is displayed rather than swallowed, and
+            // nothing was granted.
+            const approval = window.approvalPage;
+            if (!approvalPressed) {
+                approvalPressed = true;
+                approval.approve();
+                return;
+            }
+            if (approval.deciding || !approval.runReady)
+                return;
+            check("aDecisionTheRuntimeRefusesIsReportedRatherThanPretended",
+                  approval.failureKind.length > 0
+                  && approval.failureMessage.length > 0);
+            check("theRefusalKeepsTheDiscriminantTheRuntimePublished",
+                  approval.failureKind === "approval_not_active"
+                  || approval.failureKind === "approval_refused");
+            check("aRefusedDecisionGrantsNothing",
+                  String(approval.requestState) !== "granted");
+            check("aPageWhoseRequestMovedUnderneathItCatchesUp",
+                  String(approval.requestState) === "superseded");
+            check("aSupersededRequestOffersNoApproval",
+                  !approval.decidable && !approval.approveEnabled);
+
+            // The other verb, through the bridge the page's Deny button calls.
+            // A refusal has to reach a caller the same way whichever decision
+            // was asked for; the page above covers the path, and this covers
+            // the half of the bridge that path does not reach.
+            if (!denyIssued) {
+                denyIssued = true;
+                verify.deny(refusedApproval, "answered twice");
+                return;
+            }
+            if (verify.busy)
+                return;
+            check("denyingReportsARefusalTheSameWayApprovingDoes",
+                  String(verify.kind || "").length > 0
+                  && String(verify.status || "").length > 0);
+            window.closeApproval();
+            next(19);
+            return;
+        }
+
+        if (phase === 19) {
             // Main.qml's own stack behaviour, which nothing else here reaches:
             // this window's `showRun` is a stand-in for the detail page's
             // benefit, and re-implementing the stack rules rather than
@@ -1072,7 +1671,7 @@ Kirigami.ApplicationWindow {
             const main = mainWindow.createObject(null);
             check("theWindowLoads", main !== null);
             if (main === null) {
-                next(11);
+                next(20);
                 return;
             }
             const shellPage = shellStandIn.createObject(main.pageStack);
@@ -1082,7 +1681,7 @@ Kirigami.ApplicationWindow {
                   shellPage !== null && detailPageStandIn !== null);
             if (shellPage === null || detailPageStandIn === null) {
                 main.destroy();
-                next(11);
+                next(20);
                 return;
             }
 
@@ -1113,11 +1712,11 @@ Kirigami.ApplicationWindow {
                   && main.pageStack.currentItem === detailPageStandIn);
 
             main.destroy();
-            next(11);
+            next(20);
             return;
         }
 
-        if (phase === 11) {
+        if (phase === 20) {
             // Every grab is asynchronous, so the loop ends when the last of
             // them has written its file rather than when the last check ran.
             if (pendingGrabs > 0)

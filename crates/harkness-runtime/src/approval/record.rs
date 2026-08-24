@@ -779,6 +779,29 @@ impl ApprovalRequest {
         self.effective_scope != self.pending.requested_scope
     }
 
+    /// Every breadth a decision on this request may actually be granted with,
+    /// narrowest first.
+    ///
+    /// [`decide`](Self::decide) accepts exactly two answers: the stored
+    /// effective scope, and [`ExactCall`](ApprovalScope::ExactCall), which a
+    /// human may always narrow to. This is that rule expressed as a list rather
+    /// than a second copy of it, so a surface that offers these and nothing
+    /// else cannot ask for a breadth the record would refuse — and the test
+    /// below holds the two to each other in both directions.
+    ///
+    /// It is a *read* and decides nothing. A request whose ceiling already
+    /// reduced it to one call yields a single entry, which is what a
+    /// [`RemoteWrite`](RiskLevel::RemoteWrite) or
+    /// [`Destructive`](RiskLevel::Destructive) request always is.
+    #[must_use]
+    pub fn grantable_scopes(&self) -> Vec<ApprovalScope> {
+        if self.effective_scope == ApprovalScope::ExactCall {
+            vec![ApprovalScope::ExactCall]
+        } else {
+            vec![ApprovalScope::ExactCall, self.effective_scope]
+        }
+    }
+
     /// UTC time the request was recorded.
     #[must_use]
     pub const fn created_at(&self) -> OffsetDateTime {
@@ -1206,6 +1229,64 @@ pub(super) mod tests {
             ApprovalScope::ExactCall,
             "the record must show what was allowed, not what was asked"
         );
+    }
+
+    #[test]
+    fn the_grantable_scopes_are_exactly_the_ones_a_decision_is_accepted_at() {
+        for risk in RiskLevel::ALL.iter().copied() {
+            for asked in ApprovalScope::ALL.iter().copied() {
+                let record = request(risk, asked);
+                let grantable = record.grantable_scopes();
+
+                for scope in ApprovalScope::ALL.iter().copied() {
+                    let mut candidate = record.clone();
+                    let outcome = candidate.decide(ApprovalDecision::grant(
+                        candidate.id(),
+                        scope,
+                        DecidedVia::Gui,
+                        at(1),
+                    ));
+                    assert_eq!(
+                        grantable.contains(&scope),
+                        outcome.is_ok(),
+                        "{risk:?} asked {asked}: grantable={grantable:?} but deciding \
+                         {scope} was {outcome:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_narrowest_grantable_scope_is_offered_first() {
+        for risk in RiskLevel::ALL.iter().copied() {
+            for asked in ApprovalScope::ALL.iter().copied() {
+                let record = request(risk, asked);
+
+                let grantable = record.grantable_scopes();
+
+                assert_eq!(
+                    grantable.first(),
+                    Some(&ApprovalScope::ExactCall),
+                    "{risk:?}/{asked}: a surface defaulting to the first entry has \
+                     to default to the single call in front of the reader"
+                );
+                assert!(grantable.len() <= 2, "{grantable:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_one_call_only_request_offers_no_second_breadth_to_choose_from() {
+        for risk in [RiskLevel::RemoteWrite, RiskLevel::Destructive] {
+            for asked in ApprovalScope::ALL.iter().copied() {
+                assert_eq!(
+                    request(risk, asked).grantable_scopes(),
+                    vec![ApprovalScope::ExactCall],
+                    "{risk:?}/{asked}"
+                );
+            }
+        }
     }
 
     #[test]
