@@ -47,7 +47,11 @@ Item {
     Kirigami.Theme.alternateBackgroundColor: "#0d0d0d"
     Kirigami.Theme.textColor: "#ffffff"
 
-    /// Re-reads the list, which is what the shell calls after starting a run.
+    /// Re-reads the list.
+    ///
+    /// The entry point for a host that has just started a run. Nothing in the
+    /// shell calls it yet — the checks view reports no such moment — so until
+    /// one does, the pane's own Refresh button is what brings the list current.
     function refresh() {
         runList.refresh();
     }

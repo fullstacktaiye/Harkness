@@ -131,6 +131,8 @@ Item {
             model: runs
             reuseItems: true
 
+            Controls.ScrollBar.vertical: Controls.ScrollBar {}
+
             Keys.onEnterPressed: runList.openCurrent()
             Keys.onReturnPressed: runList.openCurrent()
 

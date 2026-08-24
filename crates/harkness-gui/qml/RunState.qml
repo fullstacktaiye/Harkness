@@ -368,7 +368,11 @@ Item {
             return qsTr("%1 ms").arg(Math.round(seconds * 1000));
         if (seconds < 60)
             return qsTr("%1 s").arg(seconds.toFixed(1));
-        return qsTr("%1 min %2 s").arg(Math.floor(seconds / 60)).arg(Math.round(seconds % 60));
+        // Rounded to whole seconds *before* the split, so a value whose
+        // remainder rounds up to sixty carries into the minute rather than
+        // rendering as "1 min 60 s".
+        const whole = Math.round(seconds);
+        return qsTr("%1 min %2 s").arg(Math.floor(whole / 60)).arg(whole % 60);
     }
 
     // --- Untrusted text ----------------------------------------------------

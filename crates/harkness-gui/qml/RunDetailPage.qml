@@ -44,9 +44,6 @@ Kirigami.Page {
     /// reload, because a reader comparing two runs compares the same evidence.
     property int section: 0
 
-    /// One reading of the clock the relative labels share.
-    property double now: Date.now()
-
     title: page.headerTitle
     padding: 0
 
@@ -335,7 +332,28 @@ Kirigami.Page {
 
     function reload() {
         runs.loadRun(page.runId);
-        page.now = Date.now();
+    }
+
+    /// Whether a mutation this page issued is still outstanding.
+    ///
+    /// Cancel and Retry change exactly the durable state the header is a read
+    /// of — which state the run is in, and whether a retry is still available —
+    /// and nothing else re-reads it. The timeline is what schedules a header
+    /// reload, and a run this process is not driving publishes nothing to it,
+    /// so without this the page would go on offering a Retry the coordinator
+    /// has already been asked for and would now refuse.
+    property bool mutating: false
+
+    /// Stops the run, and re-reads it once the request has been answered.
+    function cancel() {
+        page.mutating = true;
+        runs.cancelRun(page.runId);
+    }
+
+    /// Starts a fresh attempt, and re-reads this run once it has been made.
+    function retry() {
+        page.mutating = true;
+        runs.retryRun(page.runId);
     }
 
     /// Reads the run this page is pointed at, from both of its sources.
@@ -361,13 +379,6 @@ Kirigami.Page {
         page.select();
     }
 
-    Timer {
-        interval: 30000
-        repeat: true
-        running: page.visible
-        onTriggered: page.now = Date.now()
-    }
-
     /// Coalesces the header re-reads a live run's events would otherwise ask
     /// for. A tool reporting a hundred progress lines must cost one store read,
     /// not a hundred; the delay is long enough to absorb a burst and short
@@ -378,6 +389,22 @@ Kirigami.Page {
         interval: 750
         repeat: false
         onTriggered: page.reload()
+    }
+
+    Connections {
+        /// A mutation is answered by the durable state it changed rather than
+        /// by the message it returned, so the page re-reads once every
+        /// operation it has outstanding has settled. `mutating` is cleared
+        /// first, so the re-read this schedules cannot schedule another.
+        function onBusyChanged() {
+            if (runs.busy || !page.mutating)
+                return;
+            page.mutating = false;
+            page.reload();
+            timeline.refresh();
+        }
+
+        target: runs
     }
 
     Connections {
@@ -493,7 +520,7 @@ Kirigami.Page {
                         icon.name: "process-stop-symbolic"
                         text: qsTr("Cancel")
                         visible: page.cancellable
-                        onClicked: runs.cancelRun(page.runId)
+                        onClicked: page.cancel()
                     }
 
                     Controls.Button {
@@ -507,7 +534,7 @@ Kirigami.Page {
                         icon.name: "view-refresh-symbolic"
                         text: qsTr("Retry")
                         visible: page.retryable
-                        onClicked: runs.retryRun(page.runId)
+                        onClicked: page.retry()
                     }
                 }
 
@@ -864,9 +891,24 @@ Kirigami.Page {
                     activeFocusOnTab: true
                     cacheBuffer: Math.max(height * 2, Kirigami.Units.gridUnit * 20)
                     clip: true
+                    currentIndex: -1
                     keyNavigationEnabled: true
                     model: timeline
                     reuseItems: true
+
+                    Controls.ScrollBar.vertical: Controls.ScrollBar {}
+
+                    Keys.onEnterPressed: events.toggleCurrent()
+                    Keys.onReturnPressed: events.toggleCurrent()
+
+                    /// Opens the row the keyboard is on, which is what a click
+                    /// does to the row the pointer is over. Reading a payload is
+                    /// the same act either way, so both routes go through the
+                    /// delegate's own `toggle` rather than repeating its rule.
+                    function toggleCurrent() {
+                        if (currentIndex >= 0 && currentItem)
+                            currentItem.toggle();
+                    }
 
                     // Paging backwards is a header button, so a reader who has
                     // scrolled to the top of the loaded window asks for more
@@ -907,6 +949,22 @@ Kirigami.Page {
 
                         readonly property color accent: runState.eventColor(kind, summary)
 
+                        /// Opens or closes this row, reading its payload the
+                        /// first time somebody asks to see one. A payload is
+                        /// never fetched for a row nobody opened.
+                        function toggle() {
+                            expanded = !expanded;
+                            if (expanded && hasDetail && detail.length === 0)
+                                timeline.loadDetail(seq);
+                        }
+
+                        // The row is a control rather than a label: it opens,
+                        // and a reader on the keyboard has to be told what they
+                        // are on and that Enter does something to it.
+                        Accessible.name: qsTr("%1 at %2")
+                            .arg(runState.eventLabel(eventRow.kind))
+                            .arg(runState.clockTime(eventRow.at))
+                        Accessible.role: Accessible.Button
                         implicitHeight: eventBody.implicitHeight + Kirigami.Units.smallSpacing * 2
                         width: ListView.view.width
 
@@ -919,15 +977,20 @@ Kirigami.Page {
                             anchors.fill: parent
                             hoverEnabled: true
                             onClicked: {
-                                eventRow.expanded = !eventRow.expanded;
-                                if (eventRow.expanded && eventRow.hasDetail
-                                        && eventRow.detail.length === 0)
-                                    timeline.loadDetail(eventRow.seq);
+                                events.currentIndex = eventRow.index;
+                                eventRow.toggle();
                             }
 
                             Rectangle {
                                 anchors.fill: parent
-                                color: parent.containsMouse ? Qt.rgba(1, 1, 1, 0.04) : "transparent"
+                                // The keyboard's position is marked as well as
+                                // the pointer's: a list that answers Enter and
+                                // shows nothing selected answers it invisibly.
+                                color: eventRow.ListView.isCurrentItem
+                                    ? Qt.rgba(1, 1, 1, 0.08)
+                                    : parent.containsMouse
+                                        ? Qt.rgba(1, 1, 1, 0.04)
+                                        : "transparent"
                             }
                         }
 
@@ -1135,6 +1198,8 @@ Kirigami.Page {
                         model: page.calls
                         reuseItems: true
 
+                        Controls.ScrollBar.vertical: Controls.ScrollBar {}
+
                         delegate: Item {
                             id: callRow
 
@@ -1230,6 +1295,8 @@ Kirigami.Page {
                         clip: true
                         model: page.artifacts
                         reuseItems: true
+
+                        Controls.ScrollBar.vertical: Controls.ScrollBar {}
 
                         delegate: Item {
                             id: artifactRow
@@ -1373,6 +1440,8 @@ Kirigami.Page {
                         clip: true
                         model: page.approvals
                         reuseItems: true
+
+                        Controls.ScrollBar.vertical: Controls.ScrollBar {}
 
                         delegate: Item {
                             id: approvalRow
