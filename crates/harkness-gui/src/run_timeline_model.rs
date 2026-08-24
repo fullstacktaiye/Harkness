@@ -279,7 +279,7 @@ fn model_roles() -> QHash<QHashPair_i32_QByteArray> {
 /// One event as a delegate draws it.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct TimelineRow {
-    seq: u64,
+    pub(crate) seq: u64,
     /// Sequence of the oldest event this row stands for.
     ///
     /// Equal to `seq` for every row but a folded run of progress ticks, where
@@ -287,8 +287,8 @@ pub(crate) struct TimelineRow {
     /// rather than from `seq`, because a cursor of the newest folded tick would
     /// re-read the ticks the row already absorbed and show them again as rows
     /// of their own.
-    first_seq: u64,
-    kind: String,
+    pub(crate) first_seq: u64,
+    pub(crate) kind: String,
     recognized: bool,
     at: String,
     step_id: String,
@@ -688,11 +688,11 @@ impl Timeline {
 }
 
 /// One freshly loaded page and where it left the walk.
-struct TimelinePage {
-    rows: Vec<TimelineRow>,
+pub(crate) struct TimelinePage {
+    pub(crate) rows: Vec<TimelineRow>,
     /// True only when the store said the walk reached the first event; an
     /// under-full page cannot say that on its own.
-    beginning: bool,
+    pub(crate) beginning: bool,
     /// Whether a subscription is now delivering this run's later events.
     live: bool,
 }
@@ -737,7 +737,7 @@ fn open_timeline(run: RunId) -> Result<Option<(Option<EventReceiver>, TimelinePa
 /// durable history and then waits forever for a worker that does not exist in
 /// this process. Both cases read their page and stop, which is also what keeps
 /// looking at a timeline from attaching this process's lease to the store.
-fn open_timeline_in(
+pub(crate) fn open_timeline_in(
     data_dir: &std::path::Path,
     run: RunId,
 ) -> Result<Option<(Option<EventReceiver>, TimelinePage)>, RunsFailure> {
@@ -768,7 +768,7 @@ fn load_older_page(run: RunId, cursor: EventSeq) -> Result<TimelinePage, RunsFai
     load_older_page_in(&data_dir()?, run, cursor)
 }
 
-fn load_older_page_in(
+pub(crate) fn load_older_page_in(
     data_dir: &std::path::Path,
     run: RunId,
     cursor: EventSeq,

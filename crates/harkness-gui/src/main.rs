@@ -2,6 +2,8 @@ mod approval_model;
 mod backend;
 mod changes_model;
 mod file_tree_model;
+#[cfg(test)]
+mod front_end_equivalence;
 pub(crate) mod hotreload;
 mod reconcile;
 mod run_list_model;

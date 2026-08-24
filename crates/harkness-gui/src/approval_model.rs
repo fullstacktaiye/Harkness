@@ -305,7 +305,7 @@ fn load_pending() -> Result<Vec<ApprovalRow>, RunsFailure> {
 ///
 /// Split from [`load_pending`] so a test can seed a temporary store and read it
 /// back without touching `HARKNESS_DATA_DIR`, which is process-wide.
-fn load_pending_in(data_dir: &std::path::Path) -> Result<Vec<ApprovalRow>, RunsFailure> {
+pub(crate) fn load_pending_in(data_dir: &std::path::Path) -> Result<Vec<ApprovalRow>, RunsFailure> {
     let Some(store) = read_store(data_dir)? else {
         return Ok(Vec::new());
     };
