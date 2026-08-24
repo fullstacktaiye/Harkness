@@ -28,9 +28,14 @@ fn main() {
             "qml/HistoryPanel.qml",
             "qml/ReviewSurface.qml",
             "qml/RunState.qml",
+            "qml/StatePill.qml",
+            "qml/MetaField.qml",
+            "qml/BoundedText.qml",
             "qml/RunListPane.qml",
             "qml/RunsPanel.qml",
             "qml/RunDetailPage.qml",
+            "qml/ApprovalBanner.qml",
+            "qml/ApprovalPage.qml",
         ]),
     )
     .qt_module("Network")

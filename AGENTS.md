@@ -14,7 +14,7 @@ Harkness is a Rust 2024 workspace split into thirteen crates under `crates/`:
 - `harkness-test-fixtures`: hermetic repository, filesystem, and process fixtures shared only by crate tests.
 - `harkness-runtime`: typed task, run, step, and tool-call records, the typed tool contract and registry every executable operation implements, the execution contracts shared by front ends, the SQLite run store that makes those records durable, and the external-agent registry that decides which program Harkness is willing to launch at all.
 - `harkness-cli`: the `harkness` command and its integration tests in `tests/`.
-- `harkness-gui`: the Qt 6/KDE Kirigami application. Rust/CXX-Qt bindings live in `src/` and `cxx/`; UI components live in `qml/`. Run, timeline, and approval bridge code lives outside `backend.rs`, in `src/run_list_model.rs`, `src/run_timeline_model.rs`, `src/approval_model.rs`, and `src/runs_backend.rs`, sharing `src/reconcile.rs` and `cxx/listmodelbase.h`; `backend.rs` stays the Git and catalog surface and gains no run or approval members. A front-end read takes the run store, never the coordinator: building one takes this process's lease and runs the recovery sweep, which writes, so it belongs to deciding to drive work rather than to looking at what was recorded. The run surfaces themselves — `qml/RunState.qml`, `qml/RunListPane.qml`, `qml/RunsPanel.qml`, and `qml/RunDetailPage.qml` — hold no domain logic and reach only those bridges; every string a tool, an agent, or the repository wrote is rendered as `Text.PlainText`, and the one control that renders rich text whatever it is told is only handed text through `escapedRichText`.
+- `harkness-gui`: the Qt 6/KDE Kirigami application. Rust/CXX-Qt bindings live in `src/` and `cxx/`; UI components live in `qml/`. Run, timeline, and approval bridge code lives outside `backend.rs`, in `src/run_list_model.rs`, `src/run_timeline_model.rs`, `src/approval_model.rs`, and `src/runs_backend.rs`, sharing `src/reconcile.rs` and `cxx/listmodelbase.h`; `backend.rs` stays the Git and catalog surface and gains no run or approval members. A front-end read takes the run store, never the coordinator: building one takes this process's lease and runs the recovery sweep, which writes, so it belongs to deciding to drive work rather than to looking at what was recorded. The run and approval surfaces themselves — `qml/RunState.qml`, `qml/RunListPane.qml`, `qml/RunsPanel.qml`, `qml/RunDetailPage.qml`, `qml/ApprovalBanner.qml`, `qml/ApprovalPage.qml`, and the shared `qml/StatePill.qml`, `qml/MetaField.qml` and `qml/BoundedText.qml` — hold no domain logic and reach only those bridges; every string a tool, an agent, or the repository wrote is rendered as `Text.PlainText`, and the one control that renders rich text whatever it is told is only handed text through `escapedRichText`. `RunsBackend::settle` writes the shared `status`/`kind` pair and then the answer property **before** it writes `busy`, because Qt emits `busyChanged` from inside the setter. `busy` still cannot answer *for one operation* — it is a count across every operation outstanding — so a mutation's own `{kind, message}` lands on the `outcome` property, which only a mutation writes and only another mutation supersedes. A surface that inferred its decision's answer from `busy` falling read whichever operation happened to settle last, and a load overlapping a refused decision made the refusal read as a success.
 
 Desktop integration assets are in `data/`. The root `CMakeLists.txt` provides release build and local installation support; Cargo remains the primary development interface.
 
@@ -1378,6 +1378,16 @@ the surface.
 
 Absence of an answer is never consent, and never a resolution either. Closing a
 window, dismissing a dialog, and losing a surface all leave the request pending.
+The application expresses that by making its review surface a *page* rather than
+a `Kirigami.PromptDialog`: a prompt dialog has an implicit accept — escape, the
+close button and a click outside all resolve one, and the affirmative button is
+conventionally the default — and none of that may be true here. `ApprovalPage`
+has one navigation control, no default-focused button, and no handler on
+destruction, visibility or window state that reaches `approve`. The breadths it
+offers are `ApprovalRequest::grantable_scopes`, carried through the bridge, so
+the control cannot express a scope `decide` would refuse; the runtime re-checks
+it regardless, and a refusal is displayed rather than swallowed by the re-read
+that follows it.
 Only an explicit decision, an expiry, a run cancellation, or a recovery sweep
 resolves one, and the last three record `Expired`, `Cancelled` or `Superseded`
 with **no** decision attached — the waiter still observes a denial, and the

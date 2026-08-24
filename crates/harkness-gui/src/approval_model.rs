@@ -37,6 +37,12 @@
 //! validated input itself is loaded on demand through
 //! `RunsBackend::loadApprovalInput`, because it is the tool call's and may be as
 //! large as the store's inline bound allows.
+//!
+//! The one role that is not a plain field is `grantableScopes`: every breadth
+//! the *runtime* would accept a decision on this request at. It is carried
+//! rather than re-derived in QML, because a decision surface that computed it
+//! itself would be a second copy of `ApprovalRequest::decide`'s rule, free to
+//! drift into offering a button the runtime refuses.
 
 #[cxx_qt::bridge]
 pub mod ffi {
@@ -130,7 +136,7 @@ use harkness_runtime::approval::ApprovalRequest;
 use super::reconcile::{Edit, Keyed, plan};
 
 use super::runs_backend::{
-    RunsFailure, data_dir, note_qt_thread, optional_rfc3339, read_store, rfc3339,
+    RunsFailure, data_dir, note_qt_thread, optional_rfc3339, read_store, rfc3339, strings,
 };
 
 /// `Qt::DisplayRole`, so a row reads as its tool in accessibility tooling.
@@ -152,6 +158,7 @@ const REQUESTED_ROLE: i32 = 269;
 const EXPIRES_ROLE: i32 = 270;
 const WORKSPACE_ROLE: i32 = 271;
 const PROJECT_ROLE: i32 = 272;
+const GRANTABLE_ROLE: i32 = 273;
 
 fn model_roles() -> QHash<QHashPair_i32_QByteArray> {
     let mut roles = QHash::<QHashPair_i32_QByteArray>::default();
@@ -172,6 +179,7 @@ fn model_roles() -> QHash<QHashPair_i32_QByteArray> {
     roles.insert(EXPIRES_ROLE, QByteArray::from("expires"));
     roles.insert(WORKSPACE_ROLE, QByteArray::from("workspace"));
     roles.insert(PROJECT_ROLE, QByteArray::from("projectId"));
+    roles.insert(GRANTABLE_ROLE, QByteArray::from("grantableScopes"));
     roles
 }
 
@@ -194,6 +202,10 @@ pub(crate) struct ApprovalRow {
     expires: String,
     workspace: String,
     project_id: String,
+    /// Stored spellings of every breadth a decision on this request may be
+    /// given at, narrowest first — the runtime's own
+    /// `ApprovalRequest::grantable_scopes`, carried rather than re-derived.
+    grantable: Vec<String>,
 }
 
 impl Keyed for ApprovalRow {
@@ -238,6 +250,15 @@ pub(crate) fn approval_row(request: &ApprovalRequest) -> ApprovalRow {
             .project_id()
             .map(|id| id.to_string())
             .unwrap_or_default(),
+        // Read off the record rather than derived here. A surface offering
+        // these and nothing else cannot ask for a breadth `decide` would
+        // refuse, which is what stops the window and the runtime disagreeing
+        // about what a button would authorize.
+        grantable: request
+            .grantable_scopes()
+            .iter()
+            .map(|scope| scope.as_str().to_owned())
+            .collect(),
     }
 }
 
@@ -268,6 +289,7 @@ pub(crate) fn row_map(row: &ApprovalRow) -> QMap<QMapPair_QString_QVariant> {
     text("workspace", &row.workspace);
     text("projectId", &row.project_id);
     map.insert(QString::from("downgraded"), QVariant::from(&row.downgraded));
+    map.insert(QString::from("grantableScopes"), strings(&row.grantable));
     map
 }
 
@@ -333,6 +355,7 @@ impl ffi::ApprovalModel {
             EXPIRES_ROLE => text(&entry.expires),
             WORKSPACE_ROLE => text(&entry.workspace),
             PROJECT_ROLE => text(&entry.project_id),
+            GRANTABLE_ROLE => strings(&entry.grantable),
             _ => QVariant::default(),
         }
     }
@@ -476,8 +499,8 @@ mod tests {
     use super::super::reconcile::{Edit, plan};
     use super::{
         APPROVAL_ID_ROLE, CAPABILITIES_ROLE, DISPLAY_ROLE, DOWNGRADED_ROLE, EXPIRES_ROLE,
-        PROJECT_ROLE, REQUESTED_ROLE, REQUESTED_SCOPE_ROLE, RISK_ROLE, RUN_ID_ROLE, SCOPE_ROLE,
-        SUMMARY_ROLE, TOOL_CALL_ID_ROLE, TOOL_ID_ROLE, TOOL_ROLE, TOOL_VERSION_ROLE,
+        GRANTABLE_ROLE, PROJECT_ROLE, REQUESTED_ROLE, REQUESTED_SCOPE_ROLE, RISK_ROLE, RUN_ID_ROLE,
+        SCOPE_ROLE, SUMMARY_ROLE, TOOL_CALL_ID_ROLE, TOOL_ID_ROLE, TOOL_ROLE, TOOL_VERSION_ROLE,
         WORKSPACE_ROLE, approval_row, load_pending_in, model_roles, row_map,
     };
 
@@ -528,6 +551,7 @@ mod tests {
             (EXPIRES_ROLE, "expires"),
             (WORKSPACE_ROLE, "workspace"),
             (PROJECT_ROLE, "projectId"),
+            (GRANTABLE_ROLE, "grantableScopes"),
         ] {
             assert_eq!(roles.get(&role), Some(QByteArray::from(name)));
         }
@@ -591,6 +615,45 @@ mod tests {
         assert_eq!(row.requested_scope, "tool_for_run");
         assert_eq!(row.scope, "exact_call", "the risk ceiling narrowed it");
         assert!(row.downgraded);
+    }
+
+    #[test]
+    fn a_request_carries_the_breadths_the_runtime_would_accept_an_answer_at() {
+        let request = ApprovalRequest::open(
+            pending("fs.apply_patch", RiskLevel::WorkspaceWrite)
+                .requesting(ApprovalScope::CapabilityForRun)
+                .with_capabilities([Capability::new("fs.write").unwrap()]),
+        )
+        .unwrap();
+
+        let row = approval_row(&request);
+
+        assert_eq!(row.grantable, vec!["exact_call", "capability_for_run"]);
+        assert_eq!(
+            row.grantable,
+            request
+                .grantable_scopes()
+                .iter()
+                .map(|scope| scope.as_str().to_owned())
+                .collect::<Vec<_>>(),
+            "the row must carry the record's own answer rather than a second derivation"
+        );
+    }
+
+    #[test]
+    fn a_one_call_only_request_offers_the_surface_no_breadth_to_choose_from() {
+        let request = ApprovalRequest::open(
+            pending("git.push", RiskLevel::RemoteWrite).requesting(ApprovalScope::ToolForRun),
+        )
+        .unwrap();
+
+        let row = approval_row(&request);
+
+        assert_eq!(
+            row.grantable,
+            vec!["exact_call"],
+            "a downgraded request has one answer, so a surface renders no choice"
+        );
     }
 
     #[test]

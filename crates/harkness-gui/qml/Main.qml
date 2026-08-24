@@ -307,6 +307,48 @@ Kirigami.ApplicationWindow {
         });
     }
 
+    /// Opens one approval request's review surface.
+    ///
+    /// A page rather than a dialog, and pushed *above* whatever named it, so
+    /// Back returns to the run or the queue the reader came from and leaves the
+    /// request exactly as it was. Nothing about this navigation — arriving,
+    /// leaving, or the window closing over it — answers a question: only the
+    /// two buttons on the page do.
+    ///
+    /// One review surface at a time, so a reader working through a queue does
+    /// not build a stack they have to unwind one press at a time. The stack is
+    /// searched rather than only its top inspected: a review surface can put a
+    /// run detail *above* itself — "Open the run" does — and pushing over that
+    /// would leave two live pages for one request, each with its own bridge.
+    ///
+    /// `seed` is the row whoever called this already had, so the page draws its
+    /// header before its own read lands; it may be omitted.
+    function showApproval(approvalId, runId, seed) {
+        const approval = String(approvalId || "");
+        const run = String(runId || "");
+        if (approval.length === 0 || run.length === 0)
+            return;
+        for (let index = pageStack.depth - 1; index >= 0; --index) {
+            const candidate = pageStack.get(index);
+            if (!candidate || candidate.isApprovalReview !== true)
+                continue;
+            // The request already open is returned to rather than opened
+            // twice; a different one is replaced where it stands.
+            const keep = candidate.approvalId === approval ? index + 1 : index;
+            while (pageStack.depth > keep)
+                pageStack.pop();
+            if (candidate.approvalId === approval)
+                return;
+            break;
+        }
+        pageStack.push(Qt.resolvedUrl("ApprovalPage.qml"), {
+            "approvalId": approval,
+            "backend": appBackend,
+            "runId": run,
+            "seed": seed !== undefined ? seed : null
+        });
+    }
+
     onOpenedProjectChanged: {
         const id = openedProject && openedProject.id !== undefined ? String(openedProject.id) : "";
         if (id.length > 0) {

@@ -615,6 +615,57 @@ mod tests {
         );
     }
 
+    /// Whether a launch failed only because the shim was still open for
+    /// writing somewhere.
+    ///
+    /// `Fixture::shim` writes the script and closes it, so this thread holds no
+    /// descriptor to it by the time anything is launched. A test binary runs
+    /// its cases on parallel threads and spawns Git constantly, though, and a
+    /// child forked during that write inherits the descriptor until its own
+    /// `execve` drops it — and `execve` refuses a file *any* process holds open
+    /// for writing, with `ETXTBSY`. On a loaded runner the forked child can
+    /// stay descheduled long enough for our launch to land inside that window,
+    /// which is what made this suite fail on CI and nowhere else.
+    ///
+    /// Nothing about the editor is wrong when it happens, so it is waited out
+    /// rather than asserted on.
+    #[cfg(unix)]
+    fn shim_is_still_open_for_writing(error: &super::EditorError) -> bool {
+        matches!(
+            error,
+            super::EditorError::Launch { source, .. }
+                if source.kind() == std::io::ErrorKind::ExecutableFileBusy
+        )
+    }
+
+    /// Launches, waiting out [`shim_is_still_open_for_writing`].
+    ///
+    /// The window is bounded by whichever forked child is holding the
+    /// descriptor reaching its own `execve`, so waiting is the whole fix. A
+    /// launch still refused at the deadline is returned as itself: a retry loop
+    /// that swallowed a real failure would turn this into the flake it exists
+    /// to remove.
+    #[cfg(unix)]
+    fn launch_past_a_busy_shim<T, E>(
+        mut launch: impl FnMut() -> Result<T, E>,
+        busy: impl Fn(&E) -> bool,
+    ) -> Result<T, E> {
+        use std::{
+            thread,
+            time::{Duration, Instant},
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match launch() {
+                Err(error) if busy(&error) && Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                outcome => return outcome,
+            }
+        }
+    }
+
     #[cfg(unix)]
     fn recording_editor(fixture: &Fixture, log: &Path) -> EditorConfiguration {
         // Publish the log only after its complete contents are durable to the
@@ -633,6 +684,59 @@ mod tests {
         .unwrap()
     }
 
+    /// Linux only, because the refusal being waited out is Linux's.
+    ///
+    /// Darwin does not stop `execve` on a file some process holds open for
+    /// writing at all — the launch below simply succeeds there — so this asserts
+    /// the condition still looks the way `shim_is_still_open_for_writing`
+    /// expects on the platform that has it. The wait itself stays compiled on
+    /// every Unix: it costs nothing where the refusal never happens.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_launch_waits_out_a_shim_that_is_still_open_for_writing() {
+        use std::{thread, time::Duration};
+
+        let fixture = Fixture::new();
+        let root = fixture.directory("repository");
+        fs::write(root.join("changed.rs"), "content\n").unwrap();
+        let log = fixture.root.path().join("argv");
+        let configuration = recording_editor(&fixture, &log);
+        let launch = || {
+            open(
+                &root,
+                Path::new("changed.rs"),
+                position(1, 1),
+                Some(&configuration),
+                EditorLaunchContext::Graphical,
+            )
+        };
+
+        // `execve` refuses a file any process holds open for writing, and the
+        // kernel counts writers per inode rather than per process — so holding
+        // the descriptor here reproduces exactly what a child forked during
+        // `Fixture::shim`'s write holds until its own `execve` drops it.
+        let held = fs::OpenOptions::new()
+            .write(true)
+            .open(fixture.root.path().join("record-editor"))
+            .unwrap();
+
+        let refused = launch().unwrap_err();
+        assert!(
+            shim_is_still_open_for_writing(&refused),
+            "the condition this waits out no longer looks like this: {refused:?}"
+        );
+
+        // Released from another thread, because the wait below blocks this one.
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            drop(held);
+        });
+
+        launch_past_a_busy_shim(launch, shim_is_still_open_for_writing)
+            .expect("the launch has to succeed once nothing holds the shim open");
+        wait_for_file(&log);
+    }
+
     #[cfg(unix)]
     #[test]
     fn shell_metacharacters_are_passed_literally_and_execute_nothing() {
@@ -643,12 +747,17 @@ mod tests {
         let log = fixture.root.path().join("argv");
         let configuration = recording_editor(&fixture, &log);
 
-        open(
-            &root,
-            path,
-            position(17, 4),
-            Some(&configuration),
-            EditorLaunchContext::Graphical,
+        launch_past_a_busy_shim(
+            || {
+                open(
+                    &root,
+                    path,
+                    position(17, 4),
+                    Some(&configuration),
+                    EditorLaunchContext::Graphical,
+                )
+            },
+            shim_is_still_open_for_writing,
         )
         .unwrap();
 
@@ -669,7 +778,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_running_editor_holds_no_catalog_lock_and_never_blocks_the_caller() {
-        use crate::ProjectService;
+        use crate::{ProjectError, ProjectService};
 
         let fixture = Fixture::new();
         let root = fixture.directory("repository");
@@ -693,14 +802,21 @@ mod tests {
             .set_editor_configuration(Some(configuration))
             .unwrap();
 
-        service
-            .open_in_editor(
-                project.id,
-                Path::new("changed.rs"),
-                position(1, 1),
-                EditorLaunchContext::Graphical,
-            )
-            .unwrap();
+        launch_past_a_busy_shim(
+            || {
+                service.open_in_editor(
+                    project.id,
+                    Path::new("changed.rs"),
+                    position(1, 1),
+                    EditorLaunchContext::Graphical,
+                )
+            },
+            |error| {
+                matches!(error, ProjectError::Editor(editor)
+                    if shim_is_still_open_for_writing(editor))
+            },
+        )
+        .unwrap();
         wait_for_file(&ready);
         service.set_editor_configuration(None).unwrap();
         fs::write(release, b"release").unwrap();
@@ -725,12 +841,17 @@ mod tests {
             "{file}".to_owned(),
         ])
         .unwrap();
-        open(
-            &root,
-            Path::new("changed.rs"),
-            position(1, 1),
-            Some(&configuration),
-            EditorLaunchContext::Graphical,
+        launch_past_a_busy_shim(
+            || {
+                open(
+                    &root,
+                    Path::new("changed.rs"),
+                    position(1, 1),
+                    Some(&configuration),
+                    EditorLaunchContext::Graphical,
+                )
+            },
+            shim_is_still_open_for_writing,
         )
         .unwrap();
         wait_for_file(&pid_log);

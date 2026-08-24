@@ -357,6 +357,16 @@ and every new bridge file — must be added to `build.rs`'s lists.
   second lease and leave every run the checks panel started uncancellable. The three models drive
   their own reads: cxx-qt gives one bridge object no handle to another, so a model created in QML
   is not reachable from `RunsBackend`'s Rust.
+- **`RunsBackend::settle` writes `busy` last, and a mutation answers on `outcome`.** Qt emits
+  `busyChanged` from inside the setter, so a surface reacting to an operation finishing runs
+  *during* `settle`; the shared `status`/`kind` pair and the answer property are therefore both in
+  place before `busy` moves. That ordering is necessary and not sufficient: `busy` is a *count* of
+  everything outstanding, so it says only that some operation finished. A mutation's own
+  `{kind, message}` therefore lands on `outcome`, which nothing but a mutation writes and only
+  another mutation supersedes, and which is counted in its own watermark slot so a later load
+  cannot suppress a decision's reply. `ApprovalPage` and `RunDetailPage` both key on
+  `onOutcomeChanged`; keying on `busy` let a load overlapping a refused decision report it as a
+  success, and left "Cancelling…" on screen after the request it described had been answered.
 - **A read takes the store; driving work takes the coordinator.** `read_store` never creates
   `runtime.db` and never builds a coordinator, because building one takes the lease and runs the
   recovery sweep — writes, on a path a user reached by opening a panel to look at something. A
@@ -387,7 +397,22 @@ and every new bridge file — must be added to `build.rs`'s lists.
   since it was written — and `dataChanged` fires again when a lazily loaded payload arrives on a
   row that was already there. `appended` is emitted only when `plan_append` produced an edit, which
   covers the folded progress row absorbing ticks in place as well as rows arriving.
-- **The run surfaces are four QML files over those bridges and no domain logic.** `RunState.qml`
+- **The approval surface is a page, and closing it decides nothing.** `ApprovalPage.qml` is pushed
+  on `pageStack` rather than opened as a `Kirigami.PromptDialog`, because a prompt dialog has an
+  implicit accept and absence of an answer is never consent. There is no handler on destruction,
+  visibility or window state that reaches `approve`; the two buttons are the only call sites, and
+  neither is default-focused. The scopes the decision row offers are the record's own
+  `grantableScopes` — `ApprovalRequest::grantable_scopes`, carried by `approval_model.rs` — so a
+  surface cannot express a breadth `ApprovalRequest::decide` would refuse, and a `RemoteWrite` or
+  `Destructive` request renders no scope control at all rather than one holding a single entry. A
+  lapsed deadline withdraws Approve while the stored row still says `pending`, because a deadline
+  is closed by a sweeper and not by the clock. `ApprovalBanner.qml` is the compact indicator both
+  the run detail page and the project shell show; it names a question, offers only Review, and owns
+  no model — the host does.
+- **The run surfaces are QML over those bridges and no domain logic.** `StatePill.qml`,
+  `MetaField.qml` and `BoundedText.qml` are the three presentation parts the run and approval pages
+  share rather than each declaring inline, which is also why `BoundedText` takes its clipboard as a
+  property: it is the one of the three that reaches a bridge at all. `RunState.qml`
   is the shared vocabulary — state and event-kind words, the palette, byte and time units, and the
   `escapedRichText` every `InlineMessage` on these pages goes through — instantiated rather than
   imported, because `build.rs`'s flat file list cannot mark a singleton. `RunListPane.qml` is the
