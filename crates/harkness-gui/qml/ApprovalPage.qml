@@ -112,8 +112,23 @@ Kirigami.Page {
         : (page.seed !== undefined && page.seed !== null ? page.seed : null)
 
     readonly property bool ready: page.request !== null
+
+    /// One field of the record, or empty when the reading this page has does
+    /// not carry it.
+    ///
+    /// A seed is whatever the surface that opened this page already had, and
+    /// the pending queue's rows carry a subset of what a run's own approval
+    /// record does. `String(undefined)` is the five-character word "undefined",
+    /// which a `MetaField` would show as happily as a real value, so every
+    /// field on this page is read through here.
+    function field(name) {
+        if (page.request === null)
+            return "";
+        const value = page.request[name];
+        return value === undefined || value === null ? "" : String(value);
+    }
     readonly property string headerTitle: page.ready
-        ? qsTr("Approve %1").arg(String(page.request.tool))
+        ? qsTr("Approve %1").arg(page.field("tool"))
         : qsTr("Approval")
 
     /// The request's lifecycle state.
@@ -122,7 +137,8 @@ Kirigami.Page {
     /// queue's rows carry no state role, because a request leaves that queue
     /// the moment it is answered. The loaded record always carries one.
     readonly property string requestState: page.ready
-        ? String(page.request.state || "pending") : ""
+        ? (page.field("state").length > 0 ? page.field("state") : "pending")
+        : ""
     readonly property bool pending: page.requestState === "pending"
 
     /// The reader's clock, ticked so a deadline passing is visible without a
@@ -130,7 +146,7 @@ Kirigami.Page {
     /// one for a whole list.
     property real now: 0
 
-    readonly property string expires: page.ready ? String(page.request.expires || "") : ""
+    readonly property string expires: page.field("expires")
     /// Whether the deadline for answering has passed.
     ///
     /// A lapsed request stays `pending` in the store until something expires
@@ -152,16 +168,28 @@ Kirigami.Page {
     /// than rendered with one entry.
     readonly property bool scopeChoiceAllowed: page.grantableScopes.length > 1
 
-    /// Which breadth the decision row is on. Reset to the narrowest whenever
-    /// the offered set changes, so a widened choice can never be carried into
-    /// a different request by a page that was reused.
-    property int scopeIndex: 0
-    onGrantableScopesChanged: page.scopeIndex = 0
+    /// The offered set as one comparable value.
+    ///
+    /// `grantableScopes` is a `var` derived from `request`, so it is a *new*
+    /// array every time the seed is superseded by this page's own read — with
+    /// identical contents. Watching the array would reset a reader's choice
+    /// underneath them a frame after they made it; watching this does not.
+    readonly property string scopeSignature: page.grantableScopes.join(",")
+    onScopeSignatureChanged: scopeChoice.currentIndex = 0
 
-    readonly property string chosenScope: page.scopeIndex >= 0
-            && page.scopeIndex < page.grantableScopes.length
-        ? String(page.grantableScopes[page.scopeIndex])
-        : ""
+    /// The breadth the decision row is on, read off the control rather than
+    /// mirrored into a property of this page.
+    ///
+    /// A `currentIndex` bound to a page property and *also* written from
+    /// `onActivated` is a two-way binding Qt Quick resolves by destroying the
+    /// declarative half the first time a reader picks something — after which
+    /// the control and the page can disagree about what Approve would send,
+    /// which is the one thing this page may not get wrong.
+    readonly property string chosenScope: {
+        const index = page.scopeChoiceAllowed ? scopeChoice.currentIndex : 0;
+        return index >= 0 && index < page.grantableScopes.length
+            ? String(page.grantableScopes[index]) : "";
+    }
 
     /// Whether the raw input is on screen.
     property bool rawExpanded: false
@@ -180,18 +208,20 @@ Kirigami.Page {
         && runs.detail !== undefined && runs.detail !== null
         && runs.detail.truncated === true
 
-    /// The refusal the last decision received, kept across the re-read that
-    /// follows it.
+    /// How the last decision this page issued went, straight off the bridge.
     ///
-    /// `status` and `kind` are one pair shared by every operation this bridge
-    /// performs, and a settled decision immediately schedules a re-read of the
-    /// run — so a refusal left on the bridge would be cleared by the very load
-    /// that was sent to find out what the refusal did. It is captured at the
-    /// moment the decision settles and stands until the next one is asked for,
-    /// which is exactly as long as it is the answer to a question the reader
-    /// asked.
-    property string decisionKind: ""
-    property string decisionMessage: ""
+    /// Read from `outcome` rather than captured from `status` when `busy`
+    /// falls: `busy` is a count across every operation the bridge has
+    /// outstanding, so a load overlapping a decision — pressing "Show input"
+    /// while Approve is in flight is enough — would let the load's success be
+    /// read as the decision's, and a refusal would reach nobody. `outcome` is
+    /// written by mutations alone and superseded only by another one.
+    readonly property string decisionKind: runs.outcome !== undefined
+            && runs.outcome !== null
+        ? String(runs.outcome.kind || "") : ""
+    readonly property string decisionMessage: runs.outcome !== undefined
+            && runs.outcome !== null
+        ? String(runs.outcome.message || "") : ""
 
     /// The discriminant of the failure now on screen, empty when there is
     /// none. A refused decision is the whole reason this exists: the runtime is
@@ -225,6 +255,15 @@ Kirigami.Page {
             runs.loadApprovalInput(page.approvalId);
     }
 
+    /// Chooses one of the offered breadths, by index.
+    ///
+    /// The offscreen fixture drives this rather than reaching into the control,
+    /// because what it is checking is that what the page would send follows
+    /// what the reader picked.
+    function chooseScope(index) {
+        scopeChoice.currentIndex = index;
+    }
+
     /// Grants the request at the chosen breadth.
     ///
     /// One of exactly two call sites for `approve` on this page, and the other
@@ -233,22 +272,15 @@ Kirigami.Page {
     function approve() {
         if (!page.decidable)
             return;
-        page.beginDeciding();
+        page.deciding = true;
         runs.approve(page.approvalId, page.chosenScope, reasonField.text);
     }
 
     function deny() {
         if (!page.decidable)
             return;
-        page.beginDeciding();
-        runs.deny(page.approvalId, reasonField.text);
-    }
-
-    /// Clears the previous answer's outcome and marks a new one outstanding.
-    function beginDeciding() {
-        page.decisionKind = "";
-        page.decisionMessage = "";
         page.deciding = true;
+        runs.deny(page.approvalId, reasonField.text);
     }
 
     Component.onCompleted: {
@@ -269,18 +301,20 @@ Kirigami.Page {
 
     Connections {
         /// A decision is answered by the durable state it changed rather than
-        /// by the message it returned, so the page re-reads once it settles —
+        /// by the message it returned, so the page re-reads when one settles —
         /// which is also how a refusal ends up displayed beside a request that
-        /// is still pending. `deciding` is cleared first, so the re-read this
-        /// schedules cannot schedule another.
-        function onBusyChanged() {
-            if (runs.busy || !page.deciding)
-                return;
+        /// is still pending.
+        ///
+        /// Keyed on `outcome` and not on `busy`. `busy` says only that *some*
+        /// operation finished, so a load overlapping a decision would have this
+        /// page read the load's answer as the decision's; `outcome` is written
+        /// by a mutation and by nothing else.
+        function onOutcomeChanged() {
             page.deciding = false;
-            // Read off the bridge here and nowhere else: the reload on the next
-            // line takes the shared status with it.
-            page.decisionKind = String(runs.kind || "");
-            page.decisionMessage = String(runs.status || "");
+            // The question this input belonged to has been answered, and the
+            // bridge blanks `detail` with the decision — so the view closes
+            // rather than sitting open over nothing it can refill.
+            page.rawExpanded = false;
             page.reload();
         }
 
@@ -338,15 +372,13 @@ Kirigami.Page {
                         elide: Text.ElideRight
                         level: 3
                         // A tool identifier the runtime recorded.
-                        text: page.ready
-                            ? String(page.request.tool)
-                            : qsTr("Loading the request…")
+                        text: page.ready ? page.field("tool") : qsTr("Loading the request…")
                         textFormat: Text.PlainText
                     }
 
                     StatePill {
-                        pillColor: runState.riskColor(page.ready ? String(page.request.risk) : "")
-                        text: page.ready ? runState.riskLabel(String(page.request.risk)) : ""
+                        pillColor: runState.riskColor(page.field("risk"))
+                        text: page.ready ? runState.riskLabel(page.field("risk")) : ""
                     }
 
                     StatePill {
@@ -373,12 +405,12 @@ Kirigami.Page {
 
                     MetaField {
                         name: qsTr("Version")
-                        value: page.ready ? String(page.request.toolVersion) : ""
+                        value: page.field("toolVersion")
                     }
 
                     MetaField {
                         name: qsTr("Asked")
-                        value: page.ready ? runState.localTime(String(page.request.requested)) : ""
+                        value: runState.localTime(page.field("requested"))
                     }
 
                     MetaField {
@@ -410,7 +442,7 @@ Kirigami.Page {
                         font.family: "monospace"
                         font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                         // A filesystem path out of the approval's binding.
-                        text: page.ready ? String(page.request.workspace) : ""
+                        text: page.field("workspace")
                         textFormat: Text.PlainText
                     }
 
@@ -460,7 +492,10 @@ Kirigami.Page {
                     objectName: "approvalFailure"
                     text: runState.escapedRichText(page.failureMessage)
                     type: Kirigami.MessageType.Error
-                    visible: page.failureKind.length > 0
+                    // Hidden while a fresh decision is in flight: the outcome
+                    // still standing is the previous answer's, and leaving it
+                    // up would read as this one's.
+                    visible: page.failureKind.length > 0 && !page.deciding
                 }
 
                 Kirigami.InlineMessage {
@@ -503,7 +538,7 @@ Kirigami.Page {
                         objectName: "approvalSummary"
                         // The request's own summary, written by the tool layer
                         // when the call was classified.
-                        text: page.ready ? String(page.request.summary) : ""
+                        text: page.field("summary")
                         textFormat: Text.PlainText
                         visible: text.length > 0
                         wrapMode: Text.WordWrap
@@ -515,7 +550,7 @@ Kirigami.Page {
                         font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                         text: qsTr("This tool published no summary of its own. Read the input below before answering.")
                         textFormat: Text.PlainText
-                        visible: page.ready && String(page.request.summary).length === 0
+                        visible: page.ready && page.field("summary").length === 0
                         wrapMode: Text.WordWrap
                     }
 
@@ -525,13 +560,13 @@ Kirigami.Page {
 
                         MetaField {
                             name: qsTr("Capabilities")
-                            value: page.ready ? String(page.request.capabilities) : ""
+                            value: page.field("capabilities")
                         }
 
                         MetaField {
                             name: qsTr("Asked for")
                             value: page.ready && page.request.downgraded === true
-                                ? runState.scopeLabel(String(page.request.requestedScope))
+                                ? runState.scopeLabel(page.field("requestedScope"))
                                 : ""
                         }
 
@@ -563,17 +598,21 @@ Kirigami.Page {
                         }
 
                         Controls.Button {
+                            enabled: !page.deciding
                             objectName: "approvalRawToggle"
                             text: page.rawExpanded ? qsTr("Hide input") : qsTr("Show input")
                             onClicked: page.toggleRawInput()
                         }
                     }
 
+                    // Spinning while a read is actually outstanding, rather
+                    // than while the answer happens to be empty: an empty
+                    // answer is also what a blanked `detail` looks like.
                     Controls.BusyIndicator {
                         Layout.preferredHeight: Kirigami.Units.iconSizes.small
                         Layout.preferredWidth: Kirigami.Units.iconSizes.small
                         running: page.rawExpanded && page.input.length === 0
-                            && page.failureKind.length === 0
+                            && page.failureKind.length === 0 && runs.busy
                         visible: running
                     }
 
@@ -621,16 +660,18 @@ Kirigami.Page {
                         // between. A request the risk ceiling reduced to one
                         // call has exactly one answer, and a combo box holding
                         // it would imply a breadth that was never on offer.
+                        // `currentIndex` is deliberately left unbound; see
+                        // `chosenScope`. The narrowest breadth is index zero,
+                        // which is where a fresh model starts and where
+                        // `onScopeSignatureChanged` puts it back.
                         Controls.ComboBox {
                             id: scopeChoice
 
                             Layout.preferredWidth: Kirigami.Units.gridUnit * 18
-                            currentIndex: page.scopeIndex
                             model: page.grantableScopes.map(
                                 scope => runState.scopeLabel(String(scope)))
                             objectName: "approvalScopeChoice"
                             visible: page.scopeChoiceAllowed
-                            onActivated: index => page.scopeIndex = index
                         }
 
                         Controls.Label {
@@ -740,21 +781,19 @@ Kirigami.Page {
 
                         MetaField {
                             name: qsTr("Covering")
-                            value: page.ready && page.requestState === "granted"
-                                ? runState.scopeLabel(String(page.request.scope)) : ""
+                            value: page.requestState === "granted"
+                                ? runState.scopeLabel(page.field("scope")) : ""
                         }
 
                         MetaField {
                             name: qsTr("Given")
-                            value: page.ready
-                                ? runState.decidedViaLabel(String(page.request.decidedVia || ""))
-                                : ""
+                            value: page.field("decidedVia").length > 0
+                                ? runState.decidedViaLabel(page.field("decidedVia")) : ""
                         }
 
                         MetaField {
                             name: qsTr("At")
-                            value: page.ready
-                                ? runState.localTime(String(page.request.decidedAt || "")) : ""
+                            value: runState.localTime(page.field("decidedAt"))
                         }
 
                         Item {
@@ -767,7 +806,7 @@ Kirigami.Page {
                         color: runState.bodyColor
                         objectName: "approvalRecordedReason"
                         // A reason a person typed when they answered.
-                        text: page.ready ? String(page.request.reason || "") : ""
+                        text: page.field("reason")
                         textFormat: Text.PlainText
                         visible: text.length > 0
                         wrapMode: Text.WordWrap

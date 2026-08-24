@@ -103,12 +103,20 @@ pub mod ffi {
         /// the newest operation's user-facing message, and `kind` its stable
         /// discriminant (empty on success).
         ///
-        /// The other three properties are answers rather than status: `detail`
+        /// The other four properties are answers rather than status: `detail`
         /// is the last approval input `loadApprovalInput` fetched, `run` the
-        /// last run `loadRun` projected, and `excerpt` the last artifact
-        /// rendering `loadArtifactExcerpt` produced. Each is written only by
-        /// the loader that answers it, so cancelling the run a page is showing
-        /// does not blank the page.
+        /// last run `loadRun` projected, `excerpt` the last artifact rendering
+        /// `loadArtifactExcerpt` produced, and `outcome` how the last
+        /// *mutation* went. Each is written only by the operation that answers
+        /// it, so cancelling the run a page is showing does not blank the page.
+        ///
+        /// `outcome` exists because `busy` cannot answer for one operation. It
+        /// is a count across every operation this bridge has outstanding, so a
+        /// surface that waited for it to fall and then read `status` would read
+        /// whichever operation happened to settle last — and a load overlapping
+        /// a refused decision would make the refusal read as a success. A
+        /// mutation's own `{kind, message}` lands here and is superseded only
+        /// by another mutation.
         #[qobject]
         #[qml_element]
         #[qproperty(bool, busy)]
@@ -117,6 +125,7 @@ pub mod ffi {
         #[qproperty(QVariant, detail)]
         #[qproperty(QVariant, run)]
         #[qproperty(QVariant, excerpt)]
+        #[qproperty(QVariant, outcome)]
         type RunsBackend = super::RunsBackendRust;
 
         /// Stops a run: its queued calls, its executing tool, and any approval
@@ -184,7 +193,7 @@ pub mod ffi {
     impl cxx_qt::Threading for RunsBackend {}
 }
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -202,13 +211,15 @@ use harkness_runtime::approval::{
     ApprovalDecision, ApprovalId, ApprovalRequest, ApprovalScope, ApprovalState, DecidedVia,
 };
 use harkness_runtime::coordinator::{RunCoordinator, RuntimeError};
-use harkness_runtime::domain::{ArtifactId, ExecutionState, Run, RunId, ToolCall, ToolCallState};
+use harkness_runtime::domain::{
+    ArtifactId, ExecutionState, Run, RunId, ToolCall, ToolCallId, ToolCallState,
+};
 use harkness_runtime::store::{Artifact, Availability, EventPage, PassThrough, Store, StoreError};
 use harkness_runtime::tool::WorkspaceMetadata;
 
 use super::approval_model::ApprovalRow;
 use super::run_list_model::{RunRow, run_row};
-use super::run_timeline_model::{TOOL_PROGRESS_KIND, summarize};
+use super::run_timeline_model::{TOOL_PROGRESS_KIND, progress_line};
 
 /// Largest approval input this bridge hands to QML.
 ///
@@ -563,15 +574,15 @@ fn grant_scope(requested: &str, effective: ApprovalScope) -> Result<ApprovalScop
     })
 }
 
-/// Which of the bridge's three answer properties an operation may write.
+/// Which of the bridge's four answer properties an operation may write.
 ///
 /// `detail`, `run` and `excerpt` answer three different questions about three
 /// different identifiers, and an operation must never blank the answer to a
 /// question it was not asked: cancelling the run a detail page is showing would
 /// otherwise empty the page it was pressed from.
 ///
-/// A decision is the one case that writes an answer it did not produce. It
-/// clears `detail`, because approving or denying changes *which* approval is in
+/// A decision writes `outcome` — how it went — and additionally clears
+/// `detail`, because approving or denying changes *which* approval is in
 /// question and leaving the previous one's validated input bound is the worst
 /// way for that property to be wrong. It does not clear `run` or `excerpt`,
 /// which are about the run the decision was made on.
@@ -586,7 +597,8 @@ fn grant_scope(requested: &str, effective: ApprovalScope) -> Result<ApprovalScop
 /// are one shared pair, stay keyed on the newest operation of any kind.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Answer {
-    /// A mutation: writes no answer of its own and clears `detail`.
+    /// A mutation — cancel, retry, approve, deny — which writes `outcome` and
+    /// clears `detail`.
     Decision,
     /// `loadApprovalInput`, which writes `detail`.
     ApprovalInput,
@@ -598,18 +610,22 @@ pub(crate) enum Answer {
 
 /// How many answer properties an operation's staleness is tracked against.
 ///
-/// Three, not four: `Decision` and `ApprovalInput` both write `detail`, so they
-/// supersede one another and share a slot.
-const ANSWER_SLOTS: usize = 3;
+/// One per answer, `Decision` included. A decision shares no watermark with a
+/// load even though it blanks `detail` on the way past: the two are different
+/// questions, and counting them together meant a load issued after a decision
+/// suppressed that decision's own reply — which is how a refusal reached
+/// nobody.
+const ANSWER_SLOTS: usize = 4;
 
 impl Answer {
     /// Which answer property this operation writes, as an index into
     /// [`RunsBackendRust::newest`].
     fn slot(self) -> usize {
         match self {
-            Self::Decision | Self::ApprovalInput => 0,
+            Self::ApprovalInput => 0,
             Self::RunDetail => 1,
             Self::ArtifactExcerpt => 2,
+            Self::Decision => 3,
         }
     }
 }
@@ -777,13 +793,14 @@ pub(crate) struct CallRow {
     verdict: String,
     reason: String,
     source: String,
-    /// Newest progress line this call reported, for a call that has not
-    /// finished; empty for every other call.
+    /// Newest progress this call reported, for a call that is executing;
+    /// empty for every other call.
     ///
-    /// Only a call still in flight has a "latest" worth a row of its own. A
+    /// Only a call that is *running* has a "latest" worth a row of its own. A
     /// finished call's progress is history, and history is the timeline's
-    /// subject rather than a line that would sit under a terminal state pill
-    /// claiming to be current.
+    /// subject rather than a line sitting under a terminal state pill claiming
+    /// to be current; a call that is queued or parked on an approval has not
+    /// started and cannot have reported anything.
     progress: String,
 }
 
@@ -901,7 +918,7 @@ fn step_row(step: &harkness_runtime::domain::Step) -> StepRow {
 /// `loadApprovalInput` fetches for the one call a question is being asked about,
 /// and its output may be the whole of a tool's result; carrying either for every
 /// call of a run would put megabytes behind a header.
-fn call_row(call: &ToolCall, progress: &HashMap<String, String>) -> CallRow {
+fn call_row(call: &ToolCall, progress: &HashMap<ToolCallId, String>) -> CallRow {
     CallRow {
         tool_call_id: call.id().to_string(),
         step_id: call.step_id().to_string(),
@@ -932,28 +949,27 @@ fn call_row(call: &ToolCall, progress: &HashMap<String, String>) -> CallRow {
             .policy_decision()
             .map(|decision| decision.source().as_str().to_owned())
             .unwrap_or_default(),
-        progress: progress
-            .get(&call.id().to_string())
-            .cloned()
-            .unwrap_or_default(),
+        progress: progress.get(&call.id()).cloned().unwrap_or_default(),
     }
 }
 
-/// The newest progress line each unfinished call of `run` reported.
+/// The newest progress each *executing* call of `run` reported.
 ///
-/// Empty — and, more to the point, free — when every call has finished, which
-/// is what a page of run history is looking at. Only then is one bounded page
-/// of the log read, newest first, so the first tick naming a call is that
-/// call's latest.
+/// Empty — and, more to the point, free — unless something is actually running,
+/// which is what makes a page of history, a queued run, and a run parked on an
+/// approval all cost nothing here. A `tool_progress` event exists only for a
+/// call that reached `running`, so widening this to every non-terminal state
+/// would buy a bounded scan whose answer is always empty on exactly the page a
+/// reader leaves open longest.
 fn latest_progress(
     store: &Store,
     run: RunId,
     calls: &[ToolCall],
-) -> Result<HashMap<String, String>, RunsFailure> {
-    let mut wanted: HashMap<String, ()> = calls
+) -> Result<HashMap<ToolCallId, String>, RunsFailure> {
+    let mut wanted: HashSet<ToolCallId> = calls
         .iter()
-        .filter(|call| !call.state().is_terminal())
-        .map(|call| (call.id().to_string(), ()))
+        .filter(|call| call.state() == ToolCallState::Running)
+        .map(ToolCall::id)
         .collect();
     let mut newest = HashMap::new();
     if wanted.is_empty() {
@@ -967,11 +983,10 @@ fn latest_progress(
         let Some(call) = stored.event.tool_call_id() else {
             continue;
         };
-        let call = call.to_string();
         // The page is newest first, so the first tick naming a call is the one
         // the row shows; the rest of that call's ticks are the timeline's.
-        if wanted.remove(&call).is_some() {
-            newest.insert(call, summarize(stored.event.payload()));
+        if wanted.remove(&call) {
+            newest.insert(call, progress_line(stored.event.payload()));
             if wanted.is_empty() {
                 break;
             }
@@ -1324,6 +1339,7 @@ pub struct RunsBackendRust {
     detail: QVariant,
     run: QVariant,
     excerpt: QVariant,
+    outcome: QVariant,
     /// Monotonic operation number; only the newest reply writes a message.
     next_request: u64,
     /// The newest operation number issued against each answer property, indexed
@@ -1343,6 +1359,7 @@ impl Default for RunsBackendRust {
             detail: QVariant::default(),
             run: QVariant::default(),
             excerpt: QVariant::default(),
+            outcome: QVariant::default(),
             next_request: 0,
             newest: [0; ANSWER_SLOTS],
             pending: 0,
@@ -1551,7 +1568,26 @@ fn settle(
             Err(_) => &Answered::Nothing,
         };
         match answer {
-            Answer::Decision | Answer::ApprovalInput => {
+            Answer::Decision => {
+                // How the mutation went, on a property nothing but a mutation
+                // writes. A surface reads its own decision's answer here rather
+                // than inferring one from `busy` and the shared status, which
+                // report on whichever operation settled last.
+                let mut carried = QMap::<QMapPair_QString_QVariant>::default();
+                match &outcome {
+                    Ok(completion) => {
+                        text(&mut carried, "kind", "");
+                        text(&mut carried, "message", &completion.message);
+                    }
+                    Err(failure) => {
+                        text(&mut carried, "kind", &failure.kind);
+                        text(&mut carried, "message", &failure.message);
+                    }
+                }
+                backend.as_mut().set_outcome(QVariant::from(&carried));
+                backend.as_mut().set_detail(QVariant::default());
+            }
+            Answer::ApprovalInput => {
                 let detail = match answered {
                     Answered::ApprovalInput(input) => approval_detail(input),
                     _ => QVariant::default(),
@@ -1742,7 +1778,9 @@ mod tests {
         ExecutionState, Failure, Run, RunId, Step, Task, TaskId, ToolCall, ToolCallState,
     };
     use harkness_runtime::store::{EventKind, Store, StoreError};
+    use harkness_runtime::tool::{ProgressEvent, ProgressUnit};
 
+    use super::progress_line;
     use super::{
         Answer, Answered, BRIDGE_KINDS, MAX_APPROVAL_INPUT_BYTES, MAX_ARTIFACT_EXCERPT_BYTES,
         MAX_PROGRESS_SCAN_EVENTS, MAX_RUN_DETAIL_ROWS, RunDetail, RunsFailure, artifact_excerpt_in,
@@ -1828,25 +1866,27 @@ mod tests {
     // -- what a settling reply may write -----------------------------------
 
     #[test]
-    fn a_decision_and_an_approval_input_share_the_property_they_both_write() {
-        assert_eq!(Answer::Decision.slot(), Answer::ApprovalInput.slot());
+    fn a_decision_is_counted_apart_from_the_load_it_blanks() {
+        assert_ne!(
+            Answer::Decision.slot(),
+            Answer::ApprovalInput.slot(),
+            "a load issued after a decision would otherwise suppress that \
+             decision's own reply, which is how a refusal reaches nobody"
+        );
     }
 
     #[test]
-    fn the_three_answer_properties_are_counted_apart() {
+    fn the_four_answer_properties_are_counted_apart() {
         let slots = [
             Answer::ApprovalInput.slot(),
             Answer::RunDetail.slot(),
             Answer::ArtifactExcerpt.slot(),
+            Answer::Decision.slot(),
         ];
 
         let distinct: std::collections::HashSet<usize> = slots.into_iter().collect();
 
-        assert_eq!(
-            distinct.len(),
-            3,
-            "{slots:?} does not name three properties"
-        );
+        assert_eq!(distinct.len(), 4, "{slots:?} does not name four properties");
         assert!(
             slots.iter().all(|slot| *slot < super::ANSWER_SLOTS),
             "{slots:?} indexes past the watermarks"
@@ -2120,6 +2160,8 @@ mod tests {
         (step, call)
     }
 
+    /// Appends one `ProgressEvent::Message` per line, in the wire shape the
+    /// executor actually writes rather than a payload invented here.
     fn progress_events(store: &Store, run: RunId, step: &Step, call: &ToolCall, lines: &[&str]) {
         store
             .append_events(
@@ -2128,7 +2170,7 @@ mod tests {
                     harkness_runtime::store::RunEvent::new(EventKind::ToolProgress, at(5))
                         .for_step(step.id())
                         .for_tool_call(call.id())
-                        .with_payload(json!({"line": line}))
+                        .with_payload(serde_json::to_value(ProgressEvent::message(*line)).unwrap())
                 }),
             )
             .unwrap();
@@ -2151,7 +2193,59 @@ mod tests {
         let detail = detail(&data_dir, run);
 
         assert_eq!(detail.calls.len(), 1);
-        assert_eq!(detail.calls[0].progress, "line=compiling harkness-gui");
+        assert_eq!(
+            detail.calls[0].progress, "compiling harkness-gui",
+            "a message is rendered as its text rather than as its wire fields"
+        );
+    }
+
+    #[test]
+    fn each_progress_shape_is_rendered_as_the_thing_it_names() {
+        let render = |event: ProgressEvent| progress_line(&serde_json::to_value(event).unwrap());
+
+        assert_eq!(render(ProgressEvent::message("compiling")), "compiling");
+        assert_eq!(render(ProgressEvent::stage("linking")), "linking");
+        assert_eq!(
+            render(ProgressEvent::counted(3, 10, ProgressUnit::Files)),
+            "3/10 files"
+        );
+    }
+
+    #[test]
+    fn a_progress_shape_this_build_does_not_define_is_still_shown() {
+        assert_eq!(
+            progress_line(&json!({"event": "from_a_later_build", "detail": "something"})),
+            "detail=something event=from_a_later_build",
+            "a newer build's shape is rendered opaquely rather than dropped"
+        );
+    }
+
+    #[test]
+    fn a_call_parked_on_an_approval_reports_no_progress_and_reads_no_events() {
+        let (_fixture, data_dir, store, task) = seeded();
+        let run = recorded_run(&store, &task, ExecutionState::Running, 10);
+        let step = Step::new(run, 0, "run the check", at(1));
+        store.insert_step(&step).unwrap();
+        let call = ToolCall::new(
+            &step,
+            "process.exec",
+            "1.0.0",
+            json!({"argv": ["x"]}),
+            at(2),
+        );
+        store.insert_tool_call(&call).unwrap();
+        store
+            .transition_tool_call(call.id(), ToolCallState::AwaitingApproval, at(3))
+            .unwrap();
+        drop(store);
+
+        let detail = detail(&data_dir, run);
+
+        assert_eq!(
+            detail.calls[0].progress, "",
+            "a call that never started cannot have reported anything, and the \
+             page a reader leaves open longest must not pay for a scan to learn it"
+        );
     }
 
     #[test]

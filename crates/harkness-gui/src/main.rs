@@ -111,13 +111,17 @@ pub(crate) mod tests {
             ExecutionState, Failure, Run, RunId, Step, Task, TaskId, ToolCall, ToolCallState,
         };
         use harkness_runtime::store::{EventKind, RunEvent, Store};
-        use harkness_runtime::tool::{Capability, RiskLevel, ToolIdentity};
+        use harkness_runtime::tool::{Capability, ProgressEvent, RiskLevel, ToolIdentity};
         use serde_json::json;
         use std::io::Write as _;
         use time::OffsetDateTime;
 
         let at =
             |seconds: i64| OffsetDateTime::from_unix_timestamp(1_755_000_000 + seconds).unwrap();
+        // The wire shape the executor writes, rather than one invented here: a
+        // surface that renders progress has to be held to the payload it will
+        // actually be handed.
+        let progress = |event: ProgressEvent| serde_json::to_value(event).unwrap();
         let store = Store::open(data_dir).unwrap();
         let task = Task::with_id(
             TaskId::new(),
@@ -214,7 +218,7 @@ pub(crate) mod tests {
                     RunEvent::new(EventKind::ToolProgress, at(8))
                         .for_step(step.id())
                         .for_tool_call(exec.id())
-                        .with_payload(json!({"line": "compiling harkness-gui"})),
+                        .with_payload(progress(ProgressEvent::message("compiling harkness-gui"))),
                     RunEvent::new(EventKind::ArtifactCreated, at(10))
                         .for_step(step.id())
                         .for_tool_call(exec.id())
@@ -367,7 +371,9 @@ pub(crate) mod tests {
                     RunEvent::new(EventKind::ToolProgress, at(45))
                         .for_step(running_step.id())
                         .for_tool_call(running_call.id())
-                        .with_payload(json!({"line": format!("Compiling harkness-crate-{index}")}))
+                        .with_payload(progress(ProgressEvent::message(format!(
+                            "Compiling harkness-crate-{index}"
+                        ))))
                 }),
             )
             .unwrap();
@@ -420,7 +426,9 @@ pub(crate) mod tests {
                     RunEvent::new(EventKind::ToolProgress, at(63))
                         .for_step(progress_step.id())
                         .for_tool_call(progress_call.id())
-                        .with_payload(json!({"line": format!("compiling crate {index}")}))
+                        .with_payload(progress(ProgressEvent::message(format!(
+                            "compiling crate {index}"
+                        ))))
                 }),
             )
             .unwrap();
@@ -734,6 +742,7 @@ Kirigami.ApplicationWindow {
     property real cancelResponse: -1
     property bool approvalPressed: false
     property bool denyIssued: false
+    property int scopePolls: 0
 
     readonly property int wideWidth: 1180
     /// Narrower than the two halves of the detail page's body can both be, so
@@ -1053,6 +1062,15 @@ Kirigami.ApplicationWindow {
             check("reviewingFromTheQueueOpensThatRequest",
                   window.approvalPage !== null
                   && window.approvalPage.approvalId === String(queued.request.approvalId));
+            // A seed is whatever the surface that opened the page already had.
+            // `String(undefined)` is the five-character word "undefined", which
+            // a MetaField would show as happily as a real value.
+            check("aSeededHeaderNamesNoFieldItDoesNotHave",
+                  window.approvalPage.field("aFieldNoRecordCarries") === "");
+            check("aSeededHeaderShowsNoUndefinedValues",
+                  window.approvalPage.field("toolVersion") !== "undefined"
+                  && window.approvalPage.field("workspace") !== "undefined"
+                  && window.approvalPage.field("requested") !== "undefined");
             window.closeApproval();
             check("theLauncherPaneReportsNoFailure", launcherPane.loadErrorKind.length === 0);
             // The side-panel contract, which the activity bar reads off the
@@ -1389,11 +1407,22 @@ Kirigami.ApplicationWindow {
             // widening nor the leaving may reach the store.
             const approval = window.approvalPage;
             if (!scopeWidened) {
-                approval.scopeIndex = 1;
+                approval.chooseScope(1);
                 scopeWidened = true;
+                // This page re-reads its run constantly, and each read builds a
+                // fresh array of the same breadths. A choice that a re-read
+                // narrowed underneath the reader, while the control went on
+                // showing the wider one, is the failure being watched for, so
+                // the check below is made on every tick rather than once.
+                approval.reload();
                 return;
             }
             check("choosingTheWiderBreadthIsWhatWouldBeSent",
+                  approval.chosenScope === "capability_for_run");
+            scopePolls += 1;
+            if (scopePolls < 10)
+                return;
+            check("aReReadDoesNotNarrowTheBreadthTheReaderChose",
                   approval.chosenScope === "capability_for_run");
             window.closeApproval();
             check("leavingTheReviewSurfaceDestroysIt", window.approvalPage === null);
@@ -1618,6 +1647,13 @@ Kirigami.ApplicationWindow {
             if (!approvalPressed) {
                 approvalPressed = true;
                 approval.approve();
+                // A second operation, issued while the decision is still in
+                // flight and settling after it. This is what `outcome` exists
+                // for: a page reading its answer from `busy` and the shared
+                // status reads *this* load's success as the decision's, and the
+                // refusal reaches nobody. The page re-reads its own run on the
+                // way out of a decision too, so the overlap is not hypothetical.
+                approval.toggleRawInput();
                 return;
             }
             if (approval.deciding || !approval.runReady)
@@ -1625,6 +1661,9 @@ Kirigami.ApplicationWindow {
             check("aDecisionTheRuntimeRefusesIsReportedRatherThanPretended",
                   approval.failureKind.length > 0
                   && approval.failureMessage.length > 0);
+            check("aLoadOverlappingADecisionDoesNotAnswerForIt",
+                  approval.failureKind === approval.decisionKind
+                  && approval.decisionKind.length > 0);
             check("theRefusalKeepsTheDiscriminantTheRuntimePublished",
                   approval.failureKind === "approval_not_active"
                   || approval.failureKind === "approval_refused");

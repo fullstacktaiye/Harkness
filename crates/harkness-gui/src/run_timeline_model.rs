@@ -379,16 +379,48 @@ pub(crate) fn summarize(payload: &Value) -> String {
     clamp(&line, MAX_TIMELINE_SUMMARY_BYTES)
 }
 
+/// One `tool_progress` payload as a surface shows it.
+///
+/// `ProgressEvent` names its three shapes precisely so that a consumer does not
+/// have to parse English out of them, and this is the consumer that takes it up
+/// on the offer: a message is its text, a stage is its name, and counted
+/// progress is its counts. Rendering one through [`summarize`] instead would
+/// put the wire field names in front of a reader — `event=message text=...` —
+/// which is the debug spelling of a line rather than the line.
+///
+/// A payload this build does not recognize falls through to [`summarize`]
+/// rather than being dropped, for the reason every other unknown spelling here
+/// does: `ProgressEvent` is the runtime's type and a newer build may add a
+/// shape to it.
+pub(crate) fn progress_line(payload: &Value) -> String {
+    let field = |name: &str| payload.get(name).and_then(Value::as_str);
+    match payload.get("event").and_then(Value::as_str) {
+        Some("message") => field("text").unwrap_or_default().to_owned(),
+        Some("stage") => field("name").unwrap_or_default().to_owned(),
+        Some("counted") => {
+            let count = |name: &str| payload.get(name).and_then(Value::as_u64);
+            let unit = field("unit").unwrap_or("items");
+            match (count("completed"), count("total")) {
+                (Some(done), Some(total)) => format!("{done}/{total} {unit}"),
+                (Some(done), None) => format!("{done} {unit}"),
+                _ => summarize(payload),
+            }
+        }
+        _ => summarize(payload),
+    }
+}
+
 /// Projects one stored event into a row.
 ///
 /// The payload becomes a summary and is then dropped: a row must not carry the
 /// 64 KiB an event payload may hold, and `loadDetail` is how a reader asks for
 /// one of them back.
 pub(crate) fn event_row(seq: u64, event: &RunEvent) -> TimelineRow {
+    let progress = event.kind().as_str() == TOOL_PROGRESS_KIND;
     TimelineRow {
         seq,
         first_seq: seq,
-        progress_count: u32::from(event.kind().as_str() == TOOL_PROGRESS_KIND),
+        progress_count: u32::from(progress),
         kind: event.kind().as_str().to_owned(),
         recognized: event.kind().is_recognized(),
         at: rfc3339(event.at()),
@@ -401,7 +433,13 @@ pub(crate) fn event_row(seq: u64, event: &RunEvent) -> TimelineRow {
             .artifact_id()
             .map(|id| id.to_string())
             .unwrap_or_default(),
-        summary: summarize(event.payload()),
+        // A progress event is rendered as the thing it names; every other
+        // kind has no shape this build knows, so its payload is summarized.
+        summary: if progress {
+            progress_line(event.payload())
+        } else {
+            summarize(event.payload())
+        },
         outcome: outcome(event.payload()),
         has_detail: !event.payload().is_null(),
         detail: String::new(),

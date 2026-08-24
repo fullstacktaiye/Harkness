@@ -779,15 +779,27 @@ impl ApprovalRequest {
         self.effective_scope != self.pending.requested_scope
     }
 
-    /// Every breadth a decision on this request may actually be granted with,
+    /// At what breadths a decision on this request would be accepted,
     /// narrowest first.
     ///
-    /// [`decide`](Self::decide) accepts exactly two answers: the stored
+    /// [`decide`](Self::decide) accepts exactly two scopes: the stored
     /// effective scope, and [`ExactCall`](ApprovalScope::ExactCall), which a
     /// human may always narrow to. This is that rule expressed as a list rather
     /// than a second copy of it, so a surface that offers these and nothing
     /// else cannot ask for a breadth the record would refuse — and the test
     /// below holds the two to each other in both directions.
+    ///
+    /// # It answers *at what breadth*, never *whether*
+    ///
+    /// [`decide`](Self::decide) refuses a request that is no longer
+    /// [`Pending`](ApprovalState::Pending) and one whose
+    /// [`expires_at`](Self::expires_at) has passed, and it refuses both
+    /// *before* it looks at the scope at all. Those two are the caller's to
+    /// check — [`state`](Self::state) and [`is_expired`](Self::is_expired) —
+    /// and this list is unchanged by either, because the matcher and everything
+    /// beside it read no clock. A caller that offered these as *permission*
+    /// rather than as the shape of one would be offering to grant a question
+    /// that is already over.
     ///
     /// It is a *read* and decides nothing. A request whose ceiling already
     /// reduced it to one call yields a single entry, which is what a
@@ -1272,6 +1284,52 @@ pub(super) mod tests {
                      to default to the single call in front of the reader"
                 );
                 assert!(grantable.len() <= 2, "{grantable:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_breadths_are_the_shape_of_an_answer_and_never_a_permission_to_give_one() {
+        // The two refusals `decide` reaches before it looks at a scope at all.
+        // Neither moves this list, which is exactly why a caller owes the state
+        // and the deadline their own check.
+        let mut resolved = request(RiskLevel::Execute, ApprovalScope::ToolForRun);
+        resolved
+            .decide(ApprovalDecision::deny(
+                resolved.id(),
+                DecidedVia::Gui,
+                at(1),
+            ))
+            .unwrap();
+        let lapsed = ApprovalRequest::open(
+            pending(RiskLevel::Execute)
+                .requesting(ApprovalScope::ToolForRun)
+                .expiring_at(at(1)),
+        )
+        .unwrap();
+
+        for (name, record) in [("resolved", &resolved), ("lapsed", &lapsed)] {
+            let grantable = record.grantable_scopes();
+            assert_eq!(
+                grantable,
+                vec![ApprovalScope::ExactCall, ApprovalScope::ToolForRun],
+                "{name}: the offered breadths are a property of the record's scope"
+            );
+            for scope in grantable {
+                let mut candidate = record.clone();
+                assert!(
+                    candidate
+                        .decide(ApprovalDecision::grant(
+                            candidate.id(),
+                            scope,
+                            DecidedVia::Gui,
+                            at(2),
+                        ))
+                        .is_err(),
+                    "{name}: {scope} must still be refused, so a surface that \
+                     treated this list as permission would be granting a \
+                     question that is over"
+                );
             }
         }
     }

@@ -357,12 +357,16 @@ and every new bridge file — must be added to `build.rs`'s lists.
   second lease and leave every run the checks panel started uncancellable. The three models drive
   their own reads: cxx-qt gives one bridge object no handle to another, so a model created in QML
   is not reachable from `RunsBackend`'s Rust.
-- **`RunsBackend::settle` writes `busy` last.** Qt emits `busyChanged` from inside the setter, so
-  a surface reacting to an operation finishing runs *during* `settle`; the shared `status`/`kind`
-  pair and the answer property are therefore both in place before `busy` moves. `ApprovalPage`
-  depends on it: it captures the outcome of the decision it issued in `onBusyChanged` and then
-  schedules the re-read that explains it, and reading a stale `kind` there would report a refusal
-  as a success.
+- **`RunsBackend::settle` writes `busy` last, and a mutation answers on `outcome`.** Qt emits
+  `busyChanged` from inside the setter, so a surface reacting to an operation finishing runs
+  *during* `settle`; the shared `status`/`kind` pair and the answer property are therefore both in
+  place before `busy` moves. That ordering is necessary and not sufficient: `busy` is a *count* of
+  everything outstanding, so it says only that some operation finished. A mutation's own
+  `{kind, message}` therefore lands on `outcome`, which nothing but a mutation writes and only
+  another mutation supersedes, and which is counted in its own watermark slot so a later load
+  cannot suppress a decision's reply. `ApprovalPage` and `RunDetailPage` both key on
+  `onOutcomeChanged`; keying on `busy` let a load overlapping a refused decision report it as a
+  success, and left "Cancelling…" on screen after the request it described had been answered.
 - **A read takes the store; driving work takes the coordinator.** `read_store` never creates
   `runtime.db` and never builds a coordinator, because building one takes the lease and runs the
   recovery sweep — writes, on a path a user reached by opening a panel to look at something. A

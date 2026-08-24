@@ -232,10 +232,26 @@ Kirigami.Page {
     /// this banner — is about the banner rather than about the two properties
     /// its condition is built from, and the offscreen tests assert it directly.
     readonly property alias approvalBannerVisible: approvalBanner.visible
-    /// The discriminant of the last failure the bridge reported, empty on
-    /// success. Exposed for the same reason the two views below are: whether a
-    /// refused mutation reaches the reader is a property of this page.
-    readonly property string failureKind: String(runs.kind || "")
+    /// How the last mutation this page issued went, or nothing when it has
+    /// issued none. Read off `outcome`, which a load cannot overwrite.
+    readonly property string mutationKind: runs.outcome !== undefined
+            && runs.outcome !== null
+        ? String(runs.outcome.kind || "") : ""
+    readonly property string mutationMessage: runs.outcome !== undefined
+            && runs.outcome !== null
+        ? String(runs.outcome.message || "") : ""
+
+    /// The discriminant of the failure now on screen, empty on success.
+    /// Exposed for the same reason the two views below are: whether a refused
+    /// mutation reaches the reader is a property of this page.
+    ///
+    /// A refused mutation wins over the shared status, because this page
+    /// re-reads the run the moment one settles — and that read, succeeding,
+    /// would clear the very `kind` the reader has to see.
+    readonly property string failureKind: page.mutationKind.length > 0
+        ? page.mutationKind : String(runs.kind || "")
+    readonly property string failureMessage: page.mutationKind.length > 0
+        ? page.mutationMessage : String(runs.status || "")
     /// The timeline's view, exposed for the same reason: whether a
     /// thousand-event run creates delegates only for its visible region is a
     /// property of this view and of nothing the model can be asked.
@@ -292,9 +308,10 @@ Kirigami.Page {
 
     /// Stops the run, and re-reads it once the request has been answered.
     ///
-    /// The token is flipped inside `cancelRun` before its worker is spawned, so
-    /// the visible state below changes on this turn of the event loop rather
-    /// than when the store has been written.
+    /// `cancelling` is set here, before the invokable is called, and that is
+    /// what makes the control change on this turn of the event loop:
+    /// `cancelRun` does its work on a worker, so at the moment the press
+    /// returns the coordinator has not been reached and the token has not moved.
     function cancel() {
         page.mutating = true;
         page.cancelling = true;
@@ -335,21 +352,21 @@ Kirigami.Page {
         page.select();
     }
 
-    /// Coalesces the header re-reads a live run's events would otherwise ask
-    /// for. A tool reporting a hundred progress lines must cost one store read,
-    /// not a hundred; the delay is long enough to absorb a burst and short
-    /// enough that a state change lands while the reader is still looking.
-    /// One reading of the clock per second, shared by the banner below and by
-    /// nothing else on this page. Stopped for a finished run, whose timestamps
-    /// are as far in the past as they are ever going to be.
+    /// One reading of the clock per second, read by the approval banner and by
+    /// nothing else on this page — so it runs exactly while that banner is on
+    /// screen. A run with no question outstanding has nothing here that ages.
     Timer {
         interval: 1000
         repeat: true
-        running: page.ready && runState.pending(page.runStateValue)
+        running: page.approvalBannerVisible
         triggeredOnStart: true
         onTriggered: page.now = Date.now()
     }
 
+    /// Coalesces the header re-reads a live run's events would otherwise ask
+    /// for. A tool reporting a hundred progress lines must cost one store read,
+    /// not a hundred; the delay is long enough to absorb a burst and short
+    /// enough that a state change lands while the reader is still looking.
     Timer {
         id: headerReload
 
@@ -360,12 +377,15 @@ Kirigami.Page {
 
     Connections {
         /// A mutation is answered by the durable state it changed rather than
-        /// by the message it returned, so the page re-reads once every
-        /// operation it has outstanding has settled. `mutating` is cleared
-        /// first, so the re-read this schedules cannot schedule another.
-        function onBusyChanged() {
-            if (runs.busy || !page.mutating)
-                return;
+        /// by the message it returned, so the page re-reads when one settles.
+        ///
+        /// Keyed on `outcome`, which a mutation writes and nothing else does.
+        /// `busy` counts every operation this bridge has outstanding, and this
+        /// page always has another one in flight — `headerReload` re-reads the
+        /// run on a debounce for as long as a live run appends events — so
+        /// waiting for `busy` to fall left "Cancelling…" on screen after the
+        /// request it describes had already been answered.
+        function onOutcomeChanged() {
             page.mutating = false;
             page.cancelling = false;
             page.reload();
@@ -482,13 +502,16 @@ Kirigami.Page {
                         }
                     }
 
-                    // The 250 ms affordance. `cancelRun` flips this process's
-                    // token on the Qt thread before the worker that persists
-                    // anything is spawned, so `cancelling` is true on the same
-                    // turn as the press and this control has already changed by
-                    // the time the frame it was pressed on is drawn. What takes
-                    // longer is the *run* stopping, which is the tool's
-                    // cooperation and not this window's to promise.
+                    // The 250 ms affordance, and it is this binding that
+                    // provides it. `cancelRun` reaches the coordinator on a
+                    // worker — opening the store is a blocking call the Qt
+                    // thread may not make — so nothing about the request has
+                    // happened yet when the press returns. What has happened is
+                    // `page.cancelling`, set on the Qt thread inside `cancel()`
+                    // before the invokable is even called, so this control has
+                    // already changed by the time the frame it was pressed on
+                    // is drawn. The *run* stopping takes as long as the tool's
+                    // cooperation takes, which is not this window's to promise.
                     Controls.Button {
                         id: cancelButton
 
@@ -632,9 +655,9 @@ Kirigami.Page {
             Layout.fillWidth: true
             Layout.margins: Kirigami.Units.smallSpacing
             // The bridge's own message, which may quote a workspace path.
-            text: runState.escapedRichText(String(runs.status || ""))
+            text: runState.escapedRichText(page.failureMessage)
             type: Kirigami.MessageType.Error
-            visible: String(runs.kind || "").length > 0
+            visible: page.failureKind.length > 0
         }
 
         Kirigami.InlineMessage {

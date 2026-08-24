@@ -450,7 +450,7 @@ for a decision shows a banner naming the request and its risk; an interrupted
 run names the tool call that was in flight when the process stopped. Cancel
 appears while a run can still be stopped and changes what it says the moment it
 is pressed, on the run's own header and on the tool call that is holding the run
-up, which also shows the newest line that tool reported. Retry appears only when
+up, which also shows what that tool last reported. Retry appears only when
 the runtime's own durable state says a fresh attempt is allowed — with the
 reason spelled out when it is not. Everything a tool, an agent, or the
 repository wrote is rendered as inert plain text, and an artifact is only ever

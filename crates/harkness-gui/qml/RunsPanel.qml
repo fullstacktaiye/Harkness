@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls as Controls
 import QtQuick.Layouts
+import QtQuick.Window
 import org.kde.kirigami as Kirigami
 import io.github.fullstacktaiye.harkness
 
@@ -125,12 +126,34 @@ Item {
     /// whichever worker parked on it, and this view pages the store rather than
     /// subscribing to it. Polling is therefore what makes a queue a queue — the
     /// same reason the shell polls the working tree — and it is one bounded
-    /// query on a worker thread, stopped while the panel is off screen.
+    /// query on a worker thread.
+    ///
+    /// Deliberately *not* gated on this view being on screen. `SidePanel` hosts
+    /// its views in a `StackLayout`, which leaves every view but the current one
+    /// `visible: false` — and the two things this count feeds, the activity
+    /// bar's badge and the shell's own banner, are precisely what a reader who
+    /// is looking at another view sees. Gating on visibility froze both at
+    /// whatever the first read found.
+    ///
+    /// Gated on the window instead, exactly as the shell gates its working-tree
+    /// poll: an unfocused window is looking at nothing. The attached property is
+    /// read through this item because a `Timer` is not an `Item` and cannot
+    /// carry one.
     Timer {
         interval: 4000
         repeat: true
-        running: panel.visible && !approvals.loading
+        running: !approvals.loading && panel.Window.window !== null
+            && panel.Window.window.active
         onTriggered: {
+            panel.now = Date.now();
+            approvals.refresh();
+        }
+    }
+
+    /// Arriving at this view re-reads rather than waiting out the poll: a queue
+    /// a reader has just switched to must not be up to one interval stale.
+    onVisibleChanged: {
+        if (panel.visible) {
             panel.now = Date.now();
             approvals.refresh();
         }
@@ -188,28 +211,42 @@ Item {
                     delegate: ApprovalBanner {
                         required property string approvalId
                         required property string capabilities
+                        required property bool downgraded
                         required property string expires
                         required property var grantableScopes
+                        required property string requested
+                        required property string requestedScope
                         required property string risk
                         required property string runId
+                        required property string scope
                         required property string summary
                         required property string tool
+                        required property string toolVersion
+                        required property string workspace
 
                         Layout.fillWidth: true
                         now: panel.now
                         // Assembled from the delegate's own roles rather than
                         // handed the model row: a QML delegate has no handle on
-                        // the record behind it, and the page it seeds reads the
-                        // run for itself the moment it opens.
+                        // the record behind it. Every role the queue publishes
+                        // is carried, so the page this seeds draws a complete
+                        // header on the frame it opens rather than filling parts
+                        // of one in when its own read lands.
                         request: ({
                             "approvalId": approvalId,
                             "capabilities": capabilities,
+                            "downgraded": downgraded,
                             "expires": expires,
                             "grantableScopes": grantableScopes,
+                            "requested": requested,
+                            "requestedScope": requestedScope,
                             "risk": risk,
                             "runId": runId,
+                            "scope": scope,
                             "summary": summary,
-                            "tool": tool
+                            "tool": tool,
+                            "toolVersion": toolVersion,
+                            "workspace": workspace
                         })
                         onReviewRequested: panel.openApproval(request)
                     }
