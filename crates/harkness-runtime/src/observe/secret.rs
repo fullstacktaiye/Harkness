@@ -41,6 +41,22 @@
 //! which overwrites its own buffer before it is freed, and which has no
 //! `Display`, no `Debug` that prints it, and no accessor that hands it out. The
 //! only thing that can read one is the replacement loop in this module.
+//!
+//! # What holding them costs
+//!
+//! The set is append-only for the life of the process, and every redaction scans
+//! it linearly, so both memory and per-write cost grow with the number of
+//! *distinct* values declared. Two things bound that in practice: declaring the
+//! same value twice adds nothing, and a tool is only granted the environment
+//! names its descriptor published — so the usual size is a handful.
+//!
+//! A long-lived front end running many tasks against *rotating* credentials is
+//! the case that grows, and it is a real cost rather than a hidden one. Nothing
+//! here forgets a value on purpose: a redactor that stopped recognizing a secret
+//! it had already been told about would write it down, which is the one outcome
+//! this module exists to prevent. Retaining the value is also not a new exposure
+//! — it came from this process's own environment, which holds it in the clear
+//! for the process's whole life regardless.
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -243,10 +259,15 @@ impl SecretRegistry {
 /// would be absurd; `CERT` is absent because `SSL_CERT_FILE` is a path. Each of
 /// those would have declared a value that appears constantly in ordinary output,
 /// which is the failure mode this list exists to avoid.
+/// Each fragment must be able to decide an answer no other fragment already
+/// gives, or it is documentation pretending to be a rule: `AUTHTOKEN` and
+/// `SESSIONTOKEN` both contain `TOKEN`, so under a substring match neither could
+/// ever be the one that matched, and a contributor reading the list would think
+/// there were more rules to keep in step than there are. `ACCESSKEY` earns its
+/// place because `KEY` alone is not on the list.
 const SENSITIVE_NAME_FRAGMENTS: &[&str] = &[
     "ACCESSKEY",
     "APIKEY",
-    "AUTHTOKEN",
     "COOKIE",
     "CREDENTIAL",
     "PASSPHRASE",
@@ -254,7 +275,6 @@ const SENSITIVE_NAME_FRAGMENTS: &[&str] = &[
     "PASSWORD",
     "PRIVATEKEY",
     "SECRET",
-    "SESSIONTOKEN",
     "TOKEN",
 ];
 
@@ -329,8 +349,8 @@ mod tests {
     use std::ffi::OsString;
 
     use super::{
-        Declared, MIN_DECLARED_SECRET_BYTES, SecretRegistry, declare_environment_secrets,
-        is_sensitive_environment_name,
+        Declared, MIN_DECLARED_SECRET_BYTES, SENSITIVE_NAME_FRAGMENTS, SecretRegistry,
+        declare_environment_secrets, is_sensitive_environment_name,
     };
 
     fn name(text: &str) -> OsString {
@@ -396,6 +416,23 @@ mod tests {
             registry.redact("saw declared-later", "[gone]").as_deref(),
             Some("saw [gone]")
         );
+    }
+
+    #[test]
+    fn no_fragment_is_subsumed_by_another() {
+        // A fragment that contains another can never decide an answer, so it is
+        // a comment in the shape of a rule. Asserting it keeps the published
+        // list in `docs/observability.md` honest about how many rules there are.
+        for fragment in SENSITIVE_NAME_FRAGMENTS {
+            let subsumed_by = SENSITIVE_NAME_FRAGMENTS
+                .iter()
+                .filter(|other| *other != fragment && fragment.contains(*other))
+                .collect::<Vec<_>>();
+            assert!(
+                subsumed_by.is_empty(),
+                "{fragment} can never match on its own: {subsumed_by:?} already covers it"
+            );
+        }
     }
 
     #[test]

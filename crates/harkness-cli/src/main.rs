@@ -1988,12 +1988,21 @@ fn run(cli: Cli, cancellation: &Cancellation) -> Result<CommandResult, CliError>
     // rather than by this call, which is what keeps `harkness project list`
     // against a data directory that does not exist from bringing one into
     // being — the same promise `Store::open_existing` makes about `runtime.db`.
-    let _ = observe::init(
+    let diagnostics = observe::init(
         data_dir
             .clone()
             .or_else(harkness_core::data_directory)
             .as_deref(),
         observe::Options::default().mirror_to_stderr(verbose),
+    );
+    // Reported rather than discarded, because "where did my logs go" is a
+    // question with an answer, and `--verbose` — which installs the stderr
+    // mirror — is how a user asks it. Emitted as an event rather than printed,
+    // so the answer arrives as one JSON object per line like everything else on
+    // this stream, and so the file records its own location.
+    tracing::info!(
+        arrangement = %diagnostics.describe(),
+        "diagnostics initialized"
     );
     match command {
         Command::Project { command } => {

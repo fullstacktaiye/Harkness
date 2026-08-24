@@ -2055,6 +2055,21 @@ impl Store {
     /// coverage table in [`observe`](crate::observe), and
     /// [`ToolExecutor`](crate::tool::ToolExecutor), which runs the bytes it
     /// reads back out of it.
+    ///
+    /// # Redaction happens before the inline bound, and can move it
+    ///
+    /// A replacement marker is longer than much of what it replaces, so a result
+    /// that fitted [`MAX_INLINE_PAYLOAD_BYTES`] before scrubbing can exceed it
+    /// after — and is then refused with [`StoreError::PayloadTooLarge`] exactly
+    /// as an oversized one is. That ordering is the deliberate one: checking
+    /// first would admit a row whose *stored* form breaks the bound every other
+    /// column keeps, and the artifact store already checks a label after
+    /// redaction for the same reason.
+    ///
+    /// The consequence is the one the inline threshold already documents — the
+    /// caller summarizes and retries — and it is worth knowing that redaction is
+    /// among the reasons a result can cross the line. A tool returning bulk
+    /// content should be writing an artifact rather than a payload either way.
     fn redact_output(&self, output: Value) -> Value {
         redaction::redact_payload(&*self.redactor, &output)
     }

@@ -119,6 +119,7 @@
 //! by a dead process from one still executing is a question about run ownership,
 //! and answering it is not this module's job.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -316,19 +317,38 @@ impl CallOutcome {
         }
     }
 
-    /// One machine-filterable word naming how the call ended.
+    /// The [`ToolCallState`] this outcome is recorded as.
     ///
-    /// The terminal state's own spelling wherever there is one, so a diagnostic
-    /// line and the `tool_calls.state` column it describes agree, and a log
-    /// filtered on `outcome = "timed_out"` finds the same calls a query would.
+    /// A timeout has no state of its own — it is persisted as `failed` carrying
+    /// the `timed_out` failure kind — so this returns what the row will actually
+    /// say. A diagnostic line and the `tool_calls.state` column it describes
+    /// therefore agree, which is the only thing that makes filtering a log and
+    /// querying the store answer the same question.
     #[must_use]
-    pub const fn as_str(&self) -> &'static str {
+    pub const fn recorded_state(&self) -> ToolCallState {
         match self {
-            Self::Succeeded { .. } => ToolCallState::Succeeded.as_str(),
-            Self::Failed { .. } => ToolCallState::Failed.as_str(),
-            Self::Cancelled => ToolCallState::Cancelled.as_str(),
-            Self::Interrupted => ToolCallState::Interrupted.as_str(),
-            Self::TimedOut { .. } => "timed_out",
+            Self::Succeeded { .. } => ToolCallState::Succeeded,
+            Self::Failed { .. } | Self::TimedOut { .. } => ToolCallState::Failed,
+            Self::Cancelled => ToolCallState::Cancelled,
+            Self::Interrupted => ToolCallState::Interrupted,
+        }
+    }
+
+    /// The stable failure kind a diagnostic line should carry, if any.
+    ///
+    /// [`failure_kind`](Self::failure_kind) answers only for `Failed`, because a
+    /// caller inspecting an outcome wants the failure it holds. A *log* wants
+    /// the kind the row will end up with, and for a timeout that is
+    /// `timed_out` even though no `Failure` has been built yet.
+    #[must_use]
+    pub fn recorded_failure_kind(&self) -> Option<&str> {
+        match self {
+            Self::Failed { failure } => Some(failure.kind()),
+            // The kind `finish` will build from `ToolError::TimedOut`, named
+            // here rather than derived because building the error would need the
+            // limit and this is a read-only projection.
+            Self::TimedOut { .. } => Some("timed_out"),
+            _ => None,
         }
     }
 }
@@ -949,25 +969,37 @@ impl ToolExecutor {
             // one: reconstructing a two-in-the-morning failure needs what the
             // tool actually said, and behind the redactor is the one place it is
             // safe to say it.
-            match &outcome {
-                CallOutcome::Failed { failure } => tracing::warn!(
+            //
+            // A timeout takes the failure arm along with an outright failure,
+            // because that is how it is *recorded*: `finish` persists it as
+            // `failed` carrying the `timed_out` kind, and a log that called it
+            // "finished" would hide the one outcome an operator is most likely
+            // to be hunting for.
+            let state = outcome.recorded_state().as_str();
+            match outcome.recorded_failure_kind() {
+                Some(kind) => tracing::warn!(
                     run_id = %run_id,
                     step_id = %step,
                     tool_call_id = %call,
                     tool_id = %identity.id,
                     tool_version = %identity.version,
-                    outcome = outcome.as_str(),
-                    failure_kind = failure.kind(),
-                    failure = %failure.message(),
+                    outcome = state,
+                    failure_kind = kind,
+                    failure = %match &outcome {
+                        CallOutcome::Failed { failure } => Cow::Borrowed(failure.message()),
+                        CallOutcome::TimedOut { limit } =>
+                            Cow::Owned(format!("the call exceeded its {limit:?} limit")),
+                        _ => Cow::Borrowed(""),
+                    },
                     "tool call failed"
                 ),
-                _ => tracing::info!(
+                None => tracing::info!(
                     run_id = %run_id,
                     step_id = %step,
                     tool_call_id = %call,
                     tool_id = %identity.id,
                     tool_version = %identity.version,
-                    outcome = outcome.as_str(),
+                    outcome = state,
                     "tool call finished"
                 ),
             }

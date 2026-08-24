@@ -51,8 +51,24 @@ pub const MAX_LOG_FILE_BYTES: u64 = 4 * 1024 * 1024;
 /// Files kept, counting the one being written.
 ///
 /// Four archives plus the live file, so the log costs at most
-/// `MAX_LOG_FILES * MAX_LOG_FILE_BYTES` — 20 MiB — however long Harkness runs.
+/// `MAX_LOG_FILES * (MAX_LOG_FILE_BYTES + MAX_LOG_LINE_BYTES)` — a shade over
+/// 20 MiB — however long Harkness runs.
 pub const MAX_LOG_FILES: usize = 5;
+
+/// Most bytes one formatted event may write.
+///
+/// The per-file cap is checked *before* a line is written, so that a record is
+/// never split across two files; the arithmetic consequence is that a file may
+/// exceed the cap by the size of the line that crossed it. Bounding the line is
+/// what turns that into a fixed overshoot rather than an open one — an
+/// instrumentation site that interpolated a child's whole stderr would otherwise
+/// write a single multi-megabyte record straight past a bound this module
+/// documents as absolute.
+///
+/// Generous on purpose: every field a caller controls today is already clamped
+/// far below this by the store's own inline bound, so reaching it means
+/// something new is being logged that nobody bounded.
+pub const MAX_LOG_LINE_BYTES: usize = 256 * 1024;
 
 /// Where the diagnostic log for `data_dir` lives.
 #[must_use]
@@ -197,6 +213,13 @@ impl RotatingLog {
     /// The oldest archive is removed first, so the cap holds even if a later
     /// rename fails: a missed rotation costs one oversized file, while removing
     /// last would let the count creep upwards every time one did.
+    ///
+    /// A rename that fails for any other reason is *not* fatal. Two Harkness
+    /// processes share a data directory — a CLI invocation while the window is
+    /// open is the ordinary case — and either may reach the cap first, so losing
+    /// a rename race is expected rather than exceptional. The recovery is to
+    /// reopen the live name and carry on: whoever won already rotated, and the
+    /// loser's next lines belong in the file that now holds that name.
     fn rotate(&mut self) -> io::Result<()> {
         let oldest = archive(&self.directory, MAX_LOG_FILES - 1);
         if let Err(error) = fs::remove_file(&oldest)
@@ -217,8 +240,21 @@ impl RotatingLog {
         // name has moved, and the previous handle is dropped when the state is
         // overwritten.
         fs::rename(&self.path, archive(&self.directory, 1))?;
+        self.reopen()
+    }
+
+    /// Takes the file the live name currently refers to, whoever created it.
+    ///
+    /// Also the answer when another process rotated underneath this one: on Unix
+    /// a rename moves the name and not the open file, so a handle held across
+    /// somebody else's rotation keeps writing into an archive that will
+    /// eventually age out and be deleted. Reopening by name at every cap check
+    /// bounds that to one file's worth of lines rather than letting it run for
+    /// the life of a desktop session.
+    fn reopen(&mut self) -> io::Result<()> {
         let file = open_log(&self.path)?;
-        self.openness = Openness::Open { file, written: 0 };
+        let written = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        self.openness = Openness::Open { file, written };
         Ok(())
     }
 }
@@ -234,7 +270,16 @@ impl Write for RotatingLog {
         // Rotation is decided before the write rather than after it, so a line
         // is never split across two files: a JSON-lines log whose records can
         // straddle a boundary is not parseable by the tool that reads it.
-        if used > 0 && used + buffer.len() as u64 > MAX_LOG_FILE_BYTES && self.rotate().is_err() {
+        //
+        // A single line larger than the whole cap would otherwise be written
+        // into an empty file and blow the bound on its own, which is why the
+        // guard is on `used` rather than on the sum: rotating first would gain
+        // nothing, so `RedactedSink` bounds the line instead.
+        if used > 0
+            && used + buffer.len() as u64 > MAX_LOG_FILE_BYTES
+            && self.rotate().is_err()
+            && self.reopen().is_err()
+        {
             self.openness = Openness::Failed;
             self.fallback.write_all(buffer)?;
             return Ok(buffer.len());
@@ -279,6 +324,11 @@ impl<W: Write> Write for RedactedSink<W> {
         // buffer is a complete line and applying a line-oriented rule to it is
         // exact. Lossy decoding is safe here for the same reason: the formatter
         // produced this text, and everything it produces is UTF-8.
+        if buffer.len() > MAX_LOG_LINE_BYTES {
+            self.sink
+                .write_all(oversized_line(buffer.len()).as_bytes())?;
+            return Ok(buffer.len());
+        }
         let line = String::from_utf8_lossy(buffer);
         match self.redactor.redact_text(&line) {
             std::borrow::Cow::Borrowed(_) => self.sink.write_all(buffer)?,
@@ -290,6 +340,18 @@ impl<W: Write> Write for RedactedSink<W> {
     fn flush(&mut self) -> io::Result<()> {
         self.sink.flush()
     }
+}
+
+/// Stands in for a formatted event too large to be worth keeping.
+///
+/// Valid JSON on one line, like everything else the log holds, and it names the
+/// size rather than any of the content: what made the line enormous is exactly
+/// what nobody has read. A truncated original would be neither parseable nor
+/// safe, since a cut can land inside a string and strand an opening quote.
+fn oversized_line(bytes: usize) -> String {
+    format!(
+        "{{\"level\":\"WARN\",\"fields\":{{\"message\":\"a diagnostic line was dropped for exceeding {MAX_LOG_LINE_BYTES} bytes\",\"line_bytes\":{bytes}}},\"target\":\"harkness_runtime::observe\"}}\n"
+    )
 }
 
 /// The `MakeWriter` behind the diagnostic file.
@@ -371,7 +433,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        LOG_FILE_NAME, MAX_LOG_FILE_BYTES, MAX_LOG_FILES, RotatingLog, log_directory, log_file,
+        LOG_FILE_NAME, MAX_LOG_FILE_BYTES, MAX_LOG_FILES, MAX_LOG_LINE_BYTES, RotatingLog,
+        StandardRedactor, log_directory, log_file,
     };
 
     fn names(directory: &Path) -> Vec<String> {
@@ -520,6 +583,52 @@ mod tests {
 
         // Restored so the temporary directory can be removed on drop.
         fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn a_line_larger_than_a_whole_file_is_dropped_rather_than_blowing_the_cap() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Collected(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Collected {
+            fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buffer);
+                Ok(buffer.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let collected = Collected::default();
+        let mut sink = super::RedactedSink {
+            redactor: StandardRedactor::with_secrets(super::super::SecretRegistry::new()),
+            sink: collected.clone(),
+        };
+        let enormous = vec![b'x'; MAX_LOG_LINE_BYTES + 1];
+
+        assert_eq!(
+            sink.write(&enormous).unwrap(),
+            enormous.len(),
+            "the writer still reports its whole input consumed"
+        );
+
+        let written = String::from_utf8(collected.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            written.len() < 512,
+            "the replacement stands in for the line rather than truncating it: {} bytes",
+            written.len()
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(written.trim_end()).expect("the stand-in is a JSON line too");
+        assert_eq!(parsed["fields"]["line_bytes"], enormous.len());
+        assert!(
+            !written.contains("xxxx"),
+            "what made a line enormous is exactly what nobody read"
+        );
     }
 
     #[test]

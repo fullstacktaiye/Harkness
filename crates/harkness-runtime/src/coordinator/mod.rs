@@ -544,6 +544,15 @@ impl RunCoordinator {
         let Some(project_id) = task.project_id() else {
             return Err(RuntimeError::WorkspaceIdentityRequired { task: task_id });
         };
+        // Both sides of this comparison go through the store's own redactor, so
+        // a front end deriving its reference the same way agrees by
+        // construction. The one thing that could make them disagree is a
+        // declared secret arriving *between* the two derivations and matching
+        // inside the path — the declared-secret set only grows, so an earlier
+        // reference can be less redacted than a later one. It stays a comparison
+        // rather than a canonicalized check because what is being verified is
+        // that the caller named the task's workspace, and the execution root
+        // below is taken from the task itself either way.
         let expected = WorkspaceRef::from_task(&task, &**self.inner.store.redactor());
         if workspace.project_id() != expected.project_id() || workspace.root() != expected.root() {
             return Err(RuntimeError::WorkspaceMismatch { task: task_id });

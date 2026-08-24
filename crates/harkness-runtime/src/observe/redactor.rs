@@ -89,12 +89,10 @@ impl StandardRedactor {
     /// Declared values go first because they are literals: a rule that already
     /// replaced a secret cannot then be confused by whatever shape the rest of
     /// the line happens to have.
-    fn apply(&self, text: &str, streams_only: bool) -> Option<String> {
+    fn apply(&self, text: &str) -> Option<String> {
         match self.secrets.redact(text, rules::declared_secret_marker()) {
-            Some(rewritten) => {
-                Some(rules::redact_shapes(&rewritten, streams_only).unwrap_or(rewritten))
-            }
-            None => rules::redact_shapes(text, streams_only),
+            Some(rewritten) => Some(rules::redact_shapes(&rewritten).unwrap_or(rewritten)),
+            None => rules::redact_shapes(text),
         }
     }
 }
@@ -107,7 +105,7 @@ impl Default for StandardRedactor {
 
 impl Redactor for StandardRedactor {
     fn redact_text<'a>(&self, text: &'a str) -> Cow<'a, str> {
-        match self.apply(text, false) {
+        match self.apply(text) {
             Some(rewritten) => Cow::Owned(rewritten),
             None => Cow::Borrowed(text),
         }
@@ -148,25 +146,57 @@ impl LineFilter {
         }
     }
 
-    /// Emits every complete line the buffer holds, and forces a chunk out when
-    /// one line has grown past the bound.
-    fn drain_lines(&mut self) -> io::Result<()> {
-        while let Some(position) = self.buffer.iter().position(|byte| *byte == b'\n') {
-            let line: Vec<u8> = self.buffer.drain(..=position).collect();
-            self.emit(&line)?;
+    /// Completes the pending partial line from the front of `chunk`, if it can.
+    ///
+    /// Returns what is left of `chunk` afterwards. Splitting this out is what
+    /// lets [`write`](Write::write) walk the caller's slice directly rather than
+    /// appending everything and then draining it: draining from the front of a
+    /// `Vec` shifts every remaining byte once per line, which turns a 64 KiB
+    /// chunk of short lines — ordinary build output on its way into an artifact —
+    /// into hundreds of megabytes of copying.
+    fn complete_pending<'a>(&mut self, chunk: &'a [u8]) -> io::Result<&'a [u8]> {
+        if self.buffer.is_empty() {
+            return Ok(chunk);
         }
-        if self.buffer.len() >= MAX_FILTERED_LINE_BYTES {
-            let chunk = std::mem::take(&mut self.buffer);
-            self.emit(&chunk)?;
+        match chunk.iter().position(|byte| *byte == b'\n') {
+            Some(position) => {
+                self.buffer.extend_from_slice(&chunk[..=position]);
+                let line = std::mem::take(&mut self.buffer);
+                self.emit(&line)?;
+                Ok(&chunk[position + 1..])
+            }
+            None => {
+                self.buffer.extend_from_slice(chunk);
+                Ok(&[])
+            }
         }
-        Ok(())
     }
 }
 
 impl Write for LineFilter {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.buffer.extend_from_slice(buffer);
-        self.drain_lines()?;
+        let rest = self.complete_pending(buffer)?;
+        // One pass over the caller's bytes. `split_inclusive` keeps each
+        // terminator with the line it ends, and a chunk that does not end in one
+        // yields a final piece with no `\n` — which is exactly the partial line
+        // to carry over.
+        let mut pieces = rest.split_inclusive(|byte| *byte == b'\n').peekable();
+        while let Some(piece) = pieces.next() {
+            let complete = piece.ends_with(b"\n");
+            if complete {
+                self.emit(piece)?;
+            } else {
+                debug_assert!(
+                    pieces.peek().is_none(),
+                    "only the last piece can be partial"
+                );
+                self.buffer.extend_from_slice(piece);
+            }
+        }
+        if self.buffer.len() >= MAX_FILTERED_LINE_BYTES {
+            let chunk = std::mem::take(&mut self.buffer);
+            self.emit(&chunk)?;
+        }
         Ok(buffer.len())
     }
 

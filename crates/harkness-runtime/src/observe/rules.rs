@@ -148,16 +148,44 @@ const URL_USERINFO_REPLACEMENT: &str = "${1}://«redacted:url_userinfo»@";
 /// both carry these and a rule that knew only one shape would look like it
 /// worked.
 ///
-/// The value stops at a quote or a bracket for the reason [`URL_USERINFO`]'s
-/// class is positive: this runs over already-encoded JSON in the diagnostic log,
-/// and a key whose value is an *object* — `"authorization": {"scheme": …}` —
-/// would otherwise have its opening brace replaced and leave a line that no
-/// longer parses.
+/// Two details of the separator and the value class are load-bearing, and both
+/// exist because the diagnostic log redacts an *already-encoded* JSON line.
+///
+/// The optional quote either side may be escaped, because a tool that quoted a
+/// command line reaches the log as `Authorization: \"Bearer …\"`. And the value
+/// class refuses the backslash along with the quote, the newline and every
+/// bracket, so a match cannot walk out of the field it started in. The two go
+/// together: without the escaped quote in the separator, the value would match
+/// the lone `\`, stop at the quote, and leave the credential in the clear beside
+/// a line that no longer parses — the worst of both halves of this module's job.
 const AUTHORIZATION_HEADER: &str = concat!(
-    r#"(?i)\b((?:proxy-)?authorization)("?\s*[:=]\s*"?)"#,
-    r#"([^"\r\n(){}\[\]]*[^"\s\r\n(){}\[\]])"#,
+    r#"(?i)\b((?:proxy-)?authorization)("#,
+    r#"(?:\\?")?\s*[:=]\s*(?:\\?")?"#,
+    r#")([^"\\\r\n(){}\[\]]*[^"\\\s\r\n(){}\[\]])"#,
 );
-const AUTHORIZATION_HEADER_REPLACEMENT: &str = "${1}${2}«redacted:authorization»";
+
+/// Schemes an `Authorization` value may open with, from the IANA registry.
+///
+/// Present so the header rule can tell a credential from an explanation. A
+/// denial recorded as `authorization: denied because the grant no longer covers
+/// remote_write` is the reason a call was refused, and a rule that replaced it
+/// would destroy the one field an operator needs — so a value is only scrubbed
+/// when it opens with a scheme, or is a single opaque token.
+const AUTHORIZATION_SCHEMES: &[&str] = &[
+    "aws4-hmac-sha256",
+    "basic",
+    "bearer",
+    "digest",
+    "hoba",
+    "mutual",
+    "negotiate",
+    "ntlm",
+    "oauth",
+    "scram-sha-1",
+    "scram-sha-256",
+    "token",
+    "vapid",
+];
 
 /// A bare credential introduced by its scheme, with no header name in sight.
 ///
@@ -169,25 +197,22 @@ const AUTHORIZATION_SCHEME: &str = r"(?i)\b(bearer|basic|token)\s+([A-Za-z0-9._~
 
 /// Key-and-value shapes, in URLs, environment-style lines and JSON alike.
 ///
-/// The key list is deliberately narrow. `key=` and `id=` are not on it: they
-/// appear all over ordinary configuration, and false positives here corrupt
-/// audit records rather than merely annoying somebody.
+/// The key list is deliberately narrow. `key=`, `id=` and `pwd=` are not on it:
+/// they appear all over ordinary configuration and output — `PWD=` and `OLDPWD=`
+/// are in every environment dump, and the working directory is one of the first
+/// things anyone needs to reconstruct a failed run — and a false positive here
+/// corrupts an audit record rather than merely annoying somebody.
 ///
 /// There is no word boundary before the key, on purpose: the shape that matters
 /// most in process output is `PGPASSWORD=…`, and a boundary would require the
 /// key to stand alone. What keeps that from over-matching is the *separator* —
 /// a key has to be followed by `:` or `=` and a value, so `secretariat=racehorse`
 /// and `mypasswordfield` are both left alone.
-///
-/// The value class excludes every bracket as well as the quote and the
-/// separators, so `"token": {…}` in an encoded JSON line loses nothing: a rule
-/// that replaced the opening brace would leave a record that no longer parses,
-/// which is worse than one it failed to scrub.
 const CREDENTIAL_PARAMETER: &str = concat!(
     r#"(?i)(access[_-]?token|api[_-]?key|apikey|auth[_-]?token|client[_-]?secret"#,
     r#"|id[_-]?token|passphrase|password|passwd|private[_-]?key|refresh[_-]?token"#,
-    r#"|secret[_-]?access[_-]?key|secret[_-]?key|session[_-]?token|secret|token|pwd)"#,
-    r#"("?\s*[:=]\s*"?)([^"'\s&;,(){}\[\]]+)"#,
+    r#"|secret[_-]?access[_-]?key|secret[_-]?key|session[_-]?token|secret|token)"#,
+    r#"((?:\\?")?\s*[:=]\s*(?:\\?")?)([^"'\\\s&;,(){}\[\]]+)"#,
 );
 const CREDENTIAL_PARAMETER_REPLACEMENT: &str = "${1}${2}«redacted:credential_parameter»";
 
@@ -283,22 +308,46 @@ fn is_credential_shaped(value: &str) -> bool {
         .any(|character| !character.is_ascii_alphabetic())
 }
 
+/// Whether an `Authorization` value is a credential rather than an explanation.
+///
+/// A header's value is a registered scheme and a token, or one opaque token on
+/// its own. Prose is neither, and prose is what a policy or an agent refusal
+/// looks like: `authorization: denied because the grant no longer covers
+/// remote_write` is the reason a call was refused, and replacing it would
+/// destroy the one field an operator opened the log for. The rule is aggressive
+/// by design — it takes a header's *whole* value — so it needs a way to tell
+/// what it is looking at, and this is it.
+fn is_authorization_value(value: &str) -> bool {
+    let mut words = value.split_whitespace();
+    let Some(first) = words.next() else {
+        return false;
+    };
+    if AUTHORIZATION_SCHEMES
+        .iter()
+        .any(|scheme| first.eq_ignore_ascii_case(scheme))
+    {
+        return true;
+    }
+    // A scheme-less header carries one opaque token, so anything with a space
+    // in it is prose. An all-letter word is a word; `credential_token` and the
+    // declared-secret rule are what remain for the rest.
+    words.next().is_none() && is_credential_shaped(first)
+}
+
 /// Applies every shape rule to `text`, or reports that none of them fired.
 ///
 /// `None` is the common answer and the reason
 /// [`Redactor::redact_text`](crate::store::Redactor::redact_text) can hand back
 /// a borrow: clean text costs one scan per rule and no allocation.
-pub(super) fn redact_shapes(text: &str, streams_only: bool) -> Option<String> {
+pub(super) fn redact_shapes(text: &str) -> Option<String> {
     let patterns = patterns();
     let mut current: Option<String> = None;
 
-    if !streams_only {
-        take(&mut current, text, |source| {
-            patterns
-                .private_key_block
-                .replace_all(source, PRIVATE_KEY_BLOCK_MARKER)
-        });
-    }
+    take(&mut current, text, |source| {
+        patterns
+            .private_key_block
+            .replace_all(source, PRIVATE_KEY_BLOCK_MARKER)
+    });
     take(&mut current, text, |source| {
         patterns
             .url_userinfo
@@ -307,7 +356,13 @@ pub(super) fn redact_shapes(text: &str, streams_only: bool) -> Option<String> {
     take(&mut current, text, |source| {
         patterns
             .authorization_header
-            .replace_all(source, AUTHORIZATION_HEADER_REPLACEMENT)
+            .replace_all(source, |captures: &Captures<'_>| {
+                if is_authorization_value(&captures[3]) {
+                    format!("{}{}{AUTHORIZATION_MARKER}", &captures[1], &captures[2])
+                } else {
+                    captures[0].to_owned()
+                }
+            })
     });
     take(&mut current, text, |source| {
         patterns
@@ -378,16 +433,31 @@ pub(super) fn redact_shape_bytes(line: &[u8]) -> Option<Vec<u8>> {
             .replace_all(source, URL_USERINFO_REPLACEMENT.as_bytes())
     });
     take_bytes(&mut current, line, |source| {
-        patterns
-            .byte_authorization_header
-            .replace_all(source, AUTHORIZATION_HEADER_REPLACEMENT.as_bytes())
+        patterns.byte_authorization_header.replace_all(
+            source,
+            |captures: &regex::bytes::Captures<'_>| {
+                // Lossy is exact here: the value class is ASCII, so a byte that
+                // would decode lossily could not have been matched.
+                if is_authorization_value(&String::from_utf8_lossy(&captures[3])) {
+                    let mut replacement = captures[1].to_vec();
+                    replacement.extend_from_slice(&captures[2]);
+                    replacement.extend_from_slice(AUTHORIZATION_MARKER.as_bytes());
+                    replacement
+                } else {
+                    captures[0].to_vec()
+                }
+            },
+        )
     });
     take_bytes(&mut current, line, |source| {
         patterns.byte_authorization_scheme.replace_all(
             source,
             |captures: &regex::bytes::Captures<'_>| {
-                let value = String::from_utf8_lossy(&captures[2]).into_owned();
-                if is_credential_shaped(&value) {
+                // The capture class is `[A-Za-z0-9._~+/=-]`, so asking the bytes
+                // directly answers exactly what decoding them would, without an
+                // allocation on a path that runs per artifact line.
+                let credential_shaped = captures[2].iter().any(|byte| !byte.is_ascii_alphabetic());
+                if credential_shaped {
                     let mut replacement = captures[1].to_vec();
                     replacement.push(b' ');
                     replacement.extend_from_slice(AUTHORIZATION_MARKER.as_bytes());
@@ -467,7 +537,7 @@ mod tests {
 
     /// Applies every rule, as `redact_text` does.
     fn redact(text: &str) -> String {
-        redact_shapes(text, false).unwrap_or_else(|| text.to_owned())
+        redact_shapes(text).unwrap_or_else(|| text.to_owned())
     }
 
     /// Asserts a rule fired and left nothing of the secret behind.
@@ -486,7 +556,7 @@ mod tests {
     /// Asserts nothing changed at all — the negative half of every rule.
     fn assert_untouched(text: &str) {
         assert_eq!(
-            redact_shapes(text, false),
+            redact_shapes(text),
             None,
             "{text:?} matches no rule and must not be rewritten"
         );
@@ -541,6 +611,27 @@ mod tests {
         assert!(!redacted.contains("hunter2"));
         let parsed: serde_json::Value = serde_json::from_str(&redacted).expect(&redacted);
         assert_eq!(parsed["author"], "a@b.com", "only the leaking field moved");
+    }
+
+    #[test]
+    fn an_escaped_quote_does_not_end_a_value_early_and_leave_the_secret_behind() {
+        // The shape a failure message takes once the formatter has encoded it:
+        // the tool quoted a command line, so the log line holds `\"` rather than
+        // `"`. A value class that admitted the backslash matched *it* and
+        // stopped, leaving the credential in the clear and the line unparseable
+        // — the worst of both halves of this module's job.
+        let encoded = r#"{"failure":"git: remote: password=\"hunter2\" rejected","run_id":"r-1"}"#;
+
+        let redacted = redact(encoded);
+
+        assert!(!redacted.contains("hunter2"), "{redacted}");
+        let parsed: serde_json::Value = serde_json::from_str(&redacted).expect(&redacted);
+        assert_eq!(parsed["run_id"], "r-1");
+
+        let header = r#"{"failure":"sent Authorization: \"Bearer abc.123\" upstream"}"#;
+        let redacted = redact(header);
+        assert!(!redacted.contains("abc.123"), "{redacted}");
+        serde_json::from_str::<serde_json::Value>(&redacted).expect(&redacted);
     }
 
     #[test]
@@ -646,6 +737,29 @@ mod tests {
         assert_untouched("secretariat=racehorse");
     }
 
+    #[test]
+    fn the_working_directory_is_not_a_credential() {
+        // `pwd` was on the key list and `PWD=`/`OLDPWD=` are in every
+        // environment dump a tool prints. The working directory is one of the
+        // first things anybody needs to reconstruct a failed run, so scrubbing
+        // it destroys far more than it protects — the same reasoning that keeps
+        // `key=` and `id=` off the list.
+        assert_untouched("PWD=/home/taiye/project");
+        assert_untouched("OLDPWD=/tmp");
+        assert_untouched("cd $PWD && cargo test");
+    }
+
+    #[test]
+    fn a_refusal_explained_after_a_colon_keeps_its_explanation() {
+        // The header rule takes a value *whole*, so it has to be able to tell a
+        // credential from prose. A denial reason is the one field an operator
+        // opened the log for; replacing it would be the rule doing the opposite
+        // of its job.
+        assert_untouched("authorization: denied because the grant no longer covers remote_write");
+        assert_untouched("authorization = pending review by the workspace owner");
+        assert_untouched("proxy-authorization: not required for this endpoint");
+    }
+
     // -- rule 3: published token prefixes -------------------------------------
 
     #[test]
@@ -720,7 +834,7 @@ mod tests {
     fn redaction_is_idempotent_so_a_second_pass_changes_nothing() {
         let once = redact("https://user:hunter2@example.com?token=abcdefgh");
         assert_eq!(
-            redact_shapes(&once, false),
+            redact_shapes(&once),
             None,
             "a marker must not itself look like a secret: {once}"
         );
@@ -732,7 +846,7 @@ mod tests {
     fn the_byte_engine_agrees_with_the_string_engine_on_text() {
         let line = "fatal: https://user:hunter2@example.com and Authorization: Bearer abc.123";
         let bytes = redact_shape_bytes(line.as_bytes()).expect("both rules fire");
-        let text = redact_shapes(line, true).expect("both rules fire");
+        let text = redact_shapes(line).expect("both rules fire");
 
         assert_eq!(String::from_utf8(bytes).unwrap(), text);
     }

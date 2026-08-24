@@ -876,6 +876,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "time",
+ "tracing",
 ]
 
 [[package]]
@@ -950,6 +951,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "time",
+ "tracing",
 ]
 
 [[package]]

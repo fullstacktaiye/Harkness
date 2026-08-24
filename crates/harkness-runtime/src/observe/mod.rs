@@ -118,7 +118,8 @@ use crate::domain::{RunId, StepId, ToolCallId};
 use crate::tool::ToolIdentity;
 
 pub use log::{
-    LOG_FILE_NAME, LOGS_DIRECTORY, MAX_LOG_FILE_BYTES, MAX_LOG_FILES, log_directory, log_file,
+    LOG_FILE_NAME, LOGS_DIRECTORY, MAX_LOG_FILE_BYTES, MAX_LOG_FILES, MAX_LOG_LINE_BYTES,
+    log_directory, log_file,
 };
 pub use redactor::{MAX_FILTERED_LINE_BYTES, StandardRedactor, stream_rules};
 pub use rules::RedactionRule;
@@ -314,11 +315,13 @@ fn install(data_dir: Option<&Path>, options: &Options) -> InitOutcome {
         // application embedding the runtime, most likely. Its choices win.
         return InitOutcome::AlreadyInitialized;
     }
-    match (path, failure) {
-        (Some(path), _) => InitOutcome::Logging { path, mirrored },
-        (None, Some(reason)) => InitOutcome::StderrOnly { reason },
-        (None, None) => InitOutcome::StderrOnly {
-            reason: "no diagnostic file was requested".to_owned(),
+    // `path` is `Some` exactly when a data directory resolved, which is exactly
+    // when `failure` is `None`, so the two are one decision rather than four
+    // combinations a reader has to rule out.
+    match path {
+        Some(path) => InitOutcome::Logging { path, mirrored },
+        None => InitOutcome::StderrOnly {
+            reason: failure.unwrap_or_else(|| "no diagnostic file was requested".to_owned()),
         },
     }
 }

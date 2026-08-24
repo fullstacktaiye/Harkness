@@ -85,10 +85,19 @@ emits nothing of its own: what it does is visible as the gap between
 `<data_dir>` is `HARKNESS_DATA_DIR` when set, else the platform data directory
 (`~/.local/share/harkness` on Linux); `harkness --data-dir PATH` overrides both.
 
-- **Five files of 4 MiB each — 20 MiB, whatever happens.** Writing past the cap
-  renames the generations down and deletes the oldest.
+- **Five files of 4 MiB each.** Writing past the cap renames the generations down
+  and deletes the oldest.
 - **A line is never split across two files.** Rotation is decided before a line
-  is written, not after, so the file stays parseable as JSON lines.
+  is written, not after, so the file stays parseable as JSON lines. The
+  arithmetic consequence is that a file may exceed its cap by the size of the
+  line that crossed it, which is why a single line is itself bounded at 256 KiB:
+  a larger one is replaced by a JSON record naming its size and nothing else, so
+  the total stays a shade over 20 MiB however Harkness is instrumented later.
+- **Two processes sharing a data directory both write to it.** A CLI invocation
+  while the window is open is the ordinary case. Whichever reaches the cap first
+  rotates; the other notices at its own next cap check and reopens the live name,
+  so at worst one file's worth of its lines land in an archive that ages out
+  normally. A lost rename race is expected rather than fatal.
 - **The directory is created by the first line, not at start-up.** A command that
   records nothing leaves a data directory it only read exactly as it found it.
 - **`0700` on the directory, `0600` on the files** on Unix. Diagnostic lines quote
@@ -151,6 +160,16 @@ marker never echoes any part of what it replaced.
 | `credential_token` | a credential whose issuer publishes its prefix | `ghp_…`, `github_pat_…`, `glpat-…`, `xox[bp]-…`, `AKIA…`, `AIza…`, `sk-ant-…`, `npm_…`, a JWT |
 | `private_key_block` | a PEM private key, `BEGIN` line to `END` line | `-----BEGIN OPENSSH PRIVATE KEY-----…` |
 
+`authorization` takes a header's value *whole*, so it first checks that the value
+is a credential: one of the registered schemes, or a single opaque token. A
+refusal recorded as `authorization: denied because the grant lapsed` keeps its
+explanation, which is the field an operator opened the log for.
+
+`credential_parameter`'s key list is deliberately narrow. `key=`, `id=` and
+`pwd=` are all absent — `PWD=` and `OLDPWD=` appear in every environment dump,
+and the working directory is one of the first things anyone needs to reconstruct
+a failed run.
+
 The whole userinfo goes, not only the password half: `https://<token>@github.com`
 is the commonest credential URL there is, and in
 `https://x-access-token:ghp_…@host` the username names the scheme while the
@@ -181,8 +200,8 @@ variable in its descriptor gets it copied into its child's environment by
 declared automatically at the spawn, before the child can echo it anywhere:
 
 ```
-ACCESSKEY  APIKEY  AUTHTOKEN  COOKIE  CREDENTIAL  PASSPHRASE
-PASSWD     PASSWORD  PRIVATEKEY  SECRET  SESSIONTOKEN  TOKEN
+ACCESSKEY  APIKEY  COOKIE  CREDENTIAL  PASSPHRASE
+PASSWD     PASSWORD  PRIVATEKEY  SECRET  TOKEN
 ```
 
 matched case-insensitively against the name with `_` and `-` removed, so
