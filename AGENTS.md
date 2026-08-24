@@ -37,6 +37,8 @@ Use standard `rustfmt` output (four-space indentation) and keep Clippy clean. Fo
 
 Place focused unit tests in a `#[cfg(test)] mod tests` beside the implementation. Put executable-level behavior in crate-level `tests/*.rs`; use descriptive names such as `json_empty_project_list_is_exact`. Add regression coverage for catalog locking, Git process handling, filesystem safety, and navigation changes. Run the full test, format, and Clippy commands before submitting.
 
+`docs/verification-suite.md` maps every release-blocking scenario to the test that proves it, and `.github/scripts/verify-suite-mapping.sh` holds that map to the binaries; see the invariants below before renaming a test it names.
+
 A new persisted channel — a column, a file, or a stream that holds caller text — owes the redactor a pass and owes `crates/harkness-runtime/tests/credential_redaction.rs` a way to reach it. That test byte-scans the whole data directory after a run that leaks sentinels through every channel it has, so extending its fixture tool is what makes the new channel covered; a review noticing is not.
 
 ## Catalog Schema & Worktree Invariants
@@ -2024,6 +2026,42 @@ canonical byte string for hashing, refuses what it cannot encode, and is frozen 
 constant, while this one hands back a `Value` a caller goes on to serialize however it likes. Both
 sort by exact key bytes rather than by any locale or character-wise ordering, so the order is a
 property of the value and not of the platform that encoded it.
+
+## Verification Suite Invariants
+
+`docs/verification-suite.md` names the test behind every release-blocking scenario the milestone
+mandates — the flagship workflow through both front ends, the scenario matrix, the migration and
+security checks, and every latency budget. It is not prose to be trusted:
+`.github/scripts/verify-suite-mapping.sh` re-derives it from the test binaries and fails when a named
+test no longer exists, and fails again when a mandated scenario has no row at all. **Renaming a test
+that document names is a change to that document in the same commit.** The mandated list lives in the
+script rather than in the document, so the document cannot license its own omissions.
+
+A latency target reports through `harkness_test_fixtures::latency::record` and through nothing else.
+The rule it holds is one every such test used to hold separately and inconsistently: the measurement
+is taken and printed in every profile, and the budget binds only where `debug_assertions` is off,
+because a debug number measures the optimizer being off rather than the code being slow. The line it
+prints is machine-readable and carries the platform, the architecture, the CPU count and the profile
+beside the number, since the runner that produced a failure is not available to inspect afterwards.
+A new target adds a row to the document and a step to the workflow's `latency` job; an `#[ignore]`d
+benchmark named by no job runs in no profile on no platform, and its budget is unverified however
+carefully it was written.
+
+Two things about *where* tests run are deliberate and must not be quietly changed. The window's
+Kirigami-loading tests — `qml_smoke` and `run_surfaces` — run on no hosted runner, because hosted
+Ubuntu packages KF5 Kirigami and no KF6; `lint`'s `--all-targets` pass is what keeps them compiling,
+and moving them into CI needs a runner with KF6 rather than an edit here. Everything in
+`harkness-gui`'s own unit tests links Qt but instantiates no QML, needs no display, and therefore
+*does* run in CI — so a new bridge test that reaches for a `QQmlApplicationEngine` belongs in one of
+those two binaries rather than beside the model tests.
+
+`front_end_equivalence` is the one test in the workspace that executes the real `harkness` binary
+from another crate. `CARGO_BIN_EXE_*` names only its own package's binaries, so the path is derived
+from the test executable's location or taken from `HARKNESS_CLI_BIN`; it must not try to build the
+binary itself, because cargo holds the build-directory lock for the whole of `cargo test` and a
+nested `cargo build` would wait for a lock only its own parent can release. When the binary is
+absent the test says so and fails. It must never skip: a verification test that quietly verifies
+nothing is worse than one that is missing.
 
 ## Commit & Pull Request Guidelines
 

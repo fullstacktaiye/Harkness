@@ -946,6 +946,7 @@ dependencies = [
  "harkness-core",
  "harkness-git",
  "harkness-runtime",
+ "harkness-test-fixtures",
  "libc",
  "serde",
  "serde_json",
@@ -963,6 +964,7 @@ name = "harkness-provider"
 version = "0.1.0"
 dependencies = [
  "harkness-git",
+ "harkness-test-fixtures",
  "serde",
  "serde_json",
  "thiserror 2.0.19",

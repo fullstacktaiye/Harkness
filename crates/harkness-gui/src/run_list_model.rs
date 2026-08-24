@@ -277,8 +277,8 @@ pub(crate) fn row_map(row: &RunRow) -> QMap<QMapPair_QString_QVariant> {
 /// One page of rows and the continuation that follows it.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RunPageResult {
-    rows: Vec<RunRow>,
-    next: Option<RunCursor>,
+    pub(crate) rows: Vec<RunRow>,
+    pub(crate) next: Option<RunCursor>,
 }
 
 /// Turns a listing's runs into rows, reading each run's task at most once.
@@ -309,7 +309,7 @@ fn load_page(cursor: Option<RunCursor>) -> Result<RunPageResult, RunsFailure> {
 /// back without touching `HARKNESS_DATA_DIR`, which is process-wide. A directory
 /// that has recorded nothing answers with an empty page rather than creating a
 /// run store: opening the runs panel is a read.
-fn load_page_in(
+pub(crate) fn load_page_in(
     data_dir: &std::path::Path,
     cursor: Option<RunCursor>,
 ) -> Result<RunPageResult, RunsFailure> {

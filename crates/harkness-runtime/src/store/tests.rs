@@ -40,9 +40,9 @@ use super::artifact::artifact_path;
 use super::migration::{MIGRATIONS, Migration, SCHEMA_VERSION, apply, recorded_version};
 use super::redaction::tests::{MASK, Masking, NonIdempotentValueOnly, SECRET, Shouting};
 use super::{
-    ARTIFACTS_DIRECTORY, Artifact, Availability, DATABASE_FILE, EventKind, EventPage, EventSeq,
-    MAX_EVENT_PAGE_LIMIT, MAX_INLINE_PAYLOAD_BYTES, Redactor, RunCursor, RunEvent, RunPage, Store,
-    StoreArtifacts, StoreError, guard,
+    ARTIFACTS_DIRECTORY, Artifact, Availability, BUSY_TIMEOUT, DATABASE_FILE, EventKind, EventPage,
+    EventSeq, MAX_EVENT_PAGE_LIMIT, MAX_INLINE_PAYLOAD_BYTES, Redactor, RunCursor, RunEvent,
+    RunPage, Store, StoreArtifacts, StoreError, guard,
 };
 
 /// Text one byte past the largest value any column will hold.
@@ -1681,6 +1681,75 @@ fn concurrent_writers_serialize_through_the_store() {
             .iter()
             .all(|run| run.state() == ExecutionState::Running),
         "every concurrent transition should have been recorded"
+    );
+}
+
+/// Two connections, one holding a write transaction: the other waits it out.
+///
+/// [`concurrent_writers_serialize_through_the_store`] proves the *in-process*
+/// arrangement, where one mutex-guarded writer connection makes contention
+/// impossible by construction. The arrangement a released build actually meets
+/// is the other one — the window's store beside the command line's, over one
+/// file — where a write arrives while somebody else's transaction is open.
+/// SQLite's default busy handler fails that write immediately with
+/// `SQLITE_BUSY`; [`BUSY_TIMEOUT`] is what `Store::open` replaces it with, and
+/// this is the test that says the replacement is still installed, still applies
+/// to a connection this crate did not open the database with, and is still long
+/// enough that an ordinary transaction is waited out rather than reported as an
+/// error to somebody who did nothing wrong.
+#[test]
+fn a_second_store_waits_out_another_connections_write_transaction() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    // Opened before the lock is taken, because opening climbs the migration
+    // ladder and would otherwise be measuring the wrong wait.
+    let second = fixture.reopen();
+
+    // A raw connection standing in for the other process's writer, holding the
+    // reserved lock every read-modify-write in this crate takes.
+    let mut holder = Connection::open(fixture.data_dir.path().join(DATABASE_FILE)).unwrap();
+    let held = holder
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+
+    let waiting = Run::new(task.id(), at(1));
+    let waiting_id = waiting.id();
+    let began = std::time::Instant::now();
+    let writer = thread::spawn(move || second.insert_run(&waiting));
+
+    // Long enough that a connection which failed instead of waiting has already
+    // returned, and far short of the timeout it is waiting on.
+    thread::sleep(Duration::from_millis(250));
+    assert!(
+        !writer.is_finished(),
+        "the second store did not wait for the held transaction"
+    );
+    // A reader is not blocked by a writer under WAL, and must not become so: a
+    // window showing a run list has to keep answering while a run is recorded.
+    assert!(
+        fixture
+            .store
+            .list_runs(RunPage::new(10))
+            .unwrap()
+            .runs
+            .is_empty()
+    );
+
+    held.commit().unwrap();
+    drop(holder);
+
+    writer
+        .join()
+        .unwrap()
+        .expect("the waiting write should have been let through, not refused");
+    assert!(
+        began.elapsed() < BUSY_TIMEOUT,
+        "the write was let through only after the busy timeout expired"
+    );
+    assert_eq!(
+        ids(&fixture.store.list_runs(RunPage::new(10)).unwrap().runs),
+        vec![waiting_id],
+        "the run the second store recorded is readable through the first"
     );
 }
 
@@ -5619,10 +5688,10 @@ fn persisting_a_state_change_batch_meets_the_latency_target() {
         .unwrap();
     let elapsed = started.elapsed();
 
-    println!("persisting an ordinary state-change batch took {elapsed:?}");
-    assert!(
-        elapsed < std::time::Duration::from_millis(10),
-        "persisting a state-change batch took {elapsed:?}"
+    harkness_test_fixtures::latency::record(
+        "store::persist_state_change_batch",
+        elapsed,
+        std::time::Duration::from_millis(10),
     );
 }
 
@@ -5674,10 +5743,10 @@ fn persisting_a_state_change_batch_with_its_events_meets_the_latency_target() {
         .unwrap();
     let elapsed = started.elapsed();
 
-    println!("persisting a state-change batch with its events took {elapsed:?}");
-    assert!(
-        elapsed < std::time::Duration::from_millis(10),
-        "persisting a state-change batch with its events took {elapsed:?}"
+    harkness_test_fixtures::latency::record(
+        "store::persist_state_change_batch_with_events",
+        elapsed,
+        std::time::Duration::from_millis(10),
     );
 }
 
@@ -5710,10 +5779,10 @@ fn loading_a_thousand_event_run_meets_the_latency_target() {
     let elapsed = started.elapsed();
 
     assert_eq!(events.len(), EVENTS);
-    println!("loading a {EVENTS}-event run took {elapsed:?}");
-    assert!(
-        elapsed < std::time::Duration::from_millis(500),
-        "loading a {EVENTS}-event run took {elapsed:?}"
+    harkness_test_fixtures::latency::record(
+        "store::load_thousand_event_run",
+        elapsed,
+        std::time::Duration::from_millis(500),
     );
 }
 
@@ -5731,9 +5800,9 @@ fn listing_one_hundred_runs_meets_the_latency_target() {
     let elapsed = started.elapsed();
 
     assert_eq!(page.runs.len(), 100);
-    println!("listing 100 of 1000 runs took {elapsed:?}");
-    assert!(
-        elapsed < std::time::Duration::from_millis(100),
-        "listing 100 runs took {elapsed:?}"
+    harkness_test_fixtures::latency::record(
+        "store::list_one_hundred_of_a_thousand_runs",
+        elapsed,
+        std::time::Duration::from_millis(100),
     );
 }

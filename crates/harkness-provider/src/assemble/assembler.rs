@@ -915,10 +915,10 @@ mod tests {
             assembler.observe(&text).unwrap();
         }
         let per_event = started.elapsed() / u32::try_from(EVENTS).unwrap();
-        println!("text delta: {per_event:?} per event");
-        assert!(
-            per_event < std::time::Duration::from_micros(10),
-            "text assembly took {per_event:?} per event"
+        harkness_test_fixtures::latency::record(
+            "provider::assemble_text_delta",
+            per_event,
+            std::time::Duration::from_micros(10),
         );
 
         let mut assembler = TurnAssembler::new().with_limits(AssemblyLimits {
@@ -934,10 +934,10 @@ mod tests {
             assembler.observe(&delta).unwrap();
         }
         let per_argument_event = began.elapsed() / u32::try_from(EVENTS).unwrap();
-        println!("argument delta: {per_argument_event:?} per event");
-        assert!(
-            per_argument_event < std::time::Duration::from_micros(10),
-            "argument assembly took {per_argument_event:?} per event"
+        harkness_test_fixtures::latency::record(
+            "provider::assemble_tool_call_argument_delta",
+            per_argument_event,
+            std::time::Duration::from_micros(10),
         );
     }
 

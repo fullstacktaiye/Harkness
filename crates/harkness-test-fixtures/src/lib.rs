@@ -1,5 +1,7 @@
 //! Hermetic filesystem, repository, and process fixtures shared by Harkness tests.
 
+pub mod latency;
+
 use std::{
     ffi::{OsStr, OsString},
     fs,

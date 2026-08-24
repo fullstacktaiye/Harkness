@@ -43,5 +43,9 @@ cxx-qt-build = { version = "0.9", features = ["link_qt_object_files"] }
 
 [dev-dependencies]
 git2.workspace = true
+# `front_end_equivalence` builds the repository the command line then runs
+# against, through the same fixtures the command line's own tests use, so the
+# two front ends are compared over identical ground. Dev-only.
+harkness-test-fixtures.workspace = true
 tempfile.workspace = true
 time.workspace = true

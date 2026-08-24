@@ -1352,11 +1352,6 @@ impl Tool for NoOpTool {
 fn registry_lookup_and_dispatch_overhead_stay_within_issue_budgets() {
     use std::time::{Duration, Instant};
 
-    assert!(
-        !std::hint::black_box(cfg!(debug_assertions)),
-        "the dispatch overhead benchmark must run with --release"
-    );
-
     let harness = Harness::new();
     let mut registry = ToolRegistry::new();
     register_read_only_tools(&mut registry).unwrap();
@@ -1381,22 +1376,15 @@ fn registry_lookup_and_dispatch_overhead_stay_within_issue_budgets() {
     }
     let dispatch_average = started.elapsed() / 1000;
 
-    // Printed rather than eprintln!'d so `--nocapture` in CI records it.
-    println!(
-        "lookup={lookup_average:?} dispatch={dispatch_average:?} os={} arch={} parallelism={}",
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        std::thread::available_parallelism()
-            .map(|count| count.get())
-            .unwrap_or(0),
+    harkness_test_fixtures::latency::record(
+        "tools::read_registry_lookup",
+        lookup_average,
+        Duration::from_millis(1),
     );
-    assert!(
-        lookup_average < Duration::from_millis(1),
-        "registry lookup took {lookup_average:?}"
-    );
-    assert!(
-        dispatch_average < Duration::from_millis(10),
-        "dispatch overhead took {dispatch_average:?}"
+    harkness_test_fixtures::latency::record(
+        "tools::read_dispatch_overhead",
+        dispatch_average,
+        Duration::from_millis(10),
     );
 }
 

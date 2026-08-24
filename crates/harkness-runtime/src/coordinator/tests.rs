@@ -1876,10 +1876,6 @@ fn oversized_panic_fault_is_bounded_before_every_cleanup_transition() {
 #[test]
 #[ignore = "latency target; meaningful only in a release build"]
 fn approval_decision_to_tool_dispatch_stays_below_ten_milliseconds() {
-    assert!(
-        !std::hint::black_box(cfg!(debug_assertions)),
-        "the dispatch latency benchmark must run with --release"
-    );
     let mut samples = Vec::new();
     for index in 0..9 {
         let fixture = Fixture::new();
@@ -1938,15 +1934,14 @@ fn approval_decision_to_tool_dispatch_stays_below_ten_milliseconds() {
         .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
         .map(|name| name.trim().to_owned())
         .unwrap_or_else(|| "machine unavailable".to_owned());
-    println!(
-        "decision-to-dispatch samples={samples:?}; median={median:?}; {rustc}; {}-{}; parallelism={}; cpu={cpu}; machine={machine}",
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        thread::available_parallelism().map_or(0, std::num::NonZero::get),
-    );
-    assert!(
-        median < Duration::from_millis(10),
-        "median dispatch took {median:?}; samples={samples:?}"
+    // The shared recorder carries the platform, the parallelism and the
+    // profile; what only this measurement knows is the spread of its samples
+    // and the toolchain and machine they were taken on.
+    println!("decision-to-dispatch samples={samples:?}; {rustc}; cpu={cpu}; machine={machine}");
+    harkness_test_fixtures::latency::record(
+        "coordinator::approval_decision_to_dispatch",
+        median,
+        Duration::from_millis(10),
     );
 }
 

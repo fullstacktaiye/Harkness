@@ -20,3 +20,12 @@ harkness-git.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+# Dev-only, and only for `latency::record`: every latency target in the
+# workspace prints the same machine-readable line and binds its budget in the
+# same profile, which is a rule one shared recorder can hold and nine copies
+# cannot. The manifest checks in `src/lib.rs` list what this crate may not name,
+# and the fixtures crate — which depends on nothing but `git2` and `tempfile` —
+# is not among them.
+[dev-dependencies]
+harkness-test-fixtures.workspace = true

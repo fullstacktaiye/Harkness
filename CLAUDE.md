@@ -25,11 +25,17 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo doc --locked -p harkness-runtime --no-deps    # CI runs this with RUSTDOCFLAGS=-D warnings
 cargo run -p harkness-cli
 cargo run -p harkness-gui
+sh .github/scripts/verify-suite-mapping.sh      # docs/verification-suite.md vs the binaries
 ```
 
 Clippy and any `--all-targets` build require Qt 6 / KDE Frameworks 6, because `harkness-gui`'s
 build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing links the GUI. Set
 `QMAKE` if more than one Qt is installed. Fedora setup is in `README.md`.
+
+`cargo test --workspace` is the invocation the suite is written against, and one test needs it
+specifically: `harkness-gui`'s `front_end_equivalence` drives the real `harkness` binary, which only
+a workspace-wide build produces. `cargo build -p harkness-cli` first, or point `HARKNESS_CLI_BIN` at
+one, if you are running that crate alone.
 
 ### Ignored tests
 
@@ -76,7 +82,10 @@ build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing lin
   hand-written scenario. It still cannot invent one — a fixture that does not parse is not
   rewritten.
 - **Latency targets** (`store/tests.rs`, `tool/tests.rs`, `assemble/assembler.rs`,
-  `harkness-runtime/tests/diagnostics_overhead.rs`): meaningful only under `--release`. The
+  `harkness-runtime/tests/diagnostics_overhead.rs`): meaningful only under `--release`. Every one of
+  them reports through `harkness_test_fixtures::latency::record`, which prints the machine beside
+  the number and binds the budget only where `debug_assertions` is off — so a debug run records a
+  measurement instead of failing on one. `docs/verification-suite.md` lists them with their budgets. The
   diagnostics one is separate from `tool::execution_tests`'s on purpose: that measures an executor in
   a process where no subscriber is installed, where `tracing` is close to free, so it says nothing
   about the arrangement that ships. `diagnostics_overhead` installs the real subscriber — JSON
