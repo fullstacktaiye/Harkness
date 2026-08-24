@@ -64,6 +64,14 @@ shlex = "2.0.1"
 tempfile = "3.27"
 thiserror = "2.0"
 time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde-human-readable", "serde-well-known"] }
+# The diagnostic spine. `tracing` is the instrumentation vocabulary any crate may
+# use; `tracing-subscriber` is machinery only `harkness-runtime`'s `observe`
+# module assembles, and its default features are off deliberately. `ansi` would
+# colour a file nothing reads as a terminal, and `tracing-log` would adopt the
+# `log` records of dependencies that never agreed to Harkness's redaction
+# boundary — a diagnostic log is only as trustworthy as its narrowest writer.
+tracing = { version = "0.1", default-features = false, features = ["attributes", "std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "json", "registry", "smallvec", "std"] }
 uuid = { version = "1.24", features = ["serde", "v4", "v5"] }
 windows-sys = { version = "0.61", features = [
     "Wdk_Storage_FileSystem",

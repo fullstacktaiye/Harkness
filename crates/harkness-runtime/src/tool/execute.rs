@@ -131,6 +131,7 @@ use time::OffsetDateTime;
 
 use crate::approval::InputHash;
 use crate::domain::{Failure, RunId, StepId, ToolCall, ToolCallId, ToolCallState};
+use crate::observe;
 use crate::store::{EventKind, RunEvent, Store, StoreArtifacts, StoreError};
 
 use super::context::ExecutionControl;
@@ -312,6 +313,22 @@ impl CallOutcome {
         match self {
             Self::Failed { failure } => Some(failure.kind()),
             _ => None,
+        }
+    }
+
+    /// One machine-filterable word naming how the call ended.
+    ///
+    /// The terminal state's own spelling wherever there is one, so a diagnostic
+    /// line and the `tool_calls.state` column it describes agree, and a log
+    /// filtered on `outcome = "timed_out"` finds the same calls a query would.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Succeeded { .. } => ToolCallState::Succeeded.as_str(),
+            Self::Failed { .. } => ToolCallState::Failed.as_str(),
+            Self::Cancelled => ToolCallState::Cancelled.as_str(),
+            Self::Interrupted => ToolCallState::Interrupted.as_str(),
+            Self::TimedOut { .. } => "timed_out",
         }
     }
 }
@@ -905,16 +922,56 @@ impl ToolExecutor {
             let _ = finished.send(invoke_resolved(&tool, &input, &mut context));
         });
 
-        let outcome = self.supervise(Supervised {
-            run_id,
-            call,
-            step,
-            awaiting: &awaiting,
-            reports: &reports,
-            caller: cancellation,
-            call_token: &call_token,
-            control: &control,
-            deadline,
+        // One span for the whole supervised call, and exactly one — the poll
+        // loop inside `supervise` opens none, because a span every 20 ms would
+        // spend the entire per-call overhead budget on describing the wait.
+        let span = observe::tool_call_span(run_id, step, call, &identity);
+        let outcome = span.in_scope(|| {
+            let outcome = self.supervise(Supervised {
+                run_id,
+                call,
+                step,
+                awaiting: &awaiting,
+                reports: &reports,
+                caller: cancellation,
+                call_token: &call_token,
+                control: &control,
+                deadline,
+            });
+            // Reported from inside the span so the line carries it, and with the
+            // correlation fields repeated anyway: this runs on a scheduler
+            // thread that never entered the run's own span, so inheritance would
+            // supply nothing.
+            //
+            // A failure carries its detail as well as its kind. That is
+            // tool-controlled text, and it is the reason `observe::log` wraps
+            // the writer rather than trusting instrumentation sites like this
+            // one: reconstructing a two-in-the-morning failure needs what the
+            // tool actually said, and behind the redactor is the one place it is
+            // safe to say it.
+            match &outcome {
+                CallOutcome::Failed { failure } => tracing::warn!(
+                    run_id = %run_id,
+                    step_id = %step,
+                    tool_call_id = %call,
+                    tool_id = %identity.id,
+                    tool_version = %identity.version,
+                    outcome = outcome.as_str(),
+                    failure_kind = failure.kind(),
+                    failure = %failure.message(),
+                    "tool call failed"
+                ),
+                _ => tracing::info!(
+                    run_id = %run_id,
+                    step_id = %step,
+                    tool_call_id = %call,
+                    tool_id = %identity.id,
+                    tool_version = %identity.version,
+                    outcome = outcome.as_str(),
+                    "tool call finished"
+                ),
+            }
+            outcome
         });
         self.finish(call, step, Some(identity), outcome)
     }

@@ -57,6 +57,7 @@ use crate::approval::{
 use crate::domain::{
     ExecutionState, Failure, Run, RunId, Step, StepId, Task, TaskId, ToolCall, ToolCallState,
 };
+use crate::observe;
 use crate::policy::{PolicyEngine, PolicyRequest, PolicyVerdict};
 use crate::schedule::{ScheduledCall, Scheduler, WorkspaceKey};
 use crate::store::{
@@ -224,6 +225,18 @@ impl RunCoordinator {
         let now = OffsetDateTime::now_utc();
         let lease = RuntimeLease::acquire(store.data_dir(), now)?;
         let report = recovery::sweep(&store, &approvals, &lease, now)?;
+        // Counts rather than a list of identifiers: a sweep after a crash can
+        // touch hundreds of runs, and the per-run detail is already in each
+        // run's own timeline. What a log is for here is noticing that a sweep
+        // happened at all.
+        tracing::info!(
+            lease_id = %lease.id(),
+            interrupted_runs = report.interrupted_runs().len(),
+            expired_approvals = report.expired_approvals().len(),
+            failures = report.failures().len(),
+            contended = report.was_contended(),
+            "recovery sweep complete"
+        );
         let inner = Arc::new(CoordinatorInner {
             store,
             registry,
@@ -673,6 +686,7 @@ impl RunCoordinator {
             .get(&run)
             .map(|active| active.cancellation.clone())
             .ok_or(RuntimeError::RunNotActive { run })?;
+        tracing::info!(run_id = %run, "cancellation requested");
         cancellation.cancel();
         self.inner.scheduler.cancel_run(run);
 
@@ -712,6 +726,13 @@ impl RunCoordinator {
             return Err(RuntimeError::ApprovalNotActive { approval });
         }
         let (resolved, _) = self.inner.store.decide_approval(approval, decision)?;
+        tracing::info!(
+            run_id = %run,
+            tool_call_id = %resolved.tool_call_id(),
+            approval_id = %approval,
+            verdict = resolved.state().as_str(),
+            "approval decided"
+        );
         self.inner.approvals.resolve_from(&resolved);
         self.publish(run)?;
         Ok(())
@@ -1051,6 +1072,13 @@ impl RunWorker {
     }
 
     fn drive(mut self) {
+        // The worker's whole life happens inside one span, on the thread that
+        // owns the run. Everything it opens beneath this — a step, a tool call,
+        // an approval wait — names `run_id` itself as well, because the executor
+        // and the scheduler do their work on other threads and would otherwise
+        // lose the only field that makes the log searchable.
+        let span = observe::run_span(self.run);
+        let _entered = span.enter();
         self.inner
             .store
             .set_run_owner(self.run, Some(std::process::id()))
@@ -1086,6 +1114,12 @@ impl RunWorker {
             )
             .map_err(store_fault)?;
         self.publish()?;
+        tracing::info!(
+            run_id = %self.run,
+            task_id = %self.task.id(),
+            state = "running",
+            "run started"
+        );
 
         let mut observation = Observation::RunStarted {
             task: TaskRef::from_task(&self.task, &**self.inner.store.redactor()),
@@ -1142,6 +1176,7 @@ impl RunWorker {
                         )
                         .map_err(store_fault)?;
                     self.publish()?;
+                    tracing::info!(run_id = %self.run, state = "succeeded", "run finished");
                     return Ok(());
                 }
                 AgentAction::FailRun { reason } => {
@@ -1159,6 +1194,12 @@ impl RunWorker {
                         )
                         .map_err(store_fault)?;
                     self.publish()?;
+                    tracing::warn!(
+                        run_id = %self.run,
+                        state = "failed",
+                        kind = reason.kind(),
+                        "the agent failed the run"
+                    );
                     return Ok(());
                 }
             }
@@ -1286,6 +1327,20 @@ impl RunWorker {
             at,
         );
         let call_id = call.id();
+        // Opened around the whole dispatch, so policy, approval and admission
+        // events all land under the step and call they belong to. The fields are
+        // repeated rather than inherited for the reason `observe` documents:
+        // the executor supervises on another thread entirely.
+        let step_span = observe::step_span(self.run, step.id());
+        let _entered = step_span.enter();
+        tracing::debug!(
+            run_id = %self.run,
+            step_id = %step.id(),
+            tool_call_id = %call_id,
+            tool_id = %tool_id,
+            tool_version = %tool_version,
+            "tool requested"
+        );
         self.inner
             .store
             .insert_tool_call(&call)
@@ -1398,6 +1453,19 @@ impl RunWorker {
             )
             .map_err(store_fault)?;
         self.publish()?;
+        // The one event that says why a call did or did not run. `decision` is
+        // a field rather than prose so a log can be filtered to every `ask` in a
+        // run without matching on a sentence somebody may reword.
+        tracing::info!(
+            run_id = %self.run,
+            step_id = %step.id(),
+            tool_call_id = %call_id,
+            tool_id = %identity.id,
+            tool_version = %identity.version,
+            decision = decision.verdict().as_str(),
+            risk = risk.as_str(),
+            "policy decided"
+        );
 
         match decision.verdict() {
             PolicyVerdict::Allow => self.execute_scheduled(step, call_id, risk, None),
@@ -1498,6 +1566,7 @@ impl RunWorker {
         .summarized_as(format!("request to run {identity}"));
         let request = ApprovalRequest::open(pending)
             .map_err(|error| WorkerFault::new(error.kind(), error.to_string()))?;
+        let approval_id = request.id();
         let ticket = self.inner.approvals.ticket(request.id()).ok_or_else(|| {
             WorkerFault::new("approval_waiter_exists", "approval already has a waiter")
         })?;
@@ -1517,6 +1586,19 @@ impl RunWorker {
             .map_err(store_fault)?;
         self.publish()?;
 
+        // A span rather than a pair of events, because how long a run waited on
+        // a person is one of the few durations worth reading straight off a log,
+        // and two events make a reader compute it.
+        let waiting = observe::approval_span(self.run, call, approval_id);
+        let _entered = waiting.enter();
+        tracing::info!(
+            run_id = %self.run,
+            tool_call_id = %call,
+            approval_id = %approval_id,
+            requested_scope = requested_scope.as_str(),
+            risk = risk.as_str(),
+            "waiting for an approval decision"
+        );
         self.wait_approval_ticket(ticket, step, call, input_hash, binding, identity, risk)
     }
 
@@ -1882,6 +1964,16 @@ impl RunWorker {
     }
 
     fn record_fault(&self, fault: WorkerFault) {
+        // The message is instrumentation content rather than a structured value,
+        // so it reaches the log through the same redactor the store applies —
+        // see `observe::log`, which wraps the writer rather than trusting call
+        // sites like this one.
+        tracing::error!(
+            run_id = %self.run,
+            kind = fault.kind,
+            message = %fault.message,
+            "the coordinator failed the run"
+        );
         let at = OffsetDateTime::now_utc();
         for request in self.inner.store.run_approvals(self.run).unwrap_or_default() {
             if request.state() == ApprovalState::Pending

@@ -118,7 +118,7 @@ fn run(
         Some(project.id),
         OffsetDateTime::now_utc(),
     );
-    let workspace = workspace_ref(&task);
+    let workspace = workspace_ref(coordinator.store(), &task);
     let task_id = coordinator.start_task(task).map_err(CliError::Runtime)?;
     let run_id = coordinator
         .start_run_with_workspace_metadata(

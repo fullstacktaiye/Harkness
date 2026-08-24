@@ -46,6 +46,7 @@ use harkness_runtime::{
     canonical_json,
     check::{CheckOutcome, CheckSummary, check_coordinator, project_checks, run_configured_check},
     coordinator::RuntimeError,
+    observe,
     policy::EXTERNAL_POLICY_DENIAL_KINDS,
     store::{Store, StoreError},
     tool::InvocationError,
@@ -121,6 +122,14 @@ struct Cli {
     /// Use an explicit Harkness data directory instead of HARKNESS_DATA_DIR.
     #[arg(long, global = true, value_name = "PATH")]
     data_dir: Option<PathBuf>,
+
+    /// Mirror the diagnostic log to standard error, one JSON object per line.
+    ///
+    /// The same lines the log file receives, in the same rendering, so what this
+    /// shows is exactly what was recorded. `HARKNESS_LOG` chooses the level and
+    /// `HARKNESS_LOG_STDERR` turns the mirror on without a flag.
+    #[arg(long, global = true)]
+    verbose: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -1971,8 +1980,21 @@ fn run(cli: Cli, cancellation: &Cancellation) -> Result<CommandResult, CliError>
     let Cli {
         json,
         data_dir,
+        verbose,
         command,
     } = cli;
+    // Installed before any command body, so a span opened deep in the runtime
+    // has somewhere to go. The log file itself is created by the first line
+    // rather than by this call, which is what keeps `harkness project list`
+    // against a data directory that does not exist from bringing one into
+    // being — the same promise `Store::open_existing` makes about `runtime.db`.
+    let _ = observe::init(
+        data_dir
+            .clone()
+            .or_else(harkness_core::data_directory)
+            .as_deref(),
+        observe::Options::default().mirror_to_stderr(verbose),
+    );
     match command {
         Command::Project { command } => {
             run_project(command, data_dir.as_deref(), json, cancellation)

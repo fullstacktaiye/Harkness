@@ -6,11 +6,17 @@
 //! durable, so scrubbing has to happen *before* persistence rather than at each
 //! display site, where one forgotten renderer leaks everything.
 //!
-//! This module supplies the hook, not the rules. The default
-//! [`PassThrough`] does nothing, which is deliberate: the point of landing the
-//! hook first is that every write path already routes through it, so supplying
-//! real rules later is a change in one place instead of an audit of every
-//! caller.
+//! This module supplies the hook, not the rules. The rules are
+//! [`StandardRedactor`](crate::observe::StandardRedactor), which
+//! [`Store::open`](super::Store::open) installs, and they live in
+//! [`observe`](crate::observe) because the same rules have to reach a diagnostic
+//! log line this store never sees. Landing the hook first is what made that a
+//! change in one place rather than an audit of every caller.
+//!
+//! [`PassThrough`] remains for the one thing it is genuinely good for: a test
+//! that wants to read back exactly what it wrote. It is no longer the default,
+//! and making it one again would mean a front end could persist a credential by
+//! forgetting to opt in.
 //!
 //! # Two methods because there are two shapes
 //!
@@ -72,9 +78,11 @@ pub trait Redactor: fmt::Debug + Send + Sync {
 
 /// The redactor that changes nothing.
 ///
-/// The v0.3 default. It exists so the hook can be mandatory before any rules
-/// are written: a store built with it behaves exactly as one with no redaction
-/// at all, while every write path is already committed to going through one.
+/// Not the default — [`Store::open`](super::Store::open) installs
+/// [`StandardRedactor`](crate::observe::StandardRedactor). This exists for a
+/// test that needs to read back the exact bytes it wrote, and for the assertion
+/// that the hook itself is what every write path goes through, independently of
+/// what any particular rule does.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PassThrough;
 

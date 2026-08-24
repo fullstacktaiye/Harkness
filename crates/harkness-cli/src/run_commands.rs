@@ -389,7 +389,7 @@ fn retry(
         arguments.trust_workspace,
         "re-attempting a run",
     )?;
-    let workspace = workspace_ref(&task);
+    let workspace = workspace_ref(coordinator.store(), &task);
     let run_id = coordinator
         .retry_run_with_workspace_metadata(
             original,

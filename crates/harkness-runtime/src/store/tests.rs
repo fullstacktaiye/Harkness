@@ -2923,6 +2923,147 @@ fn artifact_files_are_readable_only_by_their_owner() {
 
 // -- redaction ---------------------------------------------------------------
 
+/// A URL whose userinfo the standard rules recognize.
+const LEAKY_URL: &str = "https://user:hunter2@example.com/repo.git";
+
+#[test]
+fn an_opened_store_scrubs_without_being_asked_to() {
+    let fixture = Fixture::new();
+    let task = Task::with_id(
+        TaskId::from_str(FIXTURE_TASK_ID).unwrap(),
+        format!("clone {LEAKY_URL}"),
+        "/workspace/harkness",
+        None,
+        at(0),
+    );
+
+    fixture.store.insert_task(&task).unwrap();
+
+    let stored = fixture.store.load_task(task.id()).unwrap();
+    assert!(
+        !stored.title().contains("hunter2"),
+        "Store::open must install real rules, not PassThrough: {}",
+        stored.title()
+    );
+    assert!(stored.title().contains("«redacted:url_userinfo»"));
+    assert_eq!(
+        stored.workspace_root(),
+        task.workspace_root(),
+        "a workspace root is a filesystem identity this store compares and canonicalizes"
+    );
+}
+
+#[test]
+fn a_result_and_a_failure_are_scrubbed_before_they_become_columns() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = stored_step(&fixture.store, &run);
+    let succeeding = stored_tool_call(&fixture.store, &step);
+    let failing = ToolCall::new(
+        &step,
+        "fs.read",
+        "1.0.0",
+        json!({"path": "src/lib.rs"}),
+        at(4),
+    );
+    fixture.store.insert_tool_call(&failing).unwrap();
+
+    fixture
+        .store
+        .transition_tool_call(succeeding.id(), ToolCallState::Running, at(5))
+        .unwrap();
+    fixture
+        .store
+        .succeed_tool_call(succeeding.id(), json!({"remote": LEAKY_URL}), at(6))
+        .unwrap();
+    fixture
+        .store
+        .transition_tool_call(failing.id(), ToolCallState::Running, at(7))
+        .unwrap();
+    fixture
+        .store
+        .fail_tool_call(
+            failing.id(),
+            Failure::new("not_found", format!("could not reach {LEAKY_URL}")),
+            at(8),
+        )
+        .unwrap();
+    fixture
+        .store
+        .fail_step(
+            step.id(),
+            Failure::new("tool", format!("at {LEAKY_URL}")),
+            at(9),
+        )
+        .unwrap();
+
+    let output = fixture
+        .store
+        .load_tool_call(succeeding.id())
+        .unwrap()
+        .output()
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        output["remote"],
+        "https://«redacted:url_userinfo»@example.com/repo.git"
+    );
+
+    let failed = fixture.store.load_tool_call(failing.id()).unwrap();
+    let failure = failed.failure().unwrap();
+    assert_eq!(
+        failure.kind(),
+        "not_found",
+        "the kind is a machine identifier this build chose; only the detail can leak"
+    );
+    assert!(
+        !failure.message().contains("hunter2"),
+        "{}",
+        failure.message()
+    );
+
+    let step_failure = fixture.store.load_step(step.id()).unwrap();
+    assert!(
+        !step_failure
+            .failure()
+            .unwrap()
+            .message()
+            .contains("hunter2")
+    );
+}
+
+#[test]
+fn a_tool_call_input_is_stored_exactly_as_the_caller_wrote_it() {
+    let fixture = Fixture::new();
+    let task = stored_task(&fixture.store);
+    let run = stored_run(&fixture.store, &task);
+    let step = stored_step(&fixture.store, &run);
+    let call = ToolCall::new(
+        &step,
+        "git.fetch",
+        "1.0.0",
+        json!({"remote": LEAKY_URL}),
+        at(4),
+    );
+    fixture.store.insert_tool_call(&call).unwrap();
+
+    let stored = fixture.store.load_tool_call(call.id()).unwrap();
+
+    // This is a *boundary*, not an oversight, and it is pinned here so that
+    // closing it has to be a deliberate change rather than a tidy-up. The
+    // executor reads these bytes back and runs them, and an approval's hash is
+    // taken over them: a rewritten input would run a different command than the
+    // one that was approved, against a record that no longer matches the
+    // decision made about it. `observe`'s coverage table says so where a tool
+    // author reads, and the answer is a declared environment variable.
+    assert_eq!(
+        stored.input(),
+        &json!({"remote": LEAKY_URL}),
+        "redacting an input would change what the executor runs"
+    );
+}
+
 #[test]
 fn every_event_payload_and_artifact_byte_passes_through_the_redactor() {
     let fixture = Fixture::redacting(Arc::new(Shouting));

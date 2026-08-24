@@ -14,6 +14,15 @@ use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QString, QUrl};
 const MAIN_QML_URL: &str = "qrc:/qt/qml/io/github/fullstacktaiye/harkness/qml/Main.qml";
 
 fn main() {
+    // Before anything opens a store or takes a lease, so a run this window
+    // starts is traceable from its first span. `HARKNESS_LOG_STDERR` is the
+    // switch here: a windowed application has no `--verbose` to type, and the
+    // log file is where a user is told to look either way.
+    let _ = harkness_runtime::observe::init(
+        harkness_core::data_directory().as_deref(),
+        harkness_runtime::observe::Options::default(),
+    );
+
     // Force-links the statically compiled QML module so its types register.
     cxx_qt::init_qml_module!("io.github.fullstacktaiye.harkness");
 
