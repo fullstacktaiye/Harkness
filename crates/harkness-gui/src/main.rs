@@ -524,6 +524,8 @@ Kirigami.ApplicationWindow {
     property int pendingGrabs: 0
     property bool grabbing: false
     property var openedPage: null
+    property string excerptableArtifact: ""
+    property bool overlapIssued: false
 
     /// Where to write the pages as images, or empty to write none.
     ///
@@ -641,6 +643,12 @@ Kirigami.ApplicationWindow {
         }
     }
 
+    // A bridge of its own, so the overlapping-load check drives it without
+    // disturbing the page the earlier phases asserted against.
+    RunsBackend {
+        id: overlap
+    }
+
     // The shell's Runs view, which reaches a page only through `openRun`.
     RunsPanel {
         id: runsPanel
@@ -722,8 +730,10 @@ Kirigami.ApplicationWindow {
                     ++available;
                 if (String(artifact.availability) === "missing")
                     ++missing;
-                if (artifact.excerptable === true)
+                if (artifact.excerptable === true) {
                     ++excerptable;
+                    window.excerptableArtifact = String(artifact.artifactId);
+                }
                 check("everyArtifactRowNamesItsMediaType",
                       String(artifact.mediaType).length > 0);
                 check("everyArtifactRowNamesWhereItsBytesAre",
@@ -855,13 +865,41 @@ Kirigami.ApplicationWindow {
             launcherPane.runActivated(failedRun);
             check("bothEntryPointsOpenOneDetailPageForOneRun",
                   detail === openedPage && detail.runId === failedRun);
-            // Every grab is asynchronous, so the loop ends when the last of
-            // them has written its file rather than when the last check ran.
             next(8);
             return;
         }
 
         if (phase === 8) {
+            // Two questions of different kinds, issued back to back on the Qt
+            // thread so the run detail is unambiguously the newer of them. A
+            // bridge counting staleness once for all three answer properties
+            // drops the excerpt's reply here, leaving the row that asked for it
+            // expanded, empty, and reporting no failure.
+            if (!overlapIssued) {
+                overlapIssued = true;
+                overlap.loadArtifactExcerpt(window.excerptableArtifact);
+                overlap.loadRun(failedRun);
+                return;
+            }
+            if (overlap.busy)
+                return;
+            check("anOverlappedLoadStillAnswersItsOwnQuestion",
+                  overlap.excerpt !== undefined && overlap.excerpt !== null
+                  && String(overlap.excerpt.artifactId) === window.excerptableArtifact);
+            check("theNewerOfTwoOverlappingLoadsAnswersAsWell",
+                  overlap.run !== undefined && overlap.run !== null
+                  && String(overlap.run.runId) === failedRun);
+            // The shared status describes the operation issued last, which is
+            // the one the reader would be watching.
+            check("theSharedStatusDescribesTheNewestOperation",
+                  String(overlap.status).indexOf(failedRun) !== -1);
+            // Every grab is asynchronous, so the loop ends when the last of
+            // them has written its file rather than when the last check ran.
+            next(9);
+            return;
+        }
+
+        if (phase === 9) {
             if (pendingGrabs > 0)
                 return;
             finish();

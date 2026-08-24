@@ -49,10 +49,19 @@
 //!
 //! `next_request` is the same mechanism `HarknessBackend::next_review_request`
 //! is: every operation takes the next number, and a reply whose number is no
-//! longer the newest still clears its share of `busy` but never writes
-//! `status`, `kind`, or `detail`. Two operations overlapping otherwise let the
-//! slower one's message overwrite the faster one's, so the panel would report
-//! the outcome of the thing the user did *first*.
+//! longer the newest still clears its share of `busy` but never writes `status`
+//! or `kind`. Two operations overlapping otherwise let the slower one's message
+//! overwrite the faster one's, so the panel would report the outcome of the
+//! thing the user did *first*.
+//!
+//! The *answer* properties are counted separately, one watermark each. `status`
+//! is genuinely shared and a newer operation of any kind supersedes it; `run`,
+//! `detail` and `excerpt` are three different questions, and a header re-read
+//! landing while an artifact excerpt is still being read supersedes nothing
+//! about that excerpt. Measuring all four against one counter would drop the
+//! reply, leaving the row that asked expanded, empty, and reporting no failure.
+//! [`settlement`] is the rule, and it is a pure function so it can be tested
+//! without a Qt thread.
 //!
 //! # The error namespace
 //!
@@ -545,6 +554,15 @@ fn grant_scope(requested: &str, effective: ApprovalScope) -> Result<ApprovalScop
 /// question and leaving the previous one's validated input bound is the worst
 /// way for that property to be wrong. It does not clear `run` or `excerpt`,
 /// which are about the run the decision was made on.
+///
+/// This is also why staleness is counted *per answer* and not once for the
+/// bridge. Three independent questions share one counter only if every newer
+/// operation genuinely supersedes every older one, and here they do not: a
+/// header re-read arriving while an artifact excerpt is still being read says
+/// nothing about the excerpt, and dropping its reply would leave the row
+/// expanded, empty, and reporting no failure. Each slot therefore carries its
+/// own watermark — see [`settlement`] — while `status` and `kind`, which really
+/// are one shared pair, stay keyed on the newest operation of any kind.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Answer {
     /// A mutation: writes no answer of its own and clears `detail`.
@@ -555,6 +573,58 @@ pub(crate) enum Answer {
     RunDetail,
     /// `loadArtifactExcerpt`, which writes `excerpt`.
     ArtifactExcerpt,
+}
+
+/// How many answer properties an operation's staleness is tracked against.
+///
+/// Three, not four: `Decision` and `ApprovalInput` both write `detail`, so they
+/// supersede one another and share a slot.
+const ANSWER_SLOTS: usize = 3;
+
+impl Answer {
+    /// Which answer property this operation writes, as an index into
+    /// [`RunsBackendRust::newest`].
+    fn slot(self) -> usize {
+        match self {
+            Self::Decision | Self::ApprovalInput => 0,
+            Self::RunDetail => 1,
+            Self::ArtifactExcerpt => 2,
+        }
+    }
+}
+
+/// What one settling reply is still entitled to write.
+///
+/// Two questions rather than one, because this bridge answers three independent
+/// questions about three different identifiers and reports *one* status. A
+/// reply that is no longer the newest operation of any kind must not describe
+/// itself in `status` — the panel would report the outcome of the thing the
+/// user did first — but it is still the only answer its own question is ever
+/// going to get, and dropping it leaves an empty panel with nothing said about
+/// why.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Settlement {
+    /// Whether this reply is still the newest question of its own kind, and so
+    /// may write the one answer property it owns.
+    pub(crate) answer: bool,
+    /// Whether it is the newest operation of any kind, and so may write the
+    /// single `status`/`kind` pair the three of them share.
+    pub(crate) status: bool,
+}
+
+/// Decides what a reply may write, from the two watermarks it is measured
+/// against.
+///
+/// Split out and pure so the rule is testable: `settle` needs a pinned
+/// `QObject` and a running Qt thread, and the rule is the part that is easy to
+/// get wrong. `status` implies `answer` — the newest operation overall is by
+/// construction the newest of its own kind — so the two are never both false
+/// for a reply that still matters.
+pub(crate) fn settlement(request: u64, newest_for_answer: u64, newest_overall: u64) -> Settlement {
+    Settlement {
+        answer: request == newest_for_answer,
+        status: request == newest_overall,
+    }
 }
 
 /// The answer one finished operation produced, if it produced one.
@@ -732,7 +802,8 @@ pub(crate) struct RunDetail {
     /// The runtime's own discriminants, because this is a read of the state
     /// `RunCoordinator::retry_run` refuses on rather than a second opinion.
     retry_blocked: &'static str,
-    /// Later attempts at the same task, newest information first.
+    /// Later attempts at the same task, oldest first — the order
+    /// `Store::retries_of` lists them in, which is the order they were made.
     retries: Vec<String>,
     steps: Vec<StepRow>,
     calls: Vec<CallRow>,
@@ -1178,6 +1249,10 @@ pub struct RunsBackendRust {
     excerpt: QVariant,
     /// Monotonic operation number; only the newest reply writes a message.
     next_request: u64,
+    /// The newest operation number issued against each answer property, indexed
+    /// by [`Answer::slot`]. A reply writes its answer only while it is still
+    /// the one this names.
+    newest: [u64; ANSWER_SLOTS],
     /// Operations still outstanding, which is what `busy` reports.
     pending: u32,
 }
@@ -1192,6 +1267,7 @@ impl Default for RunsBackendRust {
             run: QVariant::default(),
             excerpt: QVariant::default(),
             next_request: 0,
+            newest: [0; ANSWER_SLOTS],
             pending: 0,
         }
     }
@@ -1356,16 +1432,17 @@ fn settle(
     answer: Answer,
     outcome: Result<Completion, RunsFailure>,
 ) {
-    let newest = {
+    let settled = {
         let rust = backend.as_mut().rust_mut().get_mut();
         rust.pending = rust.pending.saturating_sub(1);
-        rust.next_request == request
+        settlement(request, rust.newest[answer.slot()], rust.next_request)
     };
     let busy = backend.as_ref().rust().pending > 0;
     backend.as_mut().set_busy(busy);
-    // A superseded reply still gave up its share of `busy`; what it must not do
-    // is describe the operation the user is currently watching.
-    if !newest {
+    // A reply superseded on its own question has nothing left to say: another
+    // load of the same kind is already on its way to the same property, and
+    // writing this one would show the older subject and then replace it.
+    if !settled.answer {
         return;
     }
     // Exactly one answer property is written, and only by the operation that
@@ -1398,6 +1475,13 @@ fn settle(
             };
             backend.as_mut().set_excerpt(excerpt);
         }
+    }
+    // `status` and `kind` are one pair shared by every operation, so only the
+    // newest of any kind may write them: two operations overlapping otherwise
+    // let the slower one's message overwrite the faster one's, and the panel
+    // would report the outcome of the thing the user did *first*.
+    if !settled.status {
+        return;
     }
     match outcome {
         Ok(completion) => {
@@ -1437,6 +1521,11 @@ impl ffi::RunsBackend {
             let rust = self.as_mut().rust_mut().get_mut();
             rust.next_request += 1;
             rust.pending += 1;
+            // Claims the answer property this operation owns as well as the
+            // shared status. Both watermarks are taken here, on the Qt thread,
+            // so the reply that eventually lands can be measured against the
+            // state that held when it was issued.
+            rust.newest[answer.slot()] = rust.next_request;
             rust.next_request
         };
         self.as_mut().set_busy(true);
@@ -1572,10 +1661,10 @@ mod tests {
     use harkness_runtime::store::{Store, StoreError};
 
     use super::{
-        Answered, BRIDGE_KINDS, MAX_APPROVAL_INPUT_BYTES, MAX_ARTIFACT_EXCERPT_BYTES,
+        Answer, Answered, BRIDGE_KINDS, MAX_APPROVAL_INPUT_BYTES, MAX_ARTIFACT_EXCERPT_BYTES,
         MAX_RUN_DETAIL_ROWS, RunDetail, RunsFailure, artifact_excerpt_in, bounded, clamp,
         grant_scope, is_renderable_text, optional_rfc3339, parse_approval, parse_artifact,
-        parse_run, retry_scenario, rfc3339, run_detail_in,
+        parse_run, retry_scenario, rfc3339, run_detail_in, settlement,
     };
 
     fn at(seconds: i64) -> OffsetDateTime {
@@ -1650,6 +1739,87 @@ mod tests {
 
         for kind in BRIDGE_KINDS {
             assert!(seen.insert(kind), "{kind} is declared twice");
+        }
+    }
+
+    // -- what a settling reply may write -----------------------------------
+
+    #[test]
+    fn a_decision_and_an_approval_input_share_the_property_they_both_write() {
+        assert_eq!(Answer::Decision.slot(), Answer::ApprovalInput.slot());
+    }
+
+    #[test]
+    fn the_three_answer_properties_are_counted_apart() {
+        let slots = [
+            Answer::ApprovalInput.slot(),
+            Answer::RunDetail.slot(),
+            Answer::ArtifactExcerpt.slot(),
+        ];
+
+        let distinct: std::collections::HashSet<usize> = slots.into_iter().collect();
+
+        assert_eq!(
+            distinct.len(),
+            3,
+            "{slots:?} does not name three properties"
+        );
+        assert!(
+            slots.iter().all(|slot| *slot < super::ANSWER_SLOTS),
+            "{slots:?} indexes past the watermarks"
+        );
+    }
+
+    #[test]
+    fn the_newest_operation_of_all_writes_both_its_answer_and_the_status() {
+        let settled = settlement(7, 7, 7);
+
+        assert!(settled.answer);
+        assert!(settled.status);
+    }
+
+    #[test]
+    fn a_load_still_answers_its_own_question_when_another_kind_overtook_it() {
+        // The header re-read a live run schedules is issued after the excerpt
+        // the reader asked for and settles first. It says nothing about the
+        // excerpt, so the excerpt still lands on the row that asked for it.
+        let settled = settlement(7, 7, 9);
+
+        assert!(
+            settled.answer,
+            "the excerpt is still the newest of its kind"
+        );
+        assert!(
+            !settled.status,
+            "but the message belongs to the operation the reader did last"
+        );
+    }
+
+    #[test]
+    fn a_load_superseded_by_another_of_its_own_kind_writes_nothing() {
+        let settled = settlement(7, 9, 9);
+
+        assert!(!settled.answer);
+        assert!(!settled.status);
+    }
+
+    #[test]
+    fn the_status_is_never_written_by_a_reply_that_may_not_write_its_answer() {
+        // A slot's watermark is a value `next_request` held at some point, so
+        // it can never run ahead of it; the combinations where it does are not
+        // states `dispatch_answering` can produce.
+        for request in 0..4u64 {
+            for newest_overall in request..4u64 {
+                for newest_for_answer in request..=newest_overall {
+                    let settled = settlement(request, newest_for_answer, newest_overall);
+
+                    assert!(
+                        !settled.status || settled.answer,
+                        "{request}/{newest_for_answer}/{newest_overall} would describe an \
+                         operation whose answer was already superseded"
+                    );
+                }
+            }
         }
     }
 

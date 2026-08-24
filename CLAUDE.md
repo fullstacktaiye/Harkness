@@ -365,7 +365,12 @@ and every new bridge file — must be added to `build.rs`'s lists.
   are filled by `loadApprovalInput`, `loadRun` and `loadArtifactExcerpt` respectively, and each is
   written only by the loader that answers it — cancelling the run a page is showing must not blank
   the page it was pressed from. A *decision* additionally clears `detail`, because approving or
-  denying changes which approval is in question.
+  denying changes which approval is in question. Staleness is therefore counted **per answer**:
+  one watermark per property, plus `next_request` for the `status`/`kind` pair the three share.
+  Measuring all of them against the one counter drops the reply of any load a newer operation of a
+  *different* kind overtakes — a header re-read landing while an artifact excerpt is still being
+  read supersedes nothing about that excerpt — and leaves the row that asked expanded, empty, and
+  reporting no failure. `settlement` is the rule and is pure, so it is tested without a Qt thread.
 - **`RunTimelineModel` folds consecutive `tool_progress` events of one call into one row.** It is
   presentation, not redaction: nothing leaves the log, the row carries the count, and `harkness run
   show` still prints every tick. The folded row remembers its oldest absorbed sequence as well as
