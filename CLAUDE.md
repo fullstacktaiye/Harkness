@@ -25,7 +25,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo doc --locked -p harkness-runtime --no-deps    # CI runs this with RUSTDOCFLAGS=-D warnings
 cargo run -p harkness-cli
 cargo run -p harkness-gui
+cargo run -p harkness-runtime --example word_count_tool   # docs/tool-authoring.md's example
 sh .github/scripts/verify-suite-mapping.sh      # docs/verification-suite.md vs the binaries
+sh .github/scripts/verify-doc-references.sh     # the v0.3 documents vs the binaries
 ```
 
 Clippy and any `--all-targets` build require Qt 6 / KDE Frameworks 6, because `harkness-gui`'s
@@ -36,6 +38,17 @@ build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing lin
 specifically: `harkness-gui`'s `front_end_equivalence` drives the real `harkness` binary, which only
 a workspace-wide build produces. `cargo build -p harkness-cli` first, or point `HARKNESS_CLI_BIN` at
 one, if you are running that crate alone.
+
+### Documentation checks
+
+Three of them, and they are cheap enough to run before pushing a documentation change.
+`harkness-cli`'s `docs` test executes every `<!-- verified -->` block in `README.md` and the six
+v0.3 documents against a hermetic data directory, so a renamed flag or a moved exit code fails
+there. `harkness-runtime`'s `documentation` test compares `docs/tool-authoring.md`'s worked example
+against `examples/word_count_tool.rs` byte for byte and checks every cited path, link and heading
+anchor. `verify-doc-references.sh` checks the "What proves this" tables against
+`cargo test -- --list`, which is why it is a script rather than a test. `AGENTS.md`'s
+"Documentation Invariants" section is the normative statement of all three.
 
 ### Ignored tests
 
@@ -295,7 +308,7 @@ translating between two cancellation mechanisms.
   external-integration adapters, currently compile-clean skeletons whose only code is the test each
   one runs against its own `Cargo.toml`. They may depend on `harkness-git` and `harkness-core`,
   never on `harkness-runtime`, a front end, or one another; protocol wire types stay private to the
-  adapter that speaks them. `docs/adr/0009` through `docs/adr/0018` decide the layering, the
+  adapter that speaks them. ADR-0009 through ADR-0018, under `docs/adr/`, decide the layering, the
   protocol revisions, the transport seam, the trust shape, and the activity classes these crates
   are built against — read them before adding code here.
 - **`harkness-test-fixtures`** is dev-only: hermetic temp repos, process fixtures, and the

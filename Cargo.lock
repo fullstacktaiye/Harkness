@@ -874,6 +874,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "shlex",
  "tempfile",
  "time",
  "tracing",

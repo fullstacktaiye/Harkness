@@ -27,4 +27,8 @@ git2.workspace = true
 # installs as links to the running integration-test binary. Dev-only.
 harkness-test-fixtures.workspace = true
 serde_json.workspace = true
+# Splits the commands `tests/docs.rs` lifts out of README.md and docs/ the way a
+# POSIX shell would quote them. Dev-only: nothing in the product parses a
+# command line it did not construct itself.
+shlex.workspace = true
 tempfile.workspace = true
