@@ -71,6 +71,7 @@ use windows_sys::Win32::System::Threading::{
 use super::{
     ArtifactRef, ArtifactStream, ExecutionContext, POLL_INTERVAL, ProgressEvent, ToolError,
 };
+use crate::observe;
 use crate::trust::{AllowlistedEnv, CommandSpec, ContainedPath};
 
 /// Bytes read from a child's pipe in one go.
@@ -725,6 +726,29 @@ impl ToolProcess {
 
     /// Starts the child with the invocation policy every tool process carries.
     fn spawn(&self, context: &ExecutionContext) -> Result<SupervisedChild, ToolError> {
+        // This is the moment a secret leaves Harkness's control: from here the
+        // value can come back in the child's stdout, its stderr, an error
+        // quoting the command line, or the tool's own result — all of which are
+        // persisted. Declaring it before the spawn rather than after is what
+        // makes every one of those channels covered by the time there is
+        // anything to cover.
+        //
+        // Only the *names* are recorded. A name identifies which grant was
+        // exercised; the value is the thing this whole mechanism exists to keep
+        // out of the record.
+        let declared = observe::declare_environment_secrets(
+            &observe::SecretRegistry::process(),
+            self.environment.iter(),
+        );
+        if !declared.is_empty() {
+            tracing::debug!(
+                run_id = %context.run(),
+                step_id = %context.step(),
+                tool_call_id = %context.call(),
+                secrets = ?declared,
+                "declared environment secrets before spawning a child"
+            );
+        }
         // `ContainedPath` is a point-in-time proof. Re-resolve immediately
         // before launch so a symlink retargeted while a call awaited approval
         // cannot redirect the child's working directory outside its grant.

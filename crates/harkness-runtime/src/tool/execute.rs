@@ -119,6 +119,7 @@
 //! by a dead process from one still executing is a question about run ownership,
 //! and answering it is not this module's job.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -131,6 +132,7 @@ use time::OffsetDateTime;
 
 use crate::approval::InputHash;
 use crate::domain::{Failure, RunId, StepId, ToolCall, ToolCallId, ToolCallState};
+use crate::observe;
 use crate::store::{EventKind, RunEvent, Store, StoreArtifacts, StoreError};
 
 use super::context::ExecutionControl;
@@ -311,6 +313,41 @@ impl CallOutcome {
     pub fn failure_kind(&self) -> Option<&str> {
         match self {
             Self::Failed { failure } => Some(failure.kind()),
+            _ => None,
+        }
+    }
+
+    /// The [`ToolCallState`] this outcome is recorded as.
+    ///
+    /// A timeout has no state of its own — it is persisted as `failed` carrying
+    /// the `timed_out` failure kind — so this returns what the row will actually
+    /// say. A diagnostic line and the `tool_calls.state` column it describes
+    /// therefore agree, which is the only thing that makes filtering a log and
+    /// querying the store answer the same question.
+    #[must_use]
+    pub const fn recorded_state(&self) -> ToolCallState {
+        match self {
+            Self::Succeeded { .. } => ToolCallState::Succeeded,
+            Self::Failed { .. } | Self::TimedOut { .. } => ToolCallState::Failed,
+            Self::Cancelled => ToolCallState::Cancelled,
+            Self::Interrupted => ToolCallState::Interrupted,
+        }
+    }
+
+    /// The stable failure kind a diagnostic line should carry, if any.
+    ///
+    /// [`failure_kind`](Self::failure_kind) answers only for `Failed`, because a
+    /// caller inspecting an outcome wants the failure it holds. A *log* wants
+    /// the kind the row will end up with, and for a timeout that is
+    /// `timed_out` even though no `Failure` has been built yet.
+    #[must_use]
+    pub fn recorded_failure_kind(&self) -> Option<&str> {
+        match self {
+            Self::Failed { failure } => Some(failure.kind()),
+            // The kind `finish` will build from `ToolError::TimedOut`, named
+            // here rather than derived because building the error would need the
+            // limit and this is a read-only projection.
+            Self::TimedOut { .. } => Some("timed_out"),
             _ => None,
         }
     }
@@ -905,16 +942,68 @@ impl ToolExecutor {
             let _ = finished.send(invoke_resolved(&tool, &input, &mut context));
         });
 
-        let outcome = self.supervise(Supervised {
-            run_id,
-            call,
-            step,
-            awaiting: &awaiting,
-            reports: &reports,
-            caller: cancellation,
-            call_token: &call_token,
-            control: &control,
-            deadline,
+        // One span for the whole supervised call, and exactly one — the poll
+        // loop inside `supervise` opens none, because a span every 20 ms would
+        // spend the entire per-call overhead budget on describing the wait.
+        let span = observe::tool_call_span(run_id, step, call, &identity);
+        let outcome = span.in_scope(|| {
+            let outcome = self.supervise(Supervised {
+                run_id,
+                call,
+                step,
+                awaiting: &awaiting,
+                reports: &reports,
+                caller: cancellation,
+                call_token: &call_token,
+                control: &control,
+                deadline,
+            });
+            // Reported from inside the span so the line carries it, and with the
+            // correlation fields repeated anyway: this runs on a scheduler
+            // thread that never entered the run's own span, so inheritance would
+            // supply nothing.
+            //
+            // A failure carries its detail as well as its kind. That is
+            // tool-controlled text, and it is the reason `observe::log` wraps
+            // the writer rather than trusting instrumentation sites like this
+            // one: reconstructing a two-in-the-morning failure needs what the
+            // tool actually said, and behind the redactor is the one place it is
+            // safe to say it.
+            //
+            // A timeout takes the failure arm along with an outright failure,
+            // because that is how it is *recorded*: `finish` persists it as
+            // `failed` carrying the `timed_out` kind, and a log that called it
+            // "finished" would hide the one outcome an operator is most likely
+            // to be hunting for.
+            let state = outcome.recorded_state().as_str();
+            match outcome.recorded_failure_kind() {
+                Some(kind) => tracing::warn!(
+                    run_id = %run_id,
+                    step_id = %step,
+                    tool_call_id = %call,
+                    tool_id = %identity.id,
+                    tool_version = %identity.version,
+                    outcome = state,
+                    failure_kind = kind,
+                    failure = %match &outcome {
+                        CallOutcome::Failed { failure } => Cow::Borrowed(failure.message()),
+                        CallOutcome::TimedOut { limit } =>
+                            Cow::Owned(format!("the call exceeded its {limit:?} limit")),
+                        _ => Cow::Borrowed(""),
+                    },
+                    "tool call failed"
+                ),
+                None => tracing::info!(
+                    run_id = %run_id,
+                    step_id = %step,
+                    tool_call_id = %call,
+                    tool_id = %identity.id,
+                    tool_version = %identity.version,
+                    outcome = state,
+                    "tool call finished"
+                ),
+            }
+            outcome
         });
         self.finish(call, step, Some(identity), outcome)
     }

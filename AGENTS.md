@@ -12,7 +12,7 @@ Harkness is a Rust 2024 workspace split into thirteen crates under `crates/`:
 - `harkness-acp`: the Agent Client Protocol client — the wire vocabulary, the `initialize` handshake, protocol-version and capability negotiation, and gated authentication. Sessions, mediation, and the rest of the v0.5 ACP surface land here beside them.
 - `harkness-mcp`, `harkness-forge`, `harkness-recipe`: the remaining v0.5 external-integration adapters — the Model Context Protocol client, forge-neutral contracts with the GitHub REST adapter, and the workflow-recipe source format and compiler. Currently skeletons; see the invariants below.
 - `harkness-test-fixtures`: hermetic repository, filesystem, and process fixtures shared only by crate tests.
-- `harkness-runtime`: typed task, run, step, and tool-call records, the typed tool contract and registry every executable operation implements, the execution contracts shared by front ends, the SQLite run store that makes those records durable, and the external-agent registry that decides which program Harkness is willing to launch at all.
+- `harkness-runtime`: typed task, run, step, and tool-call records, the typed tool contract and registry every executable operation implements, the execution contracts shared by front ends, the SQLite run store that makes those records durable, the external-agent registry that decides which program Harkness is willing to launch at all, and the `observe` module that owns both halves of the diagnostic boundary — correlation-ID spans into a bounded local log, and the redaction rules every persisted byte passes through first.
 - `harkness-cli`: the `harkness` command and its integration tests in `tests/`.
 - `harkness-gui`: the Qt 6/KDE Kirigami application. Rust/CXX-Qt bindings live in `src/` and `cxx/`; UI components live in `qml/`. Run, timeline, and approval bridge code lives outside `backend.rs`, in `src/run_list_model.rs`, `src/run_timeline_model.rs`, `src/approval_model.rs`, and `src/runs_backend.rs`, sharing `src/reconcile.rs` and `cxx/listmodelbase.h`; `backend.rs` stays the Git and catalog surface and gains no run or approval members. A front-end read takes the run store, never the coordinator: building one takes this process's lease and runs the recovery sweep, which writes, so it belongs to deciding to drive work rather than to looking at what was recorded. The run and approval surfaces themselves — `qml/RunState.qml`, `qml/RunListPane.qml`, `qml/RunsPanel.qml`, `qml/RunDetailPage.qml`, `qml/ApprovalBanner.qml`, `qml/ApprovalPage.qml`, and the shared `qml/StatePill.qml`, `qml/MetaField.qml` and `qml/BoundedText.qml` — hold no domain logic and reach only those bridges; every string a tool, an agent, or the repository wrote is rendered as `Text.PlainText`, and the one control that renders rich text whatever it is told is only handed text through `escapedRichText`. `RunsBackend::settle` writes the shared `status`/`kind` pair and then the answer property **before** it writes `busy`, because Qt emits `busyChanged` from inside the setter. `busy` still cannot answer *for one operation* — it is a count across every operation outstanding — so a mutation's own `{kind, message}` lands on the `outcome` property, which only a mutation writes and only another mutation supersedes. A surface that inferred its decision's answer from `busy` falling read whichever operation happened to settle last, and a load overlapping a refused decision made the refusal read as a success.
 
@@ -36,6 +36,8 @@ Use standard `rustfmt` output (four-space indentation) and keep Clippy clean. Fo
 ## Testing Guidelines
 
 Place focused unit tests in a `#[cfg(test)] mod tests` beside the implementation. Put executable-level behavior in crate-level `tests/*.rs`; use descriptive names such as `json_empty_project_list_is_exact`. Add regression coverage for catalog locking, Git process handling, filesystem safety, and navigation changes. Run the full test, format, and Clippy commands before submitting.
+
+A new persisted channel — a column, a file, or a stream that holds caller text — owes the redactor a pass and owes `crates/harkness-runtime/tests/credential_redaction.rs` a way to reach it. That test byte-scans the whole data directory after a run that leaks sentinels through every channel it has, so extending its fixture tool is what makes the new channel covered; a review noticing is not.
 
 ## Catalog Schema & Worktree Invariants
 
@@ -1891,6 +1893,105 @@ an unknown, disabled or untrusted agent, and a digest that no longer matches its
 its own durable consequence in the trust record. A record carrying a teardown rung is one where a
 program really did run, which is what keeps "the agent crashed on startup" distinguishable from
 "that file is not a program".
+
+## Diagnostics & Redaction Invariants
+
+`observe` owns both halves and they are one boundary, not two features: everything
+Harkness writes down is durable, so making a run inspectable is the same act as
+deciding what a credential must never reach. `docs/observability.md` is the
+user-facing reference and carries the coverage table; this section is what must
+not drift.
+
+**Every span the runtime opens names `run_id` as a field of its own.** Not
+inherited from a parent — named. Work crosses threads (the coordinator's worker,
+the scheduler's admission, the executor's supervision, a tool body on a thread of
+its own), and a span opened on a thread that never entered the run's span would
+lose the one field that makes the log searchable. Filtering a log to one run is a
+substring match on its identifier and must stay that way. Use `observe::run_span`,
+`step_span`, `tool_call_span` and `approval_span` rather than writing the macros
+out, so a field cannot be spelled two ways; `crates/harkness-runtime/tests/diagnostics.rs`
+asserts the documented field set on each of them.
+
+**No span inside a poll loop or a per-line stream.** Span count is O(1) per tool
+call. The tool runtime's budget is under 10 ms per call excluding the tool's own
+work, and a span per line of output or per 20 ms supervision tick would spend all
+of it. A loop that has something to say says it once, when the state changes.
+
+**`Store::open` installs `StandardRedactor`, and that default is fail-closed.**
+`PassThrough` exists for tests that need to read back exactly what they wrote and
+must not become the default again: a front end that has to opt in is a front end
+that can forget to. `Store::redactor` is public because a surface deriving a
+record for comparison — `WorkspaceRef::from_task` is the live case — has to use
+the *store's* redactor rather than naming one, or the coordinator refuses every
+run over a mismatch nobody introduced.
+
+**Redaction happens once, before persistence, at the store boundary.** Not at
+render time: the database, the artifacts, the CLI, the GUI and the log all read
+text that was already scrubbed, so adding a surface cannot add a leak. Every
+caller value that becomes durable goes through it — event payload string values,
+approval summary and decision reason, a tool's result, all three
+`failure_message` columns, task titles, an artifact's label and media type by
+value, artifact content by stream.
+
+**Two durable caller documents deliberately do not, and both are load-bearing
+bytes.** `tool_calls.input_json` is what the executor reads back and *runs*, and
+what an approval's hash was taken over: rewriting it would run a different
+command than the one that was approved. `workspace_snapshots.payload_json` is
+bound by a digest `harkness-context` re-derives on load. Neither exemption may be
+widened, and nothing new joins them without the same kind of reason.
+
+**Rules key on published shapes, never on entropy.** A false positive silently
+rewrites the audit trail a user is relying on, and nothing downstream can detect
+or undo it. Each rule is named, individually tested with positive *and* negative
+fixtures, and leaves `«redacted:<rule>»` — which names the rule and echoes no
+part of the match. Redaction is idempotent: `take` in `observe::rules` records a
+rewrite only when the text actually changed, which is what stops a marker that
+matches the rule that wrote it from being replaced forever.
+
+**No rule may reach across a quote or a bracket.** The diagnostic log is redacted
+one already-encoded JSON line at a time, so a value class admitting `"` or `{`
+matches from one field into the next and the replacement leaves a line nothing
+can parse — a record redaction destroyed is worse than one it failed to scrub.
+`URL_USERINFO` is written as RFC 3986's positive userinfo class for exactly this,
+the two key-and-value rules exclude every bracket, and the truncated-private-key
+arm is bounded to the PEM alphabet rather than `.*`. A new rule owes the same
+property and a test that asserts the redacted line still parses.
+
+**The string engine and the byte engine are compiled from the same patterns.** An
+event payload is UTF-8 by construction; an artifact is arbitrary bytes and
+decoding it to run string rules would corrupt everything that is not text. Both
+sides come from one set of pattern constants, so a rule cannot mean two things
+depending on which side of the store a value arrived on. An artifact is filtered
+a line at a time, which costs exactly one rule — `private_key_block`, the only one
+that spans newlines — and that gap is named in the module docs and in
+`docs/observability.md` rather than papered over.
+
+**Declared secrets are the one rule that matches an arbitrary string, and they are
+declared at the spawn.** `ToolProcess::spawn` declares the value of every
+sensitive-looking variable in the child's allowlisted environment *before* the
+child starts, because from that moment the value can come back through stdout,
+stderr, an error quoting the command line, or the result. Only the *names* are
+ever logged. The registry is append-only and process-wide, so what a redactor
+knows can only increase; a value under `MIN_DECLARED_SECRET_BYTES` is refused
+rather than allowed to eat the log, and the name list is tuned against the
+variables a desktop session actually sets (`GIT_AUTHOR_NAME` and
+`XDG_SESSION_TYPE` are why `AUTH` and `SESSION` are not fragments).
+
+**The log writer is wrapped, not the call sites.** A `tracing::info!` that
+interpolates a tool's stderr writes whatever the tool said, so the redactor sits
+on the writer and covers the diagnostic log by construction — including a call
+site nobody has written yet. Structured fields do the rest: a tool cannot forge a
+second log line with a newline, because the JSON formatter escapes it.
+
+**Nothing here may fail the work it describes.** `observe::init` never errors and
+never panics; a second call changes nothing; a `logs/` directory that cannot be
+written degrades to standard error for the life of the process. The directory is
+created by the first line rather than by `init`, so a command that records
+nothing leaves a data directory it only read exactly as it found it — the same
+promise `Store::open_existing` makes about `runtime.db`. The bound is five files
+of 4 MiB, rotation is decided *before* a line is written so no line straddles a
+file, and the oldest archive is removed before any rename so the count cannot
+creep upwards when one fails.
 
 ## Canonical JSON Key Order
 

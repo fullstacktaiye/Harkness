@@ -82,11 +82,25 @@
 //! consumer can prove they have not changed, and probed on read so deleting one
 //! degrades an artifact rather than breaking a run.
 //!
-//! Every caller value either of them persists passes through a [`Redactor`]
-//! first — payload values and an artifact's label and media type by value,
-//! artifact content by stream. The v0.3 default changes nothing; the point of
-//! the hook is that supplying real rules is a change in one place rather than an
-//! audit of every caller.
+//! # Redaction
+//!
+//! Every caller value that becomes durable here passes through a [`Redactor`]
+//! first, and [`Store::open`] installs [`StandardRedactor`] rather than
+//! [`PassThrough`], so the rules arrive by opening a store instead of by
+//! remembering to ask for them. Event payload values, an artifact's label and
+//! media type, an approval's summary and decision reason, a task's title, a
+//! tool's result, and every failure message go through
+//! [`redact_text`](Redactor::redact_text); artifact content goes through
+//! [`wrap_stream`](Redactor::wrap_stream).
+//!
+//! Two durable caller documents deliberately do not, and both are load-bearing
+//! bytes rather than prose. `tool_calls.input_json` is what
+//! [`ToolExecutor`](crate::tool::ToolExecutor) reads back and *runs*, and what
+//! an approval's hash was taken over — rewriting it would run a different
+//! command than the one that was approved. `workspace_snapshots.payload_json` is
+//! bound by a digest `harkness-context` re-derives on load, for the reason the
+//! `redaction` submodule states at length. Anything new that persists caller
+//! content comes through the redactor.
 //!
 //! # Backups
 //!
@@ -135,6 +149,7 @@ use crate::domain::{
     ToolCallId,
 };
 use crate::integration::{SubjectKind, TrustRecord, TrustRecordId};
+use crate::observe::StandardRedactor;
 use crate::tool::ToolIdentity;
 use crate::trust::{TrustState, WorkspaceTrust};
 
@@ -209,7 +224,11 @@ impl Store {
             path,
             writer: Mutex::new(connection),
             readers: Mutex::new(Vec::new()),
-            redactor: Arc::new(PassThrough),
+            // Fail-closed: the rules are installed by opening a store rather
+            // than by remembering to ask for them. A front end that forgot to
+            // opt in would be a front end that persisted credentials, and there
+            // is no version of that which is a reasonable default.
+            redactor: Arc::new(StandardRedactor::standard()),
         })
     }
 
@@ -777,12 +796,24 @@ impl Store {
 
     /// Stores a task.
     ///
+    /// The title is caller text that becomes a durable column, so it goes
+    /// through the redactor like every other one. The workspace root does not:
+    /// it is a filesystem identity this store compares, canonicalizes and hands
+    /// to a scheduler, and a rewritten path would name a directory that does not
+    /// exist. A path is also not a shape any rule here matches.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError::AlreadyExists`] when the identity is taken and
     /// [`StoreError::NonUtf8Path`] when the workspace path cannot be stored.
     pub fn insert_task(&self, task: &Task) -> Result<(), StoreError> {
-        repository::insert_task(&guard(&self.writer), task)
+        match self.redactor.redact_text(task.title()) {
+            std::borrow::Cow::Borrowed(_) => repository::insert_task(&guard(&self.writer), task),
+            std::borrow::Cow::Owned(title) => {
+                let redacted = task.clone().with_redacted_title(title);
+                repository::insert_task(&guard(&self.writer), &redacted)
+            }
+        }
     }
 
     /// Loads one task.
@@ -930,6 +961,7 @@ impl Store {
         failure: Failure,
         at: OffsetDateTime,
     ) -> Result<Run, StoreError> {
+        let failure = self.redact_failure(failure);
         self.mutate_run(id, |run| run.fail(failure, at))
     }
 
@@ -962,6 +994,7 @@ impl Store {
         failure: Failure,
         at: OffsetDateTime,
     ) -> Result<Run, StoreError> {
+        let failure = self.redact_failure(failure);
         self.mutate_run(id, |run| run.reject_approval(decided_by, failure, at))
     }
 
@@ -1177,6 +1210,7 @@ impl Store {
         failure: Failure,
         at: OffsetDateTime,
     ) -> Result<Step, StoreError> {
+        let failure = self.redact_failure(failure);
         self.mutate_step(id, |step| step.fail(failure, at))
     }
 
@@ -1206,6 +1240,7 @@ impl Store {
         failure: Failure,
         at: OffsetDateTime,
     ) -> Result<Step, StoreError> {
+        let failure = self.redact_failure(failure);
         self.mutate_step(id, |step| step.reject_approval(decided_by, failure, at))
     }
 
@@ -1267,6 +1302,7 @@ impl Store {
         output: Value,
         at: OffsetDateTime,
     ) -> Result<ToolCall, StoreError> {
+        let output = self.redact_output(output);
         self.mutate_tool_call(id, |call| call.succeed(output, at))
     }
 
@@ -1281,6 +1317,7 @@ impl Store {
         failure: Failure,
         at: OffsetDateTime,
     ) -> Result<ToolCall, StoreError> {
+        let failure = self.redact_failure(failure);
         self.mutate_tool_call(id, |call| call.fail(failure, at))
     }
 
@@ -1334,6 +1371,7 @@ impl Store {
         failure: Failure,
         at: OffsetDateTime,
     ) -> Result<ToolCall, StoreError> {
+        let failure = self.redact_failure(failure);
         self.mutate_tool_call(id, |call| call.reject_approval(decided_by, failure, at))
     }
 
@@ -1399,6 +1437,7 @@ impl Store {
         at: OffsetDateTime,
         event: RunEvent,
     ) -> Result<(Run, EventSeq), StoreError> {
+        let failure = self.redact_failure(failure);
         self.change_run_with_event("failing a run with its event", id, event, move |run| {
             run.fail(failure, at)
         })
@@ -1471,6 +1510,7 @@ impl Store {
         at: OffsetDateTime,
         event: RunEvent,
     ) -> Result<(Step, EventSeq), StoreError> {
+        let failure = self.redact_failure(failure);
         self.change_step_with_event("failing a step with its event", id, event, move |step| {
             step.fail(failure, at)
         })
@@ -1522,6 +1562,7 @@ impl Store {
         at: OffsetDateTime,
         event: RunEvent,
     ) -> Result<(ToolCall, EventSeq), StoreError> {
+        let failure = self.redact_failure(failure);
         self.change_tool_call_with_event(
             "rejecting a tool-call approval with its event",
             id,
@@ -1759,6 +1800,7 @@ impl Store {
         at: OffsetDateTime,
         event: RunEvent,
     ) -> Result<(ToolCall, EventSeq), StoreError> {
+        let output = self.redact_output(output);
         self.change_tool_call_with_event(
             "succeeding a tool call with its event",
             id,
@@ -1779,6 +1821,7 @@ impl Store {
         at: OffsetDateTime,
         event: RunEvent,
     ) -> Result<(ToolCall, EventSeq), StoreError> {
+        let failure = self.redact_failure(failure);
         self.change_tool_call_with_event(
             "failing a tool call with its event",
             id,
@@ -1973,8 +2016,62 @@ impl Store {
     }
 
     /// The redactor every recorded byte passes through.
-    pub(super) fn redactor(&self) -> &Arc<dyn Redactor> {
+    ///
+    /// Public because a front end has to be able to project a record through the
+    /// *same* rules the coordinator will, and a second, separately chosen
+    /// redactor would silently disagree with it: a workspace reference derived
+    /// with [`PassThrough`] no longer equals the one
+    /// [`RunCoordinator`](crate::coordinator::RunCoordinator) rebuilds from the
+    /// stored task, and the run is refused for a mismatch nobody introduced.
+    /// Reading the store's own answer is the only way to be sure they agree.
+    ///
+    /// It hands back a shared reference and no way to replace it, so publishing
+    /// it does not make the redactor swappable — see [`Store::redacting`] for
+    /// why that stays a construction-time decision.
+    #[must_use]
+    pub fn redactor(&self) -> &Arc<dyn Redactor> {
         &self.redactor
+    }
+
+    /// Rewrites a failure's detail before it becomes a durable column.
+    ///
+    /// Applied where the value *arrives* rather than deep in the repository
+    /// layer, so it happens once and outside every write transaction — the same
+    /// discipline `prepare_event` follows, and for the same reason: redaction is
+    /// the expensive part and a write lock is the last place to spend it.
+    fn redact_failure(&self, failure: Failure) -> Failure {
+        let message = self.redactor.redact_text(failure.message());
+        match message {
+            std::borrow::Cow::Borrowed(_) => failure,
+            std::borrow::Cow::Owned(redacted) => failure.with_redacted_message(redacted),
+        }
+    }
+
+    /// Rewrites a tool's result before it becomes `tool_calls.output_json`.
+    ///
+    /// A result is a document whose *values* a tool chose, so it is walked
+    /// exactly as an event payload is: strings rewritten, keys and structure
+    /// untouched. Its sibling column `input_json` deliberately is not — see the
+    /// coverage table in [`observe`](crate::observe), and
+    /// [`ToolExecutor`](crate::tool::ToolExecutor), which runs the bytes it
+    /// reads back out of it.
+    ///
+    /// # Redaction happens before the inline bound, and can move it
+    ///
+    /// A replacement marker is longer than much of what it replaces, so a result
+    /// that fitted [`MAX_INLINE_PAYLOAD_BYTES`] before scrubbing can exceed it
+    /// after — and is then refused with [`StoreError::PayloadTooLarge`] exactly
+    /// as an oversized one is. That ordering is the deliberate one: checking
+    /// first would admit a row whose *stored* form breaks the bound every other
+    /// column keeps, and the artifact store already checks a label after
+    /// redaction for the same reason.
+    ///
+    /// The consequence is the one the inline threshold already documents — the
+    /// caller summarizes and retries — and it is worth knowing that redaction is
+    /// among the reasons a result can cross the line. A tool returning bulk
+    /// content should be writing an artifact rather than a payload either way.
+    fn redact_output(&self, output: Value) -> Value {
+        redaction::redact_payload(&*self.redactor, &output)
     }
 
     /// The write connection, for a test that has to author a row this store

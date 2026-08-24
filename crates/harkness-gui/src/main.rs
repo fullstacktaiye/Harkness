@@ -14,6 +14,24 @@ use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QString, QUrl};
 const MAIN_QML_URL: &str = "qrc:/qt/qml/io/github/fullstacktaiye/harkness/qml/Main.qml";
 
 fn main() {
+    // Before anything opens a store or takes a lease, so a run this window
+    // starts is traceable from its first span. `HARKNESS_LOG_STDERR` is the
+    // switch here: a windowed application has no `--verbose` to type, and the
+    // log file is where a user is told to look either way.
+    let diagnostics = harkness_runtime::observe::init(
+        harkness_core::data_directory().as_deref(),
+        harkness_runtime::observe::Options::default(),
+    );
+    // The first line the log holds says where the log is, which is the only
+    // place a windowed application can put that answer: there is no `--verbose`
+    // to type and no terminal to print to. When the arrangement is the degraded
+    // one this reaches stderr instead, which is exactly where somebody looking
+    // for a missing log file will already be.
+    tracing::info!(
+        arrangement = %diagnostics.describe(),
+        "diagnostics initialized"
+    );
+
     // Force-links the statically compiled QML module so its types register.
     cxx_qt::init_qml_module!("io.github.fullstacktaiye.harkness");
 

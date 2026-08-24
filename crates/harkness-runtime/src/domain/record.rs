@@ -39,6 +39,18 @@ impl Failure {
     pub fn message(&self) -> &str {
         &self.message
     }
+
+    /// Replaces the detail with what the store's redactor made of it.
+    ///
+    /// The `kind` is untouched: it is a stable machine identifier this build
+    /// chose from a fixed set, and rewriting one would break the very callers
+    /// that switch on it. The message is the half that quotes a command line, a
+    /// URL, or a child's last words, and is therefore the half that can carry a
+    /// credential into a durable column.
+    pub(crate) fn with_redacted_message(mut self, message: String) -> Self {
+        self.message = message;
+        self
+    }
 }
 
 /// Which way one recorded approval went.
@@ -378,6 +390,16 @@ impl Task {
             project_id,
             created_at: utc(created_at),
         }
+    }
+
+    /// Replaces the title with what the store's redactor made of it.
+    ///
+    /// A task is redacted on its way into the store and handed back in the form
+    /// that was stored, so a caller never holds a title that differs from the
+    /// row and from every observation derived from it.
+    pub(crate) fn with_redacted_title(mut self, title: String) -> Self {
+        self.title = title;
+        self
     }
 
     /// Stable identifier of this task.

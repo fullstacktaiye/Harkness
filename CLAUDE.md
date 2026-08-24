@@ -75,8 +75,12 @@ build script drives `qmake`, `moc`, and `qmltyperegistrar` even when nothing lin
   routine: those scripts are authored as JSON, so it only re-canonicalizes the formatting of a
   hand-written scenario. It still cannot invent one — a fixture that does not parse is not
   rewritten.
-- **Latency targets** (`store/tests.rs`, `tool/tests.rs`, `assemble/assembler.rs`): meaningful only
-  under `--release`.
+- **Latency targets** (`store/tests.rs`, `tool/tests.rs`, `assemble/assembler.rs`,
+  `harkness-runtime/tests/diagnostics_overhead.rs`): meaningful only under `--release`. The
+  diagnostics one is separate from `tool::execution_tests`'s on purpose: that measures an executor in
+  a process where no subscriber is installed, where `tracing` is close to free, so it says nothing
+  about the arrangement that ships. `diagnostics_overhead` installs the real subscriber — JSON
+  formatter, redacting writer, rotating file — and measures the same call under it.
 
 ### Frozen fixtures
 
@@ -206,6 +210,18 @@ translating between two cancellation mechanisms.
   unchanged — are enforced here rather than in a front end, and `AgentLaunch` is the unforgeable
   proof they passed. This is why `harkness-runtime` names `harkness-acp`: the runtime is the
   composer, and ADR-0009 points that edge downward.
+  `observe` is the diagnostic boundary, and it is one module rather than two because it is one
+  problem seen from either end: everything Harkness writes down is durable, so making a run
+  inspectable is the same act as deciding what a credential must never reach. It owns the span
+  vocabulary (every span names `run_id` itself, because work crosses threads and an inherited field
+  would be lost), the bounded JSON-lines log under `<data_dir>/logs/`, and `StandardRedactor` — the
+  rules `store::redaction` left a hook for, which `Store::open` now installs by default. The rules
+  are here rather than under `store` because the same ones have to reach a log line the store never
+  sees; the log's writer is wrapped rather than its call sites, so a `tracing::info!` nobody has
+  written yet is covered too. `docs/observability.md` is the reference and AGENTS.md holds the
+  invariants; the coverage table's two exemptions — `tool_calls.input_json`, which the executor
+  reads back and *runs*, and `workspace_snapshots.payload_json`, which a digest binds — are the
+  parts to read before touching anything here.
 - **`harkness-context`** owns the context engine's vocabulary, its service
   boundary, and the first feature behind it: identifiers, `WorkspaceSnapshot`
   identity, `Provenance`, `FileClass`, the `ContextEngine` facade, the disposable
@@ -340,6 +356,13 @@ every error kind — a new error kind must be added to that namespace so callers
 mapping. JSON output is a deliberate hand-written projection, not the catalog's storage serializer;
 non-UTF-8 paths get lossy strings plus `path_is_lossy: true` and, where exactness matters, a
 `*_base64` sibling field.
+
+`--verbose` is the third thing that writes to stderr, and it stays inside the same promise: it
+mirrors the diagnostic log, which is already one JSON object per line. It is the flag form of
+`HARKNESS_LOG_STDERR`, and the mirror is the file's own rendering rather than a friendlier one so
+that what a verbose run shows is exactly what was recorded. `observe::init` runs before any command
+body dispatches, resolving `--data-dir` then `HARKNESS_DATA_DIR` then the platform directory; it
+creates nothing, because the log file is opened by the first line rather than by the call.
 
 ### GUI structure
 
@@ -507,10 +530,14 @@ past `clippy::result_large_err`'s threshold, which is why `SendRejection` carrie
 `HARKNESS_DATA_DIR` replaces the platform data directory outright; the CLI's `--data-dir` takes
 precedence over it. Tests and isolated front ends rely on this — use it rather than touching real
 user data. The directory holds `projects.json`, `projects.lock`, `agents.json`, `agents.lock`,
-`runtime.db` (+ `-wal`/`-shm`), `artifacts/`, `agent-scratch/`, `context/`, `locks/`,
+`runtime.db` (+ `-wal`/`-shm`), `artifacts/`, `agent-scratch/`, `context/`, `locks/`, `logs/`,
 `repositories/`, and `worktrees/`. `context/` is the one
 disposable subtree: it holds `<repository-key>/index.db` per repository and deleting the whole thing
-costs warm-up time and no evidence (ADR-0004). `agent-scratch/` holds one temporary working
+costs warm-up time and no evidence (ADR-0004). `logs/` is disposable in a weaker sense — it is
+evidence about the *process* rather than about a run, and the runs themselves are in `runtime.db`
+either way. It holds `harkness.log` plus at most four rotated generations, 4 MiB each, created by
+the first line rather than by `observe::init`, so a command that records nothing leaves a data
+directory it only read exactly as it found it. `agent-scratch/` holds one temporary working
 directory per health check, removed when the check returns; a process killed mid-check leaves one
 behind, which is why they are under a name a sweep can be pointed at rather than loose in the root.
 Artifact content lives at

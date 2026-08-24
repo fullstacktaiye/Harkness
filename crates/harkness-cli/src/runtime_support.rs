@@ -46,7 +46,7 @@ use harkness_runtime::domain::{
 };
 use harkness_runtime::policy::PolicyEngine;
 use harkness_runtime::store::{
-    Artifact, MAX_RUN_PAGE_LIMIT, PassThrough, RunCursor, Store, StoreError, StoredEvent,
+    Artifact, MAX_RUN_PAGE_LIMIT, RunCursor, Store, StoreError, StoredEvent,
 };
 use harkness_runtime::tool::{RegistryError, ToolRegistry};
 use harkness_runtime::tools::{register_mutating_tools, register_read_only_tools};
@@ -1266,15 +1266,12 @@ pub(crate) fn apply_workspace_trust(
 ///
 /// The coordinator validates this against a reference it builds with the
 /// store's *own* redactor and refuses the run when either field differs, so the
-/// two have to agree. A store this crate opened has the default redactor, which
-/// is [`PassThrough`], and there is no route from here to a store configured
-/// with another one: `Store::redacting` is never called in this binary, and
-/// `Store::redactor` is crate-private to `harkness-runtime` so there is nothing
-/// to read the real one from. Should a redacting store ever be opened here,
-/// this is where it would have to change too — the failure would be every run
-/// refused before it started, which is loud rather than silent.
-pub(crate) fn workspace_ref(task: &Task) -> WorkspaceRef {
-    WorkspaceRef::from_task(task, &PassThrough)
+/// two have to agree. Reading the redactor back off the store is the only way to
+/// be sure of that: naming a redactor here would be this crate guessing which
+/// one `Store::open` installed, and a guess that went stale would refuse every
+/// run before it started.
+pub(crate) fn workspace_ref(store: &Store, task: &Task) -> WorkspaceRef {
+    WorkspaceRef::from_task(task, &**store.redactor())
 }
 
 /// Whether a recorded failure kind is one the tool namespace publishes.

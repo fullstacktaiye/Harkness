@@ -65,6 +65,16 @@
 //! check that spawns an agent, negotiates once, and tears it down under a hard
 //! deadline. Every gate a launch passes is enforced there rather than in a front
 //! end, so no surface can arrange to run a program nobody trusted.
+//!
+//! [`observe`] holds the diagnostic boundary, and it is one module rather than
+//! two because it is one problem seen from either end. A run that fails at two
+//! in the morning has to be reconstructable from what Harkness wrote down, and
+//! everything Harkness writes down is durable — so the more inspectable a run
+//! becomes, the more places a credential can come to rest. It owns the
+//! correlation-ID span vocabulary, the bounded local log those spans reach, and
+//! [`observe::StandardRedactor`], the rules [`store`] installs by default so
+//! that scrubbing happens once, before persistence, rather than at each of the
+//! many places a value is later shown.
 
 pub mod agent;
 pub mod agent_registry;
@@ -75,6 +85,7 @@ pub mod coordinator;
 pub mod domain;
 pub mod integration;
 mod json;
+pub mod observe;
 pub mod policy;
 pub mod schedule;
 pub mod store;

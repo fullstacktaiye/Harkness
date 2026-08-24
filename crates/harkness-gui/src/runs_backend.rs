@@ -214,7 +214,7 @@ use harkness_runtime::coordinator::{RunCoordinator, RuntimeError};
 use harkness_runtime::domain::{
     ArtifactId, ExecutionState, Run, RunId, ToolCall, ToolCallId, ToolCallState,
 };
-use harkness_runtime::store::{Artifact, Availability, EventPage, PassThrough, Store, StoreError};
+use harkness_runtime::store::{Artifact, Availability, EventPage, Store, StoreError};
 use harkness_runtime::tool::WorkspaceMetadata;
 
 use super::approval_model::ApprovalRow;
@@ -1677,10 +1677,12 @@ impl ffi::RunsBackend {
             let record = coordinator.store().load_run(run)?;
             let task = coordinator.store().load_task(record.task_id())?;
             let scenario = retry_scenario(run, &coordinator.store().load_run_tool_calls(run)?)?;
-            // `PassThrough` is what `Store::open` installs and this process
-            // never replaces it, so this reference is byte-identical to the one
-            // the coordinator rebuilds from the same task.
-            let workspace = WorkspaceRef::from_task(&task, &PassThrough);
+            // Derived with the store's own redactor rather than with a named
+            // one, so this reference is byte-identical to the one the
+            // coordinator rebuilds from the same task. Naming a redactor here
+            // would be this crate guessing what `Store::open` installed, and a
+            // stale guess refuses every retry before it starts.
+            let workspace = WorkspaceRef::from_task(&task, &**coordinator.store().redactor());
             let agent = Box::new(MockAgent::from_scenario(scenario));
             // Catalog metadata when the task names a project the catalog still
             // knows, which is what makes the coordinator canonicalize and check

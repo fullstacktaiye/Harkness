@@ -15,6 +15,7 @@ clap.workspace = true
 harkness-core.workspace = true
 harkness-git.workspace = true
 harkness-runtime.workspace = true
+tracing.workspace = true
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
