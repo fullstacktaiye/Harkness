@@ -162,10 +162,10 @@ impl ReconcileScope {
     /// `src/watch.rs` and `src/watch/tests.rs` sort in that order — this
     /// repository's own module layout — and the entry before the last is the
     /// one that contains it. Comparing only with the previous entry keeps all
-    /// three, and [`read_units`](Self::read_units) then emits overlapping
-    /// ranges that hand the merge one row twice: consumed once as an existing
-    /// row and once as a row with no path beside it, which stages a removal for
-    /// a path the same pass just recorded.
+    /// three, and the read ranges the merge is built from then overlap — which
+    /// hands it one row twice: consumed once as an existing row and once as a
+    /// row with no path beside it, which stages a removal for a path the same
+    /// pass just recorded.
     ///
     /// A container is always an ancestor and an ancestor always sorts first, so
     /// asking about the candidate's own ancestors is the whole question.
@@ -196,8 +196,8 @@ impl ReconcileScope {
     /// or overlapping list, and every method below assumes neither.
     /// [`names_exactly`](Self::names_exactly) would silently answer "no" for a
     /// named path on an unsorted list, downgrading a force-hash hint to a
-    /// metadata comparison, and [`read_units`](Self::read_units) would emit the
-    /// overlapping ranges described above.
+    /// metadata comparison, and the merge's read ranges would overlap exactly
+    /// as [`paths`](Self::paths) describes.
     #[must_use]
     pub fn normalized(&self) -> Self {
         match self {

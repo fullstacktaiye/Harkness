@@ -84,6 +84,24 @@ fn write_at(root: &Path, relative: &str, body: &str, epoch_seconds: Option<u64>)
     }
 }
 
+/// Stops Git rewriting bytes on their way into or out of a checkout.
+///
+/// A linked worktree is *checked out* by libgit2, which reads the runner's
+/// global configuration — and the Windows runner ships `core.autocrlf=true`. The
+/// main checkout then holds the bytes the test wrote and the linked one holds
+/// the same bytes with CRLF line endings, so two files that are the same file
+/// hash differently and the sharing this whole design rests on looks broken on
+/// one platform only. Both the configuration and the attribute are pinned, so
+/// the bytes in every checkout are the bytes that were written.
+fn pin_line_endings(repository: &harkness_git::git2::Repository, root: &Path) {
+    repository
+        .config()
+        .unwrap()
+        .set_bool("core.autocrlf", false)
+        .unwrap();
+    fs::write(root.join(".gitattributes"), b"* -text\n").unwrap();
+}
+
 fn paths(scope: &ReconcileScope) -> Vec<String> {
     match scope {
         ReconcileScope::Paths(paths) => paths.iter().map(RepoPath::display).collect(),
@@ -868,6 +886,7 @@ fn two_worktrees_share_content_and_never_see_each_others_edits() {
     let fixture = Fixture::new();
     let main_root = fixture.directory("main-checkout");
     let repository = initialize_repository(&main_root);
+    pin_line_endings(&repository, &main_root);
     write_at(&main_root, "src/shared.rs", "fn shared() {}\n", None);
     commit_all(&repository, "shared");
     let linked_root = fixture.root.path().join("linked-checkout");
@@ -960,6 +979,7 @@ fn forgetting_a_worktree_keeps_what_its_sibling_still_uses() {
     let fixture = Fixture::new();
     let main_root = fixture.directory("main-checkout");
     let repository = initialize_repository(&main_root);
+    pin_line_endings(&repository, &main_root);
     write_at(&main_root, "src/shared.rs", "fn shared() {}\n", None);
     commit_all(&repository, "shared");
     let linked_root = fixture.root.path().join("linked-checkout");
