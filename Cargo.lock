@@ -850,7 +850,7 @@ dependencies = [
 
 [[package]]
 name = "harkness-acp"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "agent-client-protocol-schema",
  "harkness-transport",
@@ -862,7 +862,7 @@ dependencies = [
 
 [[package]]
 name = "harkness-cli"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "clap",
@@ -882,7 +882,7 @@ dependencies = [
 
 [[package]]
 name = "harkness-context"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "harkness-core",
@@ -900,7 +900,7 @@ dependencies = [
 
 [[package]]
 name = "harkness-core"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "dirs",
  "git2",
@@ -918,11 +918,11 @@ dependencies = [
 
 [[package]]
 name = "harkness-forge"
-version = "0.1.0"
+version = "0.3.0"
 
 [[package]]
 name = "harkness-git"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "git2",
  "harkness-test-fixtures",
@@ -937,7 +937,7 @@ dependencies = [
 
 [[package]]
 name = "harkness-gui"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "cxx",
  "cxx-qt",
@@ -958,11 +958,11 @@ dependencies = [
 
 [[package]]
 name = "harkness-mcp"
-version = "0.1.0"
+version = "0.3.0"
 
 [[package]]
 name = "harkness-provider"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "harkness-git",
  "harkness-test-fixtures",
@@ -973,11 +973,11 @@ dependencies = [
 
 [[package]]
 name = "harkness-recipe"
-version = "0.1.0"
+version = "0.3.0"
 
 [[package]]
 name = "harkness-runtime"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "harkness-acp",
@@ -1006,7 +1006,7 @@ dependencies = [
 
 [[package]]
 name = "harkness-test-fixtures"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "git2",
  "libc",
@@ -1015,7 +1015,7 @@ dependencies = [
 
 [[package]]
 name = "harkness-transport"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "harkness-git",
  "harkness-test-fixtures",
