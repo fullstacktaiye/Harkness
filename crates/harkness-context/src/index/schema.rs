@@ -183,10 +183,10 @@ impl IndexComponent {
     /// Tables whose every row was produced by this component's version.
     ///
     /// A skew empties exactly these and nothing else. The list is data rather
-    /// than a `match` arm spread through the invalidation code so that
-    /// [`every_table_is_owned_once`](tests::every_table_is_owned_once) can hold
-    /// the schema to it: a table added without an owner fails a test instead of
-    /// silently surviving the upgrade that invalidated it.
+    /// than a `match` arm spread through the invalidation code so that a test
+    /// can hold the schema to it — `every_table_is_owned_once` — and a table
+    /// added without an owner fails there instead of silently surviving the
+    /// upgrade that invalidated it.
     #[must_use]
     pub const fn owned_tables(self) -> &'static [&'static str] {
         match self {

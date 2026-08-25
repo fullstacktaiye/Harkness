@@ -710,7 +710,15 @@ fn two_linked_worktrees_share_one_cache_and_keep_their_own_file_rows() {
     assert!(secondary_paths.contains(&"shared.rs".to_owned()));
     assert!(secondary_paths.contains(&"only-linked.rs".to_owned()));
 
-    // One file-version row for the file both worktrees hold at one path.
+    // The deduplication is by *content*, so what the two checkouts actually
+    // hold is what decides the row count. Git may rewrite line endings on the
+    // way into a worktree — on Windows it routinely does — and a file that came
+    // out with different bytes is genuinely a different version rather than a
+    // dedup failure. Reading both is the honest way to say which case this is.
+    let primary_bytes = fs::read(workspace.root.join("shared.rs")).unwrap();
+    let secondary_bytes = fs::read(linked.join("shared.rs")).unwrap();
+    let expected = i64::from(primary_bytes != secondary_bytes) + 1;
+
     let connection = Connection::open(primary.cache_root().join(INDEX_DATABASE_FILE)).unwrap();
     let versions: i64 = connection
         .query_row(
@@ -719,7 +727,11 @@ fn two_linked_worktrees_share_one_cache_and_keep_their_own_file_rows() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(versions, 1, "one path with one content is one file version");
+    assert_eq!(
+        versions, expected,
+        "one path with one content is one file version, and one path with two \
+         contents is two"
+    );
 }
 
 /// A cold build reconciles before it writes. Adding rows beside the ones a

@@ -19,10 +19,10 @@
 //! # What it holds
 //!
 //! One metadata row, one row per worktree, and the derived content beneath
-//! them: [`schema`] is the whole layout and the place to read before changing
-//! anything persisted. Exactly one table is per-worktree — `files` — and
-//! everything else is content-addressed and shared, which is why every read in
-//! [`store`] takes a [`WorktreeKey`] and joins through that worktree's rows.
+//! them: [`INDEX_SCHEMA`] is the whole layout and the place to read before
+//! changing anything persisted. Exactly one table is per-worktree — `files` —
+//! and everything else is content-addressed and shared, which is why every read
+//! takes a [`WorktreeKey`] and joins through that worktree's rows.
 //!
 //! A batch is written at a *pending* generation nothing can see and becomes
 //! visible in one transaction, so a process killed part-way through a cold
@@ -82,10 +82,10 @@
 //! a UI poll answer while a cold index build is running — and a batch releases
 //! the connection between flushes for the same reason.
 //!
-//! A third lock is the advisory file in [`budget`]: an open cache holds it
-//! *shared* for its whole life so an eviction sweep, which takes it
-//! exclusively, cannot delete a cache out from under a live process. It is
-//! taken once at open and never while any other lock is held.
+//! A third lock is the advisory [`CACHE_LOCK_FILE`] in the cache's own root: an
+//! open cache holds it *shared* for its whole life so an eviction sweep, which
+//! takes it exclusively, cannot delete a cache out from under a live process.
+//! It is taken once at open and never while any other lock is held.
 //!
 //! [#115]: https://github.com/fullstacktaiye/harkness/issues/115
 

@@ -199,7 +199,8 @@ impl ContextEngineConfig {
     /// Addresses the worktree at `worktree_root` within `project_id`.
     ///
     /// `data_dir` is the Harkness data directory; the cache lands beneath its
-    /// reserved [`CONTEXT_DIRECTORY`] child and nowhere else. The path is
+    /// reserved [`CONTEXT_DIRECTORY`](harkness_core::CONTEXT_DIRECTORY) child
+    /// and nowhere else. The path is
     /// derived from the repository rather than supplied, so there is no
     /// traversal surface here for a caller to get wrong.
     #[must_use]
