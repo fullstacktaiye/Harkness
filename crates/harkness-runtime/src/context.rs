@@ -45,7 +45,7 @@ use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use harkness_context::index::CacheRecreation;
+use harkness_context::index::{BatchReceipt, CacheRecreation, EvictionReport};
 use harkness_context::{ContextEngine, ContextEngineConfig, ContextEngineError};
 use harkness_core::ProjectId;
 use harkness_git::Cancellation;
@@ -230,6 +230,48 @@ pub fn cache_recreated_event(recreation: &CacheRecreation, at: OffsetDateTime) -
         "previous_generation": recreation.previous_generation,
         "generation": recreation.generation,
         "quarantined": recreation.quarantined_to.is_some(),
+    }))
+}
+
+/// The timeline entry that records a batch of index rows becoming visible.
+///
+/// The counts travel as numbers and the worktree as its derived key, so the
+/// store's mandatory redaction of every JSON string value has nothing to
+/// rewrite — and nothing here names a path, which is the same reason the walk
+/// counts denials rather than listing them.
+#[must_use]
+pub fn index_committed_event(receipt: &BatchReceipt, at: OffsetDateTime) -> RunEvent {
+    RunEvent::new(EventKind::ContextIndexCommitted, at).with_payload(json!({
+        "worktree": receipt.worktree.as_str(),
+        "scope": receipt.scope.as_str(),
+        "generation": receipt.generation,
+        "files_recorded": receipt.files_recorded,
+        "files_removed": receipt.files_removed,
+        "chunks_recorded": receipt.chunks_recorded,
+        "symbols_recorded": receipt.symbols_recorded,
+        "rows_swept": receipt.rows_swept,
+        "rows_collected": receipt.rows_collected,
+        "duration_ms": u64::try_from(receipt.duration.as_millis()).unwrap_or(u64::MAX),
+    }))
+}
+
+/// The timeline entry that records index caches evicted for disk.
+///
+/// A run that met a cold cache after this is entitled to say why, and the
+/// repository keys are the derived UUIDs rather than paths — a data directory's
+/// layout is not something a run's timeline needs to carry.
+#[must_use]
+pub fn index_evicted_event(report: &EvictionReport, at: OffsetDateTime) -> RunEvent {
+    RunEvent::new(EventKind::ContextIndexEvicted, at).with_payload(json!({
+        "bytes_before": report.bytes_before,
+        "bytes_after": report.bytes_after,
+        "within_budget": report.within_budget,
+        "skipped_in_use": report.skipped_in_use,
+        "evicted": report
+            .evicted
+            .iter()
+            .map(|cache| json!({ "repository": cache.repository_key, "bytes": cache.bytes }))
+            .collect::<Vec<_>>(),
     }))
 }
 

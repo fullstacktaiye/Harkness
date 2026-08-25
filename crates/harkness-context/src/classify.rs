@@ -140,6 +140,22 @@ impl FileClass {
         }
     }
 
+    /// Reads a persisted spelling back, refusing one this build does not define.
+    ///
+    /// The refusal is the same position [`Deserialize`] takes and it is taken
+    /// for the same reason: a class this build does not know means a newer build
+    /// wrote the row, and coercing it to something benign is how a
+    /// [`SecretSensitive`](Self::SecretSensitive) file quietly stops being
+    /// excluded. A caller that meets [`None`] is holding a row it should refuse,
+    /// not one it should guess about.
+    #[must_use]
+    pub fn parse(spelling: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|class| class.as_str() == spelling)
+    }
+
     /// Whether a file of this class may ever be shown to a model.
     ///
     /// Advisory: the exclusion itself is enforced where retrieval happens. The
@@ -401,7 +417,7 @@ fn decodes_as_utf16(body: &[u8], big_endian: bool, complete: bool) -> bool {
     if complete && !body.len().is_multiple_of(2) {
         return false;
     }
-    let units = body.chunks_exact(2).map(|pair| {
+    let units = body.as_chunks::<2>().0.iter().map(|pair| {
         if big_endian {
             u16::from_be_bytes([pair[0], pair[1]])
         } else {

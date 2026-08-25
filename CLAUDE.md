@@ -55,9 +55,10 @@ anchor. `verify-doc-references.sh` checks the "What proves this" tables against
 `#[ignore]` marks four distinct categories; never assume an ignored test is dead.
 
 - **Child-process roles** (`*/testing.rs`, `store/tests.rs`, `coordinator/tests/recovery.rs`,
-  `harkness-context/src/index/tests.rs`): the
+  `harkness-context/src/index/tests.rs` and `.../index/store_tests.rs`): the
   parent test re-executes the test binary with `--exact --ignored`. Run them only through their
-  parent. The recovery roles are re-executed *and then killed*, so a `SIGKILL` is the expected end
+  parent. The store's role is re-executed *and then killed*, because a batch abandoned by an
+  unwinding `Drop` is not a crash and the pending-generation guarantee is about crashes. The recovery roles are re-executed *and then killed*, so a `SIGKILL` is the expected end
   of `park_a_run_awaiting_approval` and `append_event_batches_until_killed`.
 - **Network tests** (`sync.rs`, `project.rs`): reach real GitHub. CI runs them on a self-hosted
   runner via `sh .github/scripts/run-ignored-exact-test.sh <package> <exact::test::name>`, which
@@ -73,7 +74,11 @@ anchor. `verify-doc-references.sh` checks the "What proves this" tables against
   warning still: run it only when a *new* approval hash domain is published, because every stored
   `input_hash` was derived under the encoding it pins.
   `cargo test -p harkness-context -- --ignored regenerate_the_frozen_v1_fixtures` rewrites
-  `crates/harkness-context/src/fixtures/*.json` the same way,
+  `crates/harkness-context/src/fixtures/*.json` the same way, and
+  `cargo test -p harkness-context -- --ignored regenerate_the_frozen_schema` rewrites
+  `crates/harkness-context/src/index/fixtures/schema-v<version>.sql` — the index cache's own
+  layout, so run it only after bumping `INDEX_SCHEMA_VERSION` and commit the result as a *new*
+  file beside the old one,
   `cargo test -p harkness-acp -- --ignored regenerate_the_frozen_v1_fixtures` rewrites the two
   `initialize-request-*.json` fixtures under `crates/harkness-acp/src/fixtures/` — and only those
   two, because the three response fixtures beside them are an *agent's* answers and this build
@@ -121,6 +126,11 @@ asserts that the frozen payload still re-derives its own identity rather than th
 particular values. The provider's scripts are the one set that is *authored* as JSON rather than
 mirrored from Rust data: the regenerator only re-canonicalizes their formatting, so a new scenario
 is a new file and a changed step is a new version beside v1.
+
+`crates/harkness-context/src/index/fixtures/schema-v2.sql` is the one frozen fixture that is not
+JSON: it is the index cache's `sqlite_schema` as SQLite renders it, and a test compares the live
+layout against it so a column added without an `INDEX_SCHEMA_VERSION` bump fails rather than
+leaving already-written caches addressed by a build expecting different columns.
 
 A **new fixture directory needs a `.gitattributes` line** — `<path>/*.json text eol=lf` — and the
 file enumerates them one directory at a time rather than by a glob. Fixture tests compare
@@ -255,11 +265,19 @@ translating between two cancellation mechanisms.
   `src/fixtures/` because they are `runtime.db` columns.
   `engine.rs` is the eight-method facade every retrieval issue plugs into —
   `snapshot` and `inventory` are implemented, the rest return
-  `ContextEngineError::NotYetAvailable` naming the feature — and `index/` is the
-  per-repository cache at `<data_dir>/context/<repository-key>/index.db`: one
-  `index_meta` row, four version fields, a generation seeded from the clock so a
-  wiped directory cannot reissue a number a stored snapshot recorded, and
-  quarantine-and-recreate for anything unreadable. `inventory.rs` is the walk
+  `ContextEngineError::NotYetAvailable` naming the feature — plus `reindex`, the
+  cold build that fills the cache from the walk and the chunker. `index/` is the
+  per-repository cache at `<data_dir>/context/<repository-key>/index.db`, and it
+  splits four ways: `mod.rs` owns the file's lifecycle (probe, quarantine,
+  dispose, refresh, the invalidation matrix), `schema.rs` the layout and its
+  frozen `sqlite_schema` fixture, `store.rs` the batch protocol and the
+  worktree-scoped reads, `budget.rs` the two disk bounds and the advisory lock
+  eviction respects. Three things to know before touching it: only `files` is
+  per-worktree so every read takes a `WorktreeKey`, a batch is invisible until it
+  commits so a killed build leaves the previous generation answering, and a
+  component version bump invalidates only what that component produced —
+  `classify` deletes nothing at all. `docs/context-index.md` is the reference.
+  `inventory.rs` is the walk
   every retrieval feature reads instead of the filesystem, so read its module doc
   before touching it: four exclusion layers with built-in denials on top that no
   configuration can undo, a repository layer that may only tighten and is never

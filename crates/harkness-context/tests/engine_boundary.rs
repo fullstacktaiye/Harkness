@@ -182,10 +182,67 @@ fn a_corrupt_cache_is_reported_through_index_status_and_replaced() {
     engine.snapshot(&Cancellation::default()).unwrap();
 }
 
-/// The cache lifecycle is usable on its own, without an engine around it —
-/// which is what [#114] extends.
-///
-/// [#114]: https://github.com/fullstacktaiye/harkness/issues/114
+/// The persistent index, reached the way a retrieval feature will reach it:
+/// build, then read back through the public API alone, with no run store, no
+/// agent, and no network in the process.
+#[test]
+fn the_index_is_built_and_read_back_from_outside_the_crate() {
+    let workspace = Workspace::new();
+    fs::write(workspace.root.join("lib.rs"), "fn exported() {}\n").unwrap();
+    fs::create_dir_all(workspace.root.join("docs")).unwrap();
+    fs::write(workspace.root.join("docs/guide.md"), "# Guide\n\nProse.\n").unwrap();
+    let engine = workspace.engine();
+    let cancellation = Cancellation::default();
+
+    let receipt = engine.reindex(&cancellation).unwrap();
+
+    assert_eq!(receipt.worktree, engine.worktree_key());
+    assert!(receipt.files_recorded >= 2);
+    assert!(receipt.chunks_recorded >= 2);
+    assert!(receipt.generation > 0);
+
+    let source = RepoPath::from_path(Path::new("lib.rs"));
+    let row = engine
+        .indexed_file(&source)
+        .unwrap()
+        .expect("an eligible file is indexed");
+    assert!(row.eligible());
+    assert_eq!(row.byte_size, "fn exported() {}\n".len() as u64);
+    assert!(!engine.indexed_chunks(&source).unwrap().is_empty());
+
+    let counts = engine.index_counts().unwrap();
+    assert_eq!(counts.worktrees, 1);
+    assert_eq!(counts.files, receipt.files_recorded);
+    assert_eq!(counts.chunks, receipt.chunks_recorded);
+    assert!(counts.database_bytes > 0);
+
+    // And it is still a cache: disposing it costs the rows and nothing else.
+    engine.dispose_index(&cancellation).unwrap();
+    assert!(engine.indexed_files(100).unwrap().is_empty());
+    assert!(engine.snapshot(&cancellation).is_ok());
+}
+
+/// Eviction is a data-directory-wide maintenance action a front end can offer,
+/// so it has to be callable without an engine and has to skip what is open.
+#[test]
+fn eviction_is_reachable_without_an_engine_and_spares_a_live_cache() {
+    let workspace = Workspace::new();
+    fs::write(workspace.root.join("a.rs"), "fn a() {}\n").unwrap();
+    let engine = workspace.engine();
+    let cancellation = Cancellation::default();
+    engine.reindex(&cancellation).unwrap();
+
+    let report =
+        harkness_context::index::evict_to_budget(&workspace.fixture.data_dir, 0, &cancellation)
+            .unwrap();
+
+    assert!(report.evicted.is_empty(), "a live cache is never evicted");
+    assert_eq!(report.skipped_in_use, 1);
+    assert!(report.bytes_before > 0);
+    assert!(!engine.indexed_files(100).unwrap().is_empty());
+}
+
+/// The cache lifecycle is usable on its own, without an engine around it.
 #[test]
 fn the_cache_lifecycle_is_reachable_without_an_engine() {
     let fixture = Fixture::new();

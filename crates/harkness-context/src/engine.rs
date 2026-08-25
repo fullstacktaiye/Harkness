@@ -24,38 +24,52 @@
 //!
 //! # What is here and what is not
 //!
-//! The eight facade methods are the whole retrieval surface. Only
-//! [`snapshot`](ContextEngine::snapshot) is implemented today, because [#109]
-//! landed what it needs; the other seven return
+//! The eight facade methods are the whole retrieval surface.
+//! [`snapshot`](ContextEngine::snapshot) and
+//! [`inventory`](ContextEngine::inventory) are implemented, because [#109] and
+//! [#112] landed what they need; the other six return
 //! [`ContextEngineError::NotYetAvailable`] naming the missing feature. That is a
 //! real, tested refusal rather than a `todo!()`, so a caller written against the
 //! seam now gets a typed answer and the issue that implements a method deletes a
 //! branch rather than a panic.
 //!
-//! The engine returns typed values and persists nothing. Turning a snapshot or
-//! a pack into evidence is the caller's job in `harkness-runtime` ([#122],
-//! [#123]), which is what keeps the cache disposable — and ADR-0001's
-//! dependency direction makes it structural rather than merely intended, since
-//! this crate cannot name the runtime.
+//! Beside them is the cache: [`reindex`](ContextEngine::reindex) fills it,
+//! [`index_status`](ContextEngine::index_status) polls it without waiting on the
+//! writer, and [`dispose_index`](ContextEngine::dispose_index) throws it away.
+//! Those are not retrieval features and never fabricate one — they are the
+//! machinery every retrieval feature will read.
+//!
+//! The engine returns typed values and persists no *evidence*. Turning a
+//! snapshot or a pack into evidence is the caller's job in `harkness-runtime`
+//! ([#122], [#123]); what the engine writes is the disposable cache, which is a
+//! different store by ADR-0004 and which ADR-0001's dependency direction keeps
+//! separate structurally rather than by intention, since this crate cannot name
+//! the runtime.
 //!
 //! [#109]: https://github.com/fullstacktaiye/harkness/issues/109
+//! [#112]: https://github.com/fullstacktaiye/harkness/issues/112
 //! [#122]: https://github.com/fullstacktaiye/harkness/issues/122
 //! [#123]: https://github.com/fullstacktaiye/harkness/issues/123
 
 use std::path::{Path, PathBuf};
 use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use harkness_core::{CONTEXT_DIRECTORY, ProjectId};
+use harkness_core::ProjectId;
 use harkness_git::{Cancellation, GitService};
 
+use crate::chunk::{FileVersion, chunk_file};
 use crate::digest::{Sha256Hex, empty_path_set_digest};
 use crate::error::{ContextDomainError, ContextEngineError};
 use crate::ids::ChunkId;
 use crate::index::{
-    self, CacheRecreation, ExpectedVersions, IndexAvailability, IndexCache, IndexReport,
-    IndexStatus, RecreationReason,
+    self, BatchReceipt, BatchScope, CacheRecreation, ExpectedVersions, IndexAvailability,
+    IndexCache, IndexCounts, IndexReport, IndexStatus, IndexedChunk, IndexedFile, IndexedPage,
+    RecreationReason, WorktreeKey,
 };
-use crate::inventory::{FileInventory, GLOBAL_IGNORE_FILE, InventoryBuilder, InventoryPolicy};
+use crate::inventory::{
+    FileInventory, GLOBAL_IGNORE_FILE, InventoryBuilder, InventoryEntry, InventoryPolicy,
+};
+use crate::path::RepoPath;
 use crate::probe::FilesystemProbe;
 use crate::snapshot::{Capture, CaptureRequest, WorkspaceSnapshot};
 
@@ -185,7 +199,8 @@ impl ContextEngineConfig {
     /// Addresses the worktree at `worktree_root` within `project_id`.
     ///
     /// `data_dir` is the Harkness data directory; the cache lands beneath its
-    /// reserved [`CONTEXT_DIRECTORY`] child and nowhere else. The path is
+    /// reserved [`CONTEXT_DIRECTORY`](harkness_core::CONTEXT_DIRECTORY) child
+    /// and nowhere else. The path is
     /// derived from the repository rather than supplied, so there is no
     /// traversal surface here for a caller to get wrong.
     #[must_use]
@@ -409,10 +424,9 @@ impl ContextEngine {
                     reason: error.to_string(),
                 }
             })?;
-        let cache_root = config
-            .data_dir
-            .join(CONTEXT_DIRECTORY)
-            .join(&repository_key);
+        // Composed by `index` rather than here, so the eviction sweep and the
+        // engine cannot disagree about which directory a repository's cache is.
+        let cache_root = index::cache_root(&config.data_dir, &repository_key);
         let cache = open_cache(
             &cache_root,
             &config.expected_versions,
@@ -587,12 +601,16 @@ impl ContextEngine {
 
     /// The content of one indexed chunk.
     ///
+    /// Distinct from [`indexed_chunks`](Self::indexed_chunks), which answers
+    /// *where* a chunk is: the index holds paths, digests and ranges and never
+    /// text, so returning content means re-reading the working tree and
+    /// deciding what to do when it has moved since the chunk was recorded.
+    /// That decision is retrieval's, and it arrives with [#123].
+    ///
     /// # Errors
     ///
-    /// [`ContextEngineError::NotYetAvailable`] until the index persistence and
-    /// retrieval work in [#114] and [#123] lands.
+    /// [`ContextEngineError::NotYetAvailable`] until [#123] lands.
     ///
-    /// [#114]: https://github.com/fullstacktaiye/harkness/issues/114
     /// [#123]: https://github.com/fullstacktaiye/harkness/issues/123
     pub fn read_chunk(
         &self,
@@ -692,6 +710,172 @@ impl ContextEngine {
                 counts: None,
             },
         }
+    }
+
+    /// The key this worktree's rows are filed under inside the cache.
+    ///
+    /// Derived from the canonical worktree root, so two catalog entries naming
+    /// one checkout share its rows instead of each building a copy.
+    #[must_use]
+    pub fn worktree_key(&self) -> WorktreeKey {
+        WorktreeKey::for_root(&self.config.worktree_root)
+    }
+
+    /// Walks the worktree and writes what it finds into the cache.
+    ///
+    /// The cold build: capture, walk, read each eligible file, chunk it, and
+    /// commit the whole thing at one generation. Nothing it writes is visible
+    /// until the commit, so a build stopped half-way leaves the previous
+    /// generation answering rather than a repository that reports itself
+    /// half-indexed. The incremental trigger — noticing that one file changed
+    /// and reconciling only that — is [#115]'s; this is what it reconciles
+    /// *from*.
+    ///
+    /// # A truncated walk never sweeps
+    ///
+    /// A [`Full`](BatchScope::Full) batch deletes every row it did not confirm,
+    /// which is right when the walk saw the whole worktree and catastrophic
+    /// when it did not: an inventory stopped by its file or time budget would
+    /// have the index delete rows for files that exist. A truncated inventory
+    /// therefore commits as [`Targeted`](BatchScope::Targeted) — everything it
+    /// did see is updated, nothing else is touched — and the receipt's scope
+    /// says which happened.
+    ///
+    /// Blocking, and cancellation-polled between files.
+    ///
+    /// # Errors
+    ///
+    /// The failures of [`inventory`](Self::inventory), plus
+    /// [`ContextEngineError::IndexBudgetExhausted`] when the cache reaches its
+    /// per-repository cap, [`ContextEngineError::IndexBusy`] under sustained
+    /// contention, and the cache's own open failures.
+    ///
+    /// [#115]: https://github.com/fullstacktaiye/harkness/issues/115
+    pub fn reindex(&self, cancellation: &Cancellation) -> Result<BatchReceipt, ContextEngineError> {
+        if cancellation.is_cancelled() {
+            return Err(ContextEngineError::Cancelled);
+        }
+        // Reconciled before anything is written, so a build under a bumped
+        // chunking version does not add rows beside the ones it invalidates.
+        self.refresh_index(cancellation)?;
+
+        let snapshot = self.snapshot(cancellation)?;
+        let inventory = InventoryBuilder::build(&snapshot, &self.inventory_policy(), cancellation)?;
+        let scope = batch_scope(inventory.is_truncated());
+        let key = self.worktree_key();
+        let classify_version = inventory.classify_version();
+
+        self.with_cache(|cache| {
+            let _operation = cache.begin_operation("reindex");
+            let mut batch = cache.begin(&key, inventory.worktree_root(), scope, cancellation)?;
+            for entry in inventory.entries() {
+                if cancellation.is_cancelled() {
+                    return Err(ContextEngineError::Cancelled);
+                }
+                match self.derive(entry, snapshot.id(), cancellation)? {
+                    Derived::Content(derived) => {
+                        let (version, chunks) = derived.as_ref();
+                        batch.record_chunked(entry, version, chunks, classify_version)?;
+                    }
+                    // A path whose content is never read — a binary, a symlink,
+                    // a repository boundary. Recording it without content is the
+                    // honest answer; dropping it would make a full batch sweep a
+                    // path that exists.
+                    Derived::Ineligible => batch.record_entry(entry, classify_version)?,
+                    // A path that *should* have been read and could not be,
+                    // because it changed under the walk or would not open. Its
+                    // metadata is refreshed and whatever the last successful
+                    // pass derived is left alone — clearing it would delete the
+                    // file's chunks over one unreadable moment.
+                    Derived::Unreadable => batch.record_unreadable(entry, classify_version)?,
+                }
+            }
+            batch.commit(cancellation)
+        })
+    }
+
+    /// Reads and chunks one entry, saying which of three things happened.
+    ///
+    /// The distinction between "never read" and "could not be read" is the
+    /// whole reason this returns three answers rather than an [`Option`]: the
+    /// two lead to different rows, and collapsing them costs a file its chunks
+    /// the first time it is written to while a build is walking past.
+    fn derive(
+        &self,
+        entry: &InventoryEntry,
+        snapshot: crate::ids::SnapshotId,
+        cancellation: &Cancellation,
+    ) -> Result<Derived, ContextEngineError> {
+        if !entry.eligible() {
+            return Ok(Derived::Ineligible);
+        }
+        let Ok(bytes) = std::fs::read(self.config.worktree_root.join(entry.path.to_path_buf()))
+        else {
+            return Ok(Derived::Unreadable);
+        };
+        let version = match FileVersion::new(entry, snapshot, bytes.into(), cancellation) {
+            Ok(version) => version,
+            // A cancelled token is the caller's answer wherever it is observed.
+            // Reading it as "this file could not be read" would let a stopped
+            // build commit a batch describing a repository nobody walked.
+            Err(crate::chunk::ChunkError::Cancelled) => return Err(ContextEngineError::Cancelled),
+            Err(_) => return Ok(Derived::Unreadable),
+        };
+        match chunk_file(&version, None, cancellation) {
+            Ok(chunks) => Ok(Derived::Content(Box::new((version, chunks)))),
+            Err(crate::chunk::ChunkError::Cancelled) => Err(ContextEngineError::Cancelled),
+            Err(_) => Ok(Derived::Unreadable),
+        }
+    }
+
+    /// What the cache holds right now, counted rather than remembered.
+    ///
+    /// [`index_status`](Self::index_status) reports the counts the last write
+    /// published and never waits; this one takes the connection and answers
+    /// from the file, which is what a test or a `context status` command wants.
+    ///
+    /// # Errors
+    ///
+    /// The cache's read failures.
+    pub fn index_counts(&self) -> Result<IndexCounts, ContextEngineError> {
+        self.with_cache(IndexCache::counts)
+    }
+
+    /// Every file row this worktree holds, bounded by `limit`.
+    ///
+    /// The page says whether the bound is why it ended, because a full `Vec` and
+    /// a repository that happens to hold exactly that many files are otherwise
+    /// the same answer.
+    ///
+    /// # Errors
+    ///
+    /// The cache's read failures.
+    pub fn indexed_files(
+        &self,
+        limit: usize,
+    ) -> Result<IndexedPage<IndexedFile>, ContextEngineError> {
+        let key = self.worktree_key();
+        self.with_cache(|cache| cache.files(&key, limit))
+    }
+
+    /// The file row this worktree holds for `path`, when there is one.
+    ///
+    /// # Errors
+    ///
+    /// The cache's read failures.
+    pub fn indexed_file(&self, path: &RepoPath) -> Result<Option<IndexedFile>, ContextEngineError> {
+        let key = self.worktree_key();
+        self.with_cache(|cache| cache.file(&key, path))
+    }
+
+    /// Every chunk this worktree's copy of `path` was recorded with.
+    ///
+    /// # Errors
+    ///
+    /// The cache's read failures.
+    pub fn indexed_chunks(&self, path: &RepoPath) -> Result<Vec<IndexedChunk>, ContextEngineError> {
+        let key = self.worktree_key();
+        self.with_cache(|cache| cache.chunks(&key, path))
     }
 
     /// Re-checks the cache and reconciles what this build can.
@@ -808,6 +992,36 @@ impl ContextEngine {
             Cache::Unavailable(error) => Err(error.clone()),
         }
     }
+}
+
+/// The scope a walk implies, which is the sharpest edge in `reindex`.
+///
+/// A pure function rather than an inline `if`, because it is the rule and not
+/// an implementation detail: a full batch deletes every row it did not confirm,
+/// and a walk stopped by its own file or time budget did not see the whole
+/// worktree — sweeping on one would delete rows for files that exist. Reaching
+/// the truncated branch through the engine means building a repository past
+/// `MAX_INVENTORY_FILES`, so the rule is held to directly instead of by a
+/// fixture nobody can afford to write.
+const fn batch_scope(truncated: bool) -> BatchScope {
+    if truncated {
+        BatchScope::Targeted
+    } else {
+        BatchScope::Full
+    }
+}
+
+/// What reading one inventory entry produced.
+enum Derived {
+    /// The bytes were read and chunked.
+    ///
+    /// Boxed because the other two carry nothing, and one value per file of a
+    /// hundred-thousand-file walk is a size worth not paying on every entry.
+    Content(Box<(FileVersion, crate::chunk::ChunkSet)>),
+    /// The entry is one whose content is never read.
+    Ineligible,
+    /// The entry should have been read and could not be.
+    Unreadable,
 }
 
 /// Prepares the cache, keeping a failure rather than propagating it.

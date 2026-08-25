@@ -551,3 +551,360 @@ fn a_configuration_carries_its_provenance_into_the_engine() {
     let snapshot = engine.snapshot(&Cancellation::default()).unwrap();
     assert_eq!(snapshot.config_generation(), 7);
 }
+
+// -- the cold build ---------------------------------------------------------
+
+/// Writes `files` into a fresh workspace and returns the engine that serves it.
+fn workspace_with(files: &[(&str, &str)]) -> (Workspace, ContextEngine) {
+    let workspace = Workspace::new();
+    for (path, body) in files {
+        let target = workspace.root.join(path);
+        fs::create_dir_all(target.parent().expect("a file has a parent")).unwrap();
+        fs::write(target, body).unwrap();
+    }
+    let engine = workspace.engine();
+    (workspace, engine)
+}
+
+/// The whole point of the cache: a repository walked once answers from rows
+/// afterwards, and the rows say what the walk found.
+#[test]
+fn reindexing_writes_every_eligible_file_and_reopening_reads_it_back() {
+    let (workspace, engine) = workspace_with(&[
+        ("src/main.rs", "fn main() {\n    println!(\"hello\");\n}\n"),
+        ("README.md", "# Title\n\nSome prose.\n"),
+        ("assets/blob.bin", "\u{0}\u{1}\u{2}binary\u{0}"),
+    ]);
+    let cancellation = Cancellation::default();
+
+    let receipt = engine.reindex(&cancellation).unwrap();
+
+    assert_eq!(receipt.scope.as_str(), "full");
+    assert!(receipt.files_recorded >= 3);
+    assert!(receipt.chunks_recorded >= 2);
+
+    let source = RepoPath::from_path(std::path::Path::new("src/main.rs"));
+    let row = engine
+        .indexed_file(&source)
+        .unwrap()
+        .expect("the source is indexed");
+    assert!(row.eligible());
+    assert!(row.file_version.is_some());
+    assert_eq!(row.classify_version, crate::CLASSIFY_VERSION);
+    assert!(!engine.indexed_chunks(&source).unwrap().is_empty());
+
+    let binary = RepoPath::from_path(std::path::Path::new("assets/blob.bin"));
+    let blob = engine
+        .indexed_file(&binary)
+        .unwrap()
+        .expect("the blob is recorded");
+    assert!(!blob.eligible(), "recorded, and never read");
+    assert!(blob.file_version.is_none());
+
+    // A second engine over the same data directory reads the warm cache rather
+    // than an empty one, which is what "reopening a project is fast" reduces to.
+    let reopened = ContextEngine::open(
+        ContextEngineConfig::new(
+            ProjectId::new(),
+            &workspace.root,
+            &workspace.fixture.data_dir,
+        ),
+        &cancellation,
+    )
+    .unwrap();
+    assert_eq!(
+        reopened.indexed_files(1_000).unwrap().len(),
+        engine.indexed_files(1_000).unwrap().len()
+    );
+    // Adopting a warm cache deliberately does not count it — six table scans on
+    // the path a user reached by opening a project would spend the whole open
+    // budget on a number nothing has asked for. Asking is what counts it.
+    assert!(reopened.index_status().counts.is_none());
+    assert_eq!(
+        reopened.index_counts().unwrap().files,
+        receipt.files_recorded
+    );
+    assert!(reopened.refresh_index(&cancellation).is_ok());
+    assert_eq!(
+        reopened
+            .index_status()
+            .counts
+            .expect("a refresh publishes what it found")
+            .files,
+        receipt.files_recorded
+    );
+}
+
+/// A file that is gone stops being indexed. A full batch is the whole worktree,
+/// so the sweep is what makes the second build describe the repository rather
+/// than its history.
+#[test]
+fn a_second_reindex_sweeps_what_the_worktree_no_longer_has() {
+    let (workspace, engine) = workspace_with(&[
+        ("keep.rs", "fn keep() {}\n"),
+        ("remove.rs", "fn remove() {}\n"),
+    ]);
+    let cancellation = Cancellation::default();
+    engine.reindex(&cancellation).unwrap();
+
+    fs::remove_file(workspace.root.join("remove.rs")).unwrap();
+    fs::write(workspace.root.join("keep.rs"), "fn keep() { changed(); }\n").unwrap();
+    let receipt = engine.reindex(&cancellation).unwrap();
+
+    assert_eq!(receipt.rows_swept, 1);
+    let paths = engine
+        .indexed_files(100)
+        .unwrap()
+        .iter()
+        .map(|row| row.path.display())
+        .collect::<Vec<_>>();
+    assert!(paths.contains(&"keep.rs".to_owned()));
+    assert!(!paths.contains(&"remove.rs".to_owned()));
+}
+
+/// Two linked worktrees of one repository share a cache and keep their own
+/// files. Getting this wrong is how one checkout answers the other's questions.
+#[test]
+fn two_linked_worktrees_share_one_cache_and_keep_their_own_file_rows() {
+    let workspace = Workspace::new();
+    fs::write(workspace.root.join("shared.rs"), "fn shared() {}\n").unwrap();
+    let repository = harkness_git::git2::Repository::open(&workspace.root).unwrap();
+    harkness_test_fixtures::commit_all(&repository, "base");
+    let linked = workspace.fixture.root.path().join("linked");
+    repository
+        .worktree(
+            "linked",
+            &linked,
+            Some(WorktreeAddOptions::new().reference(None)),
+        )
+        .unwrap();
+    fs::write(linked.join("only-linked.rs"), "fn linked() {}\n").unwrap();
+
+    let cancellation = Cancellation::default();
+    let primary = workspace.engine();
+    let secondary = ContextEngine::open(
+        ContextEngineConfig::new(ProjectId::new(), &linked, &workspace.fixture.data_dir),
+        &cancellation,
+    )
+    .unwrap();
+    assert_eq!(primary.cache_root(), secondary.cache_root());
+    assert_ne!(primary.worktree_key(), secondary.worktree_key());
+
+    primary.reindex(&cancellation).unwrap();
+    secondary.reindex(&cancellation).unwrap();
+
+    let primary_paths = primary
+        .indexed_files(100)
+        .unwrap()
+        .iter()
+        .map(|row| row.path.display())
+        .collect::<Vec<_>>();
+    let secondary_paths = secondary
+        .indexed_files(100)
+        .unwrap()
+        .iter()
+        .map(|row| row.path.display())
+        .collect::<Vec<_>>();
+    assert!(primary_paths.contains(&"shared.rs".to_owned()));
+    assert!(!primary_paths.contains(&"only-linked.rs".to_owned()));
+    assert!(secondary_paths.contains(&"shared.rs".to_owned()));
+    assert!(secondary_paths.contains(&"only-linked.rs".to_owned()));
+
+    // The deduplication is by *content*, so what the two checkouts actually
+    // hold is what decides the row count. Git may rewrite line endings on the
+    // way into a worktree — on Windows it routinely does — and a file that came
+    // out with different bytes is genuinely a different version rather than a
+    // dedup failure. Reading both is the honest way to say which case this is.
+    let primary_bytes = fs::read(workspace.root.join("shared.rs")).unwrap();
+    let secondary_bytes = fs::read(linked.join("shared.rs")).unwrap();
+    let expected = i64::from(primary_bytes != secondary_bytes) + 1;
+
+    let connection = Connection::open(primary.cache_root().join(INDEX_DATABASE_FILE)).unwrap();
+    let versions: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM file_versions WHERE path = ?1",
+            [&b"shared.rs"[..]],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        versions, expected,
+        "one path with one content is one file version, and one path with two \
+         contents is two"
+    );
+}
+
+/// A cold build reconciles before it writes. Adding rows beside the ones a
+/// version bump invalidated would leave the cache half in each world.
+#[test]
+fn reindexing_reconciles_a_version_skew_before_it_writes() {
+    let workspace = Workspace::new();
+    fs::write(workspace.root.join("a.rs"), "fn a() {}\n").unwrap();
+    let cancellation = Cancellation::default();
+    workspace.engine().reindex(&cancellation).unwrap();
+
+    let upgraded = ContextEngine::open(
+        workspace
+            .config()
+            .with_expected_versions(crate::index::ExpectedVersions {
+                chunking_version: "99".to_owned(),
+                ..crate::index::ExpectedVersions::current()
+            }),
+        &cancellation,
+    )
+    .unwrap();
+    assert_eq!(upgraded.index_status().stale_components.len(), 1);
+
+    upgraded.reindex(&cancellation).unwrap();
+
+    assert!(upgraded.index_status().stale_components.is_empty());
+    let reachable: usize = upgraded
+        .indexed_files(1_000)
+        .unwrap()
+        .iter()
+        .map(|row| upgraded.indexed_chunks(&row.path).unwrap().len())
+        .sum();
+    assert!(reachable > 0);
+    assert_eq!(
+        upgraded.index_counts().unwrap().chunks,
+        reachable as u64,
+        "every chunk left in the cache is one this build wrote and can reach"
+    );
+}
+
+/// A cache another process is writing costs *retrieval* and nothing else. The
+/// engine's Git-backed half — workspace identity and the walk above all — is
+/// what a run cannot proceed without, so a caller met by `index_busy` degrades
+/// to reading the workspace live rather than stopping.
+#[test]
+fn a_contended_cache_costs_the_index_and_not_the_workspace() {
+    let (workspace, engine) = workspace_with(&[("a.rs", "fn a() {}\n")]);
+    let cancellation = Cancellation::default();
+    engine.reindex(&cancellation).unwrap();
+
+    // The write lock, held by somebody else. In WAL mode this is exactly what
+    // one front end indexing while another wants to looks like: readers are
+    // untouched and the *writer* is the one that has to wait or give up.
+    let blocker = Connection::open(engine.cache_root().join(INDEX_DATABASE_FILE)).unwrap();
+    blocker
+        .busy_timeout(std::time::Duration::from_millis(1))
+        .unwrap();
+    blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+    let refused = engine.reindex(&cancellation).unwrap_err();
+    assert_eq!(refused.kind(), "index_busy");
+
+    // The fallback: the same question answered from the filesystem, with the
+    // cache held by somebody else for the whole of it.
+    let live = engine
+        .inventory(&InventoryRequest::new(), &cancellation)
+        .unwrap();
+    assert!(
+        live.entries()
+            .iter()
+            .any(|entry| entry.path.display() == "a.rs")
+    );
+    assert!(engine.snapshot(&cancellation).is_ok());
+
+    // What was already indexed is still readable throughout: contention is a
+    // delay to the *update*, not a loss of the cache.
+    assert!(!engine.indexed_files(100).unwrap().is_empty());
+
+    blocker.execute_batch("ROLLBACK").unwrap();
+    drop(blocker);
+    assert!(engine.reindex(&cancellation).is_ok());
+    let _ = workspace;
+}
+
+/// The rule a truncated walk turns on, held to directly.
+///
+/// A full batch deletes every row it did not confirm, and a walk stopped by its
+/// own budget did not see the whole worktree — sweeping on one would delete
+/// rows for files that exist. Reaching the branch through `reindex` would mean
+/// building a repository past `MAX_INVENTORY_FILES`, so the decision is a pure
+/// function and this is where it is proved.
+#[test]
+fn a_truncated_walk_commits_as_targeted_and_a_complete_one_as_full() {
+    assert_eq!(super::batch_scope(true), crate::index::BatchScope::Targeted);
+    assert_eq!(super::batch_scope(false), crate::index::BatchScope::Full);
+}
+
+/// A file that changes under a running build keeps whatever the last successful
+/// pass derived, rather than being recorded as content-less — which would
+/// unlink it from its chunks and have the commit collect them.
+#[test]
+fn a_file_that_changes_under_the_build_keeps_its_previous_chunks() {
+    let (workspace, engine) = workspace_with(&[("a.rs", "fn a() {}\n")]);
+    let cancellation = Cancellation::default();
+    engine.reindex(&cancellation).unwrap();
+    let path = RepoPath::from_path(std::path::Path::new("a.rs"));
+    let chunks = engine.indexed_chunks(&path).unwrap();
+    assert!(!chunks.is_empty());
+
+    // The inventory records one size and the file is a different one by the
+    // time the bytes are read, which is what `FileVersion::new` refuses.
+    let inventory = engine
+        .inventory(&InventoryRequest::new(), &cancellation)
+        .unwrap();
+    let entry = inventory
+        .entries()
+        .iter()
+        .find(|entry| entry.path == path)
+        .expect("the file is in the inventory")
+        .clone();
+    fs::write(
+        workspace.root.join("a.rs"),
+        "fn a() { much_longer_now(); }\n",
+    )
+    .unwrap();
+
+    let key = engine.worktree_key();
+    let receipt = {
+        let cache_root = engine.cache_root().to_path_buf();
+        let cache = crate::index::IndexCache::open_or_create(
+            &cache_root,
+            &crate::index::ExpectedVersions::current(),
+            engine.repository_key(),
+            &cancellation,
+        )
+        .unwrap();
+        let mut batch = cache
+            .begin(
+                &key,
+                engine.worktree_root(),
+                crate::index::BatchScope::Targeted,
+                &cancellation,
+            )
+            .unwrap();
+        batch
+            .record_unreadable(&entry, crate::CLASSIFY_VERSION)
+            .unwrap();
+        batch.commit(&cancellation).unwrap()
+    };
+
+    assert_eq!(receipt.files_recorded, 1);
+    let row = engine
+        .indexed_file(&path)
+        .unwrap()
+        .expect("the row is still there");
+    assert!(row.unreadable);
+    assert!(row.file_version.is_some(), "still linked to what it had");
+    assert_eq!(
+        engine.indexed_chunks(&path).unwrap(),
+        chunks,
+        "and its chunks survived the pass that could not read it"
+    );
+}
+
+/// An already-cancelled token launches nothing at all.
+#[test]
+fn a_cancelled_reindex_writes_nothing_visible() {
+    let (_workspace, engine) = workspace_with(&[("a.rs", "fn a() {}\n")]);
+    let cancellation = Cancellation::default();
+    cancellation.cancel();
+
+    let error = engine.reindex(&cancellation).unwrap_err();
+
+    assert_eq!(error.kind(), "cancelled");
+    assert!(engine.indexed_files(100).unwrap().is_empty());
+}

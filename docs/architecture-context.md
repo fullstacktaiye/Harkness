@@ -120,7 +120,10 @@ Each stage in one line:
   file's whole chunk set.
 - **Index cache** — one SQLite database per repository at
   `<data_dir>/context/<repository-key>/index.db`, keyed by the same v5 UUID as
-  the repository lock. Disposable by design (ADR-0004).
+  the repository lock. Holds the file inventory, the content-addressed chunk and
+  symbol rows, and nothing else; only `files` is per-worktree, so two linked
+  worktrees share the expensive half. Disposable by design (ADR-0004), and
+  documented in [`docs/context-index.md`](context-index.md).
 - **Retrieval sources** — filename and lexical search over the index, symbol
   lookup, the repository map, Git-derived context through the existing
   `GitService`, and discovered instruction files.
@@ -147,8 +150,9 @@ past run auditable.
 | --- | --- | --- |
 | Holds | runs, steps, tool calls, events, approvals, snapshots, packs, provenance, turns, provider requests | file inventory, chunks, symbols, search structures, cached scores |
 | Character | evidence | derivation |
-| Versioning | numbered migrations, never edited once released | `index_meta`: `schema_version`, `parser_version`, `chunking_version`, `ranking_version`, plus `index_generation` |
+| Versioning | numbered migrations, never edited once released | `index_meta`: `schema_version`, `parser_version`, `chunking_version`, `ranking_version`, `classify_version`, plus `index_generation` |
 | On corruption | refuse and report | quarantine, recreate, bump generation |
+| On outgrowing its budget | never; evidence is kept | refuse the batch, or evict whole repository caches |
 | Cost of deleting it | run history and audit trail | warm-up time, nothing else |
 
 Deleting `<data_dir>/context/` is always safe (ADR-0004). The engine's
@@ -205,7 +209,25 @@ another front end holding the cache for a few seconds at exactly the wrong
 moment, so `refresh_index` and `dispose_index` retry the open before doing
 anything else — an engine that answered "no index" for its whole life because of
 five seconds at startup would make the failure far more expensive than its
-cause.
+cause. Contention has its own discriminant, `index_busy`, precisely so a caller
+can tell "come back later" from "this will still be broken next time" and
+degrade to reading the workspace live in the meantime.
+
+### Writing to it
+
+Rows are written at a *pending* generation nothing can see, flushed during the
+batch, and made visible by one transaction that also sweeps and moves the
+worktree's watermark. That is what makes a cold build of a large repository
+possible without holding the write lock for its whole length, and what makes a
+process killed half-way through leave the previous generation answering rather
+than a repository reporting itself half-indexed.
+
+A component version bump invalidates only what that component produced — chunks
+for a chunking bump, symbols for a parser bump, and *nothing* for a
+classification bump, whose file rows are still true records carrying their own
+version. [`docs/context-index.md`](context-index.md) is the reference for the
+schema, the commit protocol, the whole invalidation matrix, and the two disk
+budgets.
 
 ## The provider boundary
 
@@ -295,6 +317,8 @@ ADR when it arrives — ADR-0005) and **summarization-based context compression*
 
 - [`docs/adr/README.md`](adr/README.md) — the eight v0.4 decisions, with the
   reasoning and the alternatives that lost.
+- [`docs/context-index.md`](context-index.md) — the persistent index: schema,
+  the generation commit protocol, the invalidation matrix, and the budgets.
 - `docs/architecture-runtime.md` — the v0.3 runtime spine this builds on
   ([#105](https://github.com/fullstacktaiye/harkness/issues/105)).
 - `AGENTS.md` — the normative invariants a contributor can violate silently.

@@ -194,6 +194,20 @@ pub enum EventKind {
     /// generation bump changes what every later snapshot digest means, not
     /// because anything in `runtime.db` was touched — nothing was.
     ContextCacheRecreated,
+    /// A batch of derived index rows became visible.
+    ///
+    /// On the run's timeline because a run that indexed a repository mid-way
+    /// read different things before and after, and the row counts are what make
+    /// "the search found nothing" answerable a year later. Nothing in
+    /// `runtime.db` was touched: the rows are in the disposable cache.
+    ContextIndexCommitted,
+    /// One repository's index cache was evicted to bring the subtree under its
+    /// disk budget.
+    ///
+    /// Recorded where it was noticed rather than where it was caused: eviction
+    /// is a maintenance sweep over every repository, and the run that happened
+    /// to trigger it is the one that has to say why its next question was slow.
+    ContextIndexEvicted,
     /// A registered external agent was spawned, negotiated with, and torn down.
     ///
     /// The whole health record, including the typed failure kind and the rung
@@ -242,6 +256,8 @@ impl EventKind {
         "agent_checkpoint",
         "snapshot_captured",
         "context_cache_recreated",
+        "context_index_committed",
+        "context_index_evicted",
         "external_agent_health_checked",
         "external_agent_trust_invalidated",
         "diagnostic",
@@ -268,9 +284,11 @@ impl EventKind {
             Self::AgentCheckpoint => Self::KINDS[14],
             Self::SnapshotCaptured => Self::KINDS[15],
             Self::ContextCacheRecreated => Self::KINDS[16],
-            Self::ExternalAgentHealthChecked => Self::KINDS[17],
-            Self::ExternalAgentTrustInvalidated => Self::KINDS[18],
-            Self::Diagnostic => Self::KINDS[19],
+            Self::ContextIndexCommitted => Self::KINDS[17],
+            Self::ContextIndexEvicted => Self::KINDS[18],
+            Self::ExternalAgentHealthChecked => Self::KINDS[19],
+            Self::ExternalAgentTrustInvalidated => Self::KINDS[20],
+            Self::Diagnostic => Self::KINDS[21],
             Self::Unrecognized(spelling) => spelling,
         }
     }
@@ -300,6 +318,8 @@ impl EventKind {
             "agent_checkpoint" => Self::AgentCheckpoint,
             "snapshot_captured" => Self::SnapshotCaptured,
             "context_cache_recreated" => Self::ContextCacheRecreated,
+            "context_index_committed" => Self::ContextIndexCommitted,
+            "context_index_evicted" => Self::ContextIndexEvicted,
             "external_agent_health_checked" => Self::ExternalAgentHealthChecked,
             "external_agent_trust_invalidated" => Self::ExternalAgentTrustInvalidated,
             "diagnostic" => Self::Diagnostic,
@@ -866,6 +886,8 @@ mod tests {
             EventKind::AgentCheckpoint,
             EventKind::SnapshotCaptured,
             EventKind::ContextCacheRecreated,
+            EventKind::ContextIndexCommitted,
+            EventKind::ContextIndexEvicted,
             EventKind::ExternalAgentHealthChecked,
             EventKind::ExternalAgentTrustInvalidated,
             EventKind::Diagnostic,

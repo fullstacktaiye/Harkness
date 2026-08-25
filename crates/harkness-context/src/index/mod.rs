@@ -16,18 +16,42 @@
 //! ever write the other side, and the crate boundary makes that structural
 //! rather than intended: `harkness-context` cannot name `harkness-runtime`.
 //!
-//! # Versioning is four fields, not one
+//! # What it holds
+//!
+//! One metadata row, one row per worktree, and the derived content beneath
+//! them: [`INDEX_SCHEMA`] is the whole layout and the place to read before
+//! changing anything persisted. Exactly one table is per-worktree — `files` —
+//! and everything else is content-addressed and shared, which is why every read
+//! takes a [`WorktreeKey`] and joins through that worktree's rows.
+//!
+//! A batch is written at a *pending* generation nothing can see and becomes
+//! visible in one transaction, so a process killed part-way through a cold
+//! build leaves rows no query returns rather than a half-indexed repository
+//! reporting itself complete. [`IndexBatch`] is that protocol.
+//!
+//! # Versioning is five fields, not one
 //!
 //! [`index_meta`](IndexMeta) holds exactly one row. Its `schema_version`
 //! describes the cache's own table layout and is the only field a mismatch
 //! cannot be reconciled from: an older cache is quarantined and recreated, and
 //! a *newer* one is refused read-only and left byte-identical, mirroring the
-//! run store's `schema_too_new`. The three component versions — parser,
-//! chunking, ranking — describe what produced the rows rather than where they
-//! sit, so a mismatch leaves the file alone and marks that component's data
-//! stale for [#114] to reconcile incrementally. Rewriting the stored component
-//! version at open would destroy exactly the knowledge that reconciliation
-//! needs.
+//! run store's `schema_too_new`. The four component versions — parser,
+//! chunking, ranking, classify — describe what produced the rows rather than
+//! where they sit, so a mismatch leaves the file alone and marks that
+//! component's data stale. Rewriting the stored component version at open would
+//! destroy exactly the knowledge that reconciliation needs.
+//!
+//! [`IndexCache::refresh`] is the reconciler, and it is the only thing that
+//! moves a stored component version — after it has acted on the skew, in the
+//! same transaction. What "acting" means differs by component and the
+//! difference is the whole of the invalidation matrix:
+//!
+//! | Skew | What happens | Why |
+//! | --- | --- | --- |
+//! | `chunking` | `chunks` emptied, `file_versions.chunking_version` nulled | a chunk's identity was derived under rules this build does not use, so the row names something nothing can re-derive |
+//! | `parser` | `symbols` emptied, `file_versions.parser_version` nulled | the same, for symbol identity |
+//! | `ranking` | the tables registered as ranking-owned are emptied | a score is only meaningful under the formula that produced it |
+//! | `classify` | nothing is deleted | a `files` row is a true record that a path existed at a size; only its *class* is suspect, and the row's own `classify_version` says so |
 //!
 //! # The generation is a token, not a counter
 //!
@@ -55,10 +79,19 @@
 //! repository lock or the catalog lock is acquired, so the workspace's
 //! repository-then-catalog ordering is untouched. [`IndexCache::status`] takes
 //! a different, short-held lock and never the connection's, which is what lets
-//! a UI poll answer while a cold index build is running.
+//! a UI poll answer while a cold index build is running — and a batch releases
+//! the connection between flushes for the same reason.
 //!
-//! [#114]: https://github.com/fullstacktaiye/harkness/issues/114
+//! A third lock is the advisory [`CACHE_LOCK_FILE`] in the cache's own root: an
+//! open cache holds it *shared* for its whole life so an eviction sweep, which
+//! takes it exclusively, cannot delete a cache out from under a live process.
+//! It is taken once at open and never while any other lock is held.
+//!
 //! [#115]: https://github.com/fullstacktaiye/harkness/issues/115
+
+mod budget;
+mod schema;
+mod store;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -75,6 +108,17 @@ use time::{OffsetDateTime, UtcOffset, macros::format_description};
 
 use crate::error::ContextEngineError;
 
+pub use budget::{
+    CACHE_LOCK_FILE, CacheUsage, EvictionReport, MAX_TOTAL_CONTEXT_BYTES, evict_to_budget, survey,
+};
+pub use schema::{CORE_TABLES, INDEX_SCHEMA, INDEX_SCHEMA_VERSION};
+pub use store::{
+    BatchReceipt, BatchScope, IndexBatch, IndexedChunk, IndexedFile, IndexedPage, IndexedSymbol,
+    MAX_READ_ROWS, SymbolRecord, WorktreeKey, cache_root,
+};
+
+use budget::CacheLock;
+
 /// Name of the cache database inside one repository's cache root.
 pub const INDEX_DATABASE_FILE: &str = "index.db";
 
@@ -88,8 +132,15 @@ pub const QUARANTINE_PREFIX: &str = "index.db.corrupt-";
 /// disk with copies of itself.
 pub const MAX_QUARANTINED_CACHES: usize = 2;
 
-/// Newest cache table layout this build understands.
-pub const INDEX_SCHEMA_VERSION: u32 = 1;
+/// How large one repository's cache may grow before a batch is refused.
+///
+/// Half a gibibyte of derived rows for one repository, which the medium
+/// profile is not expected to come near. Reaching it fails the batch with
+/// [`ContextEngineError::IndexBudgetExhausted`] rather than storing what fits:
+/// an index that silently stopped recording answers "no match" for content it
+/// never held, and a caller cannot tell that from a repository that does not
+/// contain it.
+pub const MAX_INDEX_DB_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Version of the language grammars and symbol extraction that filled the cache.
 ///
@@ -108,6 +159,9 @@ pub use crate::chunk::CHUNKING_VERSION;
 /// [#121]: https://github.com/fullstacktaiye/harkness/issues/121
 pub const RANKING_VERSION: &str = "0";
 
+/// Version of the classification rules that decided each file row's class.
+pub use crate::classify::CLASSIFY_VERSION;
+
 /// How long a connection waits for another process's writer before giving up.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -124,13 +178,19 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// How long a database with no metadata is given to turn out to be a cache
 /// somebody else is still creating.
 ///
-/// Short, because the window it covers is the microseconds between another
-/// process opening the file and its one creation transaction taking the write
-/// lock — everything after that is contention, which the busy wait already
-/// answers. It is not zero, because a cache being built and a cache that is
-/// broken are indistinguishable in a single read, and quarantining the first is
-/// far more expensive than waiting out the second.
-const CREATION_GRACE: Duration = Duration::from_millis(200);
+/// It is not zero, because a cache being built and a cache that is broken are
+/// indistinguishable in a single read, and quarantining the first is far more
+/// expensive than waiting out the second.
+///
+/// It is *seconds* rather than the couple of hundred milliseconds a
+/// single-table cache needed. Creating one now applies the whole layout —
+/// seven tables and four indexes — and inserts the metadata row inside one
+/// transaction, and a cold filesystem on a loaded machine takes longer over
+/// that than the old window allowed. Waiting too long costs a one-off pause on
+/// a cache that really is broken; waiting too little destroys the cache another
+/// process is part-way through writing, and on Windows cannot even do that
+/// cleanly, because the file it would rename is open.
+const CREATION_GRACE: Duration = Duration::from_secs(3);
 
 /// Filename-safe, fixed-width, lexicographically chronological stamp.
 ///
@@ -138,19 +198,6 @@ const CREATION_GRACE: Duration = Duration::from_millis(200);
 /// the filesystem for modification times it is not obliged to keep.
 const QUARANTINE_STAMP: &[BorrowedFormatItem<'_>] =
     format_description!("[year][month][day]T[hour][minute][second][subsecond digits:9]Z");
-
-/// The single-row schema every cache carries from the day it is created.
-const INDEX_META_SCHEMA: &str = "\
-CREATE TABLE IF NOT EXISTS index_meta (
-    id                  INTEGER PRIMARY KEY CHECK (id = 1),
-    schema_version      INTEGER NOT NULL,
-    parser_version      TEXT    NOT NULL,
-    chunking_version    TEXT    NOT NULL,
-    ranking_version     TEXT    NOT NULL,
-    index_generation    INTEGER NOT NULL,
-    repository_identity TEXT    NOT NULL,
-    created_at          TEXT    NOT NULL
-) STRICT;";
 
 /// The versions a build expects the caches it opens to have been written under.
 ///
@@ -167,6 +214,8 @@ pub struct ExpectedVersions {
     pub chunking_version: String,
     /// Scoring formula.
     pub ranking_version: String,
+    /// Denial list and classification rules.
+    pub classify_version: String,
 }
 
 impl Default for ExpectedVersions {
@@ -184,6 +233,7 @@ impl ExpectedVersions {
             parser_version: PARSER_VERSION.to_owned(),
             chunking_version: CHUNKING_VERSION.to_string(),
             ranking_version: RANKING_VERSION.to_owned(),
+            classify_version: CLASSIFY_VERSION.to_string(),
         }
     }
 
@@ -210,6 +260,11 @@ impl ExpectedVersions {
                 &stored.ranking_version,
                 &self.ranking_version,
             ),
+            (
+                IndexComponent::Classify,
+                &stored.classify_version,
+                &self.classify_version,
+            ),
         ]
         .into_iter()
         .filter(|(_, found, expected)| found != expected)
@@ -232,9 +287,14 @@ pub enum IndexComponent {
     Chunking,
     /// Scoring formula.
     Ranking,
+    /// Denial list and classification rules.
+    Classify,
 }
 
 impl IndexComponent {
+    /// Every component, in the order a skew is reported and acted on.
+    pub const ALL: &'static [Self] = &[Self::Parser, Self::Chunking, Self::Ranking, Self::Classify];
+
     /// Stable spelling used in status reports and event payloads.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -242,6 +302,7 @@ impl IndexComponent {
             Self::Parser => "parser",
             Self::Chunking => "chunking",
             Self::Ranking => "ranking",
+            Self::Classify => "classify",
         }
     }
 }
@@ -330,12 +391,22 @@ pub struct IndexMeta {
     pub chunking_version: String,
     /// Scoring formula whose results it holds.
     pub ranking_version: String,
+    /// Classification rules that decided its file rows' classes.
+    pub classify_version: String,
     /// Monotonic token naming this build of the cache.
     pub index_generation: u64,
     /// Repository the cache was built for, in `harkness-git`'s spelling.
     pub repository_identity: String,
     /// When the cache was created, RFC 3339 UTC.
     pub created_at: OffsetDateTime,
+    /// When a build last adopted this cache, RFC 3339 UTC.
+    ///
+    /// Stamped after the decision to adopt, never before it, so a cache this
+    /// build refuses is still left byte-identical. It is what orders eviction:
+    /// `atime` is unusable under `relatime` and absent under `noatime`, so the
+    /// cache records its own recency rather than asking the filesystem for one
+    /// it is not obliged to keep.
+    pub last_opened_at: OffsetDateTime,
 }
 
 /// Whether the cache is usable, and why not when it is not.
@@ -362,22 +433,33 @@ pub struct IndexOperation {
     pub percent_complete: Option<u8>,
 }
 
-/// How much the cache holds, once there is anything in it to count.
+/// How much the cache holds.
 ///
-/// [#114] introduces the content tables and populates this; until then the
-/// answer is [`None`] rather than a row of zeroes, because "nothing is indexed"
-/// and "nobody can say yet" are different things to render.
+/// Reported as [`None`] rather than a row of zeroes when the cache holds no
+/// connection, because "nothing is indexed" and "nobody can say" are different
+/// things to render.
 ///
-/// [#114]: https://github.com/fullstacktaiye/harkness/issues/114
+/// `files` counts *visible* rows across every worktree — rows a batch has
+/// committed — so a cold build in progress does not report the repository as
+/// half indexed. The content-addressed counts are the file's own totals, which
+/// is what a disk question wants.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct IndexCounts {
-    /// Files with at least one indexed chunk.
+    /// Worktrees this repository's cache holds rows for.
+    pub worktrees: u64,
+    /// Visible file rows, across every worktree.
     pub files: u64,
+    /// Distinct file contents held.
+    pub contents: u64,
+    /// Distinct `(path, content)` versions held.
+    pub file_versions: u64,
     /// Chunks held.
     pub chunks: u64,
     /// Symbols held.
     pub symbols: u64,
+    /// Bytes the database and its write-ahead log occupy.
+    pub database_bytes: u64,
 }
 
 /// A non-blocking view of the cache, for a UI to poll.
@@ -413,17 +495,30 @@ pub struct IndexReport {
     /// Generation the cache carried when the refresh finished.
     pub generation: u64,
     /// Components still holding rows this build did not produce.
+    ///
+    /// Empty after a refresh that could act on every skew it found, which is
+    /// the ordinary case: acting is what a refresh is for. A component whose
+    /// invalidation could not be applied stays here.
     pub stale_components: Vec<VersionSkew>,
-    /// Content entries reconciled.
-    ///
-    /// Zero until [#114] adds the content tables there is anything to
-    /// reconcile *in*; the field is here so the report's shape does not change
-    /// when it does.
-    ///
-    /// [#114]: https://github.com/fullstacktaiye/harkness/issues/114
+    /// What each acted-on skew deleted, in the order it was applied.
+    pub invalidated: Vec<ComponentInvalidation>,
+    /// Content rows dropped because a component version no longer matched.
     pub entries_reconciled: u64,
     /// How long the refresh took.
     pub duration: Duration,
+}
+
+/// One component's rows, dropped because this build did not produce them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComponentInvalidation {
+    /// Which component's version had moved.
+    pub component: IndexComponent,
+    /// Version the cache recorded.
+    pub stored: String,
+    /// Version this build produces.
+    pub expected: String,
+    /// Rows deleted from the tables that component owns.
+    pub rows_deleted: u64,
 }
 
 /// Mutable state published to [`IndexCache::status`].
@@ -443,6 +538,14 @@ struct CacheState {
     stale_components: Vec<VersionSkew>,
     last_recreation: Option<CacheRecreation>,
     last_refreshed_at: Option<OffsetDateTime>,
+    /// What the cache held when something last counted it.
+    ///
+    /// Cached rather than counted on demand, because [`IndexCache::status`]
+    /// promises never to wait on the writer and counting takes the connection a
+    /// cold build is holding between flushes. Every path that changes what the
+    /// cache holds republishes this, so the number a UI polls is the one the
+    /// last committed batch left behind rather than a guess.
+    counts: Option<IndexCounts>,
     /// The operations running right now, innermost last.
     ///
     /// A stack rather than a flag, and it names every long operation rather
@@ -480,6 +583,13 @@ pub struct IndexCache {
     /// `None` only between a failed recreation and the next successful open.
     connection: Mutex<Option<Connection>>,
     state: Mutex<CacheState>,
+    /// Held for this cache's whole life so an eviction sweep skips it.
+    ///
+    /// `None` when the advisory lock could not be taken at all — a read-only
+    /// data directory, a filesystem without locking, an exhausted descriptor
+    /// table. That costs protection from eviction and nothing else, and taking
+    /// retrieval away over a bookkeeping file would be the worse trade.
+    _lock: Option<CacheLock>,
 }
 
 impl IndexCache {
@@ -514,11 +624,29 @@ impl IndexCache {
             reason: format!("the cache directory could not be created: {error}"),
         })?;
 
+        // Taken before the probe, so a cache is protected from eviction from
+        // the moment this build starts deciding about it rather than from the
+        // moment it succeeds.
+        let held = CacheLock::shared(cache_root);
+
         let probed = probe_existing(&database, expected, repository_identity, cancellation)?;
+        // A cache this call created holds nothing, which is a count rather than
+        // an absence of one. A cache it *adopted* is not counted here at all:
+        // `COUNT(*)` over a `WITHOUT ROWID` table is a scan, and paying six of
+        // them on the path a user reached by opening a project would spend the
+        // whole open budget on a number nothing has asked for yet.
+        // `refresh` and every committed batch publish it; `counts` takes it on
+        // demand.
+        let mut counts = Some(IndexCounts::default());
         let (connection, meta, stale_components, last_recreation) = match probed {
             Probe::Usable(meta) => {
-                let connection = open_writable(&database, cancellation)?;
+                let mut connection = open_writable(&database, cancellation)?;
+                // Stamped only now, once the cache is one this build may adopt.
+                // A refusal returns above this line with the file untouched,
+                // which is the promise `cache_version_conflict` makes.
+                let meta = stamp_opened(&mut connection, meta);
                 let stale = expected.skew(&meta);
+                counts = None;
                 (connection, meta, stale, None)
             }
             // A cache that was never there is a first build, not a recreation.
@@ -565,7 +693,11 @@ impl IndexCache {
             }
         };
 
-        Ok(Self {
+        let counts = counts.map(|counts| IndexCounts {
+            database_bytes: database_bytes(&database),
+            ..counts
+        });
+        let cache = Self {
             root: cache_root.to_path_buf(),
             database,
             expected: expected.clone(),
@@ -578,8 +710,19 @@ impl IndexCache {
                 last_recreation,
                 last_refreshed_at: None,
                 in_flight: Vec::new(),
+                counts,
             }),
-        })
+            _lock: held,
+        };
+        tracing::debug!(
+            repository = cache.repository_identity.as_str(),
+            generation = cache.generation(),
+            // Adopted rather than built, which is what "warm" means here — the
+            // row counts are deliberately not read on this path.
+            warm = cache.status().counts.is_none(),
+            "context index opened"
+        );
+        Ok(cache)
     }
 
     /// Directory this cache owns.
@@ -637,7 +780,26 @@ impl IndexCache {
                 name,
                 percent_complete: None,
             }),
-            counts: None,
+            counts: if ready { state.counts } else { None },
+        }
+    }
+
+    /// Recounts what the cache holds and publishes it to [`Self::status`].
+    ///
+    /// Called by every path that changes the answer. A failure leaves the
+    /// previous counts in place rather than blanking them: a count that could
+    /// not be taken is not the same as a cache that holds nothing, and a
+    /// surface rendering zero rows for a warm index is the more misleading of
+    /// the two.
+    pub(super) fn publish_counts(&self) {
+        let counted = {
+            let connection = lock(&self.connection);
+            connection
+                .as_ref()
+                .and_then(|open| counts_of(open, &self.database))
+        };
+        if let Some(counts) = counted {
+            lock(&self.state).counts = Some(counts);
         }
     }
 
@@ -671,7 +833,7 @@ impl IndexCache {
         &self,
         cancellation: &Cancellation,
     ) -> Result<CacheRecreation, ContextEngineError> {
-        let _operation = self.begin("dispose");
+        let _operation = self.begin_operation("dispose");
         let mut connection = lock(&self.connection);
         // Read from the state rather than through `generation()`, which answers
         // `0` for a cache that is already closed. A retried disposal would
@@ -703,6 +865,12 @@ impl IndexCache {
         // tell a surface this index was brought up to date before it existed.
         state.last_refreshed_at = None;
         state.last_recreation = Some(recreation.clone());
+        // Written here rather than through `publish_counts`, which would take
+        // the connection lock this call is still holding.
+        state.counts = Some(IndexCounts {
+            database_bytes: database_bytes(&self.database),
+            ..IndexCounts::default()
+        });
         Ok(recreation)
     }
 
@@ -740,7 +908,7 @@ impl IndexCache {
             return Err(ContextEngineError::Cancelled);
         }
         let started = Instant::now();
-        let _operation = self.begin("refresh");
+        let _operation = self.begin_operation("refresh");
         self.refresh_locked(cancellation, started)
     }
 
@@ -804,16 +972,37 @@ impl IndexCache {
             self.mark_closed("a refresh could not reopen the cache");
             *connection = Some(open_writable(&self.database, cancellation)?);
         }
+        let open = connection
+            .as_mut()
+            .expect("a connection is open by this line");
+
+        // The one place a stored component version moves, and it moves only
+        // after the rows it described are gone — in the same transaction, so a
+        // failure leaves both the rows and the version they were produced
+        // under. Doing this at open instead would erase the knowledge
+        // reconciliation needs before anything reconciled.
+        let skew = self.expected.skew(&meta);
+        let (invalidated, meta) = invalidate(open, &self.database, &self.expected, &meta, &skew)?;
+        let entries_reconciled = invalidated
+            .iter()
+            .map(|applied| applied.rows_deleted)
+            .sum::<u64>();
         let stale_components = self.expected.skew(&meta);
+        let counts = counts_of(open, &self.database);
+
         let mut state = lock(&self.state);
         state.availability = IndexAvailability::Ready;
         state.meta = meta;
         state.stale_components.clone_from(&stale_components);
         state.last_refreshed_at = Some(OffsetDateTime::now_utc());
+        if counts.is_some() {
+            state.counts = counts;
+        }
         Ok(IndexReport {
             generation: state.meta.index_generation,
             stale_components,
-            entries_reconciled: 0,
+            invalidated,
+            entries_reconciled,
             duration: started.elapsed(),
         })
     }
@@ -854,6 +1043,12 @@ impl IndexCache {
         *connection = Some(fresh);
         let mut state = lock(&self.state);
         state.availability = IndexAvailability::Ready;
+        // Exact and free: the replacement was created a few lines above and
+        // holds nothing.
+        state.counts = Some(IndexCounts {
+            database_bytes: database_bytes(&self.database),
+            ..IndexCounts::default()
+        });
         state.last_recreation = Some(CacheRecreation {
             reason,
             detail: detail.clone(),
@@ -880,7 +1075,7 @@ impl IndexCache {
     }
 
     /// Publishes `name` as in flight until the returned guard is dropped.
-    fn begin(&self, name: &'static str) -> Operation<'_> {
+    pub(super) fn begin_operation(&self, name: &'static str) -> Operation<'_> {
         lock(&self.state).in_flight.push(name);
         Operation { cache: self }
     }
@@ -893,7 +1088,7 @@ impl IndexCache {
 /// statement would leave a UI rendering a permanently spinning index with
 /// nothing behind it, which is the same lie the counter was introduced to
 /// prevent, in the other direction and for good.
-struct Operation<'a> {
+pub(super) struct Operation<'a> {
     cache: &'a IndexCache,
 }
 
@@ -959,16 +1154,19 @@ fn probe_existing(
     // instead, and it polls the token every time round.
     let _ = connection.busy_timeout(POLL_INTERVAL);
 
-    let meta = match read_meta_waiting(&connection, cancellation)? {
-        Ok(Some(meta)) => meta,
+    // The version is read *before* the rest of the row, and that ordering is
+    // what keeps a version mismatch from being reported as corruption. Only two
+    // columns have existed in every layout this build can meet, so a full read
+    // of an older cache fails on a column that is simply not there yet — which
+    // reads identically to a damaged file and would quarantine one with the
+    // wrong reason attached, after paying the creation grace to be sure.
+    let stamp = match read_waiting(&connection, cancellation, STAMP_SELECT, read_stamp)? {
+        Ok(Some(stamp)) => stamp,
         // A cache somebody else is writing is a cache to come back to, not one
         // to throw away. Reading a locked file as corruption would let one
         // front end destroy the other's index simply by being slow.
         Err(error) if is_environmental(&error) => {
-            return Err(ContextEngineError::CacheOpenFailed {
-                path: database.to_path_buf(),
-                reason: error.to_string(),
-            });
+            return Err(sqlite_failure(database, &error));
         }
         // A database with no metadata in it is either corrupt or *being built*
         // by another process that has opened the file and not yet committed its
@@ -979,7 +1177,17 @@ fn probe_existing(
         // corruption, which is the honest end of a distinction that cannot be
         // made perfectly from outside the other process.
         outcome => {
-            let Some(meta) = await_creation(&connection, cancellation)? else {
+            // A creation is one transaction: the whole layout and the metadata
+            // row land together, so a reader sees either nothing or all of it.
+            // A database that already holds tables and *still* has no readable
+            // metadata is therefore not one somebody is part-way through — it is
+            // broken, and waiting out the grace would only delay saying so.
+            let waited = if has_tables(&connection) {
+                None
+            } else {
+                await_creation(&connection, cancellation)?
+            };
+            let Some(stamp) = waited else {
                 return Ok(Probe::Replace {
                     reason: RecreationReason::Corrupt,
                     previous_generation: None,
@@ -989,27 +1197,47 @@ fn probe_existing(
                     },
                 });
             };
-            meta
+            stamp
         }
     };
 
-    if meta.schema_version > expected.schema_version {
+    if stamp.schema_version > expected.schema_version {
         return Err(ContextEngineError::CacheVersionConflict {
             path: database.to_path_buf(),
-            found: meta.schema_version,
+            found: stamp.schema_version,
             maximum: expected.schema_version,
         });
     }
-    if meta.schema_version < expected.schema_version {
+    if stamp.schema_version < expected.schema_version {
         return Ok(Probe::Replace {
             reason: RecreationReason::Version,
-            previous_generation: Some(meta.index_generation),
+            previous_generation: Some(stamp.index_generation),
             detail: format!(
                 "the cache was written at schema version {}",
-                meta.schema_version
+                stamp.schema_version
             ),
         });
     }
+
+    // The layout is this build's, so the rest of the row is addressable. A
+    // failure here really is a damaged file.
+    let meta = match read_waiting(&connection, cancellation, META_SELECT, read_meta_row)? {
+        Ok(Some(meta)) => meta,
+        Err(error) if is_environmental(&error) => {
+            return Err(sqlite_failure(database, &error));
+        }
+        outcome => {
+            return Ok(Probe::Replace {
+                reason: RecreationReason::Corrupt,
+                previous_generation: Some(stamp.index_generation),
+                detail: match outcome {
+                    Ok(_) => "index_meta holds no row".to_owned(),
+                    Err(error) => format!("index_meta is unreadable: {error}"),
+                },
+            });
+        }
+    };
+
     if meta.repository_identity != repository_identity {
         return Ok(Probe::Replace {
             reason: RecreationReason::Corrupt,
@@ -1023,19 +1251,33 @@ fn probe_existing(
     Ok(Probe::Usable(meta))
 }
 
-/// Reads the metadata, waiting out another writer while polling the token.
+/// The two columns every cache layout has carried, read before any other.
+///
+/// `schema_version` decides whether the rest of the row is even addressable,
+/// and `index_generation` is what a replacement floors itself above — so both
+/// have to be readable from a cache this build cannot otherwise understand.
+/// Adding a column here is a promise that every future layout keeps it.
+#[derive(Clone, Copy, Debug)]
+struct MetaStamp {
+    schema_version: u32,
+    index_generation: u64,
+}
+
+/// Reads one projection of the metadata, waiting out another writer.
 ///
 /// The outer `Result` is this side's decision — cancelled — and the inner one is
 /// SQLite's answer, which the caller classifies. Collapsing them would make a
 /// cancelled probe indistinguishable from an unreadable cache, and the two lead
 /// to opposite actions: one returns, the other destroys a file.
-fn read_meta_waiting(
+fn read_waiting<T>(
     connection: &Connection,
     cancellation: &Cancellation,
-) -> Result<Result<Option<IndexMeta>, rusqlite::Error>, ContextEngineError> {
+    sql: &str,
+    read: fn(&rusqlite::Row<'_>) -> Result<T, rusqlite::Error>,
+) -> Result<Result<Option<T>, rusqlite::Error>, ContextEngineError> {
     let deadline = Instant::now() + BUSY_TIMEOUT;
     loop {
-        let outcome = read_meta(connection);
+        let outcome = connection.query_row(sql, [], read).optional();
         let contended = matches!(
             &outcome,
             Err(error)
@@ -1057,6 +1299,23 @@ fn read_meta_waiting(
     }
 }
 
+/// Whether the database already holds a table of its own.
+///
+/// The question is only ever asked of a database whose metadata could not be
+/// read, and it separates the two ways that happens. Unreadable answers `false`,
+/// which sends the caller to the grace — the cautious end of a distinction that
+/// cannot be made perfectly from outside the writing process.
+fn has_tables(connection: &Connection) -> bool {
+    connection
+        .query_row(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' LIMIT 1",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .is_ok_and(|found| found.is_some())
+}
+
 /// Re-reads metadata that is absent, in case a cache is mid-creation.
 ///
 /// `Ok(None)` means the grace expired with still no row, which is the answer
@@ -1064,15 +1323,15 @@ fn read_meta_waiting(
 fn await_creation(
     connection: &Connection,
     cancellation: &Cancellation,
-) -> Result<Option<IndexMeta>, ContextEngineError> {
+) -> Result<Option<MetaStamp>, ContextEngineError> {
     let deadline = Instant::now() + CREATION_GRACE;
     while Instant::now() < deadline {
         if cancellation.is_cancelled() {
             return Err(ContextEngineError::Cancelled);
         }
         std::thread::sleep(POLL_INTERVAL);
-        if let Ok(Some(meta)) = read_meta_waiting(connection, cancellation)? {
-            return Ok(Some(meta));
+        if let Ok(Some(stamp)) = read_waiting(connection, cancellation, STAMP_SELECT, read_stamp)? {
+            return Ok(Some(stamp));
         }
     }
     Ok(None)
@@ -1106,38 +1365,242 @@ fn is_environmental(error: &rusqlite::Error) -> bool {
     )
 }
 
+/// The narrow projection every layout can answer.
+const STAMP_SELECT: &str = "SELECT schema_version, index_generation FROM index_meta WHERE id = 1";
+
+/// The whole row, addressable only once the layout is known to be this build's.
+const META_SELECT: &str = "\
+SELECT schema_version, parser_version, chunking_version, ranking_version, classify_version, \
+       index_generation, repository_identity, created_at, last_opened_at \
+FROM index_meta WHERE id = 1";
+
+fn read_stamp(row: &rusqlite::Row<'_>) -> Result<MetaStamp, rusqlite::Error> {
+    let schema_version: i64 = row.get(0)?;
+    let generation: i64 = row.get(1)?;
+    Ok(MetaStamp {
+        // Refused, never clamped. A negative or oversized version saturated to
+        // `u32::MAX` would read as "written by a build newer than this one" and
+        // be refused *permanently* with `cache_version_conflict`, leaving
+        // retrieval dead for that repository; a row nobody could have written is
+        // corruption, and the quarantine path exists for exactly that.
+        schema_version: u32::try_from(schema_version)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, schema_version))?,
+        index_generation: u64::try_from(generation)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, generation))?,
+    })
+}
+
+fn read_meta_row(row: &rusqlite::Row<'_>) -> Result<IndexMeta, rusqlite::Error> {
+    let schema_version: i64 = row.get(0)?;
+    let generation: i64 = row.get(5)?;
+    let created_at: String = row.get(7)?;
+    let last_opened_at: String = row.get(8)?;
+    Ok(IndexMeta {
+        schema_version: u32::try_from(schema_version)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, schema_version))?,
+        parser_version: row.get(1)?,
+        chunking_version: row.get(2)?,
+        ranking_version: row.get(3)?,
+        classify_version: row.get(4)?,
+        index_generation: u64::try_from(generation)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(5, generation))?,
+        repository_identity: row.get(6)?,
+        created_at: OffsetDateTime::parse(&created_at, &Rfc3339)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?
+            .to_offset(UtcOffset::UTC),
+        last_opened_at: OffsetDateTime::parse(&last_opened_at, &Rfc3339)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?
+            .to_offset(UtcOffset::UTC),
+    })
+}
+
 fn read_meta(connection: &Connection) -> Result<Option<IndexMeta>, rusqlite::Error> {
     connection
-        .query_row(
-            "SELECT schema_version, parser_version, chunking_version, ranking_version, \
-             index_generation, repository_identity, created_at FROM index_meta WHERE id = 1",
-            [],
-            |row| {
-                let schema_version: i64 = row.get(0)?;
-                let generation: i64 = row.get(4)?;
-                let created_at: String = row.get(6)?;
-                Ok(IndexMeta {
-                    // Refused, never clamped. A negative or oversized version
-                    // saturated to `u32::MAX` would read as "written by a build
-                    // newer than this one" and be refused *permanently* with
-                    // `cache_version_conflict`, leaving retrieval dead for that
-                    // repository; a row nobody could have written is corruption,
-                    // and the quarantine path exists for exactly that.
-                    schema_version: u32::try_from(schema_version)
-                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, schema_version))?,
-                    parser_version: row.get(1)?,
-                    chunking_version: row.get(2)?,
-                    ranking_version: row.get(3)?,
-                    index_generation: u64::try_from(generation)
-                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(4, generation))?,
-                    repository_identity: row.get(5)?,
-                    created_at: OffsetDateTime::parse(&created_at, &Rfc3339)
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?
-                        .to_offset(UtcOffset::UTC),
-                })
-            },
-        )
+        .query_row(META_SELECT, [], read_meta_row)
         .optional()
+}
+
+/// Records that this build adopted the cache, best effort.
+///
+/// Best effort because the stamp orders *eviction* and nothing else. A cache
+/// that could not be stamped — a read-only mount, a moment of contention —
+/// sorts as though it had not been opened, which makes it a candidate for
+/// eviction sooner than it deserves and costs a rebuild. Failing the open over
+/// it would cost retrieval instead, which is the worse of the two.
+fn stamp_opened(connection: &mut Connection, meta: IndexMeta) -> IndexMeta {
+    let now = OffsetDateTime::now_utc();
+    let Ok(formatted) = now.format(&Rfc3339) else {
+        return meta;
+    };
+    let updated = connection.execute(
+        "UPDATE index_meta SET last_opened_at = :at WHERE id = 1",
+        named_params! { ":at": formatted },
+    );
+    if updated.is_ok() {
+        return IndexMeta {
+            last_opened_at: now,
+            ..meta
+        };
+    }
+    meta
+}
+
+/// Bytes the cache database and its write-ahead log occupy.
+///
+/// The log is counted because it is the cache: pages committed and not yet
+/// checkpointed live there, and a budget that ignored it would let a cache
+/// double its cap between checkpoints.
+fn database_bytes(database: &Path) -> u64 {
+    let mut total = fs::metadata(database)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let mut log = database.as_os_str().to_os_string();
+    log.push("-wal");
+    total += fs::metadata(PathBuf::from(log))
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    total
+}
+
+/// Counts what the cache holds, answering `None` when it cannot be counted.
+fn counts_of(connection: &Connection, database: &Path) -> Option<IndexCounts> {
+    let count = |sql: &str| -> Option<u64> {
+        connection
+            .query_row(sql, [], |row| row.get::<_, i64>(0))
+            .ok()
+            .map(|value| u64::try_from(value).unwrap_or(0))
+    };
+    Some(IndexCounts {
+        worktrees: count("SELECT COUNT(*) FROM worktrees")?,
+        files: count(
+            "SELECT COUNT(*) FROM files f JOIN worktrees w ON w.worktree_id = f.worktree_id \
+             WHERE f.generation <= w.last_generation",
+        )?,
+        contents: count("SELECT COUNT(*) FROM contents")?,
+        file_versions: count("SELECT COUNT(*) FROM file_versions")?,
+        chunks: count("SELECT COUNT(*) FROM chunks")?,
+        symbols: count("SELECT COUNT(*) FROM symbols")?,
+        database_bytes: database_bytes(database),
+    })
+}
+
+/// Empties each skewed component's tables and records the version that replaced
+/// them, in one transaction per component.
+///
+/// One transaction *per component* rather than one for all of them, because a
+/// component whose invalidation fails must not undo one that succeeded: each
+/// pair of "the rows are gone" and "the version says so" is what has to be
+/// atomic, and there is nothing to gain from coupling `chunks` to `symbols`.
+///
+/// The returned metadata is re-read from the file, so a caller reports what the
+/// cache says rather than what this build asked for.
+fn invalidate(
+    connection: &mut Connection,
+    database: &Path,
+    expected: &ExpectedVersions,
+    meta: &IndexMeta,
+    skew: &[VersionSkew],
+) -> Result<(Vec<ComponentInvalidation>, IndexMeta), ContextEngineError> {
+    if skew.is_empty() {
+        return Ok((Vec::new(), meta.clone()));
+    }
+    let span = tracing::debug_span!("context.index.invalidate", components = skew.len());
+    let _entered = span.enter();
+
+    let mut applied = Vec::new();
+    for entry in skew {
+        let expectation = match entry.component {
+            IndexComponent::Parser => &expected.parser_version,
+            IndexComponent::Chunking => &expected.chunking_version,
+            IndexComponent::Ranking => &expected.ranking_version,
+            IndexComponent::Classify => &expected.classify_version,
+        };
+        let rows_deleted =
+            invalidate_component(connection, database, entry.component, expectation)?;
+        applied.push(ComponentInvalidation {
+            component: entry.component,
+            stored: entry.stored.clone(),
+            expected: entry.expected.clone(),
+            rows_deleted,
+        });
+        tracing::debug!(
+            component = entry.component.as_str(),
+            stored = entry.stored.as_str(),
+            expected = entry.expected.as_str(),
+            rows_deleted,
+            "context index component invalidated"
+        );
+    }
+
+    let refreshed = read_meta(connection)
+        .map_err(|error| sqlite_failure(database, &error))?
+        .unwrap_or_else(|| meta.clone());
+    Ok((applied, refreshed))
+}
+
+/// The transaction one component's skew resolves to.
+fn invalidate_component(
+    connection: &mut Connection,
+    database: &Path,
+    component: IndexComponent,
+    expectation: &str,
+) -> Result<u64, ContextEngineError> {
+    let failed = |error: &rusqlite::Error| sqlite_failure(database, error);
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| failed(&error))?;
+    let mut rows_deleted = 0_u64;
+    // The table names come from this build's own ownership list rather than
+    // from the database, so nothing a file records can decide what is dropped.
+    for table in component.owned_tables() {
+        rows_deleted += transaction
+            .execute(&format!("DELETE FROM \"{table}\""), [])
+            .map_err(|error| failed(&error))? as u64;
+    }
+    for (table, column) in component.cleared_columns() {
+        transaction
+            .execute(
+                &format!(
+                    "UPDATE \"{table}\" SET \"{column}\" = NULL WHERE \"{column}\" IS NOT NULL"
+                ),
+                [],
+            )
+            .map_err(|error| failed(&error))?;
+    }
+    transaction
+        .execute(
+            &format!(
+                "UPDATE index_meta SET \"{}_version\" = :expected WHERE id = 1",
+                component.as_str()
+            ),
+            named_params! { ":expected": expectation },
+        )
+        .map_err(|error| failed(&error))?;
+    transaction.commit().map_err(|error| failed(&error))?;
+    Ok(rows_deleted)
+}
+
+/// Maps a SQLite failure onto the namespace a caller branches on.
+///
+/// Contention is the one that has to be told apart. A caller met by
+/// `index_busy` degrades to reading the workspace live; one met by
+/// `cache_open_failed` has a cache that is not going to start working on a
+/// retry. Answering both with the same discriminant would make the first
+/// indistinguishable from the second and the fallback impossible to write.
+pub(super) fn sqlite_failure(database: &Path, error: &rusqlite::Error) -> ContextEngineError {
+    if matches!(
+        error.sqlite_error_code(),
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    ) {
+        return ContextEngineError::IndexBusy {
+            path: database.to_path_buf(),
+            reason: error.to_string(),
+        };
+    }
+    ContextEngineError::CacheOpenFailed {
+        path: database.to_path_buf(),
+        reason: error.to_string(),
+    }
 }
 
 /// Opens a cache for reading and writing, applying the store's pragma set.
@@ -1248,7 +1711,7 @@ fn create(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| failed(error.to_string()))?;
     transaction
-        .execute_batch(INDEX_META_SCHEMA)
+        .execute_batch(INDEX_SCHEMA)
         .map_err(|error| failed(error.to_string()))?;
     insert_meta(&transaction, expected, repository_identity, generation)?;
     transaction
@@ -1299,16 +1762,50 @@ fn quarantine(database: &Path) -> Result<Option<PathBuf>, ContextEngineError> {
         return Ok(None);
     }
     let destination = quarantine_path(database)?;
-    fs::rename(database, &destination).map_err(|error| ContextEngineError::CacheOpenFailed {
-        path: database.to_path_buf(),
-        reason: format!(
-            "the unusable cache could not be moved to '{}': {error}",
-            destination.display()
-        ),
+    fs::rename(database, &destination).map_err(|error| {
+        // A rename refused because the file is open is not a failed quarantine,
+        // it is evidence the cache is in use — Windows will not rename a file
+        // any handle holds, so the process this build was about to declare
+        // broken is demonstrably alive and writing. `index_busy` sends the
+        // caller back later; `cache_open_failed` would tell them their cache is
+        // unusable when the only thing wrong is that somebody else has it.
+        if is_in_use(&error) {
+            return ContextEngineError::IndexBusy {
+                path: database.to_path_buf(),
+                reason: format!("the cache is open elsewhere and cannot be set aside: {error}"),
+            };
+        }
+        ContextEngineError::CacheOpenFailed {
+            path: database.to_path_buf(),
+            reason: format!(
+                "the unusable cache could not be moved to '{}': {error}",
+                destination.display()
+            ),
+        }
     })?;
     remove_sidecars(database);
     prune_quarantines(database);
     Ok(Some(destination))
+}
+
+/// Whether a filesystem failure says the file is open somewhere else.
+///
+/// Only Windows has this failure: it refuses to rename a file any handle holds
+/// and reports `ERROR_SHARING_VIOLATION`, which Rust gives no stable
+/// `ErrorKind` for. Unix renames an open file happily, so there the answer is
+/// always no — and it has to be the *raw* code rather than a kind, because 32 is
+/// `EPIPE` there and would mean something else entirely.
+#[cfg(windows)]
+fn is_in_use(error: &std::io::Error) -> bool {
+    /// `ERROR_SHARING_VIOLATION`.
+    const SHARING_VIOLATION: i32 = 32;
+    error.raw_os_error() == Some(SHARING_VIOLATION)
+}
+
+/// Renaming an open file is not a failure on this platform.
+#[cfg(not(windows))]
+const fn is_in_use(_error: &std::io::Error) -> bool {
+    false
 }
 
 /// Writes the single metadata row, yielding to one that is already there.
@@ -1327,14 +1824,17 @@ fn insert_meta(
         path: PathBuf::from(INDEX_DATABASE_FILE),
         reason,
     };
+    let now = OffsetDateTime::now_utc();
     let meta = IndexMeta {
         schema_version: expected.schema_version,
         parser_version: expected.parser_version.clone(),
         chunking_version: expected.chunking_version.clone(),
         ranking_version: expected.ranking_version.clone(),
+        classify_version: expected.classify_version.clone(),
         index_generation: generation,
         repository_identity: repository_identity.to_owned(),
-        created_at: OffsetDateTime::now_utc(),
+        created_at: now,
+        last_opened_at: now,
     };
     let stored_generation = i64::try_from(meta.index_generation)
         .map_err(|_| failed(format!("generation {generation} is not representable")))?;
@@ -1346,15 +1846,16 @@ fn insert_meta(
         .execute(
             "INSERT INTO index_meta \
              (id, schema_version, parser_version, chunking_version, ranking_version, \
-              index_generation, repository_identity, created_at) \
+              classify_version, index_generation, repository_identity, created_at, last_opened_at) \
              VALUES (1, :schema_version, :parser_version, :chunking_version, :ranking_version, \
-              :index_generation, :repository_identity, :created_at) \
+              :classify_version, :index_generation, :repository_identity, :created_at, :created_at) \
              ON CONFLICT(id) DO NOTHING",
             named_params! {
                 ":schema_version": meta.schema_version,
                 ":parser_version": meta.parser_version,
                 ":chunking_version": meta.chunking_version,
                 ":ranking_version": meta.ranking_version,
+                ":classify_version": meta.classify_version,
                 ":index_generation": stored_generation,
                 ":repository_identity": meta.repository_identity,
                 ":created_at": created_at,
@@ -1385,6 +1886,13 @@ fn empty_in_place(
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| failed(error.to_string()))?;
+    // `DROP TABLE` performs an implicit delete and checks foreign keys as it
+    // goes, so dropping a parent before its children fails on a cache that is
+    // about to hold neither. Deferring to commit — by which point every table is
+    // gone — makes the order the schema listing happens to return irrelevant.
+    transaction
+        .execute_batch("PRAGMA defer_foreign_keys = ON")
+        .map_err(|error| failed(error.to_string()))?;
     let tables = {
         let mut statement = transaction
             .prepare(
@@ -1405,7 +1913,7 @@ fn empty_in_place(
             .map_err(|error| failed(error.to_string()))?;
     }
     transaction
-        .execute_batch(INDEX_META_SCHEMA)
+        .execute_batch(INDEX_SCHEMA)
         .map_err(|error| failed(error.to_string()))?;
     let meta = insert_meta(&transaction, expected, repository_identity, generation)?;
     transaction
@@ -1566,5 +2074,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+#[cfg(test)]
+mod store_tests;
 #[cfg(test)]
 pub(crate) mod tests;

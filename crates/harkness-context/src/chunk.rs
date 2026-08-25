@@ -974,7 +974,7 @@ fn decode_text(bytes: &[u8], cancellation: &Cancellation) -> Result<DecodedText,
     if !body.len().is_multiple_of(2) {
         return Err(ChunkError::UnsupportedEncoding);
     }
-    let units = body.chunks_exact(2).map(|pair| {
+    let units = body.as_chunks::<2>().0.iter().map(|pair| {
         if big_endian {
             u16::from_be_bytes([pair[0], pair[1]])
         } else {

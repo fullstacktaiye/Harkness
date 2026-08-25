@@ -483,30 +483,54 @@ approval, or artifact. It is a supported recovery action, so "reclaim disk" and
 every linked worktree of one repository maps to one cache and there is no
 traversal surface.
 
-**A cache is read before it is written.** The metadata probe opens read-only, so
-a cache written by a newer build is refused with `cache_version_conflict` and
-left byte-identical rather than downgraded, mirroring the store's
-`schema_too_new`. An older `schema_version` is quarantined and recreated —
-the cache is disposable, so there is no downgrade path and none may be added.
-A *component* version (parser, chunking, ranking) is the opposite: the file is
-kept, the stored version is **not** rewritten, and the skew is reported for
-incremental reconciliation, because overwriting it would erase exactly the
-knowledge reconciliation needs.
+**A cache is read before it is written.** The metadata probe opens read-only, and
+it reads the *schema version alone* first, because only `schema_version` and
+`index_generation` have existed in every layout — a full read of an older cache
+fails on a column that is not there yet and would report a version mismatch as
+corruption. A cache written by a newer build is then refused with
+`cache_version_conflict` and left byte-identical rather than downgraded,
+mirroring the store's `schema_too_new`. An older `schema_version` is quarantined
+and recreated — the cache is disposable, so there is no downgrade path and none
+may be added.
 
-**A busy cache is not a corrupt cache.** Contention, a permission bit, and an
-exhausted descriptor table are all `cache_open_failed`; only a statement about
-the file's *contents* may quarantine one. Reading a locked file as corruption
-would let one front end destroy the other's index simply by being slow. A cache
-recording a different repository identity is quarantined, because serving one
-checkout's rows for another is the bleed the derived path exists to prevent.
+**A component version is the opposite of a schema version, and `refresh` is the
+only thing that moves one.** Open reports the skew and rewrites nothing;
+`IndexCache::refresh` acts on it, dropping the rows that component produced and
+recording the new version *in the same transaction*, so a failure leaves both the
+rows and the version they were produced under. Which rows die is fixed data —
+`IndexComponent::owned_tables` and `cleared_columns` — not a `match` spread
+through the invalidation code, and a test holds the schema to it: a table with no
+owner would survive the upgrade that invalidated it, and one with two owners
+would be emptied by a skew that has nothing to do with it. `chunking` takes
+`chunks`, `parser` takes `symbols`, `ranking` takes the tables registered as
+ranking-owned, and **`classify` takes nothing**: a `files` row is a true record
+that a path existed at a size, only its class is suspect, and the row's own
+`classify_version` column is the marker a reconciler reads. Re-walking a whole
+repository because a boundary rule moved would make every retrieval improvement a
+cold rebuild.
+
+**A busy cache is not a corrupt cache, and it is not an unusable one either.**
+Contention is `index_busy`; a permission bit and an exhausted descriptor table
+are `cache_open_failed`. The distinction is what a caller acts on — the first
+clears and it degrades to reading the workspace live until it does, the second
+will still be there on the retry — and neither may ever quarantine, because only
+a statement about the file's *contents* licenses that. Reading a locked file as
+corruption would let one front end destroy the other's index simply by being
+slow. A cache recording a different repository identity is quarantined, because
+serving one checkout's rows for another is the bleed the derived path exists to
+prevent.
 
 **`index_generation` is a token, not a counter.** It is a component of the
 snapshot digest, so a snapshot taken against a rebuilt index must never compare
 equal to one taken against the index that produced it — and the counter lives in
 the file being deleted, so a plain increment cannot promise that. It is seeded
-from the wall clock in nanoseconds with `previous + 1` as a floor: a wiped
+from the wall clock in **microseconds** with `previous + 1` as a floor: a wiped
 directory cannot reissue a number a stored snapshot already recorded, and a clock
-that stepped backwards cannot either. The floor needs the previous value to be
+that stepped backwards cannot either. Microseconds rather than nanoseconds
+because the value travels as a JSON number in the frozen snapshot wire form, and
+nanoseconds since the epoch is past the `2^53` an IEEE-754 double represents
+exactly — a JavaScript front end would round two generations onto one and read a
+stale snapshot as fresh. The floor needs the previous value to be
 readable, so a *corrupt* cache combined with a backwards clock is the residual
 case where a generation could repeat; it is stated rather than closed, because
 closing it means keeping the counter somewhere a user is invited to delete.
@@ -524,6 +548,75 @@ reopens it. For the same reason an engine's remembered open failure is
 *retried* by `refresh_index` and `dispose_index` rather than kept for the
 engine's life: the commonest cause is a few seconds of contention, and an action
 documented as the fix for a weird index has to be able to fix that one.
+
+**Only `files` is per-worktree, and every read names a worktree.** The content
+tables — `contents`, `file_versions`, `chunks`, `symbols` — are shared by every
+worktree of the repository, so the read API takes a `WorktreeKey` on every call
+and publishes no join-free content query. That is an API shape rather than query
+discipline: the only way to leak one checkout's rows into another's answer is to
+add a method that does not take the key. The key is derived from the *canonical
+worktree root* and never from a `ProjectId`, because two catalog entries can name
+one checkout and would otherwise each build a copy of its file rows and sweep the
+other's away. `file_versions` sits between `contents` and the derived rows
+because chunking is a function of `(path, bytes)` and not of bytes alone — the
+same content at `notes.md` and `notes.rs` chunks differently, and a `ChunkId`
+absorbs the path deliberately.
+
+**A batch never writes `files`, and that is not an optimization.** Rows are
+staged in `pending_files` at a pending generation, flushed *during* the batch so
+a cold build never holds the write lock for its whole length, and copied into
+`files` by one transaction that also sweeps, collects, and moves
+`worktrees.last_generation`. Writing the live row and tagging it with an
+uncommitted generation instead is the failure the staging table exists for: it
+takes the *committed* record out of every query for the length of the batch, and
+an abandoned batch then strands it above the watermark where the next `begin`
+deletes it — a file that still exists, gone from the index, with no error
+anywhere. A killed process leaves staged rows nothing reads; the work is redone,
+never resumed.
+
+**The watermark only moves forward, and a batch that lost the race is refused.**
+Two front ends indexing one repository both stage, keyed apart by generation, and
+the commit's `WHERE last_generation < :generation` is what decides between them —
+the loser gets `index_batch_superseded` rather than dragging the watermark back
+below the winner's generation and hiding every row it published. That refusal is
+also what makes cleanup decidable: a batch below the watermark can no longer
+publish, so its staged rows are provably dead and the next commit collects them.
+Collection must skip anything `pending_files` still references, because a live
+batch's file versions have no `files` row pointing at them yet. Do not confuse
+the two counters: `index_meta.index_generation` is the snapshot-digest token
+described above, `worktrees.last_generation` is a batch watermark that never
+leaves the cache. **A full batch sweeps and a targeted one does not**, which is
+why a *truncated* inventory must commit as targeted: a walk stopped by its file
+or time budget did not see the whole worktree, and sweeping would delete rows for
+files that exist.
+
+**A file that could not be read keeps the derivation it had.** Recording it as a
+path with no content clears `files.file_version_id`, and the commit's collection
+then deletes its chunks — one unreadable moment costing a file its whole entry
+in the index. `record_unreadable` refreshes the row and leaves the link alone;
+stale beats absent. A file that is *never* read — a binary, a symlink, a
+repository boundary — is the other case and does clear it.
+
+**Nothing partial is ever stored, deleted, or *returned* without saying so.** A
+batch that would take one repository's cache past `MAX_INDEX_DB_BYTES` is refused
+whole with `index_budget_exhausted` and the previous generation keeps answering;
+storing what fits would make retrieval say "no match" for content the cache never
+held, which a caller cannot tell from a repository that does not contain it. The
+read side owes the same honesty and pays it with `IndexedPage`: a full page and a
+repository holding exactly that many rows are otherwise one answer, and the first
+is read as the whole tree.
+Eviction past `MAX_TOTAL_CONTEXT_BYTES` removes least-recently-opened repository
+directories *entirely* and never a table, because a half-emptied index lies and a
+missing one is an honest cold start. Liveness is the kernel's answer, not a claim
+in a file: every open cache holds a shared advisory lock on
+`<cache-root>/index.lock` and eviction takes the exclusive one. Recency is
+`index_meta.last_opened_at`, stamped only after a build has decided it may adopt
+the cache — `atime` is unusable under `relatime` and absent under `noatime`.
+
+**The index holds no file content, and a denied path is not in it at all.** Paths,
+digests, ranges and names only; retrieval re-reads the working tree. A path the
+inventory's built-in denial layer excluded never reached a walk entry, so there is
+nothing here to retrieve — which is the whole reason denial happens at the walk.
 
 **One engine per project, one cache per repository, and neither lock is ever
 held across the other's work.** The engine registry's mutex is not held while an
@@ -637,7 +730,8 @@ rules together; bumping it invalidates what was derived, and never silently
 reclassifies evidence recorded under the old rules.
 
 `docs/context-inventory.md` is the reference for the denial list, the class
-precedence, and the bounds.
+precedence, and the bounds; `docs/context-index.md` is the reference for what
+the cache does with what the walk found.
 
 ## Model Provider & Streaming Assembly Invariants
 

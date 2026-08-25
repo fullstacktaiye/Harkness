@@ -214,6 +214,9 @@ pub enum Boundary {
 }
 
 impl Boundary {
+    /// Every boundary, in its stable declaration order.
+    pub const ALL: &'static [Self] = &[Self::NestedRepository, Self::Submodule];
+
     /// The stable spelling of this boundary.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -221,6 +224,23 @@ impl Boundary {
             Self::NestedRepository => "nested_repository",
             Self::Submodule => "submodule",
         }
+    }
+
+    /// Reads a persisted spelling back, refusing one this build does not define.
+    ///
+    /// Kept beside [`as_str`](Self::as_str) rather than written out again where
+    /// a row is decoded, for the reason [`FileClass::parse`] is: a variant added
+    /// to the enum stores its new spelling perfectly well and then fails every
+    /// read, and a hand-written match somewhere else is not something the
+    /// compiler will point at.
+    ///
+    /// [`FileClass::parse`]: crate::FileClass::parse
+    #[must_use]
+    pub fn parse(spelling: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|boundary| boundary.as_str() == spelling)
     }
 }
 
