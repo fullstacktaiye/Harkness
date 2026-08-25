@@ -100,6 +100,7 @@ anchor. `verify-doc-references.sh` checks the "What proves this" tables against
   hand-written scenario. It still cannot invent one — a fixture that does not parse is not
   rewritten.
 - **Latency targets** (`store/tests.rs`, `tool/tests.rs`, `assemble/assembler.rs`,
+  `harkness-context/src/reconcile/tests.rs`,
   `harkness-runtime/tests/diagnostics_overhead.rs`): meaningful only under `--release`. Every one of
   them reports through `harkness_test_fixtures::latency::record`, which prints the machine beside
   the number and binds the budget only where `debug_assertions` is off — so a debug run records a
@@ -127,10 +128,11 @@ particular values. The provider's scripts are the one set that is *authored* as 
 mirrored from Rust data: the regenerator only re-canonicalizes their formatting, so a new scenario
 is a new file and a changed step is a new version beside v1.
 
-`crates/harkness-context/src/index/fixtures/schema-v2.sql` is the one frozen fixture that is not
+`crates/harkness-context/src/index/fixtures/schema-v3.sql` is the one frozen fixture that is not
 JSON: it is the index cache's `sqlite_schema` as SQLite renders it, and a test compares the live
 layout against it so a column added without an `INDEX_SCHEMA_VERSION` bump fails rather than
-leaving already-written caches addressed by a build expecting different columns.
+leaving already-written caches addressed by a build expecting different columns. The v2 rendering
+stays beside it, as every released layout does.
 
 A **new fixture directory needs a `.gitattributes` line** — `<path>/*.json text eol=lf` — and the
 file enumerates them one directory at a time rather than by a glob. Fixture tests compare
@@ -277,7 +279,17 @@ translating between two cancellation mechanisms.
   commits so a killed build leaves the previous generation answering, and a
   component version bump invalidates only what that component produced —
   `classify` deletes nothing at all. `docs/context-index.md` is the reference.
-  `inventory.rs` is the walk
+  `reconcile.rs` and `watch.rs` are the pair that keeps the
+  cache current, and the split between them is the whole design: `watch.rs`
+  decides *where to look first* — a `notify` watcher, a normalizer that applies
+  the built-in denials before anything is queued, and a dirty set bounded by
+  construction — while `reconcile.rs` decides *what is true*, by comparing the
+  worktree against the stored rows. Three things to know before touching either:
+  a reconcile always commits as `Targeted` and names its removals, because a
+  full batch sweeps what it did not confirm and a reconcile deliberately
+  confirms only what moved; a hint naming a file is force-hashed while a hint
+  naming a directory is not, which is the whole cost model; and a scope only
+  ever widens. `inventory.rs` is the walk
   every retrieval feature reads instead of the filesystem, so read its module doc
   before touching it: four exclusion layers with built-in denials on top that no
   configuration can undo, a repository layer that may only tighten and is never

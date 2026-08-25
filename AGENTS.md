@@ -6,7 +6,7 @@ Harkness is a Rust 2024 workspace split into thirteen crates under `crates/`:
 
 - `harkness-core`: project catalog, storage layout, cross-domain project workflows, and directory-listing logic shared by front ends.
 - `harkness-git`: all production Git behavior: inspection, diffs and history, change provenance, file context and hunk staging, branch and worktree mutation, commits, clone and synchronization, hermetic process execution, and repository locking.
-- `harkness-context`: the context engine's typed vocabulary — workspace snapshot identity, stable identifiers, provenance, and file classification.
+- `harkness-context`: the context engine's typed vocabulary — workspace snapshot identity, stable identifiers, provenance, and file classification — the disposable per-repository index cache beneath it, and the pair that keeps that cache current: a filesystem watcher whose events are treated strictly as hints, and a reconciler that decides truth by comparing the worktree against the stored rows.
 - `harkness-provider`: the provider-neutral model contract, the streaming turn assembler, and the deterministic scripted provider. Every concrete model adapter lives here and keeps its wire types private; nothing above learns what an endpoint's JSON looks like.
 - `harkness-transport`: the shared subprocess JSON-RPC engine both protocol adapters run on — hermetic allowlisted spawn, newline-delimited framing, request correlation, bounded messages, and the close-stdin/`SIGTERM`/`SIGKILL` teardown. Below every adapter and above nothing but `harkness-git`.
 - `harkness-acp`: the Agent Client Protocol client — the wire vocabulary, the `initialize` handshake, protocol-version and capability negotiation, and gated authentication. Sessions, mediation, and the rest of the v0.5 ACP surface land here beside them.
@@ -586,16 +586,20 @@ batch's file versions have no `files` row pointing at them yet. Do not confuse
 the two counters: `index_meta.index_generation` is the snapshot-digest token
 described above, `worktrees.last_generation` is a batch watermark that never
 leaves the cache. **A full batch sweeps and a targeted one does not**, which is
-why a *truncated* inventory must commit as targeted: a walk stopped by its file
-or time budget did not see the whole worktree, and sweeping would delete rows for
-files that exist.
+why an inventory that saw less than the worktree must commit as targeted: a walk
+stopped by its file or time budget, and a walk only ever asked about part of the
+tree, both leave rows a sweep would delete for files that exist. The question is
+asked of the inventory — it carries both its truncation and its scope — rather
+than of the caller, so the answer travels with the value it is about.
 
 **A file that could not be read keeps the derivation it had.** Recording it as a
 path with no content clears `files.file_version_id`, and the commit's collection
 then deletes its chunks — one unreadable moment costing a file its whole entry
 in the index. `record_unreadable` refreshes the row and leaves the link alone;
-stale beats absent. A file that is *never* read — a binary, a symlink, a
-repository boundary — is the other case and does clear it.
+stale beats absent. `record_refreshed` is the same treatment for the opposite
+reason — the bytes were read and turned out to be the ones the row already names
+— and a file that is *never* read (a binary, a symlink, a repository boundary)
+is the third case and does clear it.
 
 **Nothing partial is ever stored, deleted, or *returned* without saying so.** A
 batch that would take one repository's cache past `MAX_INDEX_DB_BYTES` is refused
@@ -641,6 +645,99 @@ so rewriting a path inside it would refuse the very row the rewrite was meant to
 protect. `id`, `project_id`, `snapshot_digest` and `captured_at` are lifted out
 of the payload for queries and are *compared* against it on every read, exactly
 as an artifact's `storage_path` is.
+
+## Incremental Indexing & Watch Invariants
+
+**Filesystem events are hints and the reconciler is truth.** Every watcher
+backend drops, coalesces, duplicates and races its events, and none of them sees
+anything while Harkness is not running. Nothing may be written because an event
+said so: `reconcile` compares the filesystem against the stored rows and
+produces the same index whether it was reached through a watcher, a startup
+sweep, or a caller. The test that matters runs the whole pipeline with the
+backend switched off. Do not add a path that trusts an event, and do not add one
+that skips the comparison because an event looked reliable.
+
+**A hinted file is hashed even when its metadata matches; an unhinted one is
+not.** A one-second modification-time granularity is an ordinary filesystem and
+a file rewritten twice inside one tick matches its row and lies, so cheap
+suspicion wins for a path something named. A *directory* hint is deliberately
+the weak one — everything beneath it is metadata-compared — because a checkout
+touching ten thousand files moved ten thousand modification times and rehashing
+all of them is the rebuild the whole module exists to avoid. `ReconcileScope`
+force-hashes only the paths a `Paths` scope names *exactly*, never what it
+merely covers.
+
+**A reconcile always commits as targeted, even a full one.** A full batch
+deletes every row it did not confirm and a reconcile deliberately does not
+confirm what did not change, so committing one as full would empty the index on
+every edit. Removals come from a merge of two sorted sequences — the paths the
+scoped walk recorded and the rows the cache holds in the same scope — and a row
+with no path beside it is removed *by name*. Both sides are ordered by the same
+path bytes, in memory and in SQL, and containment always requires the separator:
+`src` covers `src/main.rs` and never `src-generated.rs`.
+
+**A scope only ever widens, and the report says what it became.** A path list
+past `MAX_PATHS_PER_RECONCILE` becomes the subtree holding all of it; a diverged
+committed base becomes a full pass. Narrowing would be an update that silently
+covered less than it was asked to. The dirty set is bounded the same way:
+markers absorb what they cover and passing `WATCH_QUEUE_CAPACITY` collapses the
+whole set into a full pass carrying no paths at all, so an event storm costs one
+reconcile and a constant amount of memory.
+
+**A scoped walk descends from the root exactly as a full one does.** Every
+`.gitignore` on the way is read and every built-in denial is asked about every
+parent, so a scoped answer can never disagree with a full one about whether a
+file is eligible. A walk that jumped straight to its scope would make an
+incremental update record a file a rebuild excludes.
+
+**A denied path never becomes a hint.** Layer 1 is applied in the normalizer,
+before anything is queued, compiled from the same `BUILT_IN_DENIALS` the walk
+uses rather than from a second copy. The repository's administrative directory
+produces nothing except `.git/HEAD`, which is a whole-worktree hint because that
+is what a branch switch rewrites.
+
+**A degraded watcher is not a broken index.** No backend means
+`watcher_unavailable`, a startup sweep that still runs, and hints a caller may
+still supply. The only refusal is a worktree root that is not there, because
+that leaves nothing to watch *and* nothing to sweep. `WatchError`'s four kinds
+join `ContextEngineError::kinds()` through the same carried-whole route the
+walk's do, and `cancelled` is published once.
+
+**Only a full, untruncated pass may write `worktrees.head_marker`, and the
+marker is the branch rather than the commit.** It records what a
+*whole-worktree* pass verified against, and a pass that finds a different one
+distrusts every row — the answer to a checkout deleted and re-created at the
+same path (#63), which metadata alone cannot always tell. Adding the commit to
+it would make every ordinary commit a divergence and rehash the repository to
+discover that nothing moved, so a detached checkout carries its commit and a
+branch checkout does not. A targeted update that recorded a marker would claim
+the checkout had been verified against a base one file was compared to, and an
+*absent* marker is "cannot be told", never "unchanged".
+
+**A scope that names nothing reconciles nothing.** An empty path list is a real
+answer — a watcher whose queue drained to empty — and it is checked before the
+head comparison, which would otherwise widen it into a whole-repository pass.
+
+**Nothing decides that a checkout is gone.** A worktree whose root has
+disappeared keeps its rows and reports the failure, because an unmounted
+filesystem and a deleted checkout are indistinguishable from inside the process.
+`forget_worktree` is the explicit act, and it collects only the
+content-addressed rows no other checkout still names.
+
+**A path that kept moving while it was read is handed back, not guessed at.**
+The stat after the read decides, as it does in the walk; past
+`MAX_READ_ATTEMPTS` the row is left exactly as it was and the path lands in
+`ReconcileReport::requeued` for the caller to offer again. Stale beats torn.
+
+**A scope the cache refused goes back on the queue; one the worktree refused
+does not.** The scope was drained when the pass started, so a contended or
+superseded batch that simply reported its failure would leave the paths
+something told us about unexamined until the next sweep. It comes back covering
+what it covered and at the strength it had — a retry that downgraded a file hint
+to a subtree marker would drop the suspicion the hint existed for. Every other
+failure is dropped: a cache at its budget refuses the same scope every time, and
+re-offering it spends a walk per window on an answer that will not change.
+
 ## Context Inventory & Classification Invariants
 
 **One walk, four layers, first opinion wins.** Built-in denials, the global user

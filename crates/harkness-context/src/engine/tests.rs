@@ -818,15 +818,57 @@ fn a_contended_cache_costs_the_index_and_not_the_workspace() {
 
 /// The rule a truncated walk turns on, held to directly.
 ///
-/// A full batch deletes every row it did not confirm, and a walk stopped by its
-/// own budget did not see the whole worktree — sweeping on one would delete
-/// rows for files that exist. Reaching the branch through `reindex` would mean
-/// building a repository past `MAX_INVENTORY_FILES`, so the decision is a pure
-/// function and this is where it is proved.
+/// A full batch deletes every row it did not confirm. A walk stopped by its own
+/// budget did not see the whole worktree, and a walk asked about part of it
+/// never intended to — sweeping on either would delete rows for files that
+/// exist. Reaching the truncated branch through `reindex` would mean building a
+/// repository past `MAX_INVENTORY_FILES`, so the decision reads the inventory's
+/// own account of what it covered and this is where that is proved.
 #[test]
-fn a_truncated_walk_commits_as_targeted_and_a_complete_one_as_full() {
-    assert_eq!(super::batch_scope(true), crate::index::BatchScope::Targeted);
-    assert_eq!(super::batch_scope(false), crate::index::BatchScope::Full);
+fn a_walk_that_saw_less_than_the_worktree_commits_as_targeted() {
+    let workspace = Workspace::new();
+    for name in ["a.rs", "b.rs"] {
+        fs::write(workspace.root.join(name), "fn x() {}\n").unwrap();
+    }
+    let cancellation = Cancellation::default();
+    let engine = workspace.engine();
+    let snapshot = engine.snapshot(&cancellation).unwrap();
+
+    let complete =
+        crate::InventoryBuilder::build(&snapshot, &crate::InventoryPolicy::new(), &cancellation)
+            .unwrap();
+    assert!(!complete.is_truncated());
+    assert_eq!(
+        super::batch_scope(&complete),
+        crate::index::BatchScope::Full
+    );
+
+    let truncated = crate::InventoryBuilder::build(
+        &snapshot,
+        &crate::InventoryPolicy::new().with_max_files(1),
+        &cancellation,
+    )
+    .unwrap();
+    assert!(truncated.is_truncated());
+    assert_eq!(
+        super::batch_scope(&truncated),
+        crate::index::BatchScope::Targeted
+    );
+
+    let scoped = crate::InventoryBuilder::build_scoped(
+        snapshot.id(),
+        snapshot.worktree_root(),
+        &crate::InventoryPolicy::new(),
+        &crate::ReconcileScope::paths([RepoPath::from_path(std::path::Path::new("a.rs"))]),
+        &cancellation,
+    )
+    .unwrap();
+    assert!(!scoped.is_truncated());
+    assert_eq!(
+        super::batch_scope(&scoped),
+        crate::index::BatchScope::Targeted,
+        "an inventory that only ever looked at part of the tree must never sweep"
+    );
 }
 
 /// A file that changes under a running build keeps whatever the last successful

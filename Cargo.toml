@@ -52,6 +52,13 @@ ignore = "0.4"
 jsonschema = { version = "0.49", default-features = false }
 libc = "0.2"
 libgit2-sys = { version = "0.18", default-features = false }
+# The filesystem-change source behind the context engine's incremental indexing.
+# Its events are treated strictly as hints: every backend drops, coalesces and
+# duplicates them, and none of them sees anything while Harkness is closed, so
+# the reconciler decides truth by comparing the filesystem against the index and
+# this crate only decides where to look first. Default features are named rather
+# than inherited so the macOS backend choice is a decision in this file.
+notify = { version = "8.2", default-features = false, features = ["macos_fsevent"] }
 regex = "1.11"
 rusqlite = { version = "0.40", features = ["bundled"] }
 schemars = "1.2"

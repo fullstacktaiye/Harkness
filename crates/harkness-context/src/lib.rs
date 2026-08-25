@@ -98,6 +98,22 @@
 //! everywhere else is that the whole subtree is disposable (ADR-0004) and every
 //! read of it names a worktree.
 //!
+//! # Keeping the index current
+//!
+//! A cold build is right once. [`ContextEngine::reconcile`] is what runs every
+//! time afterwards: it compares the worktree against the stored rows within a
+//! [`ReconcileScope`] and writes only the difference, so editing one file costs
+//! one file's work whatever the size of the repository.
+//!
+//! [`watch`] is what decides *where to look first* — a filesystem watcher, a
+//! normalizer that drops a denied path before it can become a queue entry, and
+//! a dirty set that collapses a ten-thousand-file checkout into one bounded
+//! pass. Everything it produces is a **hint**. Truth is the comparison, which
+//! is why the same edits are found with the watcher switched off, after a
+//! restart, or when a backend drops half its events. `docs/context-index.md`
+//! is the reference and `crates/harkness-context/src/reconcile.rs`'s module
+//! documentation is the contract.
+//!
 //! # What is not here
 //!
 //! No search ([#116]), no symbol extraction ([#117]) — the store accepts symbol
@@ -125,8 +141,10 @@ mod inventory;
 mod path;
 mod probe;
 mod provenance;
+mod reconcile;
 mod snapshot;
 mod text;
+pub mod watch;
 mod wire;
 
 pub use chunk::{
@@ -163,6 +181,7 @@ pub use provenance::{
     ByteRange, MAX_PROVENANCE_TEXT_BYTES, Provenance, RankExplanation, RankSignal, RetrievalSource,
     SelectionReason, SelectionReasonKind, Sensitivity, SymbolRef,
 };
+pub use reconcile::{MAX_PATHS_PER_RECONCILE, ReconcileReport, ReconcileScope};
 pub use snapshot::{
     Capture, CaptureDiagnostics, CaptureRequest, FileDigestEntry, FreshnessState, PathDivergence,
     SkippedPath, SnapshotComponent, SnapshotDigest, SnapshotFiles, StalePath, UnverifiableReason,

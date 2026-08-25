@@ -4,7 +4,8 @@
 //! `<data_dir>/context/<repository-key>/index.db`, where `<repository-key>` is
 //! the v5 UUID `harkness-git` already keys the repository lock by. Every linked
 //! worktree of one repository therefore maps to one cache root, and per-worktree
-//! state is isolated *inside* it ([#115]).
+//! state is isolated *inside* it, and kept current there by [#115]'s
+//! reconciler.
 //!
 //! # This holds derivation, never evidence
 //!
@@ -113,8 +114,8 @@ pub use budget::{
 };
 pub use schema::{CORE_TABLES, INDEX_SCHEMA, INDEX_SCHEMA_VERSION};
 pub use store::{
-    BatchReceipt, BatchScope, IndexBatch, IndexedChunk, IndexedFile, IndexedPage, IndexedSymbol,
-    MAX_READ_ROWS, SymbolRecord, WorktreeKey, cache_root,
+    BatchReceipt, BatchScope, ForgetReport, IndexBatch, IndexedChunk, IndexedFile, IndexedPage,
+    IndexedSymbol, MAX_READ_ROWS, SymbolRecord, WorktreeKey, cache_root,
 };
 
 use budget::CacheLock;

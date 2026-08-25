@@ -52,26 +52,28 @@
 //! [#123]: https://github.com/fullstacktaiye/harkness/issues/123
 
 use std::path::{Path, PathBuf};
-use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use harkness_core::ProjectId;
-use harkness_git::{Cancellation, GitService};
+use harkness_git::{Cancellation, GitService, HeadState};
 
 use crate::chunk::{FileVersion, chunk_file};
 use crate::digest::{Sha256Hex, empty_path_set_digest};
 use crate::error::{ContextDomainError, ContextEngineError};
 use crate::ids::ChunkId;
 use crate::index::{
-    self, BatchReceipt, BatchScope, CacheRecreation, ExpectedVersions, IndexAvailability,
-    IndexCache, IndexCounts, IndexReport, IndexStatus, IndexedChunk, IndexedFile, IndexedPage,
-    RecreationReason, WorktreeKey,
+    self, BatchReceipt, BatchScope, CacheRecreation, ExpectedVersions, ForgetReport,
+    IndexAvailability, IndexCache, IndexCounts, IndexReport, IndexStatus, IndexedChunk,
+    IndexedFile, IndexedPage, RecreationReason, WorktreeKey,
 };
 use crate::inventory::{
     FileInventory, GLOBAL_IGNORE_FILE, InventoryBuilder, InventoryEntry, InventoryPolicy,
 };
 use crate::path::RepoPath;
 use crate::probe::FilesystemProbe;
+use crate::reconcile::{ReconcileReport, ReconcileScope, Reconciler};
 use crate::snapshot::{Capture, CaptureRequest, WorkspaceSnapshot};
+use crate::watch::{WatchOptions, WatchService};
 
 /// A group of engine settings a repository may narrow.
 ///
@@ -727,9 +729,14 @@ impl ContextEngine {
     /// commit the whole thing at one generation. Nothing it writes is visible
     /// until the commit, so a build stopped half-way leaves the previous
     /// generation answering rather than a repository that reports itself
-    /// half-indexed. The incremental trigger — noticing that one file changed
-    /// and reconciling only that — is [#115]'s; this is what it reconciles
-    /// *from*.
+    /// half-indexed.
+    ///
+    /// [`reconcile`](Self::reconcile) is the incremental half, and it is what
+    /// every later pass should use: this one reads and chunks every file
+    /// whatever its metadata says, which is right exactly once. A full
+    /// reconcile of a worktree the cache has never seen does the same work and
+    /// leaves the same rows, so the two differ only in what they are willing to
+    /// assume ([#115]).
     ///
     /// # A truncated walk never sweeps
     ///
@@ -761,13 +768,21 @@ impl ContextEngine {
 
         let snapshot = self.snapshot(cancellation)?;
         let inventory = InventoryBuilder::build(&snapshot, &self.inventory_policy(), cancellation)?;
-        let scope = batch_scope(inventory.is_truncated());
+        let scope = batch_scope(&inventory);
         let key = self.worktree_key();
         let classify_version = inventory.classify_version();
+        let marker = self.head_marker();
 
         self.with_cache(|cache| {
             let _operation = cache.begin_operation("reindex");
             let mut batch = cache.begin(&key, inventory.worktree_root(), scope, cancellation)?;
+            // A cold build examined every path, so it is entitled to say which
+            // committed base this checkout was verified against — which is what
+            // lets the *next* pass tell a re-created worktree from an unchanged
+            // one. A truncated walk is not entitled to, and does not.
+            if scope == BatchScope::Full {
+                batch.record_head_marker(marker.as_deref());
+            }
             for entry in inventory.entries() {
                 if cancellation.is_cancelled() {
                     return Err(ContextEngineError::Cancelled);
@@ -791,6 +806,174 @@ impl ContextEngine {
                 }
             }
             batch.commit(cancellation)
+        })
+    }
+
+    /// Brings the index back into agreement with the worktree, within `scope`.
+    ///
+    /// The incremental half of the pair [`reindex`](Self::reindex) is the cold
+    /// half of. Where a reindex reads and chunks every file, this compares the
+    /// filesystem against the rows already stored and writes only the
+    /// difference: a path whose size and modification time match its row is
+    /// left alone, a path the scope *named* is hashed whatever its metadata
+    /// says, and a row the walk found no path for is removed by name.
+    ///
+    /// **Events are not truth and this is why.** A watcher decides only what
+    /// goes into `scope`; every answer comes from this comparison, so a
+    /// reconcile reached through a dropped event, a startup sweep, or a caller
+    /// asking directly produces the same rows. `docs/context-index.md` states
+    /// the model and `reconcile`'s module documentation states the rules.
+    ///
+    /// A [`ReconcileScope::Full`] pass over a worktree the cache has never seen
+    /// is a cold build by another route: every path is an addition, and the
+    /// commit publishes them at one generation exactly as
+    /// [`reindex`](Self::reindex) does.
+    ///
+    /// Blocking, and cancellation-polled between paths. A cancelled pass leaves
+    /// the previous generation answering, because nothing it staged was ever
+    /// visible.
+    ///
+    /// # Errors
+    ///
+    /// The failures of [`inventory`](Self::inventory), plus
+    /// [`ContextEngineError::IndexBudgetExhausted`],
+    /// [`ContextEngineError::IndexBusy`],
+    /// [`ContextEngineError::IndexBatchSuperseded`] when another process
+    /// published this worktree while the pass was open, and the cache's own
+    /// open failures.
+    pub fn reconcile(
+        &self,
+        scope: &ReconcileScope,
+        cancellation: &Cancellation,
+    ) -> Result<ReconcileReport, ContextEngineError> {
+        if cancellation.is_cancelled() {
+            return Err(ContextEngineError::Cancelled);
+        }
+        // Acted on before anything is compared, so a pass running under a
+        // bumped chunking version sees the rows the invalidation cleared and
+        // treats them as the suspects they are. It is also the repair: a cache
+        // whose handle is gone, or whose file another process replaced, is
+        // reopened here rather than written into as a ghost.
+        //
+        // Paid on every pass rather than only on the first, which is a real
+        // cost — the refresh re-counts the cache's rows — and is kept anyway.
+        // A pass runs at most twice a second by construction, the count is
+        // small beside the walk and the hashing it precedes, and the
+        // alternative is deciding from remembered state that nothing needs
+        // repairing, which is exactly the class of answer this whole module
+        // refuses to give.
+        self.refresh_index(cancellation)?;
+
+        let policy = self.inventory_policy();
+        let marker = self.head_marker();
+        let worktree = self.worktree_key();
+        self.with_cache(|cache| {
+            Reconciler {
+                cache,
+                worktree: worktree.clone(),
+                root: &self.config.worktree_root,
+                policy: &policy,
+                head_marker: marker.clone(),
+            }
+            .run(scope, cancellation)
+        })
+    }
+
+    /// Watches the worktree and keeps the index current as it changes.
+    ///
+    /// Starts a [`WatchService`]: a filesystem watcher whose events are treated
+    /// as hints, a bounded dirty set that coalesces them, and one worker thread
+    /// that sweeps at startup and then reconciles whatever the tree has settled
+    /// into. Everything it publishes goes through
+    /// [`reconcile`](Self::reconcile), so the watcher decides latency and never
+    /// truth.
+    ///
+    /// **A watcher that cannot be established is not a failure.** The service
+    /// starts degraded and reports the reason, still sweeps, and still accepts
+    /// hints from a caller — an exhausted inotify table costs a second of
+    /// freshness rather than a correct index. The only refusal is a worktree
+    /// root that is not there, because that leaves nothing to watch and nothing
+    /// to sweep.
+    ///
+    /// Takes an [`Arc`] receiver because the worker outlives the call: the
+    /// service holds the engine for as long as it runs, which is what makes
+    /// dropping the service the whole of stopping it.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextEngineError::Watch`] carrying
+    /// [`WatchError::WatchRootMissing`](crate::watch::WatchError::WatchRootMissing).
+    pub fn watch(
+        self: &Arc<Self>,
+        options: WatchOptions,
+    ) -> Result<WatchService, ContextEngineError> {
+        WatchService::start(Arc::clone(self), options).map_err(ContextEngineError::from)
+    }
+
+    /// Forgets one checkout's rows, keeping everything a sibling still uses.
+    ///
+    /// The answer to a worktree that has been removed. Reached through any
+    /// engine of the same repository, because the cache is keyed by repository
+    /// and the checkout being forgotten no longer has an engine of its own —
+    /// which is also why it takes a key rather than acting on this engine's own
+    /// worktree.
+    ///
+    /// Nothing here decides that a checkout is gone. A worktree whose root has
+    /// disappeared keeps its rows and reports the failure, because an
+    /// unmounted filesystem and a deleted checkout are indistinguishable from
+    /// inside this process and only one of them licenses throwing rows away.
+    ///
+    /// # Errors
+    ///
+    /// The cache's write failures.
+    pub fn forget_worktree(
+        &self,
+        worktree: &WorktreeKey,
+        cancellation: &Cancellation,
+    ) -> Result<ForgetReport, ContextEngineError> {
+        self.with_cache(|cache| cache.forget_worktree(worktree, cancellation))
+    }
+
+    /// What this checkout is *on*, as one comparable string.
+    ///
+    /// The branch, and the commit only when there is no branch. That asymmetry
+    /// is the whole design of the marker, and it is a cost decision rather than
+    /// a correctness one:
+    ///
+    /// - Including the commit would make **every ordinary commit** a divergence,
+    ///   and a divergence makes every row a suspect. A commit does not touch the
+    ///   working tree at all, so that would be a whole-repository rehash to
+    ///   discover that nothing moved — on the single most frequent operation
+    ///   there is.
+    /// - Leaving the branch out would miss the case the marker exists for: a
+    ///   checkout deleted and re-created at the same path holding **another
+    ///   branch**, which is [#63]'s, and which path-derived identity cannot
+    ///   otherwise tell from the one the rows describe.
+    ///
+    /// The residual is stated rather than argued away. A worktree re-created at
+    /// the same path on the *same* branch at a different commit does not move
+    /// the marker, and is caught by metadata instead — a fresh checkout writes
+    /// its files now, so their modification times move. The marker is what
+    /// covers the case where that inference is unavailable.
+    ///
+    /// A detached checkout carries its commit, because there is no branch to
+    /// carry and moving one is a real change of content. The three states are
+    /// spelled apart so a detached checkout never compares equal to the branch
+    /// sitting at the same commit.
+    ///
+    /// `None` means the root is not a repository this build can read, which is
+    /// a true statement and never an "unchanged". Read in process through
+    /// libgit2, so a reconcile that runs every time an editor goes quiet does
+    /// not spawn a Git process to find out.
+    ///
+    /// [#63]: https://github.com/fullstacktaiye/harkness/issues/63
+    fn head_marker(&self) -> Option<String> {
+        Some(match self.git.head_state().ok().flatten()? {
+            HeadState::Unborn { branch } => {
+                format!("unborn:{}", branch.unwrap_or_default())
+            }
+            HeadState::Branch { name } => format!("branch:{name}"),
+            HeadState::Detached { commit } => format!("detached:{commit}"),
         })
     }
 
@@ -998,13 +1181,15 @@ impl ContextEngine {
 ///
 /// A pure function rather than an inline `if`, because it is the rule and not
 /// an implementation detail: a full batch deletes every row it did not confirm,
-/// and a walk stopped by its own file or time budget did not see the whole
-/// worktree — sweeping on one would delete rows for files that exist. Reaching
-/// the truncated branch through the engine means building a repository past
-/// `MAX_INVENTORY_FILES`, so the rule is held to directly instead of by a
-/// fixture nobody can afford to write.
-const fn batch_scope(truncated: bool) -> BatchScope {
-    if truncated {
+/// and a walk that did not see the whole worktree — because its own file or
+/// time budget stopped it, or because it was only ever asked about part of the
+/// tree — would have the index delete rows for files that exist. Both questions
+/// are asked of the inventory rather than of the caller, so the answer travels
+/// with the value it is about. Reaching the truncated branch through the engine
+/// means building a repository past `MAX_INVENTORY_FILES`, so the rule is held
+/// to directly instead of by a fixture nobody can afford to write.
+fn batch_scope(inventory: &FileInventory) -> BatchScope {
+    if inventory.is_truncated() || !inventory.scope().is_full() {
         BatchScope::Targeted
     } else {
         BatchScope::Full

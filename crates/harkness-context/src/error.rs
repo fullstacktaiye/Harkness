@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::inventory::InventoryError;
+use crate::watch::WatchError;
 
 /// Failures raised while capturing, verifying, or decoding context records.
 ///
@@ -336,6 +337,28 @@ pub enum ContextEngineError {
     /// to draw.
     #[error(transparent)]
     Inventory(InventoryError),
+
+    /// Establishing a filesystem watch failed beneath the facade.
+    ///
+    /// Carried whole for the same reason the walk's failures are. The
+    /// distinction that matters here is between a root that is not there and a
+    /// backend that could not be established: the first is a real failure and
+    /// the second costs latency only, because events were never what decided
+    /// whether the index was current.
+    #[error(transparent)]
+    Watch(WatchError),
+}
+
+impl From<WatchError> for ContextEngineError {
+    /// Written by hand for the same one variant [`From<InventoryError>`] is.
+    ///
+    /// [`From<InventoryError>`]: Self::from
+    fn from(error: WatchError) -> Self {
+        match error {
+            WatchError::Cancelled => Self::Cancelled,
+            carried => Self::Watch(carried),
+        }
+    }
 }
 
 impl From<InventoryError> for ContextEngineError {
@@ -385,20 +408,22 @@ impl ContextEngineError {
             Self::Cancelled => "cancelled",
             Self::Domain(error) => error.kind(),
             Self::Inventory(error) => error.kind(),
+            Self::Watch(error) => error.kind(),
         }
     }
 
     /// Every discriminant a facade call can report, in declaration order.
     ///
-    /// The engine's own table, then the domain's, then the walk's. A caller
-    /// building an exit-code or presentation table needs the union, because a
-    /// facade call can fail at any of the three layers and the caller cannot
-    /// tell which one decided.
+    /// The engine's own table, then the domain's, then the walk's, then the
+    /// watch's. A caller building an exit-code or presentation table needs the
+    /// union, because a facade call can fail at any of the four layers and the
+    /// caller cannot tell which one decided.
     ///
-    /// `cancelled` is published once. A walk that observed the token and a
-    /// facade call that observed it are the same answer, which is why
-    /// [`From<InventoryError>`](Self::from) maps one onto the other rather than
-    /// letting two tables spell it twice.
+    /// `cancelled` is published once. A walk that observed the token, a watch
+    /// that observed it, and a facade call that observed it are the same
+    /// answer, which is why [`From<InventoryError>`](Self::from) and
+    /// [`From<WatchError>`](Self::from) map onto the engine's own spelling
+    /// rather than letting three tables spell it three times.
     #[must_use]
     pub fn kinds() -> Vec<&'static str> {
         Self::KINDS
@@ -407,6 +432,12 @@ impl ContextEngineError {
             .chain(ContextDomainError::KINDS.iter().copied())
             .chain(
                 InventoryError::KINDS
+                    .iter()
+                    .copied()
+                    .filter(|kind| !Self::KINDS.contains(kind)),
+            )
+            .chain(
+                WatchError::KINDS
                     .iter()
                     .copied()
                     .filter(|kind| !Self::KINDS.contains(kind)),
@@ -600,9 +631,11 @@ mod tests {
             published.len(),
             ContextEngineError::KINDS.len()
                 + ContextDomainError::KINDS.len()
-                // Every walk kind but `cancelled`, which the engine's own table
-                // already publishes for the same event.
+                // Every walk and watch kind but `cancelled`, which the engine's
+                // own table already publishes for the same event.
                 + crate::InventoryError::KINDS.len()
+                - 1
+                + crate::watch::WatchError::KINDS.len()
                 - 1
         );
 

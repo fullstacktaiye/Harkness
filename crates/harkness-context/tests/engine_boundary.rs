@@ -3,23 +3,28 @@
 //! The unit tests beside the implementation can reach private state; these
 //! cannot, which is the point. Everything [#114]–[#123] needs to plug into is a
 //! public item, and a seam that only works from inside its own crate is not a
-//! seam. This also stands where [#133] and [#136] will: no run store, no agent,
+//! seam. [#115]'s half of that is the pair a surface reaches for: a scope it
+//! can name and a watch it can start, stop, and ask about. This also stands where [#133] and [#136] will: no run store, no agent,
 //! no model, and no network in the process.
 //!
 //! [#114]: https://github.com/fullstacktaiye/harkness/issues/114
+//! [#115]: https://github.com/fullstacktaiye/harkness/issues/115
 //! [#123]: https://github.com/fullstacktaiye/harkness/issues/123
 //! [#133]: https://github.com/fullstacktaiye/harkness/issues/133
 //! [#136]: https://github.com/fullstacktaiye/harkness/issues/136
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use harkness_context::index::{
     INDEX_DATABASE_FILE, IndexAvailability, IndexCache, RecreationReason,
 };
+use harkness_context::watch::{ChangeHint, WatchOptions, WatchService, WatchState};
 use harkness_context::{
     ChunkId, ContextEngine, ContextEngineConfig, ContextEngineError, InventoryRequest, MapRequest,
-    PackRequest, RepoPath, SearchQuery, SymbolQuery,
+    PackRequest, ReconcileScope, RepoPath, SearchQuery, SymbolQuery,
 };
 use harkness_core::{CONTEXT_DIRECTORY, ProjectId};
 use harkness_git::Cancellation;
@@ -262,4 +267,101 @@ fn the_cache_lifecycle_is_reachable_without_an_engine() {
     let recreation = cache.dispose(&Cancellation::default()).unwrap();
     assert_eq!(recreation.reason, RecreationReason::Disposed);
     assert!(cache.generation() > report.generation);
+}
+
+/// The incremental seam as a surface reaches it: name a scope, get a report,
+/// and read the rows it published. Nothing about it needs a watcher, which is
+/// the whole of the hints-are-not-truth split expressed as an API.
+#[test]
+fn a_scoped_reconcile_is_reachable_and_reports_what_it_did() {
+    let workspace = Workspace::new();
+    fs::create_dir_all(workspace.root.join("src")).unwrap();
+    fs::write(workspace.root.join("src/a.rs"), "fn a() {}\n").unwrap();
+    let engine = workspace.engine();
+    let cancellation = Cancellation::default();
+
+    let cold = engine
+        .reconcile(&ReconcileScope::Full, &cancellation)
+        .unwrap();
+    assert!(cold.added > 0);
+    assert!(cold.generation > 0);
+    assert_eq!(cold.scope, ReconcileScope::Full);
+    assert!(cold.escalated.is_none());
+
+    fs::write(workspace.root.join("src/a.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+    let path = RepoPath::from_path(Path::new("src/a.rs"));
+    let update = engine
+        .reconcile(&ReconcileScope::paths([path.clone()]), &cancellation)
+        .unwrap();
+
+    assert_eq!(update.examined, 1);
+    assert_eq!(update.changed, 1);
+    assert!(update.generation > cold.generation);
+    assert_eq!(update.worktree, engine.worktree_key());
+    assert!(!engine.indexed_chunks(&path).unwrap().is_empty());
+}
+
+/// A watch is started from an engine, answers its own status without waiting on
+/// the worker, accepts a hint from a caller, and is stopped by being dropped.
+/// Every one of those is something [#133]'s surface has to be able to do.
+///
+/// [#133]: https://github.com/fullstacktaiye/harkness/issues/133
+#[test]
+fn a_watch_is_startable_observable_and_stoppable_from_outside_the_crate() {
+    let workspace = Workspace::new();
+    fs::write(workspace.root.join("a.rs"), "fn a() {}\n").unwrap();
+    let engine = Arc::new(workspace.engine());
+
+    let mut service = engine
+        .watch(
+            WatchOptions::new()
+                .without_filesystem_events()
+                .with_quiescence(Duration::from_millis(40)),
+        )
+        .expect("the watch starts");
+    assert!(service.wait_until_quiet(Duration::from_secs(20)));
+    assert_eq!(service.worktree_root(), engine.worktree_root());
+    assert!(matches!(
+        service.status().state,
+        WatchState::Degraded { .. }
+    ));
+    assert!(
+        engine
+            .indexed_file(&RepoPath::from_path(Path::new("a.rs")))
+            .unwrap()
+            .is_some(),
+        "the startup sweep is what recovers everything missed while this process was not running"
+    );
+
+    fs::write(workspace.root.join("b.rs"), "fn b() {}\n").unwrap();
+    service.hint(ChangeHint::Path(RepoPath::from_path(Path::new("b.rs"))));
+    assert!(service.wait_until_quiet(Duration::from_secs(20)));
+    assert!(
+        engine
+            .indexed_file(&RepoPath::from_path(Path::new("b.rs")))
+            .unwrap()
+            .is_some()
+    );
+
+    service.stop();
+    assert_eq!(service.status().state, WatchState::Stopped);
+    drop(service);
+    assert_eq!(Arc::strong_count(&engine), 1);
+}
+
+/// A watch on a root that is not there refuses with the discriminant a caller
+/// switches on, carried through the engine's own namespace.
+#[test]
+fn a_watch_failure_reaches_the_caller_with_its_own_discriminant() {
+    let workspace = Workspace::new();
+    let engine = Arc::new(workspace.engine());
+    fs::remove_dir_all(&workspace.root).unwrap();
+
+    let error = engine
+        .watch(WatchOptions::new())
+        .expect_err("there is nothing to watch");
+
+    assert_eq!(error.kind(), "watch_root_missing");
+    assert!(harkness_context::ContextEngineError::kinds().contains(&"watch_root_missing"));
+    let _ = WatchService::start(engine, WatchOptions::new()).expect_err("and the type refuses too");
 }

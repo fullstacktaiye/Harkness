@@ -70,6 +70,7 @@ latency-approval-dispatch
 latency-streaming-assembly
 latency-inventory-walk
 latency-chunking-1mib
+latency-incremental-update
 '
 
 # Rows are `| `scenario` | … | `package` | `test` |`, with an optional budget

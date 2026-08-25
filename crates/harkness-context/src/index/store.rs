@@ -27,7 +27,7 @@
 //!
 //! There is no public query here that does not take a [`WorktreeKey`] and join
 //! through that worktree's `files` rows. That is the isolation contract [#115]
-//! builds on, expressed as an API shape rather than as query discipline: the
+//! rests on, expressed as an API shape rather than as query discipline: the
 //! content tables are shared by every worktree of the repository, so a query
 //! that reached them directly would answer one checkout's question with
 //! another's rows, and the only way to write one is to add a method that does
@@ -203,6 +203,16 @@ pub struct BatchReceipt {
     pub duration: Duration,
 }
 
+/// What forgetting one checkout removed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct ForgetReport {
+    /// File rows the removed worktree held.
+    pub files_removed: u64,
+    /// Content-addressed rows dropped because no worktree still named them.
+    pub rows_collected: u64,
+}
+
 /// A bounded answer, and whether the bound is why it ended.
 ///
 /// Every unbounded read here returns one. A bare `Vec` of exactly the limit is
@@ -290,6 +300,19 @@ pub struct IndexedFile {
     /// keeps its file rows — they are true records of what the walk saw — and
     /// this is what tells a reconciler which of them to re-classify.
     pub classify_version: u32,
+    /// Chunk-boundary rules the derived rows were produced under.
+    ///
+    /// The other per-row staleness marker, and the one a chunking skew moves:
+    /// [`IndexCache::refresh`](super::IndexCache::refresh) empties `chunks` and
+    /// nulls this, so a row whose file still exists reads as derived-under-
+    /// nothing rather than as derived-under-a-version-nobody-uses. A reconciler
+    /// that compared only sizes and modification times would then skip exactly
+    /// the files the invalidation created work for.
+    ///
+    /// `None` also means a path whose content is never read — a binary, a
+    /// symlink, a repository boundary — which is why the eligibility of the
+    /// entry is asked first.
+    pub chunking_version: Option<String>,
     /// Batch generation that last confirmed this row.
     pub generation: u64,
 }
@@ -394,6 +417,15 @@ enum Derivation {
     /// cost the file its whole entry in the index until something walked again.
     /// Keeping the previous derivation is stale, and stale beats absent.
     Unavailable,
+    /// The bytes were read, hashed, and turned out to be the ones the stored
+    /// row already names.
+    ///
+    /// Its metadata is refreshed and its derivation is left exactly as it is —
+    /// the same column treatment [`Unavailable`](Self::Unavailable) gets, for
+    /// the opposite reason. There is nothing to re-derive, so re-deriving would
+    /// be work whose only product is a row identical to the one already there,
+    /// and clearing the link would delete a chunk set that is still correct.
+    Kept,
 }
 
 /// The derived half of one file, present only when its bytes were read.
@@ -440,6 +472,7 @@ pub struct IndexBatch<'cache> {
     scope: BatchScope,
     generation: u64,
     started: Instant,
+    head_marker: Option<Option<String>>,
     files: Vec<PendingFile>,
     symbols: Vec<PendingSymbols>,
     removals: Vec<RepoPath>,
@@ -540,6 +573,7 @@ impl IndexCache {
             scope,
             generation,
             started: Instant::now(),
+            head_marker: None,
             files: Vec::new(),
             symbols: Vec::new(),
             removals: Vec::new(),
@@ -600,6 +634,161 @@ impl IndexCache {
             )?;
             Ok(page(rows.collect::<Result<Vec<_>, _>>()?, limit))
         })
+    }
+
+    /// Every visible file row of `worktree` at or beneath `prefix`.
+    ///
+    /// In path order, starting after `after` and bounded by `limit`, so a
+    /// caller reconciling a subtree pages through it rather than holding a
+    /// repository's worth of rows. An empty `prefix` is the worktree root and
+    /// means every row, which is what makes this one method serve a whole-tree
+    /// sweep and a one-directory one.
+    ///
+    /// Containment requires the separator: `src` returns `src` and
+    /// `src/main.rs` and never `src-generated.rs`. That is the same rule
+    /// [`RepoPath::contains`] states, expressed as a range over the stored
+    /// bytes — SQLite compares blobs by `memcmp`, which is the ordering
+    /// [`RepoPath`] already digests and sorts under, so the range and the
+    /// in-memory predicate cannot disagree.
+    ///
+    /// # Errors
+    ///
+    /// The read failures of [`IndexCache::files`].
+    pub fn files_under(
+        &self,
+        worktree: &WorktreeKey,
+        prefix: &RepoPath,
+        after: Option<&RepoPath>,
+        limit: usize,
+    ) -> Result<IndexedPage<IndexedFile>, ContextEngineError> {
+        let Some(probe) = probe_limit(limit) else {
+            return Ok(IndexedPage::default());
+        };
+        let scoped = !prefix.is_empty();
+        let mut sql = String::from(FILE_SELECT);
+        if scoped {
+            sql.push_str(" AND (f.path = :prefix OR (f.path > :low AND f.path < :high))");
+        }
+        if after.is_some() {
+            sql.push_str(" AND f.path > :after");
+        }
+        sql.push_str(" ORDER BY f.path LIMIT :limit");
+
+        let key = worktree.as_str();
+        let (low, high) = subtree_bounds(prefix);
+        let prefix_bytes = prefix.as_bytes().to_vec();
+        let after_bytes = after.map(|path| path.as_bytes().to_vec());
+        self.with_read(|connection| {
+            let mut statement = connection.prepare(&sql)?;
+            let mut params: Vec<(&str, &dyn rusqlite::ToSql)> =
+                vec![(":worktree", &key), (":limit", &probe)];
+            if scoped {
+                params.push((":prefix", &prefix_bytes));
+                params.push((":low", &low));
+                params.push((":high", &high));
+            }
+            if let Some(after) = after_bytes.as_ref() {
+                params.push((":after", after));
+            }
+            let rows = statement.query_map(params.as_slice(), read_file)?;
+            Ok(page(rows.collect::<Result<Vec<_>, _>>()?, limit))
+        })
+    }
+
+    /// The committed base a whole-worktree reconcile last verified `worktree`
+    /// against, when one has.
+    ///
+    /// `None` means no full pass has ever recorded one — a cache that has only
+    /// seen targeted updates, or one that has never seen this checkout at all.
+    /// A caller must read that as "cannot be told" rather than as "unchanged":
+    /// the marker exists to make a re-created worktree ([#63]) distrust its own
+    /// metadata, and an absent marker is exactly the case where metadata is all
+    /// there is.
+    ///
+    /// # Errors
+    ///
+    /// The read failures of [`IndexCache::files`].
+    ///
+    /// [#63]: https://github.com/fullstacktaiye/harkness/issues/63
+    pub fn worktree_marker(
+        &self,
+        worktree: &WorktreeKey,
+    ) -> Result<Option<String>, ContextEngineError> {
+        self.with_read(|connection| {
+            connection
+                .query_row(
+                    "SELECT head_marker FROM worktrees WHERE worktree_id = :worktree",
+                    named_params! { ":worktree": worktree.as_str() },
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map(Option::flatten)
+        })
+    }
+
+    /// Forgets one checkout entirely, keeping every row a sibling still uses.
+    ///
+    /// The answer to a worktree that has been removed. Its `worktrees` row and
+    /// every `files` row beneath it go; the content-addressed tables are then
+    /// collected, so a blob two checkouts shared survives exactly as long as the
+    /// other one still names it. Nothing about the *repository's* cache is
+    /// disturbed — this is not a disposal, and a sibling worktree keeps
+    /// answering from the same file throughout.
+    ///
+    /// Removing a checkout is a decision nothing here makes. A worktree whose
+    /// root has gone is reported as unavailable and keeps its rows, because a
+    /// mount that has not come back and a checkout that was deleted look
+    /// identical from inside this process and only one of them licenses
+    /// throwing the rows away.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextEngineError::IndexBusy`] under sustained contention,
+    /// [`ContextEngineError::Cancelled`] when the token is observed, and
+    /// [`ContextEngineError::CacheOpenFailed`] when the cache holds no
+    /// connection.
+    pub fn forget_worktree(
+        &self,
+        worktree: &WorktreeKey,
+        cancellation: &Cancellation,
+    ) -> Result<ForgetReport, ContextEngineError> {
+        if cancellation.is_cancelled() {
+            return Err(ContextEngineError::Cancelled);
+        }
+        let key = worktree.as_str().to_owned();
+        let report = self.with_write(|transaction| {
+            // Deleted rather than left to the foreign key, even though
+            // `foreign_keys` is on and the cascade would do it. A collection
+            // that ran before the cascade had been applied would find rows
+            // still pointing at the versions it was deciding about, and the
+            // order of two statements is a cheaper thing to be sure of than the
+            // order of a statement and a trigger.
+            let files = transaction.execute(
+                "DELETE FROM files WHERE worktree_id = :worktree",
+                named_params! { ":worktree": &key },
+            )?;
+            transaction.execute(
+                "DELETE FROM pending_files WHERE worktree_id = :worktree",
+                named_params! { ":worktree": &key },
+            )?;
+            transaction.execute(
+                "DELETE FROM worktrees WHERE worktree_id = :worktree",
+                named_params! { ":worktree": &key },
+            )?;
+            let collected = collect_all(transaction)?;
+            Ok(ForgetReport {
+                files_removed: files as u64,
+                rows_collected: collected,
+            })
+        })?;
+        self.publish_counts();
+        tracing::debug!(
+            worktree = worktree.as_str(),
+            files = report.files_removed,
+            collected = report.rows_collected,
+            "context index forgot a worktree"
+        );
+        Ok(report)
     }
 
     /// Every chunk of the file `worktree` holds at `path`, in ordinal order.
@@ -954,6 +1143,62 @@ impl IndexBatch<'_> {
         self.flush_if_full()
     }
 
+    /// Records a path whose bytes are the ones its stored row already names.
+    ///
+    /// The third answer, beside [`record_entry`](Self::record_entry) and
+    /// [`record_unreadable`](Self::record_unreadable), and the one an
+    /// incremental update spends most of its calls on. A hint said a file
+    /// changed, the file was read and hashed, and the digest matched: its size
+    /// and modification time are refreshed so the next sweep has no reason to
+    /// hash it again, and its derivation is left alone because re-deriving it
+    /// would produce the rows that are already there.
+    ///
+    /// Recording it with [`record_entry`](Self::record_entry) instead would
+    /// clear `files.file_version_id`, and the commit's collection would then
+    /// delete a chunk set nothing was wrong with — the same failure
+    /// [`record_unreadable`](Self::record_unreadable) exists to avoid, reached
+    /// from the opposite direction.
+    ///
+    /// # Errors
+    ///
+    /// The flush failures of [`IndexBatch::commit`].
+    pub fn record_refreshed(
+        &mut self,
+        entry: &InventoryEntry,
+        classify_version: u32,
+    ) -> Result<(), ContextEngineError> {
+        self.files.push(PendingFile {
+            path: entry.path.clone(),
+            byte_size: entry.byte_size,
+            mtime_ns: entry.mtime_ns,
+            class: entry.class,
+            symlink: entry.symlink,
+            boundary: entry.boundary,
+            unreadable: entry.unreadable,
+            classify_version,
+            content: Derivation::Kept,
+        });
+        self.flush_if_full()
+    }
+
+    /// Records the committed base this batch verified the whole worktree
+    /// against.
+    ///
+    /// Written by the commit beside the watermark, so a batch that never
+    /// published never claims a base. **Only a batch that examined every path
+    /// of the worktree may call this.** A targeted update that recorded a
+    /// marker would say the checkout as a whole had been verified against a
+    /// base one file was compared to, and the next full pass would then trust
+    /// metadata it had never checked — which is the exact case the marker
+    /// exists to catch.
+    ///
+    /// `None` clears it, which is what a worktree whose head cannot be read
+    /// deserves: "no base was verified" is a true statement and "the base is
+    /// whatever it was last time" is not.
+    pub fn record_head_marker(&mut self, marker: Option<&str>) {
+        self.head_marker = Some(marker.map(ToOwned::to_owned));
+    }
+
     /// Removes one path's row from the worktree this batch reconciles.
     ///
     /// The targeted answer to a deleted file. A full batch does not need it —
@@ -1010,6 +1255,7 @@ impl IndexBatch<'_> {
         let worktree = self.worktree.as_str().to_owned();
         let generation = i64::try_from(self.generation).unwrap_or(i64::MAX);
         let scope = self.scope;
+        let head_marker = self.head_marker.take();
         let displaced = std::mem::take(&mut self.displaced);
         let database = self.cache.path().to_path_buf();
         let pending = self.generation;
@@ -1025,15 +1271,33 @@ impl IndexBatch<'_> {
                 // generation and hide every row the winner published — a success
                 // that makes the index smaller. The `WHERE` is the whole guard: zero
                 // rows changed means somebody else got there.
-                let claimed = transaction.execute(
-                    "UPDATE worktrees SET last_generation = :generation, last_reconciled_at = :at \
-                 WHERE worktree_id = :worktree AND last_generation < :generation",
-                    named_params! {
-                        ":worktree": &worktree,
-                        ":generation": generation,
-                        ":at": &committed_at,
-                    },
-                )?;
+                let claimed = match &head_marker {
+                    // A batch that examined the whole worktree publishes the
+                    // base it verified against in the same statement that moves
+                    // the watermark, so the two can never disagree about which
+                    // pass a marker belongs to.
+                    Some(marker) => transaction.execute(
+                        "UPDATE worktrees \
+                         SET last_generation = :generation, last_reconciled_at = :at, \
+                             head_marker = :marker \
+                         WHERE worktree_id = :worktree AND last_generation < :generation",
+                        named_params! {
+                            ":worktree": &worktree,
+                            ":generation": generation,
+                            ":at": &committed_at,
+                            ":marker": marker.as_deref(),
+                        },
+                    )?,
+                    None => transaction.execute(
+                        "UPDATE worktrees SET last_generation = :generation, last_reconciled_at = :at \
+                         WHERE worktree_id = :worktree AND last_generation < :generation",
+                        named_params! {
+                            ":worktree": &worktree,
+                            ":generation": generation,
+                            ":at": &committed_at,
+                        },
+                    )?,
+                };
                 if claimed == 0 {
                     let watermark: i64 = transaction
                         .query_row(
@@ -1259,7 +1523,8 @@ fn supersession(
 /// forget it and return a batch that has not committed.
 const FILE_SELECT: &str = "\
 SELECT f.path, f.file_version_id, v.content_sha256, f.byte_size, f.mtime_ns, f.file_class, \
-       f.symlink, f.boundary, f.unreadable, f.classify_version, f.generation, v.truncated \
+       f.symlink, f.boundary, f.unreadable, f.classify_version, f.generation, v.truncated, \
+       v.chunking_version \
 FROM files f \
 JOIN worktrees w ON w.worktree_id = f.worktree_id \
 LEFT JOIN file_versions v ON v.file_version_id = f.file_version_id \
@@ -1303,6 +1568,23 @@ fn page<T>(mut rows: Vec<T>, limit: usize) -> IndexedPage<T> {
     let more = rows.len() > bounded;
     rows.truncate(bounded);
     IndexedPage { rows, more }
+}
+
+/// The half-open blob range holding everything strictly beneath `prefix`.
+///
+/// `prefix || '/'` is the low bound and the same bytes with that separator
+/// incremented is the high one, which works because `/` is `0x2f` and can never
+/// be the largest byte. The prefix itself sits outside the range and is matched
+/// on its own, so a directory recorded as a boundary is returned beside the
+/// files under it rather than instead of them.
+fn subtree_bounds(prefix: &RepoPath) -> (Vec<u8>, Vec<u8>) {
+    let mut low = prefix.as_bytes().to_vec();
+    low.push(b'/');
+    let mut high = low.clone();
+    if let Some(last) = high.last_mut() {
+        *last = b'/' + 1;
+    }
+    (low, high)
 }
 
 /// The row bound one read is given, saturated into what SQLite can bind.
@@ -1388,7 +1670,7 @@ fn stage_file(
 ) -> Result<(), rusqlite::Error> {
     let version = match &file.content {
         Derivation::Read(content) => Some(content.file_version.to_string()),
-        Derivation::None | Derivation::Unavailable => None,
+        Derivation::None | Derivation::Unavailable | Derivation::Kept => None,
     };
     transaction.execute(
         "INSERT INTO pending_files \
@@ -1412,7 +1694,10 @@ fn stage_file(
             ":generation": generation,
             ":path": file.path.as_bytes(),
             ":version": version,
-            ":keep": i64::from(matches!(file.content, Derivation::Unavailable)),
+            ":keep": i64::from(matches!(
+                file.content,
+                Derivation::Unavailable | Derivation::Kept
+            )),
             ":size": i64::try_from(file.byte_size).unwrap_or(i64::MAX),
             ":mtime": file.mtime_ns,
             ":class": file.class.as_str(),
@@ -1702,6 +1987,7 @@ fn read_file(row: &rusqlite::Row<'_>) -> Result<IndexedFile, rusqlite::Error> {
                 rusqlite::types::Type::Integer,
             )
         })?,
+        chunking_version: row.get(12)?,
         generation: cast_u64(generation),
     })
 }
