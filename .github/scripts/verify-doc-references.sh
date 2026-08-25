@@ -29,6 +29,7 @@ docs/policy.md
 docs/approvals.md
 docs/run-lifecycle-and-storage.md
 docs/mock-agent-scenarios.md
+docs/release-readiness-v0.3.md
 '
 
 for document in $documents; do
@@ -68,9 +69,17 @@ fi
 status=0
 packages=$(printf '%s\n' "$rows" | cut -d' ' -f2 | sort -u)
 for package in $packages; do
+    # The window's other three test binaries set `harness = false`, so libtest
+    # never sees `--list` and they would simply run. Only the binary's own unit
+    # tests are listable, and they are where its cited tests live. Same guard,
+    # for the same reason, as `verify-suite-mapping.sh`.
+    target=
+    if [ "$package" = "harkness-gui" ]; then
+        target="--bin harkness-gui"
+    fi
     echo "listing $package…"
     # shellcheck disable=SC2086
-    listing=$(cargo test --locked -p "$package" "$@" -- --list)
+    listing=$(cargo test --locked -p "$package" $target "$@" -- --list)
     for test in $(printf '%s\n' "$rows" | awk -v p="$package" '$2 == p { print $3 }' | sort -u); do
         if ! printf '%s\n' "$listing" | grep -Fqx "$test: test"; then
             citing=$(printf '%s\n' "$rows" | awk -v t="$test" '$3 == t { print $1 }' | sort -u | tr '\n' ' ')

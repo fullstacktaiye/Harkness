@@ -18,6 +18,8 @@ const DOCUMENTS: &[&str] = &[
     "README.md",
     "AGENTS.md",
     "CLAUDE.md",
+    "CHANGELOG.md",
+    "docs/release-readiness-v0.3.md",
     "docs/architecture-runtime.md",
     "docs/tool-authoring.md",
     "docs/policy.md",
