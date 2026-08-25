@@ -119,6 +119,14 @@ pub enum SearchPattern {
     ///
     /// Matched against the exact path bytes, so it finds a directory segment,
     /// a file stem, or an extension without three spellings of the query.
+    ///
+    /// It answers over the same universe as a content query, and that is a
+    /// decision rather than an accident: an oversized file, a binary, a symlink
+    /// and a repository boundary are all outside it, even though no content is
+    /// read here and their *names* would be harmless to return. One universe
+    /// for both shapes means a name a search offers is a file a search can then
+    /// read — the alternative is a caller finding `db/schema.sql` by name and
+    /// being told there is nothing in it.
     Filename(String),
 }
 
@@ -209,12 +217,18 @@ impl SearchFilters {
             path: prefix.display().to_string(),
             reason,
         };
+        // Built from the *validated components* rather than from the raw bytes,
+        // which is the difference between accepting a spelling and understanding
+        // it. `Path` normalizes nothing, so `src//`, `src/./x` and `src/` all
+        // reach `from_path` verbatim — and a stored `src/` ranges over
+        // `src//`..`src/0`, matching not one file in the subtree it names. `.`
+        // is likewise a spelling of the worktree root and not an escape from it.
+        let mut segments: Vec<&std::ffi::OsStr> = Vec::new();
         for component in prefix.components() {
             match component {
-                Component::Normal(_) => {}
-                Component::CurDir => {
-                    return Err(forbidden("'.' is not a repository-relative path"));
-                }
+                Component::Normal(segment) => segments.push(segment),
+                // `.` contributes nothing, exactly as it does to a filesystem.
+                Component::CurDir => {}
                 Component::ParentDir => {
                     return Err(forbidden("'..' would leave the workspace"));
                 }
@@ -223,7 +237,17 @@ impl SearchFilters {
                 }
             }
         }
-        let path = RepoPath::from_path(prefix).without_trailing_separator();
+        // Joined with `/` whatever the platform's separator is, because that is
+        // the byte the index stores paths under — so a filter written
+        // `src\inner` on Windows narrows to the rows it plainly means.
+        let mut bytes: Vec<u8> = Vec::new();
+        for segment in segments {
+            if !bytes.is_empty() {
+                bytes.push(b'/');
+            }
+            bytes.extend_from_slice(RepoPath::from_path(Path::new(segment)).as_bytes());
+        }
+        let path = RepoPath::from_bytes(bytes);
         if path.is_empty() {
             return Ok(self);
         }
@@ -264,7 +288,12 @@ impl SearchFilters {
     /// worth optimizing away.
     #[must_use]
     pub fn prefixes(&self) -> Vec<RepoPath> {
-        normalize(&self.prefixes)
+        debug_assert_eq!(
+            self.prefixes,
+            normalize(&self.prefixes),
+            "`under` is the only way in and it leaves the list normalized"
+        );
+        self.prefixes.clone()
     }
 
     /// The classes this query is narrowed to; empty means every class.
@@ -538,11 +567,17 @@ impl SearchQuery {
     /// The identity a cursor is bound to.
     ///
     /// Everything that decides *which* matches exist and *in what order*, and
-    /// nothing that decides how many arrive at a time: a caller may legitimately
-    /// ask for a smaller second page, and refusing that would make paging
-    /// depend on a number that has nothing to do with position. The capability
-    /// flag is absorbed too, since a pattern that was refused and one that ran
-    /// are not the same query.
+    /// nothing that decides how much arrives at a time. The pattern and the
+    /// filters decide the match set; the capability flag is absorbed with them,
+    /// since a pattern that was refused and one that ran are not the same
+    /// query.
+    ///
+    /// The four bounds are all deliberately outside it. Page size obviously is
+    /// — a caller asking for a smaller second page is paging. So are
+    /// `context_lines` and `max_line_bytes`, which is less obvious and is the
+    /// same rule: they decide how much *text* each match carries and not which
+    /// matches there are, so a surface that lets somebody expand the context
+    /// around a result and keep paging is asking one question, not two.
     #[must_use]
     pub(crate) fn identity(&self) -> Sha256Hex {
         let mut writer = DigestWriter::new(DOMAIN_SEARCH_QUERY);
@@ -562,8 +597,6 @@ impl SearchQuery {
         for class in &self.filters.classes {
             writer.field(class.as_str().as_bytes());
         }
-        writer.integer(u64::from(self.limits.context_lines));
-        writer.integer(self.limits.max_line_bytes);
         writer.finish()
     }
 }

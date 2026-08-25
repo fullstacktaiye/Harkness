@@ -50,7 +50,8 @@ use crate::provenance::{
 use super::cursor::SearchCursor;
 use super::error::SearchError;
 use super::query::{
-    MAX_PATTERN_BYTES, MAX_REGEX_SIZE_BYTES, SearchLimits, SearchPattern, SearchQuery,
+    MAX_PATTERN_BYTES, MAX_REGEX_SIZE_BYTES, SearchFilters, SearchLimits, SearchPattern,
+    SearchQuery,
 };
 use super::result::{
     BoundedText, MAX_SEARCH_OMISSIONS, SearchMatch, SearchOmission, SearchResponse, SearchStats,
@@ -83,17 +84,26 @@ pub(crate) struct Plan {
     over_paths: bool,
     source: RetrievalSource,
     reason: SelectionReason,
+    /// The filters the plan was compiled from.
+    ///
+    /// Owned rather than re-read from the query at scan time. A plan and a
+    /// query that must agree are two values that can disagree: a scan reading
+    /// filter set B while stamping its cursor with filter set A's identity
+    /// would hand back a continuation for a query nobody ran, and nothing in
+    /// the signature would have said so.
+    filters: SearchFilters,
     limits: SearchLimits,
     identity: Sha256Hex,
     cursor: Option<SearchCursor>,
-    /// The generation the cursor was admitted against and the next one is
-    /// minted from, read once so the two cannot disagree.
-    generation: u64,
 }
 
 impl Plan {
     /// Validates `query` and compiles what it needs.
-    fn compile(query: &SearchQuery, generation: u64) -> Result<Self, SearchError> {
+    fn compile(
+        query: &SearchQuery,
+        generation: u64,
+        worktree: &WorktreeKey,
+    ) -> Result<Self, SearchError> {
         let pattern = query.pattern();
         let kind = pattern.kind();
         let invalid = |reason: String| SearchError::InvalidPattern {
@@ -117,7 +127,7 @@ impl Plan {
         let identity = query.identity();
         let cursor = match query.cursor() {
             Some(cursor) => {
-                cursor.admits(generation, &identity)?;
+                cursor.admits(generation, worktree, &identity)?;
                 Some(cursor.clone())
             }
             None => None,
@@ -160,10 +170,10 @@ impl Plan {
             over_paths,
             source,
             reason: SelectionReason::new(SelectionReasonKind::QueryMatch, detail),
+            filters: query.filters().clone(),
             limits: *query.limits(),
             identity,
             cursor,
-            generation,
         })
     }
 }
@@ -220,13 +230,16 @@ impl Scan<'_> {
             }
             .into());
         }
-        Ok(Plan::compile(query, self.cache.generation())?)
+        Ok(Plan::compile(
+            query,
+            self.cache.generation(),
+            self.worktree,
+        )?)
     }
 
     /// Runs a prepared query and returns one bounded page.
     pub(crate) fn run(
         &self,
-        query: &SearchQuery,
         plan: &Plan,
         snapshot: SnapshotId,
         cancellation: &Cancellation,
@@ -234,8 +247,18 @@ impl Scan<'_> {
         if cancellation.is_cancelled() {
             return Err(ContextEngineError::Cancelled);
         }
-        let generation = plan.generation;
-        let mut rows = RowStream::open(self.cache, self.worktree, query, plan.cursor.as_ref())?;
+        let _span = tracing::debug_span!("context.search", pattern_kind = plan.kind).entered();
+        // Read here rather than carried from `prepare`, and the cursor is
+        // admitted against *this* value. The two run under separate acquisitions
+        // of the cache lock with a workspace capture between them, so a
+        // `dispose` or a `refresh` can replace the cache in the gap — and a
+        // response reporting one generation for rows that came from another is
+        // the mixing an opaque cursor exists to prevent.
+        let generation = self.cache.generation();
+        if let Some(cursor) = plan.cursor.as_ref() {
+            cursor.admits(generation, self.worktree, &plan.identity)?;
+        }
+        let mut rows = RowStream::open(self.cache, self.worktree, plan, plan.cursor.as_ref())?;
         let mut progress = Progress {
             collector: Collector::new(plan.limits),
             stats: SearchStats::default(),
@@ -250,7 +273,7 @@ impl Scan<'_> {
                 return Err(ContextEngineError::Cancelled);
             }
             progress.stats.paths_examined += 1;
-            if !row.eligible() || !query.filters().admits(row.class) {
+            if !row.eligible() || !plan.filters.admits(row.class) {
                 continue;
             }
             let carried = if plan.over_paths {
@@ -274,6 +297,7 @@ impl Scan<'_> {
         let next_cursor = truncated.then(|| matches.last()).flatten().map(|last| {
             SearchCursor::new(
                 generation,
+                self.worktree,
                 plan.identity.clone(),
                 last.path.clone(),
                 last.byte_offset,
@@ -401,11 +425,25 @@ impl Scan<'_> {
             });
             return Ok(true);
         }
-        let Some(bytes) = read_bounded(&absolute, metadata.len()) else {
-            collector.omit(SearchOmission::FileUnreadable {
-                path: row.path.clone(),
-            });
-            return Ok(true);
+        let bytes = match read_bounded(&absolute, metadata.len()) {
+            Read::Bytes(bytes) => bytes,
+            Read::Unreadable => {
+                collector.omit(SearchOmission::FileUnreadable {
+                    path: row.path.clone(),
+                });
+                return Ok(true);
+            }
+            // Grown past the threshold between the `stat` and the read. The
+            // same fact the metadata check above spells, so it is spelled the
+            // same way: telling a caller the file could not be opened when it
+            // opened fine and is simply no longer eligible sends them looking
+            // for a permission bit that is not there.
+            Read::Oversized => {
+                collector.omit(SearchOmission::FileChangedSinceIndex {
+                    path: row.path.clone(),
+                });
+                return Ok(true);
+            }
         };
         let mut moved = metadata.len() != row.byte_size
             || (row.mtime_ns.is_some()
@@ -495,18 +533,38 @@ fn line_searcher() -> Searcher {
 /// buffer, and getting that right is worth doing: `read_to_end` over a `Take`
 /// has no size hint to work from, so it starts small and doubles, and a scan
 /// that opens ten thousand files pays those extra reads ten thousand times.
-fn read_bounded(path: &Path, expected: u64) -> Option<Vec<u8>> {
+fn read_bounded(path: &Path, expected: u64) -> Read {
     use std::io::Read as _;
 
-    let file = std::fs::File::open(path).ok()?;
+    let Ok(file) = std::fs::File::open(path) else {
+        return Read::Unreadable;
+    };
     let capacity = usize::try_from(expected.min(OVERSIZED_FILE_THRESHOLD)).unwrap_or(0);
     let mut bytes = Vec::with_capacity(capacity.saturating_add(1));
     let mut reader = file.take(OVERSIZED_FILE_THRESHOLD.saturating_add(1));
-    reader.read_to_end(&mut bytes).ok()?;
-    if bytes.len() as u64 > OVERSIZED_FILE_THRESHOLD {
-        return None;
+    if reader.read_to_end(&mut bytes).is_err() {
+        return Read::Unreadable;
     }
-    Some(bytes)
+    if bytes.len() as u64 > OVERSIZED_FILE_THRESHOLD {
+        return Read::Oversized;
+    }
+    Read::Bytes(bytes)
+}
+
+/// What one attempt to read a file produced.
+///
+/// Three answers rather than an [`Option`] because the two failures are
+/// different facts about the repository: one says the file could not be opened,
+/// the other says it was read fine and is no longer a file this engine offers.
+/// Collapsing them sends a caller looking for a permission bit that is not
+/// there.
+enum Read {
+    /// The whole file, within the eligibility threshold.
+    Bytes(Vec<u8>),
+    /// The file could not be opened or read.
+    Unreadable,
+    /// The file grew past the threshold between the `stat` and the read.
+    Oversized,
 }
 
 /// The mutable state one scan carries from file to file.
@@ -590,22 +648,34 @@ impl Sink for MatchSink<'_> {
         let limit = self.plan.limits.max_line_bytes();
         let line = BoundedText::clamped(content, limit);
         let context = usize::try_from(self.plan.limits.context_lines()).unwrap_or(0);
+        // Context is cut from the same bytes the searcher matched over, and
+        // that is deliberate rather than careless about binary content: with
+        // `BinaryDetection::quit` a NUL found in the detection window abandons
+        // the *whole* file, so a match and a NUL before it cannot both exist,
+        // and a NUL past that window is invisible to the searcher, which then
+        // treats everything as lines. Cutting context from a shorter slice than
+        // the searcher used would make a match reported from one region carry
+        // context from a file the scan disagreed about the shape of.
         let before = preceding_lines(self.bytes, line_start, context, limit);
         let after = following_lines(self.bytes, line_start + raw.len(), context, limit);
         let line_number = mat.line_number();
-        let mut range = ByteRange::new(line_start as u64, (line_start + content.len()) as u64);
+        // The range names exactly the bytes the digest covers: the matched line
+        // *as emitted*. A clamped line is a prefix, and a range naming the whole
+        // of a line only a prefix of which was shown would fail the one check it
+        // exists for — read the range back out of the file, hash it, compare.
+        // `provenance.truncated` is what says the line continued.
+        let shown = line.shown_bytes();
+        let mut range = ByteRange::new(line_start as u64, (line_start + shown.len()) as u64);
         if let Some(number) = line_number.and_then(|number| u32::try_from(number).ok()) {
             range = range.with_lines(number, number);
         }
-        // The digest covers the matched line as emitted, which is what `range`
-        // names. Context lines sit beside it as their own bounded texts and are
-        // deliberately outside both: a digest spanning them would describe a
-        // region the range does not, and the range is what an edit is applied
-        // against.
+        // Context lines sit beside the digest and the range rather than inside
+        // them, and deliberately: a digest spanning them would describe a region
+        // the range does not, and the range is what an edit is applied against.
         let mut provenance = Provenance::new(
             self.plan.source,
             self.snapshot,
-            &line.shown_bytes(),
+            &shown,
             self.plan.reason.clone(),
         )
         .at_path(self.row.path.clone())
@@ -828,10 +898,10 @@ impl<'cache> RowStream<'cache> {
     fn open(
         cache: &'cache IndexCache,
         worktree: &'cache WorktreeKey,
-        query: &SearchQuery,
+        plan: &Plan,
         cursor: Option<&SearchCursor>,
     ) -> Result<Self, ContextEngineError> {
-        let mut prefixes = query.filters().prefixes();
+        let mut prefixes = plan.filters.prefixes();
         if prefixes.is_empty() {
             prefixes.push(RepoPath::from_bytes(Vec::new()));
         }

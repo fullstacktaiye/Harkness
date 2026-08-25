@@ -647,7 +647,7 @@ impl ContextEngine {
         let snapshot = self.snapshot(cancellation)?;
         self.with_cache(|cache| {
             self.scan(cache, &worktree)
-                .run(query, &plan, snapshot.id(), cancellation)
+                .run(&plan, snapshot.id(), cancellation)
         })
     }
 
@@ -684,7 +684,7 @@ impl ContextEngine {
         self.with_cache(|cache| {
             let scan = self.scan(cache, &worktree);
             let plan = scan.prepare(query)?;
-            scan.run(query, &plan, snapshot.id(), cancellation)
+            scan.run(&plan, snapshot.id(), cancellation)
         })
     }
 

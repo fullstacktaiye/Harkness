@@ -334,8 +334,19 @@ pub enum SearchOmission {
     ///
     /// Defense in depth: classification already keeps binaries out of the
     /// universe, so reaching this means a file changed kind since it was
-    /// indexed. Scanning stops at the first NUL and whatever preceded it is
-    /// reported, because bytes after one are not lines.
+    /// indexed. **The whole file is abandoned, not the tail of it** — a NUL
+    /// found in the searcher's detection window stops the scan before any line
+    /// is matched, so a file reported here contributes no matches at all even
+    /// where the NUL sits after content that would have matched. That is the
+    /// safe direction and is why this is an omission rather than a filter: the
+    /// alternative is a caller reading "no match" from a file nobody looked
+    /// inside.
+    ///
+    /// A NUL beyond that window is not detected, and the file is then scanned
+    /// as lines throughout. Search does not second-guess the searcher about
+    /// which of its bytes are lines; the honest statement is that binary
+    /// content in a text-classified file is a stale index, and reconciling it
+    /// is what fixes the classification.
     BinaryContentDetected {
         /// The file that turned out to hold binary content.
         path: RepoPath,
@@ -424,7 +435,14 @@ pub struct SearchResponse {
     pub index_generation: u64,
     /// The matches, in canonical order.
     pub matches: Vec<SearchMatch>,
-    /// Every bound that fired, at most [`MAX_SEARCH_OMISSIONS`] of them.
+    /// Every bound that fired.
+    ///
+    /// At most [`MAX_SEARCH_OMISSIONS`], **plus** the one truncation notice
+    /// when a budget stopped the page. That notice is held outside the cap on
+    /// purpose: a page whose omissions filled up with unreadable files would
+    /// otherwise lose both its notice and — since a cursor is emitted only when
+    /// a bound fired — its continuation. Size a buffer from the constant plus
+    /// one.
     pub omissions: Vec<SearchOmission>,
     /// Omissions past [`MAX_SEARCH_OMISSIONS`] that were counted, not carried.
     pub dropped_omissions: usize,

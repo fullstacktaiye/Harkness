@@ -41,6 +41,15 @@ pub enum CursorRefusal {
     /// different query from it would skip and repeat matches with nothing
     /// saying so, which is exactly the promise paging makes.
     DifferentQuery,
+    /// The token was minted against a different checkout.
+    ///
+    /// One repository's cache is shared by every linked worktree of it — the
+    /// generation is a single row, and only the `files` rows are keyed by
+    /// checkout. A cursor from a sibling worktree therefore matches on both
+    /// generation and query and still names a position in a *different* set of
+    /// rows, so resuming from it would silently skip everything the second
+    /// checkout holds before that path.
+    DifferentWorktree,
 }
 
 impl CursorRefusal {
@@ -49,6 +58,7 @@ impl CursorRefusal {
         Self::Malformed,
         Self::GenerationChanged,
         Self::DifferentQuery,
+        Self::DifferentWorktree,
     ];
 
     /// The stable spelling this refusal reports.
@@ -58,6 +68,7 @@ impl CursorRefusal {
             Self::Malformed => "malformed",
             Self::GenerationChanged => "generation_changed",
             Self::DifferentQuery => "different_query",
+            Self::DifferentWorktree => "different_worktree",
         }
     }
 }
@@ -79,15 +90,21 @@ impl std::fmt::Display for CursorRefusal {
 pub enum SearchError {
     /// The pattern is empty, malformed, or compiles past its size limit.
     ///
-    /// Raised before any file is opened, so a bad pattern costs no I/O. The
-    /// `pattern_kind` is the *shape* that was refused and never the pattern
-    /// itself, for the reason the module's diagnostics are written that way:
-    /// what a person searched for is theirs.
+    /// Raised before the workspace is even read, so a bad pattern costs no I/O.
+    ///
+    /// **`reason` can quote the caller's pattern and `pattern_kind` never
+    /// does.** The split is deliberate in both directions: a person fixing a
+    /// regular expression needs to see what was wrong with theirs, so the
+    /// compiler's own message is carried whole, while the *shape* is what a
+    /// counter or a metric is keyed by. The consequence travels with it — this
+    /// message is caller text, so any layer persisting or logging it owes it the
+    /// redactor, exactly as a tool's input does. `Scan::run`'s own span carries
+    /// `pattern_kind` alone for that reason.
     #[error("the {pattern_kind} pattern cannot be used: {reason}")]
     InvalidPattern {
         /// Stable spelling of the pattern shape that was refused.
         pattern_kind: &'static str,
-        /// Stable human-readable explanation.
+        /// Stable human-readable explanation, which may quote the pattern.
         reason: String,
     },
 

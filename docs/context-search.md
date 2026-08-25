@@ -149,10 +149,25 @@ opaque, versioned, and bound to two things it refuses rather than guesses at:
 | `malformed` | not a token this build mints | run the query again |
 | `generation_changed` | the index was rebuilt or disposed | run the query again |
 | `different_query` | the token belongs to another query | run that query, or this one from the start |
+| `different_worktree` | the token belongs to a sibling checkout | run the query in this one |
 
-All three arrive as `stale_search_cursor`, because all three lead to the same
-repair. The distinction is carried in the refusal rather than published as three
+All four arrive as `stale_search_cursor`, because all four lead to the same
+repair. The distinction is carried in the refusal rather than published as four
 kinds a caller would handle identically.
+
+The **worktree** is checked as well as the generation, and it has to be: one
+repository's cache is shared by every linked checkout of it — the generation is
+a single row, and only the `files` rows are keyed by worktree. A sibling's token
+therefore matches on generation *and* on query and still names a position in a
+different set of rows, so resuming from it would silently skip everything the
+second checkout holds before that path.
+
+What a cursor is bound to is what decides **which** matches exist and in what
+order: the pattern, the capability, and the filters. None of the four bounds is
+part of it. Page size obviously is not — a caller asking for a smaller second
+page is paging — and neither are the two *text* bounds, for the same reason:
+they decide how much each match carries, not which matches there are. A surface
+may widen the context around a result and keep following the same cursor.
 
 A continuation reads index rows strictly after the cursor's path and fetches
 that path's own row by name, because a page may have stopped in the middle of a
@@ -170,7 +185,7 @@ Every bound that fires puts an omission in the **success** payload:
 | `file_unreadable` | a file the index lists could not be opened |
 | `file_changed_since_index` | a file's bytes are not the ones the index recorded; it was searched as it is now |
 | `encoding_not_searchable` | a UTF-16 file, which this scan does not transcode |
-| `binary_content_detected` | a NUL byte inside a file the index classified as text |
+| `binary_content_detected` | a NUL inside a file the index classified as text; the **whole** file is abandoned, not the tail of it |
 
 A result list stopped by a budget and a repository holding exactly that many
 matches are otherwise one value, and reading the first as the second is how a
@@ -188,7 +203,11 @@ before the very match that did not fit, which the next call would answer the sam
 way — a caller paging politely forever over nothing.
 
 Past 256 omissions the list stops and `dropped_omissions` counts the rest, which
-is the bargain the inventory already makes with its diagnostics.
+is the bargain the inventory already makes with its diagnostics. The truncation
+notice is held **outside** that cap — a page whose omissions filled with
+unreadable files would otherwise lose both its notice and, since a cursor is
+emitted only when a bound fired, its continuation. A list can therefore hold 257
+entries; size a buffer from the constant plus one.
 
 ### Every match says where it came from
 
@@ -208,9 +227,14 @@ value. A file that moved between indexing and reading is stamped with what it
 nothing held.
 
 Neither covers the context lines. `provenance.content_sha256` covers exactly the
-region `provenance.range` names, which is the matched line; context lines sit
-beside it as their own `BoundedText`s. A digest spanning them would describe a
-region the range does not, and the range is what an edit is applied against.
+region `provenance.range` names — read the range out of the file, hash it, and
+it is that digest — while context lines sit beside both as their own
+`BoundedText`s. A digest spanning them would describe a region the range does
+not, and the range is what an edit is applied against.
+
+For a **clamped** line the range names the emitted prefix and not the whole
+line, so that check still holds; `provenance.truncated` is what says the line
+continued.
 
 Text is bounded and self-describing. Every excerpt is a `BoundedText` carrying
 a `TextEncoding`: valid UTF-8 travels as itself, anything else travels Base64,
@@ -227,6 +251,13 @@ content at all, and answers from the index's own rows. It is an order of
 magnitude faster than a content query for that reason, and its matches carry
 `filename_search` and no `content_sha256` — nothing was read, so there is no
 file version to name. The excerpt shown is the path itself.
+
+It answers over the **same universe** as a content query, which is a decision
+rather than an accident: an oversized file, a binary, a symlink and a repository
+boundary are all outside it, even though no content is read and their names
+would be harmless to return. One universe for both shapes means a name a search
+offers is a file a search can then read — the alternative is finding
+`db/schema.sql` by name and being told there is nothing in it.
 
 The same compiled engine decides what "contains" means for all three shapes. A
 hand-rolled substring search over paths would be a second answer to one question,
@@ -318,12 +349,16 @@ ADR-0005 records the alternative that was refused, and the trade it accepts.
 | A full omission list keeps the truncation notice | `harkness-context` | `search::tests::a_full_omission_list_never_swallows_the_truncation_notice` |
 | A rebuilt index refuses an old cursor | `harkness-context` | `search::tests::a_cursor_from_a_rebuilt_index_is_refused_rather_than_mixed` |
 | A cursor cannot be replayed against another query | `harkness-context` | `search::tests::a_cursor_replayed_against_a_different_query_is_refused` |
+| A cursor from a sibling worktree is refused | `harkness-context` | `search::tests::a_cursor_from_a_sibling_worktree_is_refused` |
+| Context may be widened between pages | `harkness-context` | `search::tests::context_may_be_widened_between_pages_without_restarting_the_query` |
 | A cursor round-trips through its token | `harkness-context` | `search::tests::a_cursor_round_trips_through_its_opaque_token` |
 | A foreign token is refused as malformed | `harkness-context` | `search::tests::a_token_this_build_did_not_mint_is_refused_as_malformed` |
 | Secret, ignored and binary files can never match | `harkness-context` | `search::tests::a_secret_an_ignored_and_a_binary_file_can_never_match` |
 | A symlink out of the workspace is never searched | `harkness-context` | `search::tests::a_symlink_pointing_outside_the_workspace_is_never_searched` |
 | A path filter is refused outside the workspace | `harkness-context` | `search::tests::a_prefix_leaving_the_workspace_is_refused_by_name` |
 | A path filter never reaches a sibling prefix | `harkness-context` | `search::tests::a_path_filter_never_reaches_a_sibling_it_is_a_prefix_of` |
+| A prefix is understood rather than accepted | `harkness-context` | `search::tests::a_prefix_is_understood_rather_than_merely_accepted` |
+| A trailing separator still narrows to its subtree | `harkness-context` | `search::tests::a_prefix_with_a_trailing_separator_still_narrows_to_its_subtree` |
 | A class filter admits only what it names | `harkness-context` | `search::tests::a_class_filter_admits_only_the_classes_it_names` |
 | Regex needs the capability | `harkness-context` | `search::tests::a_regex_query_is_refused_without_the_capability_and_runs_with_it` |
 | An exact pattern is literal | `harkness-context` | `search::tests::an_exact_pattern_matches_its_metacharacters_literally` |
@@ -335,6 +370,8 @@ ADR-0005 records the alternative that was refused, and the trade it accepts.
 | No caller-supplied bound exceeds its cap | `harkness-context` | `search::tests::no_caller_supplied_bound_can_exceed_its_published_cap` |
 | A long line is clamped and reported | `harkness-context` | `search::tests::a_long_line_is_clamped_and_the_omission_says_which_position` |
 | A clamped context line reports itself | `harkness-context` | `search::tests::a_clamped_context_line_reports_itself_even_when_the_match_line_fits` |
+| A range and its digest describe the same bytes | `harkness-context` | `search::tests::a_range_and_its_digest_describe_the_same_bytes` |
+| Binary content abandons the whole file | `harkness-context` | `search::tests::binary_content_abandons_the_whole_file_and_says_so` |
 | Non-UTF-8 content is Base64 and exact | `harkness-context` | `search::tests::non_utf8_match_content_is_base64_and_reconstructs_the_exact_bytes` |
 | A non-UTF-8 path carries its exact bytes | `harkness-context` | `search::tests::a_filename_match_on_a_path_that_is_not_utf8_carries_its_exact_bytes` |
 | Bounded text never cuts a character in half | `harkness-context` | `search::tests::bounded_text_round_trips_and_never_cuts_a_character_in_half` |
@@ -350,7 +387,7 @@ ADR-0005 records the alternative that was refused, and the trade it accepts.
 | Cancellation yields no partial page | `harkness-context` | `search::tests::a_cancelled_search_yields_no_partial_page` |
 | `SearchError::KINDS` is exact | `harkness-context` | `search::tests::every_search_variant_maps_to_a_listed_kind_in_declaration_order` |
 | `SearchOmission::KINDS` is exact | `harkness-context` | `search::tests::every_omission_variant_maps_to_a_listed_kind_in_declaration_order` |
-| A cursor is bound to what decides its matches | `harkness-context` | `search::tests::a_query_identity_covers_what_decides_its_matches_and_not_its_page_size` |
+| A cursor is bound to what decides its matches | `harkness-context` | `search::tests::a_query_identity_covers_what_decides_its_matches_and_not_how_much_they_carry` |
 | A search refusal keeps its own discriminant | `harkness-context` | `error::tests::a_carried_search_refusal_keeps_its_own_kind_but_not_its_own_cancellation` |
 | An unindexed worktree refuses rather than answers | `harkness-context` | `searching_an_unindexed_worktree_refuses_rather_than_answering_empty` |
 | The whole surface works from outside the crate | `harkness-context` | `search_answers_paged_attributed_matches_from_outside_the_crate` |

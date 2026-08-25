@@ -24,6 +24,7 @@ use super::{
 use crate::classify::FileClass;
 use crate::engine::{ContextEngine, ContextEngineConfig};
 use crate::error::ContextEngineError;
+use crate::index::WorktreeKey;
 use crate::path::RepoPath;
 use crate::provenance::RetrievalSource;
 
@@ -133,6 +134,7 @@ fn search_error(error: ContextEngineError) -> SearchError {
 fn a_cursor_round_trips_through_its_opaque_token() {
     let cursor = SearchCursor::new(
         7,
+        &WorktreeKey::for_root(Path::new("/w/checkout")),
         crate::digest::Sha256Hex::of(b"query"),
         // Deliberately not UTF-8: a path is a byte string, and a token that
         // spelled it through a lossy conversion would resume at a different
@@ -147,6 +149,41 @@ fn a_cursor_round_trips_through_its_opaque_token() {
     assert_eq!(parsed, cursor);
     assert_eq!(parsed.index_generation(), 7);
     assert_eq!(parsed.token(), token, "encoding is stable");
+}
+
+/// One repository's cache is shared by every linked worktree of it: the
+/// generation is a single row and only the `files` rows are keyed by checkout.
+/// A sibling's token therefore matches on generation *and* on query identity,
+/// and still names a position in a different set of rows — so continuing from
+/// it would silently skip everything the second checkout holds before that path.
+#[test]
+fn a_cursor_from_a_sibling_worktree_is_refused() {
+    let identity = crate::digest::Sha256Hex::of(b"query");
+    let here = WorktreeKey::for_root(Path::new("/w/one"));
+    let sibling = WorktreeKey::for_root(Path::new("/w/two"));
+    let cursor = SearchCursor::new(
+        7,
+        &sibling,
+        identity.clone(),
+        RepoPath::from_path(Path::new("src/z.rs")),
+        900,
+    );
+
+    let refused = cursor.admits(7, &here, &identity).unwrap_err();
+
+    assert_eq!(refused.kind(), "stale_search_cursor");
+    assert!(
+        matches!(
+            refused,
+            SearchError::StaleCursor {
+                refusal: CursorRefusal::DifferentWorktree
+            }
+        ),
+        "{refused}"
+    );
+    cursor
+        .admits(7, &sibling, &identity)
+        .expect("its own worktree");
 }
 
 #[test]
@@ -276,16 +313,65 @@ fn overlapping_prefixes_never_report_one_file_twice() {
     }
 }
 
+/// A prefix is built from its *validated components*, not from the bytes a
+/// caller typed. `Path` normalizes nothing, so a stored `src/` would range over
+/// `src//`..`src/0` and match not one file in the subtree it names — and `.` is
+/// a spelling of the worktree root rather than an escape from it.
 #[test]
-fn an_empty_prefix_narrows_nothing_and_is_not_stored() {
-    let filters = SearchFilters::new().under("").unwrap().under(".").err();
-    assert!(filters.is_some(), "'.' is not a repository-relative path");
-    assert!(
-        SearchFilters::new()
-            .under("")
+fn a_prefix_is_understood_rather_than_merely_accepted() {
+    for spelling in ["", ".", "./"] {
+        assert!(
+            SearchFilters::new()
+                .under(spelling)
+                .unwrap()
+                .prefixes()
+                .is_empty(),
+            "{spelling:?} names the worktree root and narrows nothing"
+        );
+    }
+
+    for spelling in ["src", "src/", "src//", "./src", "src/./"] {
+        let prefixes: Vec<String> = SearchFilters::new()
+            .under(spelling)
             .unwrap()
             .prefixes()
-            .is_empty()
+            .iter()
+            .map(RepoPath::display)
+            .collect();
+        assert_eq!(prefixes, vec!["src"], "{spelling:?}");
+    }
+
+    assert_eq!(
+        SearchFilters::new()
+            .under("a//b")
+            .unwrap()
+            .prefixes()
+            .iter()
+            .map(RepoPath::display)
+            .collect::<Vec<_>>(),
+        vec!["a/b"]
+    );
+}
+
+/// The same, through the engine: a filter spelled with a trailing separator
+/// must narrow to the subtree it plainly names rather than to nothing.
+#[test]
+fn a_prefix_with_a_trailing_separator_still_narrows_to_its_subtree() {
+    let workspace = Workspace::new();
+    workspace.write("src/inside.rs", "needle\n");
+    workspace.write("elsewhere/outside.rs", "needle\n");
+    let engine = workspace.indexed();
+
+    let response = engine
+        .search(
+            &SearchQuery::exact("needle").with_filters(SearchFilters::new().under("src/").unwrap()),
+            &Cancellation::default(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        positions(&response),
+        vec![("src/inside.rs".to_owned(), Some(1))]
     );
 }
 
@@ -398,7 +484,12 @@ fn every_search_variant_maps_to_a_listed_kind_in_declaration_order() {
     let spellings: Vec<&str> = CursorRefusal::ALL.iter().map(|one| one.as_str()).collect();
     assert_eq!(
         spellings,
-        vec!["malformed", "generation_changed", "different_query"]
+        vec![
+            "malformed",
+            "generation_changed",
+            "different_query",
+            "different_worktree"
+        ]
     );
 }
 
@@ -467,18 +558,27 @@ fn every_omission_variant_maps_to_a_listed_kind_in_declaration_order() {
 }
 
 /// A cursor is bound to everything that decides *which* matches exist and in
-/// what order, and to nothing that decides how many arrive at a time — a caller
-/// asking for a smaller second page is paging, not asking a new question.
+/// what order, and to nothing that decides how much arrives at a time.
+///
+/// The four bounds are all outside it. Page size obviously — a caller asking
+/// for a smaller second page is paging. So are the two *text* bounds, which is
+/// less obvious and is the same rule: a surface that lets somebody expand the
+/// context around a result and keep paging is asking one question, not two.
 #[test]
-fn a_query_identity_covers_what_decides_its_matches_and_not_its_page_size() {
+fn a_query_identity_covers_what_decides_its_matches_and_not_how_much_they_carry() {
     let base = SearchQuery::exact("needle");
-    assert_eq!(
-        base.identity(),
-        base.clone()
-            .with_limits(SearchLimits::new().with_max_results(3).with_max_bytes(9))
-            .identity(),
-        "page size does not change which matches exist"
-    );
+    for bounded in [
+        SearchLimits::new().with_max_results(3),
+        SearchLimits::new().with_max_bytes(9),
+        SearchLimits::new().with_context_lines(1),
+        SearchLimits::new().with_max_line_bytes(16),
+    ] {
+        assert_eq!(
+            base.identity(),
+            base.clone().with_limits(bounded).identity(),
+            "{bounded:?} does not change which matches exist"
+        );
+    }
 
     let variants = [
         SearchQuery::exact("other"),
@@ -487,8 +587,6 @@ fn a_query_identity_covers_what_decides_its_matches_and_not_its_page_size() {
         SearchQuery::exact("needle").permitting_regex(),
         SearchQuery::exact("needle").with_filters(SearchFilters::new().under("src").unwrap()),
         SearchQuery::exact("needle").with_filters(SearchFilters::new().in_class(FileClass::Source)),
-        SearchQuery::exact("needle").with_limits(SearchLimits::new().with_context_lines(1)),
-        SearchQuery::exact("needle").with_limits(SearchLimits::new().with_max_line_bytes(16)),
     ];
     for variant in variants {
         assert_ne!(
@@ -497,6 +595,37 @@ fn a_query_identity_covers_what_decides_its_matches_and_not_its_page_size() {
             "{variant:?} shares an identity with the base query"
         );
     }
+}
+
+/// The consequence, through the engine: a surface may widen the context around
+/// a result and keep following the same cursor.
+#[test]
+fn context_may_be_widened_between_pages_without_restarting_the_query() {
+    let workspace = Workspace::new();
+    workspace.write("src/a.rs", "one\nneedle\nthree\nneedle\nfive\n");
+    let engine = workspace.indexed();
+    let cancellation = Cancellation::default();
+
+    let first = engine
+        .search(
+            &SearchQuery::exact("needle").with_limits(SearchLimits::new().with_max_results(1)),
+            &cancellation,
+        )
+        .unwrap();
+    assert!(first.matches[0].before.is_empty());
+    let cursor = first.next_cursor.clone().expect("a continuation");
+
+    let widened = engine
+        .search(
+            &SearchQuery::exact("needle")
+                .with_limits(SearchLimits::new().with_context_lines(1))
+                .continuing(cursor),
+            &cancellation,
+        )
+        .unwrap();
+
+    assert_eq!(positions(&widened), vec![("src/a.rs".to_owned(), Some(4))]);
+    assert_eq!(widened.matches[0].before[0].as_str(), "three");
 }
 
 // -- determinism and ordering ------------------------------------------------
@@ -1265,6 +1394,83 @@ fn a_long_line_is_clamped_and_the_omission_says_which_position() {
             byte_offset: 0,
             limit: 16,
         }),
+        "{:?}",
+        response.omissions
+    );
+    // The range names exactly the bytes the digest covers — the *shown* prefix
+    // and not the whole line — because reading the range back out of the file
+    // and hashing it is the one check a range exists for.
+    let range = found.provenance.range.expect("a byte range");
+    assert_eq!(range.start, 0);
+    assert_eq!(range.end, 16, "the emitted prefix, not the 207-byte line");
+    assert_eq!(
+        found.provenance.content_sha256,
+        crate::digest::Sha256Hex::of(found.line.bytes())
+    );
+}
+
+/// The general form of that check, over a match that was *not* clamped: read
+/// the range out of the file, hash it, and it is the digest provenance carries.
+#[test]
+fn a_range_and_its_digest_describe_the_same_bytes() {
+    let workspace = Workspace::new();
+    let body = "one\nlet needle = 1;\nthree\n";
+    workspace.write("src/a.rs", body);
+    let engine = workspace.indexed();
+
+    let response = engine
+        .search(&SearchQuery::exact("needle"), &Cancellation::default())
+        .unwrap();
+
+    let found = &response.matches[0];
+    let range = found.provenance.range.expect("a byte range");
+    let start = usize::try_from(range.start).unwrap();
+    let end = usize::try_from(range.end).unwrap();
+    assert_eq!(&body.as_bytes()[start..end], b"let needle = 1;");
+    assert_eq!(
+        found.provenance.content_sha256,
+        crate::digest::Sha256Hex::of(&body.as_bytes()[start..end])
+    );
+    assert!(!found.provenance.truncated);
+}
+
+/// Binary detection abandons the *whole* file, not the tail of it — even where
+/// the NUL sits after content that would have matched.
+///
+/// That is the safe direction, and it is why the fact is an omission rather
+/// than a silent filter: the alternative is a caller reading "no match" from a
+/// file nobody looked inside. Pinned here because it is the searcher's
+/// behaviour rather than this module's, and a version of it that reported the
+/// prefix instead would change an answer without changing a line of this crate.
+#[test]
+fn binary_content_abandons_the_whole_file_and_says_so() {
+    let workspace = Workspace::new();
+    // Indexed as text, then rewritten with a NUL *after* a matching line.
+    workspace.write_stamped("src/a.rs", "needle\nquiet\n", 1_000_000);
+    workspace.write_stamped("src/b.rs", "needle\n", 1_000_000);
+    let engine = workspace.indexed();
+    let mut rewritten = b"needle\n".to_vec();
+    rewritten.extend_from_slice(&[0x00, 0xde, 0xad, b'\n']);
+    workspace.write_stamped("src/a.rs", rewritten, 2_000_000);
+
+    let response = engine
+        .search(
+            &SearchQuery::exact("needle").with_limits(SearchLimits::new().with_context_lines(5)),
+            &Cancellation::default(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        positions(&response),
+        vec![("src/b.rs".to_owned(), Some(1))],
+        "the match before the NUL is abandoned with the rest of the file"
+    );
+    assert!(
+        response.omissions.iter().any(|omission| matches!(
+            omission,
+            SearchOmission::BinaryContentDetected { path, byte_offset }
+                if path.display() == "src/a.rs" && *byte_offset == 7
+        )),
         "{:?}",
         response.omissions
     );

@@ -875,13 +875,27 @@ two overlapping streams emit one file's matches twice, at one position, which is
 the total order this whole section rests on.
 
 **A cursor is a position, not an offset, and it refuses rather than guesses.**
-It is opaque, versioned, and bound both to the `index_generation` it was minted
-against and to a digest of everything that decides which matches exist and in
-what order — the pattern, the filters, the capability flag, the context and
-per-line bounds, and not the page size, since a caller asking for a smaller
-second page is paging rather than asking a new question. All three ways a cursor
-can be wrong report `stale_search_cursor` and are told apart by the refusal it
-carries, because all three lead to the same repair.
+It is opaque, versioned, and bound to three things: the `index_generation` it was
+minted against, the **worktree** whose rows it names, and a digest of everything
+that decides which matches exist and in what order — the pattern, the filters and
+the capability flag, and **none of the four bounds**. Page size is out for the
+obvious reason, and the context and per-line bounds are out for the same one:
+they decide how much each match carries and not which matches there are, so a
+surface may widen the context around a result and keep paging. The worktree is in
+because one repository's cache is shared by every linked checkout of it — the
+generation is a single row and only the `files` rows are keyed by worktree — so a
+sibling's token matches on everything else and still names a position in a
+different set of rows. All four ways a cursor can be wrong report
+`stale_search_cursor` and are told apart by the refusal it carries, because all
+four lead to the same repair.
+
+**A prefix filter is understood, not merely accepted.** It is built from the
+path's *validated components* and never from the bytes a caller typed: `Path`
+normalizes nothing, so a stored `src/` would range over `src//`..`src/0` and
+match not one file in the subtree it names. `.` is a spelling of the worktree
+root rather than an escape from it, and the components are rejoined with `/`
+whatever the platform's separator is, because that is the byte the index stores
+paths under.
 
 **Truncation is part of the success payload.** Every bound that fires puts a
 `SearchOmission` in the answer — never in a log, never in a warning — because a
@@ -907,8 +921,11 @@ indexed.** Search re-reads the working tree, so a file that moved since it was
 indexed is searched as it is now, stamped with the digest observed, and reported
 with `file_changed_since_index`. The two digests on a match answer different
 questions and must not be collapsed: the match's own covers the *file version*
-that was read, and its provenance's covers the *excerpt* as shown after
-clamping. A filename match carries neither a file digest nor a line number,
+that was read, and its provenance's covers the *matched line as emitted* —
+exactly the region its `range` names, so reading the range out of the file and
+hashing it is a check that holds, clamped lines included. Context lines are
+outside both, because a digest spanning them would describe a region the range
+does not. A filename match carries neither a file digest nor a line number,
 because nothing was read.
 
 **A regular expression is a capability and an exact pattern is not.** `Exact`

@@ -43,6 +43,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as URL_BASE64;
 use serde::{Deserialize, Serialize};
 
 use crate::digest::Sha256Hex;
+use crate::index::WorktreeKey;
 use crate::path::RepoPath;
 
 use super::error::{CursorRefusal, SearchError};
@@ -57,6 +58,7 @@ const CURSOR_VERSION: u8 = 1;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SearchCursor {
     generation: u64,
+    worktree: String,
     query: Sha256Hex,
     path: RepoPath,
     byte_offset: u64,
@@ -72,6 +74,7 @@ pub struct SearchCursor {
 struct SearchCursorWire {
     v: u8,
     generation: u64,
+    worktree: String,
     query: String,
     path: String,
     byte_offset: u64,
@@ -79,9 +82,16 @@ struct SearchCursorWire {
 
 impl SearchCursor {
     /// Records the position one page ended at.
-    pub(crate) fn new(generation: u64, query: Sha256Hex, path: RepoPath, byte_offset: u64) -> Self {
+    pub(crate) fn new(
+        generation: u64,
+        worktree: &WorktreeKey,
+        query: Sha256Hex,
+        path: RepoPath,
+        byte_offset: u64,
+    ) -> Self {
         Self {
             generation,
+            worktree: worktree.as_str().to_owned(),
             query,
             path,
             byte_offset,
@@ -94,6 +104,7 @@ impl SearchCursor {
         let wire = SearchCursorWire {
             v: CURSOR_VERSION,
             generation: self.generation,
+            worktree: self.worktree.clone(),
             query: self.query.as_str().to_owned(),
             path: URL_BASE64.encode(self.path.as_bytes()),
             byte_offset: self.byte_offset,
@@ -127,6 +138,7 @@ impl SearchCursor {
         let path = URL_BASE64.decode(&wire.path).map_err(|_| malformed())?;
         Ok(Self {
             generation: wire.generation,
+            worktree: wire.worktree,
             query,
             path: RepoPath::from_bytes(path),
             byte_offset: wire.byte_offset,
@@ -139,23 +151,36 @@ impl SearchCursor {
         self.generation
     }
 
-    /// Refuses a cursor that cannot continue `query` against `generation`.
+    /// Refuses a cursor that cannot continue `query` over `worktree` at
+    /// `generation`.
+    ///
+    /// The worktree is checked as well as the generation because one
+    /// repository's cache is shared by every linked checkout of it: the
+    /// generation is a single row and only the `files` rows are keyed by
+    /// checkout, so a sibling worktree's token matches on everything else and
+    /// still names a position in a different set of rows.
     ///
     /// # Errors
     ///
     /// [`SearchError::StaleCursor`] carrying
-    /// [`CursorRefusal::GenerationChanged`] or
+    /// [`CursorRefusal::GenerationChanged`],
+    /// [`CursorRefusal::DifferentWorktree`] or
     /// [`CursorRefusal::DifferentQuery`].
-    pub(crate) fn admits(&self, generation: u64, query: &Sha256Hex) -> Result<(), SearchError> {
+    pub(crate) fn admits(
+        &self,
+        generation: u64,
+        worktree: &WorktreeKey,
+        query: &Sha256Hex,
+    ) -> Result<(), SearchError> {
+        let refuse = |refusal| Err(SearchError::StaleCursor { refusal });
         if self.generation != generation {
-            return Err(SearchError::StaleCursor {
-                refusal: CursorRefusal::GenerationChanged,
-            });
+            return refuse(CursorRefusal::GenerationChanged);
+        }
+        if self.worktree != worktree.as_str() {
+            return refuse(CursorRefusal::DifferentWorktree);
         }
         if &self.query != query {
-            return Err(SearchError::StaleCursor {
-                refusal: CursorRefusal::DifferentQuery,
-            });
+            return refuse(CursorRefusal::DifferentQuery);
         }
         Ok(())
     }
