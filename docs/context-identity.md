@@ -78,8 +78,12 @@ the recorded file identity before materializing text.
 Files at or below 2 KiB use one whole-file anchor. Source outlines use
 non-overlapping parser-projected nodes and line-window chunks for uncovered
 gaps. Without an outline, source uses approximately 4 KiB line windows with an
-eight-line overlap. Markdown uses ATX heading sections. TOML, YAML, and JSON use
-top-level tables or keys where conservative recognition succeeds.
+overlap of up to eight lines. The overlap never takes more than a quarter of the
+window it trails, so a file of long lines advances by whole windows rather than
+one line at a time; a flat line count would repeat such a file many times over
+and exhaust the chunk budget long before its end. Markdown uses ATX heading
+sections. TOML, YAML, and JSON use top-level tables or keys where conservative
+recognition succeeds.
 
 No represented chunk exceeds 16 KiB. A long line falls back to character-safe
 byte splitting, and a long structural node becomes ordinal continuations under

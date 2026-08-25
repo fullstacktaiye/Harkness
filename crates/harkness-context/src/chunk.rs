@@ -12,6 +12,8 @@ use harkness_git::Cancellation;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::classify::extension_is;
+use crate::text::floor_char_boundary;
 use crate::{
     ByteRange, ChunkId, FileClass, FileVersionId, InventoryEntry, RepoPath, Sensitivity, Sha256Hex,
     SnapshotId, SymbolId,
@@ -106,7 +108,12 @@ impl ContentEncoding {
 }
 
 /// One exact, eligible working-tree file version supplied to a chunker.
-#[derive(Clone, Debug)]
+///
+/// `Debug` is hand-written and names sizes rather than content. A derived one
+/// renders the whole file — repository text this type also carries a
+/// [`Sensitivity`] decision about — so a single `{:?}` in a log line or a panic
+/// message would dump a megabyte of somebody's source into the diagnostic log.
+#[derive(Clone)]
 pub struct FileVersion {
     path: RepoPath,
     id: FileVersionId,
@@ -119,6 +126,24 @@ pub struct FileVersion {
     text: Arc<str>,
     encoding: ContentEncoding,
     utf16_boundaries: Option<EncodingBoundaries>,
+}
+
+impl fmt::Debug for FileVersion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FileVersion")
+            .field("path", &self.path.display())
+            .field("id", &self.id)
+            .field("content_sha256", &self.content_sha256)
+            .field("class", &self.class)
+            .field("language", &self.language)
+            .field("snapshot", &self.snapshot)
+            .field("sensitivity", &self.sensitivity)
+            .field("byte_len", &self.bytes.len())
+            .field("text_len", &self.text.len())
+            .field("encoding", &self.encoding)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FileVersion {
@@ -265,10 +290,11 @@ impl FileVersion {
         if original == self.bytes.len() {
             return Some(self.text.len());
         }
-        self.utf16_boundaries
-            .as_deref()?
-            .iter()
-            .find_map(|(logical, source)| (*source == original).then_some(*logical))
+        // The table is ordered by both of its components, so this is the mirror
+        // of `boundary_lookup` rather than a scan. `validate_outline` asks twice
+        // per node, and a linear walk made an outline over a transcoded file
+        // quadratic — uninterruptibly so, because it polls no cancellation.
+        logical_lookup(self.utf16_boundaries.as_deref()?, original)
     }
 }
 
@@ -501,7 +527,11 @@ impl Chunker for WholeFileChunker {
         cancellation: &Cancellation,
     ) -> Result<ChunkSet, ChunkError> {
         let mut builder = ChunkSetBuilder::new(file, ChunkStrategy::WholeFile, cancellation);
-        builder.push_span(0, file.text.len(), Anchor::WholeFile, None)?;
+        if file.text.is_empty() {
+            builder.push_piece(0, 0, Anchor::WholeFile, 0, None)?;
+        } else {
+            builder.push_span(0, file.text.len(), Anchor::WholeFile, None)?;
+        }
         builder.finish()
     }
 }
@@ -739,8 +769,14 @@ impl<'a> ChunkSetBuilder<'a> {
                 reason: format!("range {start}..{end} is outside the decoded content"),
             });
         }
+        // An empty span represents nothing, so it produces nothing. A parser
+        // projecting a zero-width node would otherwise mint a record whose hash
+        // is the hash of the empty string, which is neither content-addressed
+        // nor a real chunk, and which spends a slot in the per-file budget.
+        // The one honest empty record — a zero-byte file — is pushed
+        // deliberately by its chunker rather than reached through here.
         if start == end {
-            return self.push_piece(start, end, anchor, 0, symbol);
+            return Ok(());
         }
         let mut cursor = start;
         let mut ordinal = 0_u32;
@@ -829,39 +865,52 @@ fn line_window_set(
     strategy: ChunkStrategy,
     cancellation: &Cancellation,
 ) -> Result<ChunkSet, ChunkError> {
-    let starts = line_starts(file.text());
+    // The builder already indexes the line starts; walking the text a second
+    // time for the same answer costs a full pass and a second allocation on the
+    // path every source file without an outline takes.
     let mut builder = ChunkSetBuilder::new(file, strategy, cancellation);
-    if file.text.is_empty() {
-        builder.push_span(0, 0, Anchor::WholeFile, None)?;
+    let text_len = file.text.len();
+    if text_len == 0 {
+        builder.push_piece(0, 0, Anchor::WholeFile, 0, None)?;
         return builder.finish();
     }
+    let lines = builder.line_starts.len();
     let mut line = 0_usize;
     let mut index = 0_u32;
-    while line < starts.len() {
+    while line < lines {
         if cancellation.is_cancelled() {
             return Err(ChunkError::Cancelled);
         }
-        let start = starts[line];
-        if start == file.text.len() {
-            break;
-        }
+        let start = builder.line_starts[line];
         let mut end_line = line + 1;
-        while end_line < starts.len()
-            && starts[end_line].saturating_sub(start) <= TARGET_CHUNK_BYTES
+        while end_line < lines
+            && builder.line_starts[end_line].saturating_sub(start) <= TARGET_CHUNK_BYTES
         {
             end_line += 1;
         }
-        let end = starts
+        let end = builder
+            .line_starts
             .get(end_line)
             .copied()
-            .unwrap_or(file.text.len())
-            .min(file.text.len());
+            .unwrap_or(text_len)
+            .min(text_len);
         builder.push_span(start, end, Anchor::LineWindow { index }, None)?;
-        if end == file.text.len() {
+        if end == text_len {
             break;
         }
-        let next = end_line.saturating_sub(CHUNK_OVERLAP_LINES).max(line + 1);
-        line = next;
+        // The overlap gives the next window a little leading context, and it
+        // may never cost more than it adds. On a file of long lines a whole
+        // window is fewer than `CHUNK_OVERLAP_LINES` lines, so subtracting a
+        // flat eight advanced one line at a time: every line was re-emitted in
+        // window after window, and a one-mebibyte file — the largest an
+        // eligible entry can be — exhausted the 512-chunk budget about a third
+        // of the way through, reporting the rest as truncated. Capping the
+        // overlap at a quarter of the window keeps eight lines wherever a
+        // window is large enough to spare them and bounds the duplication at
+        // four thirds everywhere else.
+        let span = end_line - line;
+        let overlap = CHUNK_OVERLAP_LINES.min(span / 4);
+        line = end_line.saturating_sub(overlap).max(line + 1);
         index = index.saturating_add(1);
     }
     builder.finish()
@@ -975,38 +1024,56 @@ fn preferred_boundary(text: &str, start: usize, target: usize, limit: usize, end
     if limit == end {
         return end;
     }
-    let mut candidate = target;
-    while candidate > start && !text.is_char_boundary(candidate) {
-        candidate -= 1;
-    }
+    // `text::floor_char_boundary` is this crate's one walk backwards off a
+    // multi-byte character; both bounds owe it the same walk.
+    let rest = &text[start..];
+    let candidate = start + floor_char_boundary(rest, target - start);
     if let Some(newline) = text[start..candidate].rfind('\n') {
         return start + newline + 1;
     }
-    candidate = limit;
-    while candidate > start && !text.is_char_boundary(candidate) {
-        candidate -= 1;
-    }
-    candidate.max(start + text[start..].chars().next().map_or(1, char::len_utf8))
+    let candidate = start + floor_char_boundary(rest, limit - start);
+    candidate.max(start + rest.chars().next().map_or(1, char::len_utf8))
 }
 
+/// Heading offsets, levels and titles, skipping fenced code.
+///
+/// A fence is tracked because `#` opens a comment in most of the languages a
+/// document shows. Without it a `# install the thing` line inside a ` ```sh `
+/// block is read as a level-one heading: it splits the fence in half and
+/// freezes a shell comment into a `ChunkId` as though it named a section.
 fn markdown_headings(text: &str) -> Vec<(usize, usize, String)> {
     let mut headings = Vec::new();
     let mut offset = 0;
+    let mut fence: Option<(char, usize)> = None;
     for line in text.split_inclusive('\n') {
-        let body = line
-            .strip_suffix('\n')
-            .unwrap_or(line)
-            .strip_suffix('\r')
-            .unwrap_or(line.strip_suffix('\n').unwrap_or(line));
-        let hashes = body.bytes().take_while(|byte| *byte == b'#').count();
-        if (1..=6).contains(&hashes)
-            && body
-                .as_bytes()
-                .get(hashes)
-                .is_some_and(u8::is_ascii_whitespace)
-        {
-            let title = body[hashes..].trim().trim_end_matches('#').trim();
-            headings.push((offset, hashes, title.to_owned()));
+        let body = line.trim_end_matches('\n').trim_end_matches('\r');
+        let trimmed = body.trim_start();
+        let marker = trimmed.chars().next().filter(|c| *c == '`' || *c == '~');
+        if let Some(marker) = marker {
+            let run = trimmed.chars().take_while(|c| *c == marker).count();
+            match fence {
+                // A closing fence is at least as long as the one it closes,
+                // uses the same character, and carries no info string.
+                Some((open, length))
+                    if open == marker && run >= length && trimmed[run..].trim().is_empty() =>
+                {
+                    fence = None;
+                }
+                None if run >= 3 => fence = Some((marker, run)),
+                _ => {}
+            }
+        }
+        if fence.is_none() {
+            let hashes = body.bytes().take_while(|byte| *byte == b'#').count();
+            if (1..=6).contains(&hashes)
+                && body
+                    .as_bytes()
+                    .get(hashes)
+                    .is_some_and(u8::is_ascii_whitespace)
+            {
+                let title = body[hashes..].trim().trim_end_matches('#').trim();
+                headings.push((offset, hashes, title.to_owned()));
+            }
         }
         offset += line.len();
     }
@@ -1015,8 +1082,11 @@ fn markdown_headings(text: &str) -> Vec<(usize, usize, String)> {
 
 fn config_sections(file: &FileVersion) -> Result<Vec<(usize, Vec<String>)>, ChunkError> {
     let name = file.path().as_bytes();
-    let json = name.ends_with(b".json") || name.ends_with(b".jsonc");
-    if json && serde_json::from_str::<serde_json::Value>(file.text()).is_err() {
+    let json = extension_is(name, &["json", "jsonc"]);
+    // `IgnoredAny` answers the only question asked — does this parse — without
+    // building the document. A `Value` over a one-mebibyte lockfile allocates a
+    // whole tree that is dropped on the next line.
+    if json && serde_json::from_str::<serde::de::IgnoredAny>(file.text()).is_err() {
         return Ok(Vec::new());
     }
     let mut sections = Vec::new();
@@ -1025,8 +1095,12 @@ fn config_sections(file: &FileVersion) -> Result<Vec<(usize, Vec<String>)>, Chun
     let mut table_path = Vec::<String>::new();
     for line in file.text().split_inclusive('\n') {
         let body = line.trim();
-        let anchor = if (body.starts_with("[[") && body.ends_with("]]"))
-            || (body.starts_with('[') && body.ends_with(']'))
+        // A bracketed line is a table header in TOML and an array in JSON, so
+        // the table branch is gated: `[]` on its own line in a JSON document
+        // would otherwise become the section every following key hangs off.
+        let anchor = if !json
+            && ((body.starts_with("[[") && body.ends_with("]]"))
+                || (body.starts_with('[') && body.ends_with(']')))
         {
             table_path = body
                 .trim_matches(['[', ']'])
@@ -1067,7 +1141,6 @@ fn config_sections(file: &FileVersion) -> Result<Vec<(usize, Vec<String>)>, Chun
         }
         offset += line.len();
     }
-    sections.dedup_by(|left, right| left.0 == right.0);
     Ok(sections)
 }
 
@@ -1119,6 +1192,13 @@ fn boundary_lookup(boundaries: &[(usize, usize)], logical: usize) -> Option<usiz
         .map(|index| boundaries[index].1)
 }
 
+fn logical_lookup(boundaries: &[(usize, usize)], original: usize) -> Option<usize> {
+    boundaries
+        .binary_search_by_key(&original, |(_, source)| *source)
+        .ok()
+        .map(|index| boundaries[index].0)
+}
+
 fn encode_path(key: &mut String, kind: &str, path: &[String]) {
     use fmt::Write as _;
     key.push_str(kind);
@@ -1152,8 +1232,11 @@ fn deduplicated_path(
 }
 
 fn is_markdown(path: &RepoPath) -> bool {
-    let bytes = path.as_bytes();
-    bytes.ends_with(b".md") || bytes.ends_with(b".markdown")
+    // `classify` already owns the extension rules, including the ASCII-blind
+    // comparison and the leading-dot-is-not-an-extension case. A second,
+    // case-sensitive spelling here made `README.MD` a file the classifier calls
+    // documentation and the chunker splits as source.
+    extension_is(path.as_bytes(), &["md", "markdown"])
 }
 
 fn to_u64(value: usize) -> Result<u64, ChunkError> {
@@ -1167,7 +1250,7 @@ mod tests {
     use harkness_git::Cancellation;
 
     use super::*;
-    use crate::InventoryEntry;
+    use crate::{InventoryEntry, OVERSIZED_FILE_THRESHOLD};
 
     fn entry(path: &str, bytes: &[u8], class: FileClass) -> InventoryEntry {
         InventoryEntry {
@@ -1700,6 +1783,149 @@ mod tests {
                     .all(|pair| pair[0].byte_range.start <= pair[1].byte_range.start)
             );
         }
+    }
+
+    #[test]
+    fn long_lines_advance_instead_of_repeating_the_file() {
+        // The largest an eligible entry can be, made of lines long enough that
+        // a whole window is fewer lines than the overlap. A flat eight-line
+        // overlap advanced one line per window here: the file came back a third
+        // covered and two thirds "truncated", every covered line repeated in
+        // seven windows.
+        let mut text = String::new();
+        while text.len() < OVERSIZED_FILE_THRESHOLD as usize {
+            text.push_str(&"x".repeat(599));
+            text.push('\n');
+        }
+        let version = file("src/long.rs", &text, FileClass::Source);
+        let set = SourceChunker
+            .chunk(&version, None, &Cancellation::default())
+            .unwrap();
+        assert_eq!(set.truncation, None);
+        let covered = set
+            .chunks
+            .iter()
+            .map(|chunk| chunk.byte_range.end)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(covered, text.len() as u64, "every byte is reachable");
+        let emitted: u64 = set.chunks.iter().map(|chunk| chunk.byte_range.len()).sum();
+        assert!(
+            emitted < (text.len() as u64) * 3 / 2,
+            "overlap repeated {emitted} bytes of a {} byte file",
+            text.len()
+        );
+    }
+
+    #[test]
+    fn a_hash_inside_a_fenced_block_is_a_comment_and_not_a_heading() {
+        let text = format!(
+            "# Title\n\n```sh\n# install the thing\ncargo build\n```\n\n{}\n## Real\ntail\n",
+            "p".repeat(MIN_WHOLE_FILE_BYTES)
+        );
+        let set = chunk_file(
+            &file("README.md", &text, FileClass::Documentation),
+            None,
+            &Cancellation::default(),
+        )
+        .unwrap();
+        let anchors = set
+            .chunks
+            .iter()
+            .map(|chunk| chunk.anchor.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            !anchors.contains(&Anchor::Heading {
+                path: vec!["install the thing".into()]
+            }),
+            "a shell comment inside a fence became a section: {anchors:?}"
+        );
+        assert!(anchors.contains(&Anchor::Heading {
+            path: vec!["Title".into(), "Real".into()]
+        }));
+    }
+
+    #[test]
+    fn a_markdown_extension_is_recognized_case_blind() {
+        let text = format!("# A\n{}\n## B\ntwo\n", "p".repeat(MIN_WHOLE_FILE_BYTES));
+        let set = chunk_file(
+            &file("NOTES.MD", &text, FileClass::Documentation),
+            None,
+            &Cancellation::default(),
+        )
+        .unwrap();
+        assert_eq!(set.strategy, ChunkStrategy::Markdown);
+    }
+
+    #[test]
+    fn an_empty_structural_node_produces_no_record() {
+        let text = "a".repeat(MIN_WHOLE_FILE_BYTES + 1);
+        let version = file("src/x.rs", &text, FileClass::Source);
+        let outline = StructuralOutline {
+            nodes: vec![OutlineNode {
+                anchor_path: vec!["fn nothing".into()],
+                byte_range: 10..10,
+                kind: "function".into(),
+                symbol: None,
+            }],
+            language: None,
+        };
+        let set = SourceChunker
+            .chunk(&version, Some(&outline), &Cancellation::default())
+            .unwrap();
+        assert!(
+            set.chunks.iter().all(|chunk| !chunk.byte_range.is_empty()),
+            "a zero-width node minted an empty record: {:?}",
+            set.chunks
+                .iter()
+                .map(|c| c.anchor.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            set.chunks
+                .iter()
+                .map(|chunk| chunk.byte_range.len())
+                .sum::<u64>(),
+            text.len() as u64
+        );
+    }
+
+    #[test]
+    fn an_outline_over_transcoded_content_maps_every_node() {
+        let source = "fn a() {}\nfn b() {}\n";
+        let mut bytes = vec![0xff, 0xfe];
+        for unit in source.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let bytes: Arc<[u8]> = bytes.into();
+        let version = FileVersion::new(
+            &entry("notes.txt", &bytes, FileClass::Documentation),
+            SnapshotId::new(),
+            bytes,
+            &Cancellation::default(),
+        )
+        .unwrap();
+        // Two UTF-16 code units per character, past the two-byte mark.
+        let half = 2 + (source.len() as u64 / 2) * 2;
+        let outline = StructuralOutline {
+            nodes: vec![OutlineNode {
+                anchor_path: vec!["fn a".into()],
+                byte_range: 2..half,
+                kind: "function".into(),
+                symbol: None,
+            }],
+            language: None,
+        };
+        let set = SourceChunker
+            .chunk(&version, Some(&outline), &Cancellation::default())
+            .unwrap();
+        assert_eq!(
+            set.chunks[0].anchor,
+            Anchor::Symbol {
+                path: vec!["fn a".into()]
+            }
+        );
+        assert_eq!(set.chunks[0].chunk_sha256, Sha256Hex::of("fn a() {}\n"));
     }
 
     #[test]

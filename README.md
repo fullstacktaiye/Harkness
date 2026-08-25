@@ -705,6 +705,7 @@ The same run is visible in the window while it happens, and afterwards: see
 | [The verification suite](docs/verification-suite.md) | Every release-blocking scenario, named by the test that proves it. |
 | [The v0.3 release gate](docs/release-readiness-v0.3.md) · [Changelog](CHANGELOG.md) | What the release was held to, the evidence for each criterion, and what shipped. |
 | [Context inventory](docs/context-inventory.md) · [Context engine](docs/architecture-context.md) | What a run can see of a workspace, and how the index cache works. |
+| [File and chunk identity](docs/context-identity.md) | How a file version and a chunk are named, what keeps a name stable, and where the fallback stops claiming structure. |
 | [External agents](docs/agents.md) · [ACP](docs/acp.md) | Registering, trusting, and health-checking external coding agents. |
 | [Filesystem and process safety](docs/filesystem-and-process-safety.md) | The boundary and child-process rules every tool inherits. |
 | [Architecture decisions](docs/adr/) | Why the boundaries are where they are. |

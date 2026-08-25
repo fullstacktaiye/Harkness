@@ -641,7 +641,11 @@ fn extension(name: &[u8]) -> Option<&[u8]> {
 }
 
 /// Whether a file name carries one of the given extensions, ASCII-case-blind.
-fn extension_is(name: &[u8], candidates: &[&str]) -> bool {
+///
+/// Visible to the crate because `chunk` asks the same question of the same
+/// names: a strategy chosen from a second, case-sensitive spelling would
+/// disagree with the class this module already assigned.
+pub(crate) fn extension_is(name: &[u8], candidates: &[&str]) -> bool {
     let Some(found) = extension(name) else {
         return false;
     };
