@@ -28,7 +28,8 @@
 //!
 //! # What this module does not do
 //!
-//! It persists nothing ([#114]), watches nothing ([#115]), hashes no content
+//! It persists nothing ([#114]), watches nothing ([#115] does that above it),
+//! hashes no content
 //! ([#113]), and emits no events: an inventory carries the counts and
 //! diagnostics an event needs, and the engine facade is what publishes them.
 //!
@@ -51,6 +52,7 @@ use thiserror::Error;
 use crate::classify::{BINARY_SNIFF_BYTES, CLASSIFY_VERSION, FileClass, FileSample};
 use crate::ids::SnapshotId;
 use crate::path::RepoPath;
+use crate::reconcile::{ReconcileScope, ScopeFilter};
 use crate::snapshot::WorkspaceSnapshot;
 use crate::text::floor_char_boundary;
 
@@ -526,6 +528,7 @@ impl InventoryPolicy {
 pub struct FileInventory {
     snapshot: SnapshotId,
     worktree_root: PathBuf,
+    scope: ReconcileScope,
     entries: Vec<InventoryEntry>,
     denied_count: u64,
     ignored_count: u64,
@@ -543,8 +546,11 @@ impl FileInventory {
     /// nothing, so a workspace that moved between the capture and the walk
     /// yields an inventory carrying an id whose snapshot no longer describes the
     /// tree. Establishing that is the caller's, through
-    /// [`WorkspaceSnapshot::verify`] before and after — the reconciliation that
-    /// makes it automatic is [#115]'s.
+    /// [`WorkspaceSnapshot::verify`] before and after.
+    ///
+    /// A [scoped](Self::scope) walk carries an id naming that *reading* rather
+    /// than a capture, because reconciling compares the filesystem against
+    /// stored rows and takes no snapshot at all ([#115]).
     ///
     /// [#115]: https://github.com/fullstacktaiye/harkness/issues/115
     #[must_use]
@@ -556,6 +562,19 @@ impl FileInventory {
     #[must_use]
     pub fn worktree_root(&self) -> &Path {
         &self.worktree_root
+    }
+
+    /// How much of the worktree this walk covered.
+    ///
+    /// Carried on the inventory rather than remembered by the caller, because
+    /// it is what decides whether the rows a batch did not confirm may be
+    /// deleted. A scoped inventory handed to a sweeping batch would delete
+    /// every path outside the scope; keeping the answer with the value makes
+    /// that a question the code can ask instead of a rule a reviewer has to
+    /// notice.
+    #[must_use]
+    pub const fn scope(&self) -> &ReconcileScope {
+        &self.scope
     }
 
     /// Every recorded path, sorted by exact path bytes.
@@ -768,13 +787,48 @@ impl InventoryBuilder {
         policy: &InventoryPolicy,
         cancellation: &Cancellation,
     ) -> Result<FileInventory, InventoryError> {
-        Walk::new(
+        Self::build_scoped(
             snapshot.id(),
             snapshot.worktree_root(),
             policy,
+            &crate::ReconcileScope::Full,
             cancellation,
-        )?
-        .run()
+        )
+    }
+
+    /// Walks the part of `worktree_root` that `scope` names.
+    ///
+    /// The layered hierarchy is applied exactly as [`build`](Self::build)
+    /// applies it: the walk still descends from the root, so every
+    /// `.gitignore` on the way to a scoped path is read and every built-in
+    /// denial is asked about every parent. What the scope changes is which
+    /// directories are opened and which entries are kept — never what a layer
+    /// would have said about them, because a scoped answer that disagreed with
+    /// the full one would make an incremental update record a file a rebuild
+    /// excludes.
+    ///
+    /// The `reading` identifier names *this* pass rather than a workspace
+    /// capture. A reconcile compares the filesystem against stored rows and
+    /// takes no snapshot; the id travels only so a derived value can say which
+    /// read produced it.
+    ///
+    /// Blocking, and cancellation-polled exactly as [`build`](Self::build) is.
+    ///
+    /// # Errors
+    ///
+    /// The failures of [`build`](Self::build), which are about the worktree
+    /// root and the rule files rather than about the scope: a scope naming a
+    /// directory that does not exist yields an empty inventory, because "no
+    /// paths are there" is the true answer and the caller's own comparison is
+    /// what turns it into removals.
+    pub fn build_scoped(
+        reading: SnapshotId,
+        worktree_root: &Path,
+        policy: &InventoryPolicy,
+        scope: &ReconcileScope,
+        cancellation: &Cancellation,
+    ) -> Result<FileInventory, InventoryError> {
+        Walk::new(reading, worktree_root, scope, policy, cancellation)?.run()
     }
 }
 
@@ -869,6 +923,8 @@ enum Decision {
 struct Walk<'a> {
     snapshot: SnapshotId,
     root: PathBuf,
+    scope: ReconcileScope,
+    filter: ScopeFilter,
     policy: &'a InventoryPolicy,
     cancellation: &'a Cancellation,
     denials: Gitignore,
@@ -889,6 +945,7 @@ impl<'a> Walk<'a> {
     fn new(
         snapshot: SnapshotId,
         root: &Path,
+        scope: &ReconcileScope,
         policy: &'a InventoryPolicy,
         cancellation: &'a Cancellation,
     ) -> Result<Self, InventoryError> {
@@ -907,6 +964,8 @@ impl<'a> Walk<'a> {
         let mut walk = Self {
             snapshot,
             root: root.to_path_buf(),
+            scope: scope.clone(),
+            filter: scope.filter(),
             policy,
             cancellation,
             denials: Gitignore::empty(),
@@ -940,23 +999,7 @@ impl<'a> Walk<'a> {
 
     /// Compiles the non-overridable denial layer, rooted at the worktree.
     fn compile_denials(&self) -> Result<Gitignore, InventoryError> {
-        let mut builder = GitignoreBuilder::new(&self.root);
-        for pattern in BUILT_IN_DENIALS {
-            builder
-                .add_line(None, pattern)
-                .map_err(|error| InventoryError::IgnoreRuleInvalid {
-                    layer: IgnoreLayer::BuiltIn,
-                    file: "<built-in>".to_owned(),
-                    reason: clamp(&error.to_string()),
-                })?;
-        }
-        builder
-            .build()
-            .map_err(|error| InventoryError::IgnoreRuleInvalid {
-                layer: IgnoreLayer::BuiltIn,
-                file: "<built-in>".to_owned(),
-                reason: clamp(&error.to_string()),
-            })
+        compile_denials(&self.root)
     }
 
     /// Reads one rule file.
@@ -1137,27 +1180,42 @@ impl<'a> Walk<'a> {
                 Decision::Included | Decision::Undecided => {}
             }
 
+            // The scope decides what is *recorded* and what is descended into,
+            // and never what the layers above decided: a scoped walk reaches its
+            // paths through the same directories a full one does and reads the
+            // same `.gitignore` chain on the way, so the two cannot disagree
+            // about whether a file is eligible. Skipping straight to a subtree
+            // would apply a different set of rules to the same tree.
+            let path = RepoPath::from_bytes(relative.clone());
+            let records = self.filter.records(&path);
+
             match listed.kind {
                 EntryKind::Symlink => {
-                    if !self.record_symlink(&absolute, RepoPath::from_bytes(relative)) {
+                    if records && !self.record_symlink(&absolute, path) {
                         break 'walk;
                     }
                 }
                 EntryKind::File => {
-                    if !self.record_file(&absolute, RepoPath::from_bytes(relative)) {
+                    if records && !self.record_file(&absolute, path) {
                         break 'walk;
                     }
                 }
                 EntryKind::Directory => {
-                    let path = RepoPath::from_bytes(relative.clone());
+                    let descends = self.filter.descends_into(&path);
+                    if !descends && !records {
+                        continue 'walk;
+                    }
                     // Asked before the listing, because a nested repository can
                     // hold hundreds of thousands of names and every one of them
                     // would be read, allocated, and sorted only to be thrown
                     // away by the boundary check that followed.
                     if fs::symlink_metadata(absolute.join(".git")).is_ok() {
-                        if !self.record_boundary(&absolute, path, &relative) {
+                        if records && !self.record_boundary(&absolute, path, &relative) {
                             break 'walk;
                         }
+                        continue 'walk;
+                    }
+                    if !descends {
                         continue 'walk;
                     }
                     let listing = match self.read_directory(&absolute, Some(&path)) {
@@ -1594,6 +1652,7 @@ impl<'a> Walk<'a> {
         FileInventory {
             snapshot: self.snapshot,
             worktree_root: self.root,
+            scope: self.scope,
             entries: self.entries,
             denied_count: self.denied_count,
             ignored_count: self.ignored_count,
@@ -1644,6 +1703,33 @@ fn symlinked_component(root: &Path, file: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Compiles [`BUILT_IN_DENIALS`] against one worktree root.
+///
+/// A free function because two things need layer 1 and neither may have its own
+/// copy of it: the walk, which is where a denied path stops being a name, and
+/// the filesystem watcher's normalizer, which must not put a denied path into a
+/// queue in the first place. Two compilations of one list would drift, and the
+/// half that drifted is the half that let a credential through.
+pub(crate) fn compile_denials(root: &Path) -> Result<Gitignore, InventoryError> {
+    let mut builder = GitignoreBuilder::new(root);
+    for pattern in BUILT_IN_DENIALS {
+        builder
+            .add_line(None, pattern)
+            .map_err(|error| InventoryError::IgnoreRuleInvalid {
+                layer: IgnoreLayer::BuiltIn,
+                file: "<built-in>".to_owned(),
+                reason: clamp(&error.to_string()),
+            })?;
+    }
+    builder
+        .build()
+        .map_err(|error| InventoryError::IgnoreRuleInvalid {
+            layer: IgnoreLayer::BuiltIn,
+            file: "<built-in>".to_owned(),
+            reason: clamp(&error.to_string()),
+        })
 }
 
 /// Reads a file's text, refusing anything past `limit` rather than trusting a
@@ -1718,7 +1804,7 @@ fn declared_submodules(root: &Path) -> BTreeSet<Vec<u8>> {
 }
 
 /// Modification time in nanoseconds since the Unix epoch.
-fn modified_nanos(metadata: &Metadata) -> Option<i64> {
+pub(crate) fn modified_nanos(metadata: &Metadata) -> Option<i64> {
     let modified = metadata.modified().ok()?;
     match modified.duration_since(UNIX_EPOCH) {
         Ok(since) => i64::try_from(since.as_nanos()).ok(),
@@ -2665,6 +2751,7 @@ mod tests {
         let missing = super::Walk::new(
             snapshot.id(),
             &workspace.root.join("gone"),
+            &crate::ReconcileScope::Full,
             &InventoryPolicy::new(),
             &Cancellation::default(),
         )
@@ -2676,6 +2763,7 @@ mod tests {
         let not_a_directory = super::Walk::new(
             snapshot.id(),
             &file,
+            &crate::ReconcileScope::Full,
             &InventoryPolicy::new(),
             &Cancellation::default(),
         )

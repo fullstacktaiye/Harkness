@@ -219,6 +219,16 @@ jobs:
           harkness-context
           chunk::tests::chunking_one_megabyte_meets_the_latency_target
           --release
+      # Issue #115 makes the headline promise of the context engine: one edit
+      # updates the index within about a second of the editor going quiet. The
+      # default suite asserts the same path's correctness with no clock in it;
+      # this is where the number is held to.
+      - name: Measure incremental index update
+        run: >-
+          sh .github/scripts/run-ignored-exact-test.sh
+          harkness-context
+          reconcile::tests::a_single_file_update_meets_the_incremental_latency_target
+          --release
       # Issue #97 puts the coordinator on every protected tool call, so its
       # per-call budget is a release requirement too.
       - name: Measure coordinator decision-to-dispatch

@@ -101,9 +101,88 @@ impl RepoPath {
     }
 
     /// Whether the path carries no bytes at all.
+    ///
+    /// The empty path is the worktree root itself, which is what makes it the
+    /// spelling of "everything" for [`contains`](Self::contains) and for a
+    /// whole-worktree reconcile scope.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Whether `other` is this path or sits beneath it.
+    ///
+    /// Byte containment with the separator required, which is the whole point:
+    /// `src` contains `src/main.rs` and does **not** contain `src-generated.rs`,
+    /// and a plain `starts_with` on the bytes would say it did. Every scope
+    /// decision in the reconciler and every subtree hint in the watcher is this
+    /// question, so it is answered once here rather than re-derived by each of
+    /// them.
+    ///
+    /// The empty path is the worktree root and therefore contains everything,
+    /// itself included.
+    #[must_use]
+    pub fn contains(&self, other: &Self) -> bool {
+        if self.0.is_empty() {
+            return true;
+        }
+        if self.0 == other.0 {
+            return true;
+        }
+        other
+            .0
+            .strip_prefix(self.0.as_slice())
+            .is_some_and(|rest| rest.first() == Some(&b'/'))
+    }
+
+    /// The directory this path sits in, or `None` at the worktree root.
+    #[must_use]
+    pub fn parent(&self) -> Option<Self> {
+        let index = self.0.iter().rposition(|byte| *byte == b'/')?;
+        Some(Self(self.0[..index].to_vec()))
+    }
+
+    /// Every directory between the worktree root and this path, root first.
+    ///
+    /// The root itself is the empty path and is always the first item, so a
+    /// caller seeding a walk with the chain above a scope never has to special
+    /// case it.
+    #[must_use]
+    pub fn ancestors(&self) -> Vec<Self> {
+        let mut ancestors = vec![Self(Vec::new())];
+        let mut cursor = 0;
+        while let Some(offset) = self.0[cursor..].iter().position(|byte| *byte == b'/') {
+            cursor += offset;
+            ancestors.push(Self(self.0[..cursor].to_vec()));
+            cursor += 1;
+        }
+        ancestors
+    }
+
+    /// The longest path that [contains](Self::contains) every one of `paths`.
+    ///
+    /// Truncated at a separator rather than at a byte, so the answer is a
+    /// directory and never half a name: the common prefix of `src/main.rs` and
+    /// `src/mainland.rs` is `src`, not `src/main`. An empty iterator and paths
+    /// with nothing in common both give the worktree root.
+    #[must_use]
+    pub fn common_ancestor<'paths>(paths: impl IntoIterator<Item = &'paths Self>) -> Self {
+        let mut paths = paths.into_iter();
+        let Some(first) = paths.next() else {
+            return Self(Vec::new());
+        };
+        // The directory of the first path, because the answer is a directory
+        // that contains every input and a file cannot contain anything.
+        let mut common = first.parent().unwrap_or_else(|| Self(Vec::new())).0;
+        for path in paths {
+            while !Self(common.clone()).contains(path) {
+                let Some(index) = common.iter().rposition(|byte| *byte == b'/') else {
+                    return Self(Vec::new());
+                };
+                common.truncate(index);
+            }
+        }
+        Self(common)
     }
 
     /// Whether Git reported a directory rather than a file.
@@ -270,6 +349,69 @@ mod tests {
             RepoPath::from_bytes(b"a/b/".to_vec()).without_trailing_separator(),
             RepoPath::from_bytes(b"a/b".to_vec())
         );
+    }
+
+    #[test]
+    fn containment_requires_a_separator_rather_than_a_byte_prefix() {
+        let directory = RepoPath::from_bytes(b"src".to_vec());
+        assert!(directory.contains(&RepoPath::from_bytes(b"src".to_vec())));
+        assert!(directory.contains(&RepoPath::from_bytes(b"src/main.rs".to_vec())));
+        // The failure this exists to prevent: a subtree scope for `src`
+        // sweeping a sibling file whose name merely begins with it.
+        assert!(!directory.contains(&RepoPath::from_bytes(b"src-generated.rs".to_vec())));
+        assert!(!directory.contains(&RepoPath::from_bytes(b"srcs/main.rs".to_vec())));
+    }
+
+    #[test]
+    fn the_root_contains_everything_including_itself() {
+        let root = RepoPath::from_bytes(Vec::new());
+        assert!(root.is_empty());
+        assert!(root.contains(&root));
+        assert!(root.contains(&RepoPath::from_bytes(b"a/b/c.rs".to_vec())));
+    }
+
+    #[test]
+    fn ancestors_start_at_the_root_and_stop_above_the_path() {
+        let path = RepoPath::from_bytes(b"a/b/c.rs".to_vec());
+        assert_eq!(
+            path.ancestors()
+                .iter()
+                .map(RepoPath::display)
+                .collect::<Vec<_>>(),
+            ["", "a", "a/b"]
+        );
+        assert_eq!(
+            RepoPath::from_bytes(b"top.rs".to_vec())
+                .ancestors()
+                .iter()
+                .map(RepoPath::display)
+                .collect::<Vec<_>>(),
+            [""]
+        );
+        assert_eq!(
+            path.parent().map(|parent| parent.display()),
+            Some("a/b".to_owned())
+        );
+        assert_eq!(RepoPath::from_bytes(b"top.rs".to_vec()).parent(), None);
+    }
+
+    #[test]
+    fn a_common_ancestor_is_a_directory_and_never_half_a_name() {
+        let paths = [
+            RepoPath::from_bytes(b"src/main.rs".to_vec()),
+            RepoPath::from_bytes(b"src/mainland.rs".to_vec()),
+        ];
+        assert_eq!(RepoPath::common_ancestor(paths.iter()).display(), "src");
+
+        let unrelated = [
+            RepoPath::from_bytes(b"src/main.rs".to_vec()),
+            RepoPath::from_bytes(b"docs/guide.md".to_vec()),
+        ];
+        assert!(RepoPath::common_ancestor(unrelated.iter()).is_empty());
+        assert!(RepoPath::common_ancestor(std::iter::empty()).is_empty());
+
+        let one = [RepoPath::from_bytes(b"a/b/c.rs".to_vec())];
+        assert_eq!(RepoPath::common_ancestor(one.iter()).display(), "a/b");
     }
 
     #[test]

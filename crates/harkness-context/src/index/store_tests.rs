@@ -1784,3 +1784,230 @@ fn a_file_version_identifier_round_trips_through_the_column() {
     let id = FileVersionId::derive(&path, b"fn main() {}\n");
     assert_eq!(id.to_string().parse::<FileVersionId>().unwrap(), id);
 }
+
+// -- reading and refreshing part of a worktree ------------------------------
+
+/// The scoped read [#115]'s merge walks, and the containment rule it must obey.
+/// A prefix match on the stored bytes alone would return `src-generated.rs` for
+/// a subtree scope of `src`, and the merge would then decide that a file it
+/// never walked has no path beside it — a removal of a file that exists.
+///
+/// [#115]: https://github.com/fullstacktaiye/harkness/issues/115
+#[test]
+fn a_scoped_read_stops_at_the_separator_and_pages_in_path_order() {
+    let fixture = StoreFixture::new();
+    let cache = fixture.open();
+    let key = worktree("alpha");
+    commit_full(
+        &cache,
+        &key,
+        "/workspaces/alpha",
+        &[
+            ("src", b"a directory-shaped name that is a file here\n"),
+            ("src-generated.rs", b"fn generated() {}\n"),
+            ("src/a.rs", b"fn a() {}\n"),
+            ("src/nested/b.rs", b"fn b() {}\n"),
+            ("srcs/c.rs", b"fn c() {}\n"),
+        ],
+    );
+
+    let scoped = cache
+        .files_under(&key, &RepoPath::from_bytes(b"src".to_vec()), None, 100)
+        .expect("the scoped read succeeds");
+    assert_eq!(
+        scoped
+            .rows
+            .iter()
+            .map(|row| row.path.display())
+            .collect::<Vec<_>>(),
+        ["src", "src/a.rs", "src/nested/b.rs"]
+    );
+    assert!(!scoped.more);
+
+    // The empty prefix is the worktree root, which is what makes one method
+    // serve a whole-tree sweep and a one-directory one.
+    let everything = cache
+        .files_under(&key, &RepoPath::from_bytes(Vec::new()), None, 100)
+        .expect("the whole-tree read succeeds");
+    assert_eq!(everything.rows.len(), 5);
+
+    // Paged, and continuing after a path rather than by offset — the merge
+    // reads forward and never re-reads a row it has already decided about.
+    let first = cache
+        .files_under(&key, &RepoPath::from_bytes(b"src".to_vec()), None, 1)
+        .expect("the first page succeeds");
+    assert_eq!(first.rows[0].path.display(), "src");
+    assert!(first.more);
+    let second = cache
+        .files_under(
+            &key,
+            &RepoPath::from_bytes(b"src".to_vec()),
+            Some(&first.rows[0].path),
+            100,
+        )
+        .expect("the second page succeeds");
+    assert_eq!(
+        second
+            .rows
+            .iter()
+            .map(|row| row.path.display())
+            .collect::<Vec<_>>(),
+        ["src/a.rs", "src/nested/b.rs"]
+    );
+}
+
+/// A file whose bytes turned out to be the ones its row already names is
+/// refreshed rather than re-derived. Recording it as a plain entry would clear
+/// `files.file_version_id`, and the commit's collection would then delete a
+/// chunk set nothing was wrong with.
+#[test]
+fn a_refreshed_file_keeps_its_derivation_and_updates_its_metadata() {
+    let fixture = StoreFixture::new();
+    let cache = fixture.open();
+    let key = worktree("alpha");
+    let bytes = b"fn a() {}\n";
+    commit_full(&cache, &key, "/workspaces/alpha", &[("src/a.rs", bytes)]);
+    let path = RepoPath::from_bytes(b"src/a.rs".to_vec());
+    let before = cache
+        .file(&key, &path)
+        .unwrap()
+        .expect("the file is stored");
+    let chunks = cache.chunks(&key, &path).unwrap();
+    assert!(!chunks.is_empty());
+
+    let cancellation = Cancellation::default();
+    let mut batch = cache
+        .begin(
+            &key,
+            Path::new("/workspaces/alpha"),
+            BatchScope::Targeted,
+            &cancellation,
+        )
+        .unwrap();
+    let mut touched = entry("src/a.rs", bytes);
+    touched.mtime_ns = Some(1_800_000_000_000_000_000);
+    batch
+        .record_refreshed(&touched, CLASSIFY_VERSION)
+        .expect("the refresh records");
+    batch.commit(&cancellation).expect("the batch commits");
+
+    let after = cache
+        .file(&key, &path)
+        .unwrap()
+        .expect("the file is stored");
+    assert_eq!(after.mtime_ns, Some(1_800_000_000_000_000_000));
+    assert_eq!(after.file_version, before.file_version);
+    assert_eq!(after.content_sha256, before.content_sha256);
+    assert_eq!(after.chunking_version, before.chunking_version);
+    assert_eq!(
+        cache.chunks(&key, &path).unwrap(),
+        chunks,
+        "a refresh must not cost a file its chunks"
+    );
+}
+
+/// The committed base a full pass verified against, written by the same
+/// statement that moves the watermark. A targeted batch records none, because a
+/// checkout is not verified by looking at one file of it.
+#[test]
+fn only_a_batch_that_says_so_records_the_committed_base() {
+    let fixture = StoreFixture::new();
+    let cache = fixture.open();
+    let key = worktree("alpha");
+    let cancellation = Cancellation::default();
+    assert_eq!(cache.worktree_marker(&key).unwrap(), None);
+
+    commit_full(
+        &cache,
+        &key,
+        "/workspaces/alpha",
+        &[("a.rs", b"fn a() {}\n")],
+    );
+    assert_eq!(
+        cache.worktree_marker(&key).unwrap(),
+        None,
+        "a batch that never claimed a base must not have one recorded for it"
+    );
+
+    let mut batch = cache
+        .begin(
+            &key,
+            Path::new("/workspaces/alpha"),
+            BatchScope::Full,
+            &cancellation,
+        )
+        .unwrap();
+    batch.record_head_marker(Some("main@abc123"));
+    batch.commit(&cancellation).unwrap();
+    assert_eq!(
+        cache.worktree_marker(&key).unwrap(),
+        Some("main@abc123".to_owned())
+    );
+
+    // A later targeted batch leaves it alone rather than reasserting a base it
+    // did not check.
+    let mut targeted = cache
+        .begin(
+            &key,
+            Path::new("/workspaces/alpha"),
+            BatchScope::Targeted,
+            &cancellation,
+        )
+        .unwrap();
+    let bytes = b"fn a() { changed() }\n";
+    let entry = entry("a.rs", bytes);
+    let (version, chunks) = derive(&entry, bytes);
+    targeted
+        .record_chunked(&entry, &version, &chunks, CLASSIFY_VERSION)
+        .unwrap();
+    targeted.commit(&cancellation).unwrap();
+    assert_eq!(
+        cache.worktree_marker(&key).unwrap(),
+        Some("main@abc123".to_owned())
+    );
+
+    // And a checkout the cache has never seen has no base rather than an empty
+    // one, because "cannot be told" and "verified against nothing" are
+    // different answers.
+    assert_eq!(cache.worktree_marker(&worktree("beta")).unwrap(), None);
+}
+
+/// Forgetting a checkout takes its rows and collects what nothing else names,
+/// while a sibling's shared content survives untouched.
+#[test]
+fn forgetting_a_worktree_collects_only_what_nothing_else_names() {
+    let fixture = StoreFixture::new();
+    let cache = fixture.open();
+    let alpha = worktree("alpha");
+    let beta = worktree("beta");
+    let shared: &[u8] = b"fn shared() {}\n";
+    commit_full(
+        &cache,
+        &alpha,
+        "/workspaces/alpha",
+        &[("shared.rs", shared), ("alpha-only.rs", b"fn alpha() {}\n")],
+    );
+    commit_full(&cache, &beta, "/workspaces/beta", &[("shared.rs", shared)]);
+    let before = cache.counts().unwrap();
+    assert_eq!(before.worktrees, 2);
+
+    let report = cache
+        .forget_worktree(&alpha, &Cancellation::default())
+        .expect("the checkout is forgotten");
+
+    assert_eq!(report.files_removed, 2);
+    assert!(report.rows_collected >= 2, "{report:?}");
+    let after = cache.counts().unwrap();
+    assert_eq!(after.worktrees, 1);
+    assert_eq!(after.files, 1);
+    let path = RepoPath::from_bytes(b"shared.rs".to_vec());
+    assert!(
+        cache.file(&beta, &path).unwrap().is_some(),
+        "the surviving checkout keeps its row"
+    );
+    assert!(
+        !cache.chunks(&beta, &path).unwrap().is_empty(),
+        "and the content rows it still names"
+    );
+    assert!(cache.file(&alpha, &path).unwrap().is_none());
+}

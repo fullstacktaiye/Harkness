@@ -10,7 +10,7 @@
 //!
 //! That is why [`INDEX_SCHEMA_VERSION`] is bumped by *any* change to the
 //! statement below — a column, an index, a constraint — and why
-//! [`fixtures/schema-v2.sql`](https://github.com/fullstacktaiye/harkness/blob/main/crates/harkness-context/src/index/fixtures/schema-v2.sql)
+//! [`fixtures/schema-v3.sql`](https://github.com/fullstacktaiye/harkness/blob/main/crates/harkness-context/src/index/fixtures/schema-v3.sql)
 //! is committed beside it. The fixture is what a test compares the live
 //! `sqlite_schema` against, so editing the DDL without bumping the version
 //! fails a test rather than leaving already-written caches silently addressed
@@ -71,8 +71,20 @@ use super::IndexComponent;
 /// that adopted one would address columns that are not there — which is what
 /// the quarantine-and-recreate path exists for.
 ///
+/// Bumped from `2` by [#115]: `worktrees` gained `head_marker`, the committed
+/// base a whole-worktree reconcile last verified this checkout against. It is
+/// the one thing a metadata comparison cannot supply — [#63] makes a worktree's
+/// identity path-derived, so a checkout deleted and re-created at the same path
+/// with another branch is indistinguishable from the one the rows describe, and
+/// a filesystem that preserved sizes and modification times across that would
+/// have every row verify as current. A cache written at `2` has no such column,
+/// and is quarantined and rebuilt rather than migrated: nothing here is
+/// evidence.
+///
+/// [#63]: https://github.com/fullstacktaiye/harkness/issues/63
 /// [#114]: https://github.com/fullstacktaiye/harkness/issues/114
-pub const INDEX_SCHEMA_VERSION: u32 = 2;
+/// [#115]: https://github.com/fullstacktaiye/harkness/issues/115
+pub const INDEX_SCHEMA_VERSION: u32 = 3;
 
 /// The whole cache layout, applied in one transaction at creation.
 ///
@@ -114,7 +126,8 @@ CREATE TABLE IF NOT EXISTS worktrees (
     root_path          BLOB    NOT NULL,
     next_generation    INTEGER NOT NULL DEFAULT 0,
     last_generation    INTEGER NOT NULL DEFAULT 0,
-    last_reconciled_at TEXT
+    last_reconciled_at TEXT,
+    head_marker        TEXT
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS contents (
@@ -263,7 +276,7 @@ pub(crate) mod tests {
     use crate::index::IndexComponent;
 
     /// The frozen layout, as `sqlite_schema` renders it.
-    const FROZEN: &str = include_str!("fixtures/schema-v2.sql");
+    const FROZEN: &str = include_str!("fixtures/schema-v3.sql");
 
     /// Renders a database's own account of its layout, ordered and normalized.
     ///
@@ -313,7 +326,7 @@ pub(crate) mod tests {
              replaced, never edited."
         );
         assert!(
-            FROZEN.contains("classify_version"),
+            FROZEN.contains("head_marker"),
             "the frozen fixture should be the version-{INDEX_SCHEMA_VERSION} layout"
         );
     }

@@ -15,8 +15,15 @@
 //! a snapshot is a fact about one worktree. The expensive, content-addressed
 //! half is shared anyway: every engine of one repository resolves to the same
 //! `<data_dir>/context/<repository-key>` cache, and the write-ahead log and busy
-//! timeout are what make several handles on it safe. Folding those handles into
-//! one engine with per-worktree state inside it is [#115]'s.
+//! timeout are what make several handles on it safe.
+//!
+//! [#115] kept that shape rather than folding the handles into one engine with
+//! per-worktree state inside it, and the reason is worth stating: the cache
+//! already serializes writers and refuses a batch that lost the race, so two
+//! checkouts indexing at once is a solved problem one layer down. A per-repository
+//! owner above it would add a second place for the same rule to be got wrong,
+//! and would make a per-worktree fact — which snapshot this is — reachable only
+//! through something that is not per worktree.
 //!
 //! # Locking
 //!

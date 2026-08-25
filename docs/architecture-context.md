@@ -124,6 +124,13 @@ Each stage in one line:
   symbol rows, and nothing else; only `files` is per-worktree, so two linked
   worktrees share the expensive half. Disposable by design (ADR-0004), and
   documented in [`docs/context-index.md`](context-index.md).
+- **Watch and reconcile** — what keeps that cache current between cold builds.
+  A filesystem watcher produces *hints* and a reconciler decides *truth* by
+  comparing the worktree against the stored rows, so a dropped event, a
+  duplicate event, and a change made while Harkness was closed all end the same
+  way. Editing one file costs one file's work; a checkout touching ten thousand
+  collapses into one bounded pass. The split, the scopes, and the worktree
+  isolation guarantees are in the same document.
 - **Retrieval sources** — filename and lexical search over the index, symbol
   lookup, the repository map, Git-derived context through the existing
   `GitService`, and discovered instruction files.
