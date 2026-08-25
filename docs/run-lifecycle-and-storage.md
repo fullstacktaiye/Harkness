@@ -117,6 +117,8 @@ as an opaque timeline entry instead of failing the read.
 | `agent_checkpoint` | The agent's resumable session checkpoint was recorded. |
 | `snapshot_captured` | A workspace snapshot was made durable evidence for this run. |
 | `context_cache_recreated` | The disposable context index cache was thrown away and rebuilt. |
+| `context_index_committed` | A batch of derived index rows became visible. |
+| `context_index_evicted` | One repository's index cache was evicted for disk. |
 | `external_agent_health_checked` | A registered external agent was spawned, negotiated with, and torn down. |
 | `external_agent_trust_invalidated` | A registered agent's executable stopped matching its grant. |
 | `diagnostic` | Anything a run wants to say that no other kind covers. |
@@ -128,6 +130,17 @@ detected and which claim was found dead.
 `snapshot_captured` is recorded by the persistence path and by nothing else.
 Capturing a snapshot is a read of the workspace that writes nothing, so an engine
 that emitted this would be claiming an audit trail it never stored.
+
+The three `context_*` kinds are entries about a store that is **not** this one.
+Nothing in `runtime.db` moved when they were recorded: the rows they describe
+live in the disposable index cache (ADR-0004, `docs/context-index.md`). They are
+on a run's timeline because what the cache held decides what the run was shown —
+a generation bump changes what every later snapshot digest means, and a cache
+that was evicted is why the next question was slow. Their payloads carry
+generations, counts and derived repository keys as **numbers and UUIDs**, never
+paths, for the same two reasons the agent payloads use numeric bytes: the store
+redacts every JSON string value, and a run's timeline is not the place to record
+somebody's directory layout.
 
 The `agent_observation`, `agent_action` and `agent_checkpoint` payloads encode
 their already-redacted versioned record as **numeric bytes**, because the store

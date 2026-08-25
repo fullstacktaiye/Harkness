@@ -275,6 +275,10 @@ Item {
             return qsTr("Workspace snapshot");
         if (value === "context_cache_recreated")
             return qsTr("Context index rebuilt");
+        if (value === "context_index_committed")
+            return qsTr("Context index updated");
+        if (value === "context_index_evicted")
+            return qsTr("Context index evicted");
         if (value === "external_agent_health_checked")
             return qsTr("External agent checked");
         if (value === "external_agent_trust_invalidated")
@@ -305,8 +309,10 @@ Item {
             return "document-save-symbolic";
         if (value === "snapshot_captured")
             return "camera-photo-symbolic";
-        if (value === "context_cache_recreated")
+        if (value === "context_cache_recreated" || value === "context_index_evicted")
             return "edit-clear-history-symbolic";
+        if (value === "context_index_committed")
+            return "view-refresh-symbolic";
         if (value === "agent_observation" || value === "agent_action"
                 || value === "agent_checkpoint" || value === "external_agent_health_checked")
             return "system-run-symbolic";

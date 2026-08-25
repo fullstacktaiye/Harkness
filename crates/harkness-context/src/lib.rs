@@ -49,9 +49,10 @@
 //!
 //! [`ContextEngine`] is the one way anything reaches a context feature, and
 //! [`index`] is the disposable per-repository cache beneath it. The engine
-//! returns typed values and persists nothing: a snapshot becomes evidence only
-//! when `harkness-runtime` records it, which is what keeps deleting
-//! `<data_dir>/context/` lossless (ADR-0004). Of the eight facade methods,
+//! returns *evidence* to nobody: a snapshot becomes evidence only when
+//! `harkness-runtime` records it, and everything the cache holds is derived
+//! from repository content, which is what keeps deleting `<data_dir>/context/`
+//! lossless (ADR-0004). Of the eight facade methods,
 //! [`snapshot`](ContextEngine::snapshot) and
 //! [`inventory`](ContextEngine::inventory) are implemented; the rest return
 //! [`ContextEngineError::NotYetAvailable`] naming what is missing, so every
@@ -86,17 +87,27 @@
 //! invalidating its chunk. `docs/context-identity.md` freezes the derivation,
 //! fallback honesty, encoding rules, and [`CHUNKING_VERSION`] bump procedure.
 //!
+//! # The persistent index
+//!
+//! [`ContextEngine::reindex`] walks a worktree once and writes what it found
+//! into [`index`], so reopening a project reads a warm cache instead of
+//! re-walking, re-hashing and re-chunking a repository. What that cache holds,
+//! how a batch becomes visible atomically, which version bump invalidates which
+//! rows, and what happens when it outgrows its budget are all in that module's
+//! documentation and in `docs/context-index.md`; the one rule to carry
+//! everywhere else is that the whole subtree is disposable (ADR-0004) and every
+//! read of it names a worktree.
+//!
 //! # What is not here
 //!
-//! No index content tables ([#114]), no search ([#116]), no symbol extraction
-//! ([#117]), and no provider or token concepts ([#111], [#122]). The
-//! identifiers and facade signatures those issues need are defined here so
-//! that none of them has to invent one.
+//! No search ([#116]), no symbol extraction ([#117]) — the store accepts symbol
+//! rows and nothing in this build produces one — and no provider or token
+//! concepts ([#111], [#122]). The identifiers and facade signatures those
+//! issues need are defined here so that none of them has to invent one.
 //!
 //! [#111]: https://github.com/fullstacktaiye/harkness/issues/111
 //! [#112]: https://github.com/fullstacktaiye/harkness/issues/112
 //! [#113]: https://github.com/fullstacktaiye/harkness/issues/113
-//! [#114]: https://github.com/fullstacktaiye/harkness/issues/114
 //! [#116]: https://github.com/fullstacktaiye/harkness/issues/116
 //! [#117]: https://github.com/fullstacktaiye/harkness/issues/117
 //! [#122]: https://github.com/fullstacktaiye/harkness/issues/122

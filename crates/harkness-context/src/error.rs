@@ -249,6 +249,43 @@ pub enum ContextEngineError {
         reason: String,
     },
 
+    /// Another process held the cache past the busy timeout.
+    ///
+    /// Deliberately its own discriminant rather than a
+    /// [`CacheOpenFailed`](Self::CacheOpenFailed) with a contention-shaped
+    /// message. The two lead to opposite responses: a caller met by this one
+    /// degrades to reading the workspace live and tries again later, while a
+    /// permission bit or an exhausted descriptor table is not going to clear on
+    /// a retry. It is never a reason to quarantine a cache — a busy cache is not
+    /// a corrupt one, and treating it as one would let a slow front end destroy
+    /// the other's index.
+    #[error("the index cache at '{}' is busy: {reason}", path.display())]
+    IndexBusy {
+        /// Cache database the contention is on.
+        path: PathBuf,
+        /// Stable human-readable explanation from SQLite.
+        reason: String,
+    },
+
+    /// A batch would have grown the cache past its per-repository cap.
+    ///
+    /// The batch is refused whole and the previous generation stays usable. The
+    /// alternative — storing what fits — makes retrieval answer "no match" for
+    /// content the cache simply never held, which a caller cannot tell from a
+    /// repository that does not contain it.
+    #[error(
+        "the index cache at '{}' holds {bytes} bytes, past its {limit}-byte limit",
+        path.display()
+    )]
+    IndexBudgetExhausted {
+        /// Cache database that reached its cap.
+        path: PathBuf,
+        /// Bytes the cache occupies.
+        bytes: u64,
+        /// Bytes it may occupy.
+        limit: u64,
+    },
+
     /// The operation observed its cancellation token.
     #[error("the context engine operation was cancelled")]
     Cancelled,
@@ -293,6 +330,8 @@ impl ContextEngineError {
         "cache_open_failed",
         "cache_version_conflict",
         "cache_corrupt_quarantined",
+        "index_busy",
+        "index_budget_exhausted",
         "cancelled",
     ];
 
@@ -304,6 +343,8 @@ impl ContextEngineError {
             Self::CacheOpenFailed { .. } => "cache_open_failed",
             Self::CacheVersionConflict { .. } => "cache_version_conflict",
             Self::CacheCorruptQuarantined { .. } => "cache_corrupt_quarantined",
+            Self::IndexBusy { .. } => "index_busy",
+            Self::IndexBudgetExhausted { .. } => "index_budget_exhausted",
             Self::Cancelled => "cancelled",
             Self::Domain(error) => error.kind(),
             Self::Inventory(error) => error.kind(),
@@ -458,6 +499,21 @@ mod tests {
                     reason: "file is not a database".to_owned(),
                 },
                 "cache_corrupt_quarantined",
+            ),
+            (
+                ContextEngineError::IndexBusy {
+                    path: PathBuf::from("/data/context/key/index.db"),
+                    reason: "database is locked".to_owned(),
+                },
+                "index_busy",
+            ),
+            (
+                ContextEngineError::IndexBudgetExhausted {
+                    path: PathBuf::from("/data/context/key/index.db"),
+                    bytes: 1,
+                    limit: 0,
+                },
+                "index_budget_exhausted",
             ),
             (ContextEngineError::Cancelled, "cancelled"),
         ];

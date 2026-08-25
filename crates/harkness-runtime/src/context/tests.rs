@@ -8,7 +8,7 @@ use harkness_git::Cancellation;
 use harkness_test_fixtures::{Fixture, initialize_repository};
 use time::OffsetDateTime;
 
-use super::{ContextEngines, cache_recreated_event};
+use super::{ContextEngines, cache_recreated_event, index_committed_event, index_evicted_event};
 use crate::domain::{Run, Task};
 use crate::store::{EventKind, Store};
 
@@ -323,6 +323,13 @@ fn deleting_the_whole_context_directory_loses_no_run_evidence() {
         .record_workspace_snapshot_for_run(run.id(), &snapshot)
         .unwrap();
 
+    // With a real index behind it, so what is deleted is the expensive thing
+    // rather than an empty file. An assertion that deleting nothing loses
+    // nothing would prove nothing.
+    let receipt = engine.reindex(&Cancellation::default()).unwrap();
+    assert!(receipt.files_recorded > 0);
+    assert!(engine.index_counts().unwrap().chunks > 0);
+
     // Close every handle, then do what a user is told to do to reclaim disk.
     registry.release_all();
     drop(engine);
@@ -364,6 +371,17 @@ fn deleting_the_whole_context_directory_loses_no_run_evidence() {
             .map(|stored| stored.event.kind().as_str().to_owned())
             .collect::<Vec<_>>(),
         ["snapshot_captured"]
+    );
+
+    // The derived half really is gone — that is what made room — and it costs
+    // a rebuild and nothing else.
+    assert!(reopened.indexed_files(100).unwrap().is_empty());
+    assert!(
+        reopened
+            .reindex(&Cancellation::default())
+            .unwrap()
+            .files_recorded
+            > 0
     );
 
     // And the snapshot taken against the old cache is honestly stale now.
@@ -450,5 +468,89 @@ fn a_cache_rebuild_becomes_a_timeline_entry_with_both_generations() {
     assert!(
         event.payload()["generation"].is_number(),
         "a generation must not travel as a string the store's redaction may rewrite"
+    );
+}
+
+/// A run that indexed a repository mid-way read different things before and
+/// after, and the counts are what make "the search found nothing" answerable a
+/// year later. The rows themselves are in the disposable cache; this entry is
+/// the evidence that they arrived.
+#[test]
+fn an_index_batch_becomes_a_timeline_entry_naming_what_it_wrote() {
+    let workspace = Workspace::new("workspace");
+    std::fs::write(workspace.root.join("a.rs"), "fn a() {}\n").unwrap();
+    let registry = workspace.registry();
+    let engine = registry
+        .engine(
+            workspace.project_id,
+            &workspace.root,
+            &Cancellation::default(),
+        )
+        .unwrap();
+
+    let receipt = engine.reindex(&Cancellation::default()).unwrap();
+    let event = index_committed_event(&receipt, OffsetDateTime::UNIX_EPOCH);
+
+    assert_eq!(event.kind(), &EventKind::ContextIndexCommitted);
+    assert_eq!(
+        event.payload()["worktree"],
+        serde_json::json!(engine.worktree_key().as_str())
+    );
+    assert_eq!(event.payload()["scope"], serde_json::json!("full"));
+    assert_eq!(
+        event.payload()["files_recorded"],
+        serde_json::json!(receipt.files_recorded)
+    );
+    for numeric in [
+        "generation",
+        "files_recorded",
+        "chunks_recorded",
+        "rows_swept",
+        "duration_ms",
+    ] {
+        assert!(
+            event.payload()[numeric].is_number(),
+            "'{numeric}' must not travel as a string the store's redaction may rewrite"
+        );
+    }
+    assert!(
+        !event
+            .payload()
+            .to_string()
+            .contains(&workspace.root.display().to_string()),
+        "a timeline entry names a derived key rather than a path on this machine"
+    );
+}
+
+/// Eviction is why a later question was slow, so it is worth a timeline entry —
+/// and it names derived repository keys rather than anybody's directory layout.
+#[test]
+fn an_eviction_becomes_a_timeline_entry_naming_repository_keys() {
+    let mut report = harkness_context::index::EvictionReport::default();
+    report.bytes_before = 4096;
+    report.bytes_after = 1024;
+    report.skipped_in_use = 1;
+    report.within_budget = true;
+    report.evicted = vec![harkness_context::index::CacheUsage {
+        repository_key: "00000001-0000-5000-8000-000000000000".to_owned(),
+        root: PathBuf::from("/data/context/00000001-0000-5000-8000-000000000000"),
+        bytes: 3072,
+        last_opened_at: None,
+    }];
+
+    let event = index_evicted_event(&report, OffsetDateTime::UNIX_EPOCH);
+
+    assert_eq!(event.kind(), &EventKind::ContextIndexEvicted);
+    assert_eq!(event.payload()["bytes_before"], serde_json::json!(4096));
+    assert_eq!(event.payload()["bytes_after"], serde_json::json!(1024));
+    assert_eq!(event.payload()["skipped_in_use"], serde_json::json!(1));
+    assert_eq!(event.payload()["within_budget"], serde_json::json!(true));
+    assert_eq!(
+        event.payload()["evicted"][0]["repository"],
+        serde_json::json!("00000001-0000-5000-8000-000000000000")
+    );
+    assert!(
+        !event.payload().to_string().contains("/data/context"),
+        "the directory a cache lived in is not something a run's timeline carries"
     );
 }

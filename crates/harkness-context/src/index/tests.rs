@@ -621,6 +621,11 @@ fn a_second_process_reads_one_cache_without_corrupting_it() {
 /// refusal. What it must never do is conclude the file is broken: a cache
 /// somebody else is writing is one to come back to, and quarantining it would
 /// let one front end destroy the other's index by being slow.
+///
+/// It answers `index_busy` rather than `cache_open_failed`, which is the
+/// distinction a caller acts on: contention clears and a caller degrades to
+/// reading the workspace live until it does, while a permission bit or an
+/// exhausted descriptor table will still be there on the retry.
 #[test]
 fn a_cache_another_writer_holds_is_refused_rather_than_quarantined() {
     let fixture = CacheFixture::new();
@@ -639,7 +644,7 @@ fn a_cache_another_writer_holds_is_refused_rather_than_quarantined() {
 
     let error = fixture.open().unwrap_err();
 
-    assert_eq!(error.kind(), "cache_open_failed");
+    assert_eq!(error.kind(), "index_busy");
     assert!(
         fixture.quarantined().is_empty(),
         "a busy cache is not a corrupt cache"

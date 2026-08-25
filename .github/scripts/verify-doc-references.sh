@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # Checks the "What proves this" tables in docs/ against the tests that exist.
 #
-# The v0.3 documents state invariants a contributor relies on — the transition
+# The reference documents state invariants a contributor relies on — the transition
 # tables, the tightening-only rule, what a grant binds, the storage guarantees —
 # and each names the test that holds the code to it. Left as prose those names
 # would be true only on the day they were written. Checked here, a renamed or
@@ -30,6 +30,7 @@ docs/approvals.md
 docs/run-lifecycle-and-storage.md
 docs/mock-agent-scenarios.md
 docs/release-readiness-v0.3.md
+docs/context-index.md
 '
 
 for document in $documents; do
