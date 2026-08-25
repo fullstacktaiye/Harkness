@@ -117,6 +117,21 @@ pub enum SearchError {
         reason: &'static str,
     },
 
+    /// A query names more distinct subtrees than the merge will stream.
+    ///
+    /// Its own discriminant rather than a [`ForbiddenPath`](Self::ForbiddenPath)
+    /// with a size-shaped message, because the two lead a front end to say
+    /// opposite things: one means "that path is not somewhere Harkness will
+    /// look", and this means "every one of those paths is fine, name fewer of
+    /// them or name what contains them". The count is of subtrees after
+    /// normalization, so naming one directory sixty-five times never reaches
+    /// this.
+    #[error("a query may narrow to at most {limit} distinct subtrees")]
+    TooManyFilters {
+        /// The limit that fired.
+        limit: usize,
+    },
+
     /// A continuation cursor could not be used.
     #[error("the search cursor cannot continue this query: {refusal}")]
     StaleCursor {
@@ -154,6 +169,7 @@ impl SearchError {
         "invalid_pattern",
         "regex_not_permitted",
         "forbidden_path",
+        "too_many_filters",
         "stale_search_cursor",
         "index_unavailable",
         "cancelled",
@@ -166,6 +182,7 @@ impl SearchError {
             Self::InvalidPattern { .. } => "invalid_pattern",
             Self::RegexNotPermitted => "regex_not_permitted",
             Self::ForbiddenPath { .. } => "forbidden_path",
+            Self::TooManyFilters { .. } => "too_many_filters",
             Self::StaleCursor { .. } => "stale_search_cursor",
             Self::IndexUnavailable { .. } => "index_unavailable",
             Self::Cancelled => "cancelled",

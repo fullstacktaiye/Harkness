@@ -205,10 +205,10 @@ pub use provenance::{
 pub use reconcile::{MAX_PATHS_PER_RECONCILE, ReconcileReport, ReconcileScope};
 pub use search::{
     BoundedText, CursorRefusal, DEFAULT_MAX_LINE_BYTES, DEFAULT_MAX_RESPONSE_BYTES,
-    DEFAULT_MAX_RESULTS, MAX_CONTEXT_LINES, MAX_PATH_PREFIXES, MAX_PATTERN_BYTES,
-    MAX_REGEX_SIZE_BYTES, MAX_RESULTS_CAP, MAX_SEARCH_OMISSIONS, SearchCursor, SearchError,
-    SearchFilters, SearchLimits, SearchMatch, SearchOmission, SearchPattern, SearchQuery,
-    SearchResponse, SearchStats, TextEncoding,
+    DEFAULT_MAX_RESULTS, MAX_CONTEXT_LINES, MAX_LINE_BYTES_CAP, MAX_PATH_PREFIXES,
+    MAX_PATTERN_BYTES, MAX_REGEX_SIZE_BYTES, MAX_RESPONSE_BYTES_CAP, MAX_RESULTS_CAP,
+    MAX_SEARCH_OMISSIONS, SearchCursor, SearchError, SearchFilters, SearchLimits, SearchMatch,
+    SearchOmission, SearchPattern, SearchQuery, SearchResponse, SearchStats, TextEncoding,
 };
 pub use snapshot::{
     Capture, CaptureDiagnostics, CaptureRequest, FileDigestEntry, FreshnessState, PathDivergence,

@@ -16,9 +16,10 @@ use harkness_git::Cancellation;
 use harkness_test_fixtures::{Fixture, initialize_repository};
 
 use super::{
-    BoundedText, CursorRefusal, DEFAULT_MAX_RESULTS, MAX_PATH_PREFIXES, MAX_PATTERN_BYTES,
-    MAX_RESULTS_CAP, MAX_SEARCH_OMISSIONS, SearchCursor, SearchError, SearchFilters, SearchLimits,
-    SearchOmission, SearchQuery, SearchResponse, TextEncoding,
+    BoundedText, CursorRefusal, DEFAULT_MAX_RESULTS, MAX_LINE_BYTES_CAP, MAX_PATH_PREFIXES,
+    MAX_PATTERN_BYTES, MAX_RESPONSE_BYTES_CAP, MAX_RESULTS_CAP, MAX_SEARCH_OMISSIONS, SearchCursor,
+    SearchError, SearchFilters, SearchLimits, SearchOmission, SearchQuery, SearchResponse,
+    TextEncoding,
 };
 use crate::classify::FileClass;
 use crate::engine::{ContextEngine, ContextEngineConfig};
@@ -167,20 +168,31 @@ fn a_token_this_build_did_not_mint_is_refused_as_malformed() {
 
 #[test]
 fn limits_are_clamped_rather_than_refused() {
+    let zeroed = SearchLimits::new()
+        .with_max_results(0)
+        .with_max_bytes(0)
+        .with_max_line_bytes(0);
+    assert_eq!(zeroed.max_results(), DEFAULT_MAX_RESULTS);
+    assert_eq!(zeroed.max_bytes(), super::DEFAULT_MAX_RESPONSE_BYTES);
+    assert_eq!(zeroed.max_line_bytes(), super::DEFAULT_MAX_LINE_BYTES);
+}
+
+/// *Every* bound is capped, not merely defaulted. An uncapped `max_bytes` or
+/// `max_line_bytes` would let a caller's number decide how much memory one
+/// response holds — a thousand matches carrying eleven megabyte-long lines is
+/// otherwise a single call away.
+#[test]
+fn no_caller_supplied_bound_can_exceed_its_published_cap() {
     let limits = SearchLimits::new()
         .with_max_results(usize::MAX)
         .with_context_lines(u32::MAX)
-        .with_max_bytes(0)
-        .with_max_line_bytes(0);
+        .with_max_bytes(u64::MAX)
+        .with_max_line_bytes(u64::MAX);
 
     assert_eq!(limits.max_results(), MAX_RESULTS_CAP);
     assert_eq!(limits.context_lines(), super::MAX_CONTEXT_LINES);
-    assert_eq!(limits.max_bytes(), super::DEFAULT_MAX_RESPONSE_BYTES);
-    assert_eq!(limits.max_line_bytes(), super::DEFAULT_MAX_LINE_BYTES);
-    assert_eq!(
-        SearchLimits::new().with_max_results(0).max_results(),
-        DEFAULT_MAX_RESULTS
-    );
+    assert_eq!(limits.max_bytes(), MAX_RESPONSE_BYTES_CAP);
+    assert_eq!(limits.max_line_bytes(), MAX_LINE_BYTES_CAP);
 }
 
 /// Sorted *prefixes* do not imply sorted *paths*: `sr-x` sorts after `sr`
@@ -203,6 +215,65 @@ fn prefixes_are_normalized_into_a_sorted_disjoint_set() {
 
     let prefixes: Vec<String> = filters.prefixes().iter().map(RepoPath::display).collect();
     assert_eq!(prefixes, vec!["sr", "sr-x", "src"], "{prefixes:?}");
+}
+
+/// A parent sorts before its children but is not *adjacent* to them: `src-gen`
+/// falls between `src` and `src/inner`, because `-` is `0x2d` and the separator
+/// is `0x2f`. Consulting only the previously kept prefix therefore keeps a
+/// child its own parent already covers — and two overlapping streams emit one
+/// file's matches twice, at the same `(path, byte_offset)`, which is the total
+/// order a cursor has to be able to sit inside.
+#[test]
+fn a_child_prefix_is_dropped_even_when_a_sibling_sorts_between_it_and_its_parent() {
+    let filters = SearchFilters::new()
+        .under("src")
+        .unwrap()
+        .under("src-gen")
+        .unwrap()
+        .under("src/inner")
+        .unwrap();
+
+    let prefixes: Vec<String> = filters.prefixes().iter().map(RepoPath::display).collect();
+    assert_eq!(prefixes, vec!["src", "src-gen"], "{prefixes:?}");
+}
+
+/// The same shape, through the engine: the overlap must not reach the merge.
+#[test]
+fn overlapping_prefixes_never_report_one_file_twice() {
+    let workspace = Workspace::new();
+    workspace.write("src/inner/a.rs", "needle\n");
+    workspace.write("src-gen/b.rs", "needle\n");
+    let engine = workspace.indexed();
+
+    let response = engine
+        .search(
+            &SearchQuery::exact("needle").with_filters(
+                SearchFilters::new()
+                    .under("src")
+                    .unwrap()
+                    .under("src-gen")
+                    .unwrap()
+                    .under("src/inner")
+                    .unwrap(),
+            ),
+            &Cancellation::default(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        positions(&response),
+        vec![
+            ("src-gen/b.rs".to_owned(), Some(1)),
+            ("src/inner/a.rs".to_owned(), Some(1)),
+        ]
+    );
+    let mut previous: Option<(&RepoPath, u64)> = None;
+    for found in &response.matches {
+        if let Some(previous) = previous {
+            assert!(previous < found.position(), "{previous:?} repeated");
+        }
+        previous = Some(found.position());
+    }
 }
 
 #[test]
@@ -234,16 +305,27 @@ fn a_prefix_leaving_the_workspace_is_refused_by_name() {
     );
 }
 
+/// A size limit is not a containment failure. Telling somebody their
+/// sixty-fifth ordinary `src/` filter left the workspace is the wrong answer to
+/// the wrong question, so the two have separate discriminants.
 #[test]
-fn a_query_may_not_name_more_prefixes_than_the_merge_holds() {
+fn a_query_may_not_name_more_subtrees_than_the_merge_holds() {
     let mut filters = SearchFilters::new();
     for index in 0..MAX_PATH_PREFIXES {
         filters = filters.under(format!("dir-{index}")).unwrap();
     }
-    assert_eq!(
-        filters.under("one-too-many").unwrap_err().kind(),
-        "forbidden_path"
-    );
+    let refused = filters.clone().under("one-too-many").unwrap_err();
+    assert_eq!(refused.kind(), "too_many_filters");
+    assert!(matches!(refused, SearchError::TooManyFilters { limit } if limit == MAX_PATH_PREFIXES));
+
+    // The count is of *distinct subtrees*, so repeating one costs nothing and
+    // a prefix already covered costs nothing either.
+    filters
+        .clone()
+        .under("dir-0")
+        .unwrap()
+        .under("dir-0/nested")
+        .unwrap();
 }
 
 #[test]
@@ -286,6 +368,12 @@ fn every_search_variant_maps_to_a_listed_kind_in_declaration_order() {
             "forbidden_path",
         ),
         (
+            SearchError::TooManyFilters {
+                limit: MAX_PATH_PREFIXES,
+            },
+            "too_many_filters",
+        ),
+        (
             SearchError::StaleCursor {
                 refusal: CursorRefusal::GenerationChanged,
             },
@@ -312,6 +400,70 @@ fn every_search_variant_maps_to_a_listed_kind_in_declaration_order() {
         spellings,
         vec!["malformed", "generation_changed", "different_query"]
     );
+}
+
+/// The omission kinds reach a payload and a reference table, and the type is
+/// `#[non_exhaustive]` — so a caller matches on the string, and a variant added
+/// with a duplicate or misspelled discriminant must fail here rather than ship.
+#[test]
+fn every_omission_variant_maps_to_a_listed_kind_in_declaration_order() {
+    let path = RepoPath::from_path(Path::new("src/a.rs"));
+    let cases = [
+        (
+            SearchOmission::ResultBudgetExhausted { limit: 1 },
+            "result_budget_exhausted",
+        ),
+        (
+            SearchOmission::ByteBudgetExhausted { limit: 1 },
+            "byte_budget_exhausted",
+        ),
+        (
+            SearchOmission::LineTooLong {
+                path: path.clone(),
+                byte_offset: 0,
+                limit: 1,
+            },
+            "line_too_long",
+        ),
+        (
+            SearchOmission::FileUnreadable { path: path.clone() },
+            "file_unreadable",
+        ),
+        (
+            SearchOmission::FileChangedSinceIndex { path: path.clone() },
+            "file_changed_since_index",
+        ),
+        (
+            SearchOmission::EncodingNotSearchable {
+                path: path.clone(),
+                encoding: crate::chunk::ContentEncoding::Utf16Le,
+            },
+            "encoding_not_searchable",
+        ),
+        (
+            SearchOmission::BinaryContentDetected {
+                path,
+                byte_offset: 0,
+            },
+            "binary_content_detected",
+        ),
+    ];
+
+    let kinds: Vec<&str> = cases.iter().map(|(_, kind)| *kind).collect();
+    assert_eq!(kinds, SearchOmission::KINDS);
+    for (omission, expected) in cases {
+        assert_eq!(
+            omission.kind(),
+            expected,
+            "unexpected kind for {omission:?}"
+        );
+    }
+
+    let mut sorted = SearchOmission::KINDS.to_vec();
+    sorted.sort_unstable();
+    let count = sorted.len();
+    sorted.dedup();
+    assert_eq!(sorted.len(), count, "two omissions share a spelling");
 }
 
 /// A cursor is bound to everything that decides *which* matches exist and in
@@ -539,6 +691,37 @@ fn paging_yields_exactly_the_unpaged_answer_at_every_page_size() {
     for page in 1..=expected.len() + 1 {
         assert_eq!(
             paged(&engine, &SearchQuery::exact("needle"), page),
+            expected,
+            "page size {page}"
+        );
+    }
+}
+
+/// The same property for the shape whose cursor handling is *different*.
+///
+/// A continuation seeds the cursor's own row by name, because a content page
+/// may have stopped in the middle of a file. A filename match holds one
+/// position per file, so that seeded row is always one the previous page
+/// already returned — and offering it again would end every page with the match
+/// that starts the next.
+#[test]
+fn paging_a_filename_query_yields_exactly_the_unpaged_answer() {
+    let workspace = Workspace::new();
+    for name in ["needle-a", "needle-b", "needle-c", "needle-d"] {
+        workspace.write(&format!("src/{name}.rs"), "quiet\n");
+    }
+    let engine = workspace.indexed();
+
+    let whole = engine
+        .search(&SearchQuery::filename("needle"), &Cancellation::default())
+        .unwrap();
+    let expected = positions(&whole);
+    assert_eq!(expected.len(), 4);
+    assert!(whole.next_cursor.is_none());
+
+    for page in 1..=expected.len() + 1 {
+        assert_eq!(
+            paged(&engine, &SearchQuery::filename("needle"), page),
             expected,
             "page size {page}"
         );
@@ -908,6 +1091,72 @@ fn a_pattern_that_cannot_be_run_is_refused_before_a_file_is_opened() {
     }
 }
 
+/// "Before a file is opened" is the weaker half of the promise. The capture
+/// that stamps an answer reads the *whole workspace* and costs several times
+/// what the scan does, so a refusable query must not reach one — otherwise
+/// repeating a query that will always be refused is an unbounded workspace-read
+/// amplifier for whatever calls this.
+///
+/// Proved by making the capture impossible: the worktree is removed, so any
+/// call that reaches `snapshot` fails with the capture's own discriminant
+/// rather than with the query's.
+#[test]
+fn a_refusable_query_never_reaches_the_capture() {
+    let workspace = Workspace::new();
+    workspace.write("src/a.rs", "needle\n");
+    let engine = workspace.indexed();
+    let cancellation = Cancellation::default();
+    // Enough of the checkout to make a capture fail, while the cache the plan
+    // is validated against is untouched.
+    fs::remove_dir_all(workspace.root.join(".git")).unwrap();
+
+    for query in [
+        SearchQuery::exact(""),
+        SearchQuery::regex("fn (").permitting_regex(),
+        SearchQuery::regex("anything"),
+    ] {
+        let refused = engine
+            .search(&query, &cancellation)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            matches!(refused.kind(), "invalid_pattern" | "regex_not_permitted"),
+            "{query:?} answered {} — it reached the capture",
+            refused.kind()
+        );
+    }
+
+    // And the control: a query that *can* run does reach the capture, and fails
+    // there. Without this the assertions above would also pass if `search` had
+    // simply stopped working.
+    let capture_failure = engine
+        .search(&SearchQuery::exact("needle"), &cancellation)
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        !matches!(
+            capture_failure.kind(),
+            "invalid_pattern" | "regex_not_permitted"
+        ),
+        "{capture_failure}"
+    );
+}
+
+/// An unindexed worktree is decided the same way, and for the same reason.
+#[test]
+fn an_unindexed_worktree_is_refused_before_the_capture() {
+    let workspace = Workspace::new();
+    let engine = workspace.engine();
+    fs::remove_dir_all(workspace.root.join(".git")).unwrap();
+
+    let refused = engine
+        .search(&SearchQuery::exact("needle"), &Cancellation::default())
+        .map(|_| ())
+        .unwrap_err();
+
+    assert_eq!(kind_of(&refused), "index_unavailable");
+}
+
 /// A refusal carries the engine's own message about the caller's pattern,
 /// because a person fixing a regular expression needs to know what was wrong
 /// with theirs. What it must never carry is the pattern into a *log*, which is
@@ -956,6 +1205,40 @@ fn an_empty_result_is_a_success_with_no_omissions() {
     assert_eq!(response.dropped_omissions, 0);
     assert!(response.next_cursor.is_none());
     assert!(response.stats.paths_examined > 0, "it really did look");
+}
+
+/// Context lines are clamped by the same bound as the match line, so the bound
+/// fires on them too — and a bound that fired with nothing in the payload
+/// saying so is the one thing the omission list exists to prevent.
+#[test]
+fn a_clamped_context_line_reports_itself_even_when_the_match_line_fits() {
+    let workspace = Workspace::new();
+    workspace.write("src/a.rs", format!("{}\nneedle\n", "x".repeat(200)));
+    let engine = workspace.indexed();
+
+    let response = engine
+        .search(
+            &SearchQuery::exact("needle").with_limits(
+                SearchLimits::new()
+                    .with_context_lines(1)
+                    .with_max_line_bytes(16),
+            ),
+            &Cancellation::default(),
+        )
+        .unwrap();
+
+    let found = &response.matches[0];
+    assert!(!found.line.is_truncated(), "the match line itself fits");
+    assert!(found.before[0].is_truncated());
+    assert!(
+        response.omissions.contains(&SearchOmission::LineTooLong {
+            path: RepoPath::from_path(Path::new("src/a.rs")),
+            byte_offset: 201,
+            limit: 16,
+        }),
+        "{:?}",
+        response.omissions
+    );
 }
 
 #[test]
@@ -1270,7 +1553,7 @@ fn a_filename_match_reads_no_content_and_is_attributed_to_the_path_search() {
     assert_eq!(found.byte_offset, 0);
     assert_eq!(found.content_sha256, None);
     assert_eq!(response.stats.files_scanned, 0);
-    assert_eq!(response.stats.bytes_scanned, 0);
+    assert_eq!(response.stats.bytes_read, 0);
 }
 
 #[test]

@@ -21,9 +21,13 @@
 //! )?;
 //! engine.reindex(&cancellation)?;
 //!
+//! // One capture for the whole paging session, not one per page: a capture
+//! // reads the whole workspace, and five pages stamped with five captures
+//! // would claim five workspace states for one moment.
+//! let snapshot = engine.snapshot(&cancellation)?;
 //! let mut query = SearchQuery::exact("TODO");
 //! loop {
-//!     let page = engine.search(&query, &cancellation)?;
+//!     let page = engine.search_under(&snapshot, &query, &cancellation)?;
 //!     for found in &page.matches {
 //!         println!("{}:{:?}", found.path.display(), found.line_number);
 //!     }
@@ -66,7 +70,10 @@
 //! value, and reading the first as the second is how a bounded search quietly
 //! becomes a wrong one. The bound is checked against the offered match rather
 //! than the stored one, so a page that fills exactly is a complete answer and
-//! not a truncated-looking one.
+//! not a truncated-looking one. Every bound is also *capped* and not merely
+//! defaulted — [`MAX_RESULTS_CAP`], [`MAX_RESPONSE_BYTES_CAP`],
+//! [`MAX_CONTEXT_LINES`], [`MAX_LINE_BYTES_CAP`] — because caller-supplied
+//! numbers may not decide how much memory one response holds.
 //!
 //! **A regular expression is a capability.** [`SearchPattern::Exact`] escapes
 //! every metacharacter, so nothing a caller writes is interpreted and no
@@ -113,8 +120,9 @@ pub use cursor::SearchCursor;
 pub use error::{CursorRefusal, SearchError};
 pub use query::{
     DEFAULT_MAX_LINE_BYTES, DEFAULT_MAX_RESPONSE_BYTES, DEFAULT_MAX_RESULTS, MAX_CONTEXT_LINES,
-    MAX_PATH_PREFIXES, MAX_PATTERN_BYTES, MAX_REGEX_SIZE_BYTES, MAX_RESULTS_CAP, SearchFilters,
-    SearchLimits, SearchPattern, SearchQuery,
+    MAX_LINE_BYTES_CAP, MAX_PATH_PREFIXES, MAX_PATTERN_BYTES, MAX_REGEX_SIZE_BYTES,
+    MAX_RESPONSE_BYTES_CAP, MAX_RESULTS_CAP, SearchFilters, SearchLimits, SearchPattern,
+    SearchQuery,
 };
 pub use result::{
     BoundedText, MAX_SEARCH_OMISSIONS, SearchMatch, SearchOmission, SearchResponse, SearchStats,

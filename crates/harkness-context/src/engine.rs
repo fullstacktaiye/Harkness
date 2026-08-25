@@ -635,11 +635,20 @@ impl ContextEngine {
         query: &SearchQuery,
         cancellation: &Cancellation,
     ) -> Result<SearchResponse, ContextEngineError> {
-        if cancellation.is_cancelled() {
-            return Err(ContextEngineError::Cancelled);
-        }
+        let worktree = self.worktree_key();
+        // Refused before the capture rather than after it. A capture reads the
+        // whole workspace, and a query that cannot run — an empty pattern, a
+        // regular expression without the capability, a cursor from a rebuilt
+        // index — must not cost one. Left the other way round it is also an
+        // amplification lever: repeating a refusable query would drive an
+        // unbounded number of full workspace reads for an answer that was never
+        // going to change.
+        let plan = self.with_cache(|cache| self.scan(cache, &worktree).prepare(query))?;
         let snapshot = self.snapshot(cancellation)?;
-        self.search_under(&snapshot, query, cancellation)
+        self.with_cache(|cache| {
+            self.scan(cache, &worktree)
+                .run(query, &plan, snapshot.id(), cancellation)
+        })
     }
 
     /// The same search, stamped with a capture the caller already holds.
@@ -665,9 +674,6 @@ impl ContextEngine {
         query: &SearchQuery,
         cancellation: &Cancellation,
     ) -> Result<SearchResponse, ContextEngineError> {
-        if cancellation.is_cancelled() {
-            return Err(ContextEngineError::Cancelled);
-        }
         if snapshot.worktree_root() != self.config.worktree_root {
             return Err(ContextEngineError::ForeignSnapshot {
                 expected: self.config.worktree_root.clone(),
@@ -676,14 +682,23 @@ impl ContextEngine {
         }
         let worktree = self.worktree_key();
         self.with_cache(|cache| {
-            Scan {
-                cache,
-                worktree: &worktree,
-                root: &self.config.worktree_root,
-                snapshot: snapshot.id(),
-            }
-            .run(query, cancellation)
+            let scan = self.scan(cache, &worktree);
+            let plan = scan.prepare(query)?;
+            scan.run(query, &plan, snapshot.id(), cancellation)
         })
+    }
+
+    /// The scan this engine's configuration implies, over `cache`.
+    fn scan<'engine>(
+        &'engine self,
+        cache: &'engine IndexCache,
+        worktree: &'engine WorktreeKey,
+    ) -> Scan<'engine> {
+        Scan {
+            cache,
+            worktree,
+            root: &self.config.worktree_root,
+        }
     }
 
     /// The content of one indexed chunk.

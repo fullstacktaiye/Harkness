@@ -868,7 +868,11 @@ what makes the pair unique: two matches sharing a position are two a cursor
 cannot sit between. A query narrowed to several subtrees reads one ordered
 stream per subtree and **merges** them; concatenating them in prefix order is
 wrong, because `sr-x/a` sorts before `sr/a` while the prefix `sr` sorts before
-`sr-x`.
+`sr-x`. Those subtrees must be made disjoint against *every* one already kept
+and not merely against the previous one: a parent sorts before its children but
+is not adjacent to them — `src-gen` falls between `src` and `src/inner` — and
+two overlapping streams emit one file's matches twice, at one position, which is
+the total order this whole section rests on.
 
 **A cursor is a position, not an offset, and it refuses rather than guesses.**
 It is opaque, versioned, and bound both to the `index_generation` it was minted
@@ -888,7 +892,15 @@ distinguishable from one that was cut short: the match that did not fit is the
 proof there was more, exactly as `IndexedPage`'s probe row is on the read side.
 One rule bends and says so: a byte budget smaller than a single match returns
 that match, because an empty page carrying a cursor that points before it is a
-caller paging forever over nothing.
+caller paging forever over nothing. Three things must not be forgotten when a
+bound is added. It reports on **every** value it clamps, context lines included
+— a bound that fired with nothing in the payload saying so is what this whole
+paragraph exists to prevent. The truncation notice lives *outside* the capped
+omission list, because a page whose omissions filled with unreadable files would
+otherwise lose both its notice and — since a cursor is emitted only when a bound
+fired — its continuation. And every bound is **capped** as well as defaulted:
+caller-supplied numbers may not decide how much memory one response holds, so a
+limit with a default and no cap is an unfinished limit.
 
 **Provenance names the bytes that were searched, not the bytes that were
 indexed.** Search re-reads the working tree, so a file that moved since it was
@@ -924,13 +936,19 @@ published bound, marked when clamped, UTF-8 where the *whole source* is UTF-8
 and Base64 otherwise, and the clamp walks back off a multi-byte character rather
 than flipping a line's encoding because of where a limit fell.
 
-**A capture is taken or given, never assumed.** `ContextEngine::search` captures
-a snapshot; `search_under` takes one the caller holds and refuses a capture of
-another checkout with `foreign_snapshot`, comparing the canonical worktree root
-and not the project id. A run stamps every retrieval with the one snapshot it
-recorded, so its evidence describes a single moment; the capture is also several
-times the cost of the scan, which is why both latency targets measure the second
-spelling and print the capture beside the numbers.
+**A capture is taken or given, never assumed — and never taken for a query that
+cannot run.** `ContextEngine::search` captures a snapshot; `search_under` takes
+one the caller holds and refuses a capture of another checkout with
+`foreign_snapshot`, comparing the canonical worktree root and not the project
+id. A run stamps every retrieval with the one snapshot it recorded, so its
+evidence describes a single moment; the capture is also several times the cost
+of the scan, which is why both latency targets measure the second spelling and
+print the capture beside the numbers. Every refusal — the pattern, the
+capability, the filters, the cursor, an unindexed worktree — is therefore
+decided *before* the capture rather than only before the first file is opened.
+Left the other way round it is an amplification lever as well as a waste:
+repeating a query that will always be refused would drive an unbounded number of
+whole-workspace reads.
 
 `docs/context-search.md` is the reference for the query surface, the omission
 table, the refusals, and the budgets.

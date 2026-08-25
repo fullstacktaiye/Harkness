@@ -154,12 +154,25 @@ impl BoundedText {
     /// from, clamped at the same place.
     #[must_use]
     pub fn bytes(&self) -> Vec<u8> {
+        self.shown_bytes().into_owned()
+    }
+
+    /// The same bytes, borrowed where they can be.
+    ///
+    /// The digest every match's provenance carries is taken over these, once
+    /// per match, and for the UTF-8 case they are already sitting in `text` —
+    /// so a page of a thousand matches would otherwise copy and free a
+    /// megabyte of excerpt to hash bytes it already held.
+    #[must_use]
+    pub fn shown_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
         match self.encoding {
-            TextEncoding::Utf8 => self.text.clone().into_bytes(),
+            TextEncoding::Utf8 => std::borrow::Cow::Borrowed(self.text.as_bytes()),
             // Written by this type and never parsed from a caller, so a decode
             // failure is unreachable; answering with no bytes rather than
             // panicking keeps a corrupted value from taking a process down.
-            TextEncoding::Base64 => STANDARD_BASE64.decode(&self.text).unwrap_or_default(),
+            TextEncoding::Base64 => {
+                std::borrow::Cow::Owned(STANDARD_BASE64.decode(&self.text).unwrap_or_default())
+            }
         }
     }
 
@@ -213,10 +226,13 @@ pub struct SearchMatch {
     pub content_sha256: Option<Sha256Hex>,
     /// Where this came from and why it was returned.
     ///
-    /// Its own `content_sha256` covers the excerpt as emitted — after clamping
-    /// — which is what
-    /// [`Provenance::new`](crate::Provenance::new) documents it to mean, and is
-    /// deliberately not the same digest as [`content_sha256`](Self::content_sha256).
+    /// Its own `content_sha256` covers the **matched line** as emitted, after
+    /// clamping — which is exactly the region its `range` names. Context lines
+    /// sit beside it as their own [`BoundedText`]s and are deliberately outside
+    /// both: a digest spanning them would describe a region the range does not,
+    /// and the range is what an edit is applied against. It is therefore not
+    /// the same digest as [`content_sha256`](Self::content_sha256), which
+    /// covers the whole file version that was searched.
     pub provenance: Provenance,
 }
 
@@ -262,10 +278,15 @@ pub enum SearchOmission {
         /// The limit that fired.
         limit: u64,
     },
-    /// A matched line was longer than [`SearchLimits::max_line_bytes`].
+    /// A line in this match's excerpt was longer than
+    /// [`SearchLimits::max_line_bytes`].
     ///
-    /// The match is still returned, clamped and marked; this says that what a
-    /// caller was shown is a prefix of the line rather than the line. Other
+    /// The matched line or one of its context lines — either way the match is
+    /// still returned, clamped and marked, and this says that what a caller was
+    /// shown at that position is a prefix rather than the whole. Context is
+    /// covered because a bound that fired silently is the one thing this list
+    /// exists to make impossible, and a caller reading only `matches` would
+    /// have no reason to look at each context line's own truncation flag. Other
     /// matches in the same file are unaffected.
     ///
     /// [`SearchLimits::max_line_bytes`]: crate::SearchLimits::max_line_bytes
@@ -324,6 +345,25 @@ pub enum SearchOmission {
 }
 
 impl SearchOmission {
+    /// Every stable discriminant this enumeration publishes.
+    ///
+    /// A table for the same reason [`SearchError::KINDS`] is one: these
+    /// spellings reach a payload and a reference table, the type is
+    /// `#[non_exhaustive]` so a caller will match on the string, and a variant
+    /// added with a duplicate or misspelled discriminant would otherwise ship
+    /// with nothing failing.
+    ///
+    /// [`SearchError::KINDS`]: crate::SearchError::KINDS
+    pub const KINDS: &'static [&'static str] = &[
+        "result_budget_exhausted",
+        "byte_budget_exhausted",
+        "line_too_long",
+        "file_unreadable",
+        "file_changed_since_index",
+        "encoding_not_searchable",
+        "binary_content_detected",
+    ];
+
     /// The stable spelling of this omission, for payloads and diagnostics.
     #[must_use]
     pub const fn kind(&self) -> &'static str {
@@ -351,8 +391,14 @@ pub struct SearchStats {
     pub paths_examined: u64,
     /// Files whose content was opened and scanned.
     pub files_scanned: u64,
-    /// Bytes of file content scanned.
-    pub bytes_scanned: u64,
+    /// Bytes of file content read and handed to the scanner.
+    ///
+    /// What the query *cost*, which is the read — not what the scanner
+    /// necessarily examined. Binary detection stops at the first NUL and a
+    /// budget can stop a scan on a file's first match, so the two differ; the
+    /// read is the number a caller sizing a budget wants, and it is the one
+    /// that can be stated exactly.
+    pub bytes_read: u64,
 }
 
 /// One page of a search.

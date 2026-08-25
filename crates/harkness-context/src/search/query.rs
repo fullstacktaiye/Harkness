@@ -45,6 +45,14 @@ pub const MAX_RESULTS_CAP: usize = 1_000;
 /// Bytes of match text a response carries when the caller names no bound.
 pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 256 * 1024;
 
+/// Most bytes of match text one response may carry, whatever the caller asks.
+///
+/// Every bound in this crate is capped and not merely defaulted, for the reason
+/// [`MAX_PATTERN_BYTES`] states: caller-supplied input may not decide how much
+/// memory Harkness holds. Without this, a thousand matches each carrying eleven
+/// megabyte-long lines is a response a caller can ask for in one call.
+pub const MAX_RESPONSE_BYTES_CAP: u64 = 8 * 1024 * 1024;
+
 /// Most context lines a match may carry on either side.
 pub const MAX_CONTEXT_LINES: u32 = 5;
 
@@ -54,6 +62,14 @@ pub const MAX_CONTEXT_LINES: u32 = 5;
 /// contain one. The bound is per line rather than per file so the other matches
 /// in such a file still arrive.
 pub const DEFAULT_MAX_LINE_BYTES: u64 = 8 * 1024;
+
+/// Most bytes of one line a response may carry, whatever the caller asks.
+///
+/// A match carries up to `1 + 2 *` [`MAX_CONTEXT_LINES`] lines, so this and
+/// [`MAX_RESPONSE_BYTES_CAP`] together are what bound a page: the byte budget
+/// stops the page, and this stops the single match the byte budget is allowed
+/// to let through when nothing else has fitted yet.
+pub const MAX_LINE_BYTES_CAP: u64 = 64 * 1024;
 
 /// Largest compiled program a pattern may produce.
 ///
@@ -166,6 +182,14 @@ impl SearchFilters {
     /// and never `src-generated.rs`. An empty prefix is the worktree root and
     /// is dropped rather than stored, since it narrows nothing.
     ///
+    /// Narrowing is idempotent and absorbing: naming one directory twice, or
+    /// naming a directory already covered by another, adds nothing. The
+    /// normalization happens here rather than only at
+    /// [`prefixes`](Self::prefixes), so the count that
+    /// [`MAX_PATH_PREFIXES`] bounds is the number of *distinct subtrees* the
+    /// merge will actually stream rather than the number of times a caller
+    /// spelled one.
+    ///
     /// # Errors
     ///
     /// [`SearchError::ForbiddenPath`] for an absolute path, a path leaving the
@@ -173,6 +197,12 @@ impl SearchFilters {
     /// never reaches the filesystem — it is compared against stored path bytes
     /// — so this is about what a caller may *express* rather than about what it
     /// could reach.
+    ///
+    /// [`SearchError::TooManyFilters`] past [`MAX_PATH_PREFIXES`] distinct
+    /// subtrees. Deliberately not a `forbidden_path`: a size limit and a path
+    /// outside the workspace lead a front end to say opposite things, and
+    /// telling somebody their sixty-fifth perfectly ordinary `src/` filter left
+    /// the worktree is the worse of the two.
     pub fn under(mut self, prefix: impl AsRef<Path>) -> Result<Self, SearchError> {
         let prefix = prefix.as_ref();
         let forbidden = |reason: &'static str| SearchError::ForbiddenPath {
@@ -197,12 +227,13 @@ impl SearchFilters {
         if path.is_empty() {
             return Ok(self);
         }
-        if self.prefixes.len() >= MAX_PATH_PREFIXES {
-            return Err(forbidden(
-                "the query already names as many prefixes as it may",
-            ));
-        }
         self.prefixes.push(path);
+        self.prefixes = normalize(&self.prefixes);
+        if self.prefixes.len() > MAX_PATH_PREFIXES {
+            return Err(SearchError::TooManyFilters {
+                limit: MAX_PATH_PREFIXES,
+            });
+        }
         Ok(self)
     }
 
@@ -220,24 +251,20 @@ impl SearchFilters {
     /// The subtrees this query is narrowed to, sorted and made disjoint.
     ///
     /// Sorted so a merge over them yields one global path order, and disjoint
-    /// so no file can be visited twice: a prefix covered by another prefix in
-    /// the same query contributes nothing but duplicates.
+    /// so no file can be visited twice: two overlapping prefixes would stream
+    /// one file down two paths, and the merge would then emit its matches
+    /// twice — two matches sharing a `(path, byte_offset)` position, which is
+    /// exactly the total order a cursor has to be able to sit inside.
+    ///
+    /// A parent always sorts before its own children, but it is **not**
+    /// necessarily adjacent to them: `src-gen` falls between `src` and
+    /// `src/inner`, because `-` is `0x2d` and the separator is `0x2f`. Every
+    /// kept prefix is therefore consulted rather than only the last one — the
+    /// list is bounded by [`MAX_PATH_PREFIXES`], so the scan costs nothing
+    /// worth optimizing away.
     #[must_use]
     pub fn prefixes(&self) -> Vec<RepoPath> {
-        let mut sorted = self.prefixes.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        let mut disjoint: Vec<RepoPath> = Vec::with_capacity(sorted.len());
-        for candidate in sorted {
-            if disjoint
-                .last()
-                .is_some_and(|kept| kept.contains(&candidate))
-            {
-                continue;
-            }
-            disjoint.push(candidate);
-        }
-        disjoint
+        normalize(&self.prefixes)
     }
 
     /// The classes this query is narrowed to; empty means every class.
@@ -251,6 +278,26 @@ impl SearchFilters {
     pub fn admits(&self, class: FileClass) -> bool {
         self.classes.is_empty() || self.classes.contains(&class)
     }
+}
+
+/// Sorts `prefixes` and drops every one another already covers.
+///
+/// A parent sorts before its own children, so one pass suffices — but it is
+/// *not* adjacent to them, which is the whole reason every kept prefix is
+/// consulted rather than only the most recent: `src-gen` sorts between `src`
+/// and `src/inner`, because `-` is `0x2d` and the separator is `0x2f`.
+fn normalize(prefixes: &[RepoPath]) -> Vec<RepoPath> {
+    let mut sorted = prefixes.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut disjoint: Vec<RepoPath> = Vec::with_capacity(sorted.len());
+    for candidate in sorted {
+        if disjoint.iter().any(|kept| kept.contains(&candidate)) {
+            continue;
+        }
+        disjoint.push(candidate);
+    }
+    disjoint
 }
 
 /// How much one response may hold.
@@ -298,12 +345,14 @@ impl SearchLimits {
         self
     }
 
-    /// Sets how many bytes of match text a response may carry. Zero is read as
-    /// the default.
+    /// Sets how many bytes of match text a response may carry, clamped to
+    /// [`MAX_RESPONSE_BYTES_CAP`]. Zero is read as the default.
     #[must_use]
     pub const fn with_max_bytes(mut self, bytes: u64) -> Self {
         self.max_bytes = if bytes == 0 {
             DEFAULT_MAX_RESPONSE_BYTES
+        } else if bytes > MAX_RESPONSE_BYTES_CAP {
+            MAX_RESPONSE_BYTES_CAP
         } else {
             bytes
         };
@@ -322,12 +371,14 @@ impl SearchLimits {
         self
     }
 
-    /// Sets how many bytes of one line a match may carry. Zero is read as the
-    /// default.
+    /// Sets how many bytes of one line a match may carry, clamped to
+    /// [`MAX_LINE_BYTES_CAP`]. Zero is read as the default.
     #[must_use]
     pub const fn with_max_line_bytes(mut self, bytes: u64) -> Self {
         self.max_line_bytes = if bytes == 0 {
             DEFAULT_MAX_LINE_BYTES
+        } else if bytes > MAX_LINE_BYTES_CAP {
+            MAX_LINE_BYTES_CAP
         } else {
             bytes
         };

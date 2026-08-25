@@ -20,6 +20,22 @@
 //! query identity, so a token cannot be replayed against a different pattern;
 //! and the version, so a token this build does not understand is not guessed at.
 //!
+//! The generation is `index_meta.index_generation` and deliberately not
+//! `worktrees.last_generation`. The batch watermark moves every time anything is
+//! committed, so binding to it would refuse every outstanding cursor each time
+//! one file was saved — paging would stop working in exactly the workspace a
+//! watcher is keeping current. What a cursor must survive is an ordinary edit;
+//! what it must not survive is the cache being thrown away and rebuilt, which is
+//! the only thing that moves this token.
+//!
+//! It is compared against *this process's* view of that value, which moves on a
+//! `refresh` rather than the instant another process recreates the file. The
+//! residual is stated rather than closed: a sibling process that disposes the
+//! cache leaves this one reading the database it already holds open — a stale
+//! answer, consistently paged, rather than two generations mixed into one result
+//! set. Widening the check to a fresh read per page would buy nothing, since the
+//! rows come from the handle either way.
+//!
 //! [`LogCursor`]: harkness_git::LogCursor
 
 use base64::Engine as _;

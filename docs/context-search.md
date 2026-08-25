@@ -58,14 +58,17 @@ indexed is searched **as it is now**, and the answer says so.
 | path prefixes | repository-relative directories | the whole worktree |
 | classes | a set of `FileClass` values | every eligible class |
 | max results | matches per page | 200, capped at 1,000 |
-| max bytes | match text per page | 256 KiB |
+| max bytes | match text per page | 256 KiB, capped at 8 MiB |
 | context lines | lines either side of a match | 0, capped at 5 |
-| max line bytes | one match line | 8 KiB |
+| max line bytes | one line of an excerpt | 8 KiB, capped at 64 KiB |
 | cursor | a previous page's continuation | none |
 
 Limits are **clamped rather than refused**. A caller asking for ten thousand
 results gets a thousand and a cursor; asking for zero gets the default. A query
 that failed on a number would be a query every front end had to validate twice.
+Every one of the four is *capped* as well as defaulted, because caller-supplied
+numbers may not decide how much memory one response holds — a thousand matches
+each carrying eleven megabyte-long lines is otherwise a single call away.
 
 Path prefixes narrow and can never widen: they are compared against stored path
 bytes and never reach the filesystem. Containment requires the separator, so
@@ -73,6 +76,12 @@ bytes and never reach the filesystem. Containment requires the separator, so
 is absolute, or that leaves the worktree through `..`, is refused with
 `forbidden_path` — not because it could reach anything, but because answering it
 would teach a caller that such a path is expressible here.
+
+Prefixes are normalized as they are added: naming one directory twice, or naming
+one another already covers, adds nothing. Past 64 **distinct subtrees** the query
+is refused with `too_many_filters` — deliberately not `forbidden_path`, because
+a size limit and a path outside the workspace lead a front end to say opposite
+things.
 
 ### A regular expression is a capability
 
@@ -108,7 +117,7 @@ SearchResponse
 ├── matches[]                  the answer, in canonical order
 ├── omissions[], dropped_omissions   everything left out
 ├── next_cursor                where to continue, when a budget fired
-└── stats                      paths examined, files scanned, bytes scanned
+└── stats                      paths examined, files scanned, bytes read
 ```
 
 The first two name the **call** and everything else names the **answer**. Two
@@ -157,7 +166,7 @@ Every bound that fires puts an omission in the **success** payload:
 | --- | --- |
 | `result_budget_exhausted` | the page filled and there was more |
 | `byte_budget_exhausted` | the page's match text filled and there was more |
-| `line_too_long` | a matched line was longer than the per-line bound; the match is returned clamped and marked |
+| `line_too_long` | the matched line **or one of its context lines** was longer than the per-line bound; the match is returned clamped and marked |
 | `file_unreadable` | a file the index lists could not be opened |
 | `file_changed_since_index` | a file's bytes are not the ones the index recorded; it was searched as it is now |
 | `encoding_not_searchable` | a UTF-16 file, which this scan does not transcode |
@@ -198,12 +207,18 @@ value. A file that moved between indexing and reading is stamped with what it
 **is**, not with what the index remembered, so provenance never names a version
 nothing held.
 
-Text is bounded and self-describing. Valid UTF-8 travels as itself; anything
-else travels Base64 with `content_encoding: "base64"`, which is the convention
-the diff payload already publishes. A clamp walks back off a multi-byte
-character rather than emitting half of one, and the encoding is decided by the
-whole source rather than by the clamped prefix — otherwise a line would flip
-from `utf8` to `base64` because of where a limit happened to fall.
+Neither covers the context lines. `provenance.content_sha256` covers exactly the
+region `provenance.range` names, which is the matched line; context lines sit
+beside it as their own `BoundedText`s. A digest spanning them would describe a
+region the range does not, and the range is what an edit is applied against.
+
+Text is bounded and self-describing. Every excerpt is a `BoundedText` carrying
+a `TextEncoding`: valid UTF-8 travels as itself, anything else travels Base64,
+and a wire projection spells that pair `content_encoding: "utf8" | "base64"`,
+following the convention the diff payload already publishes. A clamp walks back
+off a multi-byte character rather than emitting half of one, and the encoding is
+decided by the whole source rather than by the clamped prefix — otherwise a line
+would flip from `utf8` to `base64` because of where a limit happened to fall.
 
 ## Filename search
 
@@ -240,12 +255,20 @@ method would stamp its evidence with five workspace states for one moment.
 
 | Kind | Means |
 | --- | --- |
-| `invalid_pattern` | empty, too long, will not compile, or compiles past its size limit — refused before a file is opened |
+| `invalid_pattern` | empty, too long, will not compile, or compiles past its size limit |
 | `regex_not_permitted` | a regular expression arrived without the capability |
-| `forbidden_path` | a path filter is absolute, leaves the worktree, or is one prefix too many |
+| `forbidden_path` | a path filter is absolute or leaves the worktree |
+| `too_many_filters` | the query narrows to more distinct subtrees than the merge streams |
 | `stale_search_cursor` | a continuation cannot be used; see the table above |
 | `index_unavailable` | the worktree has no index — build one |
 | `cancelled` | the token was observed; no partial page is returned |
+
+Every one of these is decided **before the workspace capture**, not only before
+the first file is opened. A capture reads the whole worktree and costs several
+times what the scan does, so a query that cannot run must not pay for one — and
+left the other way round it would be an amplification lever: repeating a
+refusable query would drive an unbounded number of full workspace reads for an
+answer that was never going to change.
 
 A cancelled search yields **no** partial response. A caller that stopped one did
 not ask for the prefix of an answer, and a partial page under the same shape as a
@@ -283,7 +306,11 @@ ADR-0005 records the alternative that was refused, and the trade it accepts.
 | Ordering is path bytes then byte offset | `harkness-context` | `search::tests::matches_are_ordered_by_path_bytes_then_byte_offset` |
 | Several prefixes merge into one global order | `harkness-context` | `search::tests::several_prefixes_merge_into_one_global_path_order` |
 | Prefixes are normalized into a disjoint set | `harkness-context` | `search::tests::prefixes_are_normalized_into_a_sorted_disjoint_set` |
+| A child prefix is dropped past a sibling sorting between | `harkness-context` | `search::tests::a_child_prefix_is_dropped_even_when_a_sibling_sorts_between_it_and_its_parent` |
+| Overlapping prefixes never report one file twice | `harkness-context` | `search::tests::overlapping_prefixes_never_report_one_file_twice` |
+| More subtrees than the merge streams is its own refusal | `harkness-context` | `search::tests::a_query_may_not_name_more_subtrees_than_the_merge_holds` |
 | Paging is exactly the unpaged answer | `harkness-context` | `search::tests::paging_yields_exactly_the_unpaged_answer_at_every_page_size` |
+| Paging a filename query is exactly the unpaged answer | `harkness-context` | `search::tests::paging_a_filename_query_yields_exactly_the_unpaged_answer` |
 | A page that fills exactly is complete | `harkness-context` | `search::tests::a_page_that_fills_exactly_carries_no_cursor` |
 | A result budget hands back a usable cursor | `harkness-context` | `search::tests::a_result_budget_reports_itself_and_hands_back_a_usable_cursor` |
 | A byte budget stops at the boundary | `harkness-context` | `search::tests::a_byte_budget_reports_itself_and_stops_at_the_boundary` |
@@ -301,9 +328,13 @@ ADR-0005 records the alternative that was refused, and the trade it accepts.
 | Regex needs the capability | `harkness-context` | `search::tests::a_regex_query_is_refused_without_the_capability_and_runs_with_it` |
 | An exact pattern is literal | `harkness-context` | `search::tests::an_exact_pattern_matches_its_metacharacters_literally` |
 | An unrunnable pattern is refused before any I/O | `harkness-context` | `search::tests::a_pattern_that_cannot_be_run_is_refused_before_a_file_is_opened` |
+| A refusable query never reaches the capture | `harkness-context` | `search::tests::a_refusable_query_never_reaches_the_capture` |
+| An unindexed worktree is refused before the capture | `harkness-context` | `search::tests::an_unindexed_worktree_is_refused_before_the_capture` |
 | A refusal explains itself | `harkness-context` | `search::tests::an_invalid_pattern_refusal_explains_itself` |
 | Limits are clamped rather than refused | `harkness-context` | `search::tests::limits_are_clamped_rather_than_refused` |
+| No caller-supplied bound exceeds its cap | `harkness-context` | `search::tests::no_caller_supplied_bound_can_exceed_its_published_cap` |
 | A long line is clamped and reported | `harkness-context` | `search::tests::a_long_line_is_clamped_and_the_omission_says_which_position` |
+| A clamped context line reports itself | `harkness-context` | `search::tests::a_clamped_context_line_reports_itself_even_when_the_match_line_fits` |
 | Non-UTF-8 content is Base64 and exact | `harkness-context` | `search::tests::non_utf8_match_content_is_base64_and_reconstructs_the_exact_bytes` |
 | A non-UTF-8 path carries its exact bytes | `harkness-context` | `search::tests::a_filename_match_on_a_path_that_is_not_utf8_carries_its_exact_bytes` |
 | Bounded text never cuts a character in half | `harkness-context` | `search::tests::bounded_text_round_trips_and_never_cuts_a_character_in_half` |
@@ -318,6 +349,7 @@ ADR-0005 records the alternative that was refused, and the trade it accepts.
 | A capture of another checkout is refused | `harkness-context` | `search::tests::a_capture_of_another_checkout_is_refused_rather_than_stamped_onto_results` |
 | Cancellation yields no partial page | `harkness-context` | `search::tests::a_cancelled_search_yields_no_partial_page` |
 | `SearchError::KINDS` is exact | `harkness-context` | `search::tests::every_search_variant_maps_to_a_listed_kind_in_declaration_order` |
+| `SearchOmission::KINDS` is exact | `harkness-context` | `search::tests::every_omission_variant_maps_to_a_listed_kind_in_declaration_order` |
 | A cursor is bound to what decides its matches | `harkness-context` | `search::tests::a_query_identity_covers_what_decides_its_matches_and_not_its_page_size` |
 | A search refusal keeps its own discriminant | `harkness-context` | `error::tests::a_carried_search_refusal_keeps_its_own_kind_but_not_its_own_cancellation` |
 | An unindexed worktree refuses rather than answers | `harkness-context` | `searching_an_unindexed_worktree_refuses_rather_than_answering_empty` |

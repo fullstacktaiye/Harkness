@@ -76,7 +76,7 @@ const UTF16_BE_BOM: &[u8] = &[0xfe, 0xff];
 ///
 /// The pattern is compiled and every bound resolved before the first row is
 /// read, so a query that cannot run costs no I/O at all.
-struct Plan {
+pub(crate) struct Plan {
     kind: &'static str,
     matcher: RegexMatcher,
     /// Whether the matcher is run against paths rather than against content.
@@ -86,6 +86,9 @@ struct Plan {
     limits: SearchLimits,
     identity: Sha256Hex,
     cursor: Option<SearchCursor>,
+    /// The generation the cursor was admitted against and the next one is
+    /// minted from, read once so the two cannot disagree.
+    generation: u64,
 }
 
 impl Plan {
@@ -160,6 +163,7 @@ impl Plan {
             limits: *query.limits(),
             identity,
             cursor,
+            generation,
         })
     }
 }
@@ -192,23 +196,19 @@ pub(crate) struct Scan<'engine> {
     pub(crate) worktree: &'engine WorktreeKey,
     /// The canonical worktree root every path is resolved against.
     pub(crate) root: &'engine Path,
-    /// The capture the matches are stamped with.
-    pub(crate) snapshot: SnapshotId,
 }
 
 impl Scan<'_> {
-    /// Runs `query` and returns one bounded page.
-    pub(crate) fn run(
-        &self,
-        query: &SearchQuery,
-        cancellation: &Cancellation,
-    ) -> Result<SearchResponse, ContextEngineError> {
-        if cancellation.is_cancelled() {
-            return Err(ContextEngineError::Cancelled);
-        }
-        let generation = self.cache.generation();
-        let plan = Plan::compile(query, generation)?;
-
+    /// Everything a query can be refused for, decided with no capture taken.
+    ///
+    /// Separate from [`run`](Self::run) because the capture that stamps the
+    /// answer reads the *whole workspace* — several times the cost of the scan
+    /// on a repository of any size — and a query that cannot run must not cost
+    /// one. It is also the amplification a caller could otherwise reach for:
+    /// repeating a regular-expression query it holds no capability for would
+    /// drive an unbounded number of full workspace reads for an answer that was
+    /// always going to be `regex_not_permitted`.
+    pub(crate) fn prepare(&self, query: &SearchQuery) -> Result<Plan, ContextEngineError> {
         // Asked before anything is read, and answered from the watermark rather
         // than from a row count: a worktree with rows is indexed, and one
         // without them is a question this module must not answer with "no
@@ -220,40 +220,52 @@ impl Scan<'_> {
             }
             .into());
         }
+        Ok(Plan::compile(query, self.cache.generation())?)
+    }
 
+    /// Runs a prepared query and returns one bounded page.
+    pub(crate) fn run(
+        &self,
+        query: &SearchQuery,
+        plan: &Plan,
+        snapshot: SnapshotId,
+        cancellation: &Cancellation,
+    ) -> Result<SearchResponse, ContextEngineError> {
+        if cancellation.is_cancelled() {
+            return Err(ContextEngineError::Cancelled);
+        }
+        let generation = plan.generation;
         let mut rows = RowStream::open(self.cache, self.worktree, query, plan.cursor.as_ref())?;
-        let mut collector = Collector::new(plan.limits);
-        let mut stats = SearchStats::default();
-        // One searcher for the whole scan rather than one per file: it owns a
-        // line buffer, and a query over ten thousand files would otherwise
-        // build and drop ten thousand of them.
-        let mut searcher = line_searcher();
+        let mut progress = Progress {
+            collector: Collector::new(plan.limits),
+            stats: SearchStats::default(),
+            // One searcher for the whole scan rather than one per file: it owns
+            // a line buffer, and a query over ten thousand files would
+            // otherwise build and drop ten thousand of them.
+            searcher: line_searcher(),
+        };
 
         while let Some(row) = rows.next(cancellation)? {
             if cancellation.is_cancelled() {
                 return Err(ContextEngineError::Cancelled);
             }
-            stats.paths_examined += 1;
+            progress.stats.paths_examined += 1;
             if !row.eligible() || !query.filters().admits(row.class) {
                 continue;
             }
             let carried = if plan.over_paths {
-                self.offer_filename(&row, &plan, &mut collector)
+                self.offer_filename(&row, plan, snapshot, &mut progress)
             } else {
-                self.scan_content(
-                    &row,
-                    &plan,
-                    &mut searcher,
-                    &mut collector,
-                    &mut stats,
-                    cancellation,
-                )?
+                self.scan_content(&row, plan, snapshot, &mut progress, cancellation)?
             };
             if !carried {
                 break;
             }
         }
 
+        let Progress {
+            collector, stats, ..
+        } = progress;
         let (matches, omissions, dropped, truncated) = collector.finish();
         // A cursor only when a bound actually fired. A page that happens to hold
         // exactly `max_results` matches because the repository holds exactly
@@ -275,7 +287,7 @@ impl Scan<'_> {
             pattern_kind = plan.kind,
             paths_examined = stats.paths_examined,
             files_scanned = stats.files_scanned,
-            bytes_scanned = stats.bytes_scanned,
+            bytes_read = stats.bytes_read,
             matches = matches.len(),
             omissions = omissions.len(),
             dropped_omissions = dropped,
@@ -285,7 +297,7 @@ impl Scan<'_> {
 
         Ok(SearchResponse {
             query_id: ContextQueryId::new(),
-            snapshot_id: self.snapshot,
+            snapshot_id: snapshot,
             index_generation: generation,
             matches,
             omissions,
@@ -298,19 +310,40 @@ impl Scan<'_> {
     /// Offers one filename match, if the path holds the requested substring.
     ///
     /// Returns whether the scan may continue.
-    fn offer_filename(&self, row: &IndexedFile, plan: &Plan, collector: &mut Collector) -> bool {
+    fn offer_filename(
+        &self,
+        row: &IndexedFile,
+        plan: &Plan,
+        snapshot: SnapshotId,
+        progress: &mut Progress,
+    ) -> bool {
         if !plan.matcher.is_match(row.path.as_bytes()).unwrap_or(false) {
             return true;
         }
+        // The cursor's own row is fetched by name, because a *content* page may
+        // have stopped in the middle of a file. A filename match holds one
+        // position per file, so the seeded row is always one the previous page
+        // already returned — and offering it again is how the same match ends
+        // every page and starts the next.
+        if plan
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.precedes(&row.path, 0))
+        {
+            return true;
+        }
         let line = BoundedText::clamped(row.path.as_bytes(), plan.limits.max_line_bytes());
-        let shown = line.bytes();
-        let mut provenance =
-            Provenance::new(plan.source, self.snapshot, &shown, plan.reason.clone())
-                .at_path(row.path.clone());
+        let mut provenance = Provenance::new(
+            plan.source,
+            snapshot,
+            &line.shown_bytes(),
+            plan.reason.clone(),
+        )
+        .at_path(row.path.clone());
         if line.is_truncated() {
             provenance = provenance.truncated();
         }
-        collector.offer(SearchMatch {
+        progress.collector.offer(SearchMatch {
             path: row.path.clone(),
             byte_offset: 0,
             line_number: None,
@@ -332,11 +365,15 @@ impl Scan<'_> {
         &self,
         row: &IndexedFile,
         plan: &Plan,
-        searcher: &mut Searcher,
-        collector: &mut Collector,
-        stats: &mut SearchStats,
+        snapshot: SnapshotId,
+        progress: &mut Progress,
         cancellation: &Cancellation,
     ) -> Result<bool, ContextEngineError> {
+        let Progress {
+            collector,
+            stats,
+            searcher,
+        } = progress;
         let absolute = self.root.join(row.path.to_path_buf());
         let Ok(metadata) = std::fs::symlink_metadata(&absolute) else {
             collector.omit(SearchOmission::FileUnreadable {
@@ -392,11 +429,11 @@ impl Scan<'_> {
         }
 
         stats.files_scanned += 1;
-        stats.bytes_scanned += bytes.len() as u64;
+        stats.bytes_read += bytes.len() as u64;
 
         let mut sink = MatchSink {
-            scan: self,
             plan,
+            snapshot,
             collector,
             row,
             bytes: &bytes,
@@ -472,10 +509,22 @@ fn read_bounded(path: &Path, expected: u64) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// The mutable state one scan carries from file to file.
+///
+/// Carried as one value rather than as three parameters: they are threaded
+/// together through every step of a scan, and a signature that named each of
+/// them separately would grow by one every time a scan learned to count
+/// something else.
+struct Progress {
+    collector: Collector,
+    stats: SearchStats,
+    searcher: Searcher,
+}
+
 /// Turns the searcher's per-line callbacks into offered matches.
-struct MatchSink<'scan, 'run> {
-    scan: &'scan Scan<'scan>,
+struct MatchSink<'run> {
     plan: &'run Plan,
+    snapshot: SnapshotId,
     collector: &'run mut Collector,
     row: &'run IndexedFile,
     bytes: &'run [u8],
@@ -489,7 +538,7 @@ struct MatchSink<'scan, 'run> {
     cancelled: bool,
 }
 
-impl MatchSink<'_, '_> {
+impl MatchSink<'_> {
     /// The digest of the bytes actually searched, computed on demand.
     ///
     /// Lazily, because a query over ten thousand files matches in a handful of
@@ -499,18 +548,18 @@ impl MatchSink<'_, '_> {
     /// coarse modification times are a real filesystem, and the reconciler
     /// states the same residual for the same reason.
     fn digest(&mut self) -> Sha256Hex {
-        if self.digest.is_none() {
-            let observed = Sha256Hex::of(self.bytes);
-            if self.row.content_sha256.as_ref() != Some(&observed) {
-                *self.moved = true;
-            }
-            self.digest = Some(observed);
+        if let Some(known) = self.digest.as_ref() {
+            return known.clone();
         }
-        self.digest.clone().expect("just computed")
+        let observed = Sha256Hex::of(self.bytes);
+        if self.row.content_sha256.as_ref() != Some(&observed) {
+            *self.moved = true;
+        }
+        self.digest.insert(observed).clone()
     }
 }
 
-impl Sink for MatchSink<'_, '_> {
+impl Sink for MatchSink<'_> {
     type Error = io::Error;
 
     fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, io::Error> {
@@ -540,7 +589,6 @@ impl Sink for MatchSink<'_, '_> {
 
         let limit = self.plan.limits.max_line_bytes();
         let line = BoundedText::clamped(content, limit);
-        let shown = line.bytes();
         let context = usize::try_from(self.plan.limits.context_lines()).unwrap_or(0);
         let before = preceding_lines(self.bytes, line_start, context, limit);
         let after = following_lines(self.bytes, line_start + raw.len(), context, limit);
@@ -549,10 +597,15 @@ impl Sink for MatchSink<'_, '_> {
         if let Some(number) = line_number.and_then(|number| u32::try_from(number).ok()) {
             range = range.with_lines(number, number);
         }
+        // The digest covers the matched line as emitted, which is what `range`
+        // names. Context lines sit beside it as their own bounded texts and are
+        // deliberately outside both: a digest spanning them would describe a
+        // region the range does not, and the range is what an edit is applied
+        // against.
         let mut provenance = Provenance::new(
             self.plan.source,
-            self.scan.snapshot,
-            &shown,
+            self.snapshot,
+            &line.shown_bytes(),
             self.plan.reason.clone(),
         )
         .at_path(self.row.path.clone())
@@ -704,7 +757,18 @@ impl Collector {
             });
             return false;
         }
-        if candidate.line.is_truncated() {
+        // Context lines are clamped by the same bound as the match line, so
+        // they are asked about here too: a bound that fired with nothing in the
+        // payload saying so is the one failure this list exists to prevent, and
+        // a caller reading `matches` has no reason to inspect each context
+        // line's own truncation flag.
+        let clamped = candidate.line.is_truncated()
+            || candidate
+                .before
+                .iter()
+                .chain(candidate.after.iter())
+                .any(BoundedText::is_truncated);
+        if clamped {
             self.omit(SearchOmission::LineTooLong {
                 path: candidate.path.clone(),
                 byte_offset: candidate.byte_offset,
