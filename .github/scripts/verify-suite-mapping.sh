@@ -69,6 +69,7 @@ latency-cancellation-visible
 latency-approval-dispatch
 latency-streaming-assembly
 latency-inventory-walk
+latency-chunking-1mib
 '
 
 # Rows are `| `scenario` | … | `package` | `test` |`, with an optional budget

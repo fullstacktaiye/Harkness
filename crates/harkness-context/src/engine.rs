@@ -585,13 +585,15 @@ impl ContextEngine {
         Err(unavailable("search"))
     }
 
-    /// The content of one indexed chunk ([#113]).
+    /// The content of one indexed chunk.
     ///
     /// # Errors
     ///
-    /// [`ContextEngineError::NotYetAvailable`] until [#113] lands.
+    /// [`ContextEngineError::NotYetAvailable`] until the index persistence and
+    /// retrieval work in [#114] and [#123] lands.
     ///
-    /// [#113]: https://github.com/fullstacktaiye/harkness/issues/113
+    /// [#114]: https://github.com/fullstacktaiye/harkness/issues/114
+    /// [#123]: https://github.com/fullstacktaiye/harkness/issues/123
     pub fn read_chunk(
         &self,
         id: &ChunkId,
@@ -930,11 +932,11 @@ impl PackRequest {
 #[non_exhaustive]
 pub struct SearchResults {}
 
-/// The content of one indexed chunk ([#113]).
+/// The content of one indexed chunk ([#123]).
 ///
 /// Empty for the reason [`FileInventory`] is.
 ///
-/// [#113]: https://github.com/fullstacktaiye/harkness/issues/113
+/// [#123]: https://github.com/fullstacktaiye/harkness/issues/123
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct ChunkContent {}

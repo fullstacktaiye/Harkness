@@ -32,6 +32,7 @@ const DOCUMENTS: &[&str] = &[
     "docs/acp.md",
     "docs/architecture-context.md",
     "docs/context-inventory.md",
+    "docs/context-identity.md",
     "docs/filesystem-and-process-safety.md",
 ];
 

@@ -77,12 +77,21 @@
 //! `docs/context-inventory.md` is the reference: the whole denial list, every
 //! class with its heuristics, and how a repository tightens what Harkness reads.
 //!
+//! # Stable chunks
+//!
+//! [`FileVersion`] binds an eligible inventory entry to its exact bytes and
+//! [`chunk_file`] turns that version into bounded [`ChunkRecord`] values.
+//! Structural anchors decide identity while [`ByteRange`] remains position
+//! metadata, so an edit above an unchanged function moves its range without
+//! invalidating its chunk. `docs/context-identity.md` freezes the derivation,
+//! fallback honesty, encoding rules, and [`CHUNKING_VERSION`] bump procedure.
+//!
 //! # What is not here
 //!
-//! No chunking ([#113]), no index content tables ([#114]), no search ([#116]),
-//! no symbol extraction ([#117]), and no provider or token concepts ([#111],
-//! [#122]). The identifiers and the facade signatures those issues need are
-//! defined here so that none of them has to invent one.
+//! No index content tables ([#114]), no search ([#116]), no symbol extraction
+//! ([#117]), and no provider or token concepts ([#111], [#122]). The
+//! identifiers and facade signatures those issues need are defined here so
+//! that none of them has to invent one.
 //!
 //! [#111]: https://github.com/fullstacktaiye/harkness/issues/111
 //! [#112]: https://github.com/fullstacktaiye/harkness/issues/112
@@ -94,6 +103,7 @@
 
 #![warn(missing_docs)]
 
+mod chunk;
 mod classify;
 mod digest;
 mod engine;
@@ -108,6 +118,12 @@ mod snapshot;
 mod text;
 mod wire;
 
+pub use chunk::{
+    Anchor, CHUNK_OVERLAP_LINES, CHUNKING_VERSION, ChunkError, ChunkRecord, ChunkSet,
+    ChunkStrategy, ChunkTruncation, Chunker, ConfigChunker, ContentEncoding, FileVersion, Language,
+    MAX_CHUNK_BYTES, MAX_CHUNKS_PER_FILE, MIN_WHOLE_FILE_BYTES, MarkdownChunker, OutlineNode,
+    SourceChunker, StructuralOutline, TARGET_CHUNK_BYTES, WholeFileChunker, chunk_file,
+};
 pub use classify::{
     BINARY_SNIFF_BYTES, CLASSIFY_VERSION, FileClass, FileSample, OVERSIZED_FILE_THRESHOLD,
 };

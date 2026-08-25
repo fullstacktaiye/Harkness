@@ -176,6 +176,7 @@ sh .github/scripts/run-ignored-exact-test.sh \
 | `latency-approval-dispatch` | 10 ms | `harkness-runtime` | `coordinator::tests::approval_decision_to_tool_dispatch_stays_below_ten_milliseconds` |
 | `latency-streaming-assembly` | 10 µs | `harkness-provider` | `assemble::assembler::tests::event_dispatch_meets_the_latency_target` |
 | `latency-inventory-walk` | 1.5 s | `harkness-context` | `inventory::tests::a_medium_repository_meets_the_walk_latency_target` |
+| `latency-chunking-1mib` | 20 ms | `harkness-context` | `chunk::tests::chunking_one_megabyte_meets_the_latency_target` |
 
 `latency-per-call-overhead` has three entries because the same budget is paid in
 three different arrangements, and only one of them is the one that ships: an
