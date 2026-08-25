@@ -760,6 +760,50 @@ fn reindexing_reconciles_a_version_skew_before_it_writes() {
     );
 }
 
+/// A cache another process is writing costs *retrieval* and nothing else. The
+/// engine's Git-backed half — workspace identity and the walk above all — is
+/// what a run cannot proceed without, so a caller met by `index_busy` degrades
+/// to reading the workspace live rather than stopping.
+#[test]
+fn a_contended_cache_costs_the_index_and_not_the_workspace() {
+    let (workspace, engine) = workspace_with(&[("a.rs", "fn a() {}\n")]);
+    let cancellation = Cancellation::default();
+    engine.reindex(&cancellation).unwrap();
+
+    // The write lock, held by somebody else. In WAL mode this is exactly what
+    // one front end indexing while another wants to looks like: readers are
+    // untouched and the *writer* is the one that has to wait or give up.
+    let blocker = Connection::open(engine.cache_root().join(INDEX_DATABASE_FILE)).unwrap();
+    blocker
+        .busy_timeout(std::time::Duration::from_millis(1))
+        .unwrap();
+    blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+    let refused = engine.reindex(&cancellation).unwrap_err();
+    assert_eq!(refused.kind(), "index_busy");
+
+    // The fallback: the same question answered from the filesystem, with the
+    // cache held by somebody else for the whole of it.
+    let live = engine
+        .inventory(&InventoryRequest::new(), &cancellation)
+        .unwrap();
+    assert!(
+        live.entries()
+            .iter()
+            .any(|entry| entry.path.display() == "a.rs")
+    );
+    assert!(engine.snapshot(&cancellation).is_ok());
+
+    // What was already indexed is still readable throughout: contention is a
+    // delay to the *update*, not a loss of the cache.
+    assert!(!engine.indexed_files(100).unwrap().is_empty());
+
+    blocker.execute_batch("ROLLBACK").unwrap();
+    drop(blocker);
+    assert!(engine.reindex(&cancellation).is_ok());
+    let _ = workspace;
+}
+
 /// An already-cancelled token launches nothing at all.
 #[test]
 fn a_cancelled_reindex_writes_nothing_visible() {

@@ -248,6 +248,7 @@ than read, however it came to be at that path.
 | A schema bump rebuilds rather than invalidating | `harkness-context` | `index::store_tests::a_schema_bump_rebuilds_rather_than_invalidating` |
 | A batch past the per-repository cap is refused whole | `harkness-context` | `index::store_tests::a_batch_past_the_per_repository_cap_is_refused_and_the_cache_still_serves` |
 | Contention is `index_busy` and never a quarantine | `harkness-context` | `index::store_tests::a_batch_that_cannot_take_the_write_lock_reports_the_cache_busy` |
+| A contended cache costs the index and not the workspace | `harkness-context` | `engine::tests::a_contended_cache_costs_the_index_and_not_the_workspace` |
 | Eviction removes whole caches, least recently opened first | `harkness-context` | `index::store_tests::eviction_removes_whole_caches_least_recently_opened_first` |
 | Eviction skips a cache that is still open | `harkness-context` | `index::store_tests::eviction_skips_a_cache_that_is_still_open` |
 | A cold build is readable back through the public API | `harkness-context` | `the_index_is_built_and_read_back_from_outside_the_crate` |
