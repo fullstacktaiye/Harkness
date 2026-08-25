@@ -53,11 +53,23 @@ fn the_tool_authoring_example_is_the_file_it_claims_to_be() {
     );
     let file = fs::read_to_string(root.join(source))
         .unwrap_or_else(|error| panic!("{source} could not be read: {error}"));
+    if let Some(drift) = first_difference(block, &file) {
+        panic!(
+            "docs/tool-authoring.md and {source} have drifted apart at {drift}\n\
+             The document mirrors the file, so copy the file back into the block it marks."
+        );
+    }
+}
+
+#[test]
+fn a_mirrored_block_is_compared_by_content_rather_than_by_line_ending() {
+    let block = "fn main() {\n    // one\n}\n";
     assert_eq!(
-        block, &file,
-        "docs/tool-authoring.md and {source} have drifted apart; the document mirrors \
-         the file, so copy the file back into the block it marks"
+        first_difference(block, "fn main() {\r\n    // one\r\n}\r\n"),
+        None
     );
+    assert!(first_difference(block, "fn main() {\n    // two\n}\n").is_some());
+    assert!(first_difference(block, "fn main() {\n}\n").is_some());
 }
 
 #[test]
@@ -135,6 +147,45 @@ fn every_link_between_documents_resolves_to_a_file_and_a_heading() {
         }
     }
     assert!(broken.is_empty(), "{}", broken.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// comparison
+// ---------------------------------------------------------------------------
+
+/// Whether a mirrored block still matches its file, and where it stops matching.
+///
+/// Compared line by line rather than as two whole strings, for two reasons.
+///
+/// A whole-string `assert_eq!` over a ten-kilobyte file prints it twice and
+/// leaves the reader to find the character that moved; a drift is a real thing a
+/// contributor has to fix, so the failure names the line.
+///
+/// And a line *ending* is not part of the claim. The block is rebuilt from
+/// parsed lines, while the file arrives however the checkout wrote it — Git for
+/// Windows converts to CRLF by default, which would otherwise fail this on that
+/// platform and nowhere else. What is asserted is that the documented code is
+/// the compiled code, not that a contributor's `core.autocrlf` is set one way.
+fn first_difference(block: &str, file: &str) -> Option<String> {
+    let mut documented = block.lines();
+    let mut compiled = file.lines();
+    let mut number = 0;
+    loop {
+        number += 1;
+        return match (documented.next(), compiled.next()) {
+            (None, None) => None,
+            (Some(left), Some(right)) if left == right => continue,
+            (Some(left), Some(right)) => Some(format!(
+                "line {number}:\n  documented: {left:?}\n  compiled:   {right:?}"
+            )),
+            (Some(left), None) => Some(format!(
+                "line {number}: the document has {left:?}, the file has ended"
+            )),
+            (None, Some(right)) => Some(format!(
+                "line {number}: the file has {right:?}, the block has ended"
+            )),
+        };
+    }
 }
 
 // ---------------------------------------------------------------------------

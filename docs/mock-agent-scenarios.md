@@ -94,6 +94,10 @@ chmod +x fixture-*
 export PATH="$PWD:$PATH"
 ```
 
+On Windows the same five names need `.exe` files (or `.cmd` shims) with the same
+exit behaviour; Harkness's own harness installs copies of its test binary under
+`fixture-pass.exe` and the rest, which is why the frozen argv names no extension.
+
 `fixture-disallowed` is the one whose body should never run: the scenario asserts
 that policy refuses the call before the process starts.
 
@@ -221,6 +225,10 @@ printf 'approve\n' | harkness --json agent run \
 exit 0 · run succeeded
   process.exec: succeeded, output {"timed_out": true, "signal": 9, "exit_code": null, "duration_ms": 1006}
 ```
+
+`signal` is the Unix spelling of how the child ended; on Windows the kill goes
+through a job object and the field is `null`. `timed_out` is the platform-neutral
+fact, and it is the only one the script matches on.
 
 ### 7. `user_cancellation`
 
