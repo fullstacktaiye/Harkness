@@ -115,6 +115,14 @@ pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
 /// How often the worker re-checks for a stop while waiting out quiescence.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// How many times in a row a refused pass is put back on the queue.
+///
+/// Contention and a lost race both clear, so a retry is right — but only a
+/// bounded number of them. Re-running a whole inventory walk once per
+/// quiescence window forever is a livelock rather than a recovery, and the
+/// startup sweep is the backstop that makes giving up safe.
+const MAX_PASS_RETRIES: u64 = 3;
+
 /// Names an editor writes and then renames away.
 ///
 /// Dropped before they reach the queue. This is a cost rule rather than a
@@ -397,6 +405,8 @@ pub struct DirtySet {
     subtrees: std::collections::BTreeSet<RepoPath>,
     everything: bool,
     overflows: u64,
+    /// The size the most recent collapse gave up at, until it is reported.
+    dropped: Option<usize>,
 }
 
 impl DirtySet {
@@ -456,6 +466,15 @@ impl DirtySet {
         self.everything
     }
 
+    /// The size the set gave up at, when the pass about to be drained follows a
+    /// collapse.
+    ///
+    /// Taken rather than read, so one collapse is reported once however many
+    /// hints arrive afterwards.
+    fn overflowed_by(&mut self) -> Option<usize> {
+        self.dropped.take()
+    }
+
     /// How many times this set has collapsed since it was created.
     ///
     /// The honesty metric for hint quality: a watcher that overflows constantly
@@ -468,10 +487,13 @@ impl DirtySet {
 
     /// Empties the set into the scope it describes.
     ///
-    /// A collapsed set is [`ReconcileScope::Full`]. Everything else is a path
-    /// list, subtree markers included: a scope entry that is a directory covers
-    /// everything beneath it and is *not* force-hashed, which is exactly the
-    /// difference between "this file was edited" and "this tree was checked
+    /// A collapsed set is [`ReconcileScope::Full`]. A single subtree marker and
+    /// nothing else — which is what a narrowed storm leaves — is a
+    /// [`Subtree`](ReconcileScope::Subtree), because that is what it is, and
+    /// because a subtree scope names no path and so can never force-hash one.
+    /// Everything else is a path list holding both kinds: an entry that is a
+    /// directory covers what is beneath it without naming it, which is exactly
+    /// the difference between "this file was edited" and "this tree was checked
     /// out".
     #[must_use]
     pub fn take(&mut self) -> ReconcileScope {
@@ -480,6 +502,12 @@ impl DirtySet {
             self.paths.clear();
             self.subtrees.clear();
             return ReconcileScope::Full;
+        }
+        if self.paths.is_empty()
+            && self.subtrees.len() == 1
+            && let Some(only) = self.subtrees.pop_first()
+        {
+            return ReconcileScope::subtree(only);
         }
         let entries = std::mem::take(&mut self.paths)
             .into_iter()
@@ -493,7 +521,11 @@ impl DirtySet {
     }
 
     /// Collapses everything queued into a single full pass.
+    ///
+    /// The answer to a backend that lost events: nothing about the worktree can
+    /// be assumed, including the parts nothing was ever queued for.
     fn collapse(&mut self) {
+        self.dropped = Some(self.len().max(self.dropped.unwrap_or(0)));
         self.paths.clear();
         self.subtrees.clear();
         self.everything = true;
@@ -501,10 +533,30 @@ impl DirtySet {
     }
 
     /// Enforces the capacity, which is the only thing that can grow the set.
+    ///
+    /// A set past its bound narrows to the **one directory holding everything
+    /// it was told about** rather than to the whole worktree, and the
+    /// difference is not a micro-optimization. Reaching the capacity means
+    /// there were too many hints to carry — not that any were lost — so the
+    /// paths in hand still bound where a change can be. A `cargo build` fills
+    /// this set with `target/…` and nothing else, and collapsing that to a full
+    /// pass buys a walk of the entire repository to discover that every one of
+    /// those paths is ignored. A lost-event overflow is the other case and is
+    /// [`collapse`](Self::collapse)'s.
     fn bound(&mut self) {
-        if self.len() > WATCH_QUEUE_CAPACITY {
-            self.collapse();
+        if self.len() <= WATCH_QUEUE_CAPACITY {
+            return;
         }
+        let held = RepoPath::common_ancestor(self.paths.iter().chain(self.subtrees.iter()));
+        self.overflows = self.overflows.saturating_add(1);
+        self.dropped = Some(self.len().max(self.dropped.unwrap_or(0)));
+        self.paths.clear();
+        self.subtrees.clear();
+        if held.is_empty() {
+            self.everything = true;
+            return;
+        }
+        self.subtrees.insert(held);
     }
 }
 
@@ -571,7 +623,12 @@ pub enum WatchEvent {
         /// Human-readable explanation.
         detail: String,
     },
-    /// Events stopped arriving, or never started.
+    /// The hints stopped being worth what they were.
+    ///
+    /// No backend could be established, or the queue reached its bound and gave
+    /// up on what it was carrying. Neither costs the index anything — the pass
+    /// that follows a collapse covers more, and a degraded watch still sweeps —
+    /// which is why this is one event rather than a failure.
     Degraded {
         /// Stable discriminant of the failure.
         kind: &'static str,
@@ -695,6 +752,8 @@ struct Shared {
     observer: Option<Observer>,
     passes: AtomicU64,
     generation: AtomicU64,
+    /// Passes refused in a row by something that was supposed to clear.
+    consecutive_failures: AtomicU64,
 }
 
 /// The mutable half, behind one mutex.
@@ -702,6 +761,8 @@ struct Queue {
     dirty: DirtySet,
     last_arrival: Option<Instant>,
     state: WatchState,
+    /// The degradation the worker has yet to report, if any.
+    degraded: Option<WatchEvent>,
     reconciling: bool,
     stopping: bool,
     finished: bool,
@@ -738,6 +799,7 @@ impl WatchService {
                 dirty: DirtySet::new(),
                 last_arrival: None,
                 state: WatchState::Watching,
+                degraded: None,
                 // Set before the worker exists, so a caller that asks whether
                 // the watch is quiet between `start` and the worker's first
                 // instruction is told the truth. Reading it from the worker
@@ -753,6 +815,7 @@ impl WatchService {
             observer: options.observer.clone(),
             passes: AtomicU64::new(0),
             generation: AtomicU64::new(0),
+            consecutive_failures: AtomicU64::new(0),
         });
 
         let watcher = if options.watch_filesystem {
@@ -813,10 +876,16 @@ impl WatchService {
 
     /// Blocks until the queue is empty and no pass is running.
     ///
-    /// Returns whether it became quiet inside `timeout`. A caller that has just
-    /// written a file and wants to read the index it produced needs this;
-    /// without it the only alternative is sleeping for longer than the
-    /// quiescence window and hoping, which is how a suite becomes flaky.
+    /// Returns whether it became quiet inside `timeout`.
+    ///
+    /// **It is a statement about the queue, not about the filesystem.** A
+    /// caller that wrote a file and called this immediately can be told "quiet"
+    /// before the backend has delivered anything, because nothing orders a
+    /// write against an `inotify` or FSEvents delivery — so this answers "there
+    /// is no work outstanding *that I know about*". It becomes a promise about
+    /// a specific change only when the caller supplied the hint itself, through
+    /// [`hint`](Self::hint), which is what establishes the ordering and is how
+    /// a test asserts on a reconcile without depending on a backend's timing.
     pub fn wait_until_quiet(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let mut queue = lock(&self.shared.queue);
@@ -868,6 +937,14 @@ impl WatchService {
         // Past the deadline the pass is abandoned rather than waited out. Its
         // batch was never visible and reconciliation is idempotent, so the next
         // startup sweep re-derives the same work from the filesystem.
+        //
+        // The join that follows is unbounded, and has to be: a thread cannot be
+        // detached from safely while it holds a borrow of this service's state.
+        // What bounds it is that the token is set — the reconciler polls it
+        // between paths — and that every blocking call beneath it carries its
+        // own timeout, the cache's busy wait included. A worker that panicked
+        // has already marked itself finished through the guard in `run`, so the
+        // deadline above is not spent waiting for a thread that has gone.
         self.shared.cancellation.cancel();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -895,16 +972,14 @@ impl Shared {
         self.woken.notify_all();
     }
 
-    /// Records that no backend is delivering events.
+    /// Records that no backend is delivering events, for the worker to report.
     fn degrade(&self, error: &WatchError) {
-        {
-            let mut queue = lock(&self.queue);
-            queue.state = WatchState::Degraded {
-                kind: error.kind(),
-                detail: error.to_string(),
-            };
-        }
-        self.report(&WatchEvent::Degraded {
+        let mut queue = lock(&self.queue);
+        queue.state = WatchState::Degraded {
+            kind: error.kind(),
+            detail: error.to_string(),
+        };
+        queue.degraded = Some(WatchEvent::Degraded {
             kind: error.kind(),
             detail: error.to_string(),
         });
@@ -929,19 +1004,29 @@ impl Shared {
         }
     }
 
-    /// The worker: sweep once, then drain quiesced scopes until stopped.
+    /// The worker: report how it started, sweep once, then drain until stopped.
+    ///
+    /// The finish is marked by a guard rather than by the last statement, so a
+    /// panic anywhere inside — an observer of the caller's own, above all —
+    /// still wakes everything waiting. Without it a panicked worker makes
+    /// [`WatchService::stop`] burn its whole deadline and
+    /// [`WatchService::wait_until_quiet`] never return true, turning one
+    /// failure into a service that can only be waited out.
     fn run(&self, startup_sweep: bool) {
+        let _finish = Finish { shared: self };
+        // Reported here rather than from `start`, so every event a watch emits
+        // reaches its observer on this thread. Delivering the first one on the
+        // constructing thread would make the documented contract true of all
+        // but one event, which is the shape of contract nobody checks.
+        if let Some(degraded) = lock(&self.queue).degraded.take() {
+            self.report(&degraded);
+        }
         if startup_sweep {
             self.pass(ReconcileScope::Full);
         }
         while let Some(scope) = self.wait_for_scope() {
             self.pass(scope);
         }
-        {
-            let mut queue = lock(&self.queue);
-            queue.finished = true;
-        }
-        self.woken.notify_all();
     }
 
     /// Waits out the quiescence window and takes what is queued.
@@ -961,7 +1046,25 @@ impl Shared {
             if ready && !queue.dirty.is_empty() {
                 queue.last_arrival = None;
                 queue.reconciling = true;
-                return Some(queue.dirty.take());
+                // Reported once per collapse, from the worker, with the count
+                // the set gave up on. It is a statement about hint *quality*
+                // rather than about the index: the pass that follows covers
+                // more, not less. This is the one place `QueueOverflow` is
+                // built, and building it here is what keeps the published kind
+                // from being a discriminant no caller can ever meet.
+                let overflow = queue
+                    .dirty
+                    .overflowed_by()
+                    .map(|dropped| WatchError::QueueOverflow { dropped });
+                let scope = queue.dirty.take();
+                drop(queue);
+                if let Some(overflow) = overflow {
+                    self.report(&WatchEvent::Degraded {
+                        kind: overflow.kind(),
+                        detail: overflow.to_string(),
+                    });
+                }
+                return Some(scope);
             }
             if ready {
                 // Hints that all collapsed into nothing — every one of them
@@ -994,6 +1097,7 @@ impl Shared {
         let outcome = self.engine.reconcile(&scope, &self.cancellation);
         match outcome {
             Ok(report) => {
+                self.consecutive_failures.store(0, Ordering::Release);
                 self.generation.store(report.generation, Ordering::Release);
                 // A path that kept moving while it was read is offered back
                 // rather than dropped: its row was left alone, so nothing else
@@ -1016,7 +1120,27 @@ impl Shared {
                 // at its budget or a batch built wrong will refuse the same
                 // scope every time, and re-offering it would spend a walk per
                 // quiescence window on an answer that is not going to change.
-                if matches!(error.kind(), "index_busy" | "index_batch_superseded") {
+                // A pass the *cache* refused rather than the worktree is one
+                // worth having again — the scope was drained when the pass
+                // started, so dropping it would leave exactly the paths
+                // something told us about unexamined. `cache_corrupt_quarantined`
+                // is here too: the cache it met is gone and an empty one stands
+                // in its place, so the retry is against a file that works.
+                //
+                // Bounded, because "retry until it works" is a livelock when it
+                // never does: two watches on two checkouts of one repository
+                // each re-run a whole inventory walk before they can reach the
+                // write lock again, so an unbounded loop spends a walk per
+                // window in both processes indefinitely. Past the bound the
+                // failure is reported and the next hint — or the next startup
+                // sweep — is what recovers.
+                let retryable = matches!(
+                    error.kind(),
+                    "index_busy" | "index_batch_superseded" | "cache_corrupt_quarantined"
+                );
+                if retryable
+                    && self.consecutive_failures.fetch_add(1, Ordering::AcqRel) < MAX_PASS_RETRIES
+                {
                     for hint in scope_hints(&scope) {
                         self.offer(hint);
                     }
@@ -1054,6 +1178,22 @@ fn scope_hints(scope: &ReconcileScope) -> Vec<ChangeHint> {
     }
 }
 
+/// Marks the worker finished however it ends, panic included.
+struct Finish<'shared> {
+    shared: &'shared Shared,
+}
+
+impl Drop for Finish<'_> {
+    fn drop(&mut self) {
+        {
+            let mut queue = lock(&self.shared.queue);
+            queue.finished = true;
+            queue.reconciling = false;
+        }
+        self.shared.woken.notify_all();
+    }
+}
+
 /// Establishes a recursive watcher whose events feed `shared`'s queue.
 ///
 /// Normalization runs on the backend's own delivery thread rather than on a
@@ -1067,19 +1207,7 @@ fn establish(root: &Path, shared: &Arc<Shared>) -> Result<RecommendedWatcher, Wa
     let mut watcher = notify::recommended_watcher(
         move |event: Result<notify::Event, notify::Error>| match event {
             Ok(event) => {
-                let Some(class) = classify(&event.kind) else {
-                    return;
-                };
-                let class = if event.need_rescan() {
-                    ChangeClass::Rescan
-                } else {
-                    class
-                };
-                let change = FilesystemChange {
-                    paths: event.paths,
-                    class,
-                };
-                for hint in normalizer.normalize(&change) {
+                for hint in hints_for(&normalizer, &event) {
                     sink.offer(hint);
                 }
             }
@@ -1093,6 +1221,31 @@ fn establish(root: &Path, shared: &Arc<Shared>) -> Result<RecommendedWatcher, Wa
         .watch(root, RecursiveMode::Recursive)
         .map_err(|error| watch_failure(root, &error))?;
     Ok(watcher)
+}
+
+/// The hints one backend event is worth.
+///
+/// A free function rather than the body of the watcher's closure, because the
+/// order of the two questions below is a rule that has already been got wrong
+/// once and a rule inside a closure is a rule with no test.
+fn hints_for(normalizer: &Normalizer, event: &notify::Event) -> Vec<ChangeHint> {
+    // The rescan flag is asked about *first*, and that order is the whole of
+    // it. A backend signals lost events as `EventKind::Other` carrying
+    // `Flag::Rescan` — inotify does it on `Q_OVERFLOW`, FSEvents on its own
+    // drop — and `Other` is a kind `classify` deliberately maps to nothing.
+    // Classifying first therefore throws away the one message that says the
+    // event stream can no longer be trusted, which is the single event this
+    // module most needs to hear.
+    if event.need_rescan() {
+        return vec![ChangeHint::Overflow];
+    }
+    let Some(class) = classify(&event.kind) else {
+        return Vec::new();
+    };
+    normalizer.normalize(&FilesystemChange {
+        paths: event.paths.clone(),
+        class,
+    })
 }
 
 /// Maps one backend event kind onto the vocabulary the normalizer speaks.

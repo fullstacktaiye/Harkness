@@ -156,20 +156,55 @@ impl ReconcileScope {
     /// the worktree root is [`Full`](Self::Full); an empty list stays empty and
     /// reconciles nothing at all, because "no paths" is a real answer and
     /// promoting it to "every path" would turn a quiet watcher into a rebuild.
+    ///
+    /// **A path is stripped against every entry already kept, not against the
+    /// one before it.** Sorted order is not containment order: `src/watch`,
+    /// `src/watch.rs` and `src/watch/tests.rs` sort in that order — this
+    /// repository's own module layout — and the entry before the last is the
+    /// one that contains it. Comparing only with the previous entry keeps all
+    /// three, and [`read_units`](Self::read_units) then emits overlapping
+    /// ranges that hand the merge one row twice: consumed once as an existing
+    /// row and once as a row with no path beside it, which stages a removal for
+    /// a path the same pass just recorded.
+    ///
+    /// A container is always an ancestor and an ancestor always sorts first, so
+    /// asking about the candidate's own ancestors is the whole question.
     #[must_use]
     pub fn paths(paths: impl IntoIterator<Item = RepoPath>) -> Self {
         let sorted = paths.into_iter().collect::<BTreeSet<_>>();
         if sorted.iter().any(RepoPath::is_empty) {
             return Self::Full;
         }
+        let mut kept: BTreeSet<Vec<u8>> = BTreeSet::new();
         let mut disjoint: Vec<RepoPath> = Vec::with_capacity(sorted.len());
         for path in sorted {
-            if disjoint.last().is_some_and(|cover| cover.contains(&path)) {
+            if ancestor_in(&kept, &path) {
                 continue;
             }
+            kept.insert(path.as_bytes().to_vec());
             disjoint.push(path);
         }
         Self::Paths(disjoint)
+    }
+
+    /// This scope with its invariants re-established.
+    ///
+    /// Free for the two variants that carry none. For a path list it re-runs
+    /// [`paths`](Self::paths), because the variant's field is public and
+    /// `#[non_exhaustive]` on an enum stops exhaustive *matching* rather than
+    /// construction — so a caller outside this crate can hand over an unsorted
+    /// or overlapping list, and every method below assumes neither.
+    /// [`names_exactly`](Self::names_exactly) would silently answer "no" for a
+    /// named path on an unsorted list, downgrading a force-hash hint to a
+    /// metadata comparison, and [`read_units`](Self::read_units) would emit the
+    /// overlapping ranges described above.
+    #[must_use]
+    pub fn normalized(&self) -> Self {
+        match self {
+            Self::Full => Self::Full,
+            Self::Subtree(directory) => Self::subtree(directory.clone()),
+            Self::Paths(paths) => Self::paths(paths.iter().cloned()),
+        }
     }
 
     /// Stable spelling carried in reports, event payloads, and diagnostics.
@@ -302,10 +337,14 @@ impl ReconcileScope {
             Self::Paths(paths) => {
                 let mut open = BTreeSet::new();
                 for path in paths {
-                    open.extend(path.ancestors());
+                    open.extend(
+                        path.ancestors()
+                            .iter()
+                            .map(|ancestor| ancestor.as_bytes().to_vec()),
+                    );
                 }
                 ScopeFilter::Paths {
-                    exact: paths.iter().cloned().collect(),
+                    exact: paths.iter().map(|path| path.as_bytes().to_vec()).collect(),
                     open,
                 }
             }
@@ -336,9 +375,12 @@ pub(crate) enum ScopeFilter {
     /// One directory, its ancestors on the way down, and everything beneath it.
     Subtree(RepoPath),
     /// A path list: its ancestors are descended into, its members recorded.
+    ///
+    /// Held as raw bytes rather than as paths so the containment questions the
+    /// walk asks of every entry can be answered without allocating.
     Paths {
-        exact: BTreeSet<RepoPath>,
-        open: BTreeSet<RepoPath>,
+        exact: BTreeSet<Vec<u8>>,
+        open: BTreeSet<Vec<u8>>,
     },
 }
 
@@ -353,7 +395,9 @@ impl ScopeFilter {
         match self {
             Self::Everything => true,
             Self::Subtree(scoped) => scoped.contains(directory) || directory.contains(scoped),
-            Self::Paths { exact, open } => open.contains(directory) || covered(exact, directory),
+            Self::Paths { exact, open } => {
+                open.contains(directory.as_bytes()) || covered(exact, directory)
+            }
         }
     }
 
@@ -362,19 +406,29 @@ impl ScopeFilter {
         match self {
             Self::Everything => true,
             Self::Subtree(scoped) => scoped.contains(path),
-            Self::Paths { exact, .. } => exact.contains(path) || covered(exact, path),
+            Self::Paths { exact, .. } => covered(exact, path),
         }
     }
 }
 
-/// Whether any scoped path contains `path`, itself included.
-fn covered(exact: &BTreeSet<RepoPath>, path: &RepoPath) -> bool {
-    if exact.contains(path) {
-        return true;
-    }
-    path.ancestors()
+/// Whether `paths` holds a strict ancestor of `path`.
+///
+/// Written against the raw bytes and scanning separator positions in place,
+/// because the walk asks this of *every* entry it meets: building the ancestor
+/// chain first would allocate a vector and a path per component per file, which
+/// is the per-entry cost the precomputed filter exists to avoid.
+fn ancestor_in(paths: &BTreeSet<Vec<u8>>, path: &RepoPath) -> bool {
+    let bytes = path.as_bytes();
+    bytes
         .iter()
-        .any(|ancestor| !ancestor.is_empty() && exact.contains(ancestor))
+        .enumerate()
+        .filter(|(_, byte)| **byte == b'/')
+        .any(|(index, _)| paths.contains(&bytes[..index]))
+}
+
+/// Whether any scoped path contains `path`, itself included.
+fn covered(exact: &BTreeSet<Vec<u8>>, path: &RepoPath) -> bool {
+    exact.contains(path.as_bytes()) || ancestor_in(exact, path)
 }
 
 /// What one reconcile did.
@@ -505,6 +559,13 @@ impl Reconciler<'_> {
             return Err(ContextEngineError::Cancelled);
         }
 
+        // Re-established rather than assumed. The variant's field is public and
+        // `#[non_exhaustive]` stops exhaustive matching rather than
+        // construction, so a caller outside this crate can hand over an
+        // unsorted or overlapping list — and every method below assumes
+        // neither. Free for a scope that already came from `paths`.
+        let requested = &requested.normalized();
+
         // Asked before anything else, and about the *requested* scope. A caller
         // that named nothing gets nothing; widening it — which the head check
         // below would otherwise do, because a scope naming no paths is not a
@@ -521,8 +582,17 @@ impl Reconciler<'_> {
         let stored = self.cache.worktree_marker(&self.worktree)?;
         let head_changed = stored.is_some() && stored.as_deref() != self.head_marker.as_deref();
 
+        // Nothing published for this checkout means nothing to compare against,
+        // so an incremental pass over it would index the paths it was handed
+        // and leave the rest of the tree invisible. It is reached two ways and
+        // both matter: a worktree the cache has never seen, and one whose cache
+        // was quarantined and recreated underneath a running watch — where the
+        // pass that met the fault reported it, the scope it had drained was
+        // small, and every pass after it would otherwise be small too.
+        let unindexed = self.cache.worktree_generation(&self.worktree)? == 0;
+
         let mut escalated = requested.overflowed();
-        if head_changed && !escalated.as_ref().unwrap_or(requested).is_full() {
+        if (head_changed || unindexed) && !escalated.as_ref().unwrap_or(requested).is_full() {
             escalated = Some(ReconcileScope::Full);
         }
         let effective = escalated.clone();
@@ -731,9 +801,17 @@ impl Reconciler<'_> {
             return Ok(Applied::Skipped);
         }
 
-        pass.totals.hashed += 1;
         let version = match self.read(entry, pass.reading, cancellation)? {
-            Read::Version(version) => version,
+            Read::Version(version) => {
+                // Counted here rather than before the read, because the number
+                // is published as "paths whose bytes were read and digested"
+                // and a caller judges from it whether an update was
+                // incremental. A tree holding a handful of unreadable files
+                // would otherwise inflate it on every sweep, since a row marked
+                // unreadable is a suspect every time.
+                pass.totals.hashed += 1;
+                version
+            }
             Read::Unreadable => {
                 batch.record_unreadable(entry, classify)?;
                 return Ok(Applied::Unreadable);
@@ -790,6 +868,21 @@ impl Reconciler<'_> {
             if cancellation.is_cancelled() {
                 return Err(ContextEngineError::Cancelled);
             }
+            // Stat-ed *before* the read as well as after it. The walk's size is
+            // what bounds this file — it was taken under the inventory's own
+            // limits — and a path that is a hundred bytes in the index and ten
+            // gigabytes on disk is exactly the case a watched directory
+            // produces. Reading first and rejecting afterwards would buffer the
+            // whole of it, three times over.
+            let Ok(before) = std::fs::symlink_metadata(&absolute) else {
+                return Ok(Read::Unreadable);
+            };
+            if !before.is_file() {
+                return Ok(Read::Moving);
+            }
+            if before.len() != entry.byte_size {
+                return Ok(Read::Moving);
+            }
             let Ok(bytes) = std::fs::read(&absolute) else {
                 return Ok(Read::Unreadable);
             };
@@ -802,6 +895,9 @@ impl Reconciler<'_> {
             if !metadata.is_file() {
                 return Ok(Read::Moving);
             }
+            // The stat after the read is what decides, exactly as the walk's
+            // does: bytes read from a file that was rewritten half-way through
+            // describe neither version.
             if metadata.len() != entry.byte_size
                 || crate::inventory::modified_nanos(&metadata) != entry.mtime_ns
             {

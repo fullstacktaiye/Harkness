@@ -176,6 +176,13 @@ whether it was reached through a watcher, through the startup sweep, or through
 a caller asking directly. Turning the watcher off costs latency and nothing
 else, which is what the `without_filesystem_events` test option exists to prove.
 
+One case is not a comparison at all: a checkout the cache has published *nothing*
+for has nothing to compare against, so any scope over it becomes a full pass.
+That covers a worktree nothing has indexed and — the one that is easy to miss —
+one whose cache was quarantined and recreated underneath a running watch, where
+every pass afterwards would otherwise index only the paths it happened to be
+handed.
+
 ```text
 notify event ──▶ normalize ──▶ dirty set ──▶ quiescence ──▶ reconcile
                  (layer 1,     (coalesce,     (500 ms of      (truth)
@@ -213,11 +220,22 @@ rather than three for paths that no longer exist.
 ### The queue is bounded by construction
 
 `DirtySet` holds paths and subtree markers. A marker absorbs everything beneath
-it, a path already covered is absorbed rather than added, and passing
-`WATCH_QUEUE_CAPACITY` (4096) collapses the whole set into "everything" — which
-carries no paths at all. A backend-reported rescan does the same. So a checkout
-touching ten thousand files costs one reconcile and a constant amount of memory,
-and the number of times it has happened is reported as `overflows`: the honesty
+it, and a path already covered is absorbed rather than added. Passing
+`WATCH_QUEUE_CAPACITY` (4096) replaces the whole set with **the one directory
+holding everything it was told about** — one marker, carrying no paths — so a
+checkout touching ten thousand files costs one reconcile and a constant amount
+of memory. A `cargo build` filling the set with `target/…` therefore buys a walk
+of `target/` rather than of the repository.
+
+A backend-reported **rescan** is the other kind of overflow and cannot be
+narrowed: it says events were *lost*, so the paths in hand say nothing about the
+ones that never arrived, and the answer is a full pass. Getting these two the
+same way round matters — and so does reading the rescan flag before the event
+kind, because every backend signals a lost event as `EventKind::Other` carrying
+`Flag::Rescan`, and `Other` is a kind the classifier maps to nothing.
+
+The number of collapses is reported as `overflows`, and each one raises a
+`queue_overflow` diagnostic carrying the size the set gave up at: the honesty
 metric for how much the hints were worth.
 
 `QUIESCENCE_WINDOW` (500 ms) is the other bound. A scope is drained only once no
@@ -289,10 +307,17 @@ the next startup sweep rather than from anything remembered.
 
 A pass the *cache* refused is different, and is put back on the queue: the scope
 was drained when the pass started, so dropping it would leave exactly the paths
-something told us about unexamined until the next sweep. Only `index_busy` and
-`index_batch_superseded` are retried, because both clear; a cache at its budget
-would refuse the same scope every time, and re-offering it would spend a walk
-per window on an answer that is not going to change.
+something told us about unexamined until the next sweep. Three kinds are
+retried, and all three clear — `index_busy`, `index_batch_superseded`, and
+`cache_corrupt_quarantined`, whose cache is gone and replaced by an empty one
+that works. A cache at its budget refuses the same scope every time, so it is
+not retried at all.
+
+The retry is bounded at three in a row. Two watches on two checkouts of one
+repository each re-run a whole inventory walk before they can reach the write
+lock again, so an unbounded loop is a livelock in both processes rather than a
+recovery; past the bound the failure is reported and the next hint — or the next
+startup sweep — is what recovers.
 
 ### Degraded is not broken
 
@@ -496,6 +521,10 @@ than read, however it came to be at that path.
 | A scoped walk reads the same ignore chain a full one does | `harkness-context` | `reconcile::tests::a_scoped_walk_reads_the_same_ignore_chain_a_full_one_does` |
 | Deletions and renames propagate, and content is reused | `harkness-context` | `reconcile::tests::a_deleted_file_loses_its_row_and_a_renamed_one_keeps_its_content` |
 | A directory and a file named after it are reconciled in order | `harkness-context` | `reconcile::tests::a_directory_and_a_file_named_after_it_are_reconciled_in_order` |
+| A path is stripped against every cover, not just the previous one | `harkness-context` | `reconcile::tests::a_path_is_stripped_against_every_cover_and_not_just_the_previous_one` |
+| A module directory beside its own file keeps every row | `harkness-context` | `reconcile::tests::a_module_directory_beside_its_own_file_keeps_every_row` |
+| A hand-built scope is re-normalized before it is used | `harkness-context` | `reconcile::tests::a_hand_built_scope_is_re_normalized_before_it_is_used` |
+| A narrow scope over an unindexed worktree becomes a full pass | `harkness-context` | `reconcile::tests::a_narrow_scope_over_an_unindexed_worktree_becomes_a_full_pass` |
 | A truncated walk removes nothing | `harkness-context` | `reconcile::tests::a_truncated_walk_removes_nothing` |
 | A cancelled reconcile leaves the previous generation answering | `harkness-context` | `reconcile::tests::a_cancelled_reconcile_leaves_the_previous_generation_answering` |
 | A version bump widens the suspect set rather than rebuilding | `harkness-context` | `reconcile::tests::a_chunking_bump_makes_every_file_a_suspect_without_a_rebuild` |
@@ -507,8 +536,10 @@ than read, however it came to be at that path.
 | Forgetting a worktree keeps what its sibling uses | `harkness-context` | `reconcile::tests::forgetting_a_worktree_keeps_what_its_sibling_still_uses` |
 | A denied path never becomes a hint | `harkness-context` | `watch::tests::a_denied_path_never_becomes_a_hint` |
 | An atomic save is one hint for the target | `harkness-context` | `watch::tests::an_atomic_save_yields_one_hint_for_the_target_and_none_for_the_temporary` |
-| An event storm collapses with bounded memory | `harkness-context` | `watch::tests::an_event_storm_collapses_into_one_full_pass_with_bounded_memory` |
-| A storm of hints costs one full pass | `harkness-context` | `watch::tests::a_storm_of_hints_costs_one_full_pass` |
+| An event storm narrows to what it was told about, with bounded memory | `harkness-context` | `watch::tests::an_event_storm_narrows_to_what_it_was_told_about_with_bounded_memory` |
+| A lost-event overflow is a full pass however little was queued | `harkness-context` | `watch::tests::a_lost_event_overflow_is_a_full_pass_however_little_was_queued` |
+| A backend that lost events is heard though its kind says nothing | `harkness-context` | `watch::tests::a_backend_that_lost_events_is_heard_even_though_its_kind_says_nothing` |
+| A storm of hints costs one pass | `harkness-context` | `watch::tests::a_storm_of_hints_costs_one_pass` |
 | A watch with no backend still sweeps and still reconciles | `harkness-context` | `watch::tests::a_watch_with_no_backend_still_sweeps_and_still_reconciles` |
 | An edit reaches the index with nobody asking | `harkness-context` | `watch::tests::an_edit_reaches_the_index_without_anybody_asking` |
 | A refused pass comes back covering what it covered | `harkness-context` | `watch::tests::a_refused_pass_comes_back_covering_what_it_covered` |

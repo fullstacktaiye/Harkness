@@ -126,6 +126,97 @@ fn a_path_list_is_ordered_and_stripped_of_what_it_already_covers() {
     );
 }
 
+/// The stripping has to compare against every entry already kept, not the one
+/// before it. Sorted order is not containment order: `src/watch`,
+/// `src/watch.rs` and `src/watch/tests.rs` sort in exactly that order — this
+/// repository's own module layout — and the entry that contains the last is the
+/// one two places back. Keeping all three emits overlapping read ranges, which
+/// hands the merge one row twice and stages a removal for a path the same pass
+/// just recorded.
+#[test]
+fn a_path_is_stripped_against_every_cover_and_not_just_the_previous_one() {
+    let scope = ReconcileScope::paths([
+        RepoPath::from_bytes(b"src/watch/tests.rs".to_vec()),
+        RepoPath::from_bytes(b"src/watch.rs".to_vec()),
+        RepoPath::from_bytes(b"src/watch".to_vec()),
+    ]);
+
+    assert_eq!(paths(&scope), ["src/watch", "src/watch.rs"]);
+    assert!(scope.covers(&RepoPath::from_bytes(b"src/watch/tests.rs".to_vec())));
+    assert!(!scope.names_exactly(&RepoPath::from_bytes(b"src/watch/tests.rs".to_vec())));
+}
+
+/// The same shape, end to end: the file under the directory must survive a pass
+/// that names the directory, the file beside it, and the file itself.
+#[test]
+fn a_module_directory_beside_its_own_file_keeps_every_row() {
+    let workspace = Workspace::new();
+    workspace.write("src/watch/tests.rs", "fn tests() {}\n");
+    workspace.write("src/watch.rs", "fn watch() {}\n");
+    workspace.write("src/watcher.rs", "fn watcher() {}\n");
+    let engine = workspace.engine();
+    let cancellation = Cancellation::default();
+    engine
+        .reconcile(&ReconcileScope::Full, &cancellation)
+        .unwrap();
+
+    let report = engine
+        .reconcile(
+            &ReconcileScope::paths([
+                workspace.path("src/watch"),
+                workspace.path("src/watch.rs"),
+                workspace.path("src/watch/tests.rs"),
+            ]),
+            &cancellation,
+        )
+        .unwrap();
+
+    assert_eq!(report.removed, 0, "{report:?}");
+    assert_eq!(report.added, 0);
+    for present in ["src/watch/tests.rs", "src/watch.rs", "src/watcher.rs"] {
+        assert!(
+            engine
+                .indexed_file(&workspace.path(present))
+                .unwrap()
+                .is_some(),
+            "'{present}' left the index"
+        );
+    }
+}
+
+/// A scope built by hand rather than through `paths` must not be able to make
+/// the merge misbehave. `#[non_exhaustive]` on an enum stops exhaustive
+/// matching, not construction, so an unsorted or overlapping list is something
+/// a caller outside this crate can hand over — and everything downstream
+/// assumes neither.
+#[test]
+fn a_hand_built_scope_is_re_normalized_before_it_is_used() {
+    let hostile = ReconcileScope::Paths(vec![
+        RepoPath::from_bytes(b"src/watch/tests.rs".to_vec()),
+        RepoPath::from_bytes(b"src/watch".to_vec()),
+        RepoPath::from_bytes(b"src/watch".to_vec()),
+    ]);
+    assert_eq!(paths(&hostile.normalized()), ["src/watch"]);
+
+    let workspace = Workspace::new();
+    workspace.write("src/watch/tests.rs", "fn tests() {}\n");
+    let engine = workspace.engine();
+    let cancellation = Cancellation::default();
+    engine
+        .reconcile(&ReconcileScope::Full, &cancellation)
+        .unwrap();
+
+    let report = engine.reconcile(&hostile, &cancellation).unwrap();
+
+    assert_eq!(report.removed, 0, "{report:?}");
+    assert!(
+        engine
+            .indexed_file(&workspace.path("src/watch/tests.rs"))
+            .unwrap()
+            .is_some()
+    );
+}
+
 /// Two spellings of "everything" must not behave differently, and "nothing"
 /// must not be promoted into "everything": a watcher that has been quiet
 /// draining an empty set would otherwise rebuild the repository.
@@ -423,6 +514,53 @@ fn a_change_made_with_no_hint_at_all_is_found_by_the_sweep() {
         chunks.iter().any(|chunk| chunk.byte_range.end > 12),
         "the chunks describe the new bytes rather than the old ones"
     );
+}
+
+/// A checkout the cache has published nothing for cannot be reconciled against
+/// anything, so any scope over one becomes a full pass. It is reached two ways
+/// and both matter: a worktree nothing has indexed, and one whose cache was
+/// quarantined and recreated underneath a running watch — where every pass
+/// after the fault would otherwise index only the paths it happened to be
+/// handed, leaving the rest of the tree invisible until a restart.
+#[test]
+fn a_narrow_scope_over_an_unindexed_worktree_becomes_a_full_pass() {
+    let workspace = Workspace::new();
+    for index in 0..5 {
+        workspace.write(&format!("src/f{index}.rs"), "fn a() {}\n");
+    }
+    let engine = workspace.engine();
+    let cancellation = Cancellation::default();
+
+    let report = engine
+        .reconcile(
+            &ReconcileScope::paths([workspace.path("src/f0.rs")]),
+            &cancellation,
+        )
+        .unwrap();
+
+    assert_eq!(report.escalated, Some(ReconcileScope::Full), "{report:?}");
+    assert!(report.added >= 6, "the whole tree is indexed: {report:?}");
+    for index in 0..5 {
+        assert!(
+            engine
+                .indexed_file(&workspace.path(&format!("src/f{index}.rs")))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    // The same worktree, its cache thrown away underneath it: the next narrow
+    // pass rebuilds rather than recording one file into an empty index.
+    engine.dispose_index(&cancellation).unwrap();
+    let after = engine
+        .reconcile(
+            &ReconcileScope::paths([workspace.path("src/f0.rs")]),
+            &cancellation,
+        )
+        .unwrap();
+
+    assert_eq!(after.escalated, Some(ReconcileScope::Full), "{after:?}");
+    assert!(after.added >= 6);
 }
 
 /// A deleted path loses its row by name rather than by a sweep, and a rename

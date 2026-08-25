@@ -55,7 +55,8 @@ anchor. `verify-doc-references.sh` checks the "What proves this" tables against
 `#[ignore]` marks four distinct categories; never assume an ignored test is dead.
 
 - **Child-process roles** (`*/testing.rs`, `store/tests.rs`, `coordinator/tests/recovery.rs`,
-  `harkness-context/src/index/tests.rs` and `.../index/store_tests.rs`): the
+  `harkness-context/src/index/tests.rs`, `.../index/store_tests.rs` and
+  `.../reconcile/tests.rs`): the
   parent test re-executes the test binary with `--exact --ignored`. Run them only through their
   parent. The store's role is re-executed *and then killed*, because a batch abandoned by an
   unwinding `Drop` is not a crash and the pending-generation guarantee is about crashes. The recovery roles are re-executed *and then killed*, so a `SIGKILL` is the expected end

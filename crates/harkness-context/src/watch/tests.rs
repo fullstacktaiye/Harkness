@@ -286,8 +286,15 @@ fn a_subtree_marker_absorbs_the_paths_beneath_it() {
 /// amount of memory, not ten thousand of either. The set never grows past its
 /// capacity because reaching it replaces the contents rather than adding to
 /// them.
+///
+/// It replaces them with the **one directory holding everything it was told
+/// about**, not with the whole worktree. Reaching the capacity means there were
+/// too many hints to carry, not that any were lost, so the paths in hand still
+/// bound where a change can be — and a `cargo build` that fills this set with
+/// `target/…` must not buy a walk of the entire repository to discover that
+/// every one of those paths is ignored.
 #[test]
-fn an_event_storm_collapses_into_one_full_pass_with_bounded_memory() {
+fn an_event_storm_narrows_to_what_it_was_told_about_with_bounded_memory() {
     let mut dirty = DirtySet::new();
     let mut high_water = 0;
     for index in 0..10_000 {
@@ -299,11 +306,94 @@ fn an_event_storm_collapses_into_one_full_pass_with_bounded_memory() {
         high_water <= WATCH_QUEUE_CAPACITY + 1,
         "the set reached {high_water} entries"
     );
-    assert!(dirty.is_collapsed());
-    assert_eq!(dirty.len(), 0, "a collapsed set carries no paths at all");
+    assert!(
+        dirty.len() <= 1,
+        "a narrowed set carries one marker at most"
+    );
     assert!(dirty.overflows() >= 1);
-    assert_eq!(dirty.take(), ReconcileScope::Full);
+
+    let scope = dirty.take();
+    assert_eq!(
+        scope,
+        ReconcileScope::subtree(RepoPath::from_bytes(b"src".to_vec()))
+    );
+    assert!(scope.covers(&RepoPath::from_bytes(b"src/module7/f7.rs".to_vec())));
+    assert!(
+        !scope.covers(&RepoPath::from_bytes(b"docs/guide.md".to_vec())),
+        "and it does not claim to have looked anywhere it was never told about"
+    );
     assert!(dirty.is_empty());
+
+    // Hints with nothing in common have only the worktree root to narrow to.
+    let mut scattered = DirtySet::new();
+    for index in 0..10_000 {
+        scattered.insert(path_hint(&format!("d{index}/f.rs")));
+    }
+    assert_eq!(scattered.take(), ReconcileScope::Full);
+}
+
+/// A backend that lost events is the other kind of overflow, and it is the one
+/// that cannot be narrowed: the paths in hand say nothing about the events that
+/// never arrived.
+#[test]
+fn a_lost_event_overflow_is_a_full_pass_however_little_was_queued() {
+    let mut dirty = DirtySet::new();
+    dirty.insert(path_hint("src/a.rs"));
+
+    dirty.insert(ChangeHint::Overflow);
+
+    assert!(dirty.is_collapsed());
+    assert_eq!(dirty.take(), ReconcileScope::Full);
+}
+
+/// The rescan flag has to be read *before* the event kind is classified, and
+/// this is the whole reason that decision is a function rather than a closure.
+/// Every backend signals lost events as `EventKind::Other` carrying
+/// `Flag::Rescan` — inotify on `Q_OVERFLOW`, FSEvents on its own drop — and
+/// `Other` is a kind the classifier deliberately maps to nothing. Asking about
+/// the kind first therefore discards the single message that says the event
+/// stream can no longer be trusted, and every dropped event is silently
+/// forgiven until the process restarts.
+#[test]
+fn a_backend_that_lost_events_is_heard_even_though_its_kind_says_nothing() {
+    let workspace = Workspace::new();
+    workspace.write("src/main.rs", "fn main() {}\n");
+    let normalizer = workspace.normalizer();
+
+    let rescan = notify::Event::new(notify::EventKind::Other)
+        .set_flag(notify::event::Flag::Rescan)
+        .add_path(workspace.root.join("src/main.rs"));
+    assert_eq!(
+        super::hints_for(&normalizer, &rescan),
+        vec![ChangeHint::Overflow]
+    );
+
+    // The same kind without the flag still says nothing, which is what makes
+    // the flag rather than the kind the signal.
+    let quiet =
+        notify::Event::new(notify::EventKind::Other).add_path(workspace.root.join("src/main.rs"));
+    assert!(super::hints_for(&normalizer, &quiet).is_empty());
+
+    // And a rescan naming a denied path still names no path.
+    workspace.write(".env", "SECRET=1\n");
+    let denied = notify::Event::new(notify::EventKind::Other)
+        .set_flag(notify::event::Flag::Rescan)
+        .add_path(workspace.root.join(".env"));
+    assert_eq!(
+        super::hints_for(&normalizer, &denied),
+        vec![ChangeHint::Overflow],
+        "an overflow carries no path at all, so there is nothing to leak"
+    );
+
+    // An ordinary modification still travels the whole way through.
+    let modified = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+        notify::event::DataChange::Content,
+    )))
+    .add_path(workspace.root.join("src/main.rs"));
+    assert_eq!(
+        super::hints_for(&normalizer, &modified),
+        vec![path_hint("src/main.rs")]
+    );
 }
 
 /// A backend that reports a rescan is saying it lost track, and one that
@@ -578,10 +668,10 @@ fn a_burst_of_hints_becomes_one_pass() {
     );
 }
 
-/// Ten thousand hints arriving at once cost one full pass, not ten thousand
-/// targeted ones — and the queue never holds ten thousand of anything.
+/// Ten thousand hints arriving at once cost one pass, not ten thousand targeted
+/// ones — and the queue never holds ten thousand of anything.
 #[test]
-fn a_storm_of_hints_costs_one_full_pass() {
+fn a_storm_of_hints_costs_one_pass() {
     let workspace = Workspace::new();
     workspace.write("src/main.rs", "fn main() {}\n");
     let engine = workspace.engine();
@@ -611,10 +701,20 @@ fn a_storm_of_hints_costs_one_full_pass() {
     assert!(
         rendered
             .last()
-            .is_some_and(|line| line.starts_with("finished:full:")),
-        "{rendered:?}"
+            .is_some_and(|line| line.starts_with("finished:subtree:")),
+        "the storm narrowed to the directory holding it: {rendered:?}"
     );
     assert!(service.status().overflows >= 1);
+    // Reported once, with the size the set gave up at, which is what keeps
+    // `queue_overflow` from being a published discriminant no caller can meet.
+    assert_eq!(
+        rendered
+            .iter()
+            .filter(|line| line.starts_with("degraded:queue_overflow"))
+            .count(),
+        1,
+        "{rendered:?}"
+    );
 }
 
 /// The end-to-end promise, with a real backend where one exists: edit a file

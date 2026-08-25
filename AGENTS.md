@@ -678,11 +678,27 @@ path bytes, in memory and in SQL, and containment always requires the separator:
 
 **A scope only ever widens, and the report says what it became.** A path list
 past `MAX_PATHS_PER_RECONCILE` becomes the subtree holding all of it; a diverged
-committed base becomes a full pass. Narrowing would be an update that silently
-covered less than it was asked to. The dirty set is bounded the same way:
-markers absorb what they cover and passing `WATCH_QUEUE_CAPACITY` collapses the
-whole set into a full pass carrying no paths at all, so an event storm costs one
-reconcile and a constant amount of memory.
+committed base becomes a full pass; and a checkout the cache has published
+nothing for becomes one too, because there is nothing to compare against and a
+narrow pass over one leaves the rest of the tree invisible. Narrowing would be
+an update that silently covered less than it was asked to.
+
+**A path list is disjoint, and stripping it compares against every entry kept
+rather than the previous one.** Sorted order is not containment order —
+`src/watch`, `src/watch.rs`, `src/watch/tests.rs` sort in that order — and an
+overlapping list makes `read_units` hand the merge one row twice, which stages a
+removal for a path the same pass recorded. The invariant is re-established on
+use as well as on construction, because the variant's field is public and
+`#[non_exhaustive]` stops matching rather than construction.
+
+**The dirty set's two overflows are not the same overflow.** Reaching
+`WATCH_QUEUE_CAPACITY` means there were too many hints to carry, not that any
+were lost, so the set narrows to the one directory holding everything it was
+told about — a `cargo build` must not buy a walk of the repository to discover
+that `target/` is ignored. A backend-reported **rescan** means events were lost
+and can only be a full pass. The rescan flag is read *before* the event kind,
+because every backend spells a lost event `EventKind::Other`, which the
+classifier maps to nothing.
 
 **A scoped walk descends from the root exactly as a full one does.** Every
 `.gitignore` on the way is read and every built-in denial is asked about every
