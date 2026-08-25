@@ -417,7 +417,7 @@ fn decodes_as_utf16(body: &[u8], big_endian: bool, complete: bool) -> bool {
     if complete && !body.len().is_multiple_of(2) {
         return false;
     }
-    let units = body.chunks_exact(2).map(|pair| {
+    let units = body.as_chunks::<2>().0.iter().map(|pair| {
         if big_endian {
             u16::from_be_bytes([pair[0], pair[1]])
         } else {

@@ -178,13 +178,19 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// How long a database with no metadata is given to turn out to be a cache
 /// somebody else is still creating.
 ///
-/// Short, because the window it covers is the microseconds between another
-/// process opening the file and its one creation transaction taking the write
-/// lock — everything after that is contention, which the busy wait already
-/// answers. It is not zero, because a cache being built and a cache that is
-/// broken are indistinguishable in a single read, and quarantining the first is
-/// far more expensive than waiting out the second.
-const CREATION_GRACE: Duration = Duration::from_millis(200);
+/// It is not zero, because a cache being built and a cache that is broken are
+/// indistinguishable in a single read, and quarantining the first is far more
+/// expensive than waiting out the second.
+///
+/// It is *seconds* rather than the couple of hundred milliseconds a
+/// single-table cache needed. Creating one now applies the whole layout —
+/// seven tables and four indexes — and inserts the metadata row inside one
+/// transaction, and a cold filesystem on a loaded machine takes longer over
+/// that than the old window allowed. Waiting too long costs a one-off pause on
+/// a cache that really is broken; waiting too little destroys the cache another
+/// process is part-way through writing, and on Windows cannot even do that
+/// cleanly, because the file it would rename is open.
+const CREATION_GRACE: Duration = Duration::from_secs(3);
 
 /// Filename-safe, fixed-width, lexicographically chronological stamp.
 ///
@@ -1171,7 +1177,17 @@ fn probe_existing(
         // corruption, which is the honest end of a distinction that cannot be
         // made perfectly from outside the other process.
         outcome => {
-            let Some(stamp) = await_creation(&connection, cancellation)? else {
+            // A creation is one transaction: the whole layout and the metadata
+            // row land together, so a reader sees either nothing or all of it.
+            // A database that already holds tables and *still* has no readable
+            // metadata is therefore not one somebody is part-way through — it is
+            // broken, and waiting out the grace would only delay saying so.
+            let waited = if has_tables(&connection) {
+                None
+            } else {
+                await_creation(&connection, cancellation)?
+            };
+            let Some(stamp) = waited else {
                 return Ok(Probe::Replace {
                     reason: RecreationReason::Corrupt,
                     previous_generation: None,
@@ -1281,6 +1297,23 @@ fn read_waiting<T>(
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// Whether the database already holds a table of its own.
+///
+/// The question is only ever asked of a database whose metadata could not be
+/// read, and it separates the two ways that happens. Unreadable answers `false`,
+/// which sends the caller to the grace — the cautious end of a distinction that
+/// cannot be made perfectly from outside the writing process.
+fn has_tables(connection: &Connection) -> bool {
+    connection
+        .query_row(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' LIMIT 1",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .is_ok_and(|found| found.is_some())
 }
 
 /// Re-reads metadata that is absent, in case a cache is mid-creation.
@@ -1729,16 +1762,50 @@ fn quarantine(database: &Path) -> Result<Option<PathBuf>, ContextEngineError> {
         return Ok(None);
     }
     let destination = quarantine_path(database)?;
-    fs::rename(database, &destination).map_err(|error| ContextEngineError::CacheOpenFailed {
-        path: database.to_path_buf(),
-        reason: format!(
-            "the unusable cache could not be moved to '{}': {error}",
-            destination.display()
-        ),
+    fs::rename(database, &destination).map_err(|error| {
+        // A rename refused because the file is open is not a failed quarantine,
+        // it is evidence the cache is in use — Windows will not rename a file
+        // any handle holds, so the process this build was about to declare
+        // broken is demonstrably alive and writing. `index_busy` sends the
+        // caller back later; `cache_open_failed` would tell them their cache is
+        // unusable when the only thing wrong is that somebody else has it.
+        if is_in_use(&error) {
+            return ContextEngineError::IndexBusy {
+                path: database.to_path_buf(),
+                reason: format!("the cache is open elsewhere and cannot be set aside: {error}"),
+            };
+        }
+        ContextEngineError::CacheOpenFailed {
+            path: database.to_path_buf(),
+            reason: format!(
+                "the unusable cache could not be moved to '{}': {error}",
+                destination.display()
+            ),
+        }
     })?;
     remove_sidecars(database);
     prune_quarantines(database);
     Ok(Some(destination))
+}
+
+/// Whether a filesystem failure says the file is open somewhere else.
+///
+/// Only Windows has this failure: it refuses to rename a file any handle holds
+/// and reports `ERROR_SHARING_VIOLATION`, which Rust gives no stable
+/// `ErrorKind` for. Unix renames an open file happily, so there the answer is
+/// always no — and it has to be the *raw* code rather than a kind, because 32 is
+/// `EPIPE` there and would mean something else entirely.
+#[cfg(windows)]
+fn is_in_use(error: &std::io::Error) -> bool {
+    /// `ERROR_SHARING_VIOLATION`.
+    const SHARING_VIOLATION: i32 = 32;
+    error.raw_os_error() == Some(SHARING_VIOLATION)
+}
+
+/// Renaming an open file is not a failure on this platform.
+#[cfg(not(windows))]
+const fn is_in_use(_error: &std::io::Error) -> bool {
+    false
 }
 
 /// Writes the single metadata row, yielding to one that is already there.
