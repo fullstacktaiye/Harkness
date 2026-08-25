@@ -53,8 +53,9 @@
 //! `harkness-runtime` records it, and everything the cache holds is derived
 //! from repository content, which is what keeps deleting `<data_dir>/context/`
 //! lossless (ADR-0004). Of the eight facade methods,
-//! [`snapshot`](ContextEngine::snapshot) and
-//! [`inventory`](ContextEngine::inventory) are implemented; the rest return
+//! [`snapshot`](ContextEngine::snapshot),
+//! [`inventory`](ContextEngine::inventory) and
+//! [`search`](ContextEngine::search) are implemented; the rest return
 //! [`ContextEngineError::NotYetAvailable`] naming what is missing, so every
 //! later retrieval issue has a compiling seam.
 //!
@@ -114,12 +115,31 @@
 //! is the reference and `crates/harkness-context/src/reconcile.rs`'s module
 //! documentation is the contract.
 //!
+//! # Finding things in it
+//!
+//! [`ContextEngine::search`] is the first retrieval feature the engine answers
+//! with, and deliberately the least clever one: literal text, a regular
+//! expression, or a path substring, in an order that does not move, with
+//! everything it left out written into the answer. Its universe is the index
+//! rather than the filesystem, so a denied path or a secret-classified file is
+//! not a row to be filtered but a row that was never written — and a worktree
+//! the index has never seen is a refusal rather than an empty answer, because
+//! "no match" and "I did not look" are different things to say.
+//!
+//! [`search`] is the contract — the total order over positions, the opaque
+//! generation-bound cursor, the budgets, and the [`SearchOmission`] every one of
+//! them reports — and `docs/context-search.md` is the reference.
+//!
 //! # What is not here
 //!
-//! No search ([#116]), no symbol extraction ([#117]) — the store accepts symbol
-//! rows and nothing in this build produces one — and no provider or token
-//! concepts ([#111], [#122]). The identifiers and facade signatures those
-//! issues need are defined here so that none of them has to invent one.
+//! No ranking ([#121]) — matches come back in canonical order and the engine
+//! expresses no opinion about which is better — no symbol extraction ([#117]),
+//! since the store accepts symbol rows and nothing in this build produces one,
+//! and no provider or token concepts ([#111], [#122]). The identifiers and
+//! facade signatures those issues need are defined here so that none of them
+//! has to invent one.
+//!
+//! [#121]: https://github.com/fullstacktaiye/harkness/issues/121
 //!
 //! [#111]: https://github.com/fullstacktaiye/harkness/issues/111
 //! [#112]: https://github.com/fullstacktaiye/harkness/issues/112
@@ -142,6 +162,7 @@ mod path;
 mod probe;
 mod provenance;
 mod reconcile;
+pub mod search;
 mod snapshot;
 mod text;
 pub mod watch;
@@ -159,8 +180,8 @@ pub use classify::{
 pub use digest::{Sha256Hex, empty_path_set_digest};
 pub use engine::{
     ChunkContent, ContextEngine, ContextEngineConfig, ContextPack, InstructionSet,
-    InventoryRequest, MapRequest, PackRequest, RepositoryMap, SearchQuery, SearchResults,
-    SettingGroup, SettingOrigin, SettingOrigins, SymbolQuery, SymbolResults,
+    InventoryRequest, MapRequest, PackRequest, RepositoryMap, SettingGroup, SettingOrigin,
+    SettingOrigins, SymbolQuery, SymbolResults,
 };
 pub use error::{ContextDomainError, ContextEngineError};
 pub use ids::{
@@ -182,6 +203,13 @@ pub use provenance::{
     SelectionReason, SelectionReasonKind, Sensitivity, SymbolRef,
 };
 pub use reconcile::{MAX_PATHS_PER_RECONCILE, ReconcileReport, ReconcileScope};
+pub use search::{
+    BoundedText, CursorRefusal, DEFAULT_MAX_LINE_BYTES, DEFAULT_MAX_RESPONSE_BYTES,
+    DEFAULT_MAX_RESULTS, MAX_CONTEXT_LINES, MAX_PATH_PREFIXES, MAX_PATTERN_BYTES,
+    MAX_REGEX_SIZE_BYTES, MAX_RESULTS_CAP, MAX_SEARCH_OMISSIONS, SearchCursor, SearchError,
+    SearchFilters, SearchLimits, SearchMatch, SearchOmission, SearchPattern, SearchQuery,
+    SearchResponse, SearchStats, TextEncoding,
+};
 pub use snapshot::{
     Capture, CaptureDiagnostics, CaptureRequest, FileDigestEntry, FreshnessState, PathDivergence,
     SkippedPath, SnapshotComponent, SnapshotDigest, SnapshotFiles, StalePath, UnverifiableReason,

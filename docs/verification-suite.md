@@ -178,6 +178,8 @@ sh .github/scripts/run-ignored-exact-test.sh \
 | `latency-inventory-walk` | 1.5 s | `harkness-context` | `inventory::tests::a_medium_repository_meets_the_walk_latency_target` |
 | `latency-chunking-1mib` | 20 ms | `harkness-context` | `chunk::tests::chunking_one_megabyte_meets_the_latency_target` |
 | `latency-incremental-update` | 1 s | `harkness-context` | `reconcile::tests::a_single_file_update_meets_the_incremental_latency_target` |
+| `latency-lexical-search` | 100 ms | `harkness-context` | `search::tests::a_medium_repository_meets_the_content_search_latency_target` |
+| `latency-filename-search` | 25 ms | `harkness-context` | `search::tests::a_medium_repository_meets_the_filename_search_latency_target` |
 
 `latency-per-call-overhead` has three entries because the same budget is paid in
 three different arrangements, and only one of them is the one that ships: an
@@ -189,6 +191,15 @@ so the first two say nothing about the third.
 `latency-cancellation-visible` is listed twice for the same reason: a
 cooperative tool noticing its token and a child process being killed through its
 process group are different chains, and 250 ms is the promise for both.
+
+`latency-lexical-search` is measured on a query that matches **nothing**, so it
+opens and scans every eligible file before it can answer. A query that matches
+early stops at its result budget after a handful of files and measures almost
+nothing, which would make the budget one no repository could ever fail. Both
+searches take a capture rather than making one, which is the arrangement a run
+uses — a run records one workspace snapshot and stamps every retrieval with it —
+and the capture's own cost is printed beside the numbers so the choice hides
+nothing.
 
 ## What runs where, and why
 

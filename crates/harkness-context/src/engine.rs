@@ -25,13 +25,21 @@
 //! # What is here and what is not
 //!
 //! The eight facade methods are the whole retrieval surface.
-//! [`snapshot`](ContextEngine::snapshot) and
-//! [`inventory`](ContextEngine::inventory) are implemented, because [#109] and
-//! [#112] landed what they need; the other six return
+//! [`snapshot`](ContextEngine::snapshot), [`inventory`](ContextEngine::inventory)
+//! and [`search`](ContextEngine::search) are implemented, because [#109], [#112]
+//! and [#116] landed what they need; the other five return
 //! [`ContextEngineError::NotYetAvailable`] naming the missing feature. That is a
 //! real, tested refusal rather than a `todo!()`, so a caller written against the
 //! seam now gets a typed answer and the issue that implements a method deletes a
 //! branch rather than a panic.
+//!
+//! [`search`](ContextEngine::search) has a second spelling,
+//! [`search_under`](ContextEngine::search_under), and the difference is not a
+//! convenience: the first captures a workspace snapshot and the second takes one
+//! the caller already holds. A run records a snapshot before it starts work, and
+//! stamping everything it retrieves with that one is what makes its evidence
+//! describe a single moment rather than one per query — a capture also costs
+//! several times what a scan does on a repository of any size.
 //!
 //! Beside them is the cache: [`reindex`](ContextEngine::reindex) fills it,
 //! [`index_status`](ContextEngine::index_status) polls it without waiting on the
@@ -48,6 +56,7 @@
 //!
 //! [#109]: https://github.com/fullstacktaiye/harkness/issues/109
 //! [#112]: https://github.com/fullstacktaiye/harkness/issues/112
+//! [#116]: https://github.com/fullstacktaiye/harkness/issues/116
 //! [#122]: https://github.com/fullstacktaiye/harkness/issues/122
 //! [#123]: https://github.com/fullstacktaiye/harkness/issues/123
 
@@ -72,6 +81,7 @@ use crate::inventory::{
 use crate::path::RepoPath;
 use crate::probe::FilesystemProbe;
 use crate::reconcile::{ReconcileReport, ReconcileScope, Reconciler};
+use crate::search::{Scan, SearchQuery, SearchResponse};
 use crate::snapshot::{Capture, CaptureRequest, WorkspaceSnapshot};
 use crate::watch::{WatchOptions, WatchService};
 
@@ -585,20 +595,95 @@ impl ContextEngine {
         InventoryPolicy::new().with_global_ignore(self.config.data_dir.join(GLOBAL_IGNORE_FILE))
     }
 
-    /// Lexical and filename search over the index ([#116]).
+    /// Deterministic filename and lexical search over the index.
+    ///
+    /// The universe is the index rather than the filesystem, so what a query
+    /// can reach was decided by the inventory's exclusion layers and not by
+    /// this call: a denied path, a secret-classified file and an ignored one
+    /// are not rows to be filtered but rows that were never written. A worktree
+    /// the cache has never seen is therefore [`SearchError::IndexUnavailable`]
+    /// rather than an empty answer — build the index with
+    /// [`reindex`](Self::reindex) first.
+    ///
+    /// This one captures a snapshot and stamps the matches with its id, which
+    /// is the convenient shape and the expensive one: a capture reads the whole
+    /// workspace and, on a repository of any size, costs several times what the
+    /// scan does. A caller that already holds a capture — a run, which recorded
+    /// one before it started work — should use
+    /// [`search_under`](Self::search_under) instead, and not only to save the
+    /// time: a run that searched five times would otherwise stamp its evidence
+    /// with five workspace states for one moment.
+    ///
+    /// Blocking, and cancellation-polled between files. A cancelled search
+    /// yields no partial page: a caller that stopped one did not ask for the
+    /// prefix of an answer.
+    ///
+    /// The whole contract — the ordering, the cursor, the budgets and the
+    /// omissions — is on the [`search`](crate::search) module, and
+    /// `docs/context-search.md` is the reference.
     ///
     /// # Errors
     ///
-    /// [`ContextEngineError::NotYetAvailable`] until [#116] lands.
+    /// [`ContextEngineError::Search`] for a pattern, filter, capability or
+    /// cursor a query cannot be run with, [`ContextEngineError::Cancelled`],
+    /// the capture failures of [`snapshot`](Self::snapshot), and the cache's
+    /// own read failures.
     ///
-    /// [#116]: https://github.com/fullstacktaiye/harkness/issues/116
+    /// [`SearchError::IndexUnavailable`]: crate::SearchError::IndexUnavailable
     pub fn search(
         &self,
         query: &SearchQuery,
         cancellation: &Cancellation,
-    ) -> Result<SearchResults, ContextEngineError> {
-        let _ = (query, cancellation);
-        Err(unavailable("search"))
+    ) -> Result<SearchResponse, ContextEngineError> {
+        if cancellation.is_cancelled() {
+            return Err(ContextEngineError::Cancelled);
+        }
+        let snapshot = self.snapshot(cancellation)?;
+        self.search_under(&snapshot, query, cancellation)
+    }
+
+    /// The same search, stamped with a capture the caller already holds.
+    ///
+    /// The pairing is exactly [`InventoryBuilder::build`]'s: a walk and a search
+    /// are both readings of a workspace, and the workspace they read is named
+    /// by a capture rather than by a path a caller wrote. Passing one in is what
+    /// lets everything a run retrieves carry the one snapshot the run recorded,
+    /// so its evidence describes a single moment instead of one per query.
+    ///
+    /// The capture must be of *this* engine's worktree. A foreign one is refused
+    /// rather than used, because provenance built from it would be well formed
+    /// and false.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextEngineError::ForeignSnapshot`] when the capture describes
+    /// another checkout, and otherwise the failures of
+    /// [`search`](Self::search) apart from the capture's own.
+    pub fn search_under(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+        query: &SearchQuery,
+        cancellation: &Cancellation,
+    ) -> Result<SearchResponse, ContextEngineError> {
+        if cancellation.is_cancelled() {
+            return Err(ContextEngineError::Cancelled);
+        }
+        if snapshot.worktree_root() != self.config.worktree_root {
+            return Err(ContextEngineError::ForeignSnapshot {
+                expected: self.config.worktree_root.clone(),
+                found: snapshot.worktree_root().to_path_buf(),
+            });
+        }
+        let worktree = self.worktree_key();
+        self.with_cache(|cache| {
+            Scan {
+                cache,
+                worktree: &worktree,
+                root: &self.config.worktree_root,
+                snapshot: snapshot.id(),
+            }
+            .run(query, cancellation)
+        })
     }
 
     /// The content of one indexed chunk.
@@ -1257,24 +1342,6 @@ impl InventoryRequest {
     }
 }
 
-/// What to search for.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub struct SearchQuery {
-    /// The text to look for.
-    pub pattern: String,
-}
-
-impl SearchQuery {
-    /// Searches for `pattern`.
-    #[must_use]
-    pub fn new(pattern: impl Into<String>) -> Self {
-        Self {
-            pattern: pattern.into(),
-        }
-    }
-}
-
 /// Which symbol to look up.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -1321,15 +1388,6 @@ impl PackRequest {
         }
     }
 }
-
-/// What a search found ([#116]).
-///
-/// Empty for the reason [`FileInventory`] is.
-///
-/// [#116]: https://github.com/fullstacktaiye/harkness/issues/116
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-#[non_exhaustive]
-pub struct SearchResults {}
 
 /// The content of one indexed chunk ([#123]).
 ///

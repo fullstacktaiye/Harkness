@@ -33,6 +33,15 @@ base64 = "0.22"
 clap = { version = "4.6.5", features = ["derive"] }
 dirs = "6.0"
 git2 = { version = "0.21", default-features = false }
+# The ripgrep libraries behind the context engine's lexical search. In process
+# rather than through the `rg` binary, which is what makes shell injection
+# unrepresentable rather than defended against: there is no argv for a
+# caller-supplied pattern to escape from. `grep-matcher` is named explicitly
+# because the search sink is written against that trait rather than against a
+# concrete engine, so the pattern kind is the only thing that varies.
+grep-matcher = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
 harkness-acp = { path = "crates/harkness-acp" }
 harkness-context = { path = "crates/harkness-context" }
 harkness-forge = { path = "crates/harkness-forge" }

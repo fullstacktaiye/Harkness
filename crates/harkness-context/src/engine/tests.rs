@@ -202,6 +202,10 @@ fn every_facade_method_either_answers_or_names_the_feature_it_is_missing() {
     engine
         .inventory(&InventoryRequest::new(), &cancellation)
         .unwrap();
+    engine.reindex(&cancellation).unwrap();
+    engine
+        .search(&SearchQuery::exact("needle"), &cancellation)
+        .unwrap();
 
     let chunk = ChunkId::derive(
         &RepoPath::from_path(std::path::Path::new("src/lib.rs")),
@@ -209,12 +213,6 @@ fn every_facade_method_either_answers_or_names_the_feature_it_is_missing() {
         b"",
     );
     let refusals: Vec<(&str, crate::ContextEngineError)> = vec![
-        (
-            "search",
-            engine
-                .search(&SearchQuery::new("needle"), &cancellation)
-                .unwrap_err(),
-        ),
         (
             "read_chunk",
             engine.read_chunk(&chunk, &cancellation).unwrap_err(),
@@ -245,8 +243,8 @@ fn every_facade_method_either_answers_or_names_the_feature_it_is_missing() {
 
     assert_eq!(
         refusals.len(),
-        6,
-        "eight facade methods, two of them working"
+        5,
+        "eight facade methods, three of them working"
     );
     for (method, error) in refusals {
         assert_eq!(

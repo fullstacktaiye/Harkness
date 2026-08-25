@@ -229,6 +229,22 @@ jobs:
           harkness-context
           reconcile::tests::a_single_file_update_meets_the_incremental_latency_target
           --release
+      # Issue #116 budgets the retrieval layer every later context feature reads
+      # through. The content target is measured on a query that matches nothing,
+      # so it scans the whole repository rather than stopping at its result
+      # budget after a handful of files.
+      - name: Measure lexical search
+        run: >-
+          sh .github/scripts/run-ignored-exact-test.sh
+          harkness-context
+          search::tests::a_medium_repository_meets_the_content_search_latency_target
+          --release
+      - name: Measure filename search
+        run: >-
+          sh .github/scripts/run-ignored-exact-test.sh
+          harkness-context
+          search::tests::a_medium_repository_meets_the_filename_search_latency_target
+          --release
       # Issue #97 puts the coordinator on every protected tool call, so its
       # per-call budget is a release requirement too.
       - name: Measure coordinator decision-to-dispatch
