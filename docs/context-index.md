@@ -36,6 +36,7 @@ erDiagram
 | `index_meta` | the constant `1` | schema and component versions, the generation, the repository identity, when it was created and last opened |
 | `worktrees` | worktree key | one checkout's root, its visible generation, and its generation allocator |
 | `files` | `(worktree_id, path)` | **the only per-worktree rows**: size, modification time, class, symlink and boundary flags, the classification version, and the batch that confirmed it |
+| `pending_files` | `(worktree_id, generation, path)` | the same rows, staged by a batch in flight, before anything can see them |
 | `contents` | content SHA-256 | the size of one distinct blob of bytes |
 | `file_versions` | file-version id | one path's bytes: language, whether the text was transcoded, whether the chunk set stops short of the whole file, and the chunking and parser versions its derived rows were produced under |
 | `chunks` | `(file_version_id, chunk_id)` | anchor, ordinal, byte range, line hints, chunk digest, associated symbol |
@@ -91,19 +92,27 @@ Nothing a batch writes is visible until it commits, and then all of it is.
 ```mermaid
 sequenceDiagram
     participant B as IndexBatch
-    participant W as worktrees row
+    participant P as pending_files
+    participant F as files
     participant R as a reader
-    B->>W: begin: next_generation += 1 → g
-    B->>W: clear rows above last_generation
-    Note over B: flush: rows written at generation g
-    R->>W: reads rows where generation <= last_generation
-    Note over R: sees the previous batch, not this one
-    B->>W: commit: sweep, collect, last_generation = g
-    R->>W: reads again
+    B->>B: begin: next_generation += 1 → g
+    B->>P: flush: rows staged at generation g
+    R->>F: reads
+    Note over R: sees the previous batch, untouched
+    B->>F: commit: copy staged rows across, sweep, collect
+    B->>B: last_generation = g, forward only
+    R->>F: reads again
     Note over R: sees this batch, whole
 ```
 
-Three consequences, each of which is the point rather than a side effect:
+**A batch never writes `files`.** That is the part it is easiest to get wrong,
+and the failure is quiet: tagging the live row with an uncommitted generation
+makes the committed record invisible for the length of the batch, and an
+abandoned batch then strands it where the next `begin` deletes it — a file that
+still exists, gone from the index. Staging keeps the two rows apart, so a batch
+in flight is unobservable rather than merely filtered out.
+
+Three further consequences, each of which is the point rather than a side effect:
 
 - **A killed process leaves nothing partial.** The watermark never moved, so no
   query returns the rows, and the next batch for that worktree deletes them. The
@@ -112,10 +121,14 @@ Three consequences, each of which is the point rather than a side effect:
   batch, in their own transactions, so a reader interleaved with a hundred
   thousand files still answers — from the previous generation — instead of
   queueing behind it.
-- **A generation is allocated once.** A crashed batch's number is dead rather
-  than handed to the next batch, which matters for a targeted batch: it sweeps
-  nothing, so adopting a dead generation's leftovers would publish another
-  batch's abandoned rows under its own commit.
+- **A generation is allocated once, and the watermark only moves forward.** Two
+  front ends indexing one repository both stage, side by side, keyed apart by
+  generation; the first to commit wins and the second is refused with
+  `index_batch_superseded`. Letting the loser through would drag the watermark
+  back below the winner's generation and hide every row it published — a commit
+  that reported success while making the index smaller. The refusal is also what
+  makes cleanup decidable: a batch below the watermark can no longer publish, so
+  its staged rows are provably dead and the next commit collects them.
 
 ### Full and targeted
 
@@ -252,7 +265,13 @@ than read, however it came to be at that path.
 | Eviction removes whole caches, least recently opened first | `harkness-context` | `index::store_tests::eviction_removes_whole_caches_least_recently_opened_first` |
 | Eviction skips a cache that is still open | `harkness-context` | `index::store_tests::eviction_skips_a_cache_that_is_still_open` |
 | A cold build is readable back through the public API | `harkness-context` | `the_index_is_built_and_read_back_from_outside_the_crate` |
-| A truncated walk never sweeps | `harkness-context` | `engine::tests::a_second_reindex_sweeps_what_the_worktree_no_longer_has` |
+| A full walk sweeps what the worktree no longer has | `harkness-context` | `engine::tests::a_second_reindex_sweeps_what_the_worktree_no_longer_has` |
+| A truncated walk never sweeps | `harkness-context` | `engine::tests::a_truncated_walk_commits_as_targeted_and_a_complete_one_as_full` |
+| A batch that re-records a path never hides the committed row | `harkness-context` | `index::store_tests::a_batch_that_re_records_a_path_never_hides_the_committed_row` |
+| A batch that lost a race is refused, not allowed to move the watermark back | `harkness-context` | `index::store_tests::a_batch_that_lost_the_race_is_refused_rather_than_moving_the_watermark_back` |
+| Symbols may be recorded before the file version they belong to | `harkness-context` | `index::store_tests::symbols_recorded_before_their_file_version_are_carried_to_it` |
+| A file that became unreadable keeps the derivation it had | `harkness-context` | `index::store_tests::a_file_that_became_unreadable_keeps_the_derivation_it_had` |
+| A read that reached its bound says there is more | `harkness-context` | `index::store_tests::a_read_that_reached_its_bound_says_there_is_more` |
 | Deleting `context/` loses no run evidence | `harkness-runtime` | `context::tests::deleting_the_whole_context_directory_loses_no_run_evidence` |
 | A batch becomes a timeline entry naming what it wrote | `harkness-runtime` | `context::tests::an_index_batch_becomes_a_timeline_entry_naming_what_it_wrote` |
 

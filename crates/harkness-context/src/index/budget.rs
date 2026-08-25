@@ -85,6 +85,15 @@ pub struct EvictionReport {
     pub evicted: Vec<CacheUsage>,
     /// Caches left alone because another process held them open.
     pub skipped_in_use: u64,
+    /// Caches the sweep could not act on at all.
+    ///
+    /// Separate from [`skipped_in_use`](Self::skipped_in_use) because they are
+    /// different facts and a user acts on them differently. A cache another
+    /// process holds is doing its job; a lock file that could not be opened, or
+    /// a directory that could not be emptied, is a read-only mount or a
+    /// permission problem, and reporting it as contention would send somebody
+    /// looking for a process that is not there.
+    pub unreachable: u64,
     /// Whether the subtree is under its bound now.
     pub within_budget: bool,
 }
@@ -112,11 +121,31 @@ impl CacheLock {
         file.try_lock_shared().ok().map(|()| Self { file })
     }
 
-    /// Takes the exclusive lock, or answers `None` when a cache is open.
-    fn exclusive(cache_root: &Path) -> Option<Self> {
-        let file = open_lock_file(cache_root)?;
-        file.try_lock().ok().map(|()| Self { file })
+    /// Takes the exclusive lock.
+    ///
+    /// `Held` and `Unreachable` are told apart because eviction reports them
+    /// apart: a cache another process is using is doing its job, and a lock file
+    /// that will not open is a read-only mount or a permission bit.
+    fn exclusive(cache_root: &Path) -> Claim {
+        let Some(file) = open_lock_file(cache_root) else {
+            return Claim::Unreachable;
+        };
+        match file.try_lock() {
+            Ok(()) => Claim::Taken(Self { file }),
+            Err(std::fs::TryLockError::WouldBlock) => Claim::Held,
+            Err(std::fs::TryLockError::Error(_)) => Claim::Unreachable,
+        }
     }
+}
+
+/// What asking for a cache's exclusive lock answered.
+enum Claim {
+    /// Nobody else holds it.
+    Taken(CacheLock),
+    /// A process has the cache open.
+    Held,
+    /// The lock itself could not be reached.
+    Unreachable,
 }
 
 impl Drop for CacheLock {
@@ -177,6 +206,7 @@ pub fn evict_to_budget(
             bytes_after: bytes_before,
             evicted: Vec::new(),
             skipped_in_use: 0,
+            unreachable: 0,
             within_budget: true,
         });
     }
@@ -194,6 +224,7 @@ pub fn evict_to_budget(
     let mut bytes = bytes_before;
     let mut evicted = Vec::new();
     let mut skipped_in_use = 0;
+    let mut unreachable = 0;
     for cache in caches {
         if bytes <= limit {
             break;
@@ -201,15 +232,28 @@ pub fn evict_to_budget(
         if cancellation.is_cancelled() {
             return Err(ContextEngineError::Cancelled);
         }
-        let Some(guard) = CacheLock::exclusive(&cache.root) else {
-            skipped_in_use += 1;
-            continue;
+        let guard = match CacheLock::exclusive(&cache.root) {
+            Claim::Taken(guard) => guard,
+            Claim::Held => {
+                skipped_in_use += 1;
+                continue;
+            }
+            Claim::Unreachable => {
+                unreachable += 1;
+                continue;
+            }
         };
-        if remove_cache(&cache.root, guard) {
-            bytes = bytes.saturating_sub(cache.bytes);
+        // Measured again rather than subtracted, because a removal that only
+        // partly succeeded really did free the files it managed to unlink.
+        // Reporting the cache's whole size as reclaimed would overstate the
+        // sweep and let `within_budget` say a subtree fits when it does not.
+        let removed = remove_cache(&cache.root, guard);
+        let remaining = directory_bytes(&cache.root);
+        bytes = bytes.saturating_sub(cache.bytes.saturating_sub(remaining));
+        if removed {
             evicted.push(cache);
         } else {
-            skipped_in_use += 1;
+            unreachable += 1;
         }
     }
 
@@ -219,12 +263,14 @@ pub fn evict_to_budget(
         within_budget: bytes <= limit,
         evicted,
         skipped_in_use,
+        unreachable,
     };
     tracing::debug!(
         bytes_before = report.bytes_before,
         bytes_after = report.bytes_after,
         evicted = report.evicted.len(),
         skipped_in_use = report.skipped_in_use,
+        unreachable = report.unreachable,
         duration_ms = started.elapsed().as_millis(),
         "context index eviction swept"
     );
@@ -304,15 +350,21 @@ fn remove_cache(root: &Path, guard: CacheLock) -> bool {
 }
 
 /// Bytes one cache directory occupies, sidecars and quarantines included.
+///
+/// Recursive, because [`remove_cache`] removes subdirectories too: a size that
+/// counted only the top level would understate what a sweep is about to free
+/// and let the loop evict more caches than the budget needed.
 fn directory_bytes(root: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(root) else {
         return 0;
     };
     entries
         .filter_map(Result::ok)
-        .filter_map(|entry| entry.metadata().ok())
-        .filter(std::fs::Metadata::is_file)
-        .map(|metadata| metadata.len())
+        .map(|entry| match entry.metadata() {
+            Ok(metadata) if metadata.is_dir() => directory_bytes(&entry.path()),
+            Ok(metadata) if metadata.is_file() => metadata.len(),
+            _ => 0,
+        })
         .sum()
 }
 

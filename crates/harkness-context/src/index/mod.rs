@@ -113,8 +113,8 @@ pub use budget::{
 };
 pub use schema::{CORE_TABLES, INDEX_SCHEMA, INDEX_SCHEMA_VERSION};
 pub use store::{
-    BatchReceipt, BatchScope, IndexBatch, IndexedChunk, IndexedFile, IndexedSymbol, MAX_READ_ROWS,
-    SymbolRecord, WorktreeKey, cache_root,
+    BatchReceipt, BatchScope, IndexBatch, IndexedChunk, IndexedFile, IndexedPage, IndexedSymbol,
+    MAX_READ_ROWS, SymbolRecord, WorktreeKey, cache_root,
 };
 
 use budget::CacheLock;

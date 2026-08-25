@@ -816,6 +816,86 @@ fn a_contended_cache_costs_the_index_and_not_the_workspace() {
     let _ = workspace;
 }
 
+/// The rule a truncated walk turns on, held to directly.
+///
+/// A full batch deletes every row it did not confirm, and a walk stopped by its
+/// own budget did not see the whole worktree — sweeping on one would delete
+/// rows for files that exist. Reaching the branch through `reindex` would mean
+/// building a repository past `MAX_INVENTORY_FILES`, so the decision is a pure
+/// function and this is where it is proved.
+#[test]
+fn a_truncated_walk_commits_as_targeted_and_a_complete_one_as_full() {
+    assert_eq!(super::batch_scope(true), crate::index::BatchScope::Targeted);
+    assert_eq!(super::batch_scope(false), crate::index::BatchScope::Full);
+}
+
+/// A file that changes under a running build keeps whatever the last successful
+/// pass derived, rather than being recorded as content-less — which would
+/// unlink it from its chunks and have the commit collect them.
+#[test]
+fn a_file_that_changes_under_the_build_keeps_its_previous_chunks() {
+    let (workspace, engine) = workspace_with(&[("a.rs", "fn a() {}\n")]);
+    let cancellation = Cancellation::default();
+    engine.reindex(&cancellation).unwrap();
+    let path = RepoPath::from_path(std::path::Path::new("a.rs"));
+    let chunks = engine.indexed_chunks(&path).unwrap();
+    assert!(!chunks.is_empty());
+
+    // The inventory records one size and the file is a different one by the
+    // time the bytes are read, which is what `FileVersion::new` refuses.
+    let inventory = engine
+        .inventory(&InventoryRequest::new(), &cancellation)
+        .unwrap();
+    let entry = inventory
+        .entries()
+        .iter()
+        .find(|entry| entry.path == path)
+        .expect("the file is in the inventory")
+        .clone();
+    fs::write(
+        workspace.root.join("a.rs"),
+        "fn a() { much_longer_now(); }\n",
+    )
+    .unwrap();
+
+    let key = engine.worktree_key();
+    let receipt = {
+        let cache_root = engine.cache_root().to_path_buf();
+        let cache = crate::index::IndexCache::open_or_create(
+            &cache_root,
+            &crate::index::ExpectedVersions::current(),
+            engine.repository_key(),
+            &cancellation,
+        )
+        .unwrap();
+        let mut batch = cache
+            .begin(
+                &key,
+                engine.worktree_root(),
+                crate::index::BatchScope::Targeted,
+                &cancellation,
+            )
+            .unwrap();
+        batch
+            .record_unreadable(&entry, crate::CLASSIFY_VERSION)
+            .unwrap();
+        batch.commit(&cancellation).unwrap()
+    };
+
+    assert_eq!(receipt.files_recorded, 1);
+    let row = engine
+        .indexed_file(&path)
+        .unwrap()
+        .expect("the row is still there");
+    assert!(row.unreadable);
+    assert!(row.file_version.is_some(), "still linked to what it had");
+    assert_eq!(
+        engine.indexed_chunks(&path).unwrap(),
+        chunks,
+        "and its chunks survived the pass that could not read it"
+    );
+}
+
 /// An already-cancelled token launches nothing at all.
 #[test]
 fn a_cancelled_reindex_writes_nothing_visible() {

@@ -63,8 +63,8 @@ use crate::error::{ContextDomainError, ContextEngineError};
 use crate::ids::ChunkId;
 use crate::index::{
     self, BatchReceipt, BatchScope, CacheRecreation, ExpectedVersions, IndexAvailability,
-    IndexCache, IndexCounts, IndexReport, IndexStatus, IndexedChunk, IndexedFile, RecreationReason,
-    WorktreeKey,
+    IndexCache, IndexCounts, IndexReport, IndexStatus, IndexedChunk, IndexedFile, IndexedPage,
+    RecreationReason, WorktreeKey,
 };
 use crate::inventory::{
     FileInventory, GLOBAL_IGNORE_FILE, InventoryBuilder, InventoryEntry, InventoryPolicy,
@@ -761,11 +761,7 @@ impl ContextEngine {
 
         let snapshot = self.snapshot(cancellation)?;
         let inventory = InventoryBuilder::build(&snapshot, &self.inventory_policy(), cancellation)?;
-        let scope = if inventory.is_truncated() {
-            BatchScope::Targeted
-        } else {
-            BatchScope::Full
-        };
+        let scope = batch_scope(inventory.is_truncated());
         let key = self.worktree_key();
         let classify_version = inventory.classify_version();
 
@@ -776,44 +772,59 @@ impl ContextEngine {
                 if cancellation.is_cancelled() {
                     return Err(ContextEngineError::Cancelled);
                 }
-                match self.derive(entry, snapshot.id(), cancellation) {
-                    // A file that could not be read or chunked is still a path
-                    // the walk saw, and recording it without content is the
-                    // honest answer: dropping it would make a full batch sweep
-                    // it, and the next walk would find it again and try again.
-                    Ok(None) => batch.record_entry(entry, classify_version)?,
-                    Ok(Some((version, chunks))) => {
-                        batch.record_chunked(entry, &version, &chunks, classify_version)?;
+                match self.derive(entry, snapshot.id(), cancellation)? {
+                    Derived::Content(derived) => {
+                        let (version, chunks) = derived.as_ref();
+                        batch.record_chunked(entry, version, chunks, classify_version)?;
                     }
-                    Err(error) => return Err(error),
+                    // A path whose content is never read — a binary, a symlink,
+                    // a repository boundary. Recording it without content is the
+                    // honest answer; dropping it would make a full batch sweep a
+                    // path that exists.
+                    Derived::Ineligible => batch.record_entry(entry, classify_version)?,
+                    // A path that *should* have been read and could not be,
+                    // because it changed under the walk or would not open. Its
+                    // metadata is refreshed and whatever the last successful
+                    // pass derived is left alone — clearing it would delete the
+                    // file's chunks over one unreadable moment.
+                    Derived::Unreadable => batch.record_unreadable(entry, classify_version)?,
                 }
             }
             batch.commit(cancellation)
         })
     }
 
-    /// Reads and chunks one eligible entry, or answers `None` for one that is
-    /// not eligible, unreadable, or has moved since the walk.
+    /// Reads and chunks one entry, saying which of three things happened.
+    ///
+    /// The distinction between "never read" and "could not be read" is the
+    /// whole reason this returns three answers rather than an [`Option`]: the
+    /// two lead to different rows, and collapsing them costs a file its chunks
+    /// the first time it is written to while a build is walking past.
     fn derive(
         &self,
         entry: &InventoryEntry,
         snapshot: crate::ids::SnapshotId,
         cancellation: &Cancellation,
-    ) -> Result<Option<(FileVersion, crate::chunk::ChunkSet)>, ContextEngineError> {
+    ) -> Result<Derived, ContextEngineError> {
         if !entry.eligible() {
-            return Ok(None);
+            return Ok(Derived::Ineligible);
         }
         let Ok(bytes) = std::fs::read(self.config.worktree_root.join(entry.path.to_path_buf()))
         else {
-            return Ok(None);
+            return Ok(Derived::Unreadable);
         };
-        let Ok(version) = FileVersion::new(entry, snapshot, bytes.into(), cancellation) else {
-            return Ok(None);
+        let version = match FileVersion::new(entry, snapshot, bytes.into(), cancellation) {
+            Ok(version) => version,
+            // A cancelled token is the caller's answer wherever it is observed.
+            // Reading it as "this file could not be read" would let a stopped
+            // build commit a batch describing a repository nobody walked.
+            Err(crate::chunk::ChunkError::Cancelled) => return Err(ContextEngineError::Cancelled),
+            Err(_) => return Ok(Derived::Unreadable),
         };
         match chunk_file(&version, None, cancellation) {
-            Ok(chunks) => Ok(Some((version, chunks))),
+            Ok(chunks) => Ok(Derived::Content(Box::new((version, chunks)))),
             Err(crate::chunk::ChunkError::Cancelled) => Err(ContextEngineError::Cancelled),
-            Err(_) => Ok(None),
+            Err(_) => Ok(Derived::Unreadable),
         }
     }
 
@@ -832,10 +843,17 @@ impl ContextEngine {
 
     /// Every file row this worktree holds, bounded by `limit`.
     ///
+    /// The page says whether the bound is why it ended, because a full `Vec` and
+    /// a repository that happens to hold exactly that many files are otherwise
+    /// the same answer.
+    ///
     /// # Errors
     ///
     /// The cache's read failures.
-    pub fn indexed_files(&self, limit: usize) -> Result<Vec<IndexedFile>, ContextEngineError> {
+    pub fn indexed_files(
+        &self,
+        limit: usize,
+    ) -> Result<IndexedPage<IndexedFile>, ContextEngineError> {
         let key = self.worktree_key();
         self.with_cache(|cache| cache.files(&key, limit))
     }
@@ -974,6 +992,36 @@ impl ContextEngine {
             Cache::Unavailable(error) => Err(error.clone()),
         }
     }
+}
+
+/// The scope a walk implies, which is the sharpest edge in `reindex`.
+///
+/// A pure function rather than an inline `if`, because it is the rule and not
+/// an implementation detail: a full batch deletes every row it did not confirm,
+/// and a walk stopped by its own file or time budget did not see the whole
+/// worktree — sweeping on one would delete rows for files that exist. Reaching
+/// the truncated branch through the engine means building a repository past
+/// `MAX_INVENTORY_FILES`, so the rule is held to directly instead of by a
+/// fixture nobody can afford to write.
+const fn batch_scope(truncated: bool) -> BatchScope {
+    if truncated {
+        BatchScope::Targeted
+    } else {
+        BatchScope::Full
+    }
+}
+
+/// What reading one inventory entry produced.
+enum Derived {
+    /// The bytes were read and chunked.
+    ///
+    /// Boxed because the other two carry nothing, and one value per file of a
+    /// hundred-thousand-file walk is a size worth not paying on every entry.
+    Content(Box<(FileVersion, crate::chunk::ChunkSet)>),
+    /// The entry is one whose content is never read.
+    Ineligible,
+    /// The entry should have been read and could not be.
+    Unreadable,
 }
 
 /// Prepares the cache, keeping a failure rather than propagating it.

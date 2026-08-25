@@ -16,9 +16,25 @@
 //! fails a test rather than leaving already-written caches silently addressed
 //! by a build that expects different columns.
 //!
+//! # `files` and `pending_files` are two tables for one reason
+//!
+//! A `files` row is what readers see. A batch in flight needs somewhere to put
+//! the row it is *going* to publish, and it cannot be the same row: overwriting
+//! it and tagging it with an uncommitted generation makes the committed record
+//! invisible for the length of the batch, and an abandoned batch then strands
+//! it above the watermark where the next `begin` deletes it — a file that still
+//! exists, gone from the index.
+//!
+//! `pending_files` is therefore a staging table keyed by
+//! `(worktree_id, generation, path)`. A batch writes only there; `files` is
+//! untouched until the commit copies the staged rows across, sweeps, and moves
+//! the watermark in one transaction. The generation in its key is what lets two
+//! batches on one worktree stage side by side without erasing each other.
+//!
 //! # The keying invariant
 //!
-//! Exactly one table is per-worktree: [`files`](INDEX_SCHEMA). Everything
+//! Exactly one table is per-worktree: [`files`](INDEX_SCHEMA) — and its staging
+//! twin, which is the same rows before anybody can see them. Everything
 //! beneath it — `contents`, `file_versions`, `chunks`, `symbols` — is derived
 //! from bytes and paths rather than from a checkout, so two linked worktrees at
 //! one commit share every row but their own `files`. That is what makes the
@@ -134,6 +150,23 @@ CREATE TABLE IF NOT EXISTS files (
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS files_by_file_version ON files (file_version_id);
 
+CREATE TABLE IF NOT EXISTS pending_files (
+    worktree_id      TEXT    NOT NULL REFERENCES worktrees(worktree_id) ON DELETE CASCADE,
+    generation       INTEGER NOT NULL,
+    path             BLOB    NOT NULL,
+    file_version_id  TEXT             REFERENCES file_versions(file_version_id),
+    keep_version     INTEGER NOT NULL,
+    removed          INTEGER NOT NULL,
+    byte_size        INTEGER NOT NULL,
+    mtime_ns         INTEGER,
+    file_class       TEXT    NOT NULL,
+    symlink          INTEGER NOT NULL,
+    boundary         TEXT,
+    unreadable       INTEGER NOT NULL,
+    classify_version INTEGER NOT NULL,
+    PRIMARY KEY (worktree_id, generation, path)
+) STRICT, WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS chunks (
     file_version_id TEXT    NOT NULL REFERENCES file_versions(file_version_id) ON DELETE CASCADE,
     chunk_id        TEXT    NOT NULL,
@@ -177,6 +210,7 @@ pub const CORE_TABLES: &[&str] = &[
     "contents",
     "file_versions",
     "files",
+    "pending_files",
 ];
 
 impl IndexComponent {

@@ -64,6 +64,23 @@ CREATE TABLE index_meta (
     last_opened_at      TEXT    NOT NULL
 ) STRICT;
 
+CREATE TABLE pending_files (
+    worktree_id      TEXT    NOT NULL REFERENCES worktrees(worktree_id) ON DELETE CASCADE,
+    generation       INTEGER NOT NULL,
+    path             BLOB    NOT NULL,
+    file_version_id  TEXT             REFERENCES file_versions(file_version_id),
+    keep_version     INTEGER NOT NULL,
+    removed          INTEGER NOT NULL,
+    byte_size        INTEGER NOT NULL,
+    mtime_ns         INTEGER,
+    file_class       TEXT    NOT NULL,
+    symlink          INTEGER NOT NULL,
+    boundary         TEXT,
+    unreadable       INTEGER NOT NULL,
+    classify_version INTEGER NOT NULL,
+    PRIMARY KEY (worktree_id, generation, path)
+) STRICT, WITHOUT ROWID;
+
 CREATE TABLE symbols (
     file_version_id TEXT    NOT NULL REFERENCES file_versions(file_version_id) ON DELETE CASCADE,
     symbol_id       TEXT    NOT NULL,

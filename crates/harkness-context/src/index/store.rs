@@ -203,6 +203,53 @@ pub struct BatchReceipt {
     pub duration: Duration,
 }
 
+/// A bounded answer, and whether the bound is why it ended.
+///
+/// Every unbounded read here returns one. A bare `Vec` of exactly the limit is
+/// indistinguishable from a repository that happens to hold exactly that many
+/// rows, and the module already refuses that shape on the write side for the
+/// same reason: an answer that stops short without saying so is read as
+/// complete, and "no match" then means "no match in the part I looked at".
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct IndexedPage<T> {
+    /// The rows, at most the limit that was asked for.
+    pub rows: Vec<T>,
+    /// Whether the store holds more than this page returned.
+    pub more: bool,
+}
+
+/// Written by hand: the derived one would demand `T: Default`, and an empty
+/// page is empty whatever it would have held.
+impl<T> Default for IndexedPage<T> {
+    fn default() -> Self {
+        Self {
+            rows: Vec::new(),
+            more: false,
+        }
+    }
+}
+
+/// Reads like the `Vec` it wraps, so the flag is the only thing a caller has to
+/// learn — and it is the thing a caller must not be able to overlook when it
+/// matters, which is why it is a field rather than a convention.
+impl<T> std::ops::Deref for IndexedPage<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        &self.rows
+    }
+}
+
+impl<T> IntoIterator for IndexedPage<T> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.rows.into_iter()
+    }
+}
+
 /// One file row, rebuilt from the cache and re-validated.
 ///
 /// `eligible` is derived rather than stored, exactly as it is on
@@ -326,7 +373,27 @@ struct PendingFile {
     boundary: Option<Boundary>,
     unreadable: bool,
     classify_version: u32,
-    content: Option<PendingContent>,
+    content: Derivation,
+}
+
+/// What a batch knows about one file's *content*, which is not the same
+/// question as what it knows about the file.
+#[derive(Debug)]
+enum Derivation {
+    /// The bytes were read and chunked; this is what they produced.
+    Read(Box<PendingContent>),
+    /// The file is one whose content is never read — a binary, a symlink, a
+    /// repository boundary. Its content columns are cleared.
+    None,
+    /// The file should have been read and could not be: it changed under the
+    /// walk, or the open failed.
+    ///
+    /// Distinct from [`None`](Self::None) because clearing the columns would
+    /// unlink the file version the last successful pass stored, and the commit's
+    /// collection would then delete its chunks. One unreadable moment would
+    /// cost the file its whole entry in the index until something walked again.
+    /// Keeping the previous derivation is stale, and stale beats absent.
+    Unavailable,
 }
 
 /// The derived half of one file, present only when its bytes were read.
@@ -376,6 +443,9 @@ pub struct IndexBatch<'cache> {
     files: Vec<PendingFile>,
     symbols: Vec<PendingSymbols>,
     removals: Vec<RepoPath>,
+    /// File versions this batch has written, so symbols can be told apart from
+    /// symbols whose parent has not arrived yet.
+    recorded_versions: BTreeSet<String>,
     displaced: BTreeSet<String>,
     files_recorded: u64,
     files_removed: u64,
@@ -431,10 +501,13 @@ impl IndexCache {
                 named_params! { ":worktree": worktree.as_str() },
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
-            // Rows above the watermark can only come from a batch that never
-            // committed. Clearing them here rather than at commit is what keeps
-            // a targeted batch — which sweeps nothing — from publishing an
-            // abandoned batch's leftovers alongside its own.
+            // Staged rows at or below the watermark are provably dead, and only
+            // those. A batch holding generation `g` can publish only by moving
+            // the watermark *to* `g`, and the commit refuses to move it
+            // backwards — so once the watermark has reached `g`, the batch that
+            // holds it either already committed and cleared its own rows, or is
+            // going to be refused. A batch above the watermark may still be
+            // running in another process, and its rows are left alone.
             //
             // Their file versions are carried into this batch's displaced set,
             // because a targeted batch collects only what it displaced: without
@@ -442,8 +515,8 @@ impl IndexCache {
             // accumulate the derived rows of every batch that was interrupted.
             let abandoned = {
                 let mut statement = transaction.prepare(
-                    "SELECT DISTINCT file_version_id FROM files \
-                     WHERE worktree_id = :worktree AND generation > :visible \
+                    "SELECT DISTINCT file_version_id FROM pending_files \
+                     WHERE worktree_id = :worktree AND generation <= :visible \
                      AND file_version_id IS NOT NULL",
                 )?;
                 statement
@@ -454,7 +527,8 @@ impl IndexCache {
                     .collect::<Result<BTreeSet<_>, _>>()?
             };
             transaction.execute(
-                "DELETE FROM files WHERE worktree_id = :worktree AND generation > :visible",
+                "DELETE FROM pending_files \
+                 WHERE worktree_id = :worktree AND generation <= :visible",
                 named_params! { ":worktree": worktree.as_str(), ":visible": visible },
             )?;
             Ok((u64::try_from(pending).unwrap_or(0), abandoned))
@@ -469,6 +543,7 @@ impl IndexCache {
             files: Vec::new(),
             symbols: Vec::new(),
             removals: Vec::new(),
+            recorded_versions: BTreeSet::new(),
             displaced: abandoned,
             files_recorded: 0,
             files_removed: 0,
@@ -512,16 +587,18 @@ impl IndexCache {
         &self,
         worktree: &WorktreeKey,
         limit: usize,
-    ) -> Result<Vec<IndexedFile>, ContextEngineError> {
-        let limit = clamp_limit(limit);
+    ) -> Result<IndexedPage<IndexedFile>, ContextEngineError> {
+        let Some(probe) = probe_limit(limit) else {
+            return Ok(IndexedPage::default());
+        };
         self.with_read(|connection| {
             let mut statement =
                 connection.prepare(&format!("{FILE_SELECT} ORDER BY f.path LIMIT :limit"))?;
             let rows = statement.query_map(
-                named_params! { ":worktree": worktree.as_str(), ":limit": limit },
+                named_params! { ":worktree": worktree.as_str(), ":limit": probe },
                 read_file,
             )?;
-            rows.collect()
+            Ok(page(rows.collect::<Result<Vec<_>, _>>()?, limit))
         })
     }
 
@@ -590,8 +667,10 @@ impl IndexCache {
         worktree: &WorktreeKey,
         name: &str,
         limit: usize,
-    ) -> Result<Vec<IndexedSymbol>, ContextEngineError> {
-        let limit = clamp_limit(limit);
+    ) -> Result<IndexedPage<IndexedSymbol>, ContextEngineError> {
+        let Some(probe) = probe_limit(limit) else {
+            return Ok(IndexedPage::default());
+        };
         self.with_read(|connection| {
             let mut statement = connection.prepare(&format!(
                 "{SYMBOL_SELECT} AND s.name = :name ORDER BY f.path, s.start_byte LIMIT :limit"
@@ -600,11 +679,11 @@ impl IndexCache {
                 named_params! {
                     ":worktree": worktree.as_str(),
                     ":name": name,
-                    ":limit": limit,
+                    ":limit": probe,
                 },
                 read_symbol,
             )?;
-            rows.collect()
+            Ok(page(rows.collect::<Result<Vec<_>, _>>()?, limit))
         })
     }
 
@@ -663,29 +742,12 @@ impl IndexCache {
     ///
     /// The read failures of [`IndexCache::files`].
     pub fn counts(&self) -> Result<IndexCounts, ContextEngineError> {
-        let counts = self.with_read(|connection| {
-            let count = |sql: &str| -> Result<u64, rusqlite::Error> {
-                connection.query_row(sql, [], |row| {
-                    row.get::<_, i64>(0)
-                        .map(|value| u64::try_from(value).unwrap_or(0))
-                })
-            };
-            Ok(IndexCounts {
-                worktrees: count("SELECT COUNT(*) FROM worktrees")?,
-                files: count(
-                    "SELECT COUNT(*) FROM files f JOIN worktrees w ON w.worktree_id = f.worktree_id \
-                     WHERE f.generation <= w.last_generation",
-                )?,
-                contents: count("SELECT COUNT(*) FROM contents")?,
-                file_versions: count("SELECT COUNT(*) FROM file_versions")?,
-                chunks: count("SELECT COUNT(*) FROM chunks")?,
-                symbols: count("SELECT COUNT(*) FROM symbols")?,
-                database_bytes: 0,
-            })
-        })?;
-        Ok(IndexCounts {
-            database_bytes: database_bytes(self.path()),
-            ..counts
+        // Delegated rather than written out again. The visible-files join is
+        // the visibility rule, and the module spells that exactly once on
+        // purpose — two copies of it would let `status().counts` and this
+        // disagree about one database.
+        self.with_read(|connection| {
+            super::counts_of(connection, self.path()).ok_or(rusqlite::Error::QueryReturnedNoRows)
         })
     }
 
@@ -765,7 +827,38 @@ impl IndexBatch<'_> {
             boundary: entry.boundary,
             unreadable: entry.unreadable,
             classify_version,
-            content: None,
+            content: Derivation::None,
+        });
+        self.flush_if_full()
+    }
+
+    /// Records a path whose bytes should have been read and could not be.
+    ///
+    /// The file's own metadata is refreshed and whatever derivation the last
+    /// successful pass stored is left in place. Recording it as
+    /// [`record_entry`](Self::record_entry) instead would clear the link to that
+    /// derivation, and the commit's collection would then delete its chunks —
+    /// so a file that was being written at the moment the walk reached it would
+    /// disappear from retrieval until something walked again.
+    ///
+    /// # Errors
+    ///
+    /// The flush failures of [`IndexBatch::commit`].
+    pub fn record_unreadable(
+        &mut self,
+        entry: &InventoryEntry,
+        classify_version: u32,
+    ) -> Result<(), ContextEngineError> {
+        self.files.push(PendingFile {
+            path: entry.path.clone(),
+            byte_size: entry.byte_size,
+            mtime_ns: entry.mtime_ns,
+            class: entry.class,
+            symlink: entry.symlink,
+            boundary: entry.boundary,
+            unreadable: true,
+            classify_version,
+            content: Derivation::Unavailable,
         });
         self.flush_if_full()
     }
@@ -778,7 +871,7 @@ impl IndexBatch<'_> {
     ///
     /// # Errors
     ///
-    /// [`ContextEngineError::CacheOpenFailed`] when the entry and the version
+    /// [`ContextEngineError::IndexBatchInvalid`] when the entry and the version
     /// disagree about which path they describe, plus the flush failures of
     /// [`IndexBatch::commit`].
     pub fn record_chunked(
@@ -789,8 +882,7 @@ impl IndexBatch<'_> {
         classify_version: u32,
     ) -> Result<(), ContextEngineError> {
         if entry.path != *version.path() {
-            return Err(ContextEngineError::CacheOpenFailed {
-                path: self.cache.path().to_path_buf(),
+            return Err(ContextEngineError::IndexBatchInvalid {
                 reason: format!(
                     "the inventory entry names '{}' and the file version names '{}'",
                     entry.path.display(),
@@ -812,7 +904,7 @@ impl IndexBatch<'_> {
             boundary: entry.boundary,
             unreadable: entry.unreadable,
             classify_version,
-            content: Some(PendingContent {
+            content: Derivation::Read(Box::new(PendingContent {
                 file_version: version.id().clone(),
                 content_sha256: version.content_sha256().clone(),
                 language: version
@@ -822,7 +914,7 @@ impl IndexBatch<'_> {
                 truncated: chunks.truncation.is_some(),
                 chunking_version: Some(chunking_version),
                 chunks: chunks.chunks.iter().map(pending_chunk).collect(),
-            }),
+            })),
         });
         self.flush_if_full()
     }
@@ -834,9 +926,17 @@ impl IndexBatch<'_> {
     /// already used, and forcing one call would make the store's API change
     /// when that lands.
     ///
+    /// **Order does not matter.** Symbols named for a file version this batch
+    /// has not written yet are carried forward rather than written into a
+    /// foreign key that does not exist — a flush boundary falling between the
+    /// two calls would otherwise fail the batch, which the caller cannot see
+    /// coming and cannot control.
+    ///
     /// # Errors
     ///
-    /// The flush failures of [`IndexBatch::commit`].
+    /// The flush failures of [`IndexBatch::commit`], and
+    /// [`ContextEngineError::IndexBatchInvalid`] at commit when the file version
+    /// never arrived.
     ///
     /// [#117]: https://github.com/fullstacktaiye/harkness/issues/117
     pub fn record_symbols(
@@ -898,44 +998,109 @@ impl IndexBatch<'_> {
             return Err(ContextEngineError::Cancelled);
         }
 
+        if let Some(orphan) = self.symbols.first() {
+            return Err(ContextEngineError::IndexBatchInvalid {
+                reason: format!(
+                    "symbols were attached to file version {}, which this batch never recorded",
+                    orphan.file_version
+                ),
+            });
+        }
+
         let worktree = self.worktree.as_str().to_owned();
         let generation = i64::try_from(self.generation).unwrap_or(i64::MAX);
         let scope = self.scope;
         let displaced = std::mem::take(&mut self.displaced);
+        let database = self.cache.path().to_path_buf();
+        let pending = self.generation;
         let committed_at = OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .unwrap_or_else(|_| String::new());
 
-        let (rows_swept, rows_collected) = self.cache.with_write(|transaction| {
-            let swept = match scope {
+        let (rows_swept, rows_collected, files_removed) = self
+            .cache
+            .with_write(|transaction| {
+                // Forward only, and checked before anything else. A batch that lost
+                // a race would otherwise drag the watermark back below the winner's
+                // generation and hide every row the winner published — a success
+                // that makes the index smaller. The `WHERE` is the whole guard: zero
+                // rows changed means somebody else got there.
+                let claimed = transaction.execute(
+                    "UPDATE worktrees SET last_generation = :generation, last_reconciled_at = :at \
+                 WHERE worktree_id = :worktree AND last_generation < :generation",
+                    named_params! {
+                        ":worktree": &worktree,
+                        ":generation": generation,
+                        ":at": &committed_at,
+                    },
+                )?;
+                if claimed == 0 {
+                    let watermark: i64 = transaction
+                        .query_row(
+                            "SELECT last_generation FROM worktrees WHERE worktree_id = :worktree",
+                            named_params! { ":worktree": &worktree },
+                            |row| row.get(0),
+                        )
+                        .unwrap_or_default();
+                    return Err(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+                        Some(format!("superseded:{watermark}")),
+                    ));
+                }
+
+                // Everything this batch is about to displace, read before it is
+                // displaced. Doing it here rather than per file during the flush
+                // turns a query per file into one query per batch.
+                let mut displaced =
+                    displaced_by_batch(transaction, &worktree, generation, displaced)?;
+                // Staged rows below this generation belong to batches the guard
+                // above will now refuse, so they are dead and their derived rows are
+                // this batch's to collect. Sweeping them here rather than waiting
+                // for a later `begin` is what keeps an interrupted incremental
+                // update from paying for itself twice.
+                collect_staged_below(transaction, &worktree, generation, &mut displaced)?;
+
+                // The staged rows become the visible ones. Two statements rather
+                // than one, because a file whose content could not be read leaves
+                // `files.file_version_id` alone instead of clearing it.
+                apply_staged(transaction, &worktree, generation, false)?;
+                apply_staged(transaction, &worktree, generation, true)?;
+                let removed = transaction.execute(
+                    "DELETE FROM files WHERE worktree_id = :worktree AND path IN \
+                    (SELECT path FROM pending_files \
+                     WHERE worktree_id = :worktree AND generation = :generation AND removed = 1)",
+                    named_params! { ":worktree": &worktree, ":generation": generation },
+                )?;
+
+                // Before the collection, not after it: a staged row *references* a
+                // file version, so a version this batch is about to collect is one
+                // its own staging is still holding down.
+                transaction.execute(
+                    "DELETE FROM pending_files \
+                 WHERE worktree_id = :worktree AND generation <= :generation",
+                    named_params! { ":worktree": &worktree, ":generation": generation },
+                )?;
+
+                let swept = match scope {
                 // Anything this batch did not confirm is a path that is no
-                // longer in the worktree. Comparing against the pending
-                // generation rather than "older than" also removes rows a
-                // *later* abandoned batch left behind.
+                // longer in the worktree.
                 BatchScope::Full => transaction.execute(
                     "DELETE FROM files WHERE worktree_id = :worktree AND generation <> :generation",
                     named_params! { ":worktree": &worktree, ":generation": generation },
                 )?,
                 BatchScope::Targeted => 0,
             };
-            let collected = match scope {
-                BatchScope::Full => collect_all(transaction)?,
-                // Exactly the versions this batch displaced, so a one-file
-                // update reads and deletes rows about one file rather than
-                // scanning every content-addressed row in the repository.
-                BatchScope::Targeted => collect_displaced(transaction, &displaced)?,
-            };
-            transaction.execute(
-                "UPDATE worktrees SET last_generation = :generation, last_reconciled_at = :at \
-                 WHERE worktree_id = :worktree",
-                named_params! {
-                    ":worktree": &worktree,
-                    ":generation": generation,
-                    ":at": &committed_at,
-                },
-            )?;
-            Ok((swept as u64, collected))
-        })?;
+                let collected = match scope {
+                    BatchScope::Full => collect_all(transaction)?,
+                    // Exactly the versions this batch displaced, so a one-file
+                    // update reads and deletes rows about one file rather than
+                    // scanning every content-addressed row in the repository.
+                    BatchScope::Targeted => collect_displaced(transaction, &displaced)?,
+                };
+                Ok((swept as u64, collected, removed as u64))
+            })
+            .map_err(|error| supersession(&database, pending, &error))?;
+        self.files_removed = files_removed;
 
         let receipt = BatchReceipt {
             worktree: self.worktree.clone(),
@@ -986,56 +1151,104 @@ impl IndexBatch<'_> {
             });
         }
 
-        let files = std::mem::take(&mut self.files);
-        let symbols = std::mem::take(&mut self.symbols);
-        let removals = std::mem::take(&mut self.removals);
-        let worktree = self.worktree.as_str().to_owned();
+        // Borrowed rather than taken. A flush that fails is one the caller is
+        // told to retry — `index_busy` above all — and moving the buffers out
+        // first would destroy up to a flush's worth of rows on the way past,
+        // leaving a batch that cannot be resumed and, if the caller carries on,
+        // a commit that silently omits the paths it swallowed.
+        let files = &self.files;
+        let symbols = &self.symbols;
+        let removals = &self.removals;
+        let worktree = self.worktree.as_str();
         let generation = i64::try_from(self.generation).unwrap_or(i64::MAX);
-        // A full batch collects by asking which versions nothing points at any
-        // more, so tracking each displacement would be a per-file query whose
-        // answer that one statement already has.
-        let track_displaced = self.scope == BatchScope::Targeted;
+        let known = &self.recorded_versions;
 
-        let (recorded, removed, displaced) = self.cache.with_write(|transaction| {
-            let mut displaced = Vec::new();
+        let (recorded, written, deferred) = self.cache.with_write(|transaction| {
             let mut recorded = 0_u64;
-            let mut removed = 0_u64;
+            let mut written = BTreeSet::new();
 
-            for path in &removals {
-                if track_displaced
-                    && let Some(previous) = held_file_version(transaction, &worktree, path)?
-                {
-                    displaced.push(previous);
-                }
-                removed += transaction.execute(
-                    "DELETE FROM files WHERE worktree_id = :worktree AND path = :path",
-                    named_params! { ":worktree": &worktree, ":path": path.as_bytes() },
-                )? as u64;
+            for path in removals {
+                stage_removal(transaction, worktree, generation, path)?;
             }
 
-            for file in &files {
-                if track_displaced
-                    && let Some(previous) = held_file_version(transaction, &worktree, &file.path)?
-                {
-                    displaced.push(previous);
-                }
-                if let Some(content) = &file.content {
+            for file in files {
+                if let Derivation::Read(content) = &file.content {
                     write_content(transaction, file, content)?;
+                    written.insert(content.file_version.to_string());
                 }
-                write_file(transaction, &worktree, generation, file)?;
+                stage_file(transaction, worktree, generation, file)?;
                 recorded += 1;
             }
 
-            for attached in &symbols {
-                write_symbols(transaction, attached)?;
+            // A file version this batch has not written yet is not a caller
+            // mistake: `record_symbols` documents that order does not matter,
+            // and a flush boundary falling between the two calls is not
+            // something a caller can see coming. Anything still unattached at
+            // commit is.
+            let mut deferred = Vec::new();
+            for attached in symbols {
+                let parent = attached.file_version.to_string();
+                if known.contains(&parent)
+                    || written.contains(&parent)
+                    || version_exists(transaction, &parent)?
+                {
+                    write_symbols(transaction, attached)?;
+                } else {
+                    deferred.push(attached.file_version.clone());
+                }
             }
-            Ok((recorded, removed, displaced))
+            Ok((recorded, written, deferred))
         })?;
 
+        // Only now that the write committed.
+        let carried = std::mem::take(&mut self.symbols)
+            .into_iter()
+            .filter(|attached| deferred.contains(&attached.file_version))
+            .collect();
+        self.files.clear();
+        self.removals.clear();
+        self.symbols = carried;
+        self.recorded_versions.extend(written);
         self.files_recorded += recorded;
-        self.files_removed += removed;
-        self.displaced.extend(displaced);
         Ok(())
+    }
+}
+
+/// Whether a file version is already stored, for a symbol looking for its parent.
+fn version_exists(
+    transaction: &rusqlite::Transaction<'_>,
+    file_version: &str,
+) -> Result<bool, rusqlite::Error> {
+    transaction
+        .query_row(
+            "SELECT 1 FROM file_versions WHERE file_version_id = :id",
+            named_params! { ":id": file_version },
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|found| found.is_some())
+}
+
+/// Turns the constraint failure `commit` raises for a lost race back into the
+/// typed refusal, and leaves every other failure as it was.
+fn supersession(
+    database: &Path,
+    generation: u64,
+    error: &ContextEngineError,
+) -> ContextEngineError {
+    let ContextEngineError::CacheOpenFailed { reason, .. } = error else {
+        return error.clone();
+    };
+    let Some(watermark) = reason
+        .split_once("superseded:")
+        .and_then(|(_, rest)| rest.trim().parse::<u64>().ok())
+    else {
+        return error.clone();
+    };
+    ContextEngineError::IndexBatchSuperseded {
+        path: database.to_path_buf(),
+        generation,
+        watermark,
     }
 }
 
@@ -1071,25 +1284,30 @@ JOIN files f ON f.file_version_id = s.file_version_id \
 JOIN worktrees w ON w.worktree_id = f.worktree_id \
 WHERE f.worktree_id = :worktree AND f.generation <= w.last_generation";
 
+/// One more row than the caller asked for, which is how truncation is detected.
+///
+/// `None` for a limit of zero: a caller asking for no rows gets none. Clamping
+/// zero up to one would answer a question nobody asked and make a paging loop
+/// whose budget reached zero run forever.
+fn probe_limit(limit: usize) -> Option<i64> {
+    let bounded = limit.min(MAX_READ_ROWS);
+    if bounded == 0 {
+        return None;
+    }
+    Some(i64::try_from(bounded.saturating_add(1)).unwrap_or(i64::MAX))
+}
+
+/// Trims the probe row off and says whether it was there.
+fn page<T>(mut rows: Vec<T>, limit: usize) -> IndexedPage<T> {
+    let bounded = limit.min(MAX_READ_ROWS);
+    let more = rows.len() > bounded;
+    rows.truncate(bounded);
+    IndexedPage { rows, more }
+}
+
 /// The row bound one read is given, saturated into what SQLite can bind.
 fn clamp_limit(limit: usize) -> i64 {
     i64::try_from(limit.clamp(1, MAX_READ_ROWS)).unwrap_or(i64::MAX)
-}
-
-/// The file version a worktree currently points at, before a write replaces it.
-fn held_file_version(
-    transaction: &rusqlite::Transaction<'_>,
-    worktree: &str,
-    path: &RepoPath,
-) -> Result<Option<String>, rusqlite::Error> {
-    transaction
-        .query_row(
-            "SELECT file_version_id FROM files WHERE worktree_id = :worktree AND path = :path",
-            named_params! { ":worktree": worktree, ":path": path.as_bytes() },
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()
-        .map(Option::flatten)
 }
 
 fn write_content(
@@ -1161,32 +1379,40 @@ fn write_content(
     Ok(())
 }
 
-fn write_file(
+/// Stages one file row where no query can reach it.
+fn stage_file(
     transaction: &rusqlite::Transaction<'_>,
     worktree: &str,
     generation: i64,
     file: &PendingFile,
 ) -> Result<(), rusqlite::Error> {
+    let version = match &file.content {
+        Derivation::Read(content) => Some(content.file_version.to_string()),
+        Derivation::None | Derivation::Unavailable => None,
+    };
     transaction.execute(
-        "INSERT INTO files \
-            (worktree_id, path, file_version_id, byte_size, mtime_ns, file_class, symlink, \
-             boundary, unreadable, classify_version, generation) \
-         VALUES (:worktree, :path, :version, :size, :mtime, :class, :symlink, :boundary, \
-             :unreadable, :classify, :generation) \
-         ON CONFLICT(worktree_id, path) DO UPDATE SET \
+        "INSERT INTO pending_files \
+            (worktree_id, generation, path, file_version_id, keep_version, removed, byte_size, \
+             mtime_ns, file_class, symlink, boundary, unreadable, classify_version) \
+         VALUES (:worktree, :generation, :path, :version, :keep, 0, :size, :mtime, :class, \
+             :symlink, :boundary, :unreadable, :classify) \
+         ON CONFLICT(worktree_id, generation, path) DO UPDATE SET \
             file_version_id = excluded.file_version_id, \
+            keep_version = excluded.keep_version, \
+            removed = 0, \
             byte_size = excluded.byte_size, \
             mtime_ns = excluded.mtime_ns, \
             file_class = excluded.file_class, \
             symlink = excluded.symlink, \
             boundary = excluded.boundary, \
             unreadable = excluded.unreadable, \
-            classify_version = excluded.classify_version, \
-            generation = excluded.generation",
+            classify_version = excluded.classify_version",
         named_params! {
             ":worktree": worktree,
+            ":generation": generation,
             ":path": file.path.as_bytes(),
-            ":version": file.content.as_ref().map(|content| content.file_version.to_string()),
+            ":version": version,
+            ":keep": i64::from(matches!(file.content, Derivation::Unavailable)),
             ":size": i64::try_from(file.byte_size).unwrap_or(i64::MAX),
             ":mtime": file.mtime_ns,
             ":class": file.class.as_str(),
@@ -1194,10 +1420,134 @@ fn write_file(
             ":boundary": file.boundary.map(Boundary::as_str),
             ":unreadable": i64::from(file.unreadable),
             ":classify": i64::from(file.classify_version),
-            ":generation": generation,
         },
     )?;
     Ok(())
+}
+
+/// Stages one path's removal, which the commit applies with everything else.
+fn stage_removal(
+    transaction: &rusqlite::Transaction<'_>,
+    worktree: &str,
+    generation: i64,
+    path: &RepoPath,
+) -> Result<(), rusqlite::Error> {
+    transaction.execute(
+        "INSERT INTO pending_files \
+            (worktree_id, generation, path, file_version_id, keep_version, removed, byte_size, \
+             mtime_ns, file_class, symlink, boundary, unreadable, classify_version) \
+         VALUES (:worktree, :generation, :path, NULL, 0, 1, 0, NULL, 'unknown_text', 0, NULL, 0, 0) \
+         ON CONFLICT(worktree_id, generation, path) DO UPDATE SET \
+            removed = 1, file_version_id = NULL, keep_version = 0",
+        named_params! {
+            ":worktree": worktree,
+            ":generation": generation,
+            ":path": path.as_bytes(),
+        },
+    )?;
+    Ok(())
+}
+
+/// Copies this batch's staged rows into `files`.
+///
+/// `keep` selects the half of the batch whose content could not be read: those
+/// rows refresh the file's own metadata and leave `file_version_id` exactly as
+/// it was, so an unreadable moment does not unlink a file from the derivation
+/// the last successful pass stored.
+fn apply_staged(
+    transaction: &rusqlite::Transaction<'_>,
+    worktree: &str,
+    generation: i64,
+    keep: bool,
+) -> Result<(), rusqlite::Error> {
+    let version_clause = if keep {
+        "files.file_version_id"
+    } else {
+        "excluded.file_version_id"
+    };
+    transaction.execute(
+        &format!(
+            "INSERT INTO files \
+                (worktree_id, path, file_version_id, byte_size, mtime_ns, file_class, symlink, \
+                 boundary, unreadable, classify_version, generation) \
+             SELECT worktree_id, path, file_version_id, byte_size, mtime_ns, file_class, symlink, \
+                 boundary, unreadable, classify_version, :generation \
+             FROM pending_files \
+             WHERE worktree_id = :worktree AND generation = :generation AND removed = 0 \
+               AND keep_version = :keep AND true \
+             ON CONFLICT(worktree_id, path) DO UPDATE SET \
+                file_version_id = {version_clause}, \
+                byte_size = excluded.byte_size, \
+                mtime_ns = excluded.mtime_ns, \
+                file_class = excluded.file_class, \
+                symlink = excluded.symlink, \
+                boundary = excluded.boundary, \
+                unreadable = excluded.unreadable, \
+                classify_version = excluded.classify_version, \
+                generation = excluded.generation"
+        ),
+        named_params! {
+            ":worktree": worktree,
+            ":generation": generation,
+            ":keep": i64::from(keep),
+        },
+    )?;
+    Ok(())
+}
+
+/// Adds the derived rows of every dead staged batch to what this one collects.
+///
+/// "Dead" is decided by the same forward-only rule the commit enforces: a batch
+/// holding a generation below this one can no longer publish, so nothing will
+/// ever point at what it staged.
+fn collect_staged_below(
+    transaction: &rusqlite::Transaction<'_>,
+    worktree: &str,
+    generation: i64,
+    displaced: &mut BTreeSet<String>,
+) -> Result<(), rusqlite::Error> {
+    let mut statement = transaction.prepare(
+        "SELECT DISTINCT file_version_id FROM pending_files \
+         WHERE worktree_id = :worktree AND generation < :generation \
+           AND file_version_id IS NOT NULL",
+    )?;
+    let rows = statement.query_map(
+        named_params! { ":worktree": worktree, ":generation": generation },
+        |row| row.get::<_, String>(0),
+    )?;
+    for row in rows {
+        displaced.insert(row?);
+    }
+    Ok(())
+}
+
+/// The file versions this batch's staged rows are about to displace.
+///
+/// One query for the whole batch rather than one per file, and read *before*
+/// the staged rows are applied — afterwards the answer would be the new
+/// versions rather than the ones being replaced.
+fn displaced_by_batch(
+    transaction: &rusqlite::Transaction<'_>,
+    worktree: &str,
+    generation: i64,
+    mut displaced: BTreeSet<String>,
+) -> Result<BTreeSet<String>, rusqlite::Error> {
+    let mut statement = transaction.prepare(
+        "SELECT DISTINCT f.file_version_id FROM files f \
+         JOIN pending_files p \
+           ON p.worktree_id = f.worktree_id AND p.path = f.path \
+         WHERE f.worktree_id = :worktree AND p.generation = :generation \
+           AND f.file_version_id IS NOT NULL \
+           AND (p.removed = 1 OR p.keep_version = 0)",
+    )?;
+    let rows = statement.query_map(
+        named_params! { ":worktree": worktree, ":generation": generation },
+        |row| row.get::<_, String>(0),
+    )?;
+    for row in rows {
+        displaced.insert(row?);
+    }
+    Ok(displaced)
 }
 
 fn write_symbols(
@@ -1237,11 +1587,18 @@ fn write_symbols(
     Ok(())
 }
 
-/// Drops every content-addressed row no file row still points at.
+/// Drops every content-addressed row nothing still points at.
+///
+/// "Nothing" includes another batch's staged rows. A cold build running in
+/// another process has file versions written and no `files` row pointing at
+/// them yet — collecting those would delete the work it is part-way through,
+/// and the foreign key would refuse the whole commit rather than let it.
 fn collect_all(transaction: &rusqlite::Transaction<'_>) -> Result<u64, rusqlite::Error> {
     let versions = transaction.execute(
         "DELETE FROM file_versions WHERE file_version_id NOT IN \
-            (SELECT file_version_id FROM files WHERE file_version_id IS NOT NULL)",
+            (SELECT file_version_id FROM files WHERE file_version_id IS NOT NULL) \
+         AND file_version_id NOT IN \
+            (SELECT file_version_id FROM pending_files WHERE file_version_id IS NOT NULL)",
         [],
     )?;
     let contents = transaction.execute(
@@ -1262,19 +1619,37 @@ fn collect_displaced(
     displaced: &BTreeSet<String>,
 ) -> Result<u64, rusqlite::Error> {
     let mut collected = 0_u64;
+    let mut orphaned = BTreeSet::new();
     for version in displaced {
+        let digest: Option<String> = transaction
+            .query_row(
+                "SELECT content_sha256 FROM file_versions WHERE file_version_id = :id",
+                named_params! { ":id": version },
+                |row| row.get(0),
+            )
+            .optional()?;
         let removed = transaction.execute(
-            "DELETE FROM file_versions WHERE file_version_id = :id AND NOT EXISTS \
-                (SELECT 1 FROM files WHERE file_version_id = :id)",
+            "DELETE FROM file_versions WHERE file_version_id = :id \
+             AND NOT EXISTS (SELECT 1 FROM files WHERE file_version_id = :id) \
+             AND NOT EXISTS (SELECT 1 FROM pending_files WHERE file_version_id = :id)",
             named_params! { ":id": version },
         )?;
         collected += removed as u64;
+        if removed > 0
+            && let Some(digest) = digest
+        {
+            orphaned.insert(digest);
+        }
     }
-    if collected > 0 {
+    // By digest rather than by anti-join. The whole reason a targeted batch does
+    // not run `collect_all` is that scanning every content-addressed row to
+    // decide about one file is what it was written to avoid, and a `NOT IN` over
+    // `file_versions` here would put that scan straight back.
+    for digest in orphaned {
         collected += transaction.execute(
-            "DELETE FROM contents WHERE content_sha256 NOT IN \
-                (SELECT content_sha256 FROM file_versions)",
-            [],
+            "DELETE FROM contents WHERE content_sha256 = :digest \
+             AND NOT EXISTS (SELECT 1 FROM file_versions WHERE content_sha256 = :digest)",
+            named_params! { ":digest": digest },
         )? as u64;
     }
     Ok(collected)
@@ -1420,15 +1795,13 @@ fn parse_class(column: usize, value: &str) -> Result<FileClass, rusqlite::Error>
 }
 
 fn parse_boundary(column: usize, value: &str) -> Result<Boundary, rusqlite::Error> {
-    match value {
-        "nested_repository" => Ok(Boundary::NestedRepository),
-        "submodule" => Ok(Boundary::Submodule),
-        _ => Err(rusqlite::Error::InvalidColumnType(
+    Boundary::parse(value).ok_or_else(|| {
+        rusqlite::Error::InvalidColumnType(
             column,
             "boundary".to_owned(),
             rusqlite::types::Type::Text,
-        )),
-    }
+        )
+    })
 }
 
 const fn cast_u64(value: i64) -> u64 {

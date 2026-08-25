@@ -189,12 +189,17 @@ fn rows_are_invisible_until_the_batch_commits() {
     record_many(&mut batch, 0..FLUSHED_FILES);
 
     assert!(
-        count(&fixture.database(), "files") > 0,
+        count(&fixture.database(), "pending_files") > 0,
         "at least one flush wrote rows to the file"
+    );
+    assert_eq!(
+        count(&fixture.database(), "files"),
+        0,
+        "and none of them reached the table readers address"
     );
     assert!(
         cache.files(&key, 10_000).unwrap().is_empty(),
-        "and no query returns any of them"
+        "so no query returns any of them"
     );
     assert_eq!(cache.worktree_generation(&key).unwrap(), 0);
 
@@ -233,19 +238,24 @@ fn an_abandoned_batch_leaves_nothing_visible_and_the_next_one_clears_it() {
         )
         .unwrap();
     record_many(&mut abandoned, 0..FLUSHED_FILES);
-    let orphans = count(&fixture.database(), "files");
+    let orphans = count(&fixture.database(), "pending_files");
     drop(abandoned);
 
-    assert!(orphans > 1, "the abandoned batch reached the file");
+    assert!(orphans > 0, "the abandoned batch reached the file");
+    assert_eq!(
+        count(&fixture.database(), "files"),
+        1,
+        "and never touched the table readers address"
+    );
     assert_eq!(cache.worktree_generation(&key).unwrap(), watermark);
     let visible = cache.files(&key, 10_000).unwrap();
     assert_eq!(visible.len(), 1);
     assert_eq!(visible[0].path.display(), "kept.rs");
 
-    // The rows are still on disk until something sweeps them, and the next batch
-    // is what sweeps them — not by name, but because they are above the
-    // watermark and below its own generation.
-    assert_eq!(count(&fixture.database(), "files"), orphans);
+    // The staged rows sit there until something sweeps them, and the next
+    // commit is what sweeps them — not by name, but because a batch below its
+    // generation can no longer publish.
+    assert_eq!(count(&fixture.database(), "pending_files"), orphans);
     commit_full(
         &cache,
         &key,
@@ -253,6 +263,248 @@ fn an_abandoned_batch_leaves_nothing_visible_and_the_next_one_clears_it() {
         &[("kept.rs", b"fn kept() {}\n")],
     );
     assert_eq!(count(&fixture.database(), "files"), 1);
+    assert_eq!(count(&fixture.database(), "pending_files"), 0);
+}
+
+/// The failure the staging table exists for: a batch that re-records a path
+/// must not make the committed row invisible while it runs, and abandoning it
+/// must leave that row exactly where it was. An in-place upsert tagged the live
+/// row with an uncommitted generation, which took it out of every query for the
+/// length of the batch and let the next `begin` delete it outright.
+#[test]
+fn a_batch_that_re_records_a_path_never_hides_the_committed_row() {
+    let fixture = StoreFixture::new();
+    let cache = fixture.open();
+    let key = worktree("alpha");
+    let cancellation = Cancellation::default();
+    let path = RepoPath::from_bytes(b"kept.rs".to_vec());
+    commit_full(
+        &cache,
+        &key,
+        "/workspaces/alpha",
+        &[("kept.rs", b"fn kept() {}\n")],
+    );
+    let before = cache.file(&key, &path).unwrap();
+    assert!(before.is_some());
+
+    let mut batch = cache
+        .begin(
+            &key,
+            Path::new("/workspaces/alpha"),
+            BatchScope::Targeted,
+            &cancellation,
+        )
+        .unwrap();
+    let changed = entry("kept.rs", b"fn kept() { changed(); }\n");
+    let (version, chunks) = derive(&changed, b"fn kept() { changed(); }\n");
+    batch
+        .record_chunked(&changed, &version, &chunks, CLASSIFY_VERSION)
+        .unwrap();
+    // Past the flush threshold, so the staged row really is on disk.
+    record_many(&mut batch, 0..FLUSHED_FILES);
+
+    assert_eq!(
+        cache.file(&key, &path).unwrap(),
+        before,
+        "the committed row answers unchanged while the batch is in flight"
+    );
+
+    drop(batch);
+
+    assert_eq!(
+        cache.file(&key, &path).unwrap(),
+        before,
+        "and an abandoned batch leaves it exactly as it was"
+    );
+    let next = cache
+        .begin(
+            &key,
+            Path::new("/workspaces/alpha"),
+            BatchScope::Targeted,
+            &cancellation,
+        )
+        .unwrap();
+    next.commit(&cancellation).unwrap();
+    assert_eq!(
+        cache.file(&key, &path).unwrap(),
+        before,
+        "nor does the batch after it, which is where the file was lost for good"
+    );
+}
+
+/// Two batches on one worktree is what two front ends indexing one repository
+/// looks like. Neither may erase the other's staged rows, and the loser is
+/// refused rather than allowed to drag the watermark backwards — a commit that
+/// hid every row the winner published would be a success that shrank the index.
+#[test]
+fn a_batch_that_lost_the_race_is_refused_rather_than_moving_the_watermark_back() {
+    let fixture = StoreFixture::new();
+    let cache = fixture.open();
+    let key = worktree("alpha");
+    let cancellation = Cancellation::default();
+    let root = Path::new("/workspaces/alpha");
+
+    let mut first = cache
+        .begin(&key, root, BatchScope::Full, &cancellation)
+        .unwrap();
+    record_many(&mut first, 0..FLUSHED_FILES);
+    let staged = count(&fixture.database(), "pending_files");
+    let mut second = cache
+        .begin(&key, root, BatchScope::Full, &cancellation)
+        .unwrap();
+    assert!(second.generation() > first.generation());
+    assert_eq!(
+        count(&fixture.database(), "pending_files"),
+        staged,
+        "opening a second batch leaves the first one's staged rows alone"
+    );
+    record_many(&mut second, 0..FLUSHED_FILES);
+
+    let winner = second.commit(&cancellation).unwrap();
+    let published = cache.files(&key, 10_000).unwrap().len();
+    assert_eq!(published, usize::try_from(FLUSHED_FILES).unwrap());
+
+    let error = first.commit(&cancellation).unwrap_err();
+
+    assert_eq!(error.kind(), "index_batch_superseded");
+    assert_eq!(
+        cache.worktree_generation(&key).unwrap(),
+        winner.generation,
+        "the watermark only ever moves forward"
+    );
+    assert_eq!(
+        cache.files(&key, 10_000).unwrap().len(),
+        published,
+        "and every row the winner published is still readable"
+    );
+}
+
+/// Symbols may be attached before the file version they belong to is recorded.
+/// A flush boundary falling between the two calls is not something a caller can
+/// see coming, so the store carries them rather than failing on a foreign key.
+#[test]
+fn symbols_recorded_before_their_file_version_are_carried_to_it() {
+    let fixture = StoreFixture::new();
+    let cache = fixture.open();
+    let key = worktree("alpha");
+    let cancellation = Cancellation::default();
+    let bytes = b"fn late() {}\n";
+    let entry = entry("src/late.rs", bytes);
+    let (version, chunks) = derive(&entry, bytes);
+    let symbol = SymbolRecord {
+        id: SymbolId::derive(&entry.path, "rust", "late", "function"),
+        name: "late".to_owned(),
+        qualified_path: "late".to_owned(),
+        kind: "function".to_owned(),
+        byte_range: ByteRange::new(0, 12),
+    };
+
+    let mut batch = cache
+        .begin(
+            &key,
+            Path::new("/workspaces/alpha"),
+            BatchScope::Full,
+            &cancellation,
+        )
+        .unwrap();
+    // Symbols first, then enough files to force a flush before the version they
+    // name has been recorded at all.
+    batch
+        .record_symbols(version.id(), "1", std::slice::from_ref(&symbol))
+        .unwrap();
+    record_many(&mut batch, 0..FLUSHED_FILES);
+    batch
+        .record_chunked(&entry, &version, &chunks, CLASSIFY_VERSION)
+        .unwrap();
+    batch.commit(&cancellation).unwrap();
+
+    let found = cache.symbols_named(&key, "late", 10).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].id, symbol.id);
+}
+
+/// A file version that never arrives is a caller mistake, and it is spelled as
+/// one rather than as a broken cache — a front end must not tell a user their
+/// index is corrupt when the code above it built the batch wrong.
+#[test]
+fn symbols_whose_file_version_never_arrives_are_refused_by_name() {
+    let fixture = StoreFixture::new();
+    let cache = fixture.open();
+    let key = worktree("alpha");
+    let cancellation = Cancellation::default();
+    let path = RepoPath::from_bytes(b"src/absent.rs".to_vec());
+    let orphan = FileVersionId::derive(&path, b"nothing records this\n");
+
+    let mut batch = cache
+        .begin(
+            &key,
+            Path::new("/workspaces/alpha"),
+            BatchScope::Full,
+            &cancellation,
+        )
+        .unwrap();
+    batch
+        .record_symbols(
+            &orphan,
+            "1",
+            &[SymbolRecord {
+                id: SymbolId::derive(&path, "rust", "absent", "function"),
+                name: "absent".to_owned(),
+                qualified_path: "absent".to_owned(),
+                kind: "function".to_owned(),
+                byte_range: ByteRange::new(0, 1),
+            }],
+        )
+        .unwrap();
+
+    let error = batch.commit(&cancellation).unwrap_err();
+
+    assert_eq!(error.kind(), "index_batch_invalid");
+    assert_eq!(cache.worktree_generation(&key).unwrap(), 0);
+}
+
+/// A file that changed under the walk keeps whatever the last successful pass
+/// derived. Clearing it would unlink the file from its chunks and the commit's
+/// collection would delete them — one unreadable moment costing the file its
+/// whole entry in the index.
+#[test]
+fn a_file_that_became_unreadable_keeps_the_derivation_it_had() {
+    let fixture = StoreFixture::new();
+    let cache = fixture.open();
+    let key = worktree("alpha");
+    let cancellation = Cancellation::default();
+    let path = RepoPath::from_bytes(b"a.rs".to_vec());
+    commit_full(
+        &cache,
+        &key,
+        "/workspaces/alpha",
+        &[("a.rs", b"fn a() {}\n")],
+    );
+    let indexed = cache.file(&key, &path).unwrap().unwrap();
+    let chunks = cache.chunks(&key, &path).unwrap();
+    assert!(!chunks.is_empty());
+
+    let mut batch = cache
+        .begin(
+            &key,
+            Path::new("/workspaces/alpha"),
+            BatchScope::Full,
+            &cancellation,
+        )
+        .unwrap();
+    batch
+        .record_unreadable(&entry("a.rs", b"fn a() {}\n"), CLASSIFY_VERSION)
+        .unwrap();
+    batch.commit(&cancellation).unwrap();
+
+    let after = cache.file(&key, &path).unwrap().unwrap();
+    assert_eq!(after.file_version, indexed.file_version);
+    assert!(after.unreadable, "the row says the walk could not read it");
+    assert_eq!(
+        cache.chunks(&key, &path).unwrap(),
+        chunks,
+        "and its chunks are still there to retrieve"
+    );
 }
 
 /// A dead batch's generation is never handed out again. If it were, a targeted
@@ -664,8 +916,13 @@ fn a_process_killed_mid_batch_leaves_the_previous_generation_answering() {
     assert_eq!(visible.len(), 1);
     assert_eq!(visible[0].path.display(), "kept.rs");
     assert!(
-        count(&fixture.database(), "files") > 1,
-        "the killed batch's rows are on disk, and no query returns them"
+        count(&fixture.database(), "pending_files") > 0,
+        "the killed batch's rows are on disk, staged where no query returns them"
+    );
+    assert_eq!(
+        count(&fixture.database(), "files"),
+        1,
+        "and the table readers address holds only what was committed"
     );
 
     // Redone, not resumed: the next full batch sweeps everything it did not
@@ -677,6 +934,7 @@ fn a_process_killed_mid_batch_leaves_the_previous_generation_answering() {
         &[("kept.rs", b"fn kept() {}\n")],
     );
     assert_eq!(count(&fixture.database(), "files"), 1);
+    assert_eq!(count(&fixture.database(), "pending_files"), 0);
 }
 
 /// Sustained contention on the write lock is `index_busy` and never a
@@ -1459,6 +1717,44 @@ fn eviction_answers_for_an_empty_subtree_and_refuses_a_cancelled_one() {
 }
 
 // -- keys -------------------------------------------------------------------
+
+/// A read that stopped at its bound says so. A full page and a repository that
+/// happens to hold exactly that many rows are otherwise the same answer, and a
+/// caller assembling a repository map reads the first as the whole tree.
+#[test]
+fn a_read_that_reached_its_bound_says_there_is_more() {
+    let fixture = StoreFixture::new();
+    let cache = fixture.open();
+    let key = worktree("alpha");
+    commit_full(
+        &cache,
+        &key,
+        "/workspaces/alpha",
+        &[
+            ("a.rs", b"fn a() {}\n"),
+            ("b.rs", b"fn b() {}\n"),
+            ("c.rs", b"fn c() {}\n"),
+        ],
+    );
+
+    let bounded = cache.files(&key, 2).unwrap();
+    assert_eq!(bounded.len(), 2);
+    assert!(bounded.more);
+
+    let whole = cache.files(&key, 3).unwrap();
+    assert_eq!(whole.len(), 3);
+    assert!(
+        !whole.more,
+        "stopping because there is nothing left is not truncation"
+    );
+
+    // A caller asking for nothing gets nothing. Clamping zero up to one would
+    // answer a question nobody asked, and a paging loop whose budget reached
+    // zero would never end.
+    let none = cache.files(&key, 0).unwrap();
+    assert!(none.is_empty());
+    assert!(!none.more);
+}
 
 /// The key names a checkout, so one checkout is one row however it was reached.
 #[test]

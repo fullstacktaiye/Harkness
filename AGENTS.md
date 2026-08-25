@@ -562,27 +562,49 @@ because chunking is a function of `(path, bytes)` and not of bytes alone — the
 same content at `notes.md` and `notes.rs` chunks differently, and a `ChunkId`
 absorbs the path deliberately.
 
-**A batch is invisible until it commits, and then it is visible whole.** Rows are
-written at a pending generation taken from the worktree's own allocator, flushed
-*during* the batch so a cold build never holds the write lock for its whole
-length, and published by one transaction that sweeps and moves
-`worktrees.last_generation` together. A reader sees only
-`generation <= last_generation`, so a killed process leaves rows no query returns
-and the next batch deletes them — redone, never resumed. A generation is
-allocated once and never reissued, because a targeted batch sweeps nothing and
-would otherwise publish an abandoned batch's leftovers under its own commit. Do
-not confuse the two counters: `index_meta.index_generation` is the snapshot-digest
-token described above, `worktrees.last_generation` is a batch watermark that never
+**A batch never writes `files`, and that is not an optimization.** Rows are
+staged in `pending_files` at a pending generation, flushed *during* the batch so
+a cold build never holds the write lock for its whole length, and copied into
+`files` by one transaction that also sweeps, collects, and moves
+`worktrees.last_generation`. Writing the live row and tagging it with an
+uncommitted generation instead is the failure the staging table exists for: it
+takes the *committed* record out of every query for the length of the batch, and
+an abandoned batch then strands it above the watermark where the next `begin`
+deletes it — a file that still exists, gone from the index, with no error
+anywhere. A killed process leaves staged rows nothing reads; the work is redone,
+never resumed.
+
+**The watermark only moves forward, and a batch that lost the race is refused.**
+Two front ends indexing one repository both stage, keyed apart by generation, and
+the commit's `WHERE last_generation < :generation` is what decides between them —
+the loser gets `index_batch_superseded` rather than dragging the watermark back
+below the winner's generation and hiding every row it published. That refusal is
+also what makes cleanup decidable: a batch below the watermark can no longer
+publish, so its staged rows are provably dead and the next commit collects them.
+Collection must skip anything `pending_files` still references, because a live
+batch's file versions have no `files` row pointing at them yet. Do not confuse
+the two counters: `index_meta.index_generation` is the snapshot-digest token
+described above, `worktrees.last_generation` is a batch watermark that never
 leaves the cache. **A full batch sweeps and a targeted one does not**, which is
 why a *truncated* inventory must commit as targeted: a walk stopped by its file
 or time budget did not see the whole worktree, and sweeping would delete rows for
 files that exist.
 
-**Nothing partial is ever stored and nothing partial is ever deleted.** A batch
-that would take one repository's cache past `MAX_INDEX_DB_BYTES` is refused whole
-with `index_budget_exhausted` and the previous generation keeps answering;
+**A file that could not be read keeps the derivation it had.** Recording it as a
+path with no content clears `files.file_version_id`, and the commit's collection
+then deletes its chunks — one unreadable moment costing a file its whole entry
+in the index. `record_unreadable` refreshes the row and leaves the link alone;
+stale beats absent. A file that is *never* read — a binary, a symlink, a
+repository boundary — is the other case and does clear it.
+
+**Nothing partial is ever stored, deleted, or *returned* without saying so.** A
+batch that would take one repository's cache past `MAX_INDEX_DB_BYTES` is refused
+whole with `index_budget_exhausted` and the previous generation keeps answering;
 storing what fits would make retrieval say "no match" for content the cache never
-held, which a caller cannot tell from a repository that does not contain it.
+held, which a caller cannot tell from a repository that does not contain it. The
+read side owes the same honesty and pays it with `IndexedPage`: a full page and a
+repository holding exactly that many rows are otherwise one answer, and the first
+is read as the whole tree.
 Eviction past `MAX_TOTAL_CONTEXT_BYTES` removes least-recently-opened repository
 directories *entirely* and never a table, because a half-emptied index lies and a
 missing one is an honest cold start. Liveness is the kernel's answer, not a claim

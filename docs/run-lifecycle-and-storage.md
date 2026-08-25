@@ -136,11 +136,13 @@ Nothing in `runtime.db` moved when they were recorded: the rows they describe
 live in the disposable index cache (ADR-0004, `docs/context-index.md`). They are
 on a run's timeline because what the cache held decides what the run was shown —
 a generation bump changes what every later snapshot digest means, and a cache
-that was evicted is why the next question was slow. Their payloads carry
-generations, counts and derived repository keys as **numbers and UUIDs**, never
-paths, for the same two reasons the agent payloads use numeric bytes: the store
-redacts every JSON string value, and a run's timeline is not the place to record
-somebody's directory layout.
+that was evicted is why the next question was slow. Their payloads carry generations, counts and derived repository keys as
+**numbers and UUIDs**, and name no path on this machine: the store redacts every
+JSON string value, and a run's timeline is not the place to record somebody's
+directory layout. `context_cache_recreated`'s `detail` is the one free-form
+string among them — it carries SQLite's own account of what was wrong with a
+cache, which is prose for a person to read and is redacted like any other
+string.
 
 The `agent_observation`, `agent_action` and `agent_checkpoint` payloads encode
 their already-redacted versioned record as **numeric bytes**, because the store

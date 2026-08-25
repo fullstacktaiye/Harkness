@@ -286,6 +286,39 @@ pub enum ContextEngineError {
         limit: u64,
     },
 
+    /// Another batch published this worktree while this one was open.
+    ///
+    /// Two front ends indexing one repository is a supported situation, and one
+    /// of them has to lose. The loser is refused rather than allowed to move the
+    /// visibility watermark backwards, which would hide every row the winner
+    /// committed — a batch that reported success while making the index smaller
+    /// is the worst of the available outcomes.
+    #[error(
+        "the index cache at '{}' moved to generation {watermark} while a batch at generation {generation} was open",
+        path.display()
+    )]
+    IndexBatchSuperseded {
+        /// Cache database the batch was writing.
+        path: PathBuf,
+        /// Generation the refused batch held.
+        generation: u64,
+        /// Generation the cache actually reached.
+        watermark: u64,
+    },
+
+    /// A batch was given rows it cannot store as presented.
+    ///
+    /// A caller mistake rather than a fault in the cache — an entry paired with
+    /// another file's bytes, symbols attached to a file version the batch never
+    /// records. It is spelled apart from [`CacheOpenFailed`](Self::CacheOpenFailed)
+    /// because a front end must not tell a user their index is broken when the
+    /// code above it built the batch wrong.
+    #[error("the index batch cannot be stored as presented: {reason}")]
+    IndexBatchInvalid {
+        /// Stable human-readable explanation.
+        reason: String,
+    },
+
     /// The operation observed its cancellation token.
     #[error("the context engine operation was cancelled")]
     Cancelled,
@@ -332,6 +365,8 @@ impl ContextEngineError {
         "cache_corrupt_quarantined",
         "index_busy",
         "index_budget_exhausted",
+        "index_batch_superseded",
+        "index_batch_invalid",
         "cancelled",
     ];
 
@@ -345,6 +380,8 @@ impl ContextEngineError {
             Self::CacheCorruptQuarantined { .. } => "cache_corrupt_quarantined",
             Self::IndexBusy { .. } => "index_busy",
             Self::IndexBudgetExhausted { .. } => "index_budget_exhausted",
+            Self::IndexBatchSuperseded { .. } => "index_batch_superseded",
+            Self::IndexBatchInvalid { .. } => "index_batch_invalid",
             Self::Cancelled => "cancelled",
             Self::Domain(error) => error.kind(),
             Self::Inventory(error) => error.kind(),
@@ -514,6 +551,20 @@ mod tests {
                     limit: 0,
                 },
                 "index_budget_exhausted",
+            ),
+            (
+                ContextEngineError::IndexBatchSuperseded {
+                    path: PathBuf::from("/data/context/key/index.db"),
+                    generation: 1,
+                    watermark: 2,
+                },
+                "index_batch_superseded",
+            ),
+            (
+                ContextEngineError::IndexBatchInvalid {
+                    reason: "symbols name a file version this batch never records".to_owned(),
+                },
+                "index_batch_invalid",
             ),
             (ContextEngineError::Cancelled, "cancelled"),
         ];
