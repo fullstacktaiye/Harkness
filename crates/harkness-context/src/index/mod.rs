@@ -100,10 +100,8 @@ pub const INDEX_SCHEMA_VERSION: u32 = 1;
 /// [#117]: https://github.com/fullstacktaiye/harkness/issues/117
 pub const PARSER_VERSION: &str = "0";
 
-/// Version of the chunk-boundary rules that filled the cache ([#113]).
-///
-/// [#113]: https://github.com/fullstacktaiye/harkness/issues/113
-pub const CHUNKING_VERSION: &str = "0";
+/// Version of the chunk-boundary rules that filled the cache.
+pub use crate::chunk::CHUNKING_VERSION;
 
 /// Version of the scoring formula whose results the cache holds ([#121]).
 ///
@@ -184,7 +182,7 @@ impl ExpectedVersions {
         Self {
             schema_version: INDEX_SCHEMA_VERSION,
             parser_version: PARSER_VERSION.to_owned(),
-            chunking_version: CHUNKING_VERSION.to_owned(),
+            chunking_version: CHUNKING_VERSION.to_string(),
             ranking_version: RANKING_VERSION.to_owned(),
         }
     }

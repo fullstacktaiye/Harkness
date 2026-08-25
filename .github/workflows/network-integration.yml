@@ -211,6 +211,14 @@ jobs:
           harkness-context
           inventory::tests::a_medium_repository_meets_the_walk_latency_target
           --release
+      # Issue #113 makes chunking part of every cold context-index build and
+      # budgets a one-mebibyte source file at 20 ms.
+      - name: Measure structure-aware chunking
+        run: >-
+          sh .github/scripts/run-ignored-exact-test.sh
+          harkness-context
+          chunk::tests::chunking_one_megabyte_meets_the_latency_target
+          --release
       # Issue #97 puts the coordinator on every protected tool call, so its
       # per-call budget is a release requirement too.
       - name: Measure coordinator decision-to-dispatch
