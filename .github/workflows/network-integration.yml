@@ -326,6 +326,13 @@ jobs:
         run: cargo build --locked -p harkness-cli
       - name: Verify the scenario mapping
         run: sh .github/scripts/verify-suite-mapping.sh
+      # The v0.3 documents end in "What proves this" tables naming the test
+      # behind each documented guarantee. Same bargain as the line above: a
+      # renamed test fails here rather than quietly leaving a documented
+      # invariant unproven. The path, link and mirrored-example checks need no
+      # Cargo invocation, so they run in `core` as an ordinary test instead.
+      - name: Verify the documentation citations
+        run: sh .github/scripts/verify-doc-references.sh
       - name: Test the window's models
         env:
           HARKNESS_CLI_BIN: ${{ github.workspace }}/target/debug/harkness

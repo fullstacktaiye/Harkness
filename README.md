@@ -513,6 +513,205 @@ decision with its scope, the surface it was given through, and when.
 
 ![Project shell showing the linked-workspace creation form](docs/screenshots/worktree-creation.png)
 
+## The flagship workflow
+
+The whole of v0.3 in one sequence: read a workspace, ask before writing, apply a
+patch bound to the bytes that were approved, ask before executing, run a test,
+capture the resulting diff, and leave a timeline that reproduces all of it from a
+process that did not record it.
+
+Every command below is executed as written by `the_documented_commands_run_as_written`,
+against a fixture repository under an isolated `HARKNESS_DATA_DIR`. Every envelope
+is captured output, abridged only where marked with `…`. Nothing here reaches the
+network, an API key, or a GitHub account.
+
+The fixture is a repository named `ws` holding one file, `src/lib.rs`, containing
+exactly `pub const VALUE: &str = "old";` and a newline — the bytes the scenario's
+patch is bound to.
+
+**1. Import the workspace.** One success envelope on standard output:
+
+<!-- verified -->
+```console
+$ harkness --json project import ./ws
+```
+
+```json
+{"v":1,"type":"success","ok":true,"data":{"project":{"available":true,"checks":null,
+"display_name":"ws","effective_checks":[],"git":{"branch":"main","dirty":false,
+"staged":0,"unstaged":0,"upstream":null},"id":"d39ad020-f281-488c-af2d-ba495fb21da8",
+"last_opened":"2026-08-24T23:15:12.529462769Z","parent":null,"path_is_lossy":false,
+"remote":null,"root":"…/ws","source":"local","status_checked":true,
+"worktree_branch":null}}}
+```
+
+**2. Trust the workspace, once, after reviewing what is in it.** Any command that
+starts a run takes `--trust-workspace`; this one is also the cheapest way to look:
+
+<!-- verified -->
+```console
+$ harkness --json tool invoke workspace.inspect --input '{}' --project ws --trust-workspace
+```
+
+Trust authorizes nothing on its own. It moves the question from "may Harkness
+look at this at all" to "may Harkness do this particular thing" — everything
+above `observe` still asks. See [Policy](docs/policy.md#the-built-in-table).
+
+**3. Run the flagship scenario.** Two approvals: the workspace write, then the
+process execution.
+
+<!-- verified -->
+```console
+$ printf 'approve\napprove\n' | harkness --json agent run \
+      --scenario edit_test_diff_success --project ws --interactive
+```
+
+Standard **error** carries the persisted timeline as it is recorded, one progress
+envelope per event, so standard output stays exactly one object:
+
+```json
+{"v":1,"type":"progress","message":"7\tpolicy_decision\t2026-08-24T23:15:32.865156545Z","event":{"artifact_id":null,"at":"2026-08-24T23:15:32.865156545Z","kind":"policy_decision","payload":{"decision":{"reason":"observe is allowed by the trusted-workspace default","source":"built_in","verdict":"allow"},"risk":"observe"},"run_id":"1ff4e03d-5cab-4235-9ad4-b03038b19105","seq":7,"step_id":"16984e04-2af7-45b8-98f0-f993ffadebd5","tool_call_id":"7addeaba-deec-471a-a34b-3bd46b27007c"}}
+{"v":1,"type":"progress","message":"24\tapproval_requested\t2026-08-24T23:15:32.891131724Z","event":{"artifact_id":null,"at":"2026-08-24T23:15:32.891131724Z","kind":"approval_requested","payload":{"approval_id":"21ad694d-c717-42fb-a63d-468584a691cb","effective_scope":"tool_for_run","expires_at":null,"requested_scope":"tool_for_run","risk":"workspace_write","summary":"request to run fs.apply_patch@1.0.0","tool":"fs.apply_patch@1.0.0"},"run_id":"1ff4e03d-5cab-4235-9ad4-b03038b19105","seq":24,"step_id":null,"tool_call_id":"30d6fbe7-2a02-414e-98bb-3ffd11348f50"}}
+```
+
+The question itself is a progress envelope too, so a machine reading standard
+output never has to parse a prompt out of a result:
+
+```json
+{"v":1,"type":"progress","message":"approval 21ad694d-c717-42fb-a63d-468584a691cb requested: fs.apply_patch 1.0.0 (workspace_write risk, at most scope tool_for_run) — request to run fs.apply_patch@1.0.0"}
+{"v":1,"type":"progress","message":"answer approve (this call only), approve-tool, approve-capability, deny, or show-input"}
+```
+
+A bare `approve` authorizes **that call and nothing else**, even though the
+stored request would have permitted the tool for the rest of the run:
+
+```json
+{"v":1,"type":"progress","message":"26\tapproval_decided\t2026-08-24T23:15:32.893295226Z","event":{"artifact_id":null,"at":"2026-08-24T23:15:32.893295226Z","kind":"approval_decided","payload":{"approval_id":"21ad694d-c717-42fb-a63d-468584a691cb","decided_via":"cli","reason":"approved on the Harkness command line","scope":"exact_call","state":"granted","verdict":"granted"},"run_id":"1ff4e03d-5cab-4235-9ad4-b03038b19105","seq":26,"step_id":null,"tool_call_id":"30d6fbe7-2a02-414e-98bb-3ffd11348f50"}}
+```
+
+Standard **output** is one result envelope, and it does not grow with the run —
+the timeline was streamed, and `run show` reproduces every entry of it:
+
+```json
+{"v":1,"type":"success","ok":true,"data":{
+  "kind":"agent_run",
+  "run_id":"1ff4e03d-5cab-4235-9ad4-b03038b19105",
+  "scenario":"edit_test_diff_success",
+  "scenario_version":2,
+  "event_count":54,
+  "last_event_seq":54,
+  "timeline_complete":true,
+  "run":{"id":"1ff4e03d-5cab-4235-9ad4-b03038b19105","state":"succeeded","revision":6,
+         "task_id":"83716e8c-0e0a-487a-add4-445a81004ed0","failure":null,
+         "retry_of":null,"workspace_may_be_modified":false,
+         "created_at":"2026-08-24T23:15:32.857560382Z",
+         "started_at":"2026-08-24T23:15:32.858517058Z",
+         "finished_at":"2026-08-24T23:15:32.991593520Z",
+         "approvals":[{"decision":"approved","decided_by":"cli","decided_at":"2026-08-24T23:15:32.894833008Z"},
+                      {"decision":"approved","decided_by":"cli","decided_at":"2026-08-24T23:15:32.923911587Z"}]},
+  "tool_calls":[…, {
+    "id":"30d6fbe7-2a02-414e-98bb-3ffd11348f50",
+    "tool_id":"fs.apply_patch","tool_version":"1.0.0","state":"succeeded",
+    "policy_decision":{"verdict":"ask","source":"built_in",
+      "reason":"workspace write requires approval (built-in default for workspace_write)"},
+    "input":{"patch":"diff --git a/src/lib.rs b/src/lib.rs\n…","bases":[
+      {"path":"src/lib.rs",
+       "base_sha256":"4f03383f0bbf9e30e56d77f0a1b85286436cf6df407f00ade9f115b71f382026"}]},
+    "output":{"files":[{"path":"src/lib.rs","change":"modified","hunks_applied":1,"byte_delta":0}],
+      "diff_artifact":{"id":"66851cc2-af5f-4e8d-b1ea-c371ecd8a288",
+                       "media_type":"text/x-diff","byte_len":177}},
+    "approvals":[{"decision":"approved","decided_by":"cli",
+                  "decided_at":"2026-08-24T23:15:32.896360635Z"}]}, …],
+  "artifacts":[{
+    "id":"66851cc2-af5f-4e8d-b1ea-c371ecd8a288","name":"applied.patch",
+    "media_type":"text/x-diff","byte_size":177,"availability":"available",
+    "sha256":"e22a17f248a9a6fc78c87831b6631b443cd027d549762c0d7c248ce895456a58",
+    "tool_call_id":"30d6fbe7-2a02-414e-98bb-3ffd11348f50"}, …],
+  "approvals":[…], "steps":[…], "task":{…}}}
+```
+
+Every tool call carries the policy decision it was admitted under, so the record
+answers "why was this allowed to happen" without inference. The patch's own
+`base_sha256` is what makes an approval binding: the bytes that were approved are
+the bytes that were replaced, and anything else is refused as `stale_patch`
+without writing.
+
+**4. Read it back from a process that did not record it.** The whole timeline is
+durable, so a second invocation reproduces it. `$RUN` below is the `run_id` the
+envelope above reported:
+
+<!-- verified -->
+```console
+$ harkness --json run show "$RUN" --limit 200
+```
+
+Without `--json` the same command prints a tab-separated summary:
+
+```text
+1ff4e03d-5cab-4235-9ad4-b03038b19105	succeeded	2026-08-24T23:15:32.857560382Z	Agent scenario edit_test_diff_success
+call	workspace.inspect	1.0.0	succeeded
+call	fs.read	1.0.0	succeeded
+call	fs.apply_patch	1.0.0	succeeded
+call	test.run	1.0.0	succeeded
+call	git.diff	1.0.0	succeeded
+approval	21ad694d-c717-42fb-a63d-468584a691cb	granted	request to run fs.apply_patch@1.0.0
+approval	96b7577e-4d43-4c2e-89df-56098e35ac01	granted	request to run test.run@1.0.0
+artifact	66851cc2-af5f-4e8d-b1ea-c371ecd8a288	applied.patch	text/x-diff	177	available
+artifact	05bed6ab-120f-4a9d-a543-4c781142dbb2	test-stdout.log	text/plain	194	available
+artifact	ee103cba-c4a8-4f9b-ad52-91eb71a35dfb	test-stderr.log	text/plain	0	available
+1	run_state_changed	2026-08-24T23:15:32.857560382Z
+2	run_state_changed	2026-08-24T23:15:32.858517058Z
+3	agent_observation	2026-08-24T23:15:32.861589407Z
+…
+```
+
+**What a refusal looks like.** Without `--interactive` there is nobody to answer,
+so a run stops at its first question rather than assuming consent:
+
+<!-- verified: exit=3 -->
+```console
+$ harkness --json agent run --scenario approval_denied --project ws
+```
+
+```json
+{"v":1,"type":"error","ok":false,"error":{
+  "kind":"approval_required_noninteractive",
+  "message":"run 3b2c0c2e-8f3c-4d25-8dbf-88076eb83a3e stopped because an approval could not be answered without a terminal",
+  "details":{…}}}
+```
+
+Exit 3, and the workspace is untouched. `harkness --json contract` reports the
+exit code for every error kind, so a caller reads the classification rather than
+hardcoding it.
+
+The five process-executing scenarios name fixture programs rather than host
+tools; [The mock-agent scenarios](docs/mock-agent-scenarios.md#preconditions)
+says what to put on `PATH` to run them from a shell.
+
+The same run is visible in the window while it happens, and afterwards: see
+[Runs UI](#runs-ui) above.
+
+## Documentation
+
+| Document | Answers |
+| --- | --- |
+| [The run runtime](docs/architecture-runtime.md) | How the runtime is laid out, the two state machines, the threading model, and the front-end boundary. |
+| [Writing a tool](docs/tool-authoring.md) | The `Tool` trait, generated schemas, risk and capabilities, the execution context, and a complete compiled example. |
+| [Policy](docs/policy.md) | The six risk levels, the Allow/Ask/Deny lattice, the layers, and the tightening-only rule. |
+| [Approvals](docs/approvals.md) | The scopes, what a grant is bound to, the exact-binding hash, and the lifecycle. |
+| [Run lifecycle and storage](docs/run-lifecycle-and-storage.md) | The event log, the SQLite schema and its migration ladder, artifacts, interruption, and retry. |
+| [The mock-agent scenarios](docs/mock-agent-scenarios.md) | The ten deterministic scripts, what each proves, and how to run one. |
+| [Diagnostics and redaction](docs/observability.md) | The local log, the span fields, and what is scrubbed before anything is written. |
+| [The verification suite](docs/verification-suite.md) | Every release-blocking scenario, named by the test that proves it. |
+| [Context inventory](docs/context-inventory.md) · [Context engine](docs/architecture-context.md) | What a run can see of a workspace, and how the index cache works. |
+| [External agents](docs/agents.md) · [ACP](docs/acp.md) | Registering, trusting, and health-checking external coding agents. |
+| [Filesystem and process safety](docs/filesystem-and-process-safety.md) | The boundary and child-process rules every tool inherits. |
+| [Architecture decisions](docs/adr/) | Why the boundaries are where they are. |
+
+`AGENTS.md` is the authoritative statement of the repository's conventions and
+durable-format invariants; `CLAUDE.md` covers the commands and the cross-crate
+architecture.
+
 ## Install locally for Plasma
 
 The thin CMake wrapper builds the locked Cargo workspace and installs both

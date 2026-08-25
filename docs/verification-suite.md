@@ -194,7 +194,7 @@ process group are different chains, and 250 ms is the promise for both.
 | --- | --- | --- |
 | `lint` | `ubuntu-latest` | formatting, Clippy over every target, rustdoc for the crates that deny undocumented items |
 | `core` | `ubuntu`, `macos`, `windows` | every crate's tests, per crate, on three platforms |
-| `verification-suite` | `ubuntu-latest` | this document against the test binaries, then the window's model tests |
+| `verification-suite` | `ubuntu-latest` | this document and the v0.3 documents against the test binaries, then the window's model tests |
 | `latency` | `ubuntu-latest` | every budget above, by exact name, in release |
 | `github-remote-import` | self-hosted | the four `#[ignore]`d tests that reach real GitHub |
 

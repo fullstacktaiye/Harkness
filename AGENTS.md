@@ -2063,6 +2063,59 @@ nested `cargo build` would wait for a lock only its own parent can release. When
 absent the test says so and fails. It must never skip: a verification test that quietly verifies
 nothing is worse than one that is missing.
 
+## Documentation Invariants
+
+`docs/` is where the contracts that outlive a pull request are written down, and
+none of it is prose to be trusted. Three mechanisms hold it to the tree, and each
+exists because the failure it prevents is silent.
+
+**A documented command is executed.** A fenced ` ```sh ` or ` ```console ` block
+immediately preceded by an `<!-- verified -->` comment is run as written by
+`harkness-cli`'s `docs` test, against a hermetic `HARKNESS_DATA_DIR` and the
+scenario process fixtures, with its exit code and its envelope `type` asserted.
+`<!-- verified: exit=N -->` is how a block that documents a refusal states the
+code it expects. The marker is invisible in rendered Markdown, so a reader sees
+an ordinary example. Every document listed in that test must carry at least one
+such block, so a renamed marker fails a build instead of leaving a document
+silently unchecked. A block that cannot run — it needs a signal, a policy file
+placed first, or a second process — is left unmarked and the document says why;
+adding a shell to the runner to make one work is the wrong repair, because a
+runner pretending to check a shell script checks nothing about `harkness`.
+
+**A mirrored file is compared byte for byte.** `<!-- mirrors: PATH -->` before a
+fenced block means the block is a copy of that file, and
+`the_tool_authoring_example_is_the_file_it_claims_to_be` fails when the two
+differ. That is what makes `docs/tool-authoring.md`'s worked example code that
+compiles rather than a sketch that once did. Edit the file and copy it back;
+never edit the block alone.
+
+**A named test is checked to exist.** Each v0.3 document ends in a "What proves
+this" table whose last two cells are a package and a test.
+`.github/scripts/verify-doc-references.sh` re-derives those from the test
+binaries, exactly as `verify-suite-mapping.sh` does for the release scenarios.
+**Renaming a test one of those documents names is a change to that document in
+the same commit.** The two scripts stay separate on purpose: the suite mapping is
+additionally checked against a mandated list, so a scenario there cannot be
+covered by deleting its row, while these tables have no such list and what they
+must not do is cite a test that has gone.
+
+`harkness-runtime`'s `documentation` test carries the checks that need no Cargo
+invocation, so they run on every platform in `cargo test --workspace`: every
+backticked `crates/`, `docs/`, `.github/` or `scripts/` path a document cites
+exists, and every Markdown link between documents resolves to a file and — where
+it names one — to a heading that is really there. A path written as a pattern
+(`runtime-v{1..9}.db`, a glob, an elision) is skipped, because it is a claim
+about a family of files rather than one a reader can open; write a real path when
+you mean one.
+
+Two content rules apply to what the documents may show. **No example may teach an
+unsafe pattern** — none grants broad trust to make a demonstration shorter, none
+disables policy, and none embeds a real token or remote; fixture paths and
+`github.com/example/example` are what appear instead. And **a rendered JSON
+example is captured output**, not hand-typed, so a field name cannot drift at the
+moment it is introduced; abridge with `…` and say so rather than inventing a
+shorter payload.
+
 ## Commit & Pull Request Guidelines
 
 Write short, imperative commit subjects, matching history such as `Prevent concurrent imports from orphaning managed checkouts`. Keep each commit focused; append the PR number only when added by the merge workflow. Pull requests should explain the behavior change, testing performed, and relevant issue. Include screenshots for visible QML changes and call out platform or Qt/KDE dependency assumptions.
