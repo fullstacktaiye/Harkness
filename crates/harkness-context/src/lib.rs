@@ -174,6 +174,7 @@ mod provenance;
 mod reconcile;
 pub mod search;
 mod snapshot;
+mod symbol_pipeline;
 mod symbols;
 mod text;
 pub mod watch;

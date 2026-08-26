@@ -123,13 +123,16 @@ Each stage in one line:
 - **Chunk** — structure-aware boundaries with anchors that stay stable when
   unrelated regions of a file change, so a small edit does not invalidate a
   file's whole chunk set. Source adapters supply the symbol outline first, so
-  supported code aligns to declarations rather than fallback line windows.
+  successfully parsed code aligns to declarations rather than fallback line
+  windows. Failed, skipped, bounded-out, and transcoded extractions supply no
+  outline, so chunking falls back without treating partial or decoded offsets as
+  original-file coordinates.
 - **Index cache** — one SQLite database per repository at
   `<data_dir>/context/<repository-key>/index.db`, keyed by the same v5 UUID as
   the repository lock. Holds the file inventory, the content-addressed chunk and
-  symbol rows, and nothing else; only `files` is per-worktree, so two linked
-  worktrees share the expensive half. Disposable by design (ADR-0004), and
-  documented in [`docs/context-index.md`](context-index.md).
+  symbol rows, and no source excerpts; only `files` is per-worktree, so two
+  linked worktrees share the expensive half. Disposable by design (ADR-0004),
+  and documented in [`docs/context-index.md`](context-index.md).
 - **Watch and reconcile** — what keeps that cache current between cold builds.
   A filesystem watcher produces *hints* and a reconciler decides *truth* by
   comparing the worktree against the stored rows, so a dropped event, a

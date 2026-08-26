@@ -178,6 +178,8 @@ sh .github/scripts/run-ignored-exact-test.sh \
 | `latency-streaming-assembly` | 10 µs | `harkness-provider` | `assemble::assembler::tests::event_dispatch_meets_the_latency_target` |
 | `latency-inventory-walk` | 1.5 s | `harkness-context` | `inventory::tests::a_medium_repository_meets_the_walk_latency_target` |
 | `latency-chunking-1mib` | 20 ms | `harkness-context` | `chunk::tests::chunking_one_megabyte_meets_the_latency_target` |
+| `latency-symbol-extraction` | 200 ms and 5 MiB/s | `harkness-context` | `symbols::tests::rust_extraction_meets_the_single_file_throughput_target` |
+| `latency-symbol-lookup` | 100 ms p95 | `harkness-context` | `engine::tests::warm_symbol_lookup_meets_the_latency_target` |
 | `latency-incremental-update` | 1 s | `harkness-context` | `reconcile::tests::a_single_file_update_meets_the_incremental_latency_target` |
 | `latency-lexical-search` | 100 ms | `harkness-context` | `search::tests::a_medium_repository_meets_the_content_search_latency_target` |
 | `latency-filename-search` | 25 ms | `harkness-context` | `search::tests::a_medium_repository_meets_the_filename_search_latency_target` |
@@ -209,6 +211,12 @@ searches take a capture rather than making one, which is the arrangement a run
 uses — a run records one workspace snapshot and stamps every retrieval with it —
 and the capture's own cost is printed beside the numbers so the choice hides
 nothing.
+
+`latency-symbol-extraction` measures both elapsed time and throughput over the
+same 256 KiB Rust input; satisfying one does not waive the other.
+`latency-symbol-lookup` records p95 across one hundred warm exact-name reads
+after the 2,500-declaration index has already been built, so cache construction
+is not mistaken for lookup latency.
 
 ## What runs where, and why
 

@@ -66,7 +66,7 @@ use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use harkness_core::ProjectId;
 use harkness_git::{Cancellation, GitService, HeadState};
 
-use crate::chunk::{FileVersion, chunk_file};
+use crate::chunk::FileVersion;
 use crate::digest::{Sha256Hex, empty_path_set_digest};
 use crate::error::{ContextDomainError, ContextEngineError};
 use crate::ids::ChunkId;
@@ -84,6 +84,7 @@ use crate::probe::FilesystemProbe;
 use crate::reconcile::{ReconcileReport, ReconcileScope, Reconciler};
 use crate::search::{Scan, SearchQuery, SearchResponse};
 use crate::snapshot::{Capture, CaptureRequest, WorkspaceSnapshot};
+use crate::symbol_pipeline::{chunk_with_symbol_outline, extract_file_symbols};
 use crate::symbols::{FileSymbols, LanguageRegistry};
 use crate::watch::{WatchOptions, WatchService};
 
@@ -749,7 +750,7 @@ impl ContextEngine {
             return Err(ContextEngineError::Cancelled);
         }
         let worktree = self.worktree_key();
-        let page = self.with_cache(|cache| {
+        let (page, incomplete_files) = self.with_cache(|cache| {
             if cache.worktree_generation(&worktree)? == 0 {
                 return Err(crate::search::SearchError::IndexUnavailable {
                     worktree: worktree.as_str().to_owned(),
@@ -757,17 +758,19 @@ impl ContextEngine {
                 }
                 .into());
             }
-            match &query.lookup {
+            let page = match &query.lookup {
                 SymbolLookup::ExactName(name) => cache.symbols_named(&worktree, name, query.limit),
                 SymbolLookup::QualifiedSuffix(suffix) => {
                     cache.symbols_qualified_suffix(&worktree, suffix, query.limit)
                 }
                 SymbolLookup::File(path) => cache.symbols_in_file(&worktree, path, query.limit),
-            }
+            }?;
+            Ok((page, cache.incomplete_symbol_files(&worktree)?))
         })?;
         Ok(SymbolResults {
             symbols: page.rows,
             more: page.more,
+            incomplete_files,
         })
     }
 
@@ -1134,7 +1137,6 @@ impl ContextEngine {
         else {
             return Ok(Derived::Unreadable);
         };
-        let extracted = self.symbols.extract(&entry.path, &bytes, cancellation);
         let version = match FileVersion::new(entry, snapshot, bytes.into(), cancellation) {
             Ok(version) => version,
             // A cancelled token is the caller's answer wherever it is observed.
@@ -1143,12 +1145,12 @@ impl ContextEngine {
             Err(crate::chunk::ChunkError::Cancelled) => return Err(ContextEngineError::Cancelled),
             Err(_) => return Ok(Derived::Unreadable),
         };
+        let extracted = extract_file_symbols(&self.symbols, &entry.path, &version, cancellation);
         let version = match extracted.detection.language.clone() {
             Some(language) => version.with_language(language),
             None => version,
         };
-        let outline = (!extracted.outline.nodes.is_empty()).then_some(&extracted.outline);
-        match chunk_file(&version, outline, cancellation) {
+        match chunk_with_symbol_outline(&version, &extracted, cancellation) {
             Ok(chunks) => Ok(Derived::Content(Box::new((version, chunks, extracted)))),
             Err(crate::chunk::ChunkError::Cancelled) => Err(ContextEngineError::Cancelled),
             Err(_) => Ok(Derived::Unreadable),
@@ -1539,6 +1541,12 @@ pub struct SymbolResults {
     pub symbols: Vec<IndexedSymbol>,
     /// Whether the requested bound stopped the answer.
     pub more: bool,
+    /// Visible files whose extraction exceeded a per-file symbol or reference bound.
+    ///
+    /// A non-zero value means an empty lookup is not proof that the worktree has
+    /// no matching declaration: those files deliberately published no partial
+    /// structural inventory and remain available through lexical chunks.
+    pub incomplete_files: u64,
 }
 
 /// The structural map of a repository ([#118]).

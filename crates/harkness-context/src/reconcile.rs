@@ -71,12 +71,13 @@ use std::time::{Duration, Instant};
 
 use harkness_git::Cancellation;
 
-use crate::chunk::{ChunkError, FileVersion, chunk_file};
+use crate::chunk::{ChunkError, FileVersion};
 use crate::error::ContextEngineError;
 use crate::ids::SnapshotId;
 use crate::index::{BatchScope, IndexBatch, IndexCache, IndexedFile, WorktreeKey};
 use crate::inventory::{FileInventory, InventoryBuilder, InventoryEntry, InventoryPolicy};
 use crate::path::RepoPath;
+use crate::symbol_pipeline::{chunk_with_symbol_outline, extract_file_symbols};
 use crate::symbols::SymbolSource;
 
 /// Most paths one reconcile is asked about before the scope widens.
@@ -854,15 +855,12 @@ impl Reconciler<'_> {
             return Ok(Applied::Refreshed);
         }
 
-        let extracted = self
-            .symbols
-            .extract(&entry.path, version.bytes(), cancellation);
+        let extracted = extract_file_symbols(self.symbols, &entry.path, &version, cancellation);
         let version = match extracted.detection.language.clone() {
             Some(language) => (*version).with_language(language),
             None => *version,
         };
-        let outline = (!extracted.outline.nodes.is_empty()).then_some(&extracted.outline);
-        let chunks = match chunk_file(&version, outline, cancellation) {
+        let chunks = match chunk_with_symbol_outline(&version, &extracted, cancellation) {
             Ok(chunks) => chunks,
             Err(ChunkError::Cancelled) => return Err(ContextEngineError::Cancelled),
             Err(_) => {

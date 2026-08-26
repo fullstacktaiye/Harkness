@@ -1,0 +1,5 @@
+constant|name|name|0..13|-|false|false
+module|package|package|15..40|-|false|false
+constant|version|package::version|25..38|package|false|false
+module|package.metadata|package.metadata|40..75|-|false|false
+constant|license|package.metadata::license|59..74|package.metadata|false|false

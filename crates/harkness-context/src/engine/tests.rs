@@ -17,7 +17,10 @@ use crate::index::{
 };
 use crate::inventory::GLOBAL_IGNORE_FILE;
 use crate::probe::FilesystemProbe;
-use crate::{ChunkId, ExtractionSkipReason, FreshnessState, ParseHealth, RepoPath, SymbolKind};
+use crate::{
+    ChunkId, ExtractionSkipReason, FreshnessState, MAX_SYMBOLS_PER_FILE, ParseHealth, RepoPath,
+    SymbolKind,
+};
 
 /// The namespace `harkness-git` keys repository locks by, restated here so the
 /// test derives the cache key independently instead of asking the code under
@@ -768,6 +771,158 @@ fn reindexing_extracts_queries_and_explains_symbol_health() {
 }
 
 #[test]
+fn symbol_signatures_never_enter_the_index_database() {
+    const SENTINEL: &[u8] = b"raw-signature-sentinel-117";
+    let workspace = Workspace::new();
+    fs::write(
+        workspace.root.join("sentinel.rs"),
+        "pub fn harmless() -> &'static str { \"raw-signature-sentinel-117\" }\n",
+    )
+    .unwrap();
+
+    let engine = workspace.engine();
+    engine.reindex(&Cancellation::default()).unwrap();
+
+    for entry in fs::read_dir(engine.cache_root()).unwrap() {
+        let path = entry.unwrap().path();
+        if !path.is_file() {
+            continue;
+        }
+        let bytes = fs::read(&path).unwrap();
+        assert!(
+            !bytes
+                .windows(SENTINEL.len())
+                .any(|window| window == SENTINEL),
+            "raw declaration content leaked into {}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn nested_rust_items_remain_indexable() {
+    let workspace = Workspace::new();
+    let mut source = String::from("fn outer() {\n    fn inner() {}\n");
+    source.push_str(&"    let padding = 1;\n".repeat(160));
+    source.push_str("}\n");
+    fs::write(workspace.root.join("nested.rs"), source).unwrap();
+
+    let engine = workspace.engine();
+    engine.reindex(&Cancellation::default()).unwrap();
+
+    let path = RepoPath::from_path(std::path::Path::new("nested.rs"));
+    let file = engine.indexed_file(&path).unwrap().unwrap();
+    assert!(!file.unreadable, "valid nested declarations stay readable");
+    assert_eq!(
+        engine.symbol_health(&path).unwrap().unwrap().health,
+        ParseHealth::Complete
+    );
+    let inner = engine
+        .symbols(&SymbolQuery::exact_name("inner"), &Cancellation::default())
+        .unwrap();
+    assert_eq!(inner.symbols.len(), 1);
+    assert_eq!(inner.symbols[0].qualified_path, "outer::inner");
+    assert!(
+        !engine.indexed_chunks(&path).unwrap().is_empty(),
+        "valid source must retain fallback chunks even if an outline is refused"
+    );
+}
+
+#[test]
+fn nested_markdown_headings_round_trip_through_the_index() {
+    let workspace = Workspace::new();
+    fs::write(
+        workspace.root.join("guide.md"),
+        "# Install\n\nIntro.\n\n## Linux\n\nDetails.\n\n### Fedora\n\nMore.\n",
+    )
+    .unwrap();
+
+    let engine = workspace.engine();
+    engine.reindex(&Cancellation::default()).unwrap();
+
+    let path = RepoPath::from_path(std::path::Path::new("guide.md"));
+    let headings = engine
+        .symbols(&SymbolQuery::file(path), &Cancellation::default())
+        .unwrap();
+    assert_eq!(
+        headings
+            .symbols
+            .iter()
+            .map(|symbol| symbol.qualified_path.as_str())
+            .collect::<Vec<_>>(),
+        ["Install", "Install::Linux", "Install::Linux::Fedora"]
+    );
+}
+
+#[test]
+fn transcoded_source_records_named_symbol_skip() {
+    let workspace = Workspace::new();
+    let mut utf16 = vec![0xff, 0xfe];
+    for unit in "fn transcoded() {}\n".encode_utf16() {
+        utf16.extend_from_slice(&unit.to_le_bytes());
+    }
+    fs::write(workspace.root.join("transcoded.rs"), utf16).unwrap();
+
+    let engine = workspace.engine();
+    engine.reindex(&Cancellation::default()).unwrap();
+
+    let path = RepoPath::from_path(std::path::Path::new("transcoded.rs"));
+    assert!(matches!(
+        engine.symbol_health(&path).unwrap().unwrap().health,
+        ParseHealth::Skipped {
+            reason: ExtractionSkipReason::TranscodedInput
+        }
+    ));
+    let chunks = engine.indexed_chunks(&path).unwrap();
+    assert!(
+        !chunks.is_empty(),
+        "transcoded text still uses line chunking"
+    );
+    assert!(chunks.iter().all(|chunk| chunk.transcoded));
+    assert!(
+        engine
+            .symbols(
+                &SymbolQuery::exact_name("transcoded"),
+                &Cancellation::default(),
+            )
+            .unwrap()
+            .symbols
+            .is_empty()
+    );
+}
+
+#[test]
+fn symbol_budget_exhaustion_is_visible_to_lookup() {
+    let workspace = Workspace::new();
+    let mut source = String::new();
+    for index in 0..=MAX_SYMBOLS_PER_FILE {
+        source.push_str(&format!("fn item_{index}() {{}}\n"));
+    }
+    fs::write(workspace.root.join("too-many.rs"), source).unwrap();
+
+    let engine = workspace.engine();
+    engine.reindex(&Cancellation::default()).unwrap();
+
+    let path = RepoPath::from_path(std::path::Path::new("too-many.rs"));
+    assert!(matches!(
+        engine.symbol_health(&path).unwrap().unwrap().health,
+        ParseHealth::Failed { ref reason } if reason == "symbol_budget_exhausted"
+    ));
+    let answer = engine
+        .symbols(&SymbolQuery::exact_name("item_0"), &Cancellation::default())
+        .unwrap();
+    assert!(
+        answer.symbols.is_empty(),
+        "a failed parse exposes no prefix"
+    );
+    assert_eq!(answer.incomplete_files, 1);
+    assert!(
+        !engine.indexed_chunks(&path).unwrap().is_empty(),
+        "failed structural extraction falls back to bounded line chunks"
+    );
+}
+
+#[test]
 #[ignore = "release-mode warm symbol lookup benchmark"]
 fn warm_symbol_lookup_meets_the_latency_target() {
     let workspace = Workspace::new();
@@ -805,9 +960,54 @@ fn warm_symbol_lookup_meets_the_latency_target() {
         "warm symbol lookup: 2500 declarations, 100 samples, p95 {:.3} ms",
         p95.as_secs_f64() * 1_000.0
     );
-    if !cfg!(debug_assertions) {
-        assert!(p95 < std::time::Duration::from_millis(100));
+    harkness_test_fixtures::latency::record(
+        "symbols::warm_lookup_p95",
+        p95,
+        std::time::Duration::from_millis(100),
+    );
+}
+
+#[test]
+#[ignore = "release-mode symbol index growth benchmark"]
+fn symbol_index_growth_stays_within_the_medium_profile_target() {
+    let workspace = Workspace::new();
+    let engine = workspace.engine();
+    let empty_bytes = engine.index_counts().unwrap().database_bytes;
+
+    let mut source = String::new();
+    for index in 0..2_500 {
+        source.push_str(&format!(
+            "pub fn item_{index}() {{ let value = {index}; }}\n"
+        ));
     }
+    fs::write(workspace.root.join("medium.rs"), &source).unwrap();
+    engine.reindex(&Cancellation::default()).unwrap();
+
+    let populated_bytes = engine.index_counts().unwrap().database_bytes;
+    let growth = populated_bytes.saturating_sub(empty_bytes);
+    let connection = Connection::open(engine.cache_root().join(INDEX_DATABASE_FILE)).unwrap();
+    let symbol_bytes = connection
+        .query_row(
+            "SELECT COALESCE(SUM(pgsize), 0) FROM dbstat WHERE name = 'symbols'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    let symbol_bytes = u64::try_from(symbol_bytes).unwrap();
+    let ratio = symbol_bytes as f64 / source.len() as f64;
+    println!(
+        "harkness-resource target=symbol-index-growth source_bytes={} symbol_bytes={symbol_bytes} database_growth_bytes={growth} ratio={ratio:.3} profile={}",
+        source.len(),
+        harkness_test_fixtures::latency::profile(),
+    );
+    // The frozen medium-profile baseline is 6.0 bytes of symbols-table pages
+    // per source byte. Issue #117 permits at most twice that recorded ratio so
+    // an index-layout change cannot quietly double the feature's footprint.
+    const MAX_RATIO: f64 = 12.0;
+    assert!(
+        ratio <= MAX_RATIO,
+        "symbol index grew by {ratio:.3}x source bytes, over the {MAX_RATIO:.1}x ceiling"
+    );
 }
 
 /// A file that is gone stops being indexed. A full batch is the whole worktree,

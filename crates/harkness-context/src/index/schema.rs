@@ -207,9 +207,13 @@ CREATE TABLE IF NOT EXISTS symbols (
     start_line      INTEGER,
     end_line        INTEGER,
     parent_symbol_id TEXT,
-    signature        TEXT,
-    is_test          INTEGER NOT NULL,
-    name_is_lossy    INTEGER NOT NULL,
+    is_test          INTEGER NOT NULL CHECK (is_test IN (0, 1)),
+    name_is_lossy    INTEGER NOT NULL CHECK (name_is_lossy IN (0, 1)),
+    CHECK (ordinal >= 0),
+    CHECK (start_byte >= 0 AND end_byte >= start_byte),
+    CHECK (start_line IS NULL OR start_line >= 1),
+    CHECK (end_line IS NULL OR end_line >= 1),
+    CHECK (start_line IS NULL OR end_line IS NULL OR end_line >= start_line),
     PRIMARY KEY (file_version_id, symbol_id),
     FOREIGN KEY (file_version_id, parent_symbol_id)
         REFERENCES symbols(file_version_id, symbol_id)
@@ -225,7 +229,12 @@ CREATE TABLE IF NOT EXISTS symbol_references (
     end_byte        INTEGER NOT NULL,
     start_line      INTEGER,
     end_line        INTEGER,
-    name_is_lossy   INTEGER NOT NULL,
+    name_is_lossy   INTEGER NOT NULL CHECK (name_is_lossy IN (0, 1)),
+    CHECK (ordinal >= 0),
+    CHECK (start_byte >= 0 AND end_byte >= start_byte),
+    CHECK (start_line IS NULL OR start_line >= 1),
+    CHECK (end_line IS NULL OR end_line >= 1),
+    CHECK (start_line IS NULL OR end_line IS NULL OR end_line >= start_line),
     PRIMARY KEY (file_version_id, ordinal)
 ) STRICT, WITHOUT ROWID;
 

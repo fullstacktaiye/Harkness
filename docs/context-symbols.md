@@ -33,8 +33,9 @@ would make the same bytes parse differently after an unrelated edit.
 
 A declaration records its stable `SymbolId`, typed kind, bare and qualified
 names, duplicate ordinal, byte-exact definition range, structural parent,
-bounded signature line, test flag, and whether its stored name is a lossy view
-of invalid identifier bytes. Signatures are capped at 512 bytes. Symbol and
+test flag, and whether its stored name is a lossy view of invalid identifier
+bytes. The durable cache stores no declaration excerpt or other source line;
+names and structural metadata are not a second copy of the file. Symbol and
 reference counts are capped per file.
 
 `SymbolId` follows the landed identity contract: exact path bytes, language,
@@ -52,11 +53,16 @@ Parse health is one of:
   them remain usable;
 - `Failed { reason }`: the adapter could not produce a structural answer or
   panicked;
-- `Skipped { reason }`: the language is unknown or has no registered adapter.
+- `Skipped { reason }`: the language is unknown, has no registered adapter, or
+  requires transcoding before a grammar could parse it with honest original-byte
+  ranges. The last case is spelled `transcoded_input`.
 
 An adapter panic is caught around one file and becomes `adapter_panicked`.
 Indexing continues with the next file. Unsupported files stay in the inventory
 and lexical index; they are not mislabeled as successfully parsed empty files.
+Reaching a declaration or reference bound is a named failed extraction rather
+than a silently shortened successful inventory. A failed or skipped extraction
+contributes no structural outline.
 
 ## Indexing and invalidation
 
@@ -65,10 +71,11 @@ paths never become inventory entries, and ineligible `SecretSensitive`,
 `Binary`, `Oversized`, symlink, boundary, and unreadable entries are never
 parsed. The file's detected language is attached to its exact `FileVersionId`.
 
-For supported source, the adapter projects the leaf declarations into a
-non-overlapping `StructuralOutline` before chunking. Chunks therefore align to
-symbol ranges and carry the associated `SymbolId`; an unavailable or unsupported
-adapter falls back to the existing line-window behavior.
+For successfully parsed source, the adapter projects the leaf declarations into
+a non-overlapping `StructuralOutline` before chunking. Chunks therefore align to
+symbol ranges and carry the associated `SymbolId`. Failed, skipped, empty, and
+transcoded extractions fall back to the existing non-symbol chunking behavior;
+they never hand a partial or wrong-coordinate outline to the chunker.
 
 The disposable index schema is version 4. It adds typed symbol metadata,
 `symbol_references`, `parse_health`, and `parser_versions`. The shared parser
@@ -82,8 +89,10 @@ Lookups are worktree-scoped and never query a content table without joining
 through that worktree's visible file rows. Exact bare-name and qualified-suffix
 answers order by qualified name bytes, path bytes, then start offset. Per-file
 listings order by start offset, then qualified name. Every answer is bounded and
-reports `more`; an unindexed worktree is `index_unavailable`, not an empty
-success.
+reports `more`. It also reports `incomplete_files`, the number of visible files
+whose extraction hit a symbol or reference bound, so an empty result cannot
+masquerade as a complete search. An unindexed worktree is `index_unavailable`,
+not an empty success.
 
 ## Adding a language adapter
 
@@ -100,23 +109,34 @@ success.
    really invalidates every language.
 5. Add a versioned source fixture and frozen expected inventory covering kinds,
    qualified names, exact ranges, parents, test flags, partial parsing, and ID
-   stability. Add a language-local invalidation test beside the store tests.
+   stability. The initial language fixtures are
+   `crates/harkness-context/src/symbols/fixtures/rust-v1.rs`,
+   `crates/harkness-context/src/symbols/fixtures/toml-v1.toml`, and
+   `crates/harkness-context/src/symbols/fixtures/markdown-v1.md`, each beside a
+   `.txt` inventory. Add a language-local invalidation test beside the store
+   tests.
 6. Measure release extraction throughput and warm lookup latency. A file at or
    below 256 KiB must extract in under 200 ms, aggregate extraction must sustain
    at least 5 MiB/s, and warm lookup p95 must remain under 100 ms on the medium
-   profile.
+   profile. Record symbols-table page growth on that profile too: the frozen
+   baseline is 6.0 bytes per source byte and the regression ceiling is twice
+   that ratio.
 
 ## Recorded release benchmark
 
 On 2026-08-26, the ignored release tests ran on x86-64 Fedora Linux
 7.1.10-200.fc44 with rustc 1.97.1 and LLVM 22.1.6. The 256 KiB Rust profile
 (548 declarations) extracted in 6.35 ms, or 39.38 MiB/s. One hundred warm exact
-lookups over 2,500 declarations measured 0.056 ms at p95. The committed tests
-assert the 200 ms, 5 MiB/s, and 100 ms limits in release builds:
+lookups over 2,500 declarations measured 0.056 ms at p95. The medium 2,500-item
+fixture used 593,920 bytes of symbols-table pages for 100,280 source bytes, a
+5.923 ratio frozen conservatively as 6.0. The committed tests assert the 200 ms,
+5 MiB/s, 100 ms, and 12.0 growth limits in release builds. The exact-test runner
+is used because a bare `--ignored` invocation also runs fixture regenerators:
 
 ```text
-cargo test -p harkness-context --release rust_extraction_meets_the_single_file_throughput_target -- --ignored --nocapture
-cargo test -p harkness-context --release warm_symbol_lookup_meets_the_latency_target -- --ignored --nocapture
+sh .github/scripts/run-ignored-exact-test.sh harkness-context symbols::tests::rust_extraction_meets_the_single_file_throughput_target --release
+sh .github/scripts/run-ignored-exact-test.sh harkness-context engine::tests::warm_symbol_lookup_meets_the_latency_target --release
+sh .github/scripts/run-ignored-exact-test.sh harkness-context engine::tests::symbol_index_growth_stays_within_the_medium_profile_target --release
 ```
 
 ## What proves this
@@ -131,6 +151,10 @@ cargo test -p harkness-context --release warm_symbol_lookup_meets_the_latency_ta
 | Unrelated body edits preserve other declaration IDs | `harkness-context` | `symbols::tests::unrelated_body_edits_preserve_other_symbol_ids` |
 | Rust, TOML and Markdown all register through adapters | `harkness-context` | `symbols::tests::toml_and_markdown_are_adapters_not_core_special_cases` |
 | Cold indexing persists symbols, health, lookup, and chunk association | `harkness-context` | `engine::tests::reindexing_extracts_queries_and_explains_symbol_health` |
+| Symbols-table growth stays below twice the frozen medium-profile ratio | `harkness-context` | `engine::tests::symbol_index_growth_stays_within_the_medium_profile_target` |
+| Nested Rust declarations remain visible through the indexed lookup path | `harkness-context` | `engine::tests::nested_rust_items_remain_indexable` |
+| Transcoded source records a named skip and falls back without structural ranges | `harkness-context` | `engine::tests::transcoded_source_records_named_symbol_skip` |
+| Extraction bounds are visible in lookup completeness metadata | `harkness-context` | `engine::tests::symbol_budget_exhaustion_is_visible_to_lookup` |
 | A grammar bump invalidates only that language | `harkness-context` | `index::store_tests::a_grammar_bump_invalidates_only_that_languages_rows` |
 
 ## Where to read next

@@ -12,9 +12,14 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use harkness_git::Cancellation;
-use tree_sitter::{Language as TreeSitterLanguage, Node, Parser, Query, Tree};
+use tree_sitter::{
+    Language as TreeSitterLanguage, Node, Parser, Query, QueryCursor, StreamingIterator, Tree,
+};
 
-use crate::{ByteRange, Language, OutlineNode, RepoPath, StructuralOutline, SymbolId};
+use crate::{
+    ByteRange, Language, OVERSIZED_FILE_THRESHOLD, OutlineNode, RepoPath, StructuralOutline,
+    SymbolId,
+};
 
 /// Maximum bytes retained from a declaration's first line.
 pub const MAX_SIGNATURE_BYTES: usize = 512;
@@ -24,6 +29,8 @@ pub const MAX_SYMBOLS_PER_FILE: usize = 16_384;
 pub const MAX_REFERENCES_PER_FILE: usize = 65_536;
 /// Maximum syntax-error ranges retained for one file.
 pub const MAX_PARSE_ERROR_RANGES: usize = 1_024;
+/// Maximum bytes retained from an adapter-provided stable failure reason.
+pub const MAX_FAILURE_REASON_BYTES: usize = 256;
 /// Version of detection and extraction behavior independent of grammar crates.
 pub const SYMBOL_EXTRACTION_VERSION: &str = "1";
 
@@ -57,6 +64,7 @@ pub struct LanguageDetection {
 /// Detects a language using filename, then shebang, then bounded heuristics.
 #[must_use]
 pub fn detect_language(path: &RepoPath, content_head: &[u8]) -> LanguageDetection {
+    let content_head = &content_head[..content_head.len().min(4096)];
     if let Some(language) = extension_language(path.as_bytes()) {
         return detected(language, LanguageDetectionSource::Extension);
     }
@@ -89,7 +97,11 @@ fn extension_language(path: &[u8]) -> Option<&'static str> {
         b"cmakelists.txt" => return Some("cmake"),
         _ => {}
     }
-    let extension = lower.rsplit(|byte| *byte == b'.').next()?;
+    let mut components = lower.rsplit(|byte| *byte == b'.');
+    let extension = components.next()?;
+    // An extensionless filename such as `rs` is a name, not a Rust extension.
+    // Known extensionless names were handled by the exact-name table above.
+    components.next()?;
     Some(match extension {
         b"rs" => "rust",
         b"toml" => "toml",
@@ -293,6 +305,9 @@ pub enum ExtractionSkipReason {
     UnsupportedLanguage,
     /// No bounded detection rule claimed the file.
     UnknownLanguage,
+    /// The eligible file was decoded from an encoding whose raw byte offsets
+    /// cannot be handed to a parser expecting UTF-8 source bytes.
+    TranscodedInput,
 }
 
 impl ExtractionSkipReason {
@@ -302,6 +317,7 @@ impl ExtractionSkipReason {
         match self {
             Self::UnsupportedLanguage => "unsupported_language",
             Self::UnknownLanguage => "unknown_language",
+            Self::TranscodedInput => "transcoded_input",
         }
     }
 }
@@ -382,6 +398,25 @@ pub struct FileSymbols {
     pub outline: StructuralOutline,
 }
 
+impl FileSymbols {
+    /// Builds an honest empty extraction for a file parsing deliberately skipped.
+    #[must_use]
+    pub fn skipped(
+        detection: LanguageDetection,
+        grammar_version: impl Into<String>,
+        reason: ExtractionSkipReason,
+    ) -> Self {
+        Self {
+            detection,
+            grammar_version: grammar_version.into(),
+            health: ParseHealth::Skipped { reason },
+            symbols: Vec::new(),
+            references: Vec::new(),
+            outline: StructuralOutline::default(),
+        }
+    }
+}
+
 /// Syntax-only extraction adapter for one language.
 pub trait LanguageAdapter: Send + Sync {
     /// Language this adapter accepts.
@@ -405,6 +440,19 @@ pub trait SymbolSource: Send + Sync {
     fn expected_version(&self, language: Option<&Language>) -> &str;
     /// Extracts one file's structural inventory.
     fn extract(&self, path: &RepoPath, source: &[u8], cancellation: &Cancellation) -> FileSymbols;
+    /// Produces a typed skip result without invoking an adapter.
+    fn skipped(
+        &self,
+        path: &RepoPath,
+        content_head: &[u8],
+        reason: ExtractionSkipReason,
+    ) -> FileSymbols {
+        let detection = detect_language(path, content_head);
+        let grammar_version = self
+            .expected_version(detection.language.as_ref())
+            .to_owned();
+        FileSymbols::skipped(detection, grammar_version, reason)
+    }
 }
 
 /// Adapter registration or query-compilation failure.
@@ -483,6 +531,17 @@ impl LanguageRegistry {
             .map_or(UNSUPPORTED_VERSION, |adapter| adapter.grammar_version())
     }
 
+    /// Produces a typed skip result without invoking an adapter.
+    #[must_use]
+    pub fn skipped(
+        &self,
+        path: &RepoPath,
+        content_head: &[u8],
+        reason: ExtractionSkipReason,
+    ) -> FileSymbols {
+        <Self as SymbolSource>::skipped(self, path, content_head, reason)
+    }
+
     /// Detects and extracts one file, containing adapter panics to that file.
     pub fn extract(
         &self,
@@ -491,6 +550,21 @@ impl LanguageRegistry {
         cancellation: &Cancellation,
     ) -> FileSymbols {
         let detection = detect_language(path, source);
+        if u64::try_from(source.len()).unwrap_or(u64::MAX) > OVERSIZED_FILE_THRESHOLD {
+            let grammar_version = self
+                .expected_version(detection.language.as_ref())
+                .to_owned();
+            return FileSymbols {
+                detection,
+                grammar_version,
+                health: ParseHealth::Failed {
+                    reason: "source_budget_exhausted".to_owned(),
+                },
+                symbols: Vec::new(),
+                references: Vec::new(),
+                outline: StructuralOutline::default(),
+            };
+        }
         let Some(language) = detection.language.clone() else {
             return FileSymbols {
                 detection,
@@ -525,6 +599,7 @@ impl LanguageRegistry {
                 symbols: Vec::new(),
                 references: Vec::new(),
             });
+        let extracted = validate_extraction(source, extracted);
         let identified = identify(
             path,
             &language,
@@ -581,7 +656,7 @@ struct TreeSitterAdapter {
     language: Language,
     tree_language: TreeSitterLanguage,
     grammar_version: &'static str,
-    _query: Query,
+    query: Query,
 }
 
 impl TreeSitterAdapter {
@@ -633,7 +708,7 @@ impl TreeSitterAdapter {
             language: Language::new(language).expect("built-in language is valid"),
             tree_language,
             grammar_version,
-            _query: query,
+            query,
         })
     }
 }
@@ -658,19 +733,16 @@ impl LanguageAdapter for TreeSitterAdapter {
         let Some(tree) = parser.parse(source, None) else {
             return failed("parse_failed");
         };
+        let selection = match query_selection(self.kind, &self.query, &tree, source, cancellation) {
+            Ok(selection) => selection,
+            Err(reason) => return failed(reason),
+        };
         let mut output = match self.kind {
-            AdapterKind::Rust => extract_rust(&tree, source),
-            AdapterKind::Toml => extract_toml(&tree, source),
-            AdapterKind::Markdown => extract_markdown(&tree, source),
+            AdapterKind::Rust => extract_rust(&tree, source, &selection),
+            AdapterKind::Toml => extract_toml(&tree, source, &selection),
+            AdapterKind::Markdown => extract_markdown(&tree, source, &selection),
         };
         output.health = parse_health(&tree);
-        if output.symbols.len() > MAX_SYMBOLS_PER_FILE {
-            output.symbols.truncate(MAX_SYMBOLS_PER_FILE);
-            output.health = ParseHealth::Failed {
-                reason: "symbol_budget_exhausted".to_owned(),
-            };
-        }
-        output.references.truncate(MAX_REFERENCES_PER_FILE);
         output
     }
 }
@@ -685,19 +757,184 @@ fn failed(reason: &str) -> ExtractionResult {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct NodeKey {
+    start: usize,
+    end: usize,
+    kind: &'static str,
+}
+
+impl From<Node<'_>> for NodeKey {
+    fn from(node: Node<'_>) -> Self {
+        Self {
+            start: node.start_byte(),
+            end: node.end_byte(),
+            kind: node.kind(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct QuerySelection {
+    declarations: HashSet<NodeKey>,
+    references: HashSet<NodeKey>,
+}
+
+impl QuerySelection {
+    fn declaration(&self, node: Node<'_>) -> bool {
+        self.declarations.contains(&node.into())
+    }
+
+    fn reference(&self, node: Node<'_>) -> bool {
+        self.references.contains(&node.into())
+    }
+}
+
+/// Runs the compiled query once and reduces its captures to the two shapes the
+/// language visitors consume. The query therefore decides which syntax enters
+/// extraction; the visitors add language-specific names, parents, and flags.
+fn query_selection(
+    kind: AdapterKind,
+    query: &Query,
+    tree: &Tree,
+    source: &[u8],
+    cancellation: &Cancellation,
+) -> Result<QuerySelection, &'static str> {
+    let mut selection = QuerySelection::default();
+    let mut cursor = QueryCursor::new();
+    let mut captures = cursor.captures(query, tree.root_node(), source);
+    while let Some((matched, capture_index)) = captures.next() {
+        if cancellation.is_cancelled() {
+            return Err("cancelled");
+        }
+        let capture = matched.captures[*capture_index];
+        let name = query.capture_names()[capture.index as usize];
+        if name == "reference" {
+            if !matches!(kind, AdapterKind::Rust) || is_rust_reference(capture.node) {
+                selection.references.insert(capture.node.into());
+                if selection.references.len() > MAX_REFERENCES_PER_FILE {
+                    return Err("reference_budget_exhausted");
+                }
+            }
+        } else {
+            selection.declarations.insert(capture.node.into());
+            if selection.declarations.len() > MAX_SYMBOLS_PER_FILE {
+                return Err("symbol_budget_exhausted");
+            }
+        }
+    }
+    Ok(selection)
+}
+
+/// Re-establishes every adapter-output invariant at the registry boundary.
+///
+/// Individual adapters may be implemented outside this module, so bounds and
+/// structural validity cannot live only in the built-in tree-sitter adapter.
+/// A failed validation returns no partial inventory: callers must never read a
+/// missing declaration as evidence that the file did not contain it.
+fn validate_extraction(source: &[u8], mut extracted: ExtractionResult) -> ExtractionResult {
+    if let ParseHealth::Failed { reason } = &mut extracted.health {
+        *reason = bounded_failure_reason(reason);
+    }
+
+    if matches!(
+        extracted.health,
+        ParseHealth::Failed { .. } | ParseHealth::Skipped { .. }
+    ) {
+        extracted.symbols.clear();
+        extracted.references.clear();
+        return extracted;
+    }
+
+    if let ParseHealth::Partial { error_ranges } = &extracted.health
+        && (error_ranges.is_empty()
+            || error_ranges.len() > MAX_PARSE_ERROR_RANGES
+            || error_ranges
+                .iter()
+                .any(|range| !valid_range(range, source.len())))
+    {
+        return invalid_extraction("invalid_parse_health");
+    }
+    if extracted.symbols.len() > MAX_SYMBOLS_PER_FILE {
+        return invalid_extraction("symbol_budget_exhausted");
+    }
+    if extracted.references.len() > MAX_REFERENCES_PER_FILE {
+        return invalid_extraction("reference_budget_exhausted");
+    }
+    for (index, symbol) in extracted.symbols.iter().enumerate() {
+        if !valid_range(&symbol.byte_range, source.len()) {
+            return invalid_extraction("invalid_symbol_range");
+        }
+        if let Some(parent) = symbol.parent {
+            let Some(parent_symbol) = extracted.symbols.get(parent) else {
+                return invalid_extraction("invalid_symbol_parent");
+            };
+            if parent >= index || parent_symbol.byte_range.start > symbol.byte_range.start {
+                return invalid_extraction("invalid_symbol_parent");
+            }
+        }
+    }
+    if extracted
+        .references
+        .iter()
+        .any(|reference| !valid_range(&reference.byte_range, source.len()))
+    {
+        return invalid_extraction("invalid_reference_range");
+    }
+    extracted
+}
+
+fn invalid_extraction(reason: &str) -> ExtractionResult {
+    failed(reason)
+}
+
+fn bounded_failure_reason(reason: &str) -> String {
+    const MARKER: &str = "...[truncated]";
+    if reason.len() <= MAX_FAILURE_REASON_BYTES {
+        return reason.to_owned();
+    }
+    let available = MAX_FAILURE_REASON_BYTES.saturating_sub(MARKER.len());
+    let end = crate::text::floor_char_boundary(reason, available);
+    format!("{}{MARKER}", &reason[..end])
+}
+
+fn valid_range(range: &ByteRange, source_len: usize) -> bool {
+    let bytes_are_valid =
+        range.start <= range.end && range.end <= u64::try_from(source_len).unwrap_or(u64::MAX);
+    let lines_are_valid = match (range.first_line, range.last_line) {
+        (None, None) => true,
+        (Some(first), Some(last)) => first > 0 && first <= last,
+        (None, Some(_)) | (Some(_), None) => false,
+    };
+    bytes_are_valid && lines_are_valid
+}
+
 fn parse_health(tree: &Tree) -> ParseHealth {
     if !tree.root_node().has_error() {
         return ParseHealth::Complete;
     }
     let mut ranges = Vec::new();
+    let mut seen = HashSet::new();
+    let mut exhausted = false;
     walk(tree.root_node(), &mut |node| {
         if node.is_error() || node.is_missing() {
-            ranges.push(node_range(node));
+            let range = node_range(node);
+            let key = (range.start, range.end, range.first_line, range.last_line);
+            if seen.insert(key) {
+                if ranges.len() == MAX_PARSE_ERROR_RANGES {
+                    exhausted = true;
+                } else if !exhausted {
+                    ranges.push(range);
+                }
+            }
         }
     });
+    if exhausted {
+        return ParseHealth::Failed {
+            reason: "parse_error_budget_exhausted".to_owned(),
+        };
+    }
     ranges.sort_by_key(|range| (range.start, range.end));
-    ranges.dedup();
-    ranges.truncate(MAX_PARSE_ERROR_RANGES);
     if ranges.is_empty() {
         ParseHealth::Complete
     } else {
@@ -707,7 +944,7 @@ fn parse_health(tree: &Tree) -> ParseHealth {
     }
 }
 
-fn extract_rust(tree: &Tree, source: &[u8]) -> ExtractionResult {
+fn extract_rust(tree: &Tree, source: &[u8], selection: &QuerySelection) -> ExtractionResult {
     let mut raw = Vec::new();
     let mut references = Vec::new();
     let mut pending = vec![(tree.root_node(), None, false)];
@@ -715,6 +952,7 @@ fn extract_rust(tree: &Tree, source: &[u8]) -> ExtractionResult {
         let (child_parent, child_test) = rust_node(
             node,
             source,
+            selection,
             parent,
             enclosing_test,
             &mut raw,
@@ -739,6 +977,7 @@ fn extract_rust(tree: &Tree, source: &[u8]) -> ExtractionResult {
 fn rust_node(
     node: Node<'_>,
     source: &[u8],
+    selection: &QuerySelection,
     parent: Option<usize>,
     enclosing_test: bool,
     symbols: &mut Vec<RawSymbol>,
@@ -747,35 +986,38 @@ fn rust_node(
     let kind = node.kind();
     let in_method_container = parent
         .is_some_and(|index| matches!(symbols[index].kind, SymbolKind::Impl | SymbolKind::Trait));
-    let declaration = match kind {
-        "function_item" | "function_signature_item" => Some(if in_method_container {
-            SymbolKind::Method
-        } else {
-            SymbolKind::Function
-        }),
-        "struct_item" => Some(SymbolKind::Struct),
-        "enum_item" => Some(SymbolKind::Enum),
-        "trait_item" => Some(SymbolKind::Trait),
-        "impl_item" => Some(SymbolKind::Impl),
-        "mod_item" => Some(SymbolKind::Module),
-        "const_item" => Some(SymbolKind::Constant),
-        "static_item" => Some(SymbolKind::Static),
-        "type_item" => Some(SymbolKind::TypeAlias),
-        "use_declaration" => {
-            let mut cursor = node.walk();
-            Some(
-                if node
-                    .named_children(&mut cursor)
-                    .any(|child| child.kind() == "visibility_modifier")
-                {
-                    SymbolKind::Export
-                } else {
-                    SymbolKind::Import
-                },
-            )
-        }
-        _ => None,
-    };
+    let declaration = selection
+        .declaration(node)
+        .then(|| match kind {
+            "function_item" | "function_signature_item" => Some(if in_method_container {
+                SymbolKind::Method
+            } else {
+                SymbolKind::Function
+            }),
+            "struct_item" => Some(SymbolKind::Struct),
+            "enum_item" => Some(SymbolKind::Enum),
+            "trait_item" => Some(SymbolKind::Trait),
+            "impl_item" => Some(SymbolKind::Impl),
+            "mod_item" => Some(SymbolKind::Module),
+            "const_item" => Some(SymbolKind::Constant),
+            "static_item" => Some(SymbolKind::Static),
+            "type_item" => Some(SymbolKind::TypeAlias),
+            "use_declaration" => {
+                let mut cursor = node.walk();
+                Some(
+                    if node
+                        .named_children(&mut cursor)
+                        .any(|child| child.kind() == "visibility_modifier")
+                    {
+                        SymbolKind::Export
+                    } else {
+                        SymbolKind::Import
+                    },
+                )
+            }
+            _ => None,
+        })
+        .flatten();
     let mut child_parent = parent;
     let mut child_test = enclosing_test;
     if let Some(symbol_kind) = declaration {
@@ -796,21 +1038,79 @@ fn rust_node(
                 parent,
                 is_test,
             });
-            if matches!(
-                symbol_kind,
-                SymbolKind::Impl | SymbolKind::Trait | SymbolKind::Module
-            ) {
-                child_parent = Some(index);
-                child_test = is_test;
-            }
+            // Rust permits item declarations inside function and const bodies.
+            // Every declaration therefore becomes the structural parent while
+            // its subtree is walked, not only impls, traits, and modules.
+            child_parent = Some(index);
+            child_test = is_test;
         }
-    } else if matches!(kind, "identifier" | "type_identifier" | "field_identifier") {
+    } else if selection.reference(node) && is_rust_reference(node) {
         references.push(RawReference {
             name: source[node.byte_range()].to_vec(),
             byte_range: node_range(node),
         });
     }
     (child_parent, child_test)
+}
+
+fn is_rust_reference(node: Node<'_>) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        let kind = parent.kind();
+        if kind == "use_declaration" {
+            return false;
+        }
+        if declaration_name_field(kind)
+            .and_then(|field| parent.child_by_field_name(field))
+            .is_some_and(|field| contains_node(field, node))
+        {
+            return false;
+        }
+        if binding_field(kind)
+            .and_then(|field| parent.child_by_field_name(field))
+            .is_some_and(|field| contains_node(field, node))
+            || kind == "closure_parameters"
+            || matches!(
+                kind,
+                "type_parameter" | "lifetime_parameter" | "const_parameter"
+            )
+        {
+            return false;
+        }
+        current = parent;
+    }
+    true
+}
+
+fn declaration_name_field(kind: &str) -> Option<&'static str> {
+    match kind {
+        "function_item"
+        | "function_signature_item"
+        | "struct_item"
+        | "enum_item"
+        | "trait_item"
+        | "mod_item"
+        | "const_item"
+        | "static_item"
+        | "type_item"
+        | "enum_variant"
+        | "field_declaration" => Some("name"),
+        _ => None,
+    }
+}
+
+fn binding_field(kind: &str) -> Option<&'static str> {
+    match kind {
+        "let_declaration" | "let_condition" | "parameter" | "for_expression" | "match_arm" => {
+            Some("pattern")
+        }
+        "closure_expression" => Some("parameters"),
+        _ => None,
+    }
+}
+
+fn contains_node(container: Node<'_>, candidate: Node<'_>) -> bool {
+    container.start_byte() <= candidate.start_byte() && container.end_byte() >= candidate.end_byte()
 }
 
 fn declaration_is_test(node: Node<'_>, source: &[u8]) -> bool {
@@ -829,11 +1129,11 @@ fn declaration_is_test(node: Node<'_>, source: &[u8]) -> bool {
         || nearest.windows(9).any(|window| window == b"cfg(test)")
 }
 
-fn extract_toml(tree: &Tree, source: &[u8]) -> ExtractionResult {
+fn extract_toml(tree: &Tree, source: &[u8], selection: &QuerySelection) -> ExtractionResult {
     let mut symbols = Vec::new();
     let mut pending = vec![(tree.root_node(), None)];
     while let Some((node, parent)) = pending.pop() {
-        let Some(child_parent) = toml_node(node, source, parent, &mut symbols) else {
+        let Some(child_parent) = toml_node(node, source, selection, parent, &mut symbols) else {
             continue;
         };
         let mut cursor = node.walk();
@@ -855,10 +1155,14 @@ fn extract_toml(tree: &Tree, source: &[u8]) -> ExtractionResult {
 fn toml_node(
     node: Node<'_>,
     source: &[u8],
+    selection: &QuerySelection,
     parent: Option<usize>,
     symbols: &mut Vec<RawSymbol>,
 ) -> Option<Option<usize>> {
     let mut child_parent = parent;
+    if !selection.declaration(node) {
+        return Some(child_parent);
+    }
     match node.kind() {
         "table" | "table_array_element" => {
             let name = toml_header_name(node, source);
@@ -925,11 +1229,11 @@ fn trim_byte(mut bytes: &[u8], needle: u8, from_start: bool) -> &[u8] {
     bytes
 }
 
-fn extract_markdown(tree: &Tree, source: &[u8]) -> ExtractionResult {
+fn extract_markdown(tree: &Tree, source: &[u8], selection: &QuerySelection) -> ExtractionResult {
     let mut symbols = Vec::new();
     let mut heading_stack: Vec<(usize, usize)> = Vec::new();
     walk(tree.root_node(), &mut |node| {
-        if matches!(node.kind(), "atx_heading" | "setext_heading") {
+        if selection.declaration(node) && matches!(node.kind(), "atx_heading" | "setext_heading") {
             let text = &source[node.byte_range()];
             let first = text.split(|byte| *byte == b'\n').next().unwrap_or(text);
             let level = if node.kind() == "atx_heading" {
@@ -1126,6 +1430,38 @@ mod tests {
         RepoPath::from_bytes(value.as_bytes().to_vec())
     }
 
+    fn render_symbols(extracted: &FileSymbols) -> String {
+        let by_id = extracted
+            .symbols
+            .iter()
+            .map(|symbol| (symbol.id.clone(), symbol.qualified_name.as_str()))
+            .collect::<HashMap<_, _>>();
+        extracted
+            .symbols
+            .iter()
+            .map(|symbol| {
+                format!(
+                    "{}|{}|{}|{}..{}|{}|{}|{}",
+                    symbol.kind,
+                    symbol.name,
+                    symbol.qualified_name,
+                    symbol.byte_range.start,
+                    symbol.byte_range.end,
+                    symbol
+                        .parent
+                        .as_ref()
+                        .and_then(|parent| by_id.get(parent))
+                        .copied()
+                        .unwrap_or("-"),
+                    symbol.is_test,
+                    symbol.name_is_lossy,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    }
+
     #[test]
     fn detection_precedence_is_extension_then_shebang_then_heuristic() {
         let extension = detect_language(&path("script.rs"), b"#!/usr/bin/python3\nprint('x')");
@@ -1139,6 +1475,10 @@ mod tests {
         let heuristic = detect_language(&path("README"), b"# Heading\nbody\n");
         assert_eq!(heuristic.language.unwrap().as_str(), "markdown");
         assert_eq!(heuristic.source, Some(LanguageDetectionSource::Heuristic));
+
+        let extensionless = detect_language(&path("rs"), b"#!/usr/bin/env sh\necho hi\n");
+        assert_eq!(extensionless.language.unwrap().as_str(), "shell");
+        assert_eq!(extensionless.source, Some(LanguageDetectionSource::Shebang));
     }
 
     #[test]
@@ -1179,40 +1519,82 @@ mod tests {
     }
 
     #[test]
+    fn nested_rust_items_are_parented_and_project_to_non_overlapping_leaves() {
+        let registry = LanguageRegistry::built_in().unwrap();
+        let source = b"fn outer() { fn inner() {} inner(); }\n";
+        let extracted = registry.extract(&path("src/lib.rs"), source, &Cancellation::default());
+        assert_eq!(extracted.health, ParseHealth::Complete);
+
+        let outer = extracted
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "outer")
+            .unwrap();
+        let inner = extracted
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "inner")
+            .unwrap();
+        assert_eq!(inner.parent.as_ref(), Some(&outer.id));
+        assert_eq!(inner.qualified_name, "outer::inner");
+        assert_eq!(extracted.outline.nodes.len(), 1);
+        assert_eq!(extracted.outline.nodes[0].symbol.as_ref(), Some(&inner.id));
+    }
+
+    #[test]
+    fn declaration_and_binding_names_are_not_reported_as_references() {
+        let registry = LanguageRegistry::built_in().unwrap();
+        let source = b"struct Service;\nfn run(input: Service) { let local = input; for item in values { consume(local, item); } }\n";
+        let extracted = registry.extract(&path("src/lib.rs"), source, &Cancellation::default());
+        assert_eq!(extracted.health, ParseHealth::Complete);
+
+        let first_start = |needle: &[u8]| {
+            u64::try_from(
+                source
+                    .windows(needle.len())
+                    .position(|candidate| candidate == needle)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        for (name, start) in [
+            ("Service", first_start(b"Service")),
+            ("run", first_start(b"run")),
+            ("input", first_start(b"input")),
+            ("local", first_start(b"local")),
+            ("item", first_start(b"item")),
+        ] {
+            assert!(
+                extracted
+                    .references
+                    .iter()
+                    .all(|reference| reference.name != name || reference.byte_range.start != start),
+                "{name} definition at byte {start} was labeled as a reference"
+            );
+        }
+        assert!(
+            extracted
+                .references
+                .iter()
+                .any(|reference| reference.name == "consume")
+        );
+        assert!(
+            extracted
+                .references
+                .iter()
+                .any(|reference| reference.name == "values")
+        );
+    }
+
+    #[test]
     fn the_versioned_rust_fixture_has_an_exact_symbol_inventory() {
         let registry = LanguageRegistry::built_in().unwrap();
         let source = include_bytes!("fixtures/rust-v1.rs");
         let extracted = registry.extract(&path("src/project.rs"), source, &Cancellation::default());
-        let by_id = extracted
-            .symbols
-            .iter()
-            .map(|symbol| (symbol.id.clone(), symbol.qualified_name.as_str()))
-            .collect::<HashMap<_, _>>();
-        let rendered = extracted
-            .symbols
-            .iter()
-            .map(|symbol| {
-                format!(
-                    "{}|{}|{}|{}..{}|{}|{}|{}",
-                    symbol.kind,
-                    symbol.name,
-                    symbol.qualified_name,
-                    symbol.byte_range.start,
-                    symbol.byte_range.end,
-                    symbol
-                        .parent
-                        .as_ref()
-                        .and_then(|parent| by_id.get(parent))
-                        .copied()
-                        .unwrap_or("-"),
-                    symbol.is_test,
-                    symbol.name_is_lossy,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n";
-        assert_eq!(rendered, include_str!("fixtures/rust-v1.txt"));
+        assert_eq!(
+            render_symbols(&extracted),
+            include_str!("fixtures/rust-v1.txt")
+        );
     }
 
     #[test]
@@ -1220,37 +1602,19 @@ mod tests {
         let registry = LanguageRegistry::built_in().unwrap();
         let toml = registry.extract(
             &path("Cargo.toml"),
-            b"name = \"root\"\n[package]\nname = \"demo\"\n[dependencies]\nserde = \"1\"\n",
+            include_bytes!("fixtures/toml-v1.toml"),
             &Cancellation::default(),
         );
-        let toml_inventory = toml
-            .symbols
-            .iter()
-            .map(|symbol| (symbol.kind, symbol.qualified_name.as_str()))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            toml_inventory,
-            [
-                (SymbolKind::Constant, "name"),
-                (SymbolKind::Module, "package"),
-                (SymbolKind::Constant, "package::name"),
-                (SymbolKind::Module, "dependencies"),
-                (SymbolKind::Constant, "dependencies::serde"),
-            ]
-        );
+        assert_eq!(render_symbols(&toml), include_str!("fixtures/toml-v1.txt"));
 
         let markdown = registry.extract(
             &path("README.md"),
-            b"# Install\ntext\n## Fedora\ntext\n# Usage\n",
+            include_bytes!("fixtures/markdown-v1.md"),
             &Cancellation::default(),
         );
         assert_eq!(
-            markdown
-                .symbols
-                .iter()
-                .map(|symbol| symbol.qualified_name.as_str())
-                .collect::<Vec<_>>(),
-            ["Install", "Install::Fedora", "Usage"]
+            render_symbols(&markdown),
+            include_str!("fixtures/markdown-v1.txt")
         );
     }
 
@@ -1278,6 +1642,28 @@ mod tests {
     }
 
     #[test]
+    fn compiled_query_captures_decide_which_declarations_are_extracted() {
+        let adapter = TreeSitterAdapter::new(
+            AdapterKind::Rust,
+            "rust",
+            tree_sitter_rust::LANGUAGE.into(),
+            "query-fixture-1",
+            "(struct_item) @struct",
+        )
+        .unwrap();
+        let registry = LanguageRegistry::new(vec![Arc::new(adapter)]).unwrap();
+        let extracted = registry.extract(
+            &path("src/lib.rs"),
+            b"struct Included; fn Omitted() {}",
+            &Cancellation::default(),
+        );
+
+        assert_eq!(extracted.health, ParseHealth::Complete);
+        assert_eq!(extracted.symbols.len(), 1);
+        assert_eq!(extracted.symbols[0].name, "Included");
+    }
+
+    #[test]
     fn unsupported_language_is_not_an_extracted_empty_file() {
         let registry = LanguageRegistry::built_in().unwrap();
         let extracted = registry.extract(
@@ -1300,6 +1686,32 @@ mod tests {
         );
         assert_eq!(supported_empty.health, ParseHealth::Complete);
         assert!(supported_empty.symbols.is_empty());
+    }
+
+    #[test]
+    fn transcoded_input_has_a_stable_empty_skip_result() {
+        let registry = LanguageRegistry::built_in().unwrap();
+        let skipped = registry.skipped(
+            &path("src/lib.rs"),
+            b"f\0n\0 \0m\0a\0i\0n\0",
+            ExtractionSkipReason::TranscodedInput,
+        );
+
+        assert_eq!(skipped.detection.language.unwrap().as_str(), "rust");
+        assert_eq!(skipped.grammar_version, RUST_GRAMMAR_VERSION);
+        assert_eq!(
+            skipped.health,
+            ParseHealth::Skipped {
+                reason: ExtractionSkipReason::TranscodedInput
+            }
+        );
+        assert_eq!(
+            ExtractionSkipReason::TranscodedInput.as_str(),
+            "transcoded_input"
+        );
+        assert!(skipped.symbols.is_empty());
+        assert!(skipped.references.is_empty());
+        assert!(skipped.outline.nodes.is_empty());
     }
 
     #[test]
@@ -1403,6 +1815,183 @@ mod tests {
         assert!(matches!(next.health, ParseHealth::Skipped { .. }));
     }
 
+    #[derive(Clone, Copy)]
+    enum InvalidOutput {
+        Complete,
+        TooManySymbols,
+        TooManyReferences,
+        InvalidParent,
+        LongFailure,
+    }
+
+    struct InvalidAdapter(InvalidOutput);
+
+    impl InvalidAdapter {
+        fn symbol(parent: Option<usize>) -> RawSymbol {
+            RawSymbol {
+                name: b"item".to_vec(),
+                kind: SymbolKind::Function,
+                byte_range: ByteRange {
+                    start: 0,
+                    end: 1,
+                    first_line: Some(1),
+                    last_line: Some(1),
+                },
+                parent,
+                is_test: false,
+            }
+        }
+
+        fn reference() -> RawReference {
+            RawReference {
+                name: b"item".to_vec(),
+                byte_range: ByteRange {
+                    start: 0,
+                    end: 1,
+                    first_line: Some(1),
+                    last_line: Some(1),
+                },
+            }
+        }
+    }
+
+    impl LanguageAdapter for InvalidAdapter {
+        fn language(&self) -> Language {
+            Language::new("rust").unwrap()
+        }
+
+        fn grammar_version(&self) -> &'static str {
+            "invalid-fixture-1"
+        }
+
+        fn extract(&self, _: &[u8], _: &Cancellation) -> ExtractionResult {
+            match self.0 {
+                InvalidOutput::Complete => ExtractionResult {
+                    health: ParseHealth::Complete,
+                    symbols: Vec::new(),
+                    references: Vec::new(),
+                },
+                InvalidOutput::TooManySymbols => ExtractionResult {
+                    health: ParseHealth::Complete,
+                    symbols: vec![Self::symbol(None); MAX_SYMBOLS_PER_FILE + 1],
+                    references: vec![Self::reference()],
+                },
+                InvalidOutput::TooManyReferences => ExtractionResult {
+                    health: ParseHealth::Complete,
+                    symbols: vec![Self::symbol(None)],
+                    references: vec![Self::reference(); MAX_REFERENCES_PER_FILE + 1],
+                },
+                InvalidOutput::InvalidParent => ExtractionResult {
+                    health: ParseHealth::Complete,
+                    symbols: vec![Self::symbol(Some(0))],
+                    references: vec![Self::reference()],
+                },
+                InvalidOutput::LongFailure => ExtractionResult {
+                    health: ParseHealth::Failed {
+                        reason: "💥".repeat(MAX_FAILURE_REASON_BYTES),
+                    },
+                    symbols: vec![Self::symbol(None)],
+                    references: vec![Self::reference()],
+                },
+            }
+        }
+    }
+
+    fn extract_invalid(output: InvalidOutput) -> FileSymbols {
+        LanguageRegistry::new(vec![Arc::new(InvalidAdapter(output))])
+            .unwrap()
+            .extract(&path("fixture.rs"), b"x", &Cancellation::default())
+    }
+
+    #[test]
+    fn registry_rejects_symbol_and_reference_budget_prefixes() {
+        for (output, expected) in [
+            (InvalidOutput::TooManySymbols, "symbol_budget_exhausted"),
+            (
+                InvalidOutput::TooManyReferences,
+                "reference_budget_exhausted",
+            ),
+        ] {
+            let extracted = extract_invalid(output);
+            assert_eq!(
+                extracted.health,
+                ParseHealth::Failed {
+                    reason: expected.to_owned()
+                }
+            );
+            assert!(extracted.symbols.is_empty());
+            assert!(extracted.references.is_empty());
+            assert!(extracted.outline.nodes.is_empty());
+        }
+    }
+
+    #[test]
+    fn parse_error_budget_exhaustion_is_not_reported_as_a_partial_prefix() {
+        let registry = LanguageRegistry::built_in().unwrap();
+        let source = "let = ;\n".repeat(MAX_PARSE_ERROR_RANGES + 1);
+
+        let extracted = registry.extract(
+            &path("src/broken.rs"),
+            source.as_bytes(),
+            &Cancellation::default(),
+        );
+
+        assert_eq!(
+            extracted.health,
+            ParseHealth::Failed {
+                reason: "parse_error_budget_exhausted".to_owned()
+            }
+        );
+        assert!(extracted.symbols.is_empty());
+        assert!(extracted.references.is_empty());
+        assert!(extracted.outline.nodes.is_empty());
+    }
+
+    #[test]
+    fn registry_enforces_the_source_budget_before_invoking_an_adapter() {
+        let registry =
+            LanguageRegistry::new(vec![Arc::new(InvalidAdapter(InvalidOutput::Complete))]).unwrap();
+        let exact = vec![b' '; usize::try_from(OVERSIZED_FILE_THRESHOLD).unwrap()];
+        let accepted = registry.extract(&path("fixture.rs"), &exact, &Cancellation::default());
+        assert_eq!(accepted.health, ParseHealth::Complete);
+
+        let oversized = vec![b' '; exact.len() + 1];
+        let rejected = registry.extract(&path("fixture.rs"), &oversized, &Cancellation::default());
+        assert_eq!(
+            rejected.health,
+            ParseHealth::Failed {
+                reason: "source_budget_exhausted".to_owned()
+            }
+        );
+        assert!(rejected.symbols.is_empty());
+        assert!(rejected.references.is_empty());
+        assert!(rejected.outline.nodes.is_empty());
+    }
+
+    #[test]
+    fn registry_rejects_invalid_parents_and_bounds_failure_details() {
+        let invalid_parent = extract_invalid(InvalidOutput::InvalidParent);
+        assert_eq!(
+            invalid_parent.health,
+            ParseHealth::Failed {
+                reason: "invalid_symbol_parent".to_owned()
+            }
+        );
+        assert!(invalid_parent.symbols.is_empty());
+        assert!(invalid_parent.references.is_empty());
+        assert!(invalid_parent.outline.nodes.is_empty());
+
+        let long_failure = extract_invalid(InvalidOutput::LongFailure);
+        let ParseHealth::Failed { reason } = &long_failure.health else {
+            panic!("adapter failure must remain a failure")
+        };
+        assert!(reason.len() <= MAX_FAILURE_REASON_BYTES);
+        assert!(reason.ends_with("...[truncated]"));
+        assert!(long_failure.symbols.is_empty());
+        assert!(long_failure.references.is_empty());
+        assert!(long_failure.outline.nodes.is_empty());
+    }
+
     #[test]
     #[ignore = "release-mode extraction throughput benchmark"]
     fn rust_extraction_meets_the_single_file_throughput_target() {
@@ -1433,9 +2022,13 @@ mod tests {
             elapsed.as_secs_f64() * 1_000.0,
             mib_per_second,
         );
+        harkness_test_fixtures::latency::record(
+            "symbols::rust_single_file_extraction",
+            elapsed,
+            std::time::Duration::from_millis(200),
+        );
         assert!(!extracted.symbols.is_empty());
         if !cfg!(debug_assertions) {
-            assert!(elapsed < std::time::Duration::from_millis(200));
             assert!(mib_per_second >= 5.0);
         }
     }

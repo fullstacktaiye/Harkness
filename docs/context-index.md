@@ -44,7 +44,7 @@ erDiagram
 | `contents` | content SHA-256 | the size of one distinct blob of bytes |
 | `file_versions` | file-version id | one path's bytes: language, whether the text was transcoded, whether the chunk set stops short of the whole file, and the chunking and parser versions its derived rows were produced under |
 | `chunks` | `(file_version_id, chunk_id)` | anchor, ordinal, byte range, line hints, chunk digest, associated symbol |
-| `symbols` | `(file_version_id, symbol_id)` | typed kind, bare and qualified names, duplicate ordinal, byte range, parent, bounded signature, test and lossy-name flags |
+| `symbols` | `(file_version_id, symbol_id)` | typed kind, bare and qualified names, duplicate ordinal, byte range, parent, test and lossy-name flags; never a source excerpt |
 | `symbol_references` | `(file_version_id, ordinal)` | best-effort unresolved name mentions and exact byte ranges |
 | `parse_health` | file-version id | complete, partial, failed, or skipped status; bounded reason and syntax-error ranges |
 | `parser_versions` | language | the grammar marker that last made that language's symbol rows current |
@@ -125,9 +125,9 @@ Three further consequences, each of which is the point rather than a side effect
   query returns the rows, and the next batch for that worktree deletes them. The
   work is redone, never resumed.
 - **A cold build does not hold the write lock.** Rows are flushed during the
-  batch, in their own transactions, so a reader interleaved with a hundred
-  thousand files still answers — from the previous generation — instead of
-  queueing behind it.
+  batch, in their own transactions bounded by derived-row count and buffered
+  dynamic bytes, so a reader interleaved with a hundred thousand files still
+  answers — from the previous generation — instead of queueing behind it.
 - **A generation is allocated once, and the watermark only moves forward.** Two
   front ends indexing one repository both stage, side by side, keyed apart by
   generation; the first to commit wins and the second is refused with
@@ -467,6 +467,11 @@ Two budgets, failing in opposite directions:
 | `MAX_INDEX_DB_BYTES` | 512 MiB per repository | the batch is refused whole with `index_budget_exhausted`; the previous generation stays usable |
 | `MAX_TOTAL_CONTEXT_BYTES` | 4 GiB across `<data_dir>/context/` | least-recently-opened repository caches are removed **entirely**, oldest first, until the subtree fits |
 
+The per-repository limit is checked before a flush and again from SQLite's
+logical page count after the pending rows have been written but before their
+transaction commits. Crossing it rolls that flush back, so the check never
+discovers the overage only after the bytes have become part of the cache.
+
 Nothing partial is ever deleted and nothing is ever silently truncated. A cache
 that quietly stopped storing rows would answer "no match" for content it never
 held, which a caller cannot tell from a repository that does not contain it; a
@@ -483,7 +488,8 @@ Linux default and `noatime` never updates it at all.
 
 ## Security and privacy
 
-The index stores paths, digests, ranges and names, and **no file content**. A
+The index stores paths, digests, ranges and names, and **no file content**. In
+particular, symbol rows do not retain a declaration signature or source line. A
 leaked `index.db` exposes structure, never source text; retrieval re-reads the
 working tree when it needs bytes.
 

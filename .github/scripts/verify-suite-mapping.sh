@@ -70,6 +70,8 @@ latency-approval-dispatch
 latency-streaming-assembly
 latency-inventory-walk
 latency-chunking-1mib
+latency-symbol-extraction
+latency-symbol-lookup
 latency-incremental-update
 latency-lexical-search
 latency-filename-search
