@@ -796,6 +796,29 @@ impl InventoryBuilder {
         )
     }
 
+    /// Applies the inventory's exclusion hierarchy to a historical file name.
+    ///
+    /// A deleted or renamed source has no filesystem row for the ordinary walk
+    /// to record. This path-only check lets a Git projection preserve such a
+    /// name only when the same built-in, configured, and `.gitignore` layers
+    /// would have admitted it. Missing or non-directory ancestors fail closed.
+    pub(crate) fn historical_file_allowed(
+        reading: SnapshotId,
+        worktree_root: &Path,
+        policy: &InventoryPolicy,
+        path: &RepoPath,
+        cancellation: &Cancellation,
+    ) -> Result<bool, InventoryError> {
+        Walk::new(
+            reading,
+            worktree_root,
+            &crate::ReconcileScope::Full,
+            policy,
+            cancellation,
+        )?
+        .historical_file_allowed(path)
+    }
+
     /// Walks the part of `worktree_root` that `scope` names.
     ///
     /// The layered hierarchy is applied exactly as [`build`](Self::build)
@@ -1244,6 +1267,63 @@ impl<'a> Walk<'a> {
         }
 
         Ok(self.finish())
+    }
+
+    /// Evaluates one absent file name without ever opening the file itself.
+    fn historical_file_allowed(mut self, path: &RepoPath) -> Result<bool, InventoryError> {
+        if self.cancellation.is_cancelled() {
+            return Err(InventoryError::Cancelled);
+        }
+        let relative = path.to_path_buf();
+        let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+        let mut directory = self.root.clone();
+        let mut stack = Vec::new();
+
+        let listing =
+            self.read_directory(&directory, None)
+                .map_err(|error| InventoryError::WalkFailed {
+                    path: directory.clone(),
+                    reason: clamp(&error.to_string()),
+                })?;
+        let gitignore = self.gitignore_for(&directory, &listing);
+        stack.push(Frame {
+            absolute: directory.clone(),
+            relative: Vec::new(),
+            entries: Vec::new().into_iter(),
+            gitignore,
+        });
+
+        for component in parent.components() {
+            directory.push(component.as_os_str());
+            if matches!(
+                self.decide(&stack, &directory, EntryKind::Directory),
+                Decision::Denied | Decision::Excluded
+            ) {
+                return Ok(false);
+            }
+            let Ok(metadata) = fs::symlink_metadata(&directory) else {
+                return Ok(false);
+            };
+            if !metadata.is_dir() || metadata.is_symlink() {
+                return Ok(false);
+            }
+            let Ok(listing) = self.read_directory(&directory, None) else {
+                return Ok(false);
+            };
+            let gitignore = self.gitignore_for(&directory, &listing);
+            stack.push(Frame {
+                absolute: directory.clone(),
+                relative: Vec::new(),
+                entries: Vec::new().into_iter(),
+                gitignore,
+            });
+        }
+
+        let absolute = self.root.join(relative);
+        Ok(matches!(
+            self.decide(&stack, &absolute, EntryKind::File),
+            Decision::Included | Decision::Undecided
+        ))
     }
 
     /// Applies the four layers in order, first opinion wins.

@@ -1051,6 +1051,47 @@ whole-workspace reads.
 `docs/context-search.md` is the reference for the query surface, the omission
 table, the refusals, and the budgets.
 
+## Git-Aware Context Retrieval Invariants
+
+`harkness-context::gitctx` is an adapter over `GitService`, never another Git
+implementation. It spawns no process itself, reaches no remote, and adds no
+mutation. Blame is the one new Git-layer read: it stays inside `harkness-git`,
+runs through the hermetic local-read `GitCommand`, requires an inclusive range,
+and bounds both lines and retained porcelain output. No other retrieval may
+invoke it implicitly.
+
+Every Git context session binds one `WorkspaceSnapshot` to one `FileInventory`
+from the same capture and worktree. Diff and status content crosses that
+inventory before projection: an excluded path contributes only to an aggregate
+withheld count and never contributes its name or bytes, while an inventory row
+whose class is not retrievable keeps a named metadata record and no hunks. Do
+not add a second path filter beside the inventory or make a request capable of
+widening its policy. A deleted path or rename source has no present inventory
+row, so the engine evaluates that historical name through the same four-layer
+policy while it builds the session; only names that pass are retained, and a
+rename crossing the boundary is withheld as one record rather than leaking its
+excluded side.
+
+Working and staged context come from one `diff_snapshot` call so both targets
+share an open index and one combined budget. A branch comparison resolves the
+merge-base against the *captured HEAD* once and diffs the two object IDs; a live
+branch name is never the new side of the final comparison. Every projected file
+retains both blob IDs even when its content is omitted, and its generic
+`Provenance::content_sha256` hashes only the bytes actually returned.
+
+Every retrieval verifies the bound snapshot after its Git reads. `Stale` and
+`Unverifiable` both become `stale_snapshot`; neither is a partial success and
+neither returns the model assembled before the guard. Commit messages, author
+identities, paths, diff bytes and blame metadata are repository content and are
+marked untrusted in provenance.
+
+History is bounded in both directions. Recent history keeps `LogCursor`
+pagination. Literal file history does not follow renames, inspects no more than
+the commit budget, and reports exhaustion instead of treating the bounded scan
+as complete. Reintroducing a per-file provenance walk is still forbidden by the
+change-provenance invariants above; file history is an explicit request for one
+literal path, not attribution for a diff.
+
 ## Model Provider & Streaming Assembly Invariants
 
 Three contracts, three names, and no type implements two of them: a **model

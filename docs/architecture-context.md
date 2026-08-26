@@ -142,7 +142,9 @@ Each stage in one line:
   isolation guarantees are in the same document.
 - **Retrieval sources** — filename and lexical search over the index, symbol
   lookup, the repository map, Git-derived context through the existing
-  `GitService`, and discovered instruction files.
+  `GitService`, and discovered instruction files. Git retrieval is
+  snapshot-bound, inventory-gated, merge-base-pinned and range-explicit for
+  blame; [`docs/git-context.md`](git-context.md) is the reference.
 - **Search** — the first of those to land, and the one the rest are shaped
   against. It reads its universe out of the index and never out of the
   filesystem, so exclusion is by construction rather than by a post-filter;
@@ -342,6 +344,8 @@ ADR when it arrives — ADR-0005) and **summarization-based context compression*
   reasoning and the alternatives that lost.
 - [`docs/context-index.md`](context-index.md) — the persistent index: schema,
   the generation commit protocol, the invalidation matrix, and the budgets.
+- [`docs/git-context.md`](git-context.md) — bounded diffs, history, status,
+  worktree state, snapshot guards, and explicit blame.
 - `docs/architecture-runtime.md` — the v0.3 runtime spine this builds on
   ([#105](https://github.com/fullstacktaiye/harkness/issues/105)).
 - `AGENTS.md` — the normative invariants a contributor can violate silently.

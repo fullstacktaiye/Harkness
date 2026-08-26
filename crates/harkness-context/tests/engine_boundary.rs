@@ -23,8 +23,9 @@ use harkness_context::index::{
 };
 use harkness_context::watch::{ChangeHint, WatchOptions, WatchService, WatchState};
 use harkness_context::{
-    ChunkId, ContextEngine, ContextEngineConfig, ContextEngineError, InventoryRequest, MapRequest,
-    PackRequest, ReconcileScope, RepoPath, RetrievalSource, SearchLimits, SearchQuery, SymbolQuery,
+    ChunkId, ContextEngine, ContextEngineConfig, ContextEngineError, GitContextBudget,
+    InventoryRequest, MapRequest, PackRequest, ReconcileScope, RepoPath, RetrievalSource,
+    SearchLimits, SearchQuery, SymbolQuery,
 };
 use harkness_core::{CONTEXT_DIRECTORY, ProjectId};
 use harkness_git::Cancellation;
@@ -91,6 +92,29 @@ fn an_engine_serves_workspace_identity_with_nothing_else_in_the_process() {
         inventory.entries()
     );
     assert!(!inventory.is_truncated());
+}
+
+/// Git context is reached through the same public engine boundary and carries
+/// the caller's capture rather than taking an unrelated one per query.
+#[test]
+fn git_context_is_snapshot_bound_from_outside_the_crate() {
+    let workspace = Workspace::new();
+    fs::write(workspace.root.join("tracked.txt"), "changed outside\n").unwrap();
+    let engine = workspace.engine();
+    let cancellation = Cancellation::default();
+    let snapshot = engine.snapshot(&cancellation).unwrap();
+    let git = engine.git_context_under(&snapshot, &cancellation).unwrap();
+    let diff = git
+        .working_diff(&GitContextBudget::default(), &cancellation)
+        .unwrap();
+
+    assert_eq!(diff.snapshot_id, snapshot.id());
+    assert_eq!(diff.files.len(), 1);
+    assert_eq!(diff.files[0].provenance.snapshot_id, snapshot.id());
+    assert_eq!(
+        diff.files[0].new_path.as_ref().unwrap().as_bytes(),
+        b"tracked.txt"
+    );
 }
 
 /// The whole of what [#123] plugs into: build an index, ask a question, page

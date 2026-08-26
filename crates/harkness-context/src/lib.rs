@@ -52,10 +52,11 @@
 //! returns *evidence* to nobody: a snapshot becomes evidence only when
 //! `harkness-runtime` records it, and everything the cache holds is derived
 //! from repository content, which is what keeps deleting `<data_dir>/context/`
-//! lossless (ADR-0004). Of the eight facade methods,
+//! lossless (ADR-0004). Implemented facade methods include
 //! [`snapshot`](ContextEngine::snapshot),
-//! [`inventory`](ContextEngine::inventory) and
-//! [`search`](ContextEngine::search) are implemented; the rest return
+//! [`inventory`](ContextEngine::inventory),
+//! [`search`](ContextEngine::search), and Git-aware retrieval through
+//! [`ContextEngine::git_context_under`]; the remaining placeholders return
 //! [`ContextEngineError::NotYetAvailable`] naming what is missing, so every
 //! later retrieval issue has a compiling seam.
 //!
@@ -130,6 +131,14 @@
 //! generation-bound cursor, the budgets, and the [`SearchOmission`] every one of
 //! them reports — and `docs/context-search.md` is the reference.
 //!
+//! # Git-aware retrieval
+//!
+//! [`GitContextService`] projects the existing `harkness-git` diff, history,
+//! status, worktree and explicit blame reads into snapshot-bound context. It
+//! is built through [`ContextEngine::git_context_under`], which applies the
+//! same inventory policy as indexing before any diff bytes are projected.
+//! `docs/git-context.md` is the reference.
+//!
 //! # Structural symbols
 //!
 //! [`LanguageRegistry`] detects every eligible file and runs the registered
@@ -165,6 +174,7 @@ mod classify;
 mod digest;
 mod engine;
 mod error;
+pub mod gitctx;
 mod ids;
 pub mod index;
 mod inventory;
@@ -196,6 +206,14 @@ pub use engine::{
     SettingOrigin, SettingOrigins, SymbolLookup, SymbolQuery, SymbolResults,
 };
 pub use error::{ContextDomainError, ContextEngineError};
+pub use gitctx::{
+    BlameContext, BlameContextCommit, BlameContextEntry, BlameRequest, ChangedFile,
+    ChangedFilesContext, CommitContextItem, CommitSignatureContext, ConflictContext,
+    DEFAULT_CONTEXT_COMMITS, DEFAULT_CONTEXT_DIFF_BYTES, DEFAULT_CONTEXT_DIFF_FILES, DiffAnchor,
+    DiffComparison, DiffContext, DiffContextFile, DiffContextHunk, GitContextBudget,
+    GitContextError, GitContextService, GitDiffOmission, HistoryContext, HistoryOmission,
+    MAX_CONTEXT_COMMITS, WorkspaceDiffContext, WorktreeContext, WorktreeContextEntry,
+};
 pub use ids::{
     ChunkId, ContextItemId, ContextPackId, ContextQueryId, FileVersionId, SnapshotId, SymbolId,
 };
