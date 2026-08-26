@@ -1513,11 +1513,19 @@ fn a_filename_match_on_a_path_that_is_not_utf8_carries_its_exact_bytes() {
     use std::os::unix::ffi::OsStrExt;
 
     let workspace = Workspace::new();
+    let directory = workspace.root.join("src");
+    fs::create_dir_all(&directory).unwrap();
     let name = OsStr::from_bytes(b"needle-\xff.rs");
-    fs::write(workspace.root.join("src").join(name), "quiet\n").unwrap_or_else(|_| {
-        fs::create_dir_all(workspace.root.join("src")).unwrap();
-        fs::write(workspace.root.join("src").join(name), "quiet\n").unwrap();
-    });
+    // Linux takes any byte but `/` and NUL; APFS refuses a name that is not
+    // valid UTF-8 outright, so on macOS there is nothing to record and nothing
+    // to assert about it. The directory is written to with an ordinary name
+    // first, so the skip is conditioned on the *name* being refused rather than
+    // on any failure that happens to look the same.
+    if fs::write(directory.join(name), "quiet\n").is_err() {
+        fs::write(directory.join("plain.rs"), "quiet\n")
+            .expect("the directory is writable, so the byte sequence is what was refused");
+        return;
+    }
     let engine = workspace.indexed();
 
     let response = engine
