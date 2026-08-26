@@ -1466,11 +1466,15 @@ mod tests {
         assert_eq!(recorded.shutdowns(), 0);
     }
 
-    /// Cancellation reaches a pending handshake well inside the workspace's
-    /// 250 ms visibility target, because the connection polls its token every
-    /// 20 ms in every blocking phase.
-    #[test]
-    fn cancellation_reaches_a_pending_handshake_promptly() {
+    /// Cancels a handshake left pending by a silent agent, and reports how long
+    /// the token took to be noticed.
+    ///
+    /// The deadline is set far past the visibility target on purpose: a
+    /// `cancelled` error can then only mean the token was *observed*, because a
+    /// connection that ignored it would sit for thirty seconds and come back
+    /// with `request_timed_out` instead. That is what makes the behavioural
+    /// assertions below load-bearing without a clock.
+    fn cancel_a_pending_handshake() -> (Duration, AcpError, bool, usize) {
         let cancel = Cancellation::default();
         let (connection, recorded) =
             ScriptedAgent::connect_with(vec![Step::Silent], cancel.clone());
@@ -1494,13 +1498,50 @@ mod tests {
         let elapsed = started.elapsed();
         canceller.join().unwrap();
 
+        (elapsed, error, agent.is_closed(), recorded.shutdowns())
+    }
+
+    /// Cancellation reaches a pending handshake, closes the connection, and
+    /// shuts the agent down once.
+    ///
+    /// No clock here, and that is the point. The 250 ms visibility target is a
+    /// *number*, and a number measured under `debug_assertions` measures the
+    /// optimizer being off rather than the code being slow — which is why the
+    /// workspace routes every budget through
+    /// `harkness_test_fixtures::latency::record` and enforces it only in
+    /// release. What this test holds in every profile is the behaviour, and the
+    /// thirty-second deadline is what makes that behaviour unambiguous: an
+    /// ignored token yields `request_timed_out`, not `cancelled`.
+    #[test]
+    fn cancellation_reaches_a_pending_handshake() {
+        let (_elapsed, error, closed, shutdowns) = cancel_a_pending_handshake();
+
         assert_eq!(error.kind(), "cancelled");
-        assert!(
-            elapsed < Duration::from_millis(250),
-            "cancellation took {elapsed:?}",
+        assert!(closed);
+        assert_eq!(shutdowns, 1);
+    }
+
+    /// The number itself, held where a number means something.
+    ///
+    /// `latency-cancellation-visible` in `docs/verification-suite.md` already
+    /// carries two rows for this same 250 ms promise, because a cooperative
+    /// tool noticing its token and a child process killed through its process
+    /// group are different chains. A handshake blocked on a silent peer is a
+    /// third, and it is the one an external agent's first exchange runs
+    /// through.
+    #[test]
+    #[ignore = "latency target; meaningful only in a release build"]
+    fn cancelling_a_pending_handshake_meets_the_latency_target() {
+        let (elapsed, error, closed, shutdowns) = cancel_a_pending_handshake();
+
+        assert_eq!(error.kind(), "cancelled");
+        assert!(closed);
+        assert_eq!(shutdowns, 1);
+        harkness_test_fixtures::latency::record(
+            "acp::cancellation_of_a_pending_handshake",
+            elapsed,
+            Duration::from_millis(250),
         );
-        assert!(agent.is_closed());
-        assert_eq!(recorded.shutdowns(), 1);
     }
 
     /// "This agent had to be killed" is a bug report, so it survives however the

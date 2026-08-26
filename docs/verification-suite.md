@@ -173,6 +173,7 @@ sh .github/scripts/run-ignored-exact-test.sh \
 | `latency-event-load-1000` | 500 ms | `harkness-runtime` | `store::tests::loading_a_thousand_event_run_meets_the_latency_target` |
 | `latency-cancellation-visible` | 250 ms | `harkness-runtime` | `tool::execution_tests::cancellation_latency_meets_the_target` |
 | `latency-cancellation-visible` | 250 ms | `harkness-runtime` | `schedule::tests::processes::cancelling_a_run_stops_a_cooperative_child_within_the_promised_latency` |
+| `latency-cancellation-visible` | 250 ms | `harkness-acp` | `connection::tests::cancelling_a_pending_handshake_meets_the_latency_target` |
 | `latency-approval-dispatch` | 10 ms | `harkness-runtime` | `coordinator::tests::approval_decision_to_tool_dispatch_stays_below_ten_milliseconds` |
 | `latency-streaming-assembly` | 10 µs | `harkness-provider` | `assemble::assembler::tests::event_dispatch_meets_the_latency_target` |
 | `latency-inventory-walk` | 1.5 s | `harkness-context` | `inventory::tests::a_medium_repository_meets_the_walk_latency_target` |
@@ -188,9 +189,17 @@ one that matters — the executor with the real JSON-formatting, redacting,
 file-rotating subscriber running. `tracing` is close to free with no subscriber,
 so the first two say nothing about the third.
 
-`latency-cancellation-visible` is listed twice for the same reason: a
-cooperative tool noticing its token and a child process being killed through its
-process group are different chains, and 250 ms is the promise for both.
+`latency-cancellation-visible` is listed three times for the same reason: a
+cooperative tool noticing its token, a child process being killed through its
+process group, and a handshake blocked on a silent peer are different chains,
+and 250 ms is the promise for all three. The handshake one earned its row the
+hard way — it was asserted inline in the default suite, where a wall-clock bound
+under `debug_assertions` measures the optimizer being off, and it duly failed on
+a loaded macOS runner at 266 ms while proving nothing about the code. The
+behaviour it was really protecting is still checked in every profile by
+`connection::tests::cancellation_reaches_a_pending_handshake`, without a clock:
+the deadline is thirty seconds, so an ignored token comes back
+`request_timed_out` rather than `cancelled`.
 
 `latency-lexical-search` is measured on a query that matches **nothing**, so it
 opens and scans every eligible file before it can answer. A query that matches

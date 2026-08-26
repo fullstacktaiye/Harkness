@@ -245,6 +245,18 @@ jobs:
           harkness-context
           search::tests::a_medium_repository_meets_the_filename_search_latency_target
           --release
+      # The handshake is the first thing an external agent's connection blocks
+      # on, and a silent peer is the case where cancellation is the only way out
+      # — so the 250 ms visibility target applies to it as much as to a
+      # cooperative tool or a killed child. Measured here rather than asserted
+      # in the default suite, because a wall-clock bound under
+      # `debug_assertions` measures the optimizer being off.
+      - name: Measure handshake cancellation
+        run: >-
+          sh .github/scripts/run-ignored-exact-test.sh
+          harkness-acp
+          connection::tests::cancelling_a_pending_handshake_meets_the_latency_target
+          --release
       # Issue #97 puts the coordinator on every protected tool call, so its
       # per-call budget is a release requirement too.
       - name: Measure coordinator decision-to-dispatch

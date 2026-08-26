@@ -918,6 +918,7 @@ name = "harkness-acp"
 version = "0.3.0"
 dependencies = [
  "agent-client-protocol-schema",
+ "harkness-test-fixtures",
  "harkness-transport",
  "serde",
  "serde_json",
