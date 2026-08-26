@@ -24,10 +24,12 @@
 //!
 //! # What is here and what is not
 //!
-//! The eight facade methods are the whole retrieval surface.
+//! The facade methods are the whole retrieval surface.
 //! [`snapshot`](ContextEngine::snapshot), [`inventory`](ContextEngine::inventory)
-//! and [`search`](ContextEngine::search) are implemented, because [#109], [#112]
-//! and [#116] landed what they need; the other five return
+//! [`search`](ContextEngine::search), and
+//! [`git_context_under`](ContextEngine::git_context_under) are implemented,
+//! because [#109], [#112], [#116], and [#119] landed what they need; the
+//! remaining placeholders return
 //! [`ContextEngineError::NotYetAvailable`] naming the missing feature. That is a
 //! real, tested refusal rather than a `todo!()`, so a caller written against the
 //! seam now gets a typed answer and the issue that implements a method deletes a
@@ -57,9 +59,11 @@
 //! [#109]: https://github.com/fullstacktaiye/harkness/issues/109
 //! [#112]: https://github.com/fullstacktaiye/harkness/issues/112
 //! [#116]: https://github.com/fullstacktaiye/harkness/issues/116
+//! [#119]: https://github.com/fullstacktaiye/harkness/issues/119
 //! [#122]: https://github.com/fullstacktaiye/harkness/issues/122
 //! [#123]: https://github.com/fullstacktaiye/harkness/issues/123
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -69,6 +73,7 @@ use harkness_git::{Cancellation, GitService, HeadState};
 use crate::chunk::FileVersion;
 use crate::digest::{Sha256Hex, empty_path_set_digest};
 use crate::error::{ContextDomainError, ContextEngineError};
+use crate::gitctx::{GitContextError, GitContextService};
 use crate::ids::ChunkId;
 use crate::index::{
     self, BatchReceipt, BatchScope, CacheRecreation, ExpectedVersions, ForgetReport,
@@ -598,6 +603,56 @@ impl ContextEngine {
             &self.inventory_policy(),
             cancellation,
         )?)
+    }
+
+    /// Builds the Git-aware retrieval adapter under a capture the caller holds.
+    ///
+    /// The inventory is built here from the engine's effective policy, so Git
+    /// content cannot bypass the same built-in denials, global preferences,
+    /// repository tightening and `.gitignore` chain as search and indexing.
+    /// Every retrieval on the returned service verifies the snapshot after the
+    /// Git read and returns `stale_snapshot` if the workspace moved.
+    pub fn git_context_under(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+        cancellation: &Cancellation,
+    ) -> Result<GitContextService, GitContextError> {
+        if snapshot.worktree_root() != self.config.worktree_root {
+            return Err(GitContextError::ForeignWorktree {
+                expected: self.config.worktree_root.clone(),
+                found: snapshot.worktree_root().to_path_buf(),
+            });
+        }
+        let policy = self.inventory_policy();
+        let inventory = InventoryBuilder::build(snapshot, &policy, cancellation)?;
+        let status = self.git.detailed_status_in_process(cancellation)?;
+        let mut candidates = BTreeSet::new();
+        for entry in status.entries {
+            candidates.insert(RepoPath::from_path(&entry.path));
+            if let Some(source) = entry.rename_source {
+                candidates.insert(RepoPath::from_path(&source));
+            }
+        }
+        let mut historical_paths = BTreeSet::new();
+        for path in candidates {
+            let present = inventory
+                .entries()
+                .binary_search_by(|entry| entry.path.cmp(&path))
+                .is_ok();
+            if !present
+                && InventoryBuilder::historical_file_allowed(
+                    snapshot.id(),
+                    snapshot.worktree_root(),
+                    &policy,
+                    &path,
+                    cancellation,
+                )?
+            {
+                historical_paths.insert(path);
+            }
+        }
+        GitContextService::new(&self.git, snapshot, inventory)
+            .map(|service| service.with_historical_paths(historical_paths))
     }
 
     /// The walk policy this engine's configuration implies.

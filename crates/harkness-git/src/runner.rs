@@ -214,6 +214,7 @@ pub(crate) struct GitCommand {
     accepted_exit_codes: Vec<i32>,
     diagnose_with_stdout: bool,
     timeout: Option<Duration>,
+    max_stdout_bytes: Option<usize>,
     // A mutation command obtained through `GitService` owns the repository
     // lock for its whole lifetime, including while it runs.
     _repository_lock: Option<crate::RepositoryLock>,
@@ -239,6 +240,7 @@ impl GitCommand {
             accepted_exit_codes: Vec::new(),
             diagnose_with_stdout: false,
             timeout: access.default_timeout(),
+            max_stdout_bytes: None,
             _repository_lock: None,
         }
     }
@@ -312,6 +314,17 @@ impl GitCommand {
         self
     }
 
+    /// Bounds retained standard output while continuing to drain the child.
+    ///
+    /// The reader never stops at the bound: doing so would fill Git's pipe and
+    /// deadlock the process. It retains only `limit` bytes, drains the rest,
+    /// and reports [`GitError::OutputTooLarge`] after Git exits successfully.
+    #[must_use]
+    pub(crate) fn with_max_stdout_bytes(mut self, limit: usize) -> Self {
+        self.max_stdout_bytes = Some(limit);
+        self
+    }
+
     /// Runs Git to completion, discarding its progress reporting.
     pub fn run(self, cancellation: &Cancellation) -> Result<GitOutput, GitError> {
         self.run_with_progress(cancellation, |_| {})
@@ -379,7 +392,8 @@ impl GitCommand {
         // Two readers, always. Piping both streams and draining only one
         // deadlocks as soon as Git fills the pipe buffer of the other, which
         // `git status --porcelain=v2` does on a large repository.
-        let stdout_reader = thread::spawn(move || read_to_end(stdout));
+        let stdout_limit = self.max_stdout_bytes;
+        let stdout_reader = thread::spawn(move || read_to_end(stdout, stdout_limit));
         let stderr_reader = thread::spawn(move || read_git_output(stderr, &sender));
 
         let deadline = self.timeout.map(|timeout| Instant::now() + timeout);
@@ -412,13 +426,21 @@ impl GitCommand {
                 let code = status.code();
                 let accepted = status.success()
                     || code.is_some_and(|code| self.accepted_exit_codes.contains(&code));
-                return if accepted {
-                    Ok(GitOutput { code, stdout })
+                return if accepted && stdout.truncated {
+                    Err(GitError::OutputTooLarge {
+                        command: described,
+                        limit: self.max_stdout_bytes.unwrap_or_default(),
+                    })
+                } else if accepted {
+                    Ok(GitOutput {
+                        code,
+                        stdout: stdout.bytes,
+                    })
                 } else {
                     Err(GitError::Failed {
                         command: described,
                         stderr: if self.diagnose_with_stdout {
-                            diagnostic(&stderr, &stdout)
+                            diagnostic(&stderr, &stdout.bytes)
                         } else {
                             stderr
                         },
@@ -475,7 +497,7 @@ fn diagnostic(stderr: &str, stdout: &[u8]) -> String {
 /// that was just killed.
 fn terminate(
     child: &mut Child,
-    stdout_reader: thread::JoinHandle<Vec<u8>>,
+    stdout_reader: thread::JoinHandle<CapturedOutput>,
     stderr_reader: thread::JoinHandle<String>,
 ) {
     terminate_process_group(child);
@@ -502,10 +524,28 @@ fn terminate_process_group(child: &mut Child) {
 ///
 /// A read failure yields whatever arrived before it: the exit status and Git's
 /// diagnostics decide the outcome of a command, never this.
-fn read_to_end(stdout: impl Read) -> Vec<u8> {
+#[derive(Default)]
+struct CapturedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn read_to_end(stdout: impl Read, limit: Option<usize>) -> CapturedOutput {
     let mut reader = BufReader::new(stdout);
-    let mut captured = Vec::new();
-    let _ = reader.read_to_end(&mut captured);
+    let mut captured = CapturedOutput::default();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        let remaining = limit
+            .unwrap_or(usize::MAX)
+            .saturating_sub(captured.bytes.len());
+        let retained = read.min(remaining);
+        captured.bytes.extend_from_slice(&buffer[..retained]);
+        captured.truncated |= retained < read;
+    }
     captured
 }
 
@@ -617,6 +657,17 @@ mod tests {
             super::RETAINED_GIT_OUTPUT_SEGMENTS
         );
         assert!(retained.ends_with("fatal: repository not found"));
+    }
+
+    #[test]
+    fn bounded_stdout_is_drained_but_only_the_limit_is_retained() {
+        let captured = super::read_to_end(io::Cursor::new(b"0123456789"), Some(4));
+        assert_eq!(captured.bytes, b"0123");
+        assert!(captured.truncated);
+
+        let complete = super::read_to_end(io::Cursor::new(b"0123"), Some(4));
+        assert_eq!(complete.bytes, b"0123");
+        assert!(!complete.truncated);
     }
 
     /// Both pipes are drained concurrently. Were only one reader running, this

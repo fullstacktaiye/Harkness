@@ -6,6 +6,7 @@
 //! project catalog — and therefore nothing here can take the catalog lock out
 //! of order.
 
+mod blame;
 mod branch;
 mod clone;
 mod commit;
@@ -39,6 +40,9 @@ use thiserror::Error;
 /// API. Re-exporting the exact dependency keeps downstream versions aligned.
 pub use git2;
 
+pub use blame::{
+    BlameCommit, BlameEntry, BlameLineRange, FileBlame, MAX_BLAME_LINES, MAX_BLAME_OUTPUT_BYTES,
+};
 pub use branch::{Branch, BranchCheckout, BranchKind, BranchListOptions, CreateBranchOptions};
 pub use commit::{
     CommitOptions, CommitOutcome, CommitScope, StageOptions, StageOutcome, StagePathOutcome,
@@ -192,6 +196,10 @@ pub enum GitError {
     /// Git ran past the timeout for its kind of access and was killed.
     #[error("git {command} did not finish within {} seconds", timeout.as_secs())]
     TimedOut { command: String, timeout: Duration },
+
+    /// A bounded Git read produced more standard output than its contract permits.
+    #[error("git {command} produced more than {limit} bytes of output")]
+    OutputTooLarge { command: String, limit: usize },
 
     /// Another operation holds the repository lock.
     #[error("another operation is already running on the repository at '{}'", path.display())]
@@ -678,6 +686,18 @@ pub enum GitError {
     /// Git reported a status Harkness cannot parse.
     #[error("Git reported a status that could not be parsed: {detail}")]
     MalformedStatus { detail: String },
+
+    /// A blame range is empty, reversed, or starts before line one.
+    #[error("blame range {start}..={end} is not a valid one-based line range")]
+    InvalidBlameRange { start: u32, end: u32 },
+
+    /// A blame request exceeded the published line bound.
+    #[error("blame range contains {lines} lines, more than the {limit}-line limit")]
+    BlameRangeTooLarge { lines: u32, limit: u32 },
+
+    /// Git's porcelain blame output did not satisfy its documented grammar.
+    #[error("Git reported blame data that could not be parsed: {detail}")]
+    MalformedBlame { detail: String },
 }
 
 impl GitError {
@@ -687,6 +707,7 @@ impl GitError {
         "failed",
         "cancelled",
         "timed_out",
+        "output_too_large",
         "repository_busy",
         "lock",
         "not_a_repository",
@@ -754,6 +775,9 @@ impl GitError {
         "unrepresentable_line_selection",
         "hunk_application",
         "malformed_status",
+        "invalid_blame_range",
+        "blame_range_too_large",
+        "malformed_blame",
     ];
 
     /// Stable machine-readable discriminant for agent-facing error handling.
@@ -764,6 +788,7 @@ impl GitError {
             Self::Failed { .. } => "failed",
             Self::Cancelled => "cancelled",
             Self::TimedOut { .. } => "timed_out",
+            Self::OutputTooLarge { .. } => "output_too_large",
             Self::RepositoryBusy { .. } => "repository_busy",
             Self::Lock { .. } => "lock",
             Self::NotARepository { .. } => "not_a_repository",
@@ -833,6 +858,9 @@ impl GitError {
             Self::UnrepresentableLineSelection { .. } => "unrepresentable_line_selection",
             Self::HunkApplication { .. } => "hunk_application",
             Self::MalformedStatus { .. } => "malformed_status",
+            Self::InvalidBlameRange { .. } => "invalid_blame_range",
+            Self::BlameRangeTooLarge { .. } => "blame_range_too_large",
+            Self::MalformedBlame { .. } => "malformed_blame",
         }
     }
 }
@@ -1108,6 +1136,28 @@ impl GitService {
         request: &FileContextRequest,
     ) -> Result<FileContextResponse, GitError> {
         context::load(&self.root, request)
+    }
+
+    /// Attributes an explicit, bounded line range to commits.
+    ///
+    /// This is the one Git context read that system Git performs: porcelain
+    /// blame has no stable libgit2 equivalent in the workspace. It still uses
+    /// the hermetic local-read runner, so environment scrubbing, the 30-second
+    /// timeout, cancellation, and the output bound all apply. No repository
+    /// lock is taken and no remote is contacted.
+    pub fn blame_file(
+        &self,
+        path: impl AsRef<Path>,
+        range: BlameLineRange,
+        cancellation: &Cancellation,
+    ) -> Result<FileBlame, GitError> {
+        blame::file(
+            &self.git_executable,
+            &self.root,
+            path.as_ref(),
+            range,
+            cancellation,
+        )
     }
 
     /// Restores tracked paths from an explicit Git boundary.
@@ -2194,6 +2244,13 @@ mod tests {
                 "timed_out",
             ),
             (
+                GitError::OutputTooLarge {
+                    command: "blame".to_owned(),
+                    limit: 1,
+                },
+                "output_too_large",
+            ),
+            (
                 GitError::RepositoryBusy { path: path.clone() },
                 "repository_busy",
             ),
@@ -2575,6 +2632,23 @@ mod tests {
                     detail: "fixture".to_owned(),
                 },
                 "malformed_status",
+            ),
+            (
+                GitError::InvalidBlameRange { start: 0, end: 1 },
+                "invalid_blame_range",
+            ),
+            (
+                GitError::BlameRangeTooLarge {
+                    lines: 10_001,
+                    limit: 10_000,
+                },
+                "blame_range_too_large",
+            ),
+            (
+                GitError::MalformedBlame {
+                    detail: "fixture".to_owned(),
+                },
+                "malformed_blame",
             ),
         ];
 

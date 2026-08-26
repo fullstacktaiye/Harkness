@@ -5389,6 +5389,8 @@ fn git_exit_code(error: &GitError) -> u8 {
         | GitError::InvalidBlobId { .. }
         | GitError::InvalidLogLimit
         | GitError::InvalidLogCursor { .. }
+        | GitError::InvalidBlameRange { .. }
+        | GitError::BlameRangeTooLarge { .. }
         | GitError::EmptyCommitMessage
         | GitError::EmptyWorktreeLockReason
         | GitError::NothingStaged
@@ -5432,6 +5434,7 @@ fn git_exit_code(error: &GitError) -> u8 {
         GitError::Launch { .. }
         | GitError::Failed { .. }
         | GitError::TimedOut { .. }
+        | GitError::OutputTooLarge { .. }
         | GitError::Lock { .. }
         | GitError::WorktreeAddDestinationUnavailable { .. }
         | GitError::WorktreeAddCleanup { .. }
@@ -5446,7 +5449,8 @@ fn git_exit_code(error: &GitError) -> u8 {
         | GitError::UntrackedDiscardIo { .. }
         | GitError::MalformedDiff { .. }
         | GitError::HunkApplication { .. }
-        | GitError::MalformedStatus { .. } => EXIT_OPERATION_FAILED,
+        | GitError::MalformedStatus { .. }
+        | GitError::MalformedBlame { .. } => EXIT_OPERATION_FAILED,
         _ => EXIT_OPERATION_FAILED,
     }
 }
@@ -5468,6 +5472,7 @@ const GIT_KIND_EXIT_CODES: &[(&str, u8)] = &[
     ("failed", EXIT_OPERATION_FAILED),
     ("cancelled", EXIT_CANCELLED),
     ("timed_out", EXIT_OPERATION_FAILED),
+    ("output_too_large", EXIT_OPERATION_FAILED),
     ("repository_busy", EXIT_CONFLICT),
     ("lock", EXIT_OPERATION_FAILED),
     ("not_a_repository", EXIT_NOT_FOUND),
@@ -5538,6 +5543,9 @@ const GIT_KIND_EXIT_CODES: &[(&str, u8)] = &[
     ("unrepresentable_line_selection", EXIT_REFUSED),
     ("hunk_application", EXIT_OPERATION_FAILED),
     ("malformed_status", EXIT_OPERATION_FAILED),
+    ("invalid_blame_range", EXIT_REFUSED),
+    ("blame_range_too_large", EXIT_REFUSED),
+    ("malformed_blame", EXIT_OPERATION_FAILED),
 ];
 
 /// The exit code every project error kind reports, in
@@ -5764,6 +5772,15 @@ fn git_error_details(error: &GitError) -> Value {
         }),
         GitError::InvalidLogLimit => json!({ "minimum": 1 }),
         GitError::InvalidLogCursor { cursor } => json!({ "cursor": cursor.to_string() }),
+        GitError::InvalidBlameRange { start, end } => {
+            json!({ "start": start, "end": end, "minimum": 1 })
+        }
+        GitError::BlameRangeTooLarge { lines, limit } => {
+            json!({ "lines": lines, "limit": limit })
+        }
+        GitError::OutputTooLarge { command, limit } => {
+            json!({ "command": command, "limit": limit })
+        }
         GitError::NothingStaged => json!({ "override_flag": "--allow-empty" }),
         GitError::UnmergedBranchDeletion { .. } => json!({ "override_flag": "--force" }),
         GitError::NoUpstream { .. } => json!({ "override_flag": "--set-upstream" }),
@@ -5895,7 +5912,9 @@ fn git_error_details(error: &GitError) -> Value {
                 "repository_is_lossy": repository_is_lossy,
             })
         }
-        GitError::MalformedDiff { detail } | GitError::MalformedStatus { detail } => {
+        GitError::MalformedDiff { detail }
+        | GitError::MalformedStatus { detail }
+        | GitError::MalformedBlame { detail } => {
             json!({ "detail": detail })
         }
         GitError::OperationInProgress { path, pending } => {
