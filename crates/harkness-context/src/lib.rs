@@ -130,12 +130,22 @@
 //! generation-bound cursor, the budgets, and the [`SearchOmission`] every one of
 //! them reports — and `docs/context-search.md` is the reference.
 //!
+//! # Structural symbols
+//!
+//! [`LanguageRegistry`] detects every eligible file and runs the registered
+//! Rust, TOML, or Markdown [`LanguageAdapter`] when one exists. The resulting
+//! [`Symbol`] inventory is syntax only: names, structural parents, byte-exact
+//! definition ranges, parse health, and unresolved mentions. It makes no LSP
+//! or cross-file resolution claim. Source symbols project a non-overlapping
+//! [`StructuralOutline`] into chunking, and grammar markers are stored per
+//! language so one grammar upgrade invalidates only that language's rows.
+//! `docs/context-symbols.md` is the contributor and contract reference.
+//!
 //! # What is not here
 //!
 //! No ranking ([#121]) — matches come back in canonical order and the engine
-//! expresses no opinion about which is better — no symbol extraction ([#117]),
-//! since the store accepts symbol rows and nothing in this build produces one,
-//! and no provider or token concepts ([#111], [#122]). The identifiers and
+//! expresses no opinion about which is better — and no provider or token
+//! concepts ([#111], [#122]). The identifiers and
 //! facade signatures those issues need are defined here so that none of them
 //! has to invent one.
 //!
@@ -164,6 +174,7 @@ mod provenance;
 mod reconcile;
 pub mod search;
 mod snapshot;
+mod symbols;
 mod text;
 pub mod watch;
 mod wire;
@@ -179,9 +190,9 @@ pub use classify::{
 };
 pub use digest::{Sha256Hex, empty_path_set_digest};
 pub use engine::{
-    ChunkContent, ContextEngine, ContextEngineConfig, ContextPack, InstructionSet,
-    InventoryRequest, MapRequest, PackRequest, RepositoryMap, SettingGroup, SettingOrigin,
-    SettingOrigins, SymbolQuery, SymbolResults,
+    ChunkContent, ContextEngine, ContextEngineConfig, ContextPack, DEFAULT_SYMBOL_RESULTS,
+    InstructionSet, InventoryRequest, MapRequest, PackRequest, RepositoryMap, SettingGroup,
+    SettingOrigin, SettingOrigins, SymbolLookup, SymbolQuery, SymbolResults,
 };
 pub use error::{ContextDomainError, ContextEngineError};
 pub use ids::{
@@ -214,6 +225,13 @@ pub use snapshot::{
     Capture, CaptureDiagnostics, CaptureRequest, FileDigestEntry, FreshnessState, PathDivergence,
     SkippedPath, SnapshotComponent, SnapshotDigest, SnapshotFiles, StalePath, UnverifiableReason,
     Verification, WorkspaceReading, WorkspaceSnapshot,
+};
+pub use symbols::{
+    ExtractionResult, ExtractionSkipReason, FileSymbols, LanguageAdapter, LanguageDetection,
+    LanguageDetectionSource, LanguageRegistry, MAX_PARSE_ERROR_RANGES, MAX_REFERENCES_PER_FILE,
+    MAX_SIGNATURE_BYTES, MAX_SYMBOLS_PER_FILE, ParseHealth, RawReference, RawSymbol,
+    SYMBOL_EXTRACTION_VERSION, Symbol, SymbolError, SymbolKind, SymbolReference, SymbolSource,
+    detect_language,
 };
 pub use wire::{
     CONTEXT_RECORD_SCHEMA_VERSION, MINIMUM_CONTEXT_RECORD_SCHEMA_VERSION, ProvenanceWire,

@@ -77,6 +77,7 @@ use crate::ids::SnapshotId;
 use crate::index::{BatchScope, IndexBatch, IndexCache, IndexedFile, WorktreeKey};
 use crate::inventory::{FileInventory, InventoryBuilder, InventoryEntry, InventoryPolicy};
 use crate::path::RepoPath;
+use crate::symbols::SymbolSource;
 
 /// Most paths one reconcile is asked about before the scope widens.
 ///
@@ -515,6 +516,8 @@ pub(crate) struct Reconciler<'engine> {
     pub(crate) worktree: WorktreeKey,
     pub(crate) root: &'engine Path,
     pub(crate) policy: &'engine InventoryPolicy,
+    /// Language adapters and their per-language version markers.
+    pub(crate) symbols: &'engine dyn SymbolSource,
     /// The committed base this checkout is on right now, or `None` when it
     /// cannot be read.
     pub(crate) head_marker: Option<String>,
@@ -797,7 +800,17 @@ impl Reconciler<'_> {
             });
         }
 
-        if !hinted && existing.is_some_and(|row| row_is_current(row, entry, classify, chunking)) {
+        if !hinted
+            && existing.is_some_and(|row| {
+                row_is_current(
+                    row,
+                    entry,
+                    classify,
+                    chunking,
+                    self.symbols.expected_version(row.language.as_ref()),
+                )
+            })
+        {
             return Ok(Applied::Skipped);
         }
 
@@ -824,7 +837,14 @@ impl Reconciler<'_> {
         // set is still correct and re-deriving it would produce the rows that
         // are already there.
         if existing.is_some_and(|row| {
-            derivation_survives(row, entry, classify, chunking, version.content_sha256())
+            derivation_survives(
+                row,
+                entry,
+                classify,
+                chunking,
+                self.symbols.expected_version(row.language.as_ref()),
+                version.content_sha256(),
+            )
         }) {
             let row = existing.expect("checked above");
             if row.byte_size == entry.byte_size && row.mtime_ns == entry.mtime_ns {
@@ -834,7 +854,15 @@ impl Reconciler<'_> {
             return Ok(Applied::Refreshed);
         }
 
-        let chunks = match chunk_file(&version, None, cancellation) {
+        let extracted = self
+            .symbols
+            .extract(&entry.path, version.bytes(), cancellation);
+        let version = match extracted.detection.language.clone() {
+            Some(language) => (*version).with_language(language),
+            None => *version,
+        };
+        let outline = (!extracted.outline.nodes.is_empty()).then_some(&extracted.outline);
+        let chunks = match chunk_file(&version, outline, cancellation) {
             Ok(chunks) => chunks,
             Err(ChunkError::Cancelled) => return Err(ContextEngineError::Cancelled),
             Err(_) => {
@@ -843,6 +871,7 @@ impl Reconciler<'_> {
             }
         };
         batch.record_chunked(entry, &version, &chunks, classify)?;
+        batch.record_extraction(version.id(), &extracted)?;
         Ok(if existing.is_some() {
             Applied::Changed
         } else {
@@ -952,9 +981,11 @@ fn row_is_current(
     entry: &InventoryEntry,
     classify: u32,
     chunking: &str,
+    parser: &str,
 ) -> bool {
     row.file_version.is_some()
         && row.chunking_version.as_deref() == Some(chunking)
+        && row.parser_version.as_deref() == Some(parser)
         && row.classify_version == classify
         && !row.unreadable
         && row.class == entry.class
@@ -992,10 +1023,12 @@ fn derivation_survives(
     entry: &InventoryEntry,
     classify: u32,
     chunking: &str,
+    parser: &str,
     digest: &crate::digest::Sha256Hex,
 ) -> bool {
     row.content_sha256.as_ref() == Some(digest)
         && row.chunking_version.as_deref() == Some(chunking)
+        && row.parser_version.as_deref() == Some(parser)
         && row.classify_version == classify
         && !row.unreadable
         && row.class == entry.class

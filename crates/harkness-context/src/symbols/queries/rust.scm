@@ -1,0 +1,14 @@
+(function_item) @function
+(function_signature_item) @function
+(struct_item) @struct
+(enum_item) @enum
+(trait_item) @trait
+(impl_item) @impl
+(mod_item) @module
+(const_item) @constant
+(static_item) @static
+(type_item) @type_alias
+(use_declaration) @import_or_export
+(identifier) @reference
+(type_identifier) @reference
+(field_identifier) @reference

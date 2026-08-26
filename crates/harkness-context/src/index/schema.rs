@@ -10,7 +10,7 @@
 //!
 //! That is why [`INDEX_SCHEMA_VERSION`] is bumped by *any* change to the
 //! statement below — a column, an index, a constraint — and why
-//! [`fixtures/schema-v3.sql`](https://github.com/fullstacktaiye/harkness/blob/main/crates/harkness-context/src/index/fixtures/schema-v3.sql)
+//! [`fixtures/schema-v4.sql`](https://github.com/fullstacktaiye/harkness/blob/main/crates/harkness-context/src/index/fixtures/schema-v4.sql)
 //! is committed beside it. The fixture is what a test compares the live
 //! `sqlite_schema` against, so editing the DDL without bumping the version
 //! fails a test rather than leaving already-written caches silently addressed
@@ -84,7 +84,7 @@ use super::IndexComponent;
 /// [#63]: https://github.com/fullstacktaiye/harkness/issues/63
 /// [#114]: https://github.com/fullstacktaiye/harkness/issues/114
 /// [#115]: https://github.com/fullstacktaiye/harkness/issues/115
-pub const INDEX_SCHEMA_VERSION: u32 = 3;
+pub const INDEX_SCHEMA_VERSION: u32 = 4;
 
 /// The whole cache layout, applied in one transaction at creation.
 ///
@@ -201,13 +201,45 @@ CREATE TABLE IF NOT EXISTS symbols (
     name            TEXT    NOT NULL,
     qualified_path  TEXT    NOT NULL,
     kind            TEXT    NOT NULL,
+    ordinal         INTEGER NOT NULL,
     start_byte      INTEGER NOT NULL,
     end_byte        INTEGER NOT NULL,
     start_line      INTEGER,
     end_line        INTEGER,
-    PRIMARY KEY (file_version_id, symbol_id)
+    parent_symbol_id TEXT,
+    signature        TEXT,
+    is_test          INTEGER NOT NULL,
+    name_is_lossy    INTEGER NOT NULL,
+    PRIMARY KEY (file_version_id, symbol_id),
+    FOREIGN KEY (file_version_id, parent_symbol_id)
+        REFERENCES symbols(file_version_id, symbol_id)
 ) STRICT, WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS symbols_by_name ON symbols (name);";
+CREATE INDEX IF NOT EXISTS symbols_by_name ON symbols (name);
+CREATE INDEX IF NOT EXISTS symbols_by_qualified ON symbols (qualified_path);
+
+CREATE TABLE IF NOT EXISTS symbol_references (
+    file_version_id TEXT    NOT NULL REFERENCES file_versions(file_version_id) ON DELETE CASCADE,
+    ordinal         INTEGER NOT NULL,
+    name            TEXT    NOT NULL,
+    start_byte      INTEGER NOT NULL,
+    end_byte        INTEGER NOT NULL,
+    start_line      INTEGER,
+    end_line        INTEGER,
+    name_is_lossy   INTEGER NOT NULL,
+    PRIMARY KEY (file_version_id, ordinal)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS parse_health (
+    file_version_id  TEXT    PRIMARY KEY REFERENCES file_versions(file_version_id) ON DELETE CASCADE,
+    status           TEXT    NOT NULL,
+    reason           TEXT,
+    error_ranges_json TEXT   NOT NULL
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS parser_versions (
+    language        TEXT PRIMARY KEY,
+    grammar_version TEXT NOT NULL
+) STRICT, WITHOUT ROWID;";
 
 /// Tables no component owns, which therefore survive every component skew.
 ///
@@ -237,7 +269,12 @@ impl IndexComponent {
     #[must_use]
     pub const fn owned_tables(self) -> &'static [&'static str] {
         match self {
-            Self::Parser => &["symbols"],
+            Self::Parser => &[
+                "symbols",
+                "symbol_references",
+                "parse_health",
+                "parser_versions",
+            ],
             Self::Chunking => &["chunks"],
             // [#121] has not landed, so no table holds a score yet. The empty
             // list is the honest statement of that, and it is what the
@@ -276,7 +313,7 @@ pub(crate) mod tests {
     use crate::index::IndexComponent;
 
     /// The frozen layout, as `sqlite_schema` renders it.
-    const FROZEN: &str = include_str!("fixtures/schema-v3.sql");
+    const FROZEN: &str = include_str!("fixtures/schema-v4.sql");
 
     /// Renders a database's own account of its layout, ordered and normalized.
     ///

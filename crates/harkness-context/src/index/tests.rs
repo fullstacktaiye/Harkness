@@ -352,11 +352,11 @@ fn a_component_version_mismatch_keeps_the_cache_and_reports_the_skew() {
         skew.iter().map(|entry| entry.component).collect::<Vec<_>>(),
         [IndexComponent::Parser, IndexComponent::Ranking]
     );
-    assert_eq!(skew[0].stored, "0");
+    assert_eq!(skew[0].stored, "1");
     assert_eq!(skew[0].expected, "2");
     assert_eq!(
         cache.meta().parser_version,
-        "0",
+        "1",
         "the stored version is what reconciliation needs; overwriting it would erase the work"
     );
 }

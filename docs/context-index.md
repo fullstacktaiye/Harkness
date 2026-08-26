@@ -19,7 +19,8 @@ bump takes away, and what happens when it runs out of room.
 
 ## What it holds
 
-Six tables, and exactly one of them is per-worktree.
+Eleven tables. `files` is the only visible per-worktree content table;
+`pending_files` is its invisible per-worktree staging area.
 
 ```mermaid
 erDiagram
@@ -29,6 +30,9 @@ erDiagram
     file_versions }o--|| contents : "of these bytes"
     file_versions ||--o{ chunks : "chunked into"
     file_versions ||--o{ symbols : "declares"
+    file_versions ||--o{ symbol_references : "mentions"
+    file_versions ||--o| parse_health : "parsed as"
+    parser_versions ||--o{ file_versions : "invalidates language"
 ```
 
 | Table | Keyed by | Holds |
@@ -40,10 +44,13 @@ erDiagram
 | `contents` | content SHA-256 | the size of one distinct blob of bytes |
 | `file_versions` | file-version id | one path's bytes: language, whether the text was transcoded, whether the chunk set stops short of the whole file, and the chunking and parser versions its derived rows were produced under |
 | `chunks` | `(file_version_id, chunk_id)` | anchor, ordinal, byte range, line hints, chunk digest, associated symbol |
-| `symbols` | `(file_version_id, symbol_id)` | name, qualified path, kind, byte range |
+| `symbols` | `(file_version_id, symbol_id)` | typed kind, bare and qualified names, duplicate ordinal, byte range, parent, bounded signature, test and lossy-name flags |
+| `symbol_references` | `(file_version_id, ordinal)` | best-effort unresolved name mentions and exact byte ranges |
+| `parse_health` | file-version id | complete, partial, failed, or skipped status; bounded reason and syntax-error ranges |
+| `parser_versions` | language | the grammar marker that last made that language's symbol rows current |
 
 The full DDL is `crates/harkness-context/src/index/schema.rs`, frozen as
-`crates/harkness-context/src/index/fixtures/schema-v3.sql`. A test compares the
+`crates/harkness-context/src/index/fixtures/schema-v4.sql`. A test compares the
 live layout against that fixture, so a column added without a version bump fails
 a test rather than leaving already-written caches addressed by a build that
 expects different columns.
@@ -405,13 +412,21 @@ drops:
 | Skew | What is deleted | Why |
 | --- | --- | --- |
 | `chunking_version` | `chunks`, and `file_versions.chunking_version` is nulled | a chunk's identity was derived under boundary rules this build does not use, so the row names something nothing can re-derive |
-| `parser_version` | `symbols`, and `file_versions.parser_version` is nulled | the same, for symbol identity |
+| `parser_version` | `symbols`, `symbol_references`, `parse_health`, `parser_versions`, and `file_versions.parser_version` is nulled | shared detection, identity projection, or extraction contracts changed for every language |
 | `ranking_version` | the tables registered as ranking-owned — none yet | a score is meaningful only under the formula that produced it |
 | `classify_version` | **nothing** | a `files` row is a true record that a path existed at a size; only its class is suspect, and the row's own `classify_version` is what says so |
 
 `files` survives every component bump. Re-walking a whole repository because a
 chunk-boundary rule moved would make every retrieval improvement a cold rebuild,
 which is exactly what versioning the components apart is for.
+
+Grammar crate versions are narrower than the shared parser component. A row in
+`parser_versions` names each registered language and its adapter version. A
+mismatch deletes symbols, references, and health only for file versions carrying
+that language and nulls only those parser markers. Reconciliation then parses
+those suspects while other languages' rows remain byte-identical. Removing an
+adapter is handled the same way, allowing the next pass to replace its old parse
+with an honest unsupported-language health row.
 
 The ownership list is data — `IndexComponent::owned_tables` and
 `CORE_TABLES` — and a test holds the schema to it: a table with no owner would
@@ -557,6 +572,8 @@ than read, however it came to be at that path.
   what reaches the index at all.
 - [`docs/context-search.md`](context-search.md) — the first retrieval feature to
   read these rows, and what a generation change does to its cursors.
+- [`docs/context-symbols.md`](context-symbols.md) — language detection, parser
+  health, symbol lookup, and language-local grammar invalidation.
 - [`docs/architecture-context.md`](architecture-context.md) — the pipeline this
   sits in the middle of.
 

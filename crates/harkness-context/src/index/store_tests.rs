@@ -24,6 +24,7 @@ use crate::ids::{FileVersionId, SnapshotId, SymbolId};
 use crate::inventory::InventoryEntry;
 use crate::path::RepoPath;
 use crate::provenance::ByteRange;
+use crate::symbols::SymbolKind;
 
 const IDENTITY: &str = "22222222-2222-5222-8222-222222222222";
 
@@ -396,7 +397,12 @@ fn symbols_recorded_before_their_file_version_are_carried_to_it() {
         name: "late".to_owned(),
         qualified_path: "late".to_owned(),
         kind: "function".to_owned(),
+        ordinal: 0,
         byte_range: ByteRange::new(0, 12),
+        parent: None,
+        signature: Some("fn late() {}".to_owned()),
+        is_test: false,
+        name_is_lossy: false,
     };
 
     let mut batch = cache
@@ -452,7 +458,12 @@ fn symbols_whose_file_version_never_arrives_are_refused_by_name() {
                 name: "absent".to_owned(),
                 qualified_path: "absent".to_owned(),
                 kind: "function".to_owned(),
+                ordinal: 0,
                 byte_range: ByteRange::new(0, 1),
+                parent: None,
+                signature: None,
+                is_test: false,
+                name_is_lossy: false,
             }],
         )
         .unwrap();
@@ -789,7 +800,12 @@ fn symbol_rows_are_stored_and_looked_up_by_name() {
         name: "interesting".to_owned(),
         qualified_path: "interesting".to_owned(),
         kind: "function".to_owned(),
+        ordinal: 0,
         byte_range: ByteRange::new(0, 19).with_lines(1, 1),
+        parent: None,
+        signature: Some("fn interesting() {}".to_owned()),
+        is_test: false,
+        name_is_lossy: false,
     };
 
     let mut batch = cache
@@ -812,7 +828,7 @@ fn symbol_rows_are_stored_and_looked_up_by_name() {
     let found = cache.symbols_named(&key, "interesting", 10).unwrap();
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].id, symbol.id);
-    assert_eq!(found[0].kind, "function");
+    assert_eq!(found[0].kind, SymbolKind::Function);
     assert_eq!(found[0].parser_version, "test-parser-1");
     assert!(cache.symbols_named(&key, "absent", 10).unwrap().is_empty());
     assert!(
@@ -821,6 +837,133 @@ fn symbol_rows_are_stored_and_looked_up_by_name() {
             .unwrap()
             .is_empty(),
         "a symbol is reachable only through a worktree holding the file it is in"
+    );
+}
+
+#[test]
+fn a_grammar_bump_invalidates_only_that_languages_rows() {
+    let fixture = StoreFixture::new();
+    let cache = fixture.open();
+    let key = worktree("alpha");
+    let cancellation = Cancellation::default();
+    cache
+        .refresh_grammar_versions(&[
+            ("rust".to_owned(), "rust-1".to_owned()),
+            ("toml".to_owned(), "toml-1".to_owned()),
+        ])
+        .unwrap();
+
+    let rust_entry = entry("src/lib.rs", b"fn rust_item() {}\n");
+    let rust_version = FileVersion::new(
+        &rust_entry,
+        SnapshotId::new(),
+        Arc::from(&b"fn rust_item() {}\n"[..]),
+        &cancellation,
+    )
+    .unwrap()
+    .with_language(crate::Language::new("rust").unwrap());
+    let rust_chunks = chunk_file(&rust_version, None, &cancellation).unwrap();
+    let toml_entry = InventoryEntry {
+        class: FileClass::Configuration,
+        ..entry("Cargo.toml", b"[package]\nname = \"demo\"\n")
+    };
+    let toml_version = FileVersion::new(
+        &toml_entry,
+        SnapshotId::new(),
+        Arc::from(&b"[package]\nname = \"demo\"\n"[..]),
+        &cancellation,
+    )
+    .unwrap()
+    .with_language(crate::Language::new("toml").unwrap());
+    let toml_chunks = chunk_file(&toml_version, None, &cancellation).unwrap();
+
+    let mut batch = cache
+        .begin(
+            &key,
+            Path::new("/workspaces/alpha"),
+            BatchScope::Full,
+            &cancellation,
+        )
+        .unwrap();
+    batch
+        .record_chunked(&rust_entry, &rust_version, &rust_chunks, CLASSIFY_VERSION)
+        .unwrap();
+    batch
+        .record_symbols(
+            rust_version.id(),
+            "rust-1",
+            &[SymbolRecord {
+                id: SymbolId::derive(&rust_entry.path, "rust", "rust_item", "function"),
+                name: "rust_item".to_owned(),
+                qualified_path: "rust_item".to_owned(),
+                kind: "function".to_owned(),
+                ordinal: 0,
+                byte_range: ByteRange::new(0, 17),
+                parent: None,
+                signature: Some("fn rust_item() {}".to_owned()),
+                is_test: false,
+                name_is_lossy: false,
+            }],
+        )
+        .unwrap();
+    batch
+        .record_chunked(&toml_entry, &toml_version, &toml_chunks, CLASSIFY_VERSION)
+        .unwrap();
+    batch
+        .record_symbols(
+            toml_version.id(),
+            "toml-1",
+            &[SymbolRecord {
+                id: SymbolId::derive(&toml_entry.path, "toml", "package", "module"),
+                name: "package".to_owned(),
+                qualified_path: "package".to_owned(),
+                kind: "module".to_owned(),
+                ordinal: 0,
+                byte_range: ByteRange::new(0, 9),
+                parent: None,
+                signature: Some("[package]".to_owned()),
+                is_test: false,
+                name_is_lossy: false,
+            }],
+        )
+        .unwrap();
+    batch.commit(&cancellation).unwrap();
+
+    let toml_before = cache.symbols_named(&key, "package", 10).unwrap();
+    let invalidated = cache
+        .refresh_grammar_versions(&[
+            ("rust".to_owned(), "rust-2".to_owned()),
+            ("toml".to_owned(), "toml-1".to_owned()),
+        ])
+        .unwrap();
+
+    assert!(invalidated > 0);
+    assert!(
+        cache
+            .symbols_named(&key, "rust_item", 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        cache.symbols_named(&key, "package", 10).unwrap(),
+        toml_before
+    );
+    assert_eq!(
+        cache
+            .file(&key, &rust_entry.path)
+            .unwrap()
+            .unwrap()
+            .parser_version,
+        None
+    );
+    assert_eq!(
+        cache
+            .file(&key, &toml_entry.path)
+            .unwrap()
+            .unwrap()
+            .parser_version
+            .as_deref(),
+        Some("toml-1")
     );
 }
 
@@ -1205,7 +1348,12 @@ fn a_parser_bump_empties_only_the_symbols() {
                 name: "interesting".to_owned(),
                 qualified_path: "interesting".to_owned(),
                 kind: "function".to_owned(),
+                ordinal: 0,
                 byte_range: ByteRange::new(0, 19),
+                parent: None,
+                signature: None,
+                is_test: false,
+                name_is_lossy: false,
             }],
         )
         .unwrap();

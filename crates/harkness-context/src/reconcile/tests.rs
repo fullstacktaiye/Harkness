@@ -746,6 +746,7 @@ fn a_truncated_walk_removes_nothing() {
         worktree: engine.worktree_key(),
         root: &root,
         policy: &policy,
+        symbols: &crate::LanguageRegistry::built_in().unwrap(),
         head_marker: None,
     }
     .run(&ReconcileScope::Full, &cancellation)

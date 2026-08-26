@@ -17,7 +17,7 @@ use crate::index::{
 };
 use crate::inventory::GLOBAL_IGNORE_FILE;
 use crate::probe::FilesystemProbe;
-use crate::{ChunkId, FreshnessState, RepoPath};
+use crate::{ChunkId, ExtractionSkipReason, FreshnessState, ParseHealth, RepoPath, SymbolKind};
 
 /// The namespace `harkness-git` keys repository locks by, restated here so the
 /// test derives the cache key independently instead of asking the code under
@@ -206,6 +206,9 @@ fn every_facade_method_either_answers_or_names_the_feature_it_is_missing() {
     engine
         .search(&SearchQuery::exact("needle"), &cancellation)
         .unwrap();
+    engine
+        .symbols(&SymbolQuery::new("Thing"), &cancellation)
+        .unwrap();
 
     let chunk = ChunkId::derive(
         &RepoPath::from_path(std::path::Path::new("src/lib.rs")),
@@ -216,12 +219,6 @@ fn every_facade_method_either_answers_or_names_the_feature_it_is_missing() {
         (
             "read_chunk",
             engine.read_chunk(&chunk, &cancellation).unwrap_err(),
-        ),
-        (
-            "symbols",
-            engine
-                .symbols(&SymbolQuery::new("Thing"), &cancellation)
-                .unwrap_err(),
         ),
         (
             "repository_map",
@@ -243,8 +240,8 @@ fn every_facade_method_either_answers_or_names_the_feature_it_is_missing() {
 
     assert_eq!(
         refusals.len(),
-        5,
-        "eight facade methods, three of them working"
+        4,
+        "eight facade methods, four of them working"
     );
     for (method, error) in refusals {
         assert_eq!(
@@ -631,6 +628,186 @@ fn reindexing_writes_every_eligible_file_and_reopening_reads_it_back() {
             .files,
         receipt.files_recorded
     );
+}
+
+#[test]
+fn reindexing_extracts_queries_and_explains_symbol_health() {
+    let workspace = Workspace::new();
+    fs::create_dir_all(workspace.root.join("src")).unwrap();
+    let mut rust = String::from(
+        "pub struct ProjectService;\n\
+         impl ProjectService {\n\
+             pub fn create_worktree(&self) {}\n\
+         }\n",
+    );
+    rust.push_str(&"// structural padding\n".repeat(160));
+    fs::write(workspace.root.join("src/project.rs"), rust).unwrap();
+    fs::write(
+        workspace.root.join("src/other.rs"),
+        "struct OtherService;\nimpl OtherService { fn create_worktree(&self) {} }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.root.join("src/broken.rs"),
+        "fn before() {}\nfn broken( {\nfn after() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.root.join("script.py"),
+        "def answer():\n    return 42\n",
+    )
+    .unwrap();
+    fs::write(workspace.root.join(".env"), "fn must_never_parse() {}\n").unwrap();
+
+    let engine = workspace.engine();
+    engine.reindex(&Cancellation::default()).unwrap();
+
+    let exact = engine
+        .symbols(
+            &SymbolQuery::exact_name("create_worktree"),
+            &Cancellation::default(),
+        )
+        .unwrap();
+    let repeated_exact = engine
+        .symbols(
+            &SymbolQuery::exact_name("create_worktree"),
+            &Cancellation::default(),
+        )
+        .unwrap();
+    assert_eq!(exact, repeated_exact, "exact lookup order is deterministic");
+    assert_eq!(exact.symbols.len(), 2);
+    assert_eq!(
+        exact
+            .symbols
+            .iter()
+            .map(|symbol| symbol.qualified_path.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "OtherService::create_worktree",
+            "ProjectService::create_worktree"
+        ]
+    );
+    let project_method = exact
+        .symbols
+        .iter()
+        .find(|symbol| symbol.qualified_path == "ProjectService::create_worktree")
+        .unwrap();
+    assert_eq!(project_method.kind, SymbolKind::Method);
+    let suffix = engine
+        .symbols(
+            &SymbolQuery::qualified_suffix("ProjectService::create_worktree"),
+            &Cancellation::default(),
+        )
+        .unwrap();
+    let repeated_suffix = engine
+        .symbols(
+            &SymbolQuery::qualified_suffix("ProjectService::create_worktree"),
+            &Cancellation::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        suffix, repeated_suffix,
+        "suffix lookup order is deterministic"
+    );
+    assert_eq!(
+        suffix.symbols.as_slice(),
+        std::slice::from_ref(project_method)
+    );
+
+    let project = RepoPath::from_path(std::path::Path::new("src/project.rs"));
+    let first = engine
+        .symbols(
+            &SymbolQuery::file(project.clone()),
+            &Cancellation::default(),
+        )
+        .unwrap();
+    let second = engine
+        .symbols(
+            &SymbolQuery::file(project.clone()),
+            &Cancellation::default(),
+        )
+        .unwrap();
+    assert_eq!(first, second, "two runs are byte-for-byte deterministic");
+    assert!(
+        engine
+            .indexed_chunks(&project)
+            .unwrap()
+            .iter()
+            .any(|chunk| chunk.symbol.as_ref() == Some(&project_method.id)),
+        "the parser outline feeds symbol identity into structural chunks"
+    );
+    assert_eq!(
+        engine.symbol_health(&project).unwrap().unwrap().health,
+        ParseHealth::Complete
+    );
+
+    let broken = RepoPath::from_path(std::path::Path::new("src/broken.rs"));
+    assert!(matches!(
+        engine.symbol_health(&broken).unwrap().unwrap().health,
+        ParseHealth::Partial { .. }
+    ));
+    let python = RepoPath::from_path(std::path::Path::new("script.py"));
+    assert!(matches!(
+        engine.symbol_health(&python).unwrap().unwrap().health,
+        ParseHealth::Skipped {
+            reason: ExtractionSkipReason::UnsupportedLanguage
+        }
+    ));
+    let secret = RepoPath::from_path(std::path::Path::new(".env"));
+    assert!(engine.symbol_health(&secret).unwrap().is_none());
+    assert!(
+        engine
+            .symbols(
+                &SymbolQuery::exact_name("must_never_parse"),
+                &Cancellation::default(),
+            )
+            .unwrap()
+            .symbols
+            .is_empty()
+    );
+}
+
+#[test]
+#[ignore = "release-mode warm symbol lookup benchmark"]
+fn warm_symbol_lookup_meets_the_latency_target() {
+    let workspace = Workspace::new();
+    fs::create_dir_all(workspace.root.join("src")).unwrap();
+    let mut source = String::new();
+    for index in 0..2_500 {
+        source.push_str(&format!(
+            "pub fn item_{index}() {{ let value = {index}; }}\n"
+        ));
+    }
+    fs::write(workspace.root.join("src/medium.rs"), &source).unwrap();
+
+    let engine = workspace.engine();
+    engine.reindex(&Cancellation::default()).unwrap();
+    let query = SymbolQuery::exact_name("item_1731");
+    assert_eq!(
+        engine
+            .symbols(&query, &Cancellation::default())
+            .unwrap()
+            .symbols
+            .len(),
+        1
+    );
+
+    let mut samples = Vec::with_capacity(100);
+    for _ in 0..100 {
+        let started = std::time::Instant::now();
+        let answer = engine.symbols(&query, &Cancellation::default()).unwrap();
+        samples.push(started.elapsed());
+        assert_eq!(answer.symbols.len(), 1);
+    }
+    samples.sort_unstable();
+    let p95 = samples[94];
+    eprintln!(
+        "warm symbol lookup: 2500 declarations, 100 samples, p95 {:.3} ms",
+        p95.as_secs_f64() * 1_000.0
+    );
+    if !cfg!(debug_assertions) {
+        assert!(p95 < std::time::Duration::from_millis(100));
+    }
 }
 
 /// A file that is gone stops being indexed. A full batch is the whole worktree,

@@ -94,10 +94,11 @@ optional strategy behind an interface that nothing depends on for correctness
 ```mermaid
 graph TD
     snap[snapshot<br/>composite identity] --> inv[inventory + classify<br/>ignore hierarchy, sensitivity denial]
-    inv --> chunk[chunk<br/>structure-aware, version-gated]
-    chunk --> idx[(index cache<br/>disposable)]
+    inv --> symx[symbol extraction<br/>syntax only, language adapters]
+    symx --> chunk[chunk<br/>structure-aware, version-gated]
+    chunk & symx --> idx[(index cache<br/>disposable)]
     idx --> search[filename + lexical]
-    idx --> sym[symbols]
+    idx --> sym[symbol lookup]
     idx --> map[repository map]
     git[GitService] --> gitctx[diffs, changed files, history]
     inv --> instr[instructions<br/>scoped, hashed, untrusted]
@@ -115,9 +116,14 @@ Each stage in one line:
 - **Inventory and classify** — walks the ignore hierarchy and classifies each
   eligible file. Sensitive paths are denied **at the walk**, so they never enter
   the index and cannot be retrieved by any later stage.
+- **Symbol extraction** — detects by extension, then shebang, then bounded
+  heuristics, and dispatches Rust, TOML, and Markdown through registered
+  tree-sitter adapters. It records syntax only: declarations, unresolved name
+  mentions, and visible parse health rather than LSP or type-resolution claims.
 - **Chunk** — structure-aware boundaries with anchors that stay stable when
   unrelated regions of a file change, so a small edit does not invalidate a
-  file's whole chunk set.
+  file's whole chunk set. Source adapters supply the symbol outline first, so
+  supported code aligns to declarations rather than fallback line windows.
 - **Index cache** — one SQLite database per repository at
   `<data_dir>/context/<repository-key>/index.db`, keyed by the same v5 UUID as
   the repository lock. Holds the file inventory, the content-addressed chunk and

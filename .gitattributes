@@ -1,6 +1,7 @@
 crates/harkness-acp/src/fixtures/*.json text eol=lf
 crates/harkness-context/src/fixtures/*.json text eol=lf
 crates/harkness-context/src/index/fixtures/*.sql text eol=lf
+crates/harkness-context/src/symbols/fixtures/* text eol=lf
 crates/harkness-runtime/src/agent_registry/fixtures/*.json text eol=lf
 crates/harkness-runtime/src/approval/fixtures/*.json text eol=lf
 crates/harkness-runtime/src/agent/fixtures/*.json text eol=lf

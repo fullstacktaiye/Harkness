@@ -1,0 +1,12 @@
+import|crate::ProjectId|crate::ProjectId|0..21|-|false|false
+constant|LIMIT|LIMIT|23..50|-|false|false
+static|ENABLED|ENABLED|51..83|-|false|false
+type_alias|ResultAlias|ResultAlias|84..122|-|false|false
+struct|ProjectService|ProjectService|124..150|-|false|false
+enum|State|State|151..192|-|false|false
+trait|Runner|Runner|194..233|-|false|false
+method|run|Runner::run|217..231|Runner|false|false
+impl|ProjectService|ProjectService|235..295|-|false|false
+method|create_worktree|ProjectService::create_worktree|261..293|ProjectService|false|false
+module|tests|tests|310..364|-|true|false
+function|creates_worktree|tests::creates_worktree|338..362|tests|true|false
