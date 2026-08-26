@@ -241,7 +241,7 @@ impl Sha256Hash {
             return Err(malformed("it is not 64 hexadecimal characters long"));
         }
         let mut bytes = [0u8; 32];
-        for (byte, pair) in bytes.iter_mut().zip(spelling.chunks_exact(2)) {
+        for (byte, pair) in bytes.iter_mut().zip(spelling.as_chunks::<2>().0) {
             for digit in pair {
                 let nibble = match digit {
                     b'0'..=b'9' => digit - b'0',

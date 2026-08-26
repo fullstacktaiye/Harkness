@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::inventory::InventoryError;
+use crate::search::SearchError;
 use crate::watch::WatchError;
 
 /// Failures raised while capturing, verifying, or decoding context records.
@@ -320,6 +321,27 @@ pub enum ContextEngineError {
         reason: String,
     },
 
+    /// A capture handed to the facade is of a different checkout.
+    ///
+    /// Every method that accepts a snapshot rather than taking one is accepting
+    /// a caller's answer to "which workspace is this", and a capture of another
+    /// checkout would stamp results with a workspace state they were not read
+    /// from — provenance that is well formed and false. The root is what is
+    /// compared, and not the project id: two catalog entries may name one
+    /// checkout, which is the same reason a worktree's index rows are keyed by
+    /// its canonical root.
+    #[error(
+        "the snapshot describes the worktree at '{}', not '{}'",
+        found.display(),
+        expected.display()
+    )]
+    ForeignSnapshot {
+        /// The worktree root this engine serves.
+        expected: PathBuf,
+        /// The worktree root the snapshot describes.
+        found: PathBuf,
+    },
+
     /// The operation observed its cancellation token.
     #[error("the context engine operation was cancelled")]
     Cancelled,
@@ -347,6 +369,31 @@ pub enum ContextEngineError {
     /// whether the index was current.
     #[error(transparent)]
     Watch(WatchError),
+
+    /// A search refused beneath the facade.
+    ///
+    /// Carried whole for the same reason the other two are, and the distinction
+    /// that matters here is between a query a caller can fix and a repository
+    /// state it cannot: a malformed pattern, a path filter outside the
+    /// workspace, and a withheld capability are all answered by changing the
+    /// request, while an unindexed worktree is answered by building the index.
+    /// Folding them into one engine-level spelling would leave a front end
+    /// offering "rebuild the index" to somebody who typed an unbalanced
+    /// bracket.
+    #[error(transparent)]
+    Search(SearchError),
+}
+
+impl From<SearchError> for ContextEngineError {
+    /// Written by hand for the one variant [`From<InventoryError>`] is.
+    ///
+    /// [`From<InventoryError>`]: Self::from
+    fn from(error: SearchError) -> Self {
+        match error {
+            SearchError::Cancelled => Self::Cancelled,
+            carried => Self::Search(carried),
+        }
+    }
 }
 
 impl From<WatchError> for ContextEngineError {
@@ -390,6 +437,7 @@ impl ContextEngineError {
         "index_budget_exhausted",
         "index_batch_superseded",
         "index_batch_invalid",
+        "foreign_snapshot",
         "cancelled",
     ];
 
@@ -405,25 +453,27 @@ impl ContextEngineError {
             Self::IndexBudgetExhausted { .. } => "index_budget_exhausted",
             Self::IndexBatchSuperseded { .. } => "index_batch_superseded",
             Self::IndexBatchInvalid { .. } => "index_batch_invalid",
+            Self::ForeignSnapshot { .. } => "foreign_snapshot",
             Self::Cancelled => "cancelled",
             Self::Domain(error) => error.kind(),
             Self::Inventory(error) => error.kind(),
             Self::Watch(error) => error.kind(),
+            Self::Search(error) => error.kind(),
         }
     }
 
     /// Every discriminant a facade call can report, in declaration order.
     ///
     /// The engine's own table, then the domain's, then the walk's, then the
-    /// watch's. A caller building an exit-code or presentation table needs the
-    /// union, because a facade call can fail at any of the four layers and the
-    /// caller cannot tell which one decided.
+    /// watch's, then the search's. A caller building an exit-code or
+    /// presentation table needs the union, because a facade call can fail at
+    /// any of the five layers and the caller cannot tell which one decided.
     ///
     /// `cancelled` is published once. A walk that observed the token, a watch
-    /// that observed it, and a facade call that observed it are the same
-    /// answer, which is why [`From<InventoryError>`](Self::from) and
-    /// [`From<WatchError>`](Self::from) map onto the engine's own spelling
-    /// rather than letting three tables spell it three times.
+    /// that observed it, a search that observed it, and a facade call that
+    /// observed it are the same answer, which is why the hand-written `From`
+    /// implementations map onto the engine's own spelling rather than letting
+    /// four tables spell it four times.
     #[must_use]
     pub fn kinds() -> Vec<&'static str> {
         Self::KINDS
@@ -438,6 +488,12 @@ impl ContextEngineError {
             )
             .chain(
                 WatchError::KINDS
+                    .iter()
+                    .copied()
+                    .filter(|kind| !Self::KINDS.contains(kind)),
+            )
+            .chain(
+                SearchError::KINDS
                     .iter()
                     .copied()
                     .filter(|kind| !Self::KINDS.contains(kind)),
@@ -597,6 +653,13 @@ mod tests {
                 },
                 "index_batch_invalid",
             ),
+            (
+                ContextEngineError::ForeignSnapshot {
+                    expected: PathBuf::from("/w/this"),
+                    found: PathBuf::from("/w/other"),
+                },
+                "foreign_snapshot",
+            ),
             (ContextEngineError::Cancelled, "cancelled"),
         ];
 
@@ -622,6 +685,21 @@ mod tests {
         assert!(ContextEngineError::kinds().contains(&"repository_unavailable"));
     }
 
+    /// A search refusal is carried the same way, and its `cancelled` is the
+    /// engine's own: a caller polling one token wants one answer whichever
+    /// layer noticed first.
+    #[test]
+    fn a_carried_search_refusal_keeps_its_own_kind_but_not_its_own_cancellation() {
+        let carried = ContextEngineError::from(crate::SearchError::RegexNotPermitted);
+        assert_eq!(carried.kind(), "regex_not_permitted");
+        assert!(matches!(carried, ContextEngineError::Search(_)));
+        assert!(ContextEngineError::kinds().contains(&"regex_not_permitted"));
+
+        let cancelled = ContextEngineError::from(crate::SearchError::Cancelled);
+        assert_eq!(cancelled.kind(), "cancelled");
+        assert!(matches!(cancelled, ContextEngineError::Cancelled));
+    }
+
     /// The published namespace is a concatenation, so a spelling appearing in
     /// both tables would make `kind()` ambiguous about which layer answered.
     #[test]
@@ -636,6 +714,8 @@ mod tests {
                 + crate::InventoryError::KINDS.len()
                 - 1
                 + crate::watch::WatchError::KINDS.len()
+                - 1
+                + crate::SearchError::KINDS.len()
                 - 1
         );
 

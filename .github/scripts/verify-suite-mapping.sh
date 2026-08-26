@@ -71,6 +71,8 @@ latency-streaming-assembly
 latency-inventory-walk
 latency-chunking-1mib
 latency-incremental-update
+latency-lexical-search
+latency-filename-search
 '
 
 # Rows are `| `scenario` | … | `package` | `test` |`, with an optional budget

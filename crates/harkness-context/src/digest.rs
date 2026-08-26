@@ -32,6 +32,8 @@ pub(crate) const DOMAIN_FILE_VERSION: &str = "harkness.context.file_version.v1";
 pub(crate) const DOMAIN_CHUNK: &str = "harkness.context.chunk.v1";
 /// Domain tag for [`SymbolId`](crate::SymbolId).
 pub(crate) const DOMAIN_SYMBOL: &str = "harkness.context.symbol.v1";
+/// Domain tag for the identity a search cursor is bound to.
+pub(crate) const DOMAIN_SEARCH_QUERY: &str = "harkness.context.search_query.v1";
 
 /// Number of characters in a hexadecimal SHA-256 digest.
 const DIGEST_HEX_LENGTH: usize = 64;

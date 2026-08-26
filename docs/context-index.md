@@ -555,6 +555,8 @@ than read, however it came to be at that path.
   and the `CHUNKING_VERSION` bump procedure.
 - [`docs/context-inventory.md`](context-inventory.md) — the walk that decides
   what reaches the index at all.
+- [`docs/context-search.md`](context-search.md) — the first retrieval feature to
+  read these rows, and what a generation change does to its cursors.
 - [`docs/architecture-context.md`](architecture-context.md) — the pipeline this
   sits in the middle of.
 

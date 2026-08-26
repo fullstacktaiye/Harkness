@@ -446,8 +446,14 @@ fn append_event_batches_until_killed() {
     };
     store.append_events(run.id(), batch(0)).unwrap();
     signal(&ready, &run.id().to_string());
-    for index in 1.. {
+    // Unbounded on purpose, and spelled as a `loop` so it reads that way: this
+    // role exists to be `SIGKILL`ed mid-batch, and the parent test is what ends
+    // it. A `for index in 1..` says the same thing to a compiler and something
+    // weaker to a reader, which is the distinction `for_unbounded_range` draws.
+    let mut index = 1;
+    loop {
         store.append_events(run.id(), batch(index)).unwrap();
+        index += 1;
     }
 }
 

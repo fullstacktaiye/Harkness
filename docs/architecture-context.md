@@ -134,6 +134,13 @@ Each stage in one line:
 - **Retrieval sources** — filename and lexical search over the index, symbol
   lookup, the repository map, Git-derived context through the existing
   `GitService`, and discovered instruction files.
+- **Search** — the first of those to land, and the one the rest are shaped
+  against. It reads its universe out of the index and never out of the
+  filesystem, so exclusion is by construction rather than by a post-filter;
+  matches come back in a total order over `(path bytes, byte offset)` with an
+  opaque generation-bound cursor, and every bound that fires is reported in the
+  success payload rather than shrinking the answer quietly. Documented in
+  [`docs/context-search.md`](context-search.md).
 - **Rank** — deterministic scoring with a serializable explanation per signal.
   Exact matches, run-changed files, import adjacency, and test↔source pairing
   promote; generated, vendored, and near-duplicate content demotes.

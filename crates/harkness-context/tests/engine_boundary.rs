@@ -24,7 +24,7 @@ use harkness_context::index::{
 use harkness_context::watch::{ChangeHint, WatchOptions, WatchService, WatchState};
 use harkness_context::{
     ChunkId, ContextEngine, ContextEngineConfig, ContextEngineError, InventoryRequest, MapRequest,
-    PackRequest, ReconcileScope, RepoPath, SearchQuery, SymbolQuery,
+    PackRequest, ReconcileScope, RepoPath, RetrievalSource, SearchLimits, SearchQuery, SymbolQuery,
 };
 use harkness_core::{CONTEXT_DIRECTORY, ProjectId};
 use harkness_git::Cancellation;
@@ -93,6 +93,89 @@ fn an_engine_serves_workspace_identity_with_nothing_else_in_the_process() {
     assert!(!inventory.is_truncated());
 }
 
+/// The whole of what [#123] plugs into: build an index, ask a question, page
+/// the answer, and read where every match came from — with no run store, no
+/// policy engine and no model in the process.
+///
+/// [#123]: https://github.com/fullstacktaiye/harkness/issues/123
+#[test]
+fn search_answers_paged_attributed_matches_from_outside_the_crate() {
+    let workspace = Workspace::new();
+    let cancellation = Cancellation::default();
+    fs::write(
+        workspace.root.join("alpha.rs"),
+        "fn one() {}\nfn two() {}\nfn three() {}\n",
+    )
+    .unwrap();
+    fs::write(workspace.root.join("beta.rs"), "fn four() {}\n").unwrap();
+    let engine = workspace.engine();
+    engine.reindex(&cancellation).unwrap();
+
+    // One page at a time, so the cursor is exercised rather than described.
+    let mut query = SearchQuery::exact("fn ").with_limits(SearchLimits::new().with_max_results(2));
+    let mut found = Vec::new();
+    let mut pages = 0;
+    loop {
+        let page = engine.search(&query, &cancellation).unwrap();
+        pages += 1;
+        for matched in &page.matches {
+            assert_eq!(
+                matched.provenance.source,
+                RetrievalSource::LexicalSearch,
+                "every match names the machinery that produced it"
+            );
+            assert_eq!(matched.provenance.snapshot_id, page.snapshot_id);
+            assert!(matched.content_sha256.is_some());
+            found.push((matched.path.display(), matched.line_number.unwrap()));
+        }
+        assert_eq!(page.is_truncated(), page.next_cursor.is_some());
+        let Some(cursor) = page.next_cursor else {
+            break;
+        };
+        query = query.continuing(cursor);
+    }
+
+    assert!(pages > 1, "a two-match page over four matches has to page");
+    assert_eq!(
+        found,
+        vec![
+            ("alpha.rs".to_owned(), 1),
+            ("alpha.rs".to_owned(), 2),
+            ("alpha.rs".to_owned(), 3),
+            ("beta.rs".to_owned(), 1),
+        ]
+    );
+
+    // And the same universe answers about names without reading a byte of
+    // content.
+    let names = engine
+        .search(&SearchQuery::filename("beta"), &cancellation)
+        .unwrap();
+    assert_eq!(names.matches.len(), 1);
+    assert_eq!(names.matches[0].path.display(), "beta.rs");
+    assert_eq!(
+        names.matches[0].provenance.source,
+        RetrievalSource::FilenameSearch
+    );
+    assert_eq!(names.stats.files_scanned, 0);
+}
+
+/// A worktree the cache has never seen is a question this engine refuses,
+/// because "no match" and "I did not look" are different answers.
+#[test]
+fn searching_an_unindexed_worktree_refuses_rather_than_answering_empty() {
+    let workspace = Workspace::new();
+    let engine = workspace.engine();
+
+    let refusal = engine
+        .search(&SearchQuery::exact("initial"), &Cancellation::default())
+        .map(|_| ())
+        .unwrap_err();
+
+    assert_eq!(refusal.kind(), "index_unavailable");
+    assert!(ContextEngineError::kinds().contains(&"index_unavailable"));
+}
+
 /// Every retrieval issue has a compiling seam today and a typed refusal until it
 /// lands. Nothing panics and nothing fabricates a result.
 #[test]
@@ -103,10 +186,6 @@ fn the_unimplemented_facade_methods_refuse_by_name_from_outside_the_crate() {
     let chunk = ChunkId::derive(&RepoPath::from_path(Path::new("src/lib.rs")), "0", b"");
 
     let refusals = [
-        engine
-            .search(&SearchQuery::new("needle"), &cancellation)
-            .map(|_| ())
-            .unwrap_err(),
         engine
             .read_chunk(&chunk, &cancellation)
             .map(|_| ())

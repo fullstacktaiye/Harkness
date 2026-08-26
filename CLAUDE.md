@@ -267,7 +267,7 @@ translating between two cancellation mechanisms.
   changing anything a digest absorbs; the wire forms are frozen by fixtures under
   `src/fixtures/` because they are `runtime.db` columns.
   `engine.rs` is the eight-method facade every retrieval issue plugs into —
-  `snapshot` and `inventory` are implemented, the rest return
+  `snapshot`, `inventory` and `search` are implemented, the rest return
   `ContextEngineError::NotYetAvailable` naming the feature — plus `reindex`, the
   cold build that fills the cache from the walk and the chunker. `index/` is the
   per-repository cache at `<data_dir>/context/<repository-key>/index.db`, and it
@@ -298,7 +298,24 @@ translating between two cancellation mechanisms.
   repositories recorded as boundaries, and typed truncation where a bound is
   reached. `ignore` is used for its gitignore matcher only — the walk itself is
   ours, because `WalkBuilder` filters inside its iterator and the layer above it
-  has to see what the layer below would have removed. The engine writes nothing
+  has to see what the layer below would have removed.
+  `search/` is the first retrieval feature to read all of that, and it is split
+  the way `index/` is: `query.rs` for what may be asked, `cursor.rs` for the
+  opaque continuation, `result.rs` for what an answer holds — matches, the
+  `SearchOmission` for every bound that fired, and `BoundedText` — `error.rs`
+  for six kinds, and `scan.rs` for the scan. Five things to know before touching
+  it: the universe is the index and a fallback filesystem walk must never be
+  added, so an unindexed worktree is `index_unavailable` and not an empty
+  answer; ordering is a total order over `(path bytes, byte offset)` with one
+  match per matching line, which is what a cursor sits between; several path
+  prefixes are *merged* rather than concatenated, because `sr-x/a` sorts before
+  `sr/a` while the prefix `sr` sorts before `sr-x`; a budget is checked against
+  the *offered* match so a page that fills exactly is still a complete answer;
+  and `bom_sniffing` stays off so a byte offset always names a byte of the file.
+  `ContextEngine::search` captures a snapshot and `search_under` takes one — a
+  run should use the second, because a capture costs several times the scan and
+  because a run's evidence should name one workspace state rather than one per
+  query. `docs/context-search.md` is the reference. The engine writes nothing
   durable; `harkness-runtime`'s `context` module owns the handles and the
   persistence, and `docs/context-inventory.md` is the user-facing reference.
 - **`harkness-provider`** is the model-endpoint boundary, created by #111 against ADR-0001 and

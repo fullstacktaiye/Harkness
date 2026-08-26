@@ -6,7 +6,7 @@ Harkness is a Rust 2024 workspace split into thirteen crates under `crates/`:
 
 - `harkness-core`: project catalog, storage layout, cross-domain project workflows, and directory-listing logic shared by front ends.
 - `harkness-git`: all production Git behavior: inspection, diffs and history, change provenance, file context and hunk staging, branch and worktree mutation, commits, clone and synchronization, hermetic process execution, and repository locking.
-- `harkness-context`: the context engine's typed vocabulary — workspace snapshot identity, stable identifiers, provenance, and file classification — the disposable per-repository index cache beneath it, and the pair that keeps that cache current: a filesystem watcher whose events are treated strictly as hints, and a reconciler that decides truth by comparing the worktree against the stored rows.
+- `harkness-context`: the context engine's typed vocabulary — workspace snapshot identity, stable identifiers, provenance, and file classification — the disposable per-repository index cache beneath it, the pair that keeps that cache current (a filesystem watcher whose events are treated strictly as hints, and a reconciler that decides truth by comparing the worktree against the stored rows), and the deterministic search that reads its universe out of that cache and never out of the filesystem.
 - `harkness-provider`: the provider-neutral model contract, the streaming turn assembler, and the deterministic scripted provider. Every concrete model adapter lives here and keeps its wire types private; nothing above learns what an endpoint's JSON looks like.
 - `harkness-transport`: the shared subprocess JSON-RPC engine both protocol adapters run on — hermetic allowlisted spawn, newline-delimited framing, request correlation, bounded messages, and the close-stdin/`SIGTERM`/`SIGKILL` teardown. Below every adapter and above nothing but `harkness-git`.
 - `harkness-acp`: the Agent Client Protocol client — the wire vocabulary, the `initialize` handshake, protocol-version and capability negotiation, and gated authentication. Sessions, mediation, and the rest of the v0.5 ACP surface land here beside them.
@@ -845,6 +845,130 @@ reclassifies evidence recorded under the old rules.
 `docs/context-inventory.md` is the reference for the denial list, the class
 precedence, and the bounds; `docs/context-index.md` is the reference for what
 the cache does with what the walk found.
+
+## Context Search Invariants
+
+**The universe is the index and there is no fallback walk.** Every file a scan
+opens came out of a `files` row, and every row came out of an inventory whose
+exclusion layers had already refused a denied path, a `secret_sensitive` file, a
+binary and an ignored one. Exclusion is therefore *by construction*: there is no
+post-filter here to forget, and the excluded content is not a row waiting to be
+removed but a row that was never written. Nothing may add a filesystem walk to
+this module, however cold the cache is — a directory listing would reach paths
+no layer ever examined. The corollary is the honesty rule: a worktree the cache
+has never seen is `index_unavailable` and never an empty result, because "no
+match" and "I did not look" are answers a caller acts on differently.
+
+**Ordering is a total order over positions: path bytes, then absolute byte
+offset, and nothing else.** Both come out of the scan already ordered — the
+index yields rows in path order and a file is scanned front to back — so there
+is no sort whose stability could decide anything. A content match is reported
+once per matching *line*, positioned at the first occurrence on it, and that is
+what makes the pair unique: two matches sharing a position are two a cursor
+cannot sit between. A query narrowed to several subtrees reads one ordered
+stream per subtree and **merges** them; concatenating them in prefix order is
+wrong, because `sr-x/a` sorts before `sr/a` while the prefix `sr` sorts before
+`sr-x`. Those subtrees must be made disjoint against *every* one already kept
+and not merely against the previous one: a parent sorts before its children but
+is not adjacent to them — `src-gen` falls between `src` and `src/inner` — and
+two overlapping streams emit one file's matches twice, at one position, which is
+the total order this whole section rests on.
+
+**A cursor is a position, not an offset, and it refuses rather than guesses.**
+It is opaque, versioned, and bound to three things: the `index_generation` it was
+minted against, the **worktree** whose rows it names, and a digest of everything
+that decides which matches exist and in what order — the pattern, the filters and
+the capability flag, and **none of the four bounds**. Page size is out for the
+obvious reason, and the context and per-line bounds are out for the same one:
+they decide how much each match carries and not which matches there are, so a
+surface may widen the context around a result and keep paging. The worktree is in
+because one repository's cache is shared by every linked checkout of it — the
+generation is a single row and only the `files` rows are keyed by worktree — so a
+sibling's token matches on everything else and still names a position in a
+different set of rows. All four ways a cursor can be wrong report
+`stale_search_cursor` and are told apart by the refusal it carries, because all
+four lead to the same repair.
+
+**A prefix filter is understood, not merely accepted.** It is built from the
+path's *validated components* and never from the bytes a caller typed: `Path`
+normalizes nothing, so a stored `src/` would range over `src//`..`src/0` and
+match not one file in the subtree it names. `.` is a spelling of the worktree
+root rather than an escape from it, and the components are rejoined with `/`
+whatever the platform's separator is, because that is the byte the index stores
+paths under.
+
+**Truncation is part of the success payload.** Every bound that fires puts a
+`SearchOmission` in the answer — never in a log, never in a warning — because a
+result list stopped by a budget and a repository holding exactly that many
+matches are otherwise one value. The bound is checked against the *offered*
+match rather than the stored one, which is what keeps a page that fills exactly
+distinguishable from one that was cut short: the match that did not fit is the
+proof there was more, exactly as `IndexedPage`'s probe row is on the read side.
+One rule bends and says so: a byte budget smaller than a single match returns
+that match, because an empty page carrying a cursor that points before it is a
+caller paging forever over nothing. Three things must not be forgotten when a
+bound is added. It reports on **every** value it clamps, context lines included
+— a bound that fired with nothing in the payload saying so is what this whole
+paragraph exists to prevent. The truncation notice lives *outside* the capped
+omission list, because a page whose omissions filled with unreadable files would
+otherwise lose both its notice and — since a cursor is emitted only when a bound
+fired — its continuation. And every bound is **capped** as well as defaulted:
+caller-supplied numbers may not decide how much memory one response holds, so a
+limit with a default and no cap is an unfinished limit.
+
+**Provenance names the bytes that were searched, not the bytes that were
+indexed.** Search re-reads the working tree, so a file that moved since it was
+indexed is searched as it is now, stamped with the digest observed, and reported
+with `file_changed_since_index`. The two digests on a match answer different
+questions and must not be collapsed: the match's own covers the *file version*
+that was read, and its provenance's covers the *matched line as emitted* —
+exactly the region its `range` names, so reading the range out of the file and
+hashing it is a check that holds, clamped lines included. Context lines are
+outside both, because a digest spanning them would describe a region the range
+does not. A filename match carries neither a file digest nor a line number,
+because nothing was read.
+
+**A regular expression is a capability and an exact pattern is not.** `Exact`
+compiles with every metacharacter escaped, so nothing a caller writes is
+interpreted; `Regex` runs a caller's program over the repository and is refused
+with `regex_not_permitted` unless the query carries the grant in as many words.
+The grant must stay separable from the pattern — folding it into the
+constructor would leave nothing to refuse and no test to write. Enforcing it is
+`harkness-runtime`'s, which is the only layer that can see policy.
+
+**The libraries run in process and nothing spawns `rg`.** There is no argv for a
+caller-supplied pattern to escape from, which is what makes injection
+unrepresentable here rather than defended against. Three compile-time settings
+are guarantees rather than tuning and must not be relaxed: `fixed_strings` for
+the exact shape, a line terminator that refuses a pattern able to match across
+lines, and a banned NUL that refuses a pattern only matching content binary
+detection will stop at.
+
+**A byte offset always names a byte of the file.** `bom_sniffing` stays off, so
+nothing is transcoded before it is scanned — a UTF-16 file is reported with
+`encoding_not_searchable` rather than decoded, because offsets taken from a
+decoded stream would name positions nothing on disk holds, and every later edit
+is anchored to those offsets. Excerpt text is `BoundedText`: clamped to a
+published bound, marked when clamped, UTF-8 where the *whole source* is UTF-8
+and Base64 otherwise, and the clamp walks back off a multi-byte character rather
+than flipping a line's encoding because of where a limit fell.
+
+**A capture is taken or given, never assumed — and never taken for a query that
+cannot run.** `ContextEngine::search` captures a snapshot; `search_under` takes
+one the caller holds and refuses a capture of another checkout with
+`foreign_snapshot`, comparing the canonical worktree root and not the project
+id. A run stamps every retrieval with the one snapshot it recorded, so its
+evidence describes a single moment; the capture is also several times the cost
+of the scan, which is why both latency targets measure the second spelling and
+print the capture beside the numbers. Every refusal — the pattern, the
+capability, the filters, the cursor, an unindexed worktree — is therefore
+decided *before* the capture rather than only before the first file is opened.
+Left the other way round it is an amplification lever as well as a waste:
+repeating a query that will always be refused would drive an unbounded number of
+whole-workspace reads.
+
+`docs/context-search.md` is the reference for the query surface, the omission
+table, the refusals, and the budgets.
 
 ## Model Provider & Streaming Assembly Invariants
 

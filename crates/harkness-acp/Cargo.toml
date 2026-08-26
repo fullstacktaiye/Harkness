@@ -22,3 +22,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_path_to_error = { workspace = true }
 thiserror = { workspace = true }
+
+# Dev-only, and permitted by the rule above rather than an exception to it:
+# `harkness-test-fixtures` is neither above this crate nor beside it, and
+# `harkness-provider` takes it on the same terms. It is here for one thing —
+# `latency::record`, which the workspace requires every timing budget to report
+# through, so a number is measured in every profile and enforced only where
+# `debug_assertions` is off.
+[dev-dependencies]
+harkness-test-fixtures = { workspace = true }

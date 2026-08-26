@@ -31,6 +31,7 @@ docs/run-lifecycle-and-storage.md
 docs/mock-agent-scenarios.md
 docs/release-readiness-v0.3.md
 docs/context-index.md
+docs/context-search.md
 '
 
 for document in $documents; do

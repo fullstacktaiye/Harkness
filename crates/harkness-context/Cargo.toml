@@ -11,6 +11,9 @@ path = "src/lib.rs"
 
 [dependencies]
 base64.workspace = true
+grep-matcher.workspace = true
+grep-regex.workspace = true
+grep-searcher.workspace = true
 harkness-core.workspace = true
 harkness-git.workspace = true
 ignore.workspace = true
