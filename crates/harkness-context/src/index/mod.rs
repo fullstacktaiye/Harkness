@@ -115,7 +115,8 @@ pub use budget::{
 pub use schema::{CORE_TABLES, INDEX_SCHEMA, INDEX_SCHEMA_VERSION};
 pub use store::{
     BatchReceipt, BatchScope, ForgetReport, IndexBatch, IndexedChunk, IndexedFile, IndexedPage,
-    IndexedSymbol, MAX_READ_ROWS, SymbolRecord, WorktreeKey, cache_root,
+    IndexedParseHealth, IndexedSymbol, IndexedSymbolReference, MAX_READ_ROWS, SymbolRecord,
+    SymbolReferenceRecord, WorktreeKey, cache_root,
 };
 
 use budget::CacheLock;
@@ -145,12 +146,9 @@ pub const MAX_INDEX_DB_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Version of the language grammars and symbol extraction that filled the cache.
 ///
-/// `0` means this build has none, which is the honest answer until [#117]
-/// lands: no row in any cache was produced by a parser, so nothing can be
-/// stale against one.
-///
-/// [#117]: https://github.com/fullstacktaiye/harkness/issues/117
-pub const PARSER_VERSION: &str = "0";
+/// Grammar crate versions are recorded separately per language; this marker
+/// covers detection, identity projection, and the shared extraction contract.
+pub const PARSER_VERSION: &str = crate::symbols::SYMBOL_EXTRACTION_VERSION;
 
 /// Version of the chunk-boundary rules that filled the cache.
 pub use crate::chunk::CHUNKING_VERSION;
@@ -1184,7 +1182,14 @@ fn probe_existing(
             // metadata is therefore not one somebody is part-way through — it is
             // broken, and waiting out the grace would only delay saying so.
             let waited = if has_tables(&connection) {
-                None
+                // The creator may have committed between the failed metadata
+                // read above and this schema read. Seeing tables is proof that
+                // creation has committed, not proof that the metadata is
+                // absent from that newly committed layout, so take one fresh
+                // look before declaring the cache corrupt.
+                read_waiting(&connection, cancellation, STAMP_SELECT, read_stamp)?
+                    .ok()
+                    .flatten()
             } else {
                 await_creation(&connection, cancellation)?
             };

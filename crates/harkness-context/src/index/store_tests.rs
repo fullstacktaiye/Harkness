@@ -24,6 +24,10 @@ use crate::ids::{FileVersionId, SnapshotId, SymbolId};
 use crate::inventory::InventoryEntry;
 use crate::path::RepoPath;
 use crate::provenance::ByteRange;
+use crate::symbols::{
+    ExtractionSkipReason, FileSymbols, LanguageDetection, LanguageDetectionSource, ParseHealth,
+    SymbolKind,
+};
 
 const IDENTITY: &str = "22222222-2222-5222-8222-222222222222";
 
@@ -92,6 +96,24 @@ fn derive(entry: &InventoryEntry, bytes: &[u8]) -> (FileVersion, ChunkSet) {
         &cancellation,
     )
     .expect("the entry is eligible and its size matches");
+    let chunks = chunk_file(&version, None, &cancellation).expect("the file chunks");
+    (version, chunks)
+}
+
+fn derive_language(
+    entry: &InventoryEntry,
+    bytes: &[u8],
+    language: &str,
+) -> (FileVersion, ChunkSet) {
+    let cancellation = Cancellation::default();
+    let version = FileVersion::new(
+        entry,
+        SnapshotId::new(),
+        Arc::from(bytes.to_vec().into_boxed_slice()),
+        &cancellation,
+    )
+    .expect("the entry is eligible and its size matches")
+    .with_language(crate::Language::new(language).expect("the language is valid"));
     let chunks = chunk_file(&version, None, &cancellation).expect("the file chunks");
     (version, chunks)
 }
@@ -390,13 +412,17 @@ fn symbols_recorded_before_their_file_version_are_carried_to_it() {
     let cancellation = Cancellation::default();
     let bytes = b"fn late() {}\n";
     let entry = entry("src/late.rs", bytes);
-    let (version, chunks) = derive(&entry, bytes);
+    let (version, chunks) = derive_language(&entry, bytes, "rust");
     let symbol = SymbolRecord {
         id: SymbolId::derive(&entry.path, "rust", "late", "function"),
         name: "late".to_owned(),
         qualified_path: "late".to_owned(),
         kind: "function".to_owned(),
+        ordinal: 0,
         byte_range: ByteRange::new(0, 12),
+        parent: None,
+        is_test: false,
+        name_is_lossy: false,
     };
 
     let mut batch = cache
@@ -452,7 +478,11 @@ fn symbols_whose_file_version_never_arrives_are_refused_by_name() {
                 name: "absent".to_owned(),
                 qualified_path: "absent".to_owned(),
                 kind: "function".to_owned(),
+                ordinal: 0,
                 byte_range: ByteRange::new(0, 1),
+                parent: None,
+                is_test: false,
+                name_is_lossy: false,
             }],
         )
         .unwrap();
@@ -770,6 +800,29 @@ fn record_path(id: crate::ids::ChunkId, rows: &[super::IndexedChunk]) -> RepoPat
         .expect("the row is one of the rows it came from")
 }
 
+fn commit_symbol_rows(
+    cache: &IndexCache,
+    key: &WorktreeKey,
+    root: &str,
+    path: &str,
+    bytes: &[u8],
+    symbols: &[SymbolRecord],
+) -> FileVersionId {
+    let cancellation = Cancellation::default();
+    let entry = entry(path, bytes);
+    let (version, chunks) = derive_language(&entry, bytes, "rust");
+    let id = version.id().clone();
+    let mut batch = cache
+        .begin(key, Path::new(root), BatchScope::Full, &cancellation)
+        .unwrap();
+    batch
+        .record_chunked(&entry, &version, &chunks, CLASSIFY_VERSION)
+        .unwrap();
+    batch.record_symbols(&id, "rust-1", symbols).unwrap();
+    batch.commit(&cancellation).unwrap();
+    id
+}
+
 /// Symbols have no producer in this build, so the store's own acceptance of
 /// them is what [#117] plugs into. A table nothing can write is a table the next
 /// issue redesigns.
@@ -783,13 +836,17 @@ fn symbol_rows_are_stored_and_looked_up_by_name() {
     let cancellation = Cancellation::default();
     let bytes = b"fn interesting() {}\n";
     let entry = entry("src/lib.rs", bytes);
-    let (version, chunks) = derive(&entry, bytes);
+    let (version, chunks) = derive_language(&entry, bytes, "rust");
     let symbol = SymbolRecord {
         id: SymbolId::derive(&entry.path, "rust", "interesting", "function"),
         name: "interesting".to_owned(),
         qualified_path: "interesting".to_owned(),
         kind: "function".to_owned(),
+        ordinal: 0,
         byte_range: ByteRange::new(0, 19).with_lines(1, 1),
+        parent: None,
+        is_test: false,
+        name_is_lossy: false,
     };
 
     let mut batch = cache
@@ -812,7 +869,7 @@ fn symbol_rows_are_stored_and_looked_up_by_name() {
     let found = cache.symbols_named(&key, "interesting", 10).unwrap();
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].id, symbol.id);
-    assert_eq!(found[0].kind, "function");
+    assert_eq!(found[0].kind, SymbolKind::Function);
     assert_eq!(found[0].parser_version, "test-parser-1");
     assert!(cache.symbols_named(&key, "absent", 10).unwrap().is_empty());
     assert!(
@@ -821,6 +878,530 @@ fn symbol_rows_are_stored_and_looked_up_by_name() {
             .unwrap()
             .is_empty(),
         "a symbol is reachable only through a worktree holding the file it is in"
+    );
+}
+
+#[test]
+fn symbol_ids_are_rederived_and_tampering_is_refused() {
+    let fixture = StoreFixture::new();
+    let cache = fixture.open();
+    let key = worktree("alpha");
+    let path = RepoPath::from_bytes(b"src/lib.rs".to_vec());
+    let symbol = SymbolRecord {
+        id: SymbolId::derive(&path, "rust", "interesting", "function"),
+        name: "interesting".to_owned(),
+        qualified_path: "interesting".to_owned(),
+        kind: "function".to_owned(),
+        ordinal: 0,
+        byte_range: ByteRange::new(0, 19),
+        parent: None,
+        is_test: false,
+        name_is_lossy: false,
+    };
+    commit_symbol_rows(
+        &cache,
+        &key,
+        "/workspaces/alpha",
+        "src/lib.rs",
+        b"fn interesting() {}\n",
+        std::slice::from_ref(&symbol),
+    );
+
+    let forged = SymbolId::derive(&path, "rust", "different", "function");
+    Connection::open(fixture.database())
+        .unwrap()
+        .execute(
+            "UPDATE symbols SET symbol_id = ?1 WHERE symbol_id = ?2",
+            [forged.to_string(), symbol.id.to_string()],
+        )
+        .unwrap();
+
+    assert!(cache.symbols_named(&key, "interesting", 10).is_err());
+}
+
+#[test]
+fn symbol_parent_association_is_revalidated_on_read() {
+    let fixture = StoreFixture::new();
+    let cache = fixture.open();
+    let key = worktree("alpha");
+    let path = RepoPath::from_bytes(b"src/lib.rs".to_vec());
+    let parent_id = SymbolId::derive(&path, "rust", "outer", "function");
+    let child_id = SymbolId::derive(&path, "rust", "outer::inner", "function");
+    let symbols = [
+        SymbolRecord {
+            id: parent_id.clone(),
+            name: "outer".to_owned(),
+            qualified_path: "outer".to_owned(),
+            kind: "function".to_owned(),
+            ordinal: 0,
+            byte_range: ByteRange::new(0, 33),
+            parent: None,
+            is_test: false,
+            name_is_lossy: false,
+        },
+        SymbolRecord {
+            id: child_id,
+            name: "inner".to_owned(),
+            qualified_path: "outer::inner".to_owned(),
+            kind: "function".to_owned(),
+            ordinal: 0,
+            byte_range: ByteRange::new(17, 30),
+            parent: Some(parent_id.clone()),
+            is_test: false,
+            name_is_lossy: false,
+        },
+    ];
+    commit_symbol_rows(
+        &cache,
+        &key,
+        "/workspaces/alpha",
+        "src/lib.rs",
+        b"fn outer() {\n    fn inner() {}\n}\n",
+        &symbols,
+    );
+
+    Connection::open(fixture.database())
+        .unwrap()
+        .execute(
+            "UPDATE symbols SET start_byte = 18 WHERE symbol_id = ?1",
+            [parent_id.to_string()],
+        )
+        .unwrap();
+
+    assert!(cache.symbols_named(&key, "inner", 10).is_err());
+}
+
+#[test]
+fn stored_ranges_are_bounded_and_schema_checks_reject_impossible_integers() {
+    let fixture = StoreFixture::new();
+    let cache = fixture.open();
+    let key = worktree("alpha");
+    let path = RepoPath::from_bytes(b"src/lib.rs".to_vec());
+    let symbol = SymbolRecord {
+        id: SymbolId::derive(&path, "rust", "item", "function"),
+        name: "item".to_owned(),
+        qualified_path: "item".to_owned(),
+        kind: "function".to_owned(),
+        ordinal: 0,
+        byte_range: ByteRange::new(0, 12),
+        parent: None,
+        is_test: false,
+        name_is_lossy: false,
+    };
+    let version = commit_symbol_rows(
+        &cache,
+        &key,
+        "/workspaces/alpha",
+        "src/lib.rs",
+        b"fn item() {}\n",
+        std::slice::from_ref(&symbol),
+    );
+    let connection = Connection::open(fixture.database()).unwrap();
+
+    assert!(
+        connection
+            .execute("UPDATE symbols SET start_byte = -1", [])
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute("UPDATE symbols SET start_byte = 12, end_byte = 1", [])
+            .is_err()
+    );
+    connection
+        .execute("UPDATE symbols SET start_byte = 0, end_byte = 100", [])
+        .unwrap();
+    assert!(cache.symbols_named(&key, "item", 10).is_err());
+    connection
+        .execute(
+            "INSERT INTO symbol_references \
+             (file_version_id, ordinal, name, start_byte, end_byte, start_line, end_line, name_is_lossy) \
+             VALUES (?1, 0, 'item', 0, 100, NULL, NULL, 0)",
+            [version.to_string()],
+        )
+        .unwrap();
+    assert!(cache.symbol_references_in_file(&key, &path, 10).is_err());
+
+    connection
+        .execute(
+            "UPDATE parse_health SET status = 'partial', reason = NULL, \
+             error_ranges_json = '[{\"start\":0,\"end\":100,\"first_line\":null,\"last_line\":null}]' \
+             WHERE file_version_id = ?1",
+            [version.to_string()],
+        )
+        .unwrap();
+    assert!(cache.parse_health(&key, &path).is_err());
+}
+
+#[test]
+fn symbol_buffer_flushes_by_rows_before_commit_without_publishing() {
+    let fixture = StoreFixture::new();
+    let cache = fixture.open();
+    let key = worktree("alpha");
+    let cancellation = Cancellation::default();
+    let bytes = b"x";
+    let entry = entry("src/lib.rs", bytes);
+    let (version, chunks) = derive_language(&entry, bytes, "rust");
+    let symbols = (0..600)
+        .map(|ordinal| {
+            let name = format!("item_{ordinal}");
+            SymbolRecord {
+                id: SymbolId::derive(&entry.path, "rust", &name, "function"),
+                name: name.clone(),
+                qualified_path: name,
+                kind: "function".to_owned(),
+                ordinal: 0,
+                byte_range: ByteRange::new(0, 1),
+                parent: None,
+                is_test: false,
+                name_is_lossy: false,
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut batch = cache
+        .begin(
+            &key,
+            Path::new("/workspaces/alpha"),
+            BatchScope::Full,
+            &cancellation,
+        )
+        .unwrap();
+    batch
+        .record_chunked(&entry, &version, &chunks, CLASSIFY_VERSION)
+        .unwrap();
+    batch
+        .record_symbols(version.id(), "rust-1", &symbols)
+        .unwrap();
+
+    assert_eq!(count(&fixture.database(), "symbols"), 600);
+    assert!(cache.symbols_named(&key, "item_0", 10).unwrap().is_empty());
+}
+
+#[test]
+fn symbol_buffer_flushes_by_dynamic_bytes_before_commit() {
+    let fixture = StoreFixture::new();
+    let cache = fixture.open();
+    let key = worktree("alpha");
+    let cancellation = Cancellation::default();
+    let bytes = b"x";
+    let entry = entry("src/lib.rs", bytes);
+    let (version, chunks) = derive_language(&entry, bytes, "rust");
+    let symbols = (0..64)
+        .map(|ordinal| {
+            let name = format!("{}_{ordinal}", "x".repeat(36_000));
+            SymbolRecord {
+                id: SymbolId::derive(&entry.path, "rust", &name, "function"),
+                name: name.clone(),
+                qualified_path: name,
+                kind: "function".to_owned(),
+                ordinal: 0,
+                byte_range: ByteRange::new(0, 1),
+                parent: None,
+                is_test: false,
+                name_is_lossy: false,
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut batch = cache
+        .begin(
+            &key,
+            Path::new("/workspaces/alpha"),
+            BatchScope::Full,
+            &cancellation,
+        )
+        .unwrap();
+    batch
+        .record_chunked(&entry, &version, &chunks, CLASSIFY_VERSION)
+        .unwrap();
+    batch
+        .record_symbols(version.id(), "rust-1", &symbols)
+        .unwrap();
+
+    assert_eq!(count(&fixture.database(), "symbols"), 64);
+    assert!(
+        cache
+            .symbols_named(&key, &symbols[0].name, 10)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn health_only_rows_round_trip_without_a_language_and_keep_transcoded_reason() {
+    let fixture = StoreFixture::new();
+    let cache = fixture.open();
+    let key = worktree("alpha");
+    let cancellation = Cancellation::default();
+    let bytes = b"plain text\n";
+    let notes_entry = entry("notes", bytes);
+    let (version, chunks) = derive(&notes_entry, bytes);
+    let extraction = FileSymbols::skipped(
+        LanguageDetection {
+            language: None,
+            source: None,
+        },
+        "",
+        ExtractionSkipReason::UnknownLanguage,
+    );
+    let mut batch = cache
+        .begin(
+            &key,
+            Path::new("/workspaces/alpha"),
+            BatchScope::Full,
+            &cancellation,
+        )
+        .unwrap();
+    batch
+        .record_chunked(&notes_entry, &version, &chunks, CLASSIFY_VERSION)
+        .unwrap();
+    batch.record_extraction(version.id(), &extraction).unwrap();
+    batch.commit(&cancellation).unwrap();
+    assert!(matches!(
+        cache
+            .parse_health(&key, &notes_entry.path)
+            .unwrap()
+            .unwrap()
+            .health,
+        ParseHealth::Skipped {
+            reason: ExtractionSkipReason::UnknownLanguage
+        }
+    ));
+
+    let rust_entry = entry("src/lib.rs", b"fn item() {}\n");
+    let (rust_version, rust_chunks) = derive_language(&rust_entry, b"fn item() {}\n", "rust");
+    let transcoded = FileSymbols::skipped(
+        LanguageDetection {
+            language: crate::Language::new("rust").ok(),
+            source: Some(LanguageDetectionSource::Extension),
+        },
+        "rust-1",
+        ExtractionSkipReason::TranscodedInput,
+    );
+    let mut batch = cache
+        .begin(
+            &key,
+            Path::new("/workspaces/alpha"),
+            BatchScope::Targeted,
+            &cancellation,
+        )
+        .unwrap();
+    batch
+        .record_chunked(&rust_entry, &rust_version, &rust_chunks, CLASSIFY_VERSION)
+        .unwrap();
+    batch
+        .record_extraction(rust_version.id(), &transcoded)
+        .unwrap();
+    batch.commit(&cancellation).unwrap();
+    assert!(matches!(
+        cache
+            .parse_health(&key, &rust_entry.path)
+            .unwrap()
+            .unwrap()
+            .health,
+        ParseHealth::Skipped {
+            reason: ExtractionSkipReason::TranscodedInput
+        }
+    ));
+}
+
+#[test]
+fn incomplete_symbol_files_counts_only_visible_budget_failures_in_one_worktree() {
+    let fixture = StoreFixture::new();
+    let cache = fixture.open();
+    let alpha = worktree("alpha");
+    let beta = worktree("beta");
+    let alpha_path = RepoPath::from_bytes(b"src/alpha.rs".to_vec());
+    let beta_path = RepoPath::from_bytes(b"src/beta.rs".to_vec());
+    let alpha_symbol = SymbolRecord {
+        id: SymbolId::derive(&alpha_path, "rust", "alpha", "function"),
+        name: "alpha".to_owned(),
+        qualified_path: "alpha".to_owned(),
+        kind: "function".to_owned(),
+        ordinal: 0,
+        byte_range: ByteRange::new(0, 13),
+        parent: None,
+        is_test: false,
+        name_is_lossy: false,
+    };
+    let beta_symbol = SymbolRecord {
+        id: SymbolId::derive(&beta_path, "rust", "beta", "function"),
+        name: "beta".to_owned(),
+        qualified_path: "beta".to_owned(),
+        kind: "function".to_owned(),
+        ordinal: 0,
+        byte_range: ByteRange::new(0, 12),
+        parent: None,
+        is_test: false,
+        name_is_lossy: false,
+    };
+    let alpha_version = commit_symbol_rows(
+        &cache,
+        &alpha,
+        "/workspaces/alpha",
+        "src/alpha.rs",
+        b"fn alpha() {}\n",
+        &[alpha_symbol],
+    );
+    let beta_version = commit_symbol_rows(
+        &cache,
+        &beta,
+        "/workspaces/beta",
+        "src/beta.rs",
+        b"fn beta() {}\n",
+        &[beta_symbol],
+    );
+    let connection = Connection::open(fixture.database()).unwrap();
+    connection
+        .execute(
+            "UPDATE parse_health SET status = 'failed', reason = 'symbol_budget_exhausted', \
+             error_ranges_json = '[]' WHERE file_version_id = ?1",
+            [alpha_version.to_string()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE parse_health SET status = 'failed', reason = 'parser_failed', \
+             error_ranges_json = '[]' WHERE file_version_id = ?1",
+            [beta_version.to_string()],
+        )
+        .unwrap();
+
+    assert_eq!(cache.incomplete_symbol_files(&alpha).unwrap(), 1);
+    assert_eq!(cache.incomplete_symbol_files(&beta).unwrap(), 0);
+    connection
+        .execute(
+            "UPDATE parse_health SET reason = 'reference_budget_exhausted' \
+             WHERE file_version_id = ?1",
+            [beta_version.to_string()],
+        )
+        .unwrap();
+    assert_eq!(cache.incomplete_symbol_files(&beta).unwrap(), 1);
+}
+
+#[test]
+fn a_grammar_bump_invalidates_only_that_languages_rows() {
+    let fixture = StoreFixture::new();
+    let cache = fixture.open();
+    let key = worktree("alpha");
+    let cancellation = Cancellation::default();
+    cache
+        .refresh_grammar_versions(&[
+            ("rust".to_owned(), "rust-1".to_owned()),
+            ("toml".to_owned(), "toml-1".to_owned()),
+        ])
+        .unwrap();
+
+    let rust_entry = entry("src/lib.rs", b"fn rust_item() {}\n");
+    let rust_version = FileVersion::new(
+        &rust_entry,
+        SnapshotId::new(),
+        Arc::from(&b"fn rust_item() {}\n"[..]),
+        &cancellation,
+    )
+    .unwrap()
+    .with_language(crate::Language::new("rust").unwrap());
+    let rust_chunks = chunk_file(&rust_version, None, &cancellation).unwrap();
+    let toml_entry = InventoryEntry {
+        class: FileClass::Configuration,
+        ..entry("Cargo.toml", b"[package]\nname = \"demo\"\n")
+    };
+    let toml_version = FileVersion::new(
+        &toml_entry,
+        SnapshotId::new(),
+        Arc::from(&b"[package]\nname = \"demo\"\n"[..]),
+        &cancellation,
+    )
+    .unwrap()
+    .with_language(crate::Language::new("toml").unwrap());
+    let toml_chunks = chunk_file(&toml_version, None, &cancellation).unwrap();
+
+    let mut batch = cache
+        .begin(
+            &key,
+            Path::new("/workspaces/alpha"),
+            BatchScope::Full,
+            &cancellation,
+        )
+        .unwrap();
+    batch
+        .record_chunked(&rust_entry, &rust_version, &rust_chunks, CLASSIFY_VERSION)
+        .unwrap();
+    batch
+        .record_symbols(
+            rust_version.id(),
+            "rust-1",
+            &[SymbolRecord {
+                id: SymbolId::derive(&rust_entry.path, "rust", "rust_item", "function"),
+                name: "rust_item".to_owned(),
+                qualified_path: "rust_item".to_owned(),
+                kind: "function".to_owned(),
+                ordinal: 0,
+                byte_range: ByteRange::new(0, 17),
+                parent: None,
+                is_test: false,
+                name_is_lossy: false,
+            }],
+        )
+        .unwrap();
+    batch
+        .record_chunked(&toml_entry, &toml_version, &toml_chunks, CLASSIFY_VERSION)
+        .unwrap();
+    batch
+        .record_symbols(
+            toml_version.id(),
+            "toml-1",
+            &[SymbolRecord {
+                id: SymbolId::derive(&toml_entry.path, "toml", "package", "module"),
+                name: "package".to_owned(),
+                qualified_path: "package".to_owned(),
+                kind: "module".to_owned(),
+                ordinal: 0,
+                byte_range: ByteRange::new(0, 9),
+                parent: None,
+                is_test: false,
+                name_is_lossy: false,
+            }],
+        )
+        .unwrap();
+    batch.commit(&cancellation).unwrap();
+
+    let toml_before = cache.symbols_named(&key, "package", 10).unwrap();
+    assert_eq!(cache.status().counts.unwrap().symbols, 2);
+    let invalidated = cache
+        .refresh_grammar_versions(&[
+            ("rust".to_owned(), "rust-2".to_owned()),
+            ("toml".to_owned(), "toml-1".to_owned()),
+        ])
+        .unwrap();
+
+    assert!(invalidated > 0);
+    assert!(
+        cache
+            .symbols_named(&key, "rust_item", 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        cache.symbols_named(&key, "package", 10).unwrap(),
+        toml_before
+    );
+    assert_eq!(cache.status().counts.unwrap().symbols, 1);
+    assert_eq!(
+        cache
+            .file(&key, &rust_entry.path)
+            .unwrap()
+            .unwrap()
+            .parser_version,
+        None
+    );
+    assert_eq!(
+        cache
+            .file(&key, &toml_entry.path)
+            .unwrap()
+            .unwrap()
+            .parser_version
+            .as_deref(),
+        Some("toml-1")
     );
 }
 
@@ -1184,7 +1765,7 @@ fn a_parser_bump_empties_only_the_symbols() {
     let cancellation = Cancellation::default();
     let bytes = b"fn interesting() {}\n";
     let entry = entry("src/lib.rs", bytes);
-    let (version, chunks) = derive(&entry, bytes);
+    let (version, chunks) = derive_language(&entry, bytes, "rust");
     let mut batch = cache
         .begin(
             &key,
@@ -1205,7 +1786,11 @@ fn a_parser_bump_empties_only_the_symbols() {
                 name: "interesting".to_owned(),
                 qualified_path: "interesting".to_owned(),
                 kind: "function".to_owned(),
+                ordinal: 0,
                 byte_range: ByteRange::new(0, 19),
+                parent: None,
+                is_test: false,
+                name_is_lossy: false,
             }],
         )
         .unwrap();

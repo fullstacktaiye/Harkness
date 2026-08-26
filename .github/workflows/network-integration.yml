@@ -219,6 +219,28 @@ jobs:
           harkness-context
           chunk::tests::chunking_one_megabyte_meets_the_latency_target
           --release
+      # Issue #117 puts grammar extraction on every supported file in a cold
+      # build and symbol lookup on the warm retrieval path. Both ignored tests
+      # therefore run here by exact name instead of existing only as local
+      # benchmarks.
+      - name: Measure symbol extraction
+        run: >-
+          sh .github/scripts/run-ignored-exact-test.sh
+          harkness-context
+          symbols::tests::rust_extraction_meets_the_single_file_throughput_target
+          --release
+      - name: Measure warm symbol lookup
+        run: >-
+          sh .github/scripts/run-ignored-exact-test.sh
+          harkness-context
+          engine::tests::warm_symbol_lookup_meets_the_latency_target
+          --release
+      - name: Measure symbol index growth
+        run: >-
+          sh .github/scripts/run-ignored-exact-test.sh
+          harkness-context
+          engine::tests::symbol_index_growth_stays_within_the_medium_profile_target
+          --release
       # Issue #115 makes the headline promise of the context engine: one edit
       # updates the index within about a second of the editor going quiet. The
       # default suite asserts the same path's correctness with no clock in it;

@@ -66,14 +66,15 @@ use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use harkness_core::ProjectId;
 use harkness_git::{Cancellation, GitService, HeadState};
 
-use crate::chunk::{FileVersion, chunk_file};
+use crate::chunk::FileVersion;
 use crate::digest::{Sha256Hex, empty_path_set_digest};
 use crate::error::{ContextDomainError, ContextEngineError};
 use crate::ids::ChunkId;
 use crate::index::{
     self, BatchReceipt, BatchScope, CacheRecreation, ExpectedVersions, ForgetReport,
     IndexAvailability, IndexCache, IndexCounts, IndexReport, IndexStatus, IndexedChunk,
-    IndexedFile, IndexedPage, RecreationReason, WorktreeKey,
+    IndexedFile, IndexedPage, IndexedParseHealth, IndexedSymbol, IndexedSymbolReference,
+    RecreationReason, WorktreeKey,
 };
 use crate::inventory::{
     FileInventory, GLOBAL_IGNORE_FILE, InventoryBuilder, InventoryEntry, InventoryPolicy,
@@ -83,6 +84,8 @@ use crate::probe::FilesystemProbe;
 use crate::reconcile::{ReconcileReport, ReconcileScope, Reconciler};
 use crate::search::{Scan, SearchQuery, SearchResponse};
 use crate::snapshot::{Capture, CaptureRequest, WorkspaceSnapshot};
+use crate::symbol_pipeline::{chunk_with_symbol_outline, extract_file_symbols};
+use crate::symbols::{FileSymbols, LanguageRegistry};
 use crate::watch::{WatchOptions, WatchService};
 
 /// A group of engine settings a repository may narrow.
@@ -379,6 +382,7 @@ pub struct ContextEngine {
     cache_root: PathBuf,
     git: GitService,
     cache: RwLock<Cache>,
+    symbols: LanguageRegistry,
 }
 
 impl ContextEngine {
@@ -446,12 +450,18 @@ impl ContextEngine {
             cancellation,
         );
         let git = GitService::new(&config.worktree_root, &config.data_dir);
+        let symbols = LanguageRegistry::built_in().map_err(|error| {
+            ContextEngineError::SymbolAdapterUnavailable {
+                reason: error.to_string(),
+            }
+        })?;
         Ok(Self {
             config,
             repository_key,
             cache_root,
             git,
             cache: RwLock::new(cache),
+            symbols,
         })
     }
 
@@ -727,7 +737,8 @@ impl ContextEngine {
     ///
     /// # Errors
     ///
-    /// [`ContextEngineError::NotYetAvailable`] until [#117] lands.
+    /// `index_unavailable` until this worktree has been indexed, plus cache
+    /// read failures.
     ///
     /// [#117]: https://github.com/fullstacktaiye/harkness/issues/117
     pub fn symbols(
@@ -735,8 +746,32 @@ impl ContextEngine {
         query: &SymbolQuery,
         cancellation: &Cancellation,
     ) -> Result<SymbolResults, ContextEngineError> {
-        let _ = (query, cancellation);
-        Err(unavailable("symbol lookup"))
+        if cancellation.is_cancelled() {
+            return Err(ContextEngineError::Cancelled);
+        }
+        let worktree = self.worktree_key();
+        let (page, incomplete_files) = self.with_cache(|cache| {
+            if cache.worktree_generation(&worktree)? == 0 {
+                return Err(crate::search::SearchError::IndexUnavailable {
+                    worktree: worktree.as_str().to_owned(),
+                    reason: "build or reconcile the context index before looking up symbols",
+                }
+                .into());
+            }
+            let page = match &query.lookup {
+                SymbolLookup::ExactName(name) => cache.symbols_named(&worktree, name, query.limit),
+                SymbolLookup::QualifiedSuffix(suffix) => {
+                    cache.symbols_qualified_suffix(&worktree, suffix, query.limit)
+                }
+                SymbolLookup::File(path) => cache.symbols_in_file(&worktree, path, query.limit),
+            }?;
+            Ok((page, cache.incomplete_symbol_files(&worktree)?))
+        })?;
+        Ok(SymbolResults {
+            symbols: page.rows,
+            more: page.more,
+            incomplete_files,
+        })
     }
 
     /// The structural map of the repository ([#118]).
@@ -865,6 +900,8 @@ impl ContextEngine {
         // Reconciled before anything is written, so a build under a bumped
         // chunking version does not add rows beside the ones it invalidates.
         self.refresh_index(cancellation)?;
+        let grammar_versions = self.symbols.versions();
+        self.with_cache(|cache| cache.refresh_grammar_versions(&grammar_versions))?;
 
         let snapshot = self.snapshot(cancellation)?;
         let inventory = InventoryBuilder::build(&snapshot, &self.inventory_policy(), cancellation)?;
@@ -889,8 +926,9 @@ impl ContextEngine {
                 }
                 match self.derive(entry, snapshot.id(), cancellation)? {
                     Derived::Content(derived) => {
-                        let (version, chunks) = derived.as_ref();
+                        let (version, chunks, symbols) = derived.as_ref();
                         batch.record_chunked(entry, version, chunks, classify_version)?;
+                        batch.record_extraction(version.id(), symbols)?;
                     }
                     // A path whose content is never read — a binary, a symlink,
                     // a repository boundary. Recording it without content is the
@@ -963,6 +1001,8 @@ impl ContextEngine {
         // repairing, which is exactly the class of answer this whole module
         // refuses to give.
         self.refresh_index(cancellation)?;
+        let grammar_versions = self.symbols.versions();
+        self.with_cache(|cache| cache.refresh_grammar_versions(&grammar_versions))?;
 
         let policy = self.inventory_policy();
         let marker = self.head_marker();
@@ -974,6 +1014,7 @@ impl ContextEngine {
                 root: &self.config.worktree_root,
                 policy: &policy,
                 head_marker: marker.clone(),
+                symbols: &self.symbols,
             }
             .run(scope, cancellation)
         })
@@ -1104,8 +1145,13 @@ impl ContextEngine {
             Err(crate::chunk::ChunkError::Cancelled) => return Err(ContextEngineError::Cancelled),
             Err(_) => return Ok(Derived::Unreadable),
         };
-        match chunk_file(&version, None, cancellation) {
-            Ok(chunks) => Ok(Derived::Content(Box::new((version, chunks)))),
+        let extracted = extract_file_symbols(&self.symbols, &entry.path, &version, cancellation);
+        let version = match extracted.detection.language.clone() {
+            Some(language) => version.with_language(language),
+            None => version,
+        };
+        match chunk_with_symbol_outline(&version, &extracted, cancellation) {
+            Ok(chunks) => Ok(Derived::Content(Box::new((version, chunks, extracted)))),
             Err(crate::chunk::ChunkError::Cancelled) => Err(ContextEngineError::Cancelled),
             Err(_) => Ok(Derived::Unreadable),
         }
@@ -1159,6 +1205,25 @@ impl ContextEngine {
     pub fn indexed_chunks(&self, path: &RepoPath) -> Result<Vec<IndexedChunk>, ContextEngineError> {
         let key = self.worktree_key();
         self.with_cache(|cache| cache.chunks(&key, path))
+    }
+
+    /// Parse health for one indexed file.
+    pub fn symbol_health(
+        &self,
+        path: &RepoPath,
+    ) -> Result<Option<IndexedParseHealth>, ContextEngineError> {
+        let key = self.worktree_key();
+        self.with_cache(|cache| cache.parse_health(&key, path))
+    }
+
+    /// Best-effort unresolved mentions in one indexed file.
+    pub fn indexed_symbol_references(
+        &self,
+        path: &RepoPath,
+        limit: usize,
+    ) -> Result<IndexedPage<IndexedSymbolReference>, ContextEngineError> {
+        let key = self.worktree_key();
+        self.with_cache(|cache| cache.symbol_references_in_file(&key, path, limit))
     }
 
     /// Re-checks the cache and reconciles what this build can.
@@ -1302,7 +1367,7 @@ enum Derived {
     ///
     /// Boxed because the other two carry nothing, and one value per file of a
     /// hundred-thousand-file walk is a size worth not paying on every entry.
-    Content(Box<(FileVersion, crate::chunk::ChunkSet)>),
+    Content(Box<(FileVersion, crate::chunk::ChunkSet, FileSymbols)>),
     /// The entry is one whose content is never read.
     Ineligible,
     /// The entry should have been read and could not be.
@@ -1361,17 +1426,68 @@ impl InventoryRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct SymbolQuery {
-    /// The symbol name to look for.
-    pub name: String,
+    /// Match shape.
+    pub lookup: SymbolLookup,
+    /// Maximum rows returned; capped by the store.
+    pub limit: usize,
 }
 
 impl SymbolQuery {
     /// Looks up `name`.
     #[must_use]
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
+        Self::exact_name(name)
+    }
+
+    /// Looks up one exact bare declaration name.
+    #[must_use]
+    pub fn exact_name(name: impl Into<String>) -> Self {
+        Self {
+            lookup: SymbolLookup::ExactName(name.into()),
+            limit: DEFAULT_SYMBOL_RESULTS,
+        }
+    }
+
+    /// Looks up declarations whose qualified name ends in `suffix`.
+    #[must_use]
+    pub fn qualified_suffix(suffix: impl Into<String>) -> Self {
+        Self {
+            lookup: SymbolLookup::QualifiedSuffix(suffix.into()),
+            limit: DEFAULT_SYMBOL_RESULTS,
+        }
+    }
+
+    /// Lists declarations in one repository-relative file.
+    #[must_use]
+    pub fn file(path: RepoPath) -> Self {
+        Self {
+            lookup: SymbolLookup::File(path),
+            limit: DEFAULT_SYMBOL_RESULTS,
+        }
+    }
+
+    /// Sets the bounded row count.
+    #[must_use]
+    pub const fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
     }
 }
+
+/// How a symbol lookup matches the index.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum SymbolLookup {
+    /// Exact bare name.
+    ExactName(String),
+    /// Qualified-name suffix.
+    QualifiedSuffix(String),
+    /// Every declaration in one file.
+    File(RepoPath),
+}
+
+/// Default maximum declarations returned by one symbol query.
+pub const DEFAULT_SYMBOL_RESULTS: usize = 1_000;
 
 /// What a repository map should cover.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1420,7 +1536,18 @@ pub struct ChunkContent {}
 /// [#117]: https://github.com/fullstacktaiye/harkness/issues/117
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
-pub struct SymbolResults {}
+pub struct SymbolResults {
+    /// Deterministically ordered declarations.
+    pub symbols: Vec<IndexedSymbol>,
+    /// Whether the requested bound stopped the answer.
+    pub more: bool,
+    /// Visible files whose extraction exceeded a per-file symbol or reference bound.
+    ///
+    /// A non-zero value means an empty lookup is not proof that the worktree has
+    /// no matching declaration: those files deliberately published no partial
+    /// structural inventory and remain available through lexical chunks.
+    pub incomplete_files: u64,
+}
 
 /// The structural map of a repository ([#118]).
 ///

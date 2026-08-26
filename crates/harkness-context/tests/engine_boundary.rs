@@ -176,22 +176,25 @@ fn searching_an_unindexed_worktree_refuses_rather_than_answering_empty() {
     assert!(ContextEngineError::kinds().contains(&"index_unavailable"));
 }
 
-/// Every retrieval issue has a compiling seam today and a typed refusal until it
-/// lands. Nothing panics and nothing fabricates a result.
+/// Every remaining retrieval issue has a compiling seam and a typed refusal.
 #[test]
 fn the_unimplemented_facade_methods_refuse_by_name_from_outside_the_crate() {
     let workspace = Workspace::new();
     let engine = workspace.engine();
     let cancellation = Cancellation::default();
     let chunk = ChunkId::derive(&RepoPath::from_path(Path::new("src/lib.rs")), "0", b"");
+    engine.reindex(&cancellation).unwrap();
+    assert!(
+        engine
+            .symbols(&SymbolQuery::new("Thing"), &cancellation)
+            .unwrap()
+            .symbols
+            .is_empty()
+    );
 
     let refusals = [
         engine
             .read_chunk(&chunk, &cancellation)
-            .map(|_| ())
-            .unwrap_err(),
-        engine
-            .symbols(&SymbolQuery::new("Thing"), &cancellation)
             .map(|_| ())
             .unwrap_err(),
         engine

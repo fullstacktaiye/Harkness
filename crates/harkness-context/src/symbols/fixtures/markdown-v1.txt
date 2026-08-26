@@ -1,0 +1,4 @@
+section|Install|Install|0..10|-|false|false
+section|Linux|Install::Linux|31..40|Install|false|false
+section|Fedora|Install::Linux::Fedora|58..69|Install::Linux|false|false
+section|Usage|Usage|86..94|-|false|false

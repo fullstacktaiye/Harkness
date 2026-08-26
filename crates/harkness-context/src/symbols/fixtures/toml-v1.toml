@@ -1,0 +1,7 @@
+name = "demo"
+
+[package]
+version = "1"
+
+[package.metadata]
+license = "MIT"

@@ -199,6 +199,13 @@ pub enum ContextEngineError {
         feature: &'static str,
     },
 
+    /// A built-in language adapter could not be registered at startup.
+    #[error("the symbol adapter registry is unavailable: {reason}")]
+    SymbolAdapterUnavailable {
+        /// Query-compilation or registration diagnostic.
+        reason: String,
+    },
+
     /// The index cache could not be opened, created, or written.
     ///
     /// The engine still serves everything that does not read the cache — the
@@ -430,6 +437,7 @@ impl ContextEngineError {
     /// error surface wants; this table is the half that belongs to the engine.
     pub const KINDS: &'static [&'static str] = &[
         "not_yet_available",
+        "symbol_adapter_unavailable",
         "cache_open_failed",
         "cache_version_conflict",
         "cache_corrupt_quarantined",
@@ -446,6 +454,7 @@ impl ContextEngineError {
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::NotYetAvailable { .. } => "not_yet_available",
+            Self::SymbolAdapterUnavailable { .. } => "symbol_adapter_unavailable",
             Self::CacheOpenFailed { .. } => "cache_open_failed",
             Self::CacheVersionConflict { .. } => "cache_version_conflict",
             Self::CacheCorruptQuarantined { .. } => "cache_corrupt_quarantined",
@@ -600,6 +609,12 @@ mod tests {
             (
                 ContextEngineError::NotYetAvailable { feature: "search" },
                 "not_yet_available",
+            ),
+            (
+                ContextEngineError::SymbolAdapterUnavailable {
+                    reason: "invalid query".to_owned(),
+                },
+                "symbol_adapter_unavailable",
             ),
             (
                 ContextEngineError::CacheOpenFailed {

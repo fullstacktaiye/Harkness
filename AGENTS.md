@@ -6,7 +6,7 @@ Harkness is a Rust 2024 workspace split into thirteen crates under `crates/`:
 
 - `harkness-core`: project catalog, storage layout, cross-domain project workflows, and directory-listing logic shared by front ends.
 - `harkness-git`: all production Git behavior: inspection, diffs and history, change provenance, file context and hunk staging, branch and worktree mutation, commits, clone and synchronization, hermetic process execution, and repository locking.
-- `harkness-context`: the context engine's typed vocabulary — workspace snapshot identity, stable identifiers, provenance, and file classification — the disposable per-repository index cache beneath it, the pair that keeps that cache current (a filesystem watcher whose events are treated strictly as hints, and a reconciler that decides truth by comparing the worktree against the stored rows), and the deterministic search that reads its universe out of that cache and never out of the filesystem.
+- `harkness-context`: the context engine's typed vocabulary — workspace snapshot identity, stable identifiers, provenance, and file classification — the disposable per-repository index cache beneath it, the pair that keeps that cache current (a filesystem watcher whose events are treated strictly as hints, and a reconciler that decides truth by comparing the worktree against the stored rows), the deterministic search that reads its universe out of that cache and never out of the filesystem, and the language registry whose Rust, TOML, and Markdown adapters extract syntax-only symbols, parse health, and unresolved mentions without leaking tree-sitter types.
 - `harkness-provider`: the provider-neutral model contract, the streaming turn assembler, and the deterministic scripted provider. Every concrete model adapter lives here and keeps its wire types private; nothing above learns what an endpoint's JSON looks like.
 - `harkness-transport`: the shared subprocess JSON-RPC engine both protocol adapters run on — hermetic allowlisted spawn, newline-delimited framing, request correlation, bounded messages, and the close-stdin/`SIGTERM`/`SIGKILL` teardown. Below every adapter and above nothing but `harkness-git`.
 - `harkness-acp`: the Agent Client Protocol client — the wire vocabulary, the `initialize` handshake, protocol-version and capability negotiation, and gated authentication. Sessions, mediation, and the rest of the v0.5 ACP surface land here beside them.
@@ -845,6 +845,87 @@ reclassifies evidence recorded under the old rules.
 `docs/context-inventory.md` is the reference for the denial list, the class
 precedence, and the bounds; `docs/context-index.md` is the reference for what
 the cache does with what the walk found.
+
+## Context Symbol Extraction Invariants
+
+**A symbol is syntax and never semantic resolution.** It records what one
+language grammar parsed at one exact byte range: a typed declaration, its
+structural parent and qualified name, a bounded signature line, test status, and
+an optional unresolved name mention. It never claims a mention resolves to a
+declaration, a method dispatches to an implementation, or a file compiles. No
+ranking, editing, refactoring, or mutation decision may act as though it does.
+`SymbolSource` is the seam a future LSP-backed source attaches to; tree-sitter
+types stay private to `symbols/` and never leak into that interface or the
+index.
+
+**Detection is extension, then shebang, then a bounded heuristic.** The first
+answer wins, so contradictory content does not make a known filename change
+languages after an unrelated edit. Detection covers more languages than the
+adapter registry deliberately: a detected Python file is
+`Skipped { reason: UnsupportedLanguage }`, which is different from a supported
+file whose complete parse produced no declarations. A file no rule claims is
+`UnknownLanguage`; neither answer is an error and neither may be reported as a
+successful empty extraction.
+
+**Only an eligible inventory entry reaches an adapter.** A built-in denied path
+does not exist in the inventory, and `SecretSensitive`, `Binary`, `Oversized`,
+symlink, repository-boundary, and unreadable entries are never parsed. This is
+the same by-construction exclusion search relies on, not a second filter beside
+the registry. Adding a direct filesystem path to symbol extraction would bypass
+the denial boundary and is forbidden.
+
+**Every language is a registration and every query compiles at startup.** Rust,
+TOML, and Markdown implement `LanguageAdapter`; adding another language is one
+grammar dependency, one adapter, its registration, and versioned fixtures.
+Malformed tree-sitter queries fail engine startup as
+`symbol_adapter_unavailable`, never surprise the first file that happens to
+match. `catch_unwind` surrounds exactly one adapter call: a grammar panic makes
+that file `Failed { reason: "adapter_panicked" }`, records the health, and lets
+the indexing pass continue.
+
+**Parse health is an answer, not a diagnostic side channel.** `Complete` means
+no error or missing node, `Partial` carries exact error ranges while keeping
+declarations recovered around them, `Failed` carries a bounded stable reason,
+and `Skipped` names why extraction did not run. A query asking why a file has no
+symbols reads this row. It never infers health from an empty symbol list and
+never reparses at query time.
+
+**Landed identities and ranges win over issue-era sketches.** `SymbolId` keeps
+the domain-separated, length-framed derivation over exact path bytes, language,
+qualified name, and kind; content and byte position do not participate, so a
+body edit does not churn identity. `ByteRange` is the one half-open range type.
+Duplicate declarations receive byte-order ordinals, but ordinal zero keeps the
+frozen derivation untouched; only a residual duplicate adds a private
+`#duplicate:<ordinal>` suffix to the qualified identity input, never to the
+displayed name. Names decoded lossily say so while their ranges remain exact.
+
+**The symbol inventory and the chunk outline are related but not identical.**
+Parents and children overlap in a declaration tree, while `StructuralOutline`
+requires non-overlapping nodes. The adapter projects leaf declarations into the
+outline, preserving the associated `SymbolId`; it never hands the overlapping
+inventory wholesale to the chunker. Supported source therefore chunks at symbol
+boundaries, while an unsupported, failed, or empty outline takes the honest
+line-window fallback.
+
+**Grammar invalidation is per language.** The parser component marker versions
+shared detection and identity projection; `parser_versions` separately records
+each adapter's grammar version. A Rust grammar bump deletes Rust symbols,
+references and health, nulls only Rust file versions' parser marker, and makes
+only those rows suspects for reconciliation. TOML and Markdown rows survive
+byte-identically. A removed adapter is a language-local change too, so the next
+pass replaces its old successful parse with an unsupported health row. The
+schema is disposable version 4 and its frozen layout is
+`crates/harkness-context/src/index/fixtures/schema-v4.sql`.
+
+**Every lookup names a worktree and ends in a total order.** Exact bare-name and
+qualified-suffix queries join through visible `files` rows and order by
+qualified-name bytes, path bytes, then start offset. Per-file listings order by
+start offset then qualified name. Results are bounded and carry `more`; an
+unindexed worktree is `index_unavailable`, never an empty success. Lookup reads
+the cache only and never opens repository content.
+
+`docs/context-symbols.md` is the contributor guide, grammar-version policy,
+health table, and proof map.
 
 ## Context Search Invariants
 

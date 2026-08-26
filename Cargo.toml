@@ -80,6 +80,10 @@ shlex = "2.0.1"
 tempfile = "3.27"
 thiserror = "2.0"
 time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde-human-readable", "serde-well-known"] }
+tree-sitter = "0.26.13"
+tree-sitter-md = { package = "tree-sitter-md-025", version = "0.5.6" }
+tree-sitter-rust = "0.24.2"
+tree-sitter-toml = { package = "tree-sitter-toml-ng", version = "0.7.0" }
 # The diagnostic spine. `tracing` is the instrumentation vocabulary any crate may
 # use; `tracing-subscriber` is machinery only `harkness-runtime`'s `observe`
 # module assembles, and its default features are off deliberately. `ansi` would

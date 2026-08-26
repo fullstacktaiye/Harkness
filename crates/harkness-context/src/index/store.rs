@@ -43,7 +43,7 @@
 //!
 //! [#115]: https://github.com/fullstacktaiye/harkness/issues/115
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -61,6 +61,10 @@ use crate::ids::{ChunkId, FileVersionId, SymbolId};
 use crate::inventory::{Boundary, InventoryEntry};
 use crate::path::RepoPath;
 use crate::provenance::ByteRange;
+use crate::symbols::{
+    ExtractionSkipReason, FileSymbols, MAX_REFERENCES_PER_FILE, MAX_SYMBOLS_PER_FILE, ParseHealth,
+    Symbol, SymbolKind, SymbolReference,
+};
 
 use super::{IndexCache, IndexCounts, database_bytes, lock, sqlite_failure};
 
@@ -70,13 +74,16 @@ use super::{IndexCache, IndexCounts, database_bytes, lock, sqlite_failure};
 /// resolves to the same row on every machine and every build.
 const CONTEXT_WORKTREE_NAMESPACE: Uuid = Uuid::from_u128(0x1d4c_8f27_6a3b_5c9e_bf10_47d8_2e6a_9315);
 
-/// How many files one flush writes before it commits and releases the lock.
+/// How many derived rows one flush buffers before it commits and releases the lock.
 ///
 /// Small enough that a reader never waits long behind a cold build, large
-/// enough that a hundred thousand files are not a hundred thousand
+/// enough that a hundred thousand rows are not a hundred thousand
 /// transactions. Nothing depends on the exact value: the generation gate is
 /// what makes a flush safe, not its size.
-const FLUSH_FILES: usize = 256;
+const FLUSH_ROWS: usize = 512;
+
+/// Approximate dynamic bytes one batch buffers between flushes.
+const FLUSH_BYTES: usize = 4 * 1024 * 1024;
 
 /// Most rows any single read returns.
 ///
@@ -173,8 +180,53 @@ pub struct SymbolRecord {
     pub qualified_path: String,
     /// Parser-owned kind such as `function` or `type`.
     pub kind: String,
+    /// Deterministic byte-order ordinal for duplicate qualified declarations.
+    pub ordinal: u32,
     /// Half-open bytes of the declaration in the original file.
     pub byte_range: ByteRange,
+    /// Enclosing declaration, when one was extracted.
+    pub parent: Option<SymbolId>,
+    /// Whether test attributes or an enclosing test module apply.
+    pub is_test: bool,
+    /// Whether invalid UTF-8 was replaced in the stored name.
+    pub name_is_lossy: bool,
+}
+
+/// One unresolved name mention stored beside its file version.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SymbolReferenceRecord {
+    /// Mentioned spelling; no target is implied.
+    pub name: String,
+    /// Exact mention range.
+    pub byte_range: ByteRange,
+    /// Whether invalid UTF-8 was replaced in `name`.
+    pub name_is_lossy: bool,
+}
+
+impl From<&Symbol> for SymbolRecord {
+    fn from(symbol: &Symbol) -> Self {
+        Self {
+            id: symbol.id.clone(),
+            name: symbol.name.clone(),
+            qualified_path: symbol.qualified_name.clone(),
+            kind: symbol.kind.as_str().to_owned(),
+            ordinal: symbol.ordinal,
+            byte_range: symbol.byte_range,
+            parent: symbol.parent.clone(),
+            is_test: symbol.is_test,
+            name_is_lossy: symbol.name_is_lossy,
+        }
+    }
+}
+
+impl From<&SymbolReference> for SymbolReferenceRecord {
+    fn from(reference: &SymbolReference) -> Self {
+        Self {
+            name: reference.name.clone(),
+            byte_range: reference.byte_range,
+            name_is_lossy: reference.name_is_lossy,
+        }
+    }
 }
 
 /// What one committed batch did.
@@ -195,6 +247,14 @@ pub struct BatchReceipt {
     pub chunks_recorded: u64,
     /// Symbol rows written.
     pub symbols_recorded: u64,
+    /// Files for which a registered adapter attempted parsing.
+    pub files_parsed: u64,
+    /// Parsed files that retained bounded syntax-error ranges.
+    pub partial_files: u64,
+    /// Files whose adapter failed or panicked.
+    pub failed_files: u64,
+    /// Files deliberately skipped after detection.
+    pub skipped_files: u64,
     /// File rows a full batch's sweep deleted because nothing confirmed them.
     pub rows_swept: u64,
     /// Content-addressed rows dropped because no file row referenced them.
@@ -313,6 +373,10 @@ pub struct IndexedFile {
     /// symlink, a repository boundary — which is why the eligibility of the
     /// entry is asked first.
     pub chunking_version: Option<String>,
+    /// Detected language stored for the exact file version.
+    pub language: Option<Language>,
+    /// Grammar marker that produced this file's symbol rows.
+    pub parser_version: Option<String>,
     /// Batch generation that last confirmed this row.
     pub generation: u64,
 }
@@ -378,11 +442,51 @@ pub struct IndexedSymbol {
     /// Qualified structural path to the declaration.
     pub qualified_path: String,
     /// Parser-owned kind.
-    pub kind: String,
+    pub kind: SymbolKind,
+    /// Deterministic byte-order ordinal for duplicate declarations.
+    pub ordinal: u32,
     /// Half-open bytes of the declaration.
     pub byte_range: ByteRange,
+    /// Enclosing declaration, when one was extracted.
+    pub parent: Option<SymbolId>,
+    /// Whether test attributes or an enclosing test module apply.
+    pub is_test: bool,
+    /// Whether invalid UTF-8 was replaced in `name`.
+    pub name_is_lossy: bool,
     /// Grammar version that produced the row.
     pub parser_version: String,
+}
+
+/// Parse health stored for one exact file version.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct IndexedParseHealth {
+    /// Exact file version the answer describes.
+    pub file_version: FileVersionId,
+    /// Repository-relative path.
+    pub path: RepoPath,
+    /// Detected language, absent when detection found none.
+    pub language: Option<Language>,
+    /// Adapter marker that produced the answer.
+    pub grammar_version: String,
+    /// Complete, partial, failed, or intentionally skipped result.
+    pub health: ParseHealth,
+}
+
+/// One stored unresolved name mention.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct IndexedSymbolReference {
+    /// Exact file version the mention came from.
+    pub file_version: FileVersionId,
+    /// Repository-relative path.
+    pub path: RepoPath,
+    /// Mentioned spelling; no target is implied.
+    pub name: String,
+    /// Exact original-file mention range.
+    pub byte_range: ByteRange,
+    /// Whether invalid UTF-8 was replaced in `name`.
+    pub name_is_lossy: bool,
 }
 
 /// One file's rows, buffered until the next flush.
@@ -456,6 +560,8 @@ struct PendingSymbols {
     file_version: FileVersionId,
     parser_version: String,
     symbols: Vec<SymbolRecord>,
+    references: Vec<SymbolReferenceRecord>,
+    health: ParseHealth,
 }
 
 /// One reconciliation of one worktree, in flight.
@@ -484,9 +590,82 @@ pub struct IndexBatch<'cache> {
     files_removed: u64,
     chunks_recorded: u64,
     symbols_recorded: u64,
+    files_parsed: u64,
+    partial_files: u64,
+    failed_files: u64,
+    skipped_files: u64,
 }
 
 impl IndexCache {
+    /// Invalidates only symbol rows produced by a changed language adapter.
+    ///
+    /// Grammar versions live one row per language rather than in the global
+    /// parser component marker. A Rust grammar bump therefore nulls and
+    /// deletes Rust derivations while TOML and Markdown rows remain byte-for-
+    /// byte untouched. Removed adapters are treated as changes too so the next
+    /// reconcile records an honest `unsupported_language` health row.
+    pub fn refresh_grammar_versions(
+        &self,
+        versions: &[(String, String)],
+    ) -> Result<u64, ContextEngineError> {
+        let invalidated = self.with_write(|transaction| {
+            let current = versions.iter().cloned().collect::<BTreeMap<_, _>>();
+            let mut statement = transaction.prepare(
+                "SELECT language, grammar_version FROM parser_versions ORDER BY language",
+            )?;
+            let stored = statement
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
+            drop(statement);
+            let mut invalidated = 0_u64;
+            let languages = stored
+                .keys()
+                .chain(current.keys())
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            for language in languages {
+                if stored.get(&language) == current.get(&language) {
+                    continue;
+                }
+                for table in ["symbol_references", "parse_health", "symbols"] {
+                    invalidated = invalidated.saturating_add(
+                        u64::try_from(transaction.execute(
+                            &format!(
+                                "DELETE FROM {table} WHERE file_version_id IN \
+                                 (SELECT file_version_id FROM file_versions WHERE language = :language)"
+                            ),
+                            named_params! { ":language": &language },
+                        )?)
+                        .unwrap_or(u64::MAX),
+                    );
+                }
+                transaction.execute(
+                    "UPDATE file_versions SET parser_version = NULL WHERE language = :language",
+                    named_params! { ":language": &language },
+                )?;
+                match current.get(&language) {
+                    Some(version) => {
+                        transaction.execute(
+                            "INSERT INTO parser_versions (language, grammar_version) \
+                             VALUES (:language, :version) \
+                             ON CONFLICT(language) DO UPDATE SET grammar_version = excluded.grammar_version",
+                            named_params! { ":language": &language, ":version": version },
+                        )?;
+                    }
+                    None => {
+                        transaction.execute(
+                            "DELETE FROM parser_versions WHERE language = :language",
+                            named_params! { ":language": &language },
+                        )?;
+                    }
+                }
+            }
+            Ok(invalidated)
+        })?;
+        self.publish_counts();
+        Ok(invalidated)
+    }
+
     /// Opens a batch that reconciles `worktree`, rooted at `root`.
     ///
     /// Allocates the pending generation and clears any rows left above the
@@ -583,6 +762,10 @@ impl IndexCache {
             files_removed: 0,
             chunks_recorded: 0,
             symbols_recorded: 0,
+            files_parsed: 0,
+            partial_files: 0,
+            failed_files: 0,
+            skipped_files: 0,
         })
     }
 
@@ -862,7 +1045,8 @@ impl IndexCache {
         };
         self.with_read(|connection| {
             let mut statement = connection.prepare(&format!(
-                "{SYMBOL_SELECT} AND s.name = :name ORDER BY f.path, s.start_byte LIMIT :limit"
+                "{SYMBOL_SELECT} AND s.name = :name \
+                 ORDER BY s.qualified_path, f.path, s.start_byte LIMIT :limit"
             ))?;
             let rows = statement.query_map(
                 named_params! {
@@ -873,6 +1057,151 @@ impl IndexCache {
                 read_symbol,
             )?;
             Ok(page(rows.collect::<Result<Vec<_>, _>>()?, limit))
+        })
+    }
+
+    /// Every symbol whose qualified path ends in `suffix`.
+    pub fn symbols_qualified_suffix(
+        &self,
+        worktree: &WorktreeKey,
+        suffix: &str,
+        limit: usize,
+    ) -> Result<IndexedPage<IndexedSymbol>, ContextEngineError> {
+        let Some(probe) = probe_limit(limit) else {
+            return Ok(IndexedPage::default());
+        };
+        let pattern = format!("%::{}", escape_like(suffix));
+        self.with_read(|connection| {
+            let mut statement = connection.prepare(&format!(
+                "{SYMBOL_SELECT} AND (s.qualified_path = :suffix OR \
+                 s.qualified_path LIKE :pattern ESCAPE '\\') \
+                 ORDER BY s.qualified_path, f.path, s.start_byte LIMIT :limit"
+            ))?;
+            let rows = statement.query_map(
+                named_params! {
+                    ":worktree": worktree.as_str(),
+                    ":suffix": suffix,
+                    ":pattern": pattern,
+                    ":limit": probe,
+                },
+                read_symbol,
+            )?;
+            Ok(page(rows.collect::<Result<Vec<_>, _>>()?, limit))
+        })
+    }
+
+    /// Every declaration in `path`, in byte order.
+    pub fn symbols_in_file(
+        &self,
+        worktree: &WorktreeKey,
+        path: &RepoPath,
+        limit: usize,
+    ) -> Result<IndexedPage<IndexedSymbol>, ContextEngineError> {
+        let Some(probe) = probe_limit(limit) else {
+            return Ok(IndexedPage::default());
+        };
+        self.with_read(|connection| {
+            let mut statement = connection.prepare(&format!(
+                "{SYMBOL_SELECT} AND f.path = :path \
+                 ORDER BY s.start_byte, s.qualified_path LIMIT :limit"
+            ))?;
+            let rows = statement.query_map(
+                named_params! {
+                    ":worktree": worktree.as_str(),
+                    ":path": path.as_bytes(),
+                    ":limit": probe,
+                },
+                read_symbol,
+            )?;
+            Ok(page(rows.collect::<Result<Vec<_>, _>>()?, limit))
+        })
+    }
+
+    /// Parse health for `path`, when the worktree has a derived file version.
+    pub fn parse_health(
+        &self,
+        worktree: &WorktreeKey,
+        path: &RepoPath,
+    ) -> Result<Option<IndexedParseHealth>, ContextEngineError> {
+        self.with_read(|connection| {
+            connection
+                .query_row(
+                    "SELECT h.file_version_id, f.path, v.language, v.parser_version, h.status, \
+                            h.reason, h.error_ranges_json, c.byte_size \
+                     FROM parse_health h \
+                     JOIN file_versions v ON v.file_version_id = h.file_version_id \
+                     JOIN contents c ON c.content_sha256 = v.content_sha256 \
+                     JOIN files f ON f.file_version_id = h.file_version_id \
+                     JOIN worktrees w ON w.worktree_id = f.worktree_id \
+                     WHERE f.worktree_id = :worktree AND f.generation <= w.last_generation \
+                       AND f.path = :path",
+                    named_params! {
+                        ":worktree": worktree.as_str(),
+                        ":path": path.as_bytes(),
+                    },
+                    read_parse_health,
+                )
+                .optional()
+        })
+    }
+
+    /// Best-effort unresolved mentions in `path`, in byte order.
+    pub fn symbol_references_in_file(
+        &self,
+        worktree: &WorktreeKey,
+        path: &RepoPath,
+        limit: usize,
+    ) -> Result<IndexedPage<IndexedSymbolReference>, ContextEngineError> {
+        let Some(probe) = probe_limit(limit) else {
+            return Ok(IndexedPage::default());
+        };
+        self.with_read(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT r.file_version_id, f.path, r.name, r.start_byte, r.end_byte, \
+                        r.start_line, r.end_line, r.name_is_lossy, c.byte_size \
+                 FROM symbol_references r \
+                 JOIN file_versions v ON v.file_version_id = r.file_version_id \
+                 JOIN contents c ON c.content_sha256 = v.content_sha256 \
+                 JOIN files f ON f.file_version_id = r.file_version_id \
+                 JOIN worktrees w ON w.worktree_id = f.worktree_id \
+                 WHERE f.worktree_id = :worktree AND f.generation <= w.last_generation \
+                   AND f.path = :path ORDER BY r.start_byte, r.ordinal LIMIT :limit",
+            )?;
+            let rows = statement.query_map(
+                named_params! {
+                    ":worktree": worktree.as_str(),
+                    ":path": path.as_bytes(),
+                    ":limit": probe,
+                },
+                read_symbol_reference,
+            )?;
+            Ok(page(rows.collect::<Result<Vec<_>, _>>()?, limit))
+        })
+    }
+
+    /// Visible files whose symbol coverage stopped at a per-file budget.
+    ///
+    /// Worktree-scoped for the same reason every other derived read is: one
+    /// repository cache is shared by all linked checkouts, while visibility is
+    /// decided by each checkout's committed `files` rows.
+    pub fn incomplete_symbol_files(
+        &self,
+        worktree: &WorktreeKey,
+    ) -> Result<u64, ContextEngineError> {
+        self.with_read(|connection| {
+            connection.query_row(
+                "SELECT COUNT(*) FROM parse_health h \
+                 JOIN files f ON f.file_version_id = h.file_version_id \
+                 JOIN worktrees w ON w.worktree_id = f.worktree_id \
+                 WHERE f.worktree_id = :worktree AND f.generation <= w.last_generation \
+                   AND h.status = 'failed' \
+                   AND h.reason IN ('symbol_budget_exhausted', 'reference_budget_exhausted')",
+                named_params! { ":worktree": worktree.as_str() },
+                |row| {
+                    row.get::<_, i64>(0)
+                        .map(|count| u64::try_from(count).unwrap_or(0))
+                },
+            )
         })
     }
 
@@ -1134,11 +1463,88 @@ impl IndexBatch<'_> {
         parser_version: &str,
         symbols: &[SymbolRecord],
     ) -> Result<(), ContextEngineError> {
+        self.record_symbol_rows(
+            file_version,
+            parser_version,
+            ParseHealth::Complete,
+            symbols.to_vec(),
+            Vec::new(),
+        )
+    }
+
+    /// Attaches a complete extraction, including health and unresolved mentions.
+    ///
+    /// The ordering, buffering, and error contract are identical to
+    /// [`record_symbols`](Self::record_symbols).
+    pub fn record_extraction(
+        &mut self,
+        file_version: &FileVersionId,
+        extracted: &FileSymbols,
+    ) -> Result<(), ContextEngineError> {
+        let symbols = extracted
+            .symbols
+            .iter()
+            .map(SymbolRecord::from)
+            .collect::<Vec<_>>();
+        let references = extracted
+            .references
+            .iter()
+            .map(SymbolReferenceRecord::from)
+            .collect::<Vec<_>>();
+        self.record_symbol_rows(
+            file_version,
+            &extracted.grammar_version,
+            extracted.health.clone(),
+            symbols,
+            references,
+        )
+    }
+
+    fn record_symbol_rows(
+        &mut self,
+        file_version: &FileVersionId,
+        parser_version: &str,
+        health: ParseHealth,
+        symbols: Vec<SymbolRecord>,
+        references: Vec<SymbolReferenceRecord>,
+    ) -> Result<(), ContextEngineError> {
+        if symbols.len() > MAX_SYMBOLS_PER_FILE {
+            return Err(ContextEngineError::IndexBatchInvalid {
+                reason: format!(
+                    "file version {file_version} supplied {} symbols, above the per-file limit {MAX_SYMBOLS_PER_FILE}",
+                    symbols.len()
+                ),
+            });
+        }
+        if references.len() > MAX_REFERENCES_PER_FILE {
+            return Err(ContextEngineError::IndexBatchInvalid {
+                reason: format!(
+                    "file version {file_version} supplied {} references, above the per-file limit {MAX_REFERENCES_PER_FILE}",
+                    references.len()
+                ),
+            });
+        }
+        match &health {
+            ParseHealth::Complete => self.files_parsed = self.files_parsed.saturating_add(1),
+            ParseHealth::Partial { .. } => {
+                self.files_parsed = self.files_parsed.saturating_add(1);
+                self.partial_files = self.partial_files.saturating_add(1);
+            }
+            ParseHealth::Failed { .. } => {
+                self.files_parsed = self.files_parsed.saturating_add(1);
+                self.failed_files = self.failed_files.saturating_add(1);
+            }
+            ParseHealth::Skipped { .. } => {
+                self.skipped_files = self.skipped_files.saturating_add(1);
+            }
+        }
         self.symbols_recorded += symbols.len() as u64;
         self.symbols.push(PendingSymbols {
             file_version: file_version.clone(),
             parser_version: parser_version.to_owned(),
-            symbols: symbols.to_vec(),
+            symbols,
+            references,
+            health,
         });
         self.flush_if_full()
     }
@@ -1374,6 +1780,10 @@ impl IndexBatch<'_> {
             files_removed: self.files_removed,
             chunks_recorded: self.chunks_recorded,
             symbols_recorded: self.symbols_recorded,
+            files_parsed: self.files_parsed,
+            partial_files: self.partial_files,
+            failed_files: self.failed_files,
+            skipped_files: self.skipped_files,
             rows_swept,
             rows_collected,
             duration: self.started.elapsed(),
@@ -1384,6 +1794,11 @@ impl IndexBatch<'_> {
             generation = receipt.generation,
             files = receipt.files_recorded,
             chunks = receipt.chunks_recorded,
+            symbols = receipt.symbols_recorded,
+            parsed_files = receipt.files_parsed,
+            partial_files = receipt.partial_files,
+            failed_files = receipt.failed_files,
+            skipped_files = receipt.skipped_files,
             swept = receipt.rows_swept,
             duration_ms = receipt.duration.as_millis(),
             "context index batch committed"
@@ -1392,10 +1807,75 @@ impl IndexBatch<'_> {
     }
 
     fn flush_if_full(&mut self) -> Result<(), ContextEngineError> {
-        if self.files.len() + self.symbols.len() + self.removals.len() >= FLUSH_FILES {
+        if self.buffered_rows() >= FLUSH_ROWS || self.buffered_bytes() >= FLUSH_BYTES {
             return self.flush();
         }
         Ok(())
+    }
+
+    fn buffered_rows(&self) -> usize {
+        let files = self.files.iter().fold(0_usize, |total, file| {
+            let chunks = match &file.content {
+                Derivation::Read(content) => content.chunks.len(),
+                Derivation::None | Derivation::Unavailable | Derivation::Kept => 0,
+            };
+            total.saturating_add(1).saturating_add(chunks)
+        });
+        let symbols = self.symbols.iter().fold(0_usize, |total, attached| {
+            total
+                .saturating_add(1)
+                .saturating_add(attached.symbols.len())
+                .saturating_add(attached.references.len())
+        });
+        files
+            .saturating_add(symbols)
+            .saturating_add(self.removals.len())
+    }
+
+    fn buffered_bytes(&self) -> usize {
+        let files = self.files.iter().fold(0_usize, |total, file| {
+            let content = match &file.content {
+                Derivation::Read(content) => content.chunks.iter().fold(
+                    content
+                        .language
+                        .as_deref()
+                        .map_or(0, str::len)
+                        .saturating_add(content.chunking_version.as_deref().map_or(0, str::len)),
+                    |bytes, chunk| bytes.saturating_add(chunk.anchor.len()),
+                ),
+                Derivation::None | Derivation::Unavailable | Derivation::Kept => 0,
+            };
+            total
+                .saturating_add(file.path.as_bytes().len())
+                .saturating_add(content)
+        });
+        let symbols = self.symbols.iter().fold(0_usize, |total, attached| {
+            let declaration_bytes = attached.symbols.iter().fold(0_usize, |bytes, symbol| {
+                bytes
+                    .saturating_add(symbol.name.len())
+                    .saturating_add(symbol.qualified_path.len())
+                    .saturating_add(symbol.kind.len())
+            });
+            let reference_bytes = attached
+                .references
+                .iter()
+                .fold(0_usize, |bytes, reference| {
+                    bytes.saturating_add(reference.name.len())
+                });
+            let health_bytes = match &attached.health {
+                ParseHealth::Failed { reason } => reason.len(),
+                ParseHealth::Partial { error_ranges } => error_ranges
+                    .len()
+                    .saturating_mul(std::mem::size_of::<ByteRange>()),
+                ParseHealth::Complete | ParseHealth::Skipped { .. } => 0,
+            };
+            total
+                .saturating_add(attached.parser_version.len())
+                .saturating_add(declaration_bytes)
+                .saturating_add(reference_bytes)
+                .saturating_add(health_bytes)
+        });
+        files.saturating_add(symbols)
     }
 
     /// Writes the buffer at the pending generation, where nothing can see it.
@@ -1427,7 +1907,7 @@ impl IndexBatch<'_> {
         let generation = i64::try_from(self.generation).unwrap_or(i64::MAX);
         let known = &self.recorded_versions;
 
-        let (recorded, written, deferred) = self.cache.with_write(|transaction| {
+        let write = self.cache.with_write(|transaction| {
             let mut recorded = 0_u64;
             let mut written = BTreeSet::new();
 
@@ -1461,8 +1941,17 @@ impl IndexBatch<'_> {
                     deferred.push(attached.file_version.clone());
                 }
             }
+            let logical_bytes = logical_database_bytes(transaction)?;
+            if logical_bytes > super::MAX_INDEX_DB_BYTES {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+                    Some(format!("index_budget_exhausted:{logical_bytes}")),
+                ));
+            }
             Ok((recorded, written, deferred))
-        })?;
+        });
+        let (recorded, written, deferred) =
+            write.map_err(|error| index_budget(&self.cache.database, &error))?;
 
         // Only now that the write committed.
         let carried = std::mem::take(&mut self.symbols)
@@ -1491,6 +1980,35 @@ fn version_exists(
         )
         .optional()
         .map(|found| found.is_some())
+}
+
+/// Logical database bytes after the writes in the current transaction.
+///
+/// Unlike a filesystem check before the transaction, this includes pages the
+/// pending rows actually allocated and lets returning an error roll them all
+/// back before they become part of the cache.
+fn logical_database_bytes(transaction: &rusqlite::Transaction<'_>) -> Result<u64, rusqlite::Error> {
+    let pages = transaction.query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))?;
+    let page_size = transaction.query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))?;
+    Ok(strict_u64(pages, 0, "page_count")?.saturating_mul(strict_u64(page_size, 0, "page_size")?))
+}
+
+/// Recovers the typed budget refusal used to roll an oversized transaction back.
+fn index_budget(database: &Path, error: &ContextEngineError) -> ContextEngineError {
+    let ContextEngineError::CacheOpenFailed { reason, .. } = error else {
+        return error.clone();
+    };
+    let Some(bytes) = reason
+        .split_once("index_budget_exhausted:")
+        .and_then(|(_, rest)| rest.trim().parse::<u64>().ok())
+    else {
+        return error.clone();
+    };
+    ContextEngineError::IndexBudgetExhausted {
+        path: database.to_path_buf(),
+        bytes,
+        limit: super::MAX_INDEX_DB_BYTES,
+    }
 }
 
 /// Turns the constraint failure `commit` raises for a lost race back into the
@@ -1524,7 +2042,7 @@ fn supersession(
 const FILE_SELECT: &str = "\
 SELECT f.path, f.file_version_id, v.content_sha256, f.byte_size, f.mtime_ns, f.file_class, \
        f.symlink, f.boundary, f.unreadable, f.classify_version, f.generation, v.truncated, \
-       v.chunking_version \
+       v.chunking_version, v.language, v.parser_version \
 FROM files f \
 JOIN worktrees w ON w.worktree_id = f.worktree_id \
 LEFT JOIN file_versions v ON v.file_version_id = f.file_version_id \
@@ -1542,11 +2060,16 @@ WHERE f.worktree_id = :worktree AND f.generation <= w.last_generation";
 
 const SYMBOL_SELECT: &str = "\
 SELECT s.symbol_id, s.file_version_id, f.path, s.name, s.qualified_path, s.kind, \
-       s.start_byte, s.end_byte, s.start_line, s.end_line, v.parser_version \
+       s.ordinal, s.start_byte, s.end_byte, s.start_line, s.end_line, s.parent_symbol_id, \
+       s.is_test, s.name_is_lossy, v.parser_version, v.language, c.byte_size, \
+       p.qualified_path, p.kind, p.ordinal, p.start_byte, p.end_byte \
 FROM symbols s \
 JOIN file_versions v ON v.file_version_id = s.file_version_id \
+JOIN contents c ON c.content_sha256 = v.content_sha256 \
 JOIN files f ON f.file_version_id = s.file_version_id \
 JOIN worktrees w ON w.worktree_id = f.worktree_id \
+LEFT JOIN symbols p \
+  ON p.file_version_id = s.file_version_id AND p.symbol_id = s.parent_symbol_id \
 WHERE f.worktree_id = :worktree AND f.generation <= w.last_generation";
 
 /// One more row than the caller asked for, which is how truncation is detected.
@@ -1568,6 +2091,13 @@ fn page<T>(mut rows: Vec<T>, limit: usize) -> IndexedPage<T> {
     let more = rows.len() > bounded;
     rows.truncate(bounded);
     IndexedPage { rows, more }
+}
+
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 /// The half-open blob range holding everything strictly beneath `prefix`.
@@ -1840,6 +2370,20 @@ fn write_symbols(
     attached: &PendingSymbols,
 ) -> Result<(), rusqlite::Error> {
     let version = attached.file_version.to_string();
+    let (path, language, byte_size): (Vec<u8>, Option<String>, i64) = transaction.query_row(
+        "SELECT v.path, v.language, c.byte_size FROM file_versions v \
+         JOIN contents c ON c.content_sha256 = v.content_sha256 \
+         WHERE v.file_version_id = :id",
+        named_params! { ":id": &version },
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let path = RepoPath::from_bytes(path);
+    let language = language
+        .map(Language::new)
+        .transpose()
+        .map_err(|_| invalid_symbol(0))?;
+    let byte_size = strict_u64(byte_size, 2, "file_byte_size")?;
+    validate_pending_symbols(attached, &path, language.as_ref(), byte_size)?;
     transaction.execute(
         "UPDATE file_versions SET parser_version = :parser WHERE file_version_id = :id",
         named_params! { ":parser": &attached.parser_version, ":id": &version },
@@ -1848,28 +2392,143 @@ fn write_symbols(
         "DELETE FROM symbols WHERE file_version_id = :id",
         named_params! { ":id": &version },
     )?;
-    for symbol in &attached.symbols {
-        transaction.execute(
+    transaction.execute(
+        "DELETE FROM symbol_references WHERE file_version_id = :id",
+        named_params! { ":id": &version },
+    )?;
+    transaction.execute(
+        "DELETE FROM parse_health WHERE file_version_id = :id",
+        named_params! { ":id": &version },
+    )?;
+    {
+        let mut insert_symbol = transaction.prepare(
             "INSERT INTO symbols \
-                (file_version_id, symbol_id, name, qualified_path, kind, start_byte, end_byte, \
-                 start_line, end_line) \
-             VALUES (:version, :symbol, :name, :qualified, :kind, :start, :end, :first_line, \
-                 :last_line) \
-             ON CONFLICT(file_version_id, symbol_id) DO NOTHING",
-            named_params! {
+                (file_version_id, symbol_id, name, qualified_path, kind, ordinal, start_byte, \
+                 end_byte, start_line, end_line, parent_symbol_id, is_test, \
+                 name_is_lossy) \
+             VALUES (:version, :symbol, :name, :qualified, :kind, :ordinal, :start, :end, \
+                 :first_line, :last_line, :parent, :is_test, :lossy)",
+        )?;
+        for symbol in &attached.symbols {
+            insert_symbol.execute(named_params! {
                 ":version": &version,
                 ":symbol": symbol.id.to_string(),
                 ":name": symbol.name,
                 ":qualified": symbol.qualified_path,
                 ":kind": symbol.kind,
-                ":start": i64::try_from(symbol.byte_range.start).unwrap_or(i64::MAX),
-                ":end": i64::try_from(symbol.byte_range.end).unwrap_or(i64::MAX),
+                ":ordinal": i64::from(symbol.ordinal),
+                ":start": i64::try_from(symbol.byte_range.start)
+                    .map_err(|_| invalid_integer(6, "symbol_start_byte"))?,
+                ":end": i64::try_from(symbol.byte_range.end)
+                    .map_err(|_| invalid_integer(7, "symbol_end_byte"))?,
                 ":first_line": symbol.byte_range.first_line.map(i64::from),
                 ":last_line": symbol.byte_range.last_line.map(i64::from),
-            },
+                ":parent": symbol.parent.as_ref().map(ToString::to_string),
+                ":is_test": i64::from(symbol.is_test),
+                ":lossy": i64::from(symbol.name_is_lossy),
+            })?;
+        }
+    }
+    {
+        let mut insert_reference = transaction.prepare(
+            "INSERT INTO symbol_references \
+                (file_version_id, ordinal, name, start_byte, end_byte, start_line, end_line, \
+                 name_is_lossy) \
+             VALUES (:version, :ordinal, :name, :start, :end, :first_line, :last_line, :lossy)",
         )?;
+        for (ordinal, reference) in attached.references.iter().enumerate() {
+            insert_reference.execute(named_params! {
+                ":version": &version,
+                ":ordinal": i64::try_from(ordinal)
+                    .map_err(|_| invalid_integer(1, "reference_ordinal"))?,
+                ":name": reference.name,
+                ":start": i64::try_from(reference.byte_range.start)
+                    .map_err(|_| invalid_integer(3, "reference_start_byte"))?,
+                ":end": i64::try_from(reference.byte_range.end)
+                    .map_err(|_| invalid_integer(4, "reference_end_byte"))?,
+                ":first_line": reference.byte_range.first_line.map(i64::from),
+                ":last_line": reference.byte_range.last_line.map(i64::from),
+                ":lossy": i64::from(reference.name_is_lossy),
+            })?;
+        }
+    }
+    let (status, reason, error_ranges) = encode_parse_health(&attached.health)?;
+    transaction.execute(
+        "INSERT INTO parse_health (file_version_id, status, reason, error_ranges_json) \
+         VALUES (:version, :status, :reason, :ranges)",
+        named_params! {
+            ":version": &version,
+            ":status": status,
+            ":reason": reason,
+            ":ranges": error_ranges,
+        },
+    )?;
+    Ok(())
+}
+
+fn validate_pending_symbols(
+    attached: &PendingSymbols,
+    path: &RepoPath,
+    language: Option<&Language>,
+    byte_size: u64,
+) -> Result<(), rusqlite::Error> {
+    let by_id = attached
+        .symbols
+        .iter()
+        .map(|symbol| (symbol.id.clone(), symbol))
+        .collect::<BTreeMap<_, _>>();
+    if by_id.len() != attached.symbols.len() {
+        return Err(invalid_symbol(0));
+    }
+    for symbol in &attached.symbols {
+        let language = language.ok_or_else(|| invalid_symbol(0))?;
+        validate_bounded_range(&symbol.byte_range, byte_size, 6, "symbol_range")?;
+        let kind = SymbolKind::parse(&symbol.kind).ok_or_else(|| invalid_symbol(4))?;
+        let identity_name = if symbol.ordinal == 0 {
+            symbol.qualified_path.clone()
+        } else {
+            format!("{}#duplicate:{}", symbol.qualified_path, symbol.ordinal)
+        };
+        let expected = SymbolId::derive(path, language.as_str(), &identity_name, kind.as_str());
+        if symbol.id != expected {
+            return Err(invalid_symbol(0));
+        }
+        if let Some(parent_id) = symbol.parent.as_ref() {
+            let parent = by_id.get(parent_id).ok_or_else(|| invalid_symbol(10))?;
+            if parent.byte_range.start > symbol.byte_range.start
+                || symbol
+                    .qualified_path
+                    .strip_prefix(&parent.qualified_path)
+                    .and_then(|suffix| suffix.strip_prefix("::"))
+                    .is_none_or(str::is_empty)
+            {
+                return Err(invalid_symbol(10));
+            }
+        }
+    }
+    for reference in &attached.references {
+        validate_bounded_range(&reference.byte_range, byte_size, 3, "reference_range")?;
+    }
+    if let ParseHealth::Partial { error_ranges } = &attached.health {
+        for range in error_ranges {
+            validate_bounded_range(range, byte_size, 6, "parse_error_range")?;
+        }
     }
     Ok(())
+}
+
+fn encode_parse_health(
+    health: &ParseHealth,
+) -> Result<(&'static str, Option<String>, String), rusqlite::Error> {
+    let (status, reason, ranges) = match health {
+        ParseHealth::Complete => ("complete", None, &[][..]),
+        ParseHealth::Partial { error_ranges } => ("partial", None, error_ranges.as_slice()),
+        ParseHealth::Failed { reason } => ("failed", Some(reason.clone()), &[][..]),
+        ParseHealth::Skipped { reason } => ("skipped", Some(reason.as_str().to_owned()), &[][..]),
+    };
+    let ranges = serde_json::to_string(ranges)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    Ok((status, reason, ranges))
 }
 
 /// Drops every content-addressed row nothing still points at.
@@ -1988,6 +2647,19 @@ fn read_file(row: &rusqlite::Row<'_>) -> Result<IndexedFile, rusqlite::Error> {
             )
         })?,
         chunking_version: row.get(12)?,
+        language: row
+            .get::<_, Option<String>>(13)?
+            .map(|value| {
+                Language::new(value).map_err(|_| {
+                    rusqlite::Error::InvalidColumnType(
+                        13,
+                        "language".to_owned(),
+                        rusqlite::types::Type::Text,
+                    )
+                })
+            })
+            .transpose()?,
+        parser_version: row.get(14)?,
         generation: cast_u64(generation),
     })
 }
@@ -2034,24 +2706,239 @@ fn read_chunk(row: &rusqlite::Row<'_>) -> Result<IndexedChunk, rusqlite::Error> 
 }
 
 fn read_symbol(row: &rusqlite::Row<'_>) -> Result<IndexedSymbol, rusqlite::Error> {
-    let id: String = row.get(0)?;
+    let encoded_id: String = row.get(0)?;
     let version: String = row.get(1)?;
     let path: Vec<u8> = row.get(2)?;
+    let path = RepoPath::from_bytes(path);
+    let name: String = row.get(3)?;
+    let qualified_path: String = row.get(4)?;
+    let kind_text: String = row.get(5)?;
+    let kind = SymbolKind::parse(&kind_text).ok_or_else(|| invalid_symbol(5))?;
+    let ordinal = strict_u32(row.get(6)?, 6, "symbol_ordinal")?;
+    let byte_size = strict_u64(row.get(16)?, 16, "file_byte_size")?;
+    let byte_range = read_bounded_range(row, 7, 8, 9, 10, byte_size, "symbol_range")?;
+    let language_text: String = row.get(15).map_err(|_| invalid_symbol(15))?;
+    let language = Language::new(language_text).map_err(|_| invalid_symbol(15))?;
+    let id: SymbolId = parse_id(0, &encoded_id)?;
+    let identity_name = if ordinal == 0 {
+        qualified_path.clone()
+    } else {
+        format!("{qualified_path}#duplicate:{ordinal}")
+    };
+    let expected = SymbolId::derive(&path, language.as_str(), &identity_name, kind.as_str());
+    if id != expected {
+        return Err(invalid_symbol(0));
+    }
+
+    let parent = row
+        .get::<_, Option<String>>(11)?
+        .map(|value| parse_id(11, &value))
+        .transpose()?;
+    if let Some(parent_id) = parent.as_ref() {
+        let parent_qualified: String = row.get(17).map_err(|_| invalid_symbol(11))?;
+        let parent_kind_text: String = row.get(18).map_err(|_| invalid_symbol(11))?;
+        let parent_kind = SymbolKind::parse(&parent_kind_text).ok_or_else(|| invalid_symbol(11))?;
+        let parent_ordinal = strict_u32(
+            row.get::<_, Option<i64>>(19)?
+                .ok_or_else(|| invalid_symbol(11))?,
+            19,
+            "parent_ordinal",
+        )?;
+        let parent_identity = if parent_ordinal == 0 {
+            parent_qualified.clone()
+        } else {
+            format!("{parent_qualified}#duplicate:{parent_ordinal}")
+        };
+        let expected_parent = SymbolId::derive(
+            &path,
+            language.as_str(),
+            &parent_identity,
+            parent_kind.as_str(),
+        );
+        let parent_start = strict_u64(
+            row.get::<_, Option<i64>>(20)?
+                .ok_or_else(|| invalid_symbol(11))?,
+            20,
+            "parent_start_byte",
+        )?;
+        let parent_end = strict_u64(
+            row.get::<_, Option<i64>>(21)?
+                .ok_or_else(|| invalid_symbol(11))?,
+            21,
+            "parent_end_byte",
+        )?;
+        if parent_id != &expected_parent
+            || parent_start > byte_range.start
+            || parent_start > parent_end
+            || parent_end > byte_size
+            || qualified_path
+                .strip_prefix(&parent_qualified)
+                .and_then(|suffix| suffix.strip_prefix("::"))
+                .is_none_or(str::is_empty)
+        {
+            return Err(invalid_symbol(11));
+        }
+    }
+
     Ok(IndexedSymbol {
-        id: parse_id(0, &id)?,
+        id,
         file_version: parse_id(1, &version)?,
-        path: RepoPath::from_bytes(path),
-        name: row.get(3)?,
-        qualified_path: row.get(4)?,
-        kind: row.get(5)?,
-        byte_range: ByteRange {
-            start: cast_u64(row.get::<_, i64>(6)?),
-            end: cast_u64(row.get::<_, i64>(7)?),
-            first_line: row.get::<_, Option<i64>>(8)?.map(cast_u32),
-            last_line: row.get::<_, Option<i64>>(9)?.map(cast_u32),
-        },
-        parser_version: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
+        path,
+        name,
+        qualified_path,
+        kind,
+        ordinal,
+        byte_range,
+        parent,
+        is_test: strict_bool(row.get(12)?, 12, "symbol_is_test")?,
+        name_is_lossy: strict_bool(row.get(13)?, 13, "symbol_name_is_lossy")?,
+        parser_version: row.get::<_, Option<String>>(14)?.unwrap_or_default(),
     })
+}
+
+fn read_parse_health(row: &rusqlite::Row<'_>) -> Result<IndexedParseHealth, rusqlite::Error> {
+    let version: String = row.get(0)?;
+    let path: Vec<u8> = row.get(1)?;
+    let language = row
+        .get::<_, Option<String>>(2)?
+        .map(|value| {
+            Language::new(value).map_err(|_| {
+                rusqlite::Error::InvalidColumnType(
+                    2,
+                    "language".to_owned(),
+                    rusqlite::types::Type::Text,
+                )
+            })
+        })
+        .transpose()?;
+    let status: String = row.get(4)?;
+    let reason: Option<String> = row.get(5)?;
+    let encoded_ranges: String = row.get(6)?;
+    let ranges = serde_json::from_str::<Vec<ByteRange>>(&encoded_ranges).map_err(|_| {
+        rusqlite::Error::InvalidColumnType(
+            6,
+            "error_ranges_json".to_owned(),
+            rusqlite::types::Type::Text,
+        )
+    })?;
+    let byte_size = strict_u64(row.get(7)?, 7, "file_byte_size")?;
+    for range in &ranges {
+        validate_bounded_range(range, byte_size, 6, "parse_error_range")?;
+    }
+    let health = match status.as_str() {
+        "complete" if reason.is_none() && ranges.is_empty() => ParseHealth::Complete,
+        "partial" if reason.is_none() && !ranges.is_empty() => ParseHealth::Partial {
+            error_ranges: ranges,
+        },
+        "failed" if ranges.is_empty() => ParseHealth::Failed {
+            reason: reason.ok_or_else(|| invalid_health(5))?,
+        },
+        "skipped" if ranges.is_empty() => ParseHealth::Skipped {
+            reason: match reason.as_deref() {
+                Some("unsupported_language") => ExtractionSkipReason::UnsupportedLanguage,
+                Some("unknown_language") => ExtractionSkipReason::UnknownLanguage,
+                Some("transcoded_input") => ExtractionSkipReason::TranscodedInput,
+                _ => return Err(invalid_health(5)),
+            },
+        },
+        _ => return Err(invalid_health(4)),
+    };
+    Ok(IndexedParseHealth {
+        file_version: parse_id(0, &version)?,
+        path: RepoPath::from_bytes(path),
+        language,
+        grammar_version: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+        health,
+    })
+}
+
+fn invalid_health(column: usize) -> rusqlite::Error {
+    rusqlite::Error::InvalidColumnType(
+        column,
+        "parse_health".to_owned(),
+        rusqlite::types::Type::Text,
+    )
+}
+
+fn read_symbol_reference(
+    row: &rusqlite::Row<'_>,
+) -> Result<IndexedSymbolReference, rusqlite::Error> {
+    let version: String = row.get(0)?;
+    let path: Vec<u8> = row.get(1)?;
+    let byte_size = strict_u64(row.get(8)?, 8, "file_byte_size")?;
+    Ok(IndexedSymbolReference {
+        file_version: parse_id(0, &version)?,
+        path: RepoPath::from_bytes(path),
+        name: row.get(2)?,
+        byte_range: read_bounded_range(row, 3, 4, 5, 6, byte_size, "reference_range")?,
+        name_is_lossy: strict_bool(row.get(7)?, 7, "reference_name_is_lossy")?,
+    })
+}
+
+fn read_bounded_range(
+    row: &rusqlite::Row<'_>,
+    start_column: usize,
+    end_column: usize,
+    first_line_column: usize,
+    last_line_column: usize,
+    byte_size: u64,
+    name: &str,
+) -> Result<ByteRange, rusqlite::Error> {
+    let range = ByteRange {
+        start: strict_u64(row.get(start_column)?, start_column, name)?,
+        end: strict_u64(row.get(end_column)?, end_column, name)?,
+        first_line: row
+            .get::<_, Option<i64>>(first_line_column)?
+            .map(|value| strict_u32(value, first_line_column, name))
+            .transpose()?,
+        last_line: row
+            .get::<_, Option<i64>>(last_line_column)?
+            .map(|value| strict_u32(value, last_line_column, name))
+            .transpose()?,
+    };
+    validate_bounded_range(&range, byte_size, start_column, name)?;
+    Ok(range)
+}
+
+fn validate_bounded_range(
+    range: &ByteRange,
+    byte_size: u64,
+    column: usize,
+    name: &str,
+) -> Result<(), rusqlite::Error> {
+    if range.start > range.end
+        || range.end > byte_size
+        || range.first_line == Some(0)
+        || range.last_line == Some(0)
+        || matches!((range.first_line, range.last_line), (Some(first), Some(last)) if last < first)
+    {
+        return Err(invalid_integer(column, name));
+    }
+    Ok(())
+}
+
+fn strict_u64(value: i64, column: usize, name: &str) -> Result<u64, rusqlite::Error> {
+    u64::try_from(value).map_err(|_| invalid_integer(column, name))
+}
+
+fn strict_u32(value: i64, column: usize, name: &str) -> Result<u32, rusqlite::Error> {
+    u32::try_from(value).map_err(|_| invalid_integer(column, name))
+}
+
+fn strict_bool(value: i64, column: usize, name: &str) -> Result<bool, rusqlite::Error> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(invalid_integer(column, name)),
+    }
+}
+
+fn invalid_integer(column: usize, name: &str) -> rusqlite::Error {
+    rusqlite::Error::InvalidColumnType(column, name.to_owned(), rusqlite::types::Type::Integer)
+}
+
+fn invalid_symbol(column: usize) -> rusqlite::Error {
+    rusqlite::Error::InvalidColumnType(column, "symbol".to_owned(), rusqlite::types::Type::Text)
 }
 
 fn parse_id<T: std::str::FromStr>(column: usize, value: &str) -> Result<T, rusqlite::Error> {

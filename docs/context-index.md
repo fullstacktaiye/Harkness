@@ -19,7 +19,8 @@ bump takes away, and what happens when it runs out of room.
 
 ## What it holds
 
-Six tables, and exactly one of them is per-worktree.
+Eleven tables. `files` is the only visible per-worktree content table;
+`pending_files` is its invisible per-worktree staging area.
 
 ```mermaid
 erDiagram
@@ -29,6 +30,9 @@ erDiagram
     file_versions }o--|| contents : "of these bytes"
     file_versions ||--o{ chunks : "chunked into"
     file_versions ||--o{ symbols : "declares"
+    file_versions ||--o{ symbol_references : "mentions"
+    file_versions ||--o| parse_health : "parsed as"
+    parser_versions ||--o{ file_versions : "invalidates language"
 ```
 
 | Table | Keyed by | Holds |
@@ -40,10 +44,13 @@ erDiagram
 | `contents` | content SHA-256 | the size of one distinct blob of bytes |
 | `file_versions` | file-version id | one path's bytes: language, whether the text was transcoded, whether the chunk set stops short of the whole file, and the chunking and parser versions its derived rows were produced under |
 | `chunks` | `(file_version_id, chunk_id)` | anchor, ordinal, byte range, line hints, chunk digest, associated symbol |
-| `symbols` | `(file_version_id, symbol_id)` | name, qualified path, kind, byte range |
+| `symbols` | `(file_version_id, symbol_id)` | typed kind, bare and qualified names, duplicate ordinal, byte range, parent, test and lossy-name flags; never a source excerpt |
+| `symbol_references` | `(file_version_id, ordinal)` | best-effort unresolved name mentions and exact byte ranges |
+| `parse_health` | file-version id | complete, partial, failed, or skipped status; bounded reason and syntax-error ranges |
+| `parser_versions` | language | the grammar marker that last made that language's symbol rows current |
 
 The full DDL is `crates/harkness-context/src/index/schema.rs`, frozen as
-`crates/harkness-context/src/index/fixtures/schema-v3.sql`. A test compares the
+`crates/harkness-context/src/index/fixtures/schema-v4.sql`. A test compares the
 live layout against that fixture, so a column added without a version bump fails
 a test rather than leaving already-written caches addressed by a build that
 expects different columns.
@@ -118,9 +125,9 @@ Three further consequences, each of which is the point rather than a side effect
   query returns the rows, and the next batch for that worktree deletes them. The
   work is redone, never resumed.
 - **A cold build does not hold the write lock.** Rows are flushed during the
-  batch, in their own transactions, so a reader interleaved with a hundred
-  thousand files still answers — from the previous generation — instead of
-  queueing behind it.
+  batch, in their own transactions bounded by derived-row count and buffered
+  dynamic bytes, so a reader interleaved with a hundred thousand files still
+  answers — from the previous generation — instead of queueing behind it.
 - **A generation is allocated once, and the watermark only moves forward.** Two
   front ends indexing one repository both stage, side by side, keyed apart by
   generation; the first to commit wins and the second is refused with
@@ -405,13 +412,21 @@ drops:
 | Skew | What is deleted | Why |
 | --- | --- | --- |
 | `chunking_version` | `chunks`, and `file_versions.chunking_version` is nulled | a chunk's identity was derived under boundary rules this build does not use, so the row names something nothing can re-derive |
-| `parser_version` | `symbols`, and `file_versions.parser_version` is nulled | the same, for symbol identity |
+| `parser_version` | `symbols`, `symbol_references`, `parse_health`, `parser_versions`, and `file_versions.parser_version` is nulled | shared detection, identity projection, or extraction contracts changed for every language |
 | `ranking_version` | the tables registered as ranking-owned — none yet | a score is meaningful only under the formula that produced it |
 | `classify_version` | **nothing** | a `files` row is a true record that a path existed at a size; only its class is suspect, and the row's own `classify_version` is what says so |
 
 `files` survives every component bump. Re-walking a whole repository because a
 chunk-boundary rule moved would make every retrieval improvement a cold rebuild,
 which is exactly what versioning the components apart is for.
+
+Grammar crate versions are narrower than the shared parser component. A row in
+`parser_versions` names each registered language and its adapter version. A
+mismatch deletes symbols, references, and health only for file versions carrying
+that language and nulls only those parser markers. Reconciliation then parses
+those suspects while other languages' rows remain byte-identical. Removing an
+adapter is handled the same way, allowing the next pass to replace its old parse
+with an honest unsupported-language health row.
 
 The ownership list is data — `IndexComponent::owned_tables` and
 `CORE_TABLES` — and a test holds the schema to it: a table with no owner would
@@ -452,6 +467,11 @@ Two budgets, failing in opposite directions:
 | `MAX_INDEX_DB_BYTES` | 512 MiB per repository | the batch is refused whole with `index_budget_exhausted`; the previous generation stays usable |
 | `MAX_TOTAL_CONTEXT_BYTES` | 4 GiB across `<data_dir>/context/` | least-recently-opened repository caches are removed **entirely**, oldest first, until the subtree fits |
 
+The per-repository limit is checked before a flush and again from SQLite's
+logical page count after the pending rows have been written but before their
+transaction commits. Crossing it rolls that flush back, so the check never
+discovers the overage only after the bytes have become part of the cache.
+
 Nothing partial is ever deleted and nothing is ever silently truncated. A cache
 that quietly stopped storing rows would answer "no match" for content it never
 held, which a caller cannot tell from a repository that does not contain it; a
@@ -468,7 +488,8 @@ Linux default and `noatime` never updates it at all.
 
 ## Security and privacy
 
-The index stores paths, digests, ranges and names, and **no file content**. A
+The index stores paths, digests, ranges and names, and **no file content**. In
+particular, symbol rows do not retain a declaration signature or source line. A
 leaked `index.db` exposes structure, never source text; retrieval re-reads the
 working tree when it needs bytes.
 
@@ -557,6 +578,8 @@ than read, however it came to be at that path.
   what reaches the index at all.
 - [`docs/context-search.md`](context-search.md) — the first retrieval feature to
   read these rows, and what a generation change does to its cursors.
+- [`docs/context-symbols.md`](context-symbols.md) — language detection, parser
+  health, symbol lookup, and language-local grammar invalidation.
 - [`docs/architecture-context.md`](architecture-context.md) — the pipeline this
   sits in the middle of.
 
